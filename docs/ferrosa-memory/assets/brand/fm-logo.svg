@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Ferrosa Memory Discord logo</title>
+  <desc id="desc">A Ferrosa-family periodic-table monogram mark for Ferrosa Memory, rendered in electric blued-steel tones with an Fm symbol, atomic-number nod, orbital ring, and memory graph nodes.</desc>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="72%">
+      <stop offset="0%" stop-color="#15243b"/>
+      <stop offset="58%" stop-color="#0b111d"/>
+      <stop offset="100%" stop-color="#05070c"/>
+    </radialGradient>
+    <linearGradient id="steel" x1="18%" y1="8%" x2="88%" y2="92%">
+      <stop offset="0%" stop-color="#d7fbff"/>
+      <stop offset="18%" stop-color="#7ee7ff"/>
+      <stop offset="54%" stop-color="#348cff"/>
+      <stop offset="100%" stop-color="#516d92"/>
+    </linearGradient>
+    <linearGradient id="steel-soft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7ee7ff" stop-opacity="0.72"/>
+      <stop offset="55%" stop-color="#348cff" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#d7fbff" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="node" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f4feff"/>
+      <stop offset="45%" stop-color="#7ee7ff"/>
+      <stop offset="100%" stop-color="#2f7cff"/>
+    </linearGradient>
+    <filter id="glow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.20  0 0 0 0 0.58  0 0 0 0 1.00  0 0 0 0.85 0" result="blueGlow"/>
+      <feMerge>
+        <feMergeNode in="blueGlow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-shadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- Discord-safe square field. The mark is inset enough for circular avatar crop. -->
+  <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
+
+  <!-- Subtle blued-steel grain/plate lines. -->
+  <g opacity="0.16" stroke="#7ee7ff" stroke-width="2">
+    <path d="M168 260h148"/>
+    <path d="M728 252h126"/>
+    <path d="M142 763h170"/>
+    <path d="M712 778h164"/>
+  </g>
+
+  <!-- Ferrosa-family orbital ring, shifted to feel like memory retrieval rather than database core. -->
+  <g filter="url(#glow)">
+    <ellipse cx="512" cy="512" rx="402" ry="402" fill="none" stroke="url(#steel-soft)" stroke-width="15" stroke-linecap="round" stroke-dasharray="1260 430" transform="rotate(-22 512 512)"/>
+    <ellipse cx="512" cy="512" rx="352" ry="352" fill="none" stroke="#31577f" stroke-width="3" stroke-opacity="0.55" stroke-dasharray="24 28" transform="rotate(17 512 512)"/>
+  </g>
+
+  <!-- Periodic-table frame, same Ferrosa grammar but cooler and heavier for avatar legibility. -->
+  <g filter="url(#soft-shadow)">
+    <rect x="172" y="172" width="680" height="680" rx="142" fill="#09111f" fill-opacity="0.82" stroke="#172f4b" stroke-width="10"/>
+    <rect x="194" y="194" width="636" height="636" rx="123" fill="none" stroke="url(#steel)" stroke-width="26"/>
+    <rect x="232" y="232" width="560" height="560" rx="94" fill="none" stroke="#d7fbff" stroke-width="3" stroke-opacity="0.28"/>
+  </g>
+
+  <!-- Memory graph motif: intentionally distinct from the base Ferrosa Fe icon. -->
+  <g opacity="0.88" stroke="url(#steel-soft)" stroke-width="9" stroke-linecap="round" filter="url(#glow)">
+    <path d="M291 704 C375 633 432 611 506 621 C600 634 643 578 724 505" fill="none"/>
+    <path d="M305 366 C390 421 458 439 534 401 C603 367 660 381 725 430" fill="none"/>
+    <path d="M308 535 C394 519 447 532 512 584 C586 641 656 651 737 628" fill="none" stroke-opacity="0.58"/>
+  </g>
+  <g filter="url(#glow)">
+    <circle cx="292" cy="704" r="22" fill="url(#node)"/>
+    <circle cx="506" cy="621" r="18" fill="url(#node)"/>
+    <circle cx="724" cy="505" r="22" fill="url(#node)"/>
+    <circle cx="305" cy="366" r="18" fill="url(#node)" opacity="0.95"/>
+    <circle cx="534" cy="401" r="15" fill="url(#node)" opacity="0.82"/>
+    <circle cx="725" cy="430" r="18" fill="url(#node)" opacity="0.95"/>
+    <circle cx="737" cy="628" r="18" fill="url(#node)" opacity="0.88"/>
+  </g>
+
+  <!-- Monogram: Fm = Ferrosa Memory / Fermium nod. -->
+  <text x="512" y="584" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="348" font-weight="700" letter-spacing="-20"
+        fill="url(#steel)" filter="url(#glow)">Fm</text>
+
+  <!-- Fermium atomic-number nod. Visually echoes Fe/26 without pretending this is the database logo. -->
+  <text x="275" y="314" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="78" font-weight="800" fill="#7d9fca" letter-spacing="-2">100</text>
+
+  <!-- Small persistent-memory cue. -->
+  <g transform="translate(642 692)" opacity="0.9">
+    <path d="M0 0h108a22 22 0 0 1 22 22v34a22 22 0 0 1-22 22H0a22 22 0 0 1-22-22V22A22 22 0 0 1 0 0Z" fill="#07101d" stroke="url(#steel)" stroke-width="7"/>
+    <path d="M12 26h84M12 52h58" stroke="#7ee7ff" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>

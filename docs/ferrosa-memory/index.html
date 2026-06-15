@@ -4,26 +4,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ferrosa Memory — Long-Context Linked Memory for Agents</title>
-  <meta name="description" content="Ferrosa Memory is a developer-preview memory system for agents with temporal facts, graph links, Datalog-style derived facts, query workbench, and visualization UI.">
-  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <title>Ferrosa Memory — Structured, Linked Memory for Agents</title>
+  <meta name="description" content="Ferrosa Memory is an MCP-native memory server for LLM agents: typed entity graph, bi-temporal facts, hybrid retrieval, Datalog-derived facts, dream-cycle consolidation, and auditable forgetting — backed by Ferrosa DB.">
+  <link rel="icon" type="image/svg+xml" href="assets/brand/fm-logo.svg">
   <style>
     :root {
-      --bg-primary: #0a0a0f;
-      --bg-secondary: #111118;
-      --bg-card: #16161f;
-      --bg-card-hover: #1c1c28;
-      --text-primary: #e8e8ed;
-      --text-secondary: #9494a3;
-      --text-muted: #6b6b7a;
-      --accent: #e2725b;
-      --accent-glow: rgba(226, 114, 91, 0.15);
-      --accent-secondary: #f4a261;
-      --accent-cool: #7c9cf5;
+      --bg-primary: #05070c;
+      --bg-secondary: #09111f;
+      --bg-card: #0e1828;
+      --bg-card-hover: #142337;
+      --text-primary: #e8eef7;
+      --text-secondary: #9fb0c6;
+      --text-muted: #647794;
+      --accent: #348cff;
+      --accent-glow: rgba(52, 140, 255, 0.18);
+      --accent-secondary: #7ee7ff;
+      --accent-cool: #7ee7ff;
+      --accent-steel: #516d92;
       --accent-green: #6bc9a0;
-      --border: #1e1e2a;
-      --border-hover: #2e2e3e;
-      --code-bg: #0d0d14;
+      --border: #17273d;
+      --border-hover: #25395a;
+      --code-bg: #060b14;
       --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     }
@@ -46,7 +47,7 @@
       top: 0;
       width: 100%;
       z-index: 100;
-      background: rgba(10, 10, 15, 0.85);
+      background: rgba(5, 7, 12, 0.85);
       backdrop-filter: blur(20px);
       border-bottom: 1px solid var(--border);
       padding: 0 2rem;
@@ -160,6 +161,16 @@
       pointer-events: none;
     }
 
+    .hero-logo {
+      width: 88px;
+      height: 88px;
+      border-radius: 22px;
+      margin: 0 auto 1.75rem;
+      display: block;
+      box-shadow: 0 10px 40px rgba(52, 140, 255, 0.25);
+      position: relative;
+    }
+
     .hero-badge {
       display: inline-flex;
       align-items: center;
@@ -205,7 +216,7 @@
     .hero p {
       font-size: 1.25rem;
       color: var(--text-secondary);
-      max-width: 640px;
+      max-width: 680px;
       margin: 0 auto 2.5rem;
       line-height: 1.7;
     }
@@ -250,41 +261,6 @@
       background: var(--bg-card-hover);
     }
 
-    /* ── Stats bar ── */
-    .stats-bar {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 1px;
-      background: var(--border);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow: hidden;
-      margin-top: 4rem;
-    }
-
-    .stat {
-      background: var(--bg-secondary);
-      padding: 1.75rem 1.5rem;
-      text-align: center;
-    }
-
-    .stat-value {
-      font-size: 2rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      color: var(--text-primary);
-    }
-
-    .stat-value .unit { color: var(--accent); }
-
-    .stat-label {
-      font-size: 0.8125rem;
-      color: var(--text-muted);
-      margin-top: 0.25rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-
     /* ── Section headers ── */
     .section-label {
       font-size: 0.75rem;
@@ -306,7 +282,7 @@
     .section-subtitle {
       font-size: 1.125rem;
       color: var(--text-secondary);
-      max-width: 640px;
+      max-width: 680px;
       line-height: 1.7;
     }
 
@@ -326,40 +302,6 @@
     }
 
     .problem section { padding: 5rem 2rem; }
-
-    .pain-points {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1.5rem;
-      margin-top: 3rem;
-    }
-
-    .pain-card {
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.75rem;
-      transition: border-color 0.2s;
-    }
-
-    .pain-card:hover { border-color: var(--border-hover); }
-
-    .pain-icon {
-      font-size: 1.5rem;
-      margin-bottom: 1rem;
-    }
-
-    .pain-card h3 {
-      font-size: 1.0625rem;
-      font-weight: 700;
-      margin-bottom: 0.5rem;
-    }
-
-    .pain-card p {
-      font-size: 0.9375rem;
-      color: var(--text-secondary);
-      line-height: 1.6;
-    }
 
     /* ── Feature grid ── */
     .features-grid {
@@ -382,14 +324,6 @@
       transform: translateY(-2px);
     }
 
-    .feature-card.highlight {
-      grid-column: 1 / -1;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3rem;
-      align-items: center;
-    }
-
     .feature-icon {
       width: 44px;
       height: 44px;
@@ -401,8 +335,8 @@
       margin-bottom: 1.25rem;
     }
 
-    .feature-icon.rust { background: rgba(226, 114, 91, 0.12); }
-    .feature-icon.s3 { background: rgba(244, 162, 97, 0.12); }
+    .feature-icon.steel { background: rgba(52, 140, 255, 0.14); }
+    .feature-icon.cyan { background: rgba(126, 231, 255, 0.14); }
     .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
     .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
     .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
@@ -420,71 +354,6 @@
       color: var(--text-secondary);
       line-height: 1.65;
     }
-
-    .feature-card .metric {
-      display: inline-block;
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.25rem 0.625rem;
-      font-size: 0.8125rem;
-      font-family: var(--font-mono);
-      color: var(--accent);
-      margin-top: 0.75rem;
-    }
-
-    /* ── Code demo ── */
-    .code-demo {
-      background: var(--code-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow: hidden;
-    }
-
-    .code-tabs {
-      display: flex;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .code-tab {
-      padding: 0.75rem 1.25rem;
-      font-size: 0.8125rem;
-      font-family: var(--font-mono);
-      color: var(--text-muted);
-      cursor: pointer;
-      border-bottom: 2px solid transparent;
-      transition: color 0.2s, border-color 0.2s;
-      background: none;
-      border-top: none;
-      border-left: none;
-      border-right: none;
-    }
-
-    .code-tab.active {
-      color: var(--accent);
-      border-bottom-color: var(--accent);
-    }
-
-    .code-tab:hover { color: var(--text-secondary); }
-
-    .code-block {
-      padding: 1.5rem;
-      font-family: var(--font-mono);
-      font-size: 0.875rem;
-      line-height: 1.8;
-      overflow-x: auto;
-      display: none;
-    }
-
-    .code-block.active { display: block; }
-
-    .code-block .kw { color: #c792ea; }
-    .code-block .fn { color: #82aaff; }
-    .code-block .str { color: #c3e88d; }
-    .code-block .cm { color: #546e7a; }
-    .code-block .num { color: #f78c6c; }
-    .code-block .type { color: #ffcb6b; }
-    .code-block .op { color: #89ddff; }
 
     /* ── Comparison table ── */
     .comparison {
@@ -542,110 +411,6 @@
     .check { color: var(--accent-green); }
     .cross { color: var(--text-muted); }
 
-    /* ── Architecture ── */
-    .arch-diagram {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 3rem;
-      margin-top: 3rem;
-      text-align: center;
-    }
-
-    .arch-layers {
-      display: flex;
-      flex-direction: column;
-      gap: 0.75rem;
-      max-width: 700px;
-      margin: 0 auto;
-    }
-
-    .arch-layer {
-      display: flex;
-      align-items: center;
-      gap: 1rem;
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1rem 1.5rem;
-      transition: border-color 0.2s;
-    }
-
-    .arch-layer:hover { border-color: var(--accent); }
-
-    .arch-layer-label {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-muted);
-      min-width: 100px;
-    }
-
-    .arch-layer-items {
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }
-
-    .arch-item {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.375rem 0.75rem;
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-      color: var(--text-secondary);
-    }
-
-    .arch-arrow {
-      color: var(--text-muted);
-      font-size: 1.25rem;
-      text-align: center;
-    }
-
-    /* ── Use cases ── */
-    .use-cases {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 1.5rem;
-      margin-top: 3rem;
-    }
-
-    .use-case {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 2rem;
-      transition: border-color 0.2s;
-    }
-
-    .use-case:hover { border-color: var(--border-hover); }
-
-    .use-case-label {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 0.75rem;
-    }
-
-    .use-case-label.migrate { color: var(--accent); }
-    .use-case-label.cloud { color: var(--accent-secondary); }
-    .use-case-label.graph-uc { color: var(--accent-green); }
-
-    .use-case h3 {
-      font-size: 1.125rem;
-      font-weight: 700;
-      margin-bottom: 0.625rem;
-    }
-
-    .use-case p {
-      font-size: 0.9375rem;
-      color: var(--text-secondary);
-      line-height: 1.65;
-    }
-
     /* ── CTA section ── */
     .cta-section {
       text-align: center;
@@ -663,51 +428,10 @@
       font-size: 1.125rem;
       color: var(--text-secondary);
       margin-bottom: 2.5rem;
-      max-width: 500px;
+      max-width: 520px;
       margin-left: auto;
       margin-right: auto;
     }
-
-    .cta-actions {
-      display: flex;
-      gap: 1rem;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
-
-    /* ── Footer ── */
-    footer {
-      border-top: 1px solid var(--border);
-      padding: 3rem 2rem;
-    }
-
-    footer .footer-inner {
-      max-width: 1200px;
-      margin: 0 auto;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    footer .footer-left {
-      font-size: 0.875rem;
-      color: var(--text-muted);
-    }
-
-    footer .footer-links {
-      display: flex;
-      gap: 1.5rem;
-      list-style: none;
-    }
-
-    footer .footer-links a {
-      color: var(--text-muted);
-      text-decoration: none;
-      font-size: 0.875rem;
-      transition: color 0.2s;
-    }
-
-    footer .footer-links a:hover { color: var(--text-secondary); }
 
     /* ── Beta Banner ── */
     .beta-banner {
@@ -738,11 +462,6 @@
 
     /* ── Responsive ── */
     @media (max-width: 768px) {
-      .stats-bar { grid-template-columns: repeat(2, 1fr); }
-      .feature-card.highlight {
-        grid-template-columns: 1fr;
-        gap: 1.5rem;
-      }
       .features-grid { grid-template-columns: 1fr; }
       nav { padding: 0 1rem; }
       nav .nav-inner {
@@ -769,7 +488,7 @@
         flex-direction: column;
         gap: 0;
         padding: 0.5rem 1rem 1rem;
-        background: rgba(10, 10, 15, 0.98);
+        background: rgba(5, 7, 12, 0.98);
         border-bottom: 1px solid var(--border);
         box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
       }
@@ -796,7 +515,6 @@
       .comparison-table { font-size: 0.8125rem; }
       .comparison-table th,
       .comparison-table td { padding: 0.75rem 0.75rem; }
-      footer .footer-inner { flex-direction: column; gap: 1rem; }
     }
   </style>
 
@@ -804,31 +522,28 @@
   .suite-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:1.5rem; margin-top:2.5rem; }
   .suite-card { background: var(--bg-card); border:1px solid var(--border); border-radius:18px; padding:2rem; text-decoration:none; transition:border-color .2s, transform .2s, background .2s; }
   .suite-card:hover { border-color:var(--accent); transform:translateY(-2px); background:var(--bg-card-hover); }
-  .suite-card.memory:hover { border-color:var(--accent-cool); }
   .kicker { color:var(--accent); font-size:.75rem; letter-spacing:.12em; font-weight:800; text-transform:uppercase; margin-bottom:.75rem; }
-  .memory .kicker, .cool { color:var(--accent-cool); }
+  .cool { color:var(--accent-cool); }
   .pill-row { display:flex; flex-wrap:wrap; gap:.5rem; margin:1.25rem 0; }
   .pill { border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-secondary); border-radius:999px; padding:.35rem .75rem; font-size:.8125rem; }
   .doc-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:1rem; margin-top:1.5rem; }
-  .doc-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:1.4rem; }
+  .doc-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:1.4rem; transition:border-color .2s; }
+  .doc-card:hover { border-color:var(--border-hover); }
   .doc-card h3 { margin-bottom:.5rem; }
   .doc-card p, .suite-card p { color:var(--text-secondary); }
+  .doc-card .tag { display:inline-block; font-family:var(--font-mono); font-size:.72rem; color:var(--accent-cool); margin-bottom:.5rem; letter-spacing:.04em; }
   .code-block { background:var(--code-bg); border:1px solid var(--border); border-radius:14px; padding:1.25rem; overflow:auto; margin:1rem 0; }
-  .code-block code, pre { font-family:var(--font-mono); font-size:.875rem; color:#d6d6e5; }
-  .note { border-left:3px solid var(--accent-cool); background:rgba(124,156,245,.08); padding:1rem 1.25rem; border-radius:0 12px 12px 0; color:var(--text-secondary); margin:1.5rem 0; }
+  .code-block code, pre { font-family:var(--font-mono); font-size:.875rem; color:#cfe0f5; }
+  .note { border-left:3px solid var(--accent-cool); background:rgba(126,231,255,.08); padding:1rem 1.25rem; border-radius:0 12px 12px 0; color:var(--text-secondary); margin:1.5rem 0; }
   .two-col { display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap:2rem; align-items:start; }
 
-  .screenshot-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:1rem; margin-top:1.5rem; }
-  .screenshot-card { background:var(--bg-card); border:1px solid var(--border); border-radius:16px; overflow:hidden; }
-  .screenshot-card img { display:block; width:100%; height:auto; border-bottom:1px solid var(--border); }
-  .screenshot-card div { padding:1rem 1.2rem; color:var(--text-secondary); }
   .reference-table-wrap { margin-top:1.5rem; border:1px solid var(--border); border-radius:16px; overflow:hidden; background:rgba(255,255,255,.02); }
   .reference-table { width:100%; border-collapse:collapse; font-size:.875rem; }
   .reference-table caption { text-align:left; padding:1rem 1.1rem; color:var(--text-secondary); border-bottom:1px solid var(--border); }
   .reference-table th { text-align:left; padding:.75rem 1rem; color:var(--text-muted); font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; background:rgba(255,255,255,.025); border-bottom:1px solid var(--border); }
   .reference-table td { padding:.8rem 1rem; color:var(--text-secondary); border-bottom:1px solid rgba(255,255,255,.055); vertical-align:top; }
   .reference-table tr:last-child td { border-bottom:0; }
-  .reference-table a { color:var(--text-primary); text-decoration:none; border-bottom:1px solid rgba(124,156,245,.35); }
+  .reference-table a { color:var(--text-primary); text-decoration:none; border-bottom:1px solid rgba(126,231,255,.35); }
   .reference-table a:hover { color:var(--accent-cool); border-bottom-color:var(--accent-cool); }
   .reference-table .ref-id { color:var(--accent-cool); font-family:var(--font-mono); white-space:nowrap; }
   .reference-table .ref-theme { color:var(--text-muted); white-space:nowrap; }
@@ -842,155 +557,142 @@
 <nav>
   <div class="nav-inner">
     <a href="/" class="logo" style="display:flex;align-items:center;gap:0.5rem;">
-      <img src="/favicon.svg" alt="Fe" width="28" height="28">
-      ferro<span>sa</span>
+      <img src="assets/brand/fm-logo.svg" alt="Fm" width="28" height="28" style="border-radius:7px;">
+      ferrosa <span>memory</span>
     </a>
     <ul class="nav-links" id="site-nav-links">
-      <li><a href="/database/">Database</a></li>
-      <li><a href="/ferrosa-memory/">Memory</a></li>
-      <li><a href="/ferrosa-memory/getting-started.html">Setup</a></li>
-      <li><a href="#examples">Examples</a></li>
+      <li><a href="./">Overview</a></li>
+      <li><a href="how-it-works.html">How it works</a></li>
+      <li><a href="tools.html">Tools</a></li>
+      <li><a href="compare.html">Compare</a></li>
+      <li><a href="getting-started.html">Setup</a></li>
+      <li><a href="../database/">Database</a></li>
       <li><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></li>
     </ul>
-    <a href="#get-started" class="nav-cta">Get Started</a>
+    <a href="how-it-works.html" class="nav-cta">How it works</a>
     <button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button>
   </div>
 </nav>
 
 <div class="beta-banner">
-  <span class="beta-tag">Developer Preview</span> Ferrosa Memory is a 0.15.0 preview for agentic long-context memory.
+  <span class="beta-tag">Developer Preview</span> Ferrosa Memory 0.15 — structured, linked, auditable memory for agentic systems.
 </div>
 <section class="hero">
-  <div class="hero-badge"><span class="dot"></span> Ferrosa Memory · Developer Preview</div>
-  <h1>Linked memory for <span class="gradient">long-running agents.</span></h1>
-  <p>Ferrosa Memory gives agents a developer-preview memory layer: context segments, documents, entities, temporal facts, graph edges, hybrid retrieval, feedback-aware reranking, Datalog-style derived facts, and operator UIs for query, judge configuration, and visualization.</p>
+  <img class="hero-logo" src="assets/brand/fm-logo.svg" alt="Ferrosa Memory logo">
+  <div class="hero-badge"><span class="dot"></span> Ferrosa Memory · 0.15 · Developer Preview</div>
+  <h1>Memory your agents can <span class="gradient">query, link, and trust.</span></h1>
+  <p>Ferrosa Memory is an MCP-native memory server for LLM agents. Instead of dumping text into a vector store, it keeps a typed entity graph, bi-temporal facts, raw context segments, and Datalog-derived knowledge — retrieved with hybrid search, consolidated automatically, and forgettable with a full audit trail.</p>
   <div class="hero-actions">
-    <a href="getting-started.html" class="btn-primary">Quickstart</a>
-    <a href="#workbench" class="btn-secondary">Explore the UI</a>
+    <a href="how-it-works.html" class="btn-primary">See how it works</a>
+    <a href="compare.html" class="btn-secondary">Compare alternatives</a>
   </div>
 </section>
+
 <section id="overview">
   <div class="section-label cool">Why it exists</div>
-  <h2>Agents need memory that is structured, explainable, and queryable.</h2>
+  <h2 class="section-title">Most "agent memory" is a vector store with a summary on top.</h2>
+  <p class="section-subtitle">That loses the things agents actually need: when a fact changed, how facts relate, why a memory exists, and how to safely remove it. Ferrosa Memory treats memory as structured, queryable data — not opaque text.</p>
   <div class="doc-grid">
-    <div class="doc-card"><h3>Temporal facts</h3><p>Record what changed over time instead of overwriting history. Current facts stay easy to retrieve, while superseded facts remain inspectable for audit and debugging.</p></div>
-    <div class="doc-card"><h3>Graph links</h3><p>Entities, folds, facts, skills, and tags are connected with typed edges so an agent can follow relationships rather than only search text.</p></div>
-    <div class="doc-card"><h3>Retrieval + context windows</h3><p>Hybrid retrieval uses lexical, vector, phonetic, graph, workspace, and recency signals, then can expand around raw context or document chunks to recover neighboring evidence.</p></div>
-    <div class="doc-card"><h3>Datalog-style materialization</h3><p>Rules can derive and explain higher-level facts from graph state, making memory behavior easier to inspect than opaque summaries alone.</p></div>
+    <div class="doc-card"><h3>Bi-temporal facts</h3><p>Record what changed over time instead of overwriting history. The current fact stays easy to retrieve, while superseded facts remain inspectable for audit, debugging, and time-travel queries.</p></div>
+    <div class="doc-card"><h3>Typed entity graph</h3><p>Entities, folds, facts, skills, and tags are connected with typed edges (<code>depends_on</code>, <code>contains</code>, <code>calls</code>, <code>references</code>…) so an agent can follow relationships, not just match text.</p></div>
+    <div class="doc-card"><h3>Hybrid retrieval</h3><p>Recall fuses lexical, vector, phonetic, graph, workspace, and recency signals with Reciprocal Rank Fusion, then expands around raw context or document chunks to recover neighboring evidence.</p></div>
+    <div class="doc-card"><h3>Explainable derivation</h3><p>Datalog-style rules derive and <em>explain</em> higher-level facts from graph state, so memory behavior can be inspected and audited instead of trusted blindly.</p></div>
+    <div class="doc-card"><h3>Auditable forgetting</h3><p>The 0.15 <code>forget</code> flow shows the blast radius before anything changes, then retracts reversibly (or hard-deletes) with an append-only journal. Memory you can remove is memory you can trust.</p></div>
+    <div class="doc-card"><h3>Durable, tiered storage</h3><p>Built on Ferrosa DB: CQL storage, HNSW vector indexes, a property graph, and S3-backed durability with hot/warm/cold tiering. Memory survives restarts and scales past one process.</p></div>
   </div>
 </section>
-<section id="release-notes">
-  <div class="section-label cool">0.13 preview highlights</div>
-  <h2>Long-recall work is now wired into the memory service.</h2>
-  <div class="doc-grid">
-    <div class="doc-card"><h3>Document retrieval plane</h3><p>Documents, sections, chunks, and adjacency links can be stored as typed memory so answers that span neighboring chunks can be traversed instead of relying on a single ranked hit.</p></div>
-    <div class="doc-card"><h3>Candidate fanout + fusion</h3><p>Hybrid search can gather candidates from exact/document IDs, BM25, semantic vectors, phonetic matches, workspace boosts, graph neighbors, and recent session context before fusion.</p></div>
-    <div class="doc-card"><h3>Task-aware decomposition</h3><p>BRIGHT-Pro-style queries can generate task-native subqueries and merge candidate pools before final ranking, improving the support-doc-closed eval slice.</p></div>
-    <div class="doc-card"><h3>Feedback learning loop</h3><p>Agents, users, and optional judge models can send compact item feedback. Abstentions are tracked separately, and future ranking can account for workspace-specific relevance.</p></div>
-  </div>
-  <div class="note">Best known 0.13 BRIGHT-Pro support-doc-closed MCP slice settings: retrieval_k=25, candidate_limit=50, fusion_profile=all, query_decomposition=llm, query_embed_variants=true, chunk_expansion=none, rerank=false. On the 200-document biology slice this measured alpha_nDCG 0.816, NDCG 0.799, aspect_recall 0.940, and recall 0.796.</div>
-</section>
-<section id="architecture">
-  <div class="section-label">Architecture</div>
-  <h2>A thin memory adapter over database, graph, and inference surfaces.</h2>
-  <div class="two-col">
-    <div>
-      <p style="color:var(--text-secondary);">Ferrosa Memory exposes an MCP-compatible memory service and an operator workbench. The memory layer owns memory semantics—entities, folds, facts, retrieval outcomes, intentions, skills, Datalog rules, explanations—while Ferrosa Database provides CQL storage, graph traversal, and query surfaces.</p>
-      <p style="color:var(--text-secondary);">The public contract is intentionally small: agents call tools to ingest, retrieve, link, and explain memory. Operators use the workbench and visualization UI to inspect what happened.</p>
-    </div>
-    <div class="code-block"><pre><code>Agent / IDE / runtime
-        │ MCP
+
+<section id="how" class="problem">
+  <section>
+    <div class="section-label cool">How it works</div>
+    <h2 class="section-title">A thin memory layer over database, graph, and inference.</h2>
+    <div class="two-col">
+      <div>
+        <p style="color:var(--text-secondary);">Agents talk to Ferrosa Memory through a small set of MCP tools — ingest, retrieve, link, explain, and forget. The memory layer owns memory <em>semantics</em>: entities, folds, temporal facts, retrieval outcomes, intentions, skills, Datalog rules, and explanations.</p>
+        <p style="color:var(--text-secondary); margin-top:1rem;">Underneath, Ferrosa Database provides CQL storage, vector indexes, graph traversal, and durable S3-backed tiering. A background "dream cycle" consolidates new memories — discovering connections, scoring importance, and decaying stale recall — while you sleep.</p>
+        <p style="margin-top:1.5rem;"><a href="how-it-works.html" class="btn-secondary">Read the full architecture →</a></p>
+      </div>
+      <div class="code-block"><pre><code>Agent / IDE / runtime
+        │ MCP tools
         ▼
 Ferrosa Memory service
-  ├─ memory tools + routing
-  ├─ temporal facts + folds
+  ├─ entities + typed graph
+  ├─ bi-temporal facts
+  ├─ context segments + folds
+  ├─ hybrid retrieval (RRF)
+  ├─ dream-cycle consolidation
   ├─ Datalog-derived facts
-  ├─ Workbench query UIs
-  └─ Viz graph surface
+  └─ auditable forget journal
         │
         ▼
-Ferrosa Database storage + graph</code></pre></div>
-  </div>
+Ferrosa Database
+  CQL · HNSW vectors · graph · S3 tiering</code></pre></div>
+    </div>
+  </section>
 </section>
-<section id="workbench">
-  <div class="section-label cool">Workbench and visualization</div>
-  <h2>Query memory directly, then inspect what was linked.</h2>
-  <div class="doc-grid">
-    <div class="doc-card"><h3>Workbench</h3><p>The browser workbench includes Home, Viz, CQL Explorer, SPARQL Explorer, Datalog Explorer, Judge Config, Aliases, Rules, Approvals, and Explanations.</p></div>
-    <div class="doc-card"><h3>Query APIs</h3><p>Use <code>/workbench/api/cql/query</code>, <code>/workbench/api/sparql/query</code>, and <code>/workbench/api/datalog/query</code> while evaluating storage, graph, and derived-memory behavior.</p></div>
-    <div class="doc-card"><h3>Visualization</h3><p>The viz surface is served separately from the main memory API. In local developer preview, it is available at <code>http://localhost:18766/viz</code>.</p></div>
+
+<section id="tools">
+  <div class="section-label cool">Tool catalog</div>
+  <h2 class="section-title">Two tiers: a focused default set, and the full toolbox.</h2>
+  <p class="section-subtitle">Agents see a focused <strong>Tier&nbsp;1</strong> set of everyday tools by default. The full <strong>Tier&nbsp;2</strong> surface — batch operations, folds, bi-temporal facts, memo &amp; plan tracking, skills, consolidation, and the Datalog governance plane — unlocks with <code>include_all</code> when an operator needs it.</p>
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="feature-icon steel">🧰</div>
+      <h3>Tier 1 — Everyday memory (21 tools)</h3>
+      <p>Ingest and recall: <code>smart_ingest</code>, <code>hybrid_search</code>, entity lookup, typed edges, chunk &amp; turn context, intention checks, the full session-task surface, feedback, stats, <code>configure</code>, and <code>forget</code>. Everything an agent reaches for in a normal session.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon cyan">⚙️</div>
+      <h3>Tier 2 — Advanced &amp; operator (58 tools)</h3>
+      <p>Batch ingest/edit, trajectory folds, bi-temporal facts, memo &amp; plans, the intention lifecycle, stored skills, dream-cycle consolidation &amp; graph inference, the Datalog expert system (rules, claims, approvals, explanations), and config/introspection.</p>
+    </div>
   </div>
-  <div class="screenshot-grid">
-    <a class="screenshot-card" href="/assets/screenshots/ferrosa-memory-viz.png">
-      <img src="/assets/screenshots/ferrosa-memory-viz.png" alt="Ferrosa Memory visualization graph screenshot">
-      <div><strong>Memory visualization.</strong> Inspect linked entities and edges in the local preview graph UI.</div>
-    </a>
-    <a class="screenshot-card" href="/assets/screenshots/ferrosa-operations-console.png">
-      <img src="/assets/screenshots/ferrosa-operations-console.png" alt="Ferrosa operations console screenshot">
-      <div><strong>Operations console.</strong> Check node status, metrics, and operational views from a running Ferrosa system.</div>
-    </a>
-  </div>
-  <div class="note">In shared deployments, keep the visualization surface operator-only. The preview docs assume loopback/local use unless you explicitly configure TLS, auth, and tenant mappings.</div>
+  <p style="margin-top:2rem;"><a href="tools.html" class="btn-secondary">Browse the full tool catalog by level →</a></p>
 </section>
-<section id="quickstart">
-  <div class="section-label">Quickstart</div>
-  <h2>Local developer preview configuration.</h2>
-  <p style="color:var(--text-secondary); max-width:780px;">For the shortest path, run the hosted memory setup script. It downloads the onboarding prompt, optionally clones or updates the public repositories, offers to pull <code>nomic-embed-text-v2-moe</code>, installs Hermes/Claude/Codex hooks when requested, and hands the user to an LLM harness. Minimal native mode can use local filesystem storage with no S3/MinIO; the full Compose mode adds a three-node cluster and MinIO for operator testing.</p>
-  <div class="code-block"><pre><code>curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 
-# Optional semantic/vector search layer:
-ollama pull nomic-embed-text-v2-moe
-
-# ferrosa-memory.toml — local preview shape
-[server]
-transport = "http"
-http_port = 18765
-
-[ferrosa]
-contact_points = ["127.0.0.1:19042"]
-keyspace = "agent_memory"
-
-[viz]
-enabled = true
-bind = "127.0.0.1:18766"
-
-[retrieval]
-default_limit = 10
-
-[embeddings]
-provider = "ollama"
-model = "nomic-embed-text-v2-moe"
-dimensions = 768
-
-[security]
-# For local preview only. Use TLS + auth mapping for shared deployment.
-require_tls = false</code></pre></div>
-  <div class="code-block"><pre><code># Local URLs
-MCP endpoint:      http://localhost:18765/mcp
-Workbench:         http://localhost:18765/
-Visualization:     http://localhost:18766/viz
-Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
+<section id="whats-new" class="comparison">
+  <section>
+    <div class="section-label cool">What's new in 0.15</div>
+    <h2 class="section-title">Recall you can trust, and memory you can remove.</h2>
+    <div class="doc-grid">
+      <div class="doc-card"><span class="tag">forget</span><h3>Auditable forgetting</h3><p>Propose candidates, see the blast radius (edges, temporal chains, derived facts), then confirm a reversible retraction or a hard delete — all recorded in an append-only forget journal with crash recovery.</p></div>
+      <div class="doc-card"><span class="tag">recall</span><h3>Recall-relevance hardening</h3><p>Source-aware relevance guards, lexical-overlap checks, authority/PageRank adjustments, and workspace filtering so hooks prefer silence over noisy context. Native full-text indexing speeds lexical recall.</p></div>
+      <div class="doc-card"><span class="tag">session</span><h3>Durable session tasks</h3><p>First-class task state — focus stack, working set, and recovery hints — survives restarts and supports multi-agent handoff, so an interrupted agent can resume where it left off.</p></div>
+      <div class="doc-card"><span class="tag">hooks</span><h3>Workspace-isolated hooks</h3><p>Session-start recall derives stable, workspace-specific sessions instead of leaking process-global state, and fallback recall stays semantic/procedural — never raw episodic transcript.</p></div>
+    </div>
+    <div class="note">0.15 is a developer-preview release. Run it locally or self-hosted; keep the workbench and visualization surfaces operator-only unless you configure TLS, auth, and tenant isolation.</div>
+  </section>
 </section>
-<section id="examples">
-  <div class="section-label cool">Examples</div>
-  <h2>What agents can do with Ferrosa Memory.</h2>
-  <div class="doc-grid">
-    <div class="doc-card"><h3>Remember evolving project state</h3><p>Record an entity once, then write temporal facts as status changes. Ask for the current fact or inspect the supersession chain.</p></div>
-    <div class="doc-card"><h3>Link context into a graph</h3><p>Ingest raw conversation segments, extract entities, add typed edges, then retrieve adjacent memories by graph traversal.</p></div>
-    <div class="doc-card"><h3>Explain derived facts</h3><p>Use Datalog rules and explanation endpoints to show why a derived memory exists instead of treating memory as uninspectable text.</p></div>
-    <div class="doc-card"><h3>Operate the system</h3><p>Use liveness/readiness probes, metrics, query explorers, and the visualization UI to check whether memory is being recorded and linked as expected.</p></div>
-  </div>
+
+<section id="compare">
+  <div class="section-label cool">How it compares</div>
+  <h2 class="section-title">Built for structure, not just similarity.</h2>
+  <p class="section-subtitle">Vector stores and most memory layers answer "what looks similar?" Ferrosa Memory also answers "what changed, what's connected, why does this exist, and can I safely remove it?"</p>
+  <table class="comparison-table">
+    <thead>
+      <tr>
+        <th>Capability</th>
+        <th class="ferrosa-col">Ferrosa Memory</th>
+        <th>Vector store + RAG</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Typed knowledge graph</td><td class="ferrosa-col">Yes</td><td>No — similarity only</td></tr>
+      <tr><td>Bi-temporal fact history</td><td class="ferrosa-col">Yes</td><td>Overwrite / append</td></tr>
+      <tr><td>Hybrid retrieval (lexical+vector+graph+recency)</td><td class="ferrosa-col">Yes — RRF over ~11 signals</td><td>Vector (± keyword)</td></tr>
+      <tr><td>Explainable derived facts</td><td class="ferrosa-col">Yes — Datalog</td><td>No</td></tr>
+      <tr><td>Auditable forgetting</td><td class="ferrosa-col">Yes — blast radius + journal</td><td>Manual delete</td></tr>
+      <tr><td>Automatic consolidation</td><td class="ferrosa-col">Yes — dream cycle</td><td>No</td></tr>
+      <tr><td>MCP-native tools</td><td class="ferrosa-col">Yes</td><td>Framework-dependent</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:2rem;"><a href="compare.html" class="btn-secondary">See the full comparison vs. Mem0, Zep, and Letta →</a></p>
 </section>
+
 <section id="research">
   <div class="section-label">Research foundation</div>
-  <h2>Inspired by memory systems, graph retrieval, compression, and logic.</h2>
-  <p style="color:var(--text-secondary); max-width:820px;">Ferrosa Memory is product engineering, not a paper implementation, but the design is informed by recent and classic work on agent memory, virtual context, retrieval, Datalog-style inference, and memory evaluation.</p>
-  <div class="doc-grid">
-    <div class="doc-card"><h3>Agent memory systems</h3><p>The local research corpus includes papers on very-long-term conversational memory, episodic memory, cross-domain user memory, and multi-session agent tasks. These motivate temporal facts, context windows, and explicit update history.</p></div>
-    <div class="doc-card"><h3>Graph retrieval</h3><p>Graph-recall and GraphRAG work motivate making links inspectable instead of relying only on vector similarity. Ferrosa Memory borrows these ideas; it is not a direct implementation of any one paper.</p></div>
-    <div class="doc-card"><h3>Compression and evaluation</h3><p>LLMLingua-family prompt compression, long-memory benchmarks, and memory-system surveys shape how retrieval, summarization, and memory quality should be evaluated during preview.</p></div>
-    <div class="doc-card"><h3>Logic and safety</h3><p>Datalog-style derived facts and neuro-symbolic rule-evaluation work inform explainable memory operations. Preview deployments should keep memory tooling local or explicitly protected with TLS, auth, tenant isolation, and operator review.</p></div>
-  </div>
+  <h2 class="section-title">Engineering informed by the memory literature.</h2>
+  <p class="section-subtitle">Ferrosa Memory is product engineering, not a paper implementation — but the design draws on recent and classic work on agent memory, virtual context, graph retrieval, prompt compression, Datalog-style inference, and memory evaluation.</p>
   <div class="reference-table-wrap">
     <table class="reference-table">
       <caption>Selected references from the local research corpus. Links point to canonical arXiv records.</caption>
@@ -1001,37 +703,35 @@ Viz snapshot API:  http://localhost:18766/viz/snapshot</code></pre></div>
         <tr><td><a href="https://arxiv.org/abs/2402.17753">LoCoMo: Evaluating Very Long-Term Conversational Memory of LLM Agents</a></td><td class="ref-id">2402.17753</td><td class="ref-theme">long-term conversational memory</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2410.10813">LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory</a></td><td class="ref-id">2410.10813</td><td class="ref-theme">memory evaluation</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2509.18868">Memory in Large Language Models: Mechanisms, Evaluation and Evolution</a></td><td class="ref-id">2509.18868</td><td class="ref-theme">memory taxonomy</td></tr>
-        <tr><td><a href="https://arxiv.org/abs/2603.25973">MemoryCD: Benchmarking Long-Context User Memory for Lifelong Cross-Domain Personalization</a></td><td class="ref-id">2603.25973</td><td class="ref-theme">cross-domain user memory</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2502.06975">Episodic Memory is the Missing Piece for Long-Term LLM Agents</a></td><td class="ref-id">2502.06975</td><td class="ref-theme">episodic memory</td></tr>
-        <tr><td><a href="https://arxiv.org/abs/2602.16313">Benchmarking Agent Memory in Interdependent Multi-Session Agentic Tasks</a></td><td class="ref-id">2602.16313</td><td class="ref-theme">multi-session agents</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2402.11821">Microstructures and Accuracy of Graph Recall by Large Language Models</a></td><td class="ref-id">2402.11821</td><td class="ref-theme">graph recall</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2404.16130">From Local to Global: A Graph RAG Approach to Query-Focused Summarization</a></td><td class="ref-id">2404.16130</td><td class="ref-theme">GraphRAG</td></tr>
-        <tr><td><a href="https://arxiv.org/abs/2310.05736">LLMLingua: Compressing Prompts for Accelerated Inference of Large Language Models</a></td><td class="ref-id">2310.05736</td><td class="ref-theme">prompt compression</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2310.06839">LongLLMLingua: Accelerating and Enhancing LLMs in Long Context Scenarios via Prompt Compression</a></td><td class="ref-id">2310.06839</td><td class="ref-theme">long-context compression</td></tr>
         <tr><td><a href="https://arxiv.org/abs/2402.04617">InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory</a></td><td class="ref-id">2402.04617</td><td class="ref-theme">context memory</td></tr>
-        <tr><td><a href="https://arxiv.org/abs/2604.28087">Towards Neuro-symbolic Causal Rule Synthesis, Verification, and Evaluation Grounded in Legal and Safety Principles</a></td><td class="ref-id">2604.28087</td><td class="ref-theme">rules + verification</td></tr>
-        <tr><td><a href="https://arxiv.org/abs/2605.04018">Rethinking Reasoning-Intensive Retrieval: Evaluating and Advancing Retrievers in Agentic Search Systems</a></td><td class="ref-id">2605.04018</td><td class="ref-theme">agentic retrieval</td></tr>
       </tbody>
     </table>
   </div>
 </section>
+
 <section id="get-started" class="cta-section">
-  <h2>Preview Ferrosa Memory with your agents.</h2>
-  <p>Start local, inspect memory in the workbench, and use the viz surface to check how context is becoming linked memory.</p>
+  <h2>Give your agents memory worth keeping.</h2>
+  <p>Start local, inspect memory in the workbench, and watch raw context become linked, durable, queryable memory.</p>
   <div class="hero-actions">
-    <a href="getting-started.html" class="btn-primary">Configure local preview</a>
-    <a href="../database/" class="btn-secondary">Use Ferrosa Database</a>
+    <a href="how-it-works.html" class="btn-primary">How it works</a>
+    <a href="getting-started.html" class="btn-secondary">Set up locally</a>
   </div>
 </section>
+
 <footer>
   <div style="max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; border-top: 1px solid var(--border); display:flex; justify-content:space-between; gap:2rem; flex-wrap:wrap; color:var(--text-muted);">
-    <div>Ferrosa Suite <span style="color:var(--accent);">0.15.0</span> · Developer preview</div>
+    <div>Ferrosa Memory <span style="color:var(--accent);">0.15</span> · Developer preview</div>
     <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+      <a href="./" style="color:var(--text-secondary); text-decoration:none;">Overview</a>
+      <a href="how-it-works.html" style="color:var(--text-secondary); text-decoration:none;">How it works</a>
+      <a href="tools.html" style="color:var(--text-secondary); text-decoration:none;">Tools</a>
+      <a href="compare.html" style="color:var(--text-secondary); text-decoration:none;">Compare</a>
+      <a href="getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Setup</a>
       <a href="../database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
-      <a href="./" style="color:var(--text-secondary); text-decoration:none;">Memory</a>
-      <a href="../database/getting-started.html" style="color:var(--text-secondary); text-decoration:none;">DB Docs</a>
-      <a href="getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Memory Setup</a>
-      <a href="#examples" style="color:var(--text-secondary); text-decoration:none;">Memory Examples</a>
     </div>
   </div>
 </footer>
