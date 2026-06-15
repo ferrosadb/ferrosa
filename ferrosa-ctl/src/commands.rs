@@ -1007,7 +1007,10 @@ mod tests {
         // Step 1: simulate a running node by creating a sled DB with
         // some log entries and meta keys.
         {
-            let db = sled::open(dir.path()).unwrap();
+            let db = ferrosa_cluster::raft::log_store::SledLogStore::open_sled_db_with_lock_retry(
+                dir.path(),
+            )
+            .unwrap();
             let log = db.open_tree("log").unwrap();
             let meta = db.open_tree("meta").unwrap();
             for i in 0u64..5 {
@@ -1022,7 +1025,10 @@ mod tests {
 
         // Step 3: reopen and confirm the trees are empty — the node will
         // rejoin as a fresh learner.
-        let db = sled::open(dir.path()).unwrap();
+        let db = ferrosa_cluster::raft::log_store::SledLogStore::open_sled_db_with_lock_retry(
+            dir.path(),
+        )
+        .unwrap();
         let log = db.open_tree("log").unwrap();
         let meta = db.open_tree("meta").unwrap();
         assert_eq!(log.len(), 0, "log must be empty after reset");
@@ -1035,7 +1041,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let db = sled::open(dir.path()).unwrap();
+            let db = ferrosa_cluster::raft::log_store::SledLogStore::open_sled_db_with_lock_retry(
+                dir.path(),
+            )
+            .unwrap();
             let log = db.open_tree("log").unwrap();
             for i in 0u64..3 {
                 log.insert(i.to_be_bytes(), b"entry".to_vec()).unwrap();
@@ -1046,7 +1055,10 @@ mod tests {
         super::raft_reset(dir.path(), true).expect("dry-run must succeed");
 
         // Assert nothing was cleared.
-        let db = sled::open(dir.path()).unwrap();
+        let db = ferrosa_cluster::raft::log_store::SledLogStore::open_sled_db_with_lock_retry(
+            dir.path(),
+        )
+        .unwrap();
         let log = db.open_tree("log").unwrap();
         assert_eq!(log.len(), 3, "dry-run must not mutate");
     }

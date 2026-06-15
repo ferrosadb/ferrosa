@@ -397,27 +397,30 @@ impl SledLogStore {
     /// far longer than the budget, so a real dual-open conflict still surfaces
     /// the error — only the transient is absorbed.
     pub fn new(path: &Path) -> Result<Self, sled::Error> {
-        Self::open_with_lock_retry(path)
-    }
-
-    /// Single-shot open with no lock-contention retry.
-    fn open_raw(path: &Path) -> Result<Self, sled::Error> {
-        let db = sled::open(path)?;
+        let db = Self::open_sled_db_with_lock_retry(path)?;
         let log = db.open_tree("log")?;
         let meta = db.open_tree("meta")?;
         Ok(Self { db, log, meta })
     }
 
-    /// Open `path`, retrying [`Self::open_raw`] through transient lock
-    /// contention with a bounded backoff (logged each attempt). Shared by the
-    /// online [`Self::new`] and the offline tooling [`Self::open_offline`].
-    fn open_with_lock_retry(path: &Path) -> Result<Self, sled::Error> {
+    /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
+    /// contention with a bounded backoff (≤ `MAX_ATTEMPTS` × `BACKOFF` ≈ 500 ms,
+    /// logged per attempt, classified by [`Self::is_lock_contention`]).
+    ///
+    /// The single transient-lock retry primitive: used by [`Self::new`] and the
+    /// offline tooling, and exposed (`pub`) for tools/tests that need the raw
+    /// `sled::Db` directly (manipulating trees) and would otherwise hit the same
+    /// `EWOULDBLOCK`/`EAGAIN` flake on a fresh dir under heavy parallel I/O. A
+    /// genuinely-held lock (a live node on this dir) outlasts the budget, so a
+    /// real dual-open conflict still surfaces the error — only the transient is
+    /// absorbed.
+    pub fn open_sled_db_with_lock_retry(path: &Path) -> Result<sled::Db, sled::Error> {
         const MAX_ATTEMPTS: u32 = 10;
         const BACKOFF: Duration = Duration::from_millis(50);
         let mut attempt: u32 = 1;
         loop {
-            match Self::open_raw(path) {
-                Ok(store) => return Ok(store),
+            match sled::open(path) {
+                Ok(db) => return Ok(db),
                 Err(err) if attempt < MAX_ATTEMPTS && Self::is_lock_contention(&err) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -438,7 +441,7 @@ impl SledLogStore {
     /// `truncate_from`). Same transient-lock retry as [`Self::new`]; kept as a
     /// named entry point for the offline tools.
     fn open_offline(path: &Path) -> Result<Self, sled::Error> {
-        Self::open_with_lock_retry(path)
+        Self::new(path)
     }
 
     /// True only for the transient "directory lock already held" condition,
@@ -1676,7 +1679,7 @@ mod tests {
         std::fs::write(&marker, b"kept with reset backup").unwrap();
 
         {
-            let db = sled::open(&original_path).unwrap();
+            let db = SledLogStore::open_sled_db_with_lock_retry(&original_path).unwrap();
             let log = db.open_tree("log").unwrap();
             log.insert(1u64.to_be_bytes(), b"entry".to_vec()).unwrap();
             db.flush().unwrap();
