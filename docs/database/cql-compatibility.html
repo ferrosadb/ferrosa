@@ -635,16 +635,16 @@
 
 <span class="cm">-- Query with fts_match() — boolean operators, phrase, prefix</span>
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
-  <span class="kw">WHERE</span> fts_match(body, <span class="str">'distributed AND database'</span>);
+  <span class="kw">WHERE</span> body = fts_match(<span class="str">'distributed AND database'</span>);
 
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
-  <span class="kw">WHERE</span> fts_match(body, <span class="str">'"S3 backed storage"'</span>);
+  <span class="kw">WHERE</span> body = fts_match(<span class="str">'"S3 backed storage"'</span>);
 
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
-  <span class="kw">WHERE</span> fts_match(body, <span class="str">'compac*'</span>);
+  <span class="kw">WHERE</span> body = fts_match(<span class="str">'compac*'</span>);
 
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> <span class="type">articles</span>
-  <span class="kw">WHERE</span> fts_match(body, <span class="str">'NOT deprecated'</span>);</pre>
+  <span class="kw">WHERE</span> body = fts_match(<span class="str">'NOT deprecated'</span>);</pre>
 
   <table>
     <thead><tr><th>Query syntax</th><th>Example</th><th>Description</th></tr></thead>

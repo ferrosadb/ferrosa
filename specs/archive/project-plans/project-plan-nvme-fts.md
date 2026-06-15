@@ -95,7 +95,7 @@
 |---|------|------|-----------------|-------|
 | FT2.1 | FTS query parser: term, phrase, AND, OR, NOT, prefix | M | `"rust AND \"S3 backed\""` parses to `And(Term("rust"), Phrase(["s3", "backed"]))` | `fts_query_parse_term`, `fts_query_parse_phrase`, `fts_query_parse_boolean`, `fts_query_boolean_precedence` |
 | FT2.2 | BM25 scoring | M | Given term freq + doc freq + doc length, produces correct score | `bm25_single_term`, `bm25_multi_term_ranking` |
-| FT2.3 | `fts_match()` CQL function wired to WHERE clause | L | `SELECT ... WHERE fts_match(col, 'query')` returns matching rows | `fts_match_simple_query`, `fts_match_boolean_query` |
+| FT2.3 | `fts_match()` CQL function wired to WHERE clause | L | `SELECT ... WHERE col = fts_match('query')` returns matching rows | `fts_match_simple_query`, `fts_match_boolean_query` |
 | FT2.4 | Wildcard expansion with cap (max 10000 terms) | S | `compac*` expands to matching terms; `*` returns error | `fts_wildcard_expansion_capped`, `fts_wildcard_bare_star_rejected` |
 | FT2.5 | Compaction merge: merge FTI sidecars | M | Two FTI files merged correctly; no duplicate postings | `fts_compaction_merge_deduplicates`, `fts_compaction_merge_preserves_scores` |
 | FT2.6 | S3 upload includes FTI sidecar | S | After flush + S3 sync, FTI file in object store | `fts_sidecar_uploaded_to_s3` |

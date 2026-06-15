@@ -1,6 +1,6 @@
 //! Full-text index (FTI) implementation.
 //!
-//! Provides an inverted-index pipeline for CQL `fts_match(column, query)` queries:
+//! Provides an inverted-index pipeline for CQL `column = fts_match(query)` queries:
 //!
 //! - [`analyzer`]: text analyzers (Standard, Simple, Keyword).
 //! - [`builder`]: FTI builder — ingests documents, serializes to bytes.

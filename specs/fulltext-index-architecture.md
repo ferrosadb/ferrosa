@@ -24,7 +24,7 @@ graph TD
     Flush["On flush: index memtable rows"]
     Compact["On compaction: merge inverted indexes"]
     Sidecar["Sidecar file: {gen}-FTI-{index_name}.db"]
-    Query["SELECT ... WHERE fts_match(col, 'query')"]
+    Query["SELECT ... WHERE col = fts_match('query')"]
     Reader["FullTextIndexReader"]
     Results["Ranked partition keys"]
 
@@ -62,13 +62,13 @@ graph TD
 
 ### ADR-FTS-03: Query via CQL function, not new syntax
 
-**Decision:** Full-text queries use a `fts_match(column, query)` function in WHERE clauses, not new CQL syntax like `MATCH` or `CONTAINS TEXT`.
+**Decision:** Full-text queries use a `column = fts_match(query)` predicate in WHERE clauses, not new CQL syntax like `MATCH` or `CONTAINS TEXT`.
 
 **Rationale:**
 - CQL function calls are already parsed by the ferrosa CQL parser
 - No grammar changes needed — functions are extensible
 - Cassandra compatibility: SASI uses `LIKE '%term%'`; we support that too
-- Advanced queries via `fts_match(col, 'term1 AND term2 OR "exact phrase"')` with mini query parser inside the function
+- Advanced queries via `col = fts_match('term1 AND term2 OR "exact phrase"')` with mini query parser inside the function
 
 ### ADR-FTS-04: BM25 ranking for relevance scoring
 
@@ -280,21 +280,21 @@ CREATE INDEX idx_body_fts ON articles (body)
     };
 
 -- Query using fts_match function
-SELECT * FROM articles WHERE fts_match(body, 'distributed database');
+SELECT * FROM articles WHERE body = fts_match('distributed database');
 
 -- Boolean query
-SELECT * FROM articles WHERE fts_match(body, 'rust AND cassandra');
+SELECT * FROM articles WHERE body = fts_match('rust AND cassandra');
 
 -- Phrase query
-SELECT * FROM articles WHERE fts_match(body, '"S3 backed storage"');
+SELECT * FROM articles WHERE body = fts_match('"S3 backed storage"');
 
 -- Prefix query
-SELECT * FROM articles WHERE fts_match(body, 'compac*');
+SELECT * FROM articles WHERE body = fts_match('compac*');
 
 -- Combined with regular WHERE clauses
 SELECT * FROM articles
     WHERE category = 'tech'
-    AND fts_match(body, 'distributed database')
+    AND body = fts_match('distributed database')
     ALLOW FILTERING;
 ```
 
