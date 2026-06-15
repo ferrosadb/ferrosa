@@ -1,6 +1,6 @@
 //! Full-text search query parsing.
 //!
-//! Parses a CQL `fts_match(column, query_string)` query string into an
+//! Parses a CQL `column = fts_match(query_string)` query string into an
 //! [`FtsQuery`] enum. The query language supports:
 //!
 //! - **Phrase queries**: `"hello world"` — match documents containing the exact phrase.

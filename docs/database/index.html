@@ -1161,7 +1161,7 @@
   <span class="kw">USING</span> <span class="str">'fulltext'</span>;
 
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> articles
-  <span class="kw">WHERE</span> fts_match(body, <span class="str">'distributed AND database'</span>);
+  <span class="kw">WHERE</span> body = fts_match(<span class="str">'distributed AND database'</span>);
 
 <span class="cm">-- Nearest neighbor query</span>
 <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> documents

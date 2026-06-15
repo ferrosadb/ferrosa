@@ -472,7 +472,7 @@ graph LR
 **File:** `ferrosa-cql/src/router.rs`
 
 **Implementation:**
-1. Detect `fts_match(column, query_string)` in WHERE clause
+1. Detect `column = fts_match(query_string)` in WHERE clause
 2. Look up FullText index on the column
 3. Parse query string via FTS query parser
 4. For each SSTable: open FTI sidecar reader, execute query, collect scored results
