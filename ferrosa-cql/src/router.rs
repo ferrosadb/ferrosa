@@ -247,7 +247,7 @@ fn squared_l2_distance(left: &[u32], right: &[u32]) -> Result<f32, CqlError> {
 }
 
 fn apply_ann_of_ordering(
-    rows: &mut [Vec<Option<CqlValue>>],
+    rows: &mut Vec<Vec<Option<CqlValue>>>,
     ann_col: &str,
     ann_query: &Term,
     all_col_names: &[String],
@@ -263,14 +263,16 @@ fn apply_ann_of_ordering(
     let query_bits = vector_bits_from_term(ann_query, target_type)?;
 
     let mut keyed_rows = Vec::with_capacity(rows.len());
-    for (ordinal, row) in rows.iter().cloned().enumerate() {
+    for (ordinal, row) in rows.drain(..).enumerate() {
         let value = row
             .get(col_idx)
             .ok_or_else(|| CqlError::Invalid(format!("missing ANN OF column {ann_col} in row")))?;
+        // A row whose ANN column is NULL or non-vector simply has no embedding
+        // to score against, so it cannot participate in a similarity search.
+        // Skip it rather than failing the whole query — one un-embedded row must
+        // not poison ANN for every embedded row in the table.
         let Some(CqlValue::Vector(row_bits)) = value else {
-            return Err(CqlError::Invalid(format!(
-                "ANN OF column {ann_col} must contain vector values"
-            )));
+            continue;
         };
         let distance = squared_l2_distance(row_bits, &query_bits)?;
         keyed_rows.push((distance, ordinal, row));
@@ -284,9 +286,9 @@ fn apply_ann_of_ordering(
         },
     );
 
-    for (slot, (_, _, row)) in rows.iter_mut().zip(keyed_rows) {
-        *slot = row;
-    }
+    // Rebuild from the (filtered, ranked) rows — the result excludes any skipped
+    // un-embedded rows, so the cardinality may shrink.
+    *rows = keyed_rows.into_iter().map(|(_, _, row)| row).collect();
     Ok(())
 }
 
@@ -20386,6 +20388,71 @@ mod tests {
 
         assert_eq!(rows[0][1], Some(CqlValue::Int(2)));
         assert_eq!(rows[1][1], Some(CqlValue::Int(1)));
+    }
+
+    #[test]
+    fn ann_of_ordering_skips_null_vector_rows() {
+        // A single un-embedded (NULL vector) row must NOT poison ANN for the
+        // whole result set — the embedded rows are still ranked and returned.
+        let all_col_names = vec!["tenant".to_string(), "id".to_string(), "vec".to_string()];
+        let all_col_types = vec![
+            CqlType::Varchar,
+            CqlType::Int,
+            CqlType::Vector(Box::new(CqlType::Float), 3),
+        ];
+        let query = Term::BlobLiteral(
+            [1.0_f32, 0.0, 0.0]
+                .into_iter()
+                .flat_map(f32::to_be_bytes)
+                .collect(),
+        );
+        let mut rows = vec![
+            // embedded, far from the query
+            vec![
+                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Vector(vec![
+                    0.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                ])),
+            ],
+            // un-embedded: NULL vector — must be skipped, not error
+            vec![
+                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Int(99)),
+                None,
+            ],
+            // embedded, nearest to the query
+            vec![
+                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Int(2)),
+                Some(CqlValue::Vector(vec![
+                    1.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                ])),
+            ],
+        ];
+
+        apply_ann_of_ordering(&mut rows, "vec", &query, &all_col_names, &all_col_types)
+            .expect("a NULL-vector row must be skipped, not fail the whole query");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the un-embedded NULL-vector row must be excluded from ANN results"
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::Int(2)),
+            "nearest embedded row first"
+        );
+        assert_eq!(rows[1][1], Some(CqlValue::Int(1)));
+        assert!(
+            !rows.iter().any(|r| r[1] == Some(CqlValue::Int(99))),
+            "the un-embedded row must not appear in the ranked results"
+        );
     }
 
     #[test]
