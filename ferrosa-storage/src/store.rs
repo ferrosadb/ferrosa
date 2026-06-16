@@ -1420,6 +1420,21 @@ impl<F: FlushTarget> TableStore<F> {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    // A mid-read error after a SUCCESSFUL open is the residual
+                    // read-vs-compaction window: the descriptor came from a view
+                    // snapshot that a concurrent compaction has since swapped out,
+                    // and `evict_local_input_sstable_files` deleted this input's
+                    // `Data.db` *between* our open (cached reader) and our seek —
+                    // so the index/bloom said "present" but the partition fetch
+                    // hits `ENOENT`. The merged output in the NEW view holds the
+                    // row, so this must drive the same view-retry as an open
+                    // failure rather than silently dropping the key (`Ok(None)` =
+                    // data loss). Marking `sstable_open_failed` engages
+                    // `with_retried_view`: a transient compaction window resolves
+                    // on retry against the fresh view; a genuinely corrupt SSTable
+                    // re-errors across all retries and surfaces loudly via
+                    // `view_retry_exhausted` (never silently masked).
+                    sstable_open_failed = true;
                     // Detailed diagnostic for truncated SSTable investigation.
                     let id_info = guard
                         .sstable_ids
@@ -1433,7 +1448,9 @@ impl<F: FlushTarget> TableStore<F> {
                         data_file_len = data_len,
                         sstable_count = guard.sstables.len(),
                         key = ?key.key.as_bytes(),
-                        "SSTable read error: skipping corrupt partition — data may be incomplete"
+                        "SSTable read error after successful open: retrying against a fresh \
+                         view (likely compaction deleted this input mid-read); data may be \
+                         incomplete only if the error persists across all retries"
                     );
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1549,6 +1566,13 @@ impl<F: FlushTarget> TableStore<F> {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    // Mid-read error after a successful open: same residual
+                    // read-vs-compaction window as the partition-read path —
+                    // a concurrent compaction deleted this input's `Data.db`
+                    // between our (cached) open and the row seek, so the row
+                    // lives in the merged SSTable of the NEW view. Drive the
+                    // view-retry instead of silently dropping the row.
+                    sstable_open_failed = true;
                     let id_info = guard
                         .sstable_ids
                         .get(i)
@@ -1559,7 +1583,8 @@ impl<F: FlushTarget> TableStore<F> {
                         %id_info,
                         key = ?key.key.as_bytes(),
                         clustering = ?clustering,
-                        "SSTable exact clustering read error: skipping corrupt source — data may be incomplete"
+                        "SSTable exact clustering read error after successful open: retrying \
+                         against a fresh view (likely compaction deleted this input mid-read)"
                     );
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5568,6 +5593,65 @@ mod tests {
                 || err.to_string().contains("unexpected EOF")
                 || err.to_string().contains("UnexpectedEof"),
             "error should identify the SSTable read failure, got: {err}"
+        );
+    }
+
+    /// Regression for the residual read-vs-compaction data-loss window
+    /// (fix/read-compaction-residual-window): when a point read opens an SSTable
+    /// successfully and its bloom says the key IS present, but the partition
+    /// fetch returns `Err` (the input's `Data.db` was deleted by a concurrent
+    /// compaction *after* the cached reader opened and *before* the seek), the
+    /// read must signal `stale_view_failed = true` so `with_retried_view` retries
+    /// against the freshly-merged view — NOT swallow the error and return a
+    /// spurious `Ok(None)` (silent data loss). Before the fix the mid-read `Err`
+    /// arm of `read_with_view` left `sstable_open_failed = false`, so no retry
+    /// fired and the committed key vanished.
+    #[test]
+    fn mid_read_fetch_error_signals_view_retry() {
+        let store = test_store();
+        let schema = test_schema();
+        let key = make_key("k-residual");
+
+        // An SSTable that holds `key` (bloom + index present) but whose Data.db
+        // is truncated, so the partition fetch errors during the data seek —
+        // modelling a file deleted out from under a still-cached reader.
+        let truncated = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("k-residual", b"v", 1000)],
+            Some(8),
+        ));
+        assert!(
+            truncated.may_contain_key(&key),
+            "bloom must say the key is present — that is what makes the silent-loss window dangerous"
+        );
+
+        let current = store.view.load_full();
+        let desc = SstableDescriptor::from_reader(
+            "truncated".to_string(),
+            std::path::PathBuf::new(),
+            &truncated,
+        );
+        store.seed_reader(&desc, truncated);
+        store.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(vec![desc.clone()]),
+            sstable_ids: Arc::new(vec![("truncated".to_string(), std::path::PathBuf::new())]),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(vec![Arc::new(HashMap::new())]),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+
+        let view = store.view.load_full();
+        let (result, stale_view_failed) = store.read_with_view(&view, &key, 0).unwrap();
+        assert!(
+            result.is_none(),
+            "the truncated source yields no rows on this single view snapshot"
+        );
+        assert!(
+            stale_view_failed,
+            "a mid-read fetch error on a bloom-matching SSTable must request a view retry, \
+             not be swallowed into a silent Ok(None)"
         );
     }
 
