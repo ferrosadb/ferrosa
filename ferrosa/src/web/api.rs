@@ -65,6 +65,10 @@ pub async fn get_metrics(
     let mut body = ferrosa_cql::prometheus::render_metrics(&registry);
     // Automatic-repair scheduler counters (ferrosa_auto_repair_*).
     body.push_str(&ferrosa_cluster::repair::scheduler::render_prometheus());
+    // Quarantine → anti-entropy refill counters (ferrosa_anti_entropy_refills_*).
+    // anti_entropy_refills_no_source_total being non-zero means quarantined data
+    // is awaiting the periodic repair backstop and should alert (FMEA #10).
+    body.push_str(&ferrosa_cluster::repair::trigger::render_prometheus());
     (
         StatusCode::OK,
         [(
