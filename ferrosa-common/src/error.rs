@@ -29,6 +29,24 @@ pub enum Error {
     UnsupportedVersion(String),
     /// Compression algorithm not supported.
     UnsupportedCompression(String),
+    /// A read could not be resolved because a snapshotted SSTable was
+    /// genuinely corrupt (the view-retry bound was exhausted with the file
+    /// still failing) and no healthy local source held the key.
+    ///
+    /// This is a *typed* signal — never string-matched — so the read
+    /// coordinator can (a) treat the local replica as failed and fail over to
+    /// another replica, and (b) target anti-entropy repair at the corrupt
+    /// SSTable's covered token range. The corrupt SSTable has already been
+    /// quarantined by the storage layer when this error is raised.
+    CorruptSstable {
+        /// Stable generation ID of the corrupt SSTable (file-name / pool key).
+        gen: String,
+        /// Smallest partition token the corrupt SSTable covered — the lower
+        /// bound of the range repair must refill from a healthy replica.
+        min_token: i64,
+        /// Largest partition token the corrupt SSTable covered.
+        max_token: i64,
+    },
 }
 
 impl Error {
@@ -42,6 +60,31 @@ impl Error {
                     || msg.contains(": overloaded:")
             }
             _ => false,
+        }
+    }
+
+    /// Construct a [`Error::CorruptSstable`] from the corrupt SSTable's
+    /// generation and covered token range.
+    pub fn corrupt_sstable(gen: impl Into<String>, min_token: i64, max_token: i64) -> Self {
+        Error::CorruptSstable {
+            gen: gen.into(),
+            min_token,
+            max_token,
+        }
+    }
+
+    /// When this error is a [`Error::CorruptSstable`], return the corrupt
+    /// SSTable's covered token range `(min_token, max_token)` so the caller can
+    /// target anti-entropy repair at exactly that range. `None` for every other
+    /// error variant — the typed alternative to matching on a message string.
+    pub fn corrupt_sstable_range(&self) -> Option<(i64, i64)> {
+        match self {
+            Error::CorruptSstable {
+                min_token,
+                max_token,
+                ..
+            } => Some((*min_token, *max_token)),
+            _ => None,
         }
     }
 }
@@ -60,6 +103,16 @@ impl fmt::Display for Error {
             }
             Error::UnsupportedVersion(v) => write!(f, "unsupported version: {v}"),
             Error::UnsupportedCompression(c) => write!(f, "unsupported compression: {c}"),
+            Error::CorruptSstable {
+                gen,
+                min_token,
+                max_token,
+            } => write!(
+                f,
+                "corrupt SSTable made the read unresolvable [gen={gen} \
+                 tokens=[{min_token},{max_token}]]; quarantined and scheduled \
+                 for anti-entropy repair"
+            ),
         }
     }
 }
