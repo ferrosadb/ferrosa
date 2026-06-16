@@ -430,6 +430,19 @@ fn global_fd_cache() -> std::sync::Arc<FdCache> {
     }))
 }
 
+/// Drop the cached descriptor for `path` from the process-global `Data.db` fd
+/// cache, if present. Test-only.
+///
+/// An open fd survives `unlink` on Unix, so a still-cached descriptor would let
+/// a positional read succeed even after the file is deleted. The residual
+/// read-vs-compaction race test must model a read whose `Data.db` was deleted
+/// *and* whose fd has been evicted, so the next `read_at` re-opens by path and
+/// observes `ENOENT` — exactly the mid-read error the fix recovers from.
+#[doc(hidden)]
+pub fn evict_global_fd_for_test(path: impl AsRef<Path>) {
+    global_fd_cache().invalidate(path.as_ref());
+}
+
 fn should_mmap_component(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
