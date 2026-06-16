@@ -212,6 +212,20 @@ impl<K: Eq + Hash + Clone, V> ReaderPool<K, V> {
             .expect("reader pool mutex poisoned")
             .contains_key(key)
     }
+
+    /// Return the cached `Arc<V>` for `key` without opening on a miss and
+    /// without perturbing recency. Test-only: the read-vs-compaction race tests
+    /// grab a still-cached input reader before a swap evicts it, so they can
+    /// re-seed it afterwards to model a *cache-hit-then-deleted-file* mid-read
+    /// (the residual window), distinct from a cache-miss reopen failure.
+    #[cfg(test)]
+    pub fn peek_arc(&self, key: &K) -> Option<Arc<V>> {
+        self.inner
+            .lock()
+            .expect("reader pool mutex poisoned")
+            .get(key)
+            .map(|entry| Arc::clone(&entry.value))
+    }
 }
 
 #[cfg(test)]

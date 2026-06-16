@@ -6908,6 +6908,43 @@ impl StorageEngine {
         self.reader_pool.remove(&(table_id.to_string(), gen));
     }
 
+    /// Grab the currently-cached reader `Arc` for `(table_id, gen)` without
+    /// reopening or perturbing recency. Returns `None` if not resident.
+    ///
+    /// Used by the residual read-vs-compaction race test to capture an input
+    /// SSTable's pooled reader *before* a compaction swap evicts it, so the
+    /// same `Arc` can be re-seeded afterwards — modelling the window where
+    /// `open_reader` is a cache HIT (open succeeds, in-memory bloom matches) but
+    /// the data seek hits an already-deleted `Data.db` (`ENOENT` mid-read).
+    #[cfg(test)]
+    pub(crate) fn pooled_reader_arc_for_test(
+        &self,
+        table_id: &TableId,
+        gen: u64,
+    ) -> Option<
+        std::sync::Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>>,
+    > {
+        self.reader_pool.peek_arc(&(table_id.to_string(), gen))
+    }
+
+    /// Re-insert an already-open reader `Arc` for `(table_id, gen)` into the
+    /// pool, replacing any existing entry. Pairs with
+    /// [`Self::pooled_reader_arc_for_test`] to restore a cache HIT for an input
+    /// generation that a compaction swap evicted, so the next read takes the
+    /// cache-hit path against a now-deleted `Data.db`.
+    #[cfg(test)]
+    pub(crate) fn reseed_pooled_reader_for_test(
+        &self,
+        table_id: &TableId,
+        gen: u64,
+        reader: std::sync::Arc<
+            ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>,
+        >,
+    ) {
+        self.reader_pool
+            .insert_arc((table_id.to_string(), gen), reader);
+    }
+
     /// Returns the count of SSTable read errors for a table.
     pub fn sstable_read_errors(&self, table_id: &TableId) -> u64 {
         self.tables
@@ -12477,6 +12514,139 @@ mod tests {
         assert!(
             got.is_some(),
             "t2 must remain readable across a concurrent compaction that deleted its SSTable"
+        );
+    }
+
+    /// Residual window — the *cache-hit-then-mid-read-ENOENT* path that the
+    /// open-failure tests above do NOT exercise.
+    ///
+    /// `read_during_compaction_retries_against_new_view` deletes gen2 and lets
+    /// the resumed read REOPEN it, so `open_reader` returns `Err` (cache miss on
+    /// a deleted file) and the existing open-failure retry fires. The residual
+    /// race is subtler: the gen2 reader is still POOLED (a flush seeded it), so
+    /// `open_reader` is a cache HIT — open succeeds and the in-memory bloom says
+    /// the key is present — but `evict_local_input_sstable_files` already deleted
+    /// gen2's `Data.db`, so the *data seek* inside `get_partition_limited_rows`
+    /// re-opens the path and hits `ENOENT` MID-READ. Before the fix that `Err`
+    /// arm of `read_with_view` left `sstable_open_failed = false`, so no view
+    /// retry fired and the committed key vanished as a spurious `Ok(None)` —
+    /// silent data loss of a row that lives in the freshly-merged SSTable.
+    ///
+    /// This test reproduces that exact ordering deterministically with the
+    /// `ReadViewBarrier` hook: the read snapshots the pre-swap view (gen2), pauses
+    /// at the barrier while the compaction swap completes (merged output holds
+    /// t2; gen2 `Data.db` deleted), and we then (a) re-seed gen2's still-open
+    /// reader into the pool so the resumed `open_reader` is a cache HIT, and
+    /// (b) evict gen2's `Data.db` fd so the seek must re-open the deleted path.
+    /// On release the read takes open=ok → bloom=present → seek=ENOENT, which the
+    /// fix turns into a view retry that finds t2 in the merged SSTable.
+    ///
+    /// Non-vacuous: WITHOUT the fix the mid-read `Err` is swallowed and the read
+    /// returns `Ok(None)`, failing the `is_some()` assertion.
+    #[tokio::test]
+    async fn read_cache_hit_mid_read_delete_retries_against_new_view() {
+        use crate::store::read_race_test_hook::{ReadViewBarrier, ARMED};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // t1 -> gen1, t2 -> gen2. t2 lives ONLY in gen2 (no survivor SSTable).
+        // Each flush SEEDS the gen's reader into the pool, so a later read of t2
+        // is a cache hit that consults gen2's in-memory bloom.
+        engine
+            .write(&tid, &make_key("t1"), make_row(b"v1", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("t2"), make_row(b"v2", 2000), 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+
+        // Identify gen2 (newest) and grab its still-pooled reader `Arc`. Holding
+        // this `Arc` keeps the reader (and its in-memory bloom) alive across the
+        // swap's pool eviction, so we can re-seed it as a cache hit afterwards.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let gen2 = *StorageEngine::list_generations_in_dir(&table_dir)
+            .iter()
+            .max()
+            .expect("gen2 must exist");
+        let gen2_reader = engine
+            .pooled_reader_arc_for_test(&tid, gen2)
+            .expect("gen2 reader must be pooled after flush (cache-hit precondition)");
+        let gen2_data_db =
+            StorageEngine::generation_component_path_for_test(&table_dir, gen2, "Data.db")
+                .expect("gen2 Data.db path must resolve");
+
+        // Submit a compaction merging gen1+gen2; control when the swap applies.
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs: metadata,
+                output_dir: dir.path().join("compaction"),
+                schema: test_schema(),
+                table_id: tid.clone(),
+            };
+            engine.compaction_executor.submit(task).unwrap();
+        }
+
+        // Reader thread: arm it so its read pauses right after snapshotting the
+        // still-unswapped view (referencing gen2).
+        let barrier = ReadViewBarrier::new();
+        let b_reader = Arc::clone(&barrier);
+        let eng = Arc::clone(&engine);
+        let rtid = tid.clone();
+        let reader = std::thread::spawn(move || {
+            ARMED.with(|c| *c.borrow_mut() = Some(b_reader));
+            eng.read(&rtid, &make_key("t2"))
+                .expect("read must not error")
+        });
+
+        // With the read holding the old view, drive the swap to completion:
+        // poll_compactions publishes the merged output and deletes gen2's files.
+        barrier.wait_reached();
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            swapped,
+            "compaction swap should merge the two inputs into one (background merge never completed)"
+        );
+        assert!(
+            !gen2_data_db.exists(),
+            "the swap must have deleted gen2's Data.db (that is the mid-read ENOENT trigger)"
+        );
+
+        // Re-establish the cache-HIT precondition the swap just tore down: put
+        // gen2's still-open reader back in the pool so the resumed `open_reader`
+        // succeeds and its in-memory bloom reports t2 present...
+        engine.reseed_pooled_reader_for_test(&tid, gen2, Arc::clone(&gen2_reader));
+        // ...and evict gen2's Data.db descriptor so the data seek re-opens the
+        // (now-deleted) path and observes ENOENT instead of reading through a
+        // lingering unlinked fd.
+        ferrosa_sstable::io::evict_global_fd_for_test(&gen2_data_db);
+
+        barrier.release();
+        let got = reader.join().unwrap();
+        assert!(
+            got.is_some(),
+            "t2 must remain readable when a pooled (cache-hit) gen2 reader's Data.db was \
+             deleted mid-read by a concurrent compaction — the mid-read ENOENT must drive a \
+             view retry to the merged SSTable, never a spurious Ok(None) (silent data loss)"
         );
     }
 
