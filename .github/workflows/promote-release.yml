@@ -1,62 +1,88 @@
 name: Promote Release to Stable
 
-# Blesses an existing (nightly/prerelease) release as the stable channel:
-# marks it --latest and clears the prerelease flag. This is the only path by
-# which a release leaves the "nightly" channel and becomes "stable".
-#
-# Releases are cut nightly as prereleases (see nightly-release.yml +
-# release.yml). When a build has been validated, promote its tag here.
+# Promotes a CalVer nightly (vYYYY.MM.DD.HHMM, a prerelease) to a stable SemVer
+# release (vX.Y.Z). Because nightly and stable are now SEPARATE tags, promotion
+# is a recut, not a flag flip: we check out the nightly's commit, compute the
+# next stable SemVer from Conventional Commit history, tag it, and rebuild so
+# the stable artifacts carry a clean SemVer (the nightly binaries report
+# `X.Y.Z-nightly`). release.yml publishes it as `--latest`, not prerelease.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to promote to stable (e.g. v0.14.0)'
+        description: 'Nightly tag to promote (CalVer, e.g. v2026.06.16.0817)'
         required: true
         type: string
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: promote-release-${{ github.repository }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   promote:
-    name: Mark ${{ github.event.inputs.tag }} as stable
+    name: Promote ${{ github.event.inputs.tag }} -> stable SemVer
     runs-on: ubuntu-latest
     steps:
-      - name: Promote tag to stable
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Validate nightly tag and compute stable SemVer
+        id: calc
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.event.inputs.tag }}
         run: |
-          # Fail loudly if the tag has no release to promote.
+          # The nightly must exist as a release.
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "error: no release found for tag ${TAG} in ${REPO}" >&2
             exit 1
           fi
-          gh release edit "$TAG" --repo "$REPO" \
-            --draft=false --prerelease=false --latest
-          echo "Promoted ${TAG} to stable (latest, not prerelease)."
-
-      - name: Notify Homebrew tap to resync formulae
-        env:
-          # Fine-grained PAT (or classic repo-scoped token) with contents:write
-          # on ferrosadb/homebrew-tap. GITHUB_TOKEN cannot dispatch cross-repo.
-          # Absent token => skip (the tap's hourly cron still picks it up).
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set; skipping tap notify (hourly cron will sync)."
-            exit 0
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "error: tag ${TAG} not found in this checkout" >&2
+            exit 1
           fi
-          curl -fsSL -X POST \
-            -H "Authorization: Bearer ${TAP_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/ferrosadb/homebrew-tap/dispatches \
-            -d '{"event_type":"release-promoted"}'
-          echo "Dispatched release-promoted to ferrosadb/homebrew-tap."
+          # Compute the next stable SemVer relative to the nightly's COMMIT, so
+          # the bump reflects exactly what this nightly contains. Detach there
+          # first; the script only counts commits up to HEAD.
+          git checkout -q "refs/tags/${TAG}"
+          # force=true: a promotion is intentional even if the script's
+          # commits-since-stable guard would otherwise skip.
+          bash .github/scripts/next-release-version.sh auto true
+
+      - name: Create stable commit and SemVer tag
+        env:
+          NEXT_VERSION: ${{ steps.calc.outputs.next_version }}
+          NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # We are detached at the nightly commit. Set a clean SemVer version and
+          # capture it on the new tag (not pushed to main, same as nightly cuts).
+          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${NEXT_VERSION}"'"/s' Cargo.toml
+          cargo update -w
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${NEXT_TAG} (promoted from nightly ${TAG})"
+          git tag -a "${NEXT_TAG}" \
+            -m "${NEXT_TAG} stable" \
+            -m "Promoted from nightly ${TAG}."
+          git push origin "${NEXT_TAG}"
+
+      - name: Dispatch stable release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
+        # prerelease=false => release.yml marks it --latest (the stable channel).
+        run: gh workflow run release.yml --ref "${NEXT_TAG}" -f prerelease=false

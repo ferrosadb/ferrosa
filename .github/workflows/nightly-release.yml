@@ -79,42 +79,55 @@ jobs:
         env:
           VERSION: ${{ steps.next.outputs.next_version }}
         run: |
-          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${VERSION}"'"/s' Cargo.toml
+          # Nightlies carry a `-nightly` SemVer pre-release on the computed next
+          # version (e.g. 0.22.0-nightly). The release TAG is CalVer (see below);
+          # the binary's --version reports this informative base. Promotion to
+          # stable recuts a clean SemVer (see promote-release.yml).
+          NIGHTLY_VERSION="${VERSION}-nightly"
+          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${NIGHTLY_VERSION}"'"/s' Cargo.toml
           cargo update -w
           git diff -- Cargo.toml Cargo.lock
 
-      - name: Create release commit and tag
+      - name: Create release commit and CalVer tag
         if: steps.next.outputs.should_release == 'true'
         env:
           NEXT_VERSION: ${{ steps.next.outputs.next_version }}
-          NEXT_TAG: ${{ steps.next.outputs.next_tag }}
           BASE_TAG: ${{ steps.next.outputs.base_tag }}
           BUMP: ${{ steps.next.outputs.bump }}
           COMMIT_COUNT: ${{ steps.next.outputs.commit_count }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Nightly tags are CalVer (vYYYY.MM.DD.HHMM, UTC) so they are visually
+          # distinct from stable SemVer (vX.Y.Z) in the releases list. The
+          # version math (next-release-version.sh) ignores 4-segment CalVer tags,
+          # so nightlies never pollute the stable base.
+          NIGHTLY_TAG="v$(date -u +%Y.%m.%d.%H%M)"
+          if git rev-parse -q --verify "refs/tags/${NIGHTLY_TAG}" >/dev/null; then
+            echo "error: nightly tag ${NIGHTLY_TAG} already exists (two cuts in the same UTC minute); rerun shortly" >&2
+            exit 1
+          fi
+          echo "NIGHTLY_TAG=${NIGHTLY_TAG}" >> "$GITHUB_ENV"
           git add Cargo.toml Cargo.lock
           # The release commit carries the version bump and is captured by the
           # tag. We intentionally do NOT push it to the default branch: the
           # `main` ruleset requires pull requests, so a direct branch push is
           # rejected (GH013). The tag is the release artifact source; main's
           # Cargo.toml version is decorative between releases.
-          git commit -m "chore(release): ${NEXT_TAG}"
-          git tag -a "${NEXT_TAG}" \
-            -m "${NEXT_TAG} (${GITHUB_EVENT_NAME} release)" \
-            -m "${BUMP} bump from ${BASE_TAG} after ${COMMIT_COUNT} commits."
+          git commit -m "chore(nightly): ${NIGHTLY_TAG} (${NEXT_VERSION}-nightly)"
+          git tag -a "${NIGHTLY_TAG}" \
+            -m "${NIGHTLY_TAG} nightly (${GITHUB_EVENT_NAME})" \
+            -m "${BUMP} bump target ${NEXT_VERSION} from ${BASE_TAG} after ${COMMIT_COUNT} commits."
           # Push the tag only (the branch ruleset does not cover refs/tags/*).
-          git push origin "${NEXT_TAG}"
+          git push origin "${NIGHTLY_TAG}"
 
       - name: Dispatch release build
         if: steps.next.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          NEXT_TAG: ${{ steps.next.outputs.next_tag }}
         # Explicit dispatch is required: tags pushed with GITHUB_TOKEN do NOT
         # trigger release.yml's `on: push` (GitHub's recursion guard). Every
         # auto-cut release — whether from a merge, the nightly cron, or a manual
         # dispatch — is a prerelease (the "nightly" channel); a maintainer
         # promotes it to stable via promote-release.yml.
-        run: gh workflow run release.yml --ref "${NEXT_TAG}" -f prerelease=true
+        run: gh workflow run release.yml --ref "${NIGHTLY_TAG}" -f prerelease=true
