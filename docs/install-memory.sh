@@ -3,6 +3,11 @@
 # offers system-service registration. Assumes Ferrosa is already running at
 # localhost:9042 (install via https://ferrosadb.com/install.sh first).
 #
+# SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory : docs/install-memory.sh).
+# It is mirrored into ferrosadb/ferrosa docs/install-memory.sh, which is what
+# GitHub Pages serves at https://ferrosadb.com/install-memory.sh. Edit it HERE;
+# the ferrosa copy is a published mirror.
+#
 # It is idempotent: re-running upgrades an existing install in place. When the
 # resolved version already matches what's installed it does nothing (use
 # --force to reinstall).
@@ -26,6 +31,7 @@ BIN_DIR="${INSTALL_ROOT}/bin"
 CONFIG_DIR="${INSTALL_ROOT}/config"
 DATA_DIR="${INSTALL_ROOT}/data"
 LOG_DIR="${INSTALL_ROOT}/logs"
+RUN_DIR="${INSTALL_ROOT}/run"
 # Separate stamp from ferrosa's own .version so the two installers don't clobber
 # each other's idempotency state.
 VERSION_STAMP="${INSTALL_ROOT}/.memory-version"
@@ -136,11 +142,22 @@ say "verifying SHA256"
 
 # ---------- install layout ----------
 say "installing to $INSTALL_ROOT"
-mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
+mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR"
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
 
 cp "$TMP/ferrosa-memory-mcp" "$BIN_DIR/"
 chmod +x "$BIN_DIR/ferrosa-memory-mcp"
+
+# The native setup CLI (`ferrosa-memory`) ships in releases built after v0.16.x.
+# Install it when the tarball contains it; older tarballs (e.g. stable v0.16.0)
+# bundle only the MCP server, so guard the copy to stay compatible across tags.
+if [ -f "$TMP/ferrosa-memory" ]; then
+  cp "$TMP/ferrosa-memory" "$BIN_DIR/"
+  chmod +x "$BIN_DIR/ferrosa-memory"
+  HAS_SETUP_CLI="yes"
+else
+  HAS_SETUP_CLI="no"
+fi
 
 # Record the installed version so the next run is idempotent.
 printf '%s\n' "$VERSION" > "$VERSION_STAMP"
@@ -228,6 +245,18 @@ cat <<EOF >&2
 
 ferrosa-memory $VERSION installed (${CHANNEL} channel).
 
+EOF
+if [ "$HAS_SETUP_CLI" = "yes" ]; then
+  cat <<EOF >&2
+  setup:  $BIN_DIR/ferrosa-memory
+
+Run the native setup reconciler any time you want to change local choices:
+
+  $BIN_DIR/ferrosa-memory setup
+
+EOF
+fi
+cat <<EOF >&2
   binary: $BIN_DIR/ferrosa-memory-mcp
   config: $CONFIG_DIR/ferrosa-memory.toml
 
