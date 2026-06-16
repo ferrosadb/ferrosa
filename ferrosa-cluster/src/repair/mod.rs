@@ -22,6 +22,7 @@ pub mod executor;
 pub mod merkle;
 pub mod rpc;
 pub mod scheduler;
+pub mod trigger;
 
 pub use cluster_view::{
     ClusterRepairView, ClusterTopology, ProbeOutcome, RepairProbe, RingTopology, RpcRepairProbe,
@@ -36,6 +37,7 @@ pub use scheduler::{
     select_initiated_ranges, select_tables_for_tick, AutoRepairConfig, AutoRepairScheduler,
     InitiatedRange, RepairContext,
 };
+pub use trigger::{ClusterRepairTrigger, ExecutorProvider};
 
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
