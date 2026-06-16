@@ -12770,6 +12770,158 @@ mod tests {
         );
     }
 
+    /// Property-based regression for the read-vs-compaction data-loss class
+    /// (bug t_940cc015): a committed, never-deleted key MUST remain readable
+    /// even when a concurrent compaction deletes its input `Data.db` mid-read.
+    ///
+    /// This generalizes `read_cache_hit_mid_read_delete_retries_against_new_view`
+    /// over randomized layouts (filler-generation count, target value bytes,
+    /// target key) so the invariant is checked across many on-disk shapes rather
+    /// than one hand-picked fixture. It is the DETERMINISTIC tier: the dangerous
+    /// interleaving is forced via the `ReadViewBarrier` + mid-read ENOENT
+    /// injection (not timing), so each case is reproducible. Bounded to a small
+    /// case count to keep the per-PR CI gate fast; the broad stochastic sweep is
+    /// the nightly real-concurrency stress (`tests/read_compaction_race_stress.rs`).
+    ///
+    /// Non-vacuous: with the get-error retry fix reverted (the `Err` arm of
+    /// `read_with_view` not setting `sstable_open_failed`), every case fails with
+    /// a spurious `Ok(None)` (silent data loss).
+    mod read_compaction_race_props {
+        use super::*;
+        use crate::store::read_race_test_hook::{ReadViewBarrier, ARMED};
+        use proptest::prelude::*;
+        use std::sync::Arc;
+
+        /// Returns whether the committed target key was still readable after a
+        /// compaction deleted its input `Data.db` between a cache-hit open and
+        /// the row seek. `false` == the silent-data-loss bug.
+        fn target_survives_midread_delete(n_filler: usize, val: &[u8], suffix: u32) -> bool {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let dir = tempfile::tempdir().unwrap();
+                let mut config = StorageEngineConfig::test_config(dir.path());
+                config.compaction.min_threshold = 2;
+                let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+                engine.register_table(test_schema()).unwrap();
+                let tid = table_id();
+
+                // Filler generations (one key each), then the TARGET alone in the
+                // newest generation — so the target lives only in a to-be-merged
+                // input and "moves" into the compacted output.
+                let mut ts = 1000i64;
+                for i in 0..n_filler {
+                    engine
+                        .write(&tid, &make_key(&format!("f{i}")), make_row(b"f", ts), ts)
+                        .unwrap();
+                    engine.flush(&tid).unwrap();
+                    ts += 1000;
+                }
+                let target = make_key(&format!("t{suffix}"));
+                engine
+                    .write(&tid, &target, make_row(val, ts), ts)
+                    .unwrap();
+                engine.flush(&tid).unwrap();
+                assert_eq!(engine.sstable_count(&tid), n_filler + 1);
+
+                // Hold the target gen's pooled reader (keeps its bloom alive for the
+                // post-swap cache-hit) and resolve its Data.db path.
+                let table_dir = dir.path().join("sstables").join(tid.to_string());
+                let target_gen = *StorageEngine::list_generations_in_dir(&table_dir)
+                    .iter()
+                    .max()
+                    .expect("target gen exists");
+                let target_reader = engine
+                    .pooled_reader_arc_for_test(&tid, target_gen)
+                    .expect("target reader pooled after flush");
+                let target_data_db = StorageEngine::generation_component_path_for_test(
+                    &table_dir,
+                    target_gen,
+                    "Data.db",
+                )
+                .expect("target Data.db path resolves");
+
+                // Submit a compaction merging every generation.
+                {
+                    let tables = engine.tables.read();
+                    let state = tables.get(&tid).unwrap();
+                    let metadata = engine.collect_sstable_metadata(&tid, state);
+                    drop(tables);
+                    let task = crate::compaction::metadata::CompactionTask {
+                        inputs: metadata,
+                        output_dir: dir.path().join("compaction"),
+                        schema: test_schema(),
+                        table_id: tid.clone(),
+                    };
+                    engine.compaction_executor.submit(task).unwrap();
+                }
+
+                // Reader pauses right after snapshotting the pre-swap view.
+                let barrier = ReadViewBarrier::new();
+                let b_reader = Arc::clone(&barrier);
+                let eng = Arc::clone(&engine);
+                let rtid = tid.clone();
+                let rkey = target.clone();
+                let reader = std::thread::spawn(move || {
+                    ARMED.with(|c| *c.borrow_mut() = Some(b_reader));
+                    eng.read(&rtid, &rkey).expect("read must not error")
+                });
+
+                barrier.wait_reached();
+                // Drive the swap to completion. The bound is a generous hang-guard
+                // (~30s), NOT a timing assertion: the background merge always
+                // finishes, but a starved executor thread (and macOS F_FULLFSYNC)
+                // can make it slow — so we wait it out rather than race a deadline.
+                let mut swapped = false;
+                for _ in 0..1500 {
+                    engine.poll_compactions().await;
+                    if engine.sstable_count(&tid) == 1 {
+                        swapped = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert!(swapped, "compaction swap did not complete");
+                assert!(
+                    !target_data_db.exists(),
+                    "swap must delete the target's Data.db (the mid-read ENOENT trigger)"
+                );
+
+                // Re-establish the cache-HIT precondition the swap tore down, then
+                // evict the fd so the resumed seek hits ENOENT on the deleted path.
+                engine.reseed_pooled_reader_for_test(
+                    &tid,
+                    target_gen,
+                    Arc::clone(&target_reader),
+                );
+                ferrosa_sstable::io::evict_global_fd_for_test(&target_data_db);
+
+                barrier.release();
+                reader.join().unwrap().is_some()
+            })
+        }
+
+        proptest! {
+            // Bounded for the per-PR gate; the nightly fuzz workflow scales this
+            // up via the PROPTEST_CASES env var (proptest reads it automatically).
+            #![proptest_config(ProptestConfig::with_cases(8))]
+            #[test]
+            fn committed_key_survives_midread_delete_during_compaction(
+                n_filler in 1usize..=3,
+                val in prop::collection::vec(any::<u8>(), 1..16usize),
+                suffix in 0u32..10_000,
+            ) {
+                prop_assert!(
+                    target_survives_midread_delete(n_filler, &val, suffix),
+                    "committed key vanished as a spurious Ok(None) across a mid-read \
+                     Data.db delete + compaction swap — read-vs-compaction silent data loss"
+                );
+            }
+        }
+    }
+
     /// Window (1), DELETED-`Filter.db` variant — fail-loud + retry path.
     ///
     /// A read snapshots a view referencing the sole-survivor input SSTable
