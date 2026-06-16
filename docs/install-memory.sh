@@ -101,12 +101,11 @@ fi
 
 # ---------- idempotency: compare against what's installed ----------
 read_installed_version() {
-  if [ -f "$VERSION_STAMP" ]; then
-    cat "$VERSION_STAMP"
-  elif [ -x "${BIN_DIR}/ferrosa-memory-mcp" ]; then
-    # Best-effort fallback for installs predating the version stamp.
-    "${BIN_DIR}/ferrosa-memory-mcp" --version 2>/dev/null | awk 'NR==1{print "v"$NF}'
-  fi
+  # Stamp-only: ferrosa-memory-mcp is a stdio MCP server with no --version flag
+  # (running it just starts the server), so there is no safe way to probe an
+  # installed version from the binary. Installs predating the stamp are treated
+  # as fresh and simply reinstalled.
+  [ -f "$VERSION_STAMP" ] && cat "$VERSION_STAMP"
 }
 INSTALLED_VERSION="$(read_installed_version || true)"
 IS_UPGRADE="no"; [ -n "$INSTALLED_VERSION" ] && IS_UPGRADE="yes"

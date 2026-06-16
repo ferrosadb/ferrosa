@@ -104,9 +104,11 @@ fi
 read_installed_version() {
   if [ -f "$VERSION_STAMP" ]; then
     cat "$VERSION_STAMP"
-  elif [ -x "${BIN_DIR}/ferrosa" ]; then
-    # Best-effort fallback for installs predating the version stamp.
-    "${BIN_DIR}/ferrosa" --version 2>/dev/null | awk 'NR==1{print "v"$NF}'
+  elif [ -x "${BIN_DIR}/ferrosa-ctl" ]; then
+    # Best-effort fallback for installs predating the version stamp. The main
+    # `ferrosa` binary boots the server on any args (no --version); ferrosa-ctl
+    # has a clean --version that prints "ferrosa-ctl X.Y.Z".
+    "${BIN_DIR}/ferrosa-ctl" --version 2>/dev/null | awk 'NR==1{print "v"$NF}'
   fi
 }
 INSTALLED_VERSION="$(read_installed_version || true)"

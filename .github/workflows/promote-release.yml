@@ -41,3 +41,22 @@ jobs:
           gh release edit "$TAG" --repo "$REPO" \
             --draft=false --prerelease=false --latest
           echo "Promoted ${TAG} to stable (latest, not prerelease)."
+
+      - name: Notify Homebrew tap to resync formulae
+        env:
+          # Fine-grained PAT (or classic repo-scoped token) with contents:write
+          # on ferrosadb/homebrew-tap. GITHUB_TOKEN cannot dispatch cross-repo.
+          # Absent token => skip (the tap's hourly cron still picks it up).
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping tap notify (hourly cron will sync)."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${TAP_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/ferrosadb/homebrew-tap/dispatches \
+            -d '{"event_type":"release-promoted"}'
+          echo "Dispatched release-promoted to ferrosadb/homebrew-tap."
