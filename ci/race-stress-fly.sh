@@ -38,20 +38,24 @@ echo ":: creating throwaway app $APP"
 fly apps create "$APP" --org "${FLY_ORG:-personal}" >/dev/null
 
 # Remote build+run. `bash -c` (NOT -lc: a login shell drops /usr/local/cargo/bin
-# from PATH -> cargo not found -> exit 127). Markers below use expanded values so
-# log scraping can't match the echoed script source.
+# from PATH -> cargo not found -> exit 127). The completion marker is ASSEMBLED
+# at runtime (M below) so the literal `RS_RESULT` never appears in the script
+# SOURCE — fly echoes the whole script to the log on boot, and a literal marker
+# in the source would be matched by the host-side grep, falsely "completing" the
+# run before the build even starts.
 REMOTE='set -uo pipefail
+M="RS_RE""SULT"   # emitted = RS_RESULT, but the source token is not that literal
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/cargo/bin:$PATH CARGO_HOME=/usr/local/cargo
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git capnproto cmake clang pkg-config libssl-dev build-essential >/dev/null 2>&1
 cd /tmp
 git clone --depth 1 --branch '"$BRANCH"' https://x-access-token:${GH_TOKEN}@github.com/ferrosadb/ferrosa f 2>&1 | tail -2
-cd f || { echo "RS_RESULT rc=66 (clone failed)"; exit 66; }
+cd f || { echo "$M rc=66 (clone failed)"; exit 66; }
 SECONDS=0
 RACE_KEYS='"$RACE_KEYS"' RACE_READERS='"$RACE_READERS"' RACE_SECS='"$RACE_SECS"' RACE_FLUSH_EVERY='"$RACE_FLUSH_EVERY"' \
   cargo test -p ferrosa-storage --features race-stress --release --lib \
   committed_keys_stay_readable_under_compaction_storm -- --nocapture 2>&1 | tail -40
-echo "RS_RESULT rc=${PIPESTATUS[0]} elapsed=${SECONDS}s"'
+echo "$M rc=${PIPESTATUS[0]} elapsed=${SECONDS}s"'
 
 echo ":: launching $VM in $REGION (starved baseline is the fuzzer)"
 fly machine run rust:1-bookworm \
