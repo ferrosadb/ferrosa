@@ -255,10 +255,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
           BRANCH: ${{ github.ref_name }}
-          # shared-cpu on purpose: the ~6.5% baseline starves the compaction
+          # shared-cpu on purpose: the throttled baseline starves the compaction
           # executor — that starvation is what surfaces the read-vs-compaction
-          # race. A performance VM would NOT reproduce it.
-          VM: shared-cpu-1x
+          # race. A performance VM would NOT reproduce it. Use the 2x size (4 GB)
+          # so the in-VM `--release` build of ferrosa-storage doesn't OOM
+          # (shared-cpu-1x caps at 2 GB); it is still shared/throttled.
+          VM: shared-cpu-2x
+          VM_MEMORY: '4096'
           RACE_KEYS: '2000'
           RACE_READERS: '8'
           RACE_SECS: '600'

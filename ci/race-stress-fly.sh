@@ -65,7 +65,7 @@ fly machine run rust:1-bookworm \
 
 echo ":: waiting for completion (RS_RESULT marker)…"
 LOG="$(mktemp)"
-deadline=$(( $(date +%s) + RACE_SECS + 2400 ))   # storm + generous build/boot headroom
+deadline=$(( $(date +%s) + RACE_SECS + 3600 ))   # storm + generous build/boot headroom (starved build is slow)
 rc=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
   fly logs -a "$APP" --no-tail >"$LOG" 2>/dev/null || true
