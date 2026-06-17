@@ -192,9 +192,10 @@ jobs:
   smoke-test:
     name: Docker Smoke Test (Pair Mode)
     runs-on: ubuntu-latest
-    # Was 10 min and timed out nightly (image build + 2-node bring-up + smoke
-    # exceeds 10 min on the runner). Give it headroom to complete.
-    timeout-minutes: 35
+    # Image build (cold cache) + rustfs bring-up + pair/cluster tests can exceed
+    # 35 min on GitHub-hosted runners. Size this to the same cap as the fuzz job
+    # so a slow build does not cancel the run before the smoke test completes.
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -202,34 +203,56 @@ jobs:
       - name: Install cqlsh
         run: pip install cqlsh
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
       - name: Run Docker smoke test
         env:
-          PAIR_CQL_TIMEOUT: 180
-        run: bash tests/docker-smoke.sh
+          PAIR_CQL_TIMEOUT: 240
+          COMPOSE_PARALLEL_LIMIT: 2
+        run: |
+          set -uo pipefail
+          # Run with an explicit inner timeout so that if the smoke test hangs
+          # we still reach the log-collection/upload steps and can diagnose why.
+          timeout --kill-after=60s 3060 bash tests/docker-smoke.sh 2>&1 | tee docker-smoke-output.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > docker-smoke-status
+          exit 0
+        continue-on-error: true
 
-      - name: Collect Docker logs on failure
-        if: failure()
+      - name: Collect Docker state and logs
+        if: always()
         run: |
           docker compose ps > docker-compose-ps.log 2>&1 || true
+          docker compose ps -a >> docker-compose-ps.log 2>&1 || true
+          docker system df >> docker-compose-ps.log 2>&1 || true
           for service in node1 node2 node3 rustfs rustfs-init; do
-            if [ ! -s "${service}.log" ]; then
-              docker compose logs "$service" > "${service}.log" 2>&1 || true
-            fi
+            docker compose logs --tail 500 "$service" > "${service}.log" 2>&1 || true
           done
 
       - name: Upload Docker logs
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: docker-smoke-logs
           path: |
             docker-compose-ps.log
+            docker-smoke-output.log
             node1.log
             node2.log
             node3.log
             rustfs.log
             rustfs-init.log
           retention-days: 14
+
+      - name: Fail if smoke test failed
+        if: always()
+        run: |
+          status=$(cat docker-smoke-status 2>/dev/null || echo 1)
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Docker smoke test failed or timed out with exit status $status — check docker-smoke-logs artifact"
+            exit "$status"
+          fi
 
       - name: Cleanup
         if: always()
