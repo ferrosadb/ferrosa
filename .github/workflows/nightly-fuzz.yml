@@ -303,3 +303,41 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v --remove-orphans 2>/dev/null || true
+
+  race-stress-fly:
+    name: Read-vs-compaction stress (shared-cpu Fly)
+    runs-on: ubuntu-latest
+    # The script provisions a throwaway shared-cpu Fly machine, builds with
+    # --features race-stress, runs an RACE_SECS storm, and tears the app down.
+    # Generous cap = build/boot headroom + the storm; the script self-destroys
+    # the app via an EXIT trap even if this job is cancelled.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Read-vs-compaction stress on a starved shared-cpu Fly machine
+        env:
+          # Only NEW secret required. If unset, the step skips cleanly (so the
+          # nightly run is green until the secret is provisioned — see t_dfbc14f3).
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          # The repo-scoped job token can clone this private repo on the VM.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
+          BRANCH: ${{ github.ref_name }}
+          # shared-cpu on purpose: the ~6.5% baseline starves the compaction
+          # executor — that starvation is what surfaces the read-vs-compaction
+          # race. A performance VM would NOT reproduce it.
+          VM: shared-cpu-1x
+          RACE_KEYS: '2000'
+          RACE_READERS: '8'
+          RACE_SECS: '600'
+          RACE_FLUSH_EVERY: '50'
+        run: |
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "::notice::FLY_API_TOKEN not set — skipping nightly Fly race-stress (provision it; see board task t_dfbc14f3)"
+            exit 0
+          fi
+          curl -fsSL https://fly.io/install.sh | sh
+          export FLYCTL_INSTALL="$HOME/.fly"
+          export PATH="$FLYCTL_INSTALL/bin:$PATH"
+          bash ci/race-stress-fly.sh
