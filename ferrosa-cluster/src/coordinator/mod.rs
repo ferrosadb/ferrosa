@@ -53,6 +53,11 @@ pub struct ClusterCoordinator {
     pub(crate) hint_store: Option<Arc<HintStore>>,
     /// Read repair metrics (attempted/succeeded/failed counters).
     pub repair_metrics: Arc<ReadRepairMetrics>,
+    /// Bounded sink for async anti-entropy repair requests fired by the read
+    /// path when it serves a read around a corrupt local SSTable. The repair
+    /// scheduler drains this to refill the affected token range from a healthy
+    /// replica (LOCKED DESIGN: serve now, repair in the background).
+    pub(crate) anti_entropy_repair_queue: Arc<crate::coordinator::read::AntiEntropyRepairQueue>,
     /// Optional snapshot of Raft state for index-aware replica selection.
     pub(crate) raft_state: Option<Arc<ArcSwap<RaftState>>>,
     /// Bounded semaphore limiting concurrent in-flight writes. Prevents bulk
@@ -116,6 +121,9 @@ impl ClusterCoordinator {
             default_cl,
             hint_store: None,
             repair_metrics: Arc::new(ReadRepairMetrics::new()),
+            anti_entropy_repair_queue: Arc::new(
+                crate::coordinator::read::AntiEntropyRepairQueue::default(),
+            ),
             raft_state: None,
             write_semaphore: Arc::new(tokio::sync::Semaphore::new(WRITE_CONCURRENCY_LIMIT)),
             stream_router: Arc::new(StreamRouter::new()),

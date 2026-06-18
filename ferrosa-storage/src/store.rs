@@ -299,6 +299,46 @@ impl SstableDescriptor {
     }
 }
 
+/// Identity of an SSTable that a read could not consult after exhausting the
+/// view-retry bound — i.e. genuinely corrupt/missing rather than a transient
+/// compaction window. Carried up the read path so the caller can (a) name the
+/// file in a fail-loud error and (b) quarantine it and target anti-entropy
+/// repair at its covered token range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptSstableId {
+    /// Stable generation ID of the corrupt SSTable (file-name / pool key).
+    pub gen: String,
+    /// Directory holding the SSTable's component files (empty for in-memory
+    /// fixtures); paired with `gen` it locates the file for forensics/repair.
+    pub dir: std::path::PathBuf,
+    /// Smallest partition token the corrupt SSTable covered — the lower bound
+    /// of the range anti-entropy repair must refill from a healthy replica.
+    pub min_token: i64,
+    /// Largest partition token the corrupt SSTable covered.
+    pub max_token: i64,
+}
+
+impl CorruptSstableId {
+    fn from_descriptor(desc: &SstableDescriptor) -> Self {
+        Self {
+            gen: desc.gen.clone(),
+            dir: desc.dir.clone(),
+            min_token: desc.min_token,
+            max_token: desc.max_token,
+        }
+    }
+}
+
+impl std::fmt::Display for CorruptSstableId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gen={} dir={:?} tokens=[{},{}]",
+            self.gen, self.dir, self.min_token, self.max_token
+        )
+    }
+}
+
 /// Atomic snapshot of the storage engine's current state.
 ///
 /// Held inside an [`ArcSwap`] so any thread can load a consistent view
@@ -469,6 +509,14 @@ pub struct TableStore<F: FlushTarget> {
     /// [`ann_search_partitions`] enumerate those scoped sidecars and recover the
     /// actual partition keys without a full table scan.
     vector_index_scopes: parking_lot::Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    /// SSTable generations the read path has quarantined because a read
+    /// exhausted the view-retry bound against them (genuine corruption, not a
+    /// transient compaction window). Subsequent reads SKIP these generations so
+    /// they neither re-fail nor re-incur the full retry storm, and anti-entropy
+    /// repair targets their covered token range to refill from a healthy
+    /// replica. Keyed by `gen`; the covered range is recovered from the live
+    /// descriptor (still in the view until repair swaps it out).
+    quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -814,6 +862,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
+            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -1019,6 +1068,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
+            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -1096,6 +1146,7 @@ impl<F: FlushTarget> TableStore<F> {
             vector_index_methods: HashMap::new(),
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
+            quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -1299,21 +1350,27 @@ impl<F: FlushTarget> TableStore<F> {
     /// component such as `Filter.db` removed) before we open it, the data has
     /// already moved into a new SSTable in a newer view — so reload and retry
     /// instead of returning a result that silently drops the key (a fail-loud
-    /// violation). `attempt` returns `(result, stale_view_failed)` where
-    /// `stale_view_failed` means a snapshotted SSTable could not be fully
-    /// consulted; whenever it is set we reload the view and retry.
+    /// violation). `attempt` returns `(result, corrupt)` where `corrupt` is
+    /// `Some(id)` when a snapshotted SSTable could not be fully consulted; while
+    /// it is set we reload the view and retry.
     ///
     /// Retry is **not** gated on the view pointer changing: a deletion that
     /// leaves the live view referencing the same generation (e.g. S3
     /// local-cache eviction) must still be retried so the reopen re-resolves /
-    /// re-fetches the file. Bounded by `MAX_VIEW_RETRIES`; if a fresh reopen
+    /// re-fetches the file. Bounded by `MAX_VIEW_RETRIES`. If a fresh reopen
     /// against the current view still fails after the bound, the file is
-    /// genuinely corrupt/missing and the (tolerant) result is returned — but
-    /// the exhaustion is logged and metered so it is never silent.
+    /// genuinely corrupt (a transient compaction window resolves within the
+    /// bound): the SSTable is **quarantined** (so later reads skip it and
+    /// anti-entropy repair can target its range) and then —
+    ///
+    /// - if the key was still resolved from a healthy source, the result is
+    ///   returned (`Ok(Some)`) and the corruption logged/metered;
+    /// - if nothing resolved, the read **fails loud** with an error naming the
+    ///   corrupt SSTable (never a silent `Ok(None)`).
     fn with_retried_view<R>(
         &self,
         op: &'static str,
-        mut attempt: impl FnMut(&StoreView) -> Result<(Option<R>, bool)>,
+        mut attempt: impl FnMut(&StoreView) -> Result<(Option<R>, Option<CorruptSstableId>)>,
     ) -> Result<Option<R>> {
         const MAX_VIEW_RETRIES: usize = 8;
         for n in 0..=MAX_VIEW_RETRIES {
@@ -1324,40 +1381,114 @@ impl<F: FlushTarget> TableStore<F> {
                 barrier.reach_and_wait();
             }
 
-            let (result, stale_view_failed) = attempt(&view)?;
-            if stale_view_failed && n < MAX_VIEW_RETRIES {
+            let (result, corrupt) = attempt(&view)?;
+            let Some(corrupt) = corrupt else {
+                // No snapshotted SSTable failed to be consulted — clean attempt.
+                return Ok(result);
+            };
+            if n < MAX_VIEW_RETRIES {
+                // A snapshotted SSTable could not be consulted. In the common
+                // case this is the transient compaction window: reload and retry
+                // against a fresh view. ONLY exhaustion (below) is treated as
+                // genuine corruption — a transient window resolves within the
+                // bound and never reaches the quarantine/fail-loud path.
                 continue;
             }
-            if stale_view_failed {
-                // Bound exhausted with a still-failing open: fail loud rather
-                // than silently returning a possibly-incomplete result.
-                self.view_retry_exhausted
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Bound exhausted with the SSTable still failing: genuine
+            // corruption. Quarantine it so later reads skip it (no re-fail, no
+            // repeated retry storm) and so anti-entropy repair can target its
+            // covered token range to refill from a healthy replica.
+            self.view_retry_exhausted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.quarantine_sstable(&corrupt);
+
+            if result.is_some() {
+                // Data was still resolvable from a healthy source (memtable or
+                // another SSTable) — serve it. The corrupt file is quarantined
+                // for background repair, but the read itself succeeds.
                 tracing::error!(
                     op,
+                    corrupt = %corrupt,
                     retries = MAX_VIEW_RETRIES,
-                    "read exhausted view retries with an SSTable still failing to open — \
-                     result may be incomplete (genuinely corrupt/missing file?)"
+                    "read served from a healthy source despite a corrupt SSTable; \
+                     corrupt SSTable quarantined for anti-entropy repair"
                 );
+                return Ok(result);
             }
-            return Ok(result);
+
+            // Nothing resolved AND a source was corrupt: fail loud. Returning
+            // Ok(None) here would be silent data loss — the key may live only in
+            // the corrupt SSTable. The error names the SSTable so the
+            // coordinator can fail over to a replica and repair can refill its
+            // range.
+            tracing::error!(
+                op,
+                corrupt = %corrupt,
+                retries = MAX_VIEW_RETRIES,
+                "read exhausted view retries with a corrupt SSTable and no healthy \
+                 source resolved the key — failing loud (quarantined for repair)"
+            );
+            // Typed signal (never string-matched): carries the corrupt
+            // SSTable's generation and covered token range so the read
+            // coordinator can fail over to a replica and target anti-entropy
+            // repair at exactly that range.
+            return Err(ferrosa_common::Error::corrupt_sstable(
+                corrupt.gen.clone(),
+                corrupt.min_token,
+                corrupt.max_token,
+            ));
         }
         unreachable!("read retry loop returns within MAX_VIEW_RETRIES")
     }
 
+    /// Record `corrupt`'s generation in the quarantine set. Idempotent: a
+    /// generation already present is left as-is (it is still skipped on every
+    /// read until repair swaps it out of the view).
+    fn quarantine_sstable(&self, corrupt: &CorruptSstableId) {
+        let inserted = self
+            .quarantined_sstables
+            .write()
+            .insert(corrupt.gen.clone());
+        if inserted {
+            tracing::warn!(
+                corrupt = %corrupt,
+                "quarantined corrupt SSTable: subsequent reads skip it and anti-entropy \
+                 repair will refill its token range from a healthy replica"
+            );
+        }
+    }
+
+    /// Whether `gen` is currently quarantined (and therefore skipped by reads).
+    /// Used by the repair path to target the SSTable's range and by tests.
+    pub fn is_sstable_quarantined(&self, gen: &str) -> bool {
+        self.quarantined_sstables.read().contains(gen)
+    }
+
+    /// Snapshot of all currently-quarantined SSTable generations. The
+    /// anti-entropy repair scheduler drains this to learn which ranges to
+    /// refill from a healthy replica.
+    pub fn quarantined_sstable_gens(&self) -> Vec<String> {
+        self.quarantined_sstables.read().iter().cloned().collect()
+    }
+
     /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
-    /// Returns the merged partition (if any) plus whether any SSTable failed to
-    /// open — the signal the caller uses to retry against a fresh view when the
-    /// view was concurrently swapped by compaction.
+    /// Returns the merged partition (if any) plus the identity of any
+    /// snapshotted SSTable that could not be consulted — the signal the caller
+    /// uses to retry against a fresh view (transient compaction swap) and, on
+    /// retry exhaustion, to quarantine the corrupt file and target repair.
     fn read_with_view(
         &self,
         guard: &StoreView,
         key: &DecoratedKey,
         row_limit: usize,
-    ) -> Result<(Option<Partition>, bool)> {
+    ) -> Result<(Option<Partition>, Option<CorruptSstableId>)> {
         let started = Instant::now();
         let schema = self.schema.load();
-        let mut sstable_open_failed = false;
+        // Identity of a snapshotted SSTable that could not be consulted this
+        // attempt. `None` = clean; `Some` drives the retry, then (on exhaustion)
+        // quarantine + fail-loud in `with_retried_view`.
+        let mut corrupt: Option<CorruptSstableId> = None;
 
         let mut sources: Vec<Partition> = Vec::new();
         let mut memtable_hits = 0u64;
@@ -1386,6 +1517,14 @@ impl<F: FlushTarget> TableStore<F> {
         // format-incompatible SSTable should not prevent reading data
         // that exists in other SSTables or the memtable (FRSA-BUG-026).
         for (i, desc) in guard.sstables.iter().enumerate() {
+            // Skip SSTables a previous read already quarantined as corrupt: they
+            // re-error every attempt, so reopening them would only re-incur the
+            // retry storm. The data they held is being refilled by anti-entropy
+            // repair; until then we serve from the remaining healthy sources.
+            if self.is_sstable_quarantined(&desc.gen) {
+                sstable_pruned += 1;
+                continue;
+            }
             // Token-prune by descriptor bounds first (no reader open). The
             // partition's token must lie within the SSTable's covered range or
             // it cannot hold the key.
@@ -1402,7 +1541,7 @@ impl<F: FlushTarget> TableStore<F> {
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     sstable_errors += 1;
-                    sstable_open_failed = true;
+                    corrupt = Some(CorruptSstableId::from_descriptor(desc));
                     continue;
                 }
             };
@@ -1429,12 +1568,12 @@ impl<F: FlushTarget> TableStore<F> {
                     // hits `ENOENT`. The merged output in the NEW view holds the
                     // row, so this must drive the same view-retry as an open
                     // failure rather than silently dropping the key (`Ok(None)` =
-                    // data loss). Marking `sstable_open_failed` engages
+                    // data loss). Recording the failing descriptor engages
                     // `with_retried_view`: a transient compaction window resolves
                     // on retry against the fresh view; a genuinely corrupt SSTable
-                    // re-errors across all retries and surfaces loudly via
-                    // `view_retry_exhausted` (never silently masked).
-                    sstable_open_failed = true;
+                    // re-errors across all retries and is quarantined + surfaced
+                    // loudly (never silently masked).
+                    corrupt = Some(CorruptSstableId::from_descriptor(desc));
                     // Detailed diagnostic for truncated SSTable investigation.
                     let id_info = guard
                         .sstable_ids
@@ -1470,7 +1609,7 @@ impl<F: FlushTarget> TableStore<F> {
                 sstable_hits,
                 sstable_errors,
             );
-            return Ok((None, sstable_open_failed));
+            return Ok((None, corrupt));
         }
 
         let mut merged = merge::merge_partitions(sources);
@@ -1488,7 +1627,7 @@ impl<F: FlushTarget> TableStore<F> {
             sstable_hits,
             sstable_errors,
         );
-        Ok((Some(merged), sstable_open_failed))
+        Ok((Some(merged), corrupt))
     }
 
     /// Read exactly one clustered row from a partition by clustering-key
@@ -1514,17 +1653,18 @@ impl<F: FlushTarget> TableStore<F> {
     }
 
     /// One attempt of [`read_clustering_row`] against a fixed `view` snapshot.
-    /// Returns the matching row (if any) plus whether any SSTable failed to
-    /// open — the signal the caller uses to retry against a fresh view.
+    /// Returns the matching row (if any) plus the identity of any snapshotted
+    /// SSTable that could not be consulted — the signal the caller uses to retry
+    /// against a fresh view and, on exhaustion, to quarantine + repair.
     fn read_clustering_row_with_view(
         &self,
         guard: &StoreView,
         key: &DecoratedKey,
         clustering: &[u8],
-    ) -> Result<(Option<Partition>, bool)> {
+    ) -> Result<(Option<Partition>, Option<CorruptSstableId>)> {
         let schema = self.schema.load();
         let mut sources: Vec<Partition> = Vec::new();
-        let mut sstable_open_failed = false;
+        let mut corrupt: Option<CorruptSstableId> = None;
 
         if let Some(p) = guard.active.get(key)? {
             if let Some(filtered) = partition_with_matching_clustering(&p, clustering) {
@@ -1541,6 +1681,10 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         for (i, desc) in guard.sstables.iter().enumerate() {
+            // Skip already-quarantined corrupt SSTables (see `read_with_view`).
+            if self.is_sstable_quarantined(&desc.gen) {
+                continue;
+            }
             let token = key.token.0;
             if token < desc.min_token || token > desc.max_token {
                 continue;
@@ -1551,7 +1695,7 @@ impl<F: FlushTarget> TableStore<F> {
                     tracing::error!(%e, gen = %desc.gen, "clustering read: failed to open SSTable reader");
                     self.sstable_read_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    sstable_open_failed = true;
+                    corrupt = Some(CorruptSstableId::from_descriptor(desc));
                     continue;
                 }
             };
@@ -1572,7 +1716,7 @@ impl<F: FlushTarget> TableStore<F> {
                     // between our (cached) open and the row seek, so the row
                     // lives in the merged SSTable of the NEW view. Drive the
                     // view-retry instead of silently dropping the row.
-                    sstable_open_failed = true;
+                    corrupt = Some(CorruptSstableId::from_descriptor(desc));
                     let id_info = guard
                         .sstable_ids
                         .get(i)
@@ -1593,15 +1737,15 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         if sources.is_empty() {
-            return Ok((None, sstable_open_failed));
+            return Ok((None, corrupt));
         }
 
         let mut merged = merge::merge_partitions(sources);
         merged.rows.retain(|row| row.clustering == clustering);
         if merged.rows.is_empty() {
-            Ok((None, sstable_open_failed))
+            Ok((None, corrupt))
         } else {
-            Ok((Some(merged), sstable_open_failed))
+            Ok((Some(merged), corrupt))
         }
     }
 
@@ -5643,15 +5787,147 @@ mod tests {
         }));
 
         let view = store.view.load_full();
-        let (result, stale_view_failed) = store.read_with_view(&view, &key, 0).unwrap();
+        let (result, corrupt) = store.read_with_view(&view, &key, 0).unwrap();
         assert!(
             result.is_none(),
             "the truncated source yields no rows on this single view snapshot"
         );
+        let corrupt = corrupt.expect(
+            "a mid-read fetch error on a bloom-matching SSTable must request a view retry \
+             (carry the failing SSTable id), not be swallowed into a silent Ok(None)",
+        );
+        assert_eq!(
+            corrupt.gen, "truncated",
+            "the retry signal must identify the failing SSTable by gen"
+        );
+    }
+
+    /// Anti-entropy slice (feat/corrupt-sstable-anti-entropy): a point read that
+    /// EXHAUSTS the view-retry bound on a genuinely-corrupt SSTable whose data
+    /// is NOT resolvable from any healthy source (memtable / another SSTable)
+    /// must FAIL LOUD — return `Err` that identifies the corrupt SSTable (its
+    /// gen) — never a spurious `Ok(None)`. It must also QUARANTINE that SSTable
+    /// so a subsequent read of the same key skips it instead of re-failing.
+    #[test]
+    fn exhausted_corrupt_read_unresolvable_fails_loud_and_quarantines() {
+        let store = test_store();
+        let schema = test_schema();
+        let key = make_key("k-corrupt-only");
+
+        // The only source holding the key is a corrupt (truncated) SSTable:
+        // bloom says present, but every partition fetch errors. No memtable
+        // copy, no second SSTable — the read cannot be resolved.
+        let truncated = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("k-corrupt-only", b"v", 1000)],
+            Some(8),
+        ));
         assert!(
-            stale_view_failed,
-            "a mid-read fetch error on a bloom-matching SSTable must request a view retry, \
-             not be swallowed into a silent Ok(None)"
+            truncated.may_contain_key(&key),
+            "bloom must say the key is present — that is what makes the loss dangerous"
+        );
+
+        let current = store.view.load_full();
+        let desc = SstableDescriptor::from_reader(
+            "corrupt-gen".to_string(),
+            std::path::PathBuf::new(),
+            &truncated,
+        );
+        store.seed_reader(&desc, truncated);
+        store.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(vec![desc.clone()]),
+            sstable_ids: Arc::new(vec![("corrupt-gen".to_string(), std::path::PathBuf::new())]),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(vec![Arc::new(HashMap::new())]),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+
+        // First read: exhausts retries with nothing resolved -> fail loud.
+        let err = store
+            .read(&key)
+            .expect_err("an unresolvable read over a corrupt SSTable must fail loud, not Ok(None)");
+        assert!(
+            err.to_string().contains("corrupt-gen"),
+            "the error must identify the corrupt SSTable by gen, got: {err}"
+        );
+
+        // The corrupt SSTable must now be quarantined.
+        assert!(
+            store.is_sstable_quarantined("corrupt-gen"),
+            "the corrupt SSTable must be quarantined so later reads can target/skip it"
+        );
+
+        // Second read of the same key: the quarantined SSTable is skipped, so
+        // we no longer re-fail on it. With nothing else holding the key the
+        // result is a clean Ok(None) (the data is genuinely gone locally;
+        // repair refills it in the background).
+        let again = store.read(&key).expect(
+            "after quarantine the corrupt SSTable is skipped, so the read no longer errors",
+        );
+        assert!(
+            again.is_none(),
+            "no healthy local source holds the key after the corrupt SSTable is quarantined"
+        );
+    }
+
+    /// A read whose data IS resolvable from a healthy source (here the memtable)
+    /// must still return `Ok(Some)` even though a corrupt SSTable in the same
+    /// token range errors on every attempt. Fail-loud applies ONLY when nothing
+    /// was resolved. The corrupt SSTable is still quarantined for repair.
+    #[test]
+    fn corrupt_sstable_resolvable_from_memtable_returns_ok_some() {
+        let store = test_store();
+        let schema = test_schema();
+        let key = make_key("k-resolvable");
+
+        // Live, healthy copy in the active memtable.
+        store.write(&key, make_row(b"live", 2000)).unwrap();
+
+        // A corrupt SSTable that also covers this key's token range.
+        let truncated = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("k-resolvable", b"stale", 1000)],
+            Some(8),
+        ));
+        assert!(truncated.may_contain_key(&key));
+
+        let current = store.view.load_full();
+        let desc = SstableDescriptor::from_reader(
+            "corrupt-gen-2".to_string(),
+            std::path::PathBuf::new(),
+            &truncated,
+        );
+        store.seed_reader(&desc, truncated);
+        store.view.store(Arc::new(StoreView {
+            active: Arc::clone(&current.active),
+            flushing: None,
+            sstables: Arc::new(vec![desc.clone()]),
+            sstable_ids: Arc::new(vec![(
+                "corrupt-gen-2".to_string(),
+                std::path::PathBuf::new(),
+            )]),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(vec![Arc::new(HashMap::new())]),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+
+        let result = store
+            .read(&key)
+            .expect("a read resolvable from the memtable must succeed despite a corrupt SSTable");
+        let partition = result.expect("the memtable copy must be returned");
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(b"live".as_slice()),
+            "the healthy memtable value must be served"
+        );
+
+        // Even though the read succeeded, the corrupt SSTable is quarantined so
+        // anti-entropy repair can refill its range in the background.
+        assert!(
+            store.is_sstable_quarantined("corrupt-gen-2"),
+            "a corrupt SSTable detected during a resolvable read is still quarantined for repair"
         );
     }
 

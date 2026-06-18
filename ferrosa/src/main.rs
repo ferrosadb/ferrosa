@@ -1421,12 +1421,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         let cluster_view: std::sync::Arc<dyn ferrosa_storage::self_heal::ClusterView> =
             std::sync::Arc::new(
-                ferrosa_cluster::repair::cluster_view::ClusterRepairView::new(topology, probe),
+                ferrosa_cluster::repair::cluster_view::ClusterRepairView::new(
+                    topology.clone(),
+                    probe.clone(),
+                ),
             );
+        // Quarantine → anti-entropy refill trigger. Uses the SAME verified-
+        // healthy-replica topology + probe as the posture gate (FMEA #1: only
+        // refill from a peer proven to hold a non-corrupt copy), and resolves
+        // the repair executor against the CURRENT ring per refill via
+        // `build_repair_executor` (the same path the periodic scheduler's
+        // RepairContext::build_executor uses). The provider returns `None` —
+        // refill skipped, periodic cycle is the backstop — until the node is
+        // ring-ready.
+        let exec_provider: std::sync::Arc<dyn ferrosa_cluster::repair::ExecutorProvider> = {
+            let mode_controller = mode_controller.clone();
+            let storage = storage.clone();
+            std::sync::Arc::new(move || {
+                crate::repair_wiring::build_repair_executor(&mode_controller, &storage)
+            })
+        };
         let refill_trigger: std::sync::Arc<dyn ferrosa_storage::self_heal::RepairTrigger> =
-            std::sync::Arc::new(crate::repair_wiring::BinaryRepairTrigger::new(
-                repair_ctx.clone(),
-                runtimes.data.handle().clone(),
+            std::sync::Arc::new(ferrosa_cluster::repair::ClusterRepairTrigger::new(
+                topology,
+                probe,
+                exec_provider,
             ));
         ferrosa_storage::self_heal::SelfHealController::spawn_with_trigger(
             storage.clone(),

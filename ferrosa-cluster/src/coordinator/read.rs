@@ -156,6 +156,87 @@ async fn read_local_range_limited_rows_offloaded(
 }
 
 // ---------------------------------------------------------------------------
+// Anti-entropy repair requests (async, fired from the read path)
+// ---------------------------------------------------------------------------
+
+/// A request to refill a token range from a healthy replica via anti-entropy
+/// repair, fired by the read coordinator when it served a read around a corrupt
+/// local SSTable (LOCKED DESIGN: serve now, repair in the background).
+///
+/// The request names the table and the corrupt SSTable's covered token range so
+/// the repair scheduler can run a targeted Merkle repair of exactly that range
+/// rather than the whole table. It is *recorded* (not yet executed) here: the
+/// read path must never block on repair, and the scheduler drains these on its
+/// own tick. Draining-into-`repair_initiated` is wired separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntiEntropyRepairRequest {
+    /// Table whose range needs refilling.
+    pub table_id: TableId,
+    /// Lower bound (inclusive) of the corrupt SSTable's covered token range.
+    pub min_token: i64,
+    /// Upper bound (inclusive) of the corrupt SSTable's covered token range.
+    pub max_token: i64,
+}
+
+/// Bounded, observable sink for [`AntiEntropyRepairRequest`]s fired from the
+/// read path. Holds a bounded backlog the repair scheduler drains; a global
+/// metric counts every request so corruption-driven self-heal is alertable.
+///
+/// Bounded (Power-of-10 Rule 3): once the backlog is full, further requests
+/// still bump the metric (so corruption is never silently dropped from
+/// observability) but are not queued again — the already-queued range repair
+/// for that table will refill overlapping corrupt ranges anyway.
+pub struct AntiEntropyRepairQueue {
+    /// Max queued requests before new ones are coalesced away (metric still
+    /// fires). Generous: each entry is tiny and the scheduler drains quickly.
+    capacity: usize,
+    pending: parking_lot::Mutex<std::collections::VecDeque<AntiEntropyRepairRequest>>,
+}
+
+impl AntiEntropyRepairQueue {
+    /// Default backlog capacity. Far larger than the number of distinct
+    /// corrupt SSTables a single node realistically quarantines between repair
+    /// ticks, so coalescing only engages under pathological corruption.
+    const DEFAULT_CAPACITY: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            capacity: Self::DEFAULT_CAPACITY,
+            pending: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Record a repair request: always bumps the global metric; enqueues the
+    /// request unless the bounded backlog is full. Returns the new total count
+    /// of requests observed process-wide.
+    fn request(&self, req: AntiEntropyRepairRequest) -> u64 {
+        let total = super::metrics::inc_anti_entropy_repair_requested();
+        let mut pending = self.pending.lock();
+        if pending.len() < self.capacity {
+            pending.push_back(req);
+        } else {
+            tracing::warn!(
+                "anti-entropy repair backlog full ({}); coalescing new corrupt-range \
+                 request into existing queued repairs (metric still incremented)",
+                self.capacity
+            );
+        }
+        total
+    }
+
+    /// Drain and return all queued requests (the scheduler's pull side).
+    fn drain(&self) -> Vec<AntiEntropyRepairRequest> {
+        self.pending.lock().drain(..).collect()
+    }
+}
+
+impl Default for AntiEntropyRepairQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal result type for a single replica read
 // ---------------------------------------------------------------------------
 
@@ -849,6 +930,39 @@ impl ClusterCoordinator {
             .map(|info| info.host_id)
     }
 
+    /// Process-wide count of async anti-entropy repairs this coordinator has
+    /// requested after serving a read around a corrupt local SSTable.
+    pub fn anti_entropy_repairs_requested_total(&self) -> u64 {
+        super::metrics::anti_entropy_repairs_requested_total()
+    }
+
+    /// Drain the queued anti-entropy repair requests fired by the read path.
+    /// The repair scheduler calls this on its tick to run targeted range
+    /// repairs; tests call it to assert a repair was requested.
+    pub fn drain_anti_entropy_repair_requests(&self) -> Vec<AntiEntropyRepairRequest> {
+        self.anti_entropy_repair_queue.drain()
+    }
+
+    /// Record an async anti-entropy repair request for the corrupt SSTable's
+    /// token range. Never blocks the read; the scheduler refills the range from
+    /// a healthy replica in the background.
+    fn request_anti_entropy_repair(&self, table_id: &TableId, min_token: i64, max_token: i64) {
+        let req = AntiEntropyRepairRequest {
+            table_id: table_id.clone(),
+            min_token,
+            max_token,
+        };
+        let total = self.anti_entropy_repair_queue.request(req);
+        tracing::warn!(
+            table = %table_id,
+            min_token,
+            max_token,
+            anti_entropy_repairs_requested_total = total,
+            "served read around a corrupt local SSTable; requested async anti-entropy \
+             repair to refill the range from a healthy replica"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // CL=ONE helper
     // -----------------------------------------------------------------------
@@ -877,6 +991,14 @@ impl ClusterCoordinator {
             }
         }
 
+        // LOCKED DESIGN: a local corrupt-SSTable read is treated like a failed
+        // replica — at CL=ONE we fall over to a remote replica to serve the
+        // client. The corrupt SSTable's token range is remembered so that, once
+        // a healthy replica serves the read, we fire an ASYNC anti-entropy
+        // repair to refill that range (never blocking the read). `None` until a
+        // local read surfaces a typed `CorruptSstable` error.
+        let mut corrupt_range: Option<(i64, i64)> = None;
+
         for &target in &candidates {
             if target == self.local_node_id {
                 match read_local_partition(
@@ -892,6 +1014,19 @@ impl ClusterCoordinator {
                 {
                     Ok(Some(rows)) if !rows.is_empty() => return Ok(Some(rows)),
                     Ok(_) => continue, // no data on this replica, try next
+                    Err(ClusterError::Storage(ref e)) if e.corrupt_sstable_range().is_some() => {
+                        // Genuine local SSTable corruption (storage already
+                        // quarantined it). Treat it as a failed replica: record
+                        // the range so a successful failover triggers repair,
+                        // then try the next replica.
+                        corrupt_range = e.corrupt_sstable_range();
+                        tracing::warn!(
+                            %e,
+                            "read_one_replica: local SSTable corrupt; failing over to a \
+                             remote replica and scheduling anti-entropy repair"
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         tracing::debug!(%e, "read_one_replica: local read failed, trying next");
                         continue;
@@ -960,8 +1095,26 @@ impl ClusterCoordinator {
             }
 
             if found_partition && !all_rows.is_empty() {
+                // Served from a healthy remote replica. If we got here because a
+                // local SSTable was corrupt, fire the async repair now (the read
+                // itself is already satisfied and is NOT blocked on repair).
+                if let Some((min_token, max_token)) = corrupt_range.take() {
+                    self.request_anti_entropy_repair(table_id, min_token, max_token);
+                }
                 return Ok(Some(all_rows));
             }
+        }
+
+        // All replicas exhausted. If a local SSTable was corrupt and no replica
+        // could serve the key, FAIL LOUD rather than returning a silent `Ok(None)`
+        // that would masquerade corruption as "key not found" — the key may have
+        // lived only in the corrupt SSTable. Still request repair so the range is
+        // refilled when a replica recovers.
+        if let Some((min_token, max_token)) = corrupt_range {
+            self.request_anti_entropy_repair(table_id, min_token, max_token);
+            return Err(ClusterError::Storage(
+                ferrosa_common::Error::corrupt_sstable("local", min_token, max_token),
+            ));
         }
 
         // All replicas exhausted — data genuinely not found.
@@ -2282,6 +2435,212 @@ mod tests {
         assert!(
             pm.has_peer(remote_host_id_3),
             "healthy spare digest replica should be connected"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Build a flushed-then-corrupted local SSTable so a local read of `key`
+    /// fails loud with [`ferrosa_common::Error::CorruptSstable`].
+    ///
+    /// Writes `row`, flushes it to an SSTable, then truncates every `-Data.db`
+    /// component for the table to a single byte. The data lives ONLY in that
+    /// SSTable (no memtable copy after flush), so a subsequent read exhausts the
+    /// view-retry bound and surfaces the typed corrupt-SSTable error — exactly
+    /// the signal the coordinator must map to a replica failover + repair.
+    fn corrupt_local_sstable(
+        dir: &std::path::Path,
+        storage: &StorageEngine,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        ts: i64,
+    ) {
+        storage.write(table_id, key, row, ts).unwrap();
+        storage.flush(table_id).unwrap();
+        let sstable_dir = dir.join("sstables").join(table_id.to_string());
+        let mut corrupted = 0usize;
+        for entry in std::fs::read_dir(&sstable_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with("-Data.db") {
+                std::fs::write(&path, [0u8]).unwrap();
+                corrupted += 1;
+            }
+        }
+        assert!(
+            corrupted > 0,
+            "test setup: expected a flushed Data.db to corrupt"
+        );
+        // NOTE: we deliberately do NOT read here to verify. The first read that
+        // hits the corruption quarantines the SSTable (later reads then skip it
+        // and return Ok(None) instead of the corrupt error). The coordinator's
+        // read under test must be that first read, so it surfaces the typed
+        // CorruptSstable error and drives the failover + repair path.
+    }
+
+    /// CL=ONE: a local corrupt-SSTable read must FAIL OVER to a remote replica
+    /// and serve the client the remote's data, rather than propagating the local
+    /// corruption error. Today CL=ONE prefers local; this asserts the failover.
+    #[tokio::test]
+    async fn coordinate_read_at_one_fails_over_to_remote_on_local_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        // Remote replica serves the partition over a real RPC server.
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(1234)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        // Local replica holds the same key but in a corrupt-only SSTable.
+        corrupt_local_sstable(dir.path(), &storage, &table_id, &key, test_row(1234), 1234);
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        // Both own token 42 (test_key) at RF=2: local is preferred, remote is
+        // the failover target.
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            2, // RF=2
+            ConsistencyLevel::One,
+        );
+
+        let result = coordinator
+            .coordinate_read(&table_id, &key)
+            .await
+            .expect("CL=ONE must fail over to the remote replica, not error on local corruption");
+        let rows = result.expect("remote replica holds the partition");
+        assert!(
+            !rows.is_empty(),
+            "failover read must return the remote rows"
+        );
+        let ts = rows
+            .iter()
+            .flat_map(|r| r.cells.iter().map(|(_, c)| c.timestamp))
+            .max()
+            .unwrap();
+        assert_eq!(
+            ts, 1234,
+            "served data must come from the healthy remote replica"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// CL=ONE failover on local corruption must ALSO fire an async anti-entropy
+    /// repair request targeting the corrupt SSTable's token range, recorded so
+    /// the scheduler can drain it (asserted via the recorded trigger + metric).
+    #[tokio::test]
+    async fn coordinate_read_at_one_requests_repair_on_local_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(1234)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(StaticReadHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+
+        corrupt_local_sstable(dir.path(), &storage, &table_id, &key, test_row(1234), 1234);
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[100]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::One,
+        );
+
+        // The global metric is process-wide (shared across parallel tests), so
+        // assert it strictly *increased* — the per-coordinator queue below is
+        // the deterministic, instance-scoped source of truth for the exact count.
+        let before = coordinator.anti_entropy_repairs_requested_total();
+        coordinator.coordinate_read(&table_id, &key).await.unwrap();
+        assert!(
+            coordinator.anti_entropy_repairs_requested_total() > before,
+            "serving from a replica on local corruption must increment the \
+             anti-entropy repair metric"
+        );
+
+        // Exactly one repair request must have been recorded for this read.
+        let requests = coordinator.drain_anti_entropy_repair_requests();
+        assert_eq!(requests.len(), 1, "exactly one repair request recorded");
+        let req = &requests[0];
+        assert_eq!(
+            req.table_id, table_id,
+            "repair must target the read's table"
+        );
+        // The corrupt SSTable covered token 42 (test_key); the requested range
+        // must include it.
+        assert!(
+            req.min_token <= key.token.0 && key.token.0 <= req.max_token,
+            "repair range [{},{}] must cover the corrupt key's token {}",
+            req.min_token,
+            req.max_token,
+            key.token.0
         );
 
         server.shutdown(std::time::Duration::from_millis(50)).await;

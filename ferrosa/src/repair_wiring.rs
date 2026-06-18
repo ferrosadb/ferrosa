@@ -1,12 +1,14 @@
 //! Binary-side wiring for automatic anti-entropy repair.
 //!
 //! The cluster layer ships the *primitives* (`RepairCoordinator`,
-//! `AutoRepairScheduler`, `ClusterRepairView`) and the *ports*
-//! (`RepairContext`, storage's `RepairTrigger`). This module is the single
-//! place in the `ferrosa` binary that satisfies those ports against live node
-//! state (`ModeController` + `StorageEngine` + `Schema`), so the scheduler, the
-//! manual `POST /api/cluster/repair` endpoint, and the self-heal controller all
-//! share one executor-construction code path.
+//! `AutoRepairScheduler`, `ClusterRepairView`, `ClusterRepairTrigger`) and the
+//! *ports* (`RepairContext`, storage's `RepairTrigger` /
+//! `ExecutorProvider`). This module is the place in the `ferrosa` binary that
+//! satisfies the `RepairContext` port against live node state (the
+//! `ModeController`, `StorageEngine`, and `Schema`) and exposes the single
+//! `build_repair_executor` code path that both the periodic scheduler and the
+//! self-heal refill trigger's executor provider resolve against the current
+//! ring.
 //!
 //! See `specs/proposed/automatic-repair-scheduler-design.md` and its FMEA.
 
@@ -15,39 +17,29 @@ use std::sync::Arc;
 
 use ferrosa_cluster::ModeController;
 use ferrosa_cluster::{
-    LocalRepairExecutor, RemoteRepairStore, RepairContext, RepairCoordinator, SessionExecutor,
+    LocalRepairExecutor, RemoteRepairStore, RepairContext, SessionExecutor,
     StorageEngineRepairStore,
 };
 use ferrosa_schema::Schema;
-use ferrosa_storage::self_heal::RepairTrigger;
 use ferrosa_storage::{StorageEngine, TableId};
-
-/// A repair executor wired for the *current* ring, paired with this node's
-/// resolved `node_id`. `None` when the node is not ready to repair (not in
-/// cluster mode, no peer manager, or local node not yet placed in the ring).
-///
-/// This is the **single** executor-construction path. The manual repair
-/// endpoint and the [`BinaryRepairContext`] used by the scheduler both call it,
-/// so there is exactly one place that builds the local
-/// [`StorageEngineRepairStore`] + per-peer [`RemoteRepairStore`] →
-/// [`LocalRepairExecutor`].
-pub struct ResolvedExecutor {
-    /// The wired executor.
-    pub executor: Arc<dyn SessionExecutor>,
-    /// This node's `node_id` within the live ring.
-    pub local_node_id: u64,
-}
 
 /// Build a repair executor for the current ring, resolving this node's
 /// `node_id` from its `host_id`. Returns `None` when not in cluster mode, the
 /// peer manager is not initialised, or this node is not yet in the ring.
+///
+/// This is the **single** executor-construction path. The scheduler's
+/// [`BinaryRepairContext::build_executor`] and the self-heal refill trigger's
+/// [`ExecutorProvider`](ferrosa_cluster::repair::ExecutorProvider) closure both
+/// call it, so there is exactly one place that builds the local
+/// [`StorageEngineRepairStore`] + per-peer [`RemoteRepairStore`] →
+/// [`LocalRepairExecutor`].
 ///
 /// FMEA: every "not ready" condition is a clean `None` (the caller treats it as
 /// a no-op), never a panic or a fake executor.
 pub fn build_repair_executor(
     mode_controller: &ModeController,
     storage: &Arc<StorageEngine>,
-) -> Option<ResolvedExecutor> {
+) -> Option<Arc<dyn SessionExecutor>> {
     let ring = mode_controller.token_ring()?;
     let peer_manager = mode_controller.peer_manager_arc()?;
 
@@ -77,11 +69,7 @@ pub fn build_repair_executor(
         remotes.insert(node_id, remote);
     }
 
-    let executor: Arc<dyn SessionExecutor> = Arc::new(LocalRepairExecutor { local, remotes });
-    Some(ResolvedExecutor {
-        executor,
-        local_node_id,
-    })
+    Some(Arc::new(LocalRepairExecutor { local, remotes }))
 }
 
 /// Parse a keyspace's replication factor from its replication options.
@@ -213,134 +201,11 @@ impl RepairContext for BinaryRepairContext {
     }
 
     fn build_executor(&self) -> Option<Arc<dyn SessionExecutor>> {
-        build_repair_executor(&self.mode_controller, &self.storage).map(|r| r.executor)
+        build_repair_executor(&self.mode_controller, &self.storage)
     }
 
     fn user_tables(&self) -> Vec<(TableId, usize)> {
         user_tables_from_schema(&self.schema, &self.skip_prefixes, self.default_rf)
-    }
-}
-
-/// Production [`RepairTrigger`]: a quarantine schedules a prompt targeted
-/// repair of the affected table from a healthy replica (FMEA #10).
-///
-/// `request_refill` must be cheap and non-blocking, so it **spawns** the actual
-/// repair on the supplied runtime handle, bounded by a small semaphore so a
-/// burst of quarantines can't fan out unbounded repair load. A dropped permit
-/// (semaphore exhausted) is logged loudly — the periodic cycle is the backstop.
-pub struct BinaryRepairTrigger {
-    ctx: Arc<BinaryRepairContext>,
-    runtime: tokio::runtime::Handle,
-    /// Bounds concurrent triggered refills (FMEA #2 — don't OOM the node we heal).
-    permits: Arc<tokio::sync::Semaphore>,
-}
-
-impl BinaryRepairTrigger {
-    /// Maximum concurrent triggered refills. Small: a refill is a full
-    /// `repair_initiated` cycle for a table, already bounded internally by the
-    /// coordinator's session semaphore.
-    const MAX_CONCURRENT_REFILLS: usize = 2;
-
-    /// Construct from a [`BinaryRepairContext`] and the runtime to spawn the
-    /// refill on (the data runtime, which already drives internode IO).
-    pub fn new(ctx: Arc<BinaryRepairContext>, runtime: tokio::runtime::Handle) -> Self {
-        Self {
-            ctx,
-            runtime,
-            permits: Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_REFILLS)),
-        }
-    }
-}
-
-impl RepairTrigger for BinaryRepairTrigger {
-    fn request_refill(&self, table: &TableId, ranges: &[(i64, i64)]) {
-        let table = table.clone();
-        let ranges_len = ranges.len();
-        let ctx = self.ctx.clone();
-        let permits = self.permits.clone();
-
-        // Spawn — never block the self-heal controller's tick (FMEA #10).
-        self.runtime.spawn(async move {
-            // Bound concurrent refills; if exhausted, log loud and let the
-            // periodic cycle be the backstop rather than queueing unboundedly.
-            let _permit = match permits.try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::warn!(
-                        keyspace = %table.keyspace,
-                        table = %table.table,
-                        "auto-repair: refill trigger at capacity; skipping prompt refill — \
-                         periodic repair cycle is the backstop (FMEA #10)"
-                    );
-                    return;
-                }
-            };
-
-            let Some(resolved) = build_repair_executor(&ctx.mode_controller, &ctx.storage) else {
-                tracing::warn!(
-                    keyspace = %table.keyspace,
-                    table = %table.table,
-                    "auto-repair: refill requested but node not ring-ready; \
-                     periodic repair cycle is the backstop (FMEA #10)"
-                );
-                return;
-            };
-            let Some(ring) = ctx.mode_controller.token_ring() else {
-                tracing::warn!(
-                    keyspace = %table.keyspace,
-                    table = %table.table,
-                    "auto-repair: refill requested but ring vanished; backstop is the periodic cycle"
-                );
-                return;
-            };
-
-            // Per-keyspace RF (FMEA #11) — look the table up in the eligible set.
-            let rf = ctx
-                .user_tables()
-                .into_iter()
-                .find(|(t, _)| *t == table)
-                .map(|(_, rf)| rf)
-                .unwrap_or(ctx.default_rf);
-
-            tracing::info!(
-                keyspace = %table.keyspace,
-                table = %table.table,
-                rf,
-                ranges = ranges_len,
-                "auto-repair: starting triggered refill after quarantine"
-            );
-
-            // Reuse the initiator-only path: this node just quarantined a local
-            // copy, so it should initiate reconciliation of the ranges it owns.
-            let coord = RepairCoordinator::default();
-            let results = coord
-                .repair_initiated(
-                    resolved.executor,
-                    &ring,
-                    resolved.local_node_id,
-                    rf,
-                    &table,
-                )
-                .await;
-
-            let failed = results.iter().filter(|r| r.result.is_err()).count();
-            if failed > 0 {
-                tracing::warn!(
-                    keyspace = %table.keyspace,
-                    table = %table.table,
-                    sessions_total = results.len(),
-                    sessions_failed = failed,
-                    "auto-repair: triggered refill had failed sessions; periodic cycle is the backstop"
-                );
-            } else {
-                tracing::info!(
-                    keyspace = %table.keyspace,
-                    table = %table.table,
-                    sessions_total = results.len(),
-                    "auto-repair: triggered refill completed"
-                );
-            }
-        });
     }
 }
 

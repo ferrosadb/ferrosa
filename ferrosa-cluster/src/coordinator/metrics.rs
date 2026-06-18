@@ -15,6 +15,7 @@ static INBOUND_MUTATION_ROWS: AtomicU64 = AtomicU64::new(0);
 static INBOUND_MUTATION_FAILURES: AtomicU64 = AtomicU64::new(0);
 static WRITE_ADMISSION_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
 static WRITE_ADMISSION_IN_FLIGHT_MAX: AtomicI64 = AtomicI64::new(0);
+static ANTI_ENTROPY_REPAIRS_REQUESTED: AtomicU64 = AtomicU64::new(0);
 
 fn update_max_i64(target: &AtomicI64, value: i64) {
     let mut current = target.load(Ordering::Relaxed);
@@ -84,6 +85,20 @@ pub fn dec_write_admission_in_flight() {
     WRITE_ADMISSION_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
 }
 
+/// Record that the read coordinator requested one async anti-entropy repair
+/// after serving a read from a healthy replica because a local SSTable was
+/// corrupt. Returns the new total (process-wide). Non-zero in CI steady state
+/// should alert: it means real SSTable corruption was observed and self-healed.
+pub fn inc_anti_entropy_repair_requested() -> u64 {
+    ANTI_ENTROPY_REPAIRS_REQUESTED.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Process-wide count of async anti-entropy repairs the read coordinator has
+/// requested after serving around a corrupt local SSTable.
+pub fn anti_entropy_repairs_requested_total() -> u64 {
+    ANTI_ENTROPY_REPAIRS_REQUESTED.load(Ordering::Relaxed)
+}
+
 pub fn render_prometheus() -> String {
     format!(
         "# HELP ferrosa_coordinator_replica_write_attempts_total Replica write attempts by this coordinator.\n\
@@ -124,7 +139,10 @@ pub fn render_prometheus() -> String {
          ferrosa_coordinator_write_admission_in_flight {}\n\
          # HELP ferrosa_coordinator_write_admission_in_flight_max Maximum writes holding coordinator admission permits since process start.\n\
          # TYPE ferrosa_coordinator_write_admission_in_flight_max gauge\n\
-         ferrosa_coordinator_write_admission_in_flight_max {}\n",
+         ferrosa_coordinator_write_admission_in_flight_max {}\n\
+         # HELP ferrosa_coordinator_anti_entropy_repairs_requested_total Async anti-entropy repairs requested after serving a read around a corrupt local SSTable.\n\
+         # TYPE ferrosa_coordinator_anti_entropy_repairs_requested_total counter\n\
+         ferrosa_coordinator_anti_entropy_repairs_requested_total {}\n",
         LOCAL_WRITE_ATTEMPTS.load(Ordering::Relaxed),
         REMOTE_WRITE_ATTEMPTS.load(Ordering::Relaxed),
         LOCAL_WRITE_ACKS.load(Ordering::Relaxed),
@@ -140,6 +158,7 @@ pub fn render_prometheus() -> String {
         INBOUND_MUTATION_FAILURES.load(Ordering::Relaxed),
         WRITE_ADMISSION_IN_FLIGHT.load(Ordering::Relaxed),
         WRITE_ADMISSION_IN_FLIGHT_MAX.load(Ordering::Relaxed),
+        ANTI_ENTROPY_REPAIRS_REQUESTED.load(Ordering::Relaxed),
     )
 }
 

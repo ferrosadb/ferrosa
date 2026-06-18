@@ -5403,6 +5403,19 @@ impl StorageEngine {
         }
     }
 
+    /// SSTable generations the read path has quarantined for `table_id` because
+    /// a read exhausted the view-retry bound against them (genuine corruption,
+    /// not a transient compaction window). A non-empty result is the storage
+    /// signal that anti-entropy repair must refill those generations' token
+    /// ranges from a healthy replica. Empty (or an unknown table) yields `[]`.
+    pub fn table_quarantined_sstable_gens(&self, table_id: &TableId) -> Vec<String> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state.store.quarantined_sstable_gens(),
+            None => Vec::new(),
+        }
+    }
+
     /// Reads exactly one clustered row from a table partition, merging matching
     /// rows across memtable and SSTable sources.
     pub fn read_clustering_row(
@@ -9818,15 +9831,38 @@ mod tests {
             }
         }
 
-        // Read must NOT panic after SSTable files are deleted.
-        // The reader may still have data via mmap — both Some and None
-        // are acceptable. The key invariant: no panic, no hang.
-        let result = engine.read(&tid, &key);
-        assert!(
-            result.is_ok(),
-            "read after SSTable deletion must not panic: {:?}",
-            result.err()
-        );
+        // Read must NOT panic after SSTable files are deleted, and must NOT
+        // silently return empty results (the data was the only copy on this
+        // single node, RF=1). Two outcomes are correct:
+        //   (a) the cached reader still serves the data via its open fd/mmap →
+        //       Ok(Some) (the file deletion didn't actually break the read); or
+        //   (b) the read can no longer resolve the key → FAIL LOUD (`Err`) and
+        //       quarantine the corrupt SSTable for anti-entropy repair.
+        // A silent Ok(None) is the one forbidden outcome.
+        match engine.read(&tid, &key) {
+            Ok(Some(_)) => {
+                // Cached reader still served the data — acceptable.
+            }
+            Ok(None) => {
+                panic!(
+                    "read after SSTable deletion must not silently lose data: \
+                     got Ok(None) instead of failing loud"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    e.to_string().contains("corrupt SSTable")
+                        && e.to_string().contains("anti-entropy repair"),
+                    "the fail-loud error must identify the corrupt SSTable and signal repair, \
+                     got: {e}"
+                );
+                assert!(
+                    !engine.table_quarantined_sstable_gens(&tid).is_empty(),
+                    "a fail-loud unresolvable read must quarantine the corrupt SSTable \
+                     (repair requested)"
+                );
+            }
+        }
     }
 
     /// Production scenario: batch1 (small), flush, batch2 (large), flush,
@@ -14766,9 +14802,11 @@ mod tests {
 
     // ── FMEA: SSTable corruption resilience ─────────────────────────────
 
-    /// FMEA #1: Truncating an SSTable Data.db file should not crash reads.
-    /// The read should return data from the memtable or other SSTables,
-    /// logging a warning about the corrupt SSTable.
+    /// FMEA #1: Truncating an SSTable Data.db file must not crash reads — but
+    /// with NO healthy replica to refill from (single-node, RF=1) an
+    /// unresolvable read of the corrupt-only key must FAIL LOUD (return `Err`),
+    /// never a silent `Ok(None)` (anti-entropy slice). It must also QUARANTINE
+    /// the corrupt SSTable so repair can refill its range.
     #[test]
     fn read_survives_truncated_sstable_data_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -14815,17 +14853,26 @@ mod tests {
             }
         }
 
-        // Read should NOT crash — should return None (data lost but no panic)
-        let result = engine.read(&tid, &key);
+        // No healthy source holds the key (single-node, RF=1) and the only
+        // SSTable is corrupt: the read must FAIL LOUD, not silently lose data.
+        let err = engine
+            .read(&tid, &key)
+            .expect_err("unresolvable read of a corrupt-only SSTable must fail loud, not Ok(None)");
         assert!(
-            result.is_ok(),
-            "read with corrupt SSTable should not crash: {:?}",
-            result.err()
+            err.to_string().contains("corrupt SSTable")
+                && err.to_string().contains("anti-entropy repair"),
+            "the error must identify the corrupt SSTable and signal repair, got: {err}"
         );
-        // Data may be lost (from corrupt SSTable) but the operation didn't crash
+        // And the corrupt SSTable must be quarantined so repair can refill it.
+        assert!(
+            !engine.table_quarantined_sstable_gens(&tid).is_empty(),
+            "the corrupt SSTable must be quarantined (repair requested)"
+        );
     }
 
-    /// FMEA #6: Zero-length Data.db should not crash reads.
+    /// FMEA #6: Zero-length Data.db must not crash reads. With no healthy
+    /// replica (single-node, RF=1) an unresolvable read of the corrupt-only key
+    /// must FAIL LOUD and quarantine the corrupt SSTable for repair.
     #[test]
     fn read_survives_zero_length_data_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -14871,11 +14918,17 @@ mod tests {
             }
         }
 
-        let result = engine.read(&tid, &key);
+        let err = engine.read(&tid, &key).expect_err(
+            "unresolvable read of a zero-length corrupt SSTable must fail loud, not Ok(None)",
+        );
         assert!(
-            result.is_ok(),
-            "read with zero-length SSTable should not crash: {:?}",
-            result.err()
+            err.to_string().contains("corrupt SSTable")
+                && err.to_string().contains("anti-entropy repair"),
+            "the error must identify the corrupt SSTable and signal repair, got: {err}"
+        );
+        assert!(
+            !engine.table_quarantined_sstable_gens(&tid).is_empty(),
+            "the corrupt SSTable must be quarantined (repair requested)"
         );
     }
 
@@ -14955,8 +15008,11 @@ mod tests {
         assert!(r2.unwrap().is_some(), "new row should exist");
     }
 
-    /// FMEA #8: Memtable write + new data in memtable should still work
-    /// even if an SSTable is corrupt.
+    /// FMEA #8: A read RESOLVABLE from the memtable must still succeed
+    /// (`Ok(Some)`) even when an SSTable is corrupt — the corruption only
+    /// affects keys that lived in that SSTable. A read of the corrupt-only key,
+    /// with no healthy replica (single-node, RF=1), must FAIL LOUD and
+    /// quarantine the corrupt SSTable for repair (anti-entropy slice).
     #[test]
     fn memtable_data_survives_corrupt_sstable() {
         let dir = tempfile::tempdir().unwrap();
@@ -15013,17 +15069,26 @@ mod tests {
         };
         engine.write(&tid, &key_new, row, 2000).unwrap();
 
-        // Read new data from memtable — should work despite corrupt SSTable
+        // Read new data from memtable — must still work despite the corrupt
+        // SSTable (the key is resolvable from a healthy source).
         let r = engine.read(&tid, &key_new);
         assert!(r.is_ok(), "memtable read should work: {:?}", r.err());
         assert!(r.unwrap().is_some(), "memtable row should exist");
 
-        // Read old data — corrupt SSTable, but should not crash
-        let r_old = engine.read(&tid, &key_old);
+        // Read old data — it lived ONLY in the now-corrupt SSTable and there is
+        // no healthy replica to refill from. The read must FAIL LOUD rather than
+        // silently return Ok(None), and quarantine the corrupt SSTable.
+        let err = engine
+            .read(&tid, &key_old)
+            .expect_err("read of corrupt-only data with no replica must fail loud, not Ok(None)");
         assert!(
-            r_old.is_ok(),
-            "read of corrupt SSTable data should not crash: {:?}",
-            r_old.err()
+            err.to_string().contains("corrupt SSTable")
+                && err.to_string().contains("anti-entropy repair"),
+            "the error must identify the corrupt SSTable and signal repair, got: {err}"
+        );
+        assert!(
+            !engine.table_quarantined_sstable_gens(&tid).is_empty(),
+            "the corrupt SSTable must be quarantined (repair requested)"
         );
     }
 

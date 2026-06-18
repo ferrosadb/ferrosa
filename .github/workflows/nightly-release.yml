@@ -16,13 +16,12 @@ on:
       - 'docs/**'
       - '.github/**'
   schedule:
-    # Safety-net nightly in UTC (catches anything the push path missed, e.g. a
-    # release run that failed transiently). Skips itself when no commits have
-    # landed since the latest stable vX.Y.Z tag. Releases are cut as tags only:
-    # the version bump commit is captured by the tag and never pushed to the
-    # `main` branch (its ruleset requires pull requests). `release.yml` builds
-    # from the tag, so the published artifact always carries the correct version.
-    - cron: '17 8 * * *'
+    # Nightly release cut at 00:17 UTC so the built .deb/tarball artifacts are
+    # available well before the 03:00 Nightly Fuzz + Smoke Test workflow. The
+    # smoke test consumes the prebuilt Debian package instead of compiling from
+    # source, which was consuming most of the 55-minute job timeout and causing
+    # the pair-mode smoke test to be killed before nodes became CQL-ready.
+    - cron: '17 0 * * *'
   workflow_dispatch:
     inputs:
       bump:
