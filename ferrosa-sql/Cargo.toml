@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 ordered-float = "4"
+uuid = "1"

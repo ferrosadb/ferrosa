@@ -2160,6 +2160,7 @@ name = "ferrosa-sql"
 version = "0.13.0"
 dependencies = [
  "ordered-float",
+ "uuid",
 ]
 
 [[package]]

@@ -37,16 +37,18 @@
 //!
 //! ## Lossy [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
 //!
-//! The first-slice [`ferrosa_sql::Value`] models `Null | Int(i64) | Text | Bool
-//! | Float(f64)`. [`cql_to_value`] maps the integral / textual / boolean /
-//! floating-point CQL scalars onto it losslessly (f32 widens to f64). Every other
-//! CQL type is **known-lossy** and converts to `Value::Null` (with a code comment,
-//! never a panic). Widening `Value` to carry these is tracked as follow-up. The
-//! lossy types are:
+//! The [`ferrosa_sql::Value`] model covers `Null | Int(i64) | Text | Bool |
+//! Float(f64) | Uuid(uuid::Uuid) | Bytea(Vec<u8>)`. [`cql_to_value`] maps the
+//! integral / textual / boolean / floating-point CQL scalars onto it losslessly
+//! (f32 widens to f64); `uuid`/`timeuuid` map to `Value::Uuid` and `blob` to
+//! `Value::Bytea` (both have exact Postgres text representations). Every other
+//! CQL type is **known-lossy** and converts to `Value::Null` (with a code
+//! comment, never a panic). Widening `Value` to carry these is tracked as
+//! follow-up. The remaining lossy types are:
 //!
 //! - Arbitrary precision: `Decimal`, `Varint`
 //! - Temporal: `Timestamp`, `Date`, `Time`, `Duration`
-//! - Identifiers / binary: `Uuid`, `Timeuuid`, `Inet`, `Blob`
+//! - Network: `Inet`
 //! - Collections / composites: `List`, `Set`, `Map`, `Tuple`, `Udt`, `Vector`
 
 use std::fmt;
@@ -80,20 +82,24 @@ pub fn cql_to_value(v: &CqlValue) -> Value {
         // CQL value type can be Eq/Ord). Reconstruct the float and widen f32→f64.
         CqlValue::Float(bits) => Value::float(f32::from_bits(*bits) as f64),
         CqlValue::Double(bits) => Value::float(f64::from_bits(*bits)),
+        // Identifiers / binary: `uuid` and `timeuuid` carry a `uuid::Uuid`
+        // (Postgres uuid, OID 2950); `blob` carries raw bytes (Postgres bytea,
+        // OID 17). Both have exact, unambiguous Postgres text representations.
+        CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Value::Uuid(*u),
+        CqlValue::Blob(bytes) => Value::Bytea(bytes.clone()),
         // ── Known lossy gaps ──────────────────────────────────────────────
         // The first-slice `ferrosa_sql::Value` cannot represent these yet, so
         // they read as NULL rather than panicking. Widen `Value` (and update
         // this match) when real support lands. See the module-level doc list.
+        // Future widenings with exact Postgres text reprs: `timestamp`,
+        // `decimal`/`numeric`, `inet`.
         CqlValue::Decimal { .. }
         | CqlValue::Varint(_)
         | CqlValue::Timestamp(_)
         | CqlValue::Date(_)
         | CqlValue::Time(_)
         | CqlValue::Duration { .. }
-        | CqlValue::Uuid(_)
-        | CqlValue::Timeuuid(_)
         | CqlValue::Inet(_)
-        | CqlValue::Blob(_)
         | CqlValue::List(_)
         | CqlValue::Set(_)
         | CqlValue::Map(_)
@@ -132,17 +138,19 @@ impl std::error::Error for LoadError {}
 
 /// Map a CQL column-type string to the engine's [`ColumnType`].
 ///
-/// Only the three first-slice engine types exist (`Int`, `Text`, `Bool`); the CQL
-/// integral family collapses to `Int`, the textual family to `Text`. Anything the
-/// engine can't yet model (and any unknown type) defaults to `Text` — the most
-/// permissive textual representation — consistent with `catalog::type_oid`'s
-/// text fallback. The actual *value* for such columns still comes back NULL via
-/// [`cql_to_value`]; this only decides the column's declared schema type.
+/// The CQL integral family collapses to `Int`, the textual family to `Text`;
+/// `uuid`/`timeuuid` map to `Uuid` and `blob`/`bytes` to `Bytea` so a column's
+/// declared schema type agrees with the [`cql_to_value`] value type (and hence
+/// the advertised RowDescription OID). Anything the engine can't yet model (and
+/// any unknown type) defaults to `Text` — the most permissive textual
+/// representation — consistent with `catalog::type_oid`'s text fallback.
 fn engine_column_type(cql_type: &str) -> ColumnType {
     match normalize_type_head(cql_type).as_str() {
         "int" | "bigint" | "counter" | "smallint" | "tinyint" | "varint" => ColumnType::Int,
         "boolean" | "bool" => ColumnType::Bool,
         "text" | "varchar" | "ascii" => ColumnType::Text,
+        "uuid" | "timeuuid" => ColumnType::Uuid,
+        "blob" | "bytes" => ColumnType::Bytea,
         // Unknown / not-yet-modelled types default to Text (documented fallback).
         _ => ColumnType::Text,
     }
@@ -337,13 +345,24 @@ mod tests {
 
     #[test]
     fn cql_to_value_maps_lossy_types_to_null() {
-        // A representative lossy scalar, temporal, identifier, and collection.
+        // A representative lossy scalar, temporal, and collection. (Uuid /
+        // Timeuuid / Blob are no longer lossy — see the dedicated test below.)
         assert_eq!(cql_to_value(&CqlValue::Timestamp(123)), Value::Null);
-        assert_eq!(cql_to_value(&CqlValue::Uuid(Uuid::nil())), Value::Null);
-        assert_eq!(cql_to_value(&CqlValue::Blob(vec![1, 2, 3])), Value::Null);
         assert_eq!(
             cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn cql_to_value_maps_uuid_timeuuid_and_blob() {
+        // These now map through to the widened Value variants (no longer lossy).
+        let u = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(cql_to_value(&CqlValue::Uuid(u)), Value::Uuid(u));
+        assert_eq!(cql_to_value(&CqlValue::Timeuuid(u)), Value::Uuid(u));
+        assert_eq!(
+            cql_to_value(&CqlValue::Blob(vec![1, 2, 3])),
+            Value::Bytea(vec![1, 2, 3])
         );
     }
 
@@ -370,8 +389,11 @@ mod tests {
         assert_eq!(engine_column_type("text"), ColumnType::Text);
         assert_eq!(engine_column_type("ASCII"), ColumnType::Text);
         assert_eq!(engine_column_type("boolean"), ColumnType::Bool);
+        // uuid / timeuuid / blob now map to the widened engine types.
+        assert_eq!(engine_column_type("uuid"), ColumnType::Uuid);
+        assert_eq!(engine_column_type("timeuuid"), ColumnType::Uuid);
+        assert_eq!(engine_column_type("blob"), ColumnType::Bytea);
         // Unknown / not-yet-modelled -> Text fallback.
-        assert_eq!(engine_column_type("uuid"), ColumnType::Text);
         assert_eq!(engine_column_type("map<text, text>"), ColumnType::Text);
     }
 
