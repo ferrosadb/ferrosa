@@ -12825,7 +12825,12 @@ mod tests {
             while start.elapsed().as_secs() < secs {
                 for _ in 0..flush_every {
                     engine
-                        .write(&tid, &make_key(&format!("junk{j:010}")), make_row(b"j", ts), ts)
+                        .write(
+                            &tid,
+                            &make_key(&format!("junk{j:010}")),
+                            make_row(b"j", ts),
+                            ts,
+                        )
                         .unwrap();
                     ts += 1;
                     j += 1;
