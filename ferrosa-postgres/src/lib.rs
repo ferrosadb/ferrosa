@@ -12,6 +12,7 @@
 //! **types** (`messages`) — the pure, infra-free foundation (harness layer H1)
 //! that the connection state machine and SCRAM exchange build on.
 
+pub mod catalog;
 pub mod codec;
 pub mod connection;
 pub mod handshake;

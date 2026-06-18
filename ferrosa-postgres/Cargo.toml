@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-sql = { path = "../ferrosa-sql" }
 base64 = "0.22"
 bytes = "1"
 hmac = "0.12"
@@ -17,6 +18,8 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["net", "rt", "io-util", "macros", "sync"] }
 
 [dev-dependencies]
+indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
+uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
