@@ -134,6 +134,7 @@ mod tests {
                 can_login: true,
                 salted_hash,
                 member_of: HashSet::new(),
+                scram: None,
             },
         );
         snap
@@ -180,6 +181,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: ["parent".to_string()].into_iter().collect(),
+                scram: None,
             },
         );
         let rows = query_role_members(&snap);

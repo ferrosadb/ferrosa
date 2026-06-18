@@ -57,6 +57,21 @@ pub struct ScramVerifier {
     pub server_key: [u8; 32],
 }
 
+impl From<&ferrosa_schema::ScramCredential> for ScramVerifier {
+    /// Adapt a schema-stored SCRAM credential (derived at password-set time in
+    /// `ferrosa-schema`, per D4) into the postgres wire verifier. The fields are
+    /// identical, so this is a field-for-field copy — the server half of the
+    /// exchange (`server_first`/`verify_client_final`) then operates on it.
+    fn from(c: &ferrosa_schema::ScramCredential) -> Self {
+        ScramVerifier {
+            salt: c.salt.clone(),
+            iterations: c.iterations,
+            stored_key: c.stored_key,
+            server_key: c.server_key,
+        }
+    }
+}
+
 impl ScramVerifier {
     /// Derive a verifier from a cleartext password (called at password-set time,
     /// on every CQL/Postgres password path per D4).

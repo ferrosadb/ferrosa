@@ -341,6 +341,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema
             .create_role(role, Some("viewerpass"), &superuser_ctx)
@@ -506,6 +507,7 @@ mod tests {
             can_login: false,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema
             .create_role(operator_role, None, &superuser_ctx)
@@ -520,6 +522,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of,
+            scram: None,
         };
         schema
             .create_role(ops_user, Some("opspass123"), &superuser_ctx)

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ferrosa-schema = { path = "../ferrosa-schema" }
 base64 = "0.22"
 bytes = "1"
 hmac = "0.12"

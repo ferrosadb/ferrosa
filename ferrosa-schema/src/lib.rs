@@ -24,7 +24,7 @@ pub use audit::{
 };
 pub use auth::{
     check_permission, AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy,
-    Permission, RateLimitConfig, Resource, RoleMetadata, RoleUpdates,
+    Permission, RateLimitConfig, Resource, RoleMetadata, RoleUpdates, ScramCredential,
 };
 pub use convert::cql_to_marshal_type;
 pub use error::{Result, SchemaError};

@@ -317,6 +317,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: HashSet::new(),
+                scram: None,
             },
         );
         snap.grants.insert(
@@ -408,6 +409,7 @@ mod tests {
                 can_login: false,
                 salted_hash: None,
                 member_of: HashSet::new(),
+                scram: None,
             },
         );
         snap.grants.insert(
@@ -428,6 +430,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: ["data_team".to_string()].into_iter().collect(),
+                scram: None,
             },
         );
 
@@ -454,6 +457,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: ["role_b".to_string()].into_iter().collect(),
+                scram: None,
             },
         );
         snap.roles.insert(
@@ -464,6 +468,7 @@ mod tests {
                 can_login: false,
                 salted_hash: None,
                 member_of: ["role_a".to_string()].into_iter().collect(),
+                scram: None,
             },
         );
 

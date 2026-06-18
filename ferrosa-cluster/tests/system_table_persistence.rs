@@ -124,6 +124,7 @@ fn multiple_ddl_operations_survive_restart() {
             can_login: true,
             salted_hash: Some("$argon2id$hash".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
         writer
             .apply(SystemTableMutation::RoleCreated(role))
