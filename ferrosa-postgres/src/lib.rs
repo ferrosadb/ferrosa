@@ -18,9 +18,11 @@ pub mod handshake;
 pub mod messages;
 pub mod scram;
 pub mod server;
+pub mod store;
 
 pub use connection::{ConnError, Connection};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
+pub use store::SchemaVerifierStore;
 
 pub use codec::{CodecError, MAX_MESSAGE_LEN};
 pub use messages::{

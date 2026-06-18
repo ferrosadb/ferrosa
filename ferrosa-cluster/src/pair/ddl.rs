@@ -791,6 +791,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2a$10$primary-side-hash".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
         let envelope = DdlEnvelope {
             op: DdlOperation::CreateRole(role),
@@ -861,6 +862,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2a$10$abcdef".into()),
             member_of: HashSet::new(),
+            scram: None,
         };
         let op = DdlOperation::CreateRole(role);
         let bytes = op.to_bytes().unwrap();
@@ -1016,6 +1018,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         });
         let bytes = op.to_bytes().unwrap();
         let decoded = DdlOperation::from_bytes(&bytes).unwrap();

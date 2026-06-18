@@ -7812,6 +7812,7 @@ async fn route_create_role(
         can_login: s.login.unwrap_or(false),
         salted_hash: None,
         member_of: HashSet::new(),
+        scram: None,
     };
 
     let ddl_guard = state.ddl_path.load();

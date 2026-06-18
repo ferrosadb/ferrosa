@@ -4,6 +4,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::scram::ScramCredential;
+
 /// Metadata for a database role.
 ///
 /// Roles in Cassandra are the principals for both authentication and
@@ -20,6 +22,13 @@ pub struct RoleMetadata {
     pub salted_hash: Option<String>,
     /// Set of role names this role is a member of (inherited permissions).
     pub member_of: HashSet<String>,
+    /// SCRAM-SHA-256 verifier derived from the cleartext password at
+    /// password-set time (D4). `None` when no plaintext password has been set
+    /// (e.g. `HASHED PASSWORD` roles, or roles created before this field
+    /// existed). `#[serde(default)]` keeps old persisted/replicated roles
+    /// forward/backward compatible — they deserialize with `scram == None`.
+    #[serde(default)]
+    pub scram: Option<ScramCredential>,
 }
 
 /// Authentication context for the current session.
@@ -66,6 +75,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2a$10$abcdef".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
 
         assert_eq!(role.name, "admin");

@@ -112,6 +112,7 @@ fn seed_role(schema: &Schema, role: &str, grants: Vec<GrantEntry>) {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         })
         .expect("seed role");
     for grant in grants {

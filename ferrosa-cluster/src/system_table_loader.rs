@@ -535,6 +535,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: Default::default(),
+                scram: None,
             })
             .unwrap();
 

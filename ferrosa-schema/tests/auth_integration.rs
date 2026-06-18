@@ -46,6 +46,7 @@ fn test_role(name: &str) -> RoleMetadata {
         can_login: true,
         salted_hash: None,
         member_of: HashSet::new(),
+        scram: None,
     }
 }
 

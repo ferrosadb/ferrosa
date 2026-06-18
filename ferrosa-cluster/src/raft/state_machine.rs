@@ -3011,6 +3011,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
 
         let entries = vec![
@@ -3032,6 +3033,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: HashSet::new(),
+                scram: None,
             })
         };
         let grant = |member: &str, role: &str| RaftOp::GrantRole {
@@ -3098,6 +3100,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2a$10$leader-side-hash".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
 
         sm.apply(vec![make_entry(1, 1, RaftOp::CreateRole(role))])
@@ -3818,6 +3821,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
 
         let entries = vec![make_entry(1, 1, RaftOp::CreateRole(role))];

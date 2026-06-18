@@ -1814,6 +1814,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         ddl.execute(DdlOperation::CreateRole(role)).await.unwrap();
         assert!(schema.snapshot().roles.contains_key("test_role"));
@@ -1841,6 +1842,7 @@ mod tests {
             can_login: false,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         ddl.execute(DdlOperation::CreateRole(role)).await.unwrap();
 
@@ -1908,6 +1910,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         let op = DdlOperation::CreateRole(role);
         let cmd = ddl_op_to_raft_command(op);
