@@ -2048,6 +2048,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-postgres"
+version = "0.13.0"
+dependencies = [
+ "bytes",
+ "proptest",
+]
+
+[[package]]
 name = "ferrosa-schema"
 version = "0.13.0"
 dependencies = [
