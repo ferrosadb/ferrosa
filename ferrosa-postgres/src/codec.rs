@@ -149,6 +149,11 @@ pub fn read_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Code
                 .ok_or(CodecError::Malformed("query string not NUL-terminated"))?;
             Ok(Some(FrontendMessage::Query(query)))
         }
+        b'P' => parse_parse(&mut frame),
+        b'B' => parse_bind(&mut frame),
+        b'D' => parse_describe(&mut frame),
+        b'E' => parse_execute(&mut frame),
+        b'C' => parse_close(&mut frame),
         b'S' => Ok(Some(FrontendMessage::Sync)),
         b'X' => Ok(Some(FrontendMessage::Terminate)),
         b'p' => Ok(Some(FrontendMessage::SaslResponse {
@@ -159,6 +164,129 @@ pub fn read_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Code
             body: frame.to_vec(),
         })),
     }
+}
+
+/// Read a big-endian `i16` from the front of an already-framed message body,
+/// failing loud if fewer than 2 bytes remain (a structurally short frame).
+fn read_i16(buf: &mut BytesMut) -> Result<i16, CodecError> {
+    if buf.len() < 2 {
+        return Err(CodecError::Malformed("expected i16, body too short"));
+    }
+    Ok(buf.get_i16())
+}
+
+/// Read a big-endian `i32` from the front of an already-framed message body.
+fn read_i32(buf: &mut BytesMut) -> Result<i32, CodecError> {
+    if buf.len() < 4 {
+        return Err(CodecError::Malformed("expected i32, body too short"));
+    }
+    Ok(buf.get_i32())
+}
+
+/// Read a required NUL-terminated C-string, failing loud if absent.
+fn read_cstring_req(buf: &mut BytesMut, why: &'static str) -> Result<String, CodecError> {
+    read_cstring(buf)?.ok_or(CodecError::Malformed(why))
+}
+
+/// Parse a `P` (Parse): `stmt_name`, `query`, then i16 count of i32 type OIDs.
+fn parse_parse(frame: &mut BytesMut) -> Result<Option<FrontendMessage>, CodecError> {
+    let stmt_name = read_cstring_req(frame, "Parse: statement name not NUL-terminated")?;
+    let query = read_cstring_req(frame, "Parse: query string not NUL-terminated")?;
+    let n = read_i16(frame)?;
+    if n < 0 {
+        return Err(CodecError::Malformed(
+            "Parse: negative parameter-type count",
+        ));
+    }
+    let mut param_types = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        param_types.push(read_i32(frame)?);
+    }
+    Ok(Some(FrontendMessage::Parse {
+        stmt_name,
+        query,
+        param_types,
+    }))
+}
+
+/// Read a count-prefixed list of i16 format codes (used for both the parameter
+/// and result format-code arrays in Bind).
+fn read_format_codes(frame: &mut BytesMut) -> Result<Vec<i16>, CodecError> {
+    let n = read_i16(frame)?;
+    if n < 0 {
+        return Err(CodecError::Malformed("Bind: negative format-code count"));
+    }
+    let mut codes = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        codes.push(read_i16(frame)?);
+    }
+    Ok(codes)
+}
+
+/// Parse a `B` (Bind): portal, statement name, parameter format codes,
+/// parameter values (each i32 length + bytes; -1 = NULL), result format codes.
+fn parse_bind(frame: &mut BytesMut) -> Result<Option<FrontendMessage>, CodecError> {
+    let portal = read_cstring_req(frame, "Bind: portal name not NUL-terminated")?;
+    let stmt_name = read_cstring_req(frame, "Bind: statement name not NUL-terminated")?;
+    let param_formats = read_format_codes(frame)?;
+
+    let nvals = read_i16(frame)?;
+    if nvals < 0 {
+        return Err(CodecError::Malformed(
+            "Bind: negative parameter-value count",
+        ));
+    }
+    let mut param_values = Vec::with_capacity(nvals as usize);
+    for _ in 0..nvals {
+        let len = read_i32(frame)?;
+        if len == -1 {
+            param_values.push(None); // SQL NULL
+        } else if len < 0 {
+            return Err(CodecError::Malformed("Bind: invalid parameter length"));
+        } else {
+            let len = len as usize;
+            if frame.len() < len {
+                return Err(CodecError::Malformed("Bind: parameter value truncated"));
+            }
+            param_values.push(Some(frame.split_to(len).to_vec()));
+        }
+    }
+
+    let result_formats = read_format_codes(frame)?;
+    Ok(Some(FrontendMessage::Bind {
+        portal,
+        stmt_name,
+        param_formats,
+        param_values,
+        result_formats,
+    }))
+}
+
+/// Parse a `D` (Describe): one kind byte (`S` statement | `P` portal) + name.
+fn parse_describe(frame: &mut BytesMut) -> Result<Option<FrontendMessage>, CodecError> {
+    if frame.is_empty() {
+        return Err(CodecError::Malformed("Describe: missing kind byte"));
+    }
+    let kind = frame.get_u8();
+    let name = read_cstring_req(frame, "Describe: name not NUL-terminated")?;
+    Ok(Some(FrontendMessage::Describe { kind, name }))
+}
+
+/// Parse an `E` (Execute): portal name + i32 max-rows.
+fn parse_execute(frame: &mut BytesMut) -> Result<Option<FrontendMessage>, CodecError> {
+    let portal = read_cstring_req(frame, "Execute: portal name not NUL-terminated")?;
+    let max_rows = read_i32(frame)?;
+    Ok(Some(FrontendMessage::Execute { portal, max_rows }))
+}
+
+/// Parse a `C` (Close): one kind byte (`S` | `P`) + name.
+fn parse_close(frame: &mut BytesMut) -> Result<Option<FrontendMessage>, CodecError> {
+    if frame.is_empty() {
+        return Err(CodecError::Malformed("Close: missing kind byte"));
+    }
+    let kind = frame.get_u8();
+    let name = read_cstring_req(frame, "Close: name not NUL-terminated")?;
+    Ok(Some(FrontendMessage::Close { kind, name }))
 }
 
 #[cfg(test)]
@@ -399,12 +527,12 @@ mod tests {
     #[test]
     fn unknown_frontend_tag_is_surfaced_not_dropped() {
         let mut buf = BytesMut::new();
-        buf.put_u8(b'P'); // Parse — not handled in this slice
+        buf.put_u8(b'H'); // Flush — not handled in this slice; surfaced as Unknown
         buf.put_i32(4 + 3);
         buf.extend_from_slice(&[1, 2, 3]);
         match read_frontend(&mut buf).unwrap().unwrap() {
             FrontendMessage::Unknown { tag, body } => {
-                assert_eq!(tag, b'P');
+                assert_eq!(tag, b'H');
                 assert_eq!(body, vec![1, 2, 3]);
             }
             other => panic!("expected Unknown, got {other:?}"),
@@ -422,5 +550,135 @@ mod tests {
                 len: MAX_MESSAGE_LEN + 1
             })
         );
+    }
+
+    // ---- extended-query frontend messages (Parse/Bind/Describe/Execute/Close) ----
+
+    /// Wrap an extended-message body with its tag + length prefix.
+    fn tagged(tag: u8, body: &[u8]) -> BytesMut {
+        let mut v = BytesMut::new();
+        v.put_u8(tag);
+        v.put_i32((body.len() + 4) as i32);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn parses_parse_message_with_param_types() {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"stmt1\x00"); // statement name
+        body.extend_from_slice(b"SELECT $1\x00"); // query
+        body.put_i16(1); // one declared param type
+        body.put_i32(23); // int4
+        let mut buf = tagged(b'P', &body);
+        assert_eq!(
+            read_frontend(&mut buf).unwrap(),
+            Some(FrontendMessage::Parse {
+                stmt_name: "stmt1".into(),
+                query: "SELECT $1".into(),
+                param_types: vec![23],
+            })
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn parses_bind_message_binary_param_and_null_and_result_formats() {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"\x00"); // portal: unnamed
+        body.extend_from_slice(b"stmt1\x00"); // statement name
+        body.put_i16(1); // one param format code...
+        body.put_i16(1); // ...binary, applies to all
+        body.put_i16(2); // two param values
+        body.put_i32(4); // value 0: 4 bytes (an int4)
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.put_i32(-1); // value 1: NULL
+        body.put_i16(1); // one result format code...
+        body.put_i16(1); // ...binary
+        let mut buf = tagged(b'B', &body);
+        assert_eq!(
+            read_frontend(&mut buf).unwrap(),
+            Some(FrontendMessage::Bind {
+                portal: String::new(),
+                stmt_name: "stmt1".into(),
+                param_formats: vec![1],
+                param_values: vec![Some(1i32.to_be_bytes().to_vec()), None],
+                result_formats: vec![1],
+            })
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn parses_describe_statement_and_portal() {
+        let mut s = tagged(b'D', b"S\x00"); // describe the unnamed statement
+        assert_eq!(
+            read_frontend(&mut s).unwrap(),
+            Some(FrontendMessage::Describe {
+                kind: b'S',
+                name: String::new()
+            })
+        );
+        let mut p = tagged(b'D', b"Pportal\x00");
+        assert_eq!(
+            read_frontend(&mut p).unwrap(),
+            Some(FrontendMessage::Describe {
+                kind: b'P',
+                name: "portal".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_execute_with_max_rows() {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"\x00"); // unnamed portal
+        body.put_i32(0); // all rows
+        let mut buf = tagged(b'E', &body);
+        assert_eq!(
+            read_frontend(&mut buf).unwrap(),
+            Some(FrontendMessage::Execute {
+                portal: String::new(),
+                max_rows: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parses_close_statement() {
+        let mut buf = tagged(b'C', b"Sstmt1\x00");
+        assert_eq!(
+            read_frontend(&mut buf).unwrap(),
+            Some(FrontendMessage::Close {
+                kind: b'S',
+                name: "stmt1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn bind_with_zero_param_formats_means_all_text() {
+        let mut body = BytesMut::new();
+        body.extend_from_slice(b"\x00"); // portal
+        body.extend_from_slice(b"\x00"); // statement (unnamed)
+        body.put_i16(0); // zero param format codes ⇒ all text
+        body.put_i16(1); // one value
+        body.put_i32(3);
+        body.extend_from_slice(b"abc");
+        body.put_i16(0); // zero result format codes
+        let mut buf = tagged(b'B', &body);
+        match read_frontend(&mut buf).unwrap().unwrap() {
+            FrontendMessage::Bind {
+                param_formats,
+                param_values,
+                result_formats,
+                ..
+            } => {
+                assert!(param_formats.is_empty());
+                assert_eq!(param_values, vec![Some(b"abc".to_vec())]);
+                assert!(result_formats.is_empty());
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
     }
 }

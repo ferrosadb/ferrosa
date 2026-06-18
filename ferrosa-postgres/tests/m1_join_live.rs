@@ -384,6 +384,99 @@ async fn m1_join_returns_rows_to_a_real_driver() {
 }
 
 #[tokio::test]
+async fn extended_query_error_recovers_after_sync() {
+    // A parameterized query against a missing table must surface as a fail-loud
+    // driver error (extended protocol: ErrorResponse, then ignore until Sync),
+    // and the connection must remain usable for the next query.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seed_engine(dir.path());
+    let schema = create_schema();
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    let client = connect(port).await;
+
+    // Unknown table via the extended (parameterized) path ⇒ undefined_table.
+    let err = client
+        .query("SELECT name FROM ghosts WHERE id = $1", &[&1i32])
+        .await
+        .expect_err("missing table must surface as a driver error");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("42P01"),
+        "unexpected error for missing table: {err}"
+    );
+
+    // Session still usable: a valid parameterized query returns rows.
+    let rows = client
+        .query(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = $1",
+            &[&1i32],
+        )
+        .await
+        .expect("session remains usable after a fail-loud extended error");
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn extended_parameterized_join_over_a_real_driver() {
+    // tokio-postgres `query()` uses the EXTENDED protocol with BINARY parameter
+    // AND BINARY result encoding: Parse → Describe(S) → Bind → Execute → Sync.
+    // This exercises the full prepared-statement / portal path end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seed_engine(dir.path());
+    let schema = create_schema();
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    let client = connect(port).await;
+
+    // alice (id=1) has two orders: oid 10 and 11. `$1` is a binary int4 param,
+    // and the typed `row.get::<_, i32>` forces binary result decoding.
+    let rows = client
+        .query(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = $1",
+            &[&1i32],
+        )
+        .await
+        .expect("parameterized join should return rows");
+    assert_eq!(rows.len(), 2, "alice has exactly two orders");
+    let mut oids: Vec<i32> = rows
+        .iter()
+        .map(|r| {
+            assert_eq!(r.get::<_, &str>(0), "alice", "name column must be alice");
+            r.get::<_, i32>(1)
+        })
+        .collect();
+    oids.sort_unstable();
+    assert_eq!(oids, vec![10, 11], "alice's orders are oid 10 and 11");
+
+    // bob (id=2) has exactly one order (oid 12).
+    let bob = client
+        .query(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = $1",
+            &[&2i32],
+        )
+        .await
+        .expect("parameterized join for bob should return rows");
+    assert_eq!(bob.len(), 1, "bob has exactly one order");
+    assert_eq!(bob[0].get::<_, &str>(0), "bob");
+    assert_eq!(bob[0].get::<_, i32>(1), 12);
+}
+
+#[tokio::test]
 async fn group_by_order_by_limit_over_a_real_driver() {
     let dir = tempfile::tempdir().unwrap();
     let engine = seed_engine(dir.path());

@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod codec;
 pub mod connection;
+pub mod extended;
 pub mod handshake;
 pub mod messages;
 pub mod query;

@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 
 use crate::codec::{self, CodecError};
 use crate::connection::{ConnError, Connection};
+use crate::extended::{self, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage, TransactionStatus};
 use crate::query;
@@ -114,8 +115,12 @@ where
     query_loop(&mut stream, &mut frames, &ctx, &mut buf).await
 }
 
-/// Frame and serve simple queries until the client terminates or the socket
-/// closes. `frames` is seeded with any already-buffered post-auth bytes.
+/// Frame and serve queries — both the **simple** (`Q`) and **extended**
+/// (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`) protocols — until the
+/// client terminates or the socket closes. `frames` is seeded with any
+/// already-buffered post-auth bytes. A per-connection [`Session`] holds the
+/// prepared statements and portals; an error mid-extended-sequence sets a skip
+/// flag so subsequent messages are ignored until `Sync`.
 async fn query_loop<St>(
     stream: &mut St,
     frames: &mut BytesMut,
@@ -125,27 +130,14 @@ async fn query_loop<St>(
 where
     St: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut session = Session::new();
     loop {
         match codec::read_frontend(frames) {
-            Ok(Some(FrontendMessage::Query(sql))) => {
-                let msgs =
-                    query::execute_query(&ctx.engine, &ctx.schema, &sql, &ctx.default_schema).await;
-                let mut out = BytesMut::new();
-                for m in &msgs {
-                    m.encode(&mut out);
+            Ok(Some(msg)) => {
+                if handle_frontend(stream, ctx, &mut session, msg).await? {
+                    return Ok(()); // Terminate
                 }
-                BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
-                stream.write_all(&out).await?;
             }
-            Ok(Some(FrontendMessage::Sync)) => {
-                let mut out = BytesMut::new();
-                BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
-                stream.write_all(&out).await?;
-            }
-            Ok(Some(FrontendMessage::Terminate)) => return Ok(()),
-            // Unknown / not-yet-handled post-auth messages: ignore (extended-query
-            // Parse/Bind/etc. are a later slice), continue framing.
-            Ok(Some(_)) => {}
             Ok(None) => {
                 // Need more bytes for a complete frame.
                 let n = stream.read(read_buf).await?;
@@ -161,6 +153,250 @@ where
             }
         }
     }
+}
+
+/// Handle one framed frontend message. Returns `Ok(true)` when the client asked
+/// to terminate. Encodes any backend replies and writes them to `stream`.
+///
+/// Extended-protocol error skipping: while `session.is_error_pending()`, every
+/// message except `Sync` is ignored (Postgres semantics — the backend discards
+/// messages until the next Sync after an error).
+async fn handle_frontend<St>(
+    stream: &mut St,
+    ctx: &QueryContext,
+    session: &mut Session,
+    msg: FrontendMessage,
+) -> std::io::Result<bool>
+where
+    St: AsyncRead + AsyncWrite + Unpin,
+{
+    // While an error is pending, skip everything until Sync (which re-readies).
+    if session.is_error_pending() && !matches!(msg, FrontendMessage::Sync) {
+        return Ok(false);
+    }
+
+    let mut out = BytesMut::new();
+    match msg {
+        FrontendMessage::Query(sql) => {
+            let msgs =
+                query::execute_query(&ctx.engine, &ctx.schema, &sql, &ctx.default_schema).await;
+            for m in &msgs {
+                m.encode(&mut out);
+            }
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
+        }
+        FrontendMessage::Parse {
+            stmt_name,
+            query,
+            param_types,
+        } => {
+            session
+                .on_parse(stmt_name, &query, param_types)
+                .encode(&mut out);
+        }
+        FrontendMessage::Bind {
+            portal,
+            stmt_name,
+            param_formats,
+            param_values,
+            result_formats,
+        } => {
+            session
+                .on_bind(
+                    portal,
+                    stmt_name,
+                    &param_formats,
+                    &param_values,
+                    result_formats,
+                )
+                .encode(&mut out);
+        }
+        FrontendMessage::Describe { kind, name } => {
+            for m in describe(ctx, session, kind, &name).await {
+                m.encode(&mut out);
+            }
+        }
+        FrontendMessage::Execute { portal, .. } => {
+            for m in execute_portal(ctx, session, &portal).await {
+                m.encode(&mut out);
+            }
+        }
+        FrontendMessage::Close { kind, name } => {
+            session.on_close(kind, &name).encode(&mut out);
+        }
+        FrontendMessage::Sync => {
+            session.on_sync();
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
+        }
+        FrontendMessage::Terminate => return Ok(true),
+        // SASL after auth, or any other unexpected message: ignore.
+        FrontendMessage::SaslResponse { .. } | FrontendMessage::Unknown { .. } => {}
+    }
+
+    if !out.is_empty() {
+        stream.write_all(&out).await?;
+    }
+    Ok(false)
+}
+
+/// Handle `Describe`: for a statement (`S`), reply `ParameterDescription` then a
+/// `RowDescription`/`NoData`; for a portal (`P`), reply a `RowDescription`/
+/// `NoData` under the portal's result formats. On any error, set the skip flag
+/// and reply a single `ErrorResponse`.
+async fn describe(
+    ctx: &QueryContext,
+    session: &mut Session,
+    kind: u8,
+    name: &str,
+) -> Vec<BackendMessage> {
+    match kind {
+        b'S' => {
+            let Some(stmt) = session.statement(name) else {
+                return vec![session.fail(query::error_response(
+                    "26000",
+                    &format!("prepared statement \"{name}\" does not exist"),
+                ))];
+            };
+            let parsed = stmt.parsed.clone();
+            let declared = stmt.param_oids.clone();
+
+            // ParameterDescription: a driver (e.g. tokio-postgres) relies on this
+            // to serialize bound parameters. Use the client-declared OID where
+            // given (non-zero), else infer the parameter's type from the column
+            // it is compared against.
+            let param_oids = match infer_param_oids(ctx, session, &parsed, &declared).await {
+                Ok(oids) => oids,
+                Err(err) => return vec![err],
+            };
+            // Persist the resolved OIDs so a later Bind decodes binary params
+            // against the same types the driver was told to serialize with.
+            session.set_param_oids(name, param_oids.clone());
+            let mut msgs = vec![extended::parameter_description(&param_oids)];
+            match describe_columns(ctx, session, &parsed).await {
+                Ok(columns) => msgs.push(extended::describe_statement_rows(&columns)),
+                Err(err) => return vec![err], // describe_columns already set the flag
+            }
+            msgs
+        }
+        b'P' => {
+            let Some(portal) = session.portal(name) else {
+                return vec![session.fail(query::error_response(
+                    "34000",
+                    &format!("portal \"{name}\" does not exist"),
+                ))];
+            };
+            let stmt_name = portal.stmt_name.clone();
+            let result_formats = portal.result_formats.clone();
+            let Some(stmt) = session.statement(&stmt_name) else {
+                return vec![session.fail(query::error_response(
+                    "26000",
+                    &format!("prepared statement \"{stmt_name}\" does not exist"),
+                ))];
+            };
+            let parsed = stmt.parsed.clone();
+            match describe_columns(ctx, session, &parsed).await {
+                Ok(columns) => vec![extended::describe_portal_rows(&columns, &result_formats)],
+                Err(err) => vec![err],
+            }
+        }
+        _ => vec![session.fail(query::error_response(
+            "08P01",
+            "Describe kind must be 'S' or 'P'",
+        ))],
+    }
+}
+
+/// Resolve the parameter type OIDs to advertise in `ParameterDescription`. For
+/// each `$N`, prefer the client-declared OID when it is non-zero; otherwise
+/// infer the type from the column the parameter is compared against (loading the
+/// referenced tables to type-resolve). On failure, set the skip flag and return
+/// the `ErrorResponse`.
+async fn infer_param_oids(
+    ctx: &QueryContext,
+    session: &mut Session,
+    stmt: &ferrosa_sql::SelectStmt,
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let catalog =
+        match query::load_catalog(&ctx.engine, &ctx.schema, stmt, &ctx.default_schema).await {
+            Ok(catalog) => catalog,
+            Err(err) => return Err(session.fail(err)),
+        };
+    let inferred = match ferrosa_sql::infer_param_types(stmt, &catalog, &ctx.default_schema) {
+        Ok(types) => types,
+        Err(e) => return Err(session.fail(extended::describe_exec_error(&e))),
+    };
+    Ok(inferred
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| match declared.get(i).copied() {
+            Some(oid) if oid != 0 => oid,
+            _ => query::column_type_oid(*ty),
+        })
+        .collect())
+}
+
+/// Resolve a statement's output columns: load its tables, then call
+/// `ferrosa_sql::describe` (no operators / no params). On failure, set the skip
+/// flag and return the `ErrorResponse`.
+async fn describe_columns(
+    ctx: &QueryContext,
+    session: &mut Session,
+    stmt: &ferrosa_sql::SelectStmt,
+) -> Result<Vec<ferrosa_sql::Column>, BackendMessage> {
+    let catalog =
+        match query::load_catalog(&ctx.engine, &ctx.schema, stmt, &ctx.default_schema).await {
+            Ok(catalog) => catalog,
+            Err(err) => return Err(session.fail(err)),
+        };
+    match ferrosa_sql::describe(stmt, &catalog, &ctx.default_schema) {
+        Ok(columns) => Ok(columns),
+        Err(e) => Err(session.fail(extended::describe_exec_error(&e))),
+    }
+}
+
+/// Handle `Execute`: load the portal's tables, run the bound query, and emit the
+/// result rows encoded per the portal's result formats + `CommandComplete`. On
+/// any error, set the skip flag and reply a single `ErrorResponse`. (Does NOT
+/// emit `ReadyForQuery` — that follows `Sync`.)
+async fn execute_portal(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+) -> Vec<BackendMessage> {
+    let Some(portal) = session.portal(portal_name) else {
+        return vec![session.fail(query::error_response(
+            "34000",
+            &format!("portal \"{portal_name}\" does not exist"),
+        ))];
+    };
+    let stmt_name = portal.stmt_name.clone();
+    let params = portal.params.clone();
+    let result_formats = portal.result_formats.clone();
+
+    let Some(stmt) = session.statement(&stmt_name) else {
+        return vec![session.fail(query::error_response(
+            "26000",
+            &format!("prepared statement \"{stmt_name}\" does not exist"),
+        ))];
+    };
+    let parsed = stmt.parsed.clone();
+
+    let catalog =
+        match query::load_catalog(&ctx.engine, &ctx.schema, &parsed, &ctx.default_schema).await {
+            Ok(catalog) => catalog,
+            Err(err) => return vec![session.fail(err)],
+        };
+
+    let result = ferrosa_sql::execute(&parsed, &catalog, &ctx.default_schema, &params);
+    let errored = result.is_err();
+    let msgs = query::render_execute_result(result, &result_formats);
+    // On an execution error, set the skip flag so the rest of the sequence is
+    // ignored until Sync (Postgres semantics).
+    if errored {
+        session.mark_error();
+    }
+    msgs
 }
 
 /// SQLSTATE for a codec-level framing error (always a protocol violation).
