@@ -382,3 +382,62 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         .count();
     assert_eq!(again_rows, 1, "bob has exactly one order");
 }
+
+#[tokio::test]
+async fn group_by_order_by_limit_over_a_real_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seed_engine(dir.path());
+    let schema = create_schema();
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    let client = connect(port).await;
+
+    let collect = |msgs: Vec<tokio_postgres::SimpleQueryMessage>| {
+        msgs.into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Orders per user, ascending: uid=1 → 2 orders, uid=2 → 1 order.
+    let grouped = collect(
+        client
+            .simple_query("SELECT o.uid, COUNT(*) FROM orders o GROUP BY o.uid ORDER BY o.uid")
+            .await
+            .expect("GROUP BY query should return aggregated rows"),
+    );
+    assert_eq!(grouped.len(), 2, "two groups");
+    assert_eq!(
+        (grouped[0].get(0), grouped[0].get(1)),
+        (Some("1"), Some("2"))
+    );
+    assert_eq!(
+        (grouped[1].get(0), grouped[1].get(1)),
+        (Some("2"), Some("1"))
+    );
+
+    // ORDER BY DESC + LIMIT trims to the highest uid.
+    let limited = collect(
+        client
+            .simple_query(
+                "SELECT o.uid, COUNT(*) FROM orders o GROUP BY o.uid ORDER BY o.uid DESC LIMIT 1",
+            )
+            .await
+            .expect("LIMIT query should succeed"),
+    );
+    assert_eq!(limited.len(), 1, "LIMIT 1");
+    assert_eq!(
+        limited[0].get(0),
+        Some("2"),
+        "DESC orders the highest uid first"
+    );
+}
