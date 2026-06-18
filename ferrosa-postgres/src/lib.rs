@@ -14,8 +14,10 @@
 
 pub mod codec;
 pub mod messages;
+pub mod scram;
 
 pub use codec::{CodecError, MAX_MESSAGE_LEN};
 pub use messages::{
     BackendMessage, FrontendMessage, StartupFrame, StartupMessage, TransactionStatus,
 };
+pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
