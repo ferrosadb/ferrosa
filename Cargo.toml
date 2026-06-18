@@ -42,7 +42,7 @@ split-debuginfo = "off"
 strip = "none"
 
 [workspace.package]
-version = "0.13.0"
+version = "0.16.0-nightly"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/ferrosadb/ferrosa"
