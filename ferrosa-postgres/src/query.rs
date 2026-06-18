@@ -55,12 +55,14 @@ fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 
 /// The Postgres type OID for a relational [`ColumnType`].
 ///
-/// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool).
+/// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool),
+/// `Float -> 701` (float8).
 fn column_type_oid(ty: ColumnType) -> i32 {
     match ty {
         ColumnType::Int => 23,
         ColumnType::Text => 25,
         ColumnType::Bool => 16,
+        ColumnType::Float => 701,
     }
 }
 
@@ -69,18 +71,39 @@ fn column_type_size(ty: ColumnType) -> i16 {
     match ty {
         ColumnType::Int => 4,
         ColumnType::Bool => 1,
+        ColumnType::Float => 8,
         ColumnType::Text => -1,
     }
 }
 
 /// Render a [`SqlValue`] to its Postgres **text-format** column bytes, or `None`
 /// for SQL NULL (encoded on the wire as a `-1` length with no bytes).
+///
+/// Float uses Rust's default `{}` formatting (round-trippable shortest form) for
+/// v1, with the non-finite cases mapped to Postgres's spellings: `NaN`,
+/// `Infinity`, `-Infinity`. Exact float text-format parity with Postgres is
+/// tracked as follow-up.
 fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
     match value {
         SqlValue::Null => None,
         SqlValue::Int(i) => Some(i.to_string().into_bytes()),
         SqlValue::Text(s) => Some(s.clone().into_bytes()),
         SqlValue::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
+        SqlValue::Float(of) => {
+            let f = of.0;
+            let s = if f.is_nan() {
+                "NaN".to_string()
+            } else if f.is_infinite() {
+                if f.is_sign_negative() {
+                    "-Infinity".to_string()
+                } else {
+                    "Infinity".to_string()
+                }
+            } else {
+                format!("{f}")
+            };
+            Some(s.into_bytes())
+        }
     }
 }
 
@@ -177,12 +200,14 @@ mod tests {
         assert_eq!(column_type_oid(ColumnType::Int), 23);
         assert_eq!(column_type_oid(ColumnType::Text), 25);
         assert_eq!(column_type_oid(ColumnType::Bool), 16);
+        assert_eq!(column_type_oid(ColumnType::Float), 701); // float8
     }
 
     #[test]
     fn column_type_sizes_are_wire_correct() {
         assert_eq!(column_type_size(ColumnType::Int), 4);
         assert_eq!(column_type_size(ColumnType::Bool), 1);
+        assert_eq!(column_type_size(ColumnType::Float), 8);
         assert_eq!(column_type_size(ColumnType::Text), -1); // variable length
     }
 
@@ -197,6 +222,28 @@ mod tests {
         );
         assert_eq!(render_value(&SqlValue::Bool(true)), Some(b"t".to_vec()));
         assert_eq!(render_value(&SqlValue::Bool(false)), Some(b"f".to_vec()));
+    }
+
+    #[test]
+    fn render_value_float_text_format() {
+        assert_eq!(render_value(&SqlValue::float(1.5)), Some(b"1.5".to_vec()));
+        assert_eq!(
+            render_value(&SqlValue::float(-0.25)),
+            Some(b"-0.25".to_vec())
+        );
+        // Non-finite values use Postgres spellings.
+        assert_eq!(
+            render_value(&SqlValue::float(f64::NAN)),
+            Some(b"NaN".to_vec())
+        );
+        assert_eq!(
+            render_value(&SqlValue::float(f64::INFINITY)),
+            Some(b"Infinity".to_vec())
+        );
+        assert_eq!(
+            render_value(&SqlValue::float(f64::NEG_INFINITY)),
+            Some(b"-Infinity".to_vec())
+        );
     }
 
     #[test]
