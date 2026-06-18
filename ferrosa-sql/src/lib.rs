@@ -7,10 +7,12 @@
 //! first-JOIN milestone — built TDD against an in-memory provider. The
 //! storage-backed provider and the SQL parser/planner land on top.
 
+pub mod catalog;
 pub mod exec;
 pub mod provider;
 pub mod types;
 
+pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{filter, hash_join, project, seq_scan, CmpOp, Predicate, RowStream};
 pub use provider::{InMemoryTable, TableProvider};
 pub use types::{Column, ColumnType, RelSchema, Row, Value};
