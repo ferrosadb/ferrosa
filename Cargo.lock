@@ -2053,8 +2053,12 @@ dependencies = [
 name = "ferrosa-postgres"
 version = "0.13.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
+ "hmac 0.12.1",
+ "pbkdf2 0.12.2",
  "proptest",
+ "sha2 0.10.9",
 ]
 
 [[package]]
