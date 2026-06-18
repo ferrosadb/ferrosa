@@ -1,0 +1,16 @@
+//! Bespoke relational query engine for Ferrosa (decision D3).
+//!
+//! No DataFusion / Arrow: this crate owns the value/row model, a `TableProvider`
+//! scan contract, and the physical operators (scan, filter, project, hash join)
+//! that the Postgres front-end's queries lower onto. The first slice covers
+//! single-table scans and an inner equi-join — the operators behind the M1
+//! first-JOIN milestone — built TDD against an in-memory provider. The
+//! storage-backed provider and the SQL parser/planner land on top.
+
+pub mod exec;
+pub mod provider;
+pub mod types;
+
+pub use exec::{filter, hash_join, project, seq_scan, CmpOp, Predicate, RowStream};
+pub use provider::{InMemoryTable, TableProvider};
+pub use types::{Column, ColumnType, RelSchema, Row, Value};
