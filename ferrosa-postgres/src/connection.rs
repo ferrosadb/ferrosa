@@ -46,6 +46,9 @@ pub struct Connection<'a, S: VerifierStore> {
     inbuf: BytesMut,
     handshake: Handshake<'a, S>,
     phase: Phase,
+    /// `(process_id, secret_key)` advertised in BackendKeyData for cancellation.
+    /// Placeholder `(0, 0)` until the cancel protocol is wired (follow-up).
+    backend_key: (i32, i32),
 }
 
 impl<'a, S: VerifierStore> Connection<'a, S> {
@@ -54,6 +57,7 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
             inbuf: BytesMut::new(),
             handshake: Handshake::new(store, server_nonce),
             phase: Phase::AwaitingStartup,
+            backend_key: (0, 0),
         }
     }
 
@@ -98,6 +102,7 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
                             m.encode(&mut out);
                         }
                         if self.handshake.is_authenticated() {
+                            append_startup_complete(&mut out, self.backend_key);
                             self.phase = Phase::Ready;
                         }
                     }
@@ -138,6 +143,34 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
 
         Ok(out.to_vec())
     }
+}
+
+/// Append the post-authentication startup-completion messages: the run-time
+/// parameters drivers read on connect, the cancellation key, and the first
+/// ReadyForQuery that signals the session is usable.
+fn append_startup_complete(out: &mut BytesMut, backend_key: (i32, i32)) {
+    const PARAMS: &[(&str, &str)] = &[
+        ("server_version", "16.0 (ferrosa)"),
+        ("server_encoding", "UTF8"),
+        ("client_encoding", "UTF8"),
+        ("DateStyle", "ISO, MDY"),
+        ("TimeZone", "UTC"),
+        ("integer_datetimes", "on"),
+        ("standard_conforming_strings", "on"),
+    ];
+    for (name, value) in PARAMS {
+        BackendMessage::ParameterStatus {
+            name: (*name).to_string(),
+            value: (*value).to_string(),
+        }
+        .encode(out);
+    }
+    BackendMessage::BackendKeyData {
+        process_id: backend_key.0,
+        secret_key: backend_key.1,
+    }
+    .encode(out);
+    BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(out);
 }
 
 #[cfg(test)]
