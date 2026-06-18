@@ -1756,6 +1756,7 @@ dependencies = [
  "ferrosa-cql",
  "ferrosa-graph",
  "ferrosa-net",
+ "ferrosa-postgres",
  "ferrosa-schema",
  "ferrosa-session",
  "ferrosa-sparql",

@@ -1592,6 +1592,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("SPARQL server disabled (set FERROSA_SPARQL_ENABLED=true to enable)");
     }
 
+    // 11b. Postgres wire-protocol listener (port 5432). Authenticates real roles
+    // via the shared schema's SCRAM verifiers (D4); shares storage/schema with
+    // the other front-ends. Query execution is a fail-loud stub until the
+    // relational engine (ferrosa-sql) is wired in (M1).
+    {
+        let pg_bind: std::net::SocketAddr = std::env::var("FERROSA_POSTGRES_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:5432".into())
+            .parse()
+            .expect("invalid FERROSA_POSTGRES_BIND");
+        let pg_store =
+            std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
+        runtimes.background.spawn(async move {
+            match tokio::net::TcpListener::bind(pg_bind).await {
+                Ok(listener) => {
+                    tracing::info!(%pg_bind, "Postgres server listening");
+                    if let Err(e) = ferrosa_postgres::server::serve(listener, pg_store).await {
+                        tracing::error!(%e, "Postgres server failed");
+                    }
+                }
+                Err(e) => tracing::error!(%e, %pg_bind, "Postgres bind failed"),
+            }
+        });
+    }
+
     // 12. Background: connect to seeds with exponential backoff
     // Seeds can be hostnames (e.g., "node2:7000") which SocketAddr can't parse.
     // Resolve via DNS in the background task.
