@@ -16,13 +16,13 @@ pub mod provider;
 pub mod types;
 
 pub use ast::SelectStmt;
-pub use ast::{AggArg, Expr, Operand, OrderItem, Projection, SelectItem};
+pub use ast::{AggArg, Expr, Operand, OrderItem, Projection, SelectItem, Term};
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
     filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort, AggFunc, CmpOp,
     Predicate, RowStream, SortDir, SortKey,
 };
 pub use parser::{parse, ParseError};
-pub use plan::{execute, ExecError, QueryResult};
+pub use plan::{describe, execute, infer_param_types, ExecError, QueryResult};
 pub use provider::{InMemoryTable, TableProvider};
 pub use types::{Column, ColumnType, RelSchema, Row, Value};

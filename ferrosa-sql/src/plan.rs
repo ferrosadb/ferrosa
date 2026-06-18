@@ -11,7 +11,9 @@ use std::fmt;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use crate::ast::{AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef};
+use crate::ast::{
+    AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef, Term,
+};
 use crate::catalog::Catalog;
 use crate::exec::{
     hash_aggregate, hash_join, limit_offset, seq_scan, sort, AggFunc, CmpOp, SortKey,
@@ -42,6 +44,9 @@ pub enum ExecError {
     /// An aggregate function was used in a `WHERE` clause (illegal — aggregates
     /// belong in `HAVING`).
     AggregateInWhere(String),
+    /// A `$N` parameter placeholder referenced an index with no bound value
+    /// (out of range of the supplied `params`). Carries the 1-based index.
+    MissingParameter(usize),
 }
 
 impl fmt::Display for ExecError {
@@ -66,7 +71,20 @@ impl fmt::Display for ExecError {
                 f,
                 "aggregate functions are not allowed in WHERE: \"{a}\" (use HAVING)"
             ),
+            ExecError::MissingParameter(n) => {
+                write!(f, "there is no parameter ${n}")
+            }
         }
+    }
+}
+
+/// Resolve a comparison [`Term`] to a concrete [`Value`]: a literal yields
+/// itself; a `$N` parameter looks up `params[N-1]`, failing loud with
+/// [`ExecError::MissingParameter`] when the index is out of range.
+fn resolve_term<'a>(term: &'a Term, params: &'a [Value]) -> Result<&'a Value, ExecError> {
+    match term {
+        Term::Literal(v) => Ok(v),
+        Term::Param(n) => params.get(n - 1).ok_or(ExecError::MissingParameter(*n)),
     }
 }
 
@@ -84,24 +102,46 @@ fn apply_cmp(op: CmpOp, ord: Ordering) -> bool {
 
 /// Evaluate a boolean expression over `row` under three-valued Kleene logic,
 /// returning `None` for UNKNOWN. `resolve` maps each leaf comparison's operand
-/// to the value to compare (its column/aggregate slot in `row`); a comparison
-/// is UNKNOWN when [`Value::sql_cmp`] is `None`.
-fn eval_kleene(expr: &Expr, row: &Row, resolve: &dyn Fn(&Operand) -> usize) -> Option<bool> {
+/// to the value to compare (its column/aggregate slot in `row`); the RHS
+/// [`Term`] is resolved against `params` (parameters are validated up front, so
+/// a missing one — impossible here — is treated as UNKNOWN). A comparison is
+/// UNKNOWN when [`Value::sql_cmp`] is `None`.
+fn eval_kleene(
+    expr: &Expr,
+    row: &Row,
+    params: &[Value],
+    resolve: &dyn Fn(&Operand) -> usize,
+) -> Option<bool> {
     match expr {
         Expr::Compare { left, op, value } => {
             let idx = resolve(left);
-            row.0[idx].sql_cmp(value).map(|ord| apply_cmp(*op, ord))
+            let rhs = resolve_term(value, params).ok()?;
+            row.0[idx].sql_cmp(rhs).map(|ord| apply_cmp(*op, ord))
         }
-        Expr::Not(inner) => eval_kleene(inner, row, resolve).map(|b| !b),
+        Expr::Not(inner) => eval_kleene(inner, row, params, resolve).map(|b| !b),
         Expr::And(l, r) => {
-            let a = eval_kleene(l, row, resolve);
-            let b = eval_kleene(r, row, resolve);
+            let a = eval_kleene(l, row, params, resolve);
+            let b = eval_kleene(r, row, params, resolve);
             kleene_and(a, b)
         }
         Expr::Or(l, r) => {
-            let a = eval_kleene(l, row, resolve);
-            let b = eval_kleene(r, row, resolve);
+            let a = eval_kleene(l, row, params, resolve);
+            let b = eval_kleene(r, row, params, resolve);
             kleene_or(a, b)
+        }
+    }
+}
+
+/// Validate that every `$N` parameter referenced anywhere in a boolean
+/// expression has a bound value in `params`. Fail-loud entry point so a missing
+/// parameter is reported before any row is evaluated.
+fn validate_params(expr: &Expr, params: &[Value]) -> Result<(), ExecError> {
+    match expr {
+        Expr::Compare { value, .. } => resolve_term(value, params).map(|_| ()),
+        Expr::Not(inner) => validate_params(inner, params),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            validate_params(l, params)?;
+            validate_params(r, params)
         }
     }
 }
@@ -127,58 +167,51 @@ fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 impl std::error::Error for ExecError {}
 
 /// Execute a parsed statement against `catalog`; bare table names resolve under
-/// `default_schema`.
+/// `default_schema`. `params` supplies the bound values for any `$N` parameter
+/// placeholders in the WHERE/HAVING terms (the prepared/extended-query path);
+/// the simple-query path passes `&[]`.
 pub fn execute(
     stmt: &SelectStmt,
     catalog: &dyn Catalog,
     default_schema: &str,
+    params: &[Value],
 ) -> Result<QueryResult, ExecError> {
+    // Fail loud up front if a referenced `$N` has no bound value.
+    if let Some(f) = &stmt.filter {
+        validate_params(f, params)?;
+    }
+    if let Some(h) = &stmt.having {
+        validate_params(h, params)?;
+    }
+
+    let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
+
+    // Scan the FROM (and hash-join the JOIN, if any) into the base row set. The
+    // binding scope / combined schema already came from `resolve_scope`.
     let from_provider = resolve_table(catalog, &stmt.from, default_schema)?;
-    let from_schema = from_provider.schema().clone();
-    let from_binding = stmt.from.binding_name().to_string();
-
-    let mut scope = vec![Bound {
-        binding: from_binding.clone(),
-        schema: from_schema.clone(),
-        base: 0,
-    }];
-    let combined_schema: RelSchema;
-    let base_rows: Vec<Row>;
-
-    if let Some(join) = &stmt.join {
+    let base_rows: Vec<Row> = if let Some(join) = &stmt.join {
         let join_provider = resolve_table(catalog, &join.table, default_schema)?;
-        let join_schema = join_provider.schema().clone();
-        let join_binding = join.table.binding_name().to_string();
-
-        // Resolve `ON a = b` to (from-local, join-local) key indices, either order.
+        let from_schema = from_provider.schema();
+        let join_schema = join_provider.schema();
+        let from_binding = stmt.from.binding_name();
+        let join_binding = join.table.binding_name();
         let (left_key, right_key) = resolve_join_keys(
-            &from_binding,
-            &from_schema,
-            &join_binding,
-            &join_schema,
+            from_binding,
+            from_schema,
+            join_binding,
+            join_schema,
             &join.left,
             &join.right,
         )?;
-
-        base_rows = hash_join(
+        hash_join(
             seq_scan(&*from_provider),
             seq_scan(&*join_provider),
             left_key,
             right_key,
-        );
-
-        scope.push(Bound {
-            binding: join_binding,
-            schema: join_schema.clone(),
-            base: from_schema.width(),
-        });
-        let mut cols = from_schema.columns.clone();
-        cols.extend(join_schema.columns);
-        combined_schema = RelSchema::new(cols);
+        )
     } else {
-        base_rows = seq_scan(&*from_provider).collect();
-        combined_schema = from_schema;
-    }
+        seq_scan(&*from_provider).collect()
+    };
 
     // WHERE: pre-resolve every comparison's column operand to a scope index
     // (aggregates are illegal here), then keep rows that evaluate to Some(true)
@@ -188,7 +221,7 @@ pub fn execute(
         let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
         base_rows
             .into_iter()
-            .filter(|r| eval_kleene(f, r, &resolve) == Some(true))
+            .filter(|r| eval_kleene(f, r, params, &resolve) == Some(true))
             .collect()
     } else {
         base_rows
@@ -202,7 +235,7 @@ pub fn execute(
             if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
 
     let (columns, rows) = if is_aggregate {
-        plan_aggregate(stmt, &scope, &combined_schema, filtered)?
+        plan_aggregate(stmt, &scope, &combined_schema, filtered, params)?
     } else {
         plan_simple(stmt, &scope, &combined_schema, filtered)?
     };
@@ -215,22 +248,175 @@ pub fn execute(
     Ok(QueryResult { columns, rows })
 }
 
-/// Non-aggregate path. Without DISTINCT, ORDER BY resolves against the input
-/// scope (so it may name a non-selected column) and is applied before
-/// projection. With DISTINCT, the rows are projected and deduped first, then
-/// ORDER BY resolves against the OUTPUT columns.
-fn plan_simple(
+/// Build the FROM/JOIN binding scope and the combined output schema for `stmt`,
+/// resolving table and join-key references through `catalog` WITHOUT scanning
+/// any rows. Shared by [`execute`] (which then scans) and [`describe`] (which
+/// only needs the column shape).
+fn resolve_scope(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+) -> Result<(Vec<Bound>, RelSchema), ExecError> {
+    let from_provider = resolve_table(catalog, &stmt.from, default_schema)?;
+    let from_schema = from_provider.schema().clone();
+    let from_binding = stmt.from.binding_name().to_string();
+
+    let mut scope = vec![Bound {
+        binding: from_binding.clone(),
+        schema: from_schema.clone(),
+        base: 0,
+    }];
+
+    if let Some(join) = &stmt.join {
+        let join_provider = resolve_table(catalog, &join.table, default_schema)?;
+        let join_schema = join_provider.schema().clone();
+        let join_binding = join.table.binding_name().to_string();
+
+        // Validate the `ON a = b` keys resolve (same fail-loud check as execute).
+        resolve_join_keys(
+            &from_binding,
+            &from_schema,
+            &join_binding,
+            &join_schema,
+            &join.left,
+            &join.right,
+        )?;
+
+        scope.push(Bound {
+            binding: join_binding,
+            schema: join_schema.clone(),
+            base: from_schema.width(),
+        });
+        let mut cols = from_schema.columns.clone();
+        cols.extend(join_schema.columns);
+        Ok((scope, RelSchema::new(cols)))
+    } else {
+        Ok((scope, from_schema))
+    }
+}
+
+/// Describe the OUTPUT columns of `stmt` (the `RowDescription` shape) without
+/// running any operators or evaluating WHERE/HAVING — so it works before any
+/// parameters are bound. Uses the same projection column-derivation as
+/// [`execute`], so a later execute over the same statement produces matching
+/// columns.
+pub fn describe(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+) -> Result<Vec<Column>, ExecError> {
+    let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
+
+    // Aggregate mode iff GROUP BY / HAVING present or any aggregate select item.
+    let is_aggregate = !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || matches!(&stmt.projection, Projection::Items(items)
+            if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
+
+    if is_aggregate {
+        aggregate_output_columns(stmt, &scope, &combined_schema)
+    } else {
+        let (columns, _indices) = simple_projection(stmt, &scope, &combined_schema)?;
+        Ok(columns)
+    }
+}
+
+/// Infer the [`ColumnType`] of each `$N` parameter from the comparison it
+/// appears in: a `column <op> $N` takes the column's type; an aggregate operand
+/// (`COUNT(*) > $N`, only legal in HAVING) takes the aggregate's result type.
+/// Returns the inferred types indexed by 0-based parameter position (`$1` ⇒
+/// index 0). Used to answer the extended-protocol `ParameterDescription` so the
+/// driver serializes parameters with the right type. A `$N` that is never
+/// referenced defaults to [`ColumnType::Text`] (the most permissive choice).
+pub fn infer_param_types(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+) -> Result<Vec<ColumnType>, ExecError> {
+    let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
+    let mut inferred: Vec<Option<ColumnType>> = Vec::new();
+
+    let mut record = |idx: usize, ty: ColumnType| {
+        if inferred.len() < idx + 1 {
+            inferred.resize(idx + 1, None);
+        }
+        // First binding wins; consistent re-use of the same `$N` keeps its type.
+        if inferred[idx].is_none() {
+            inferred[idx] = Some(ty);
+        }
+    };
+
+    if let Some(f) = &stmt.filter {
+        infer_in_expr(f, &scope, &combined_schema, &mut record)?;
+    }
+    if let Some(h) = &stmt.having {
+        infer_in_expr(h, &scope, &combined_schema, &mut record)?;
+    }
+
+    Ok(inferred
+        .into_iter()
+        .map(|t| t.unwrap_or(ColumnType::Text))
+        .collect())
+}
+
+/// Walk a boolean expression, recording the inferred type of each `$N` param
+/// against the column / aggregate it is compared with.
+fn infer_in_expr(
+    expr: &Expr,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+    record: &mut impl FnMut(usize, ColumnType),
+) -> Result<(), ExecError> {
+    match expr {
+        Expr::Compare { left, value, .. } => {
+            if let Term::Param(n) = value {
+                let ty = operand_type(left, scope, combined_schema)?;
+                record(n - 1, ty);
+            }
+            Ok(())
+        }
+        Expr::Not(inner) => infer_in_expr(inner, scope, combined_schema, record),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            infer_in_expr(l, scope, combined_schema, record)?;
+            infer_in_expr(r, scope, combined_schema, record)
+        }
+    }
+}
+
+/// The [`ColumnType`] an operand evaluates to: a column's declared type, or an
+/// aggregate's result type (COUNT/SUM/MIN/MAX/AVG per [`aggregate_column`]).
+fn operand_type(
+    operand: &Operand,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+) -> Result<ColumnType, ExecError> {
+    match operand {
+        Operand::Column(cr) => {
+            let gi = resolve_column(scope, cr)?;
+            Ok(combined_schema.columns[gi].ty)
+        }
+        Operand::Aggregate { func, arg } => {
+            let arg_col = resolve_agg_arg(arg, scope)?;
+            Ok(aggregate_column(*func, arg_col, combined_schema).ty)
+        }
+    }
+}
+
+/// Resolve a non-aggregate projection into `(output columns, source indices)`:
+/// `SELECT *` selects every column of the combined schema; a column list
+/// resolves each name to its global slot. An aggregate item is unreachable here
+/// (it forces aggregate mode upstream). Shared by [`plan_simple`] and
+/// [`describe`] so the two derive identical output columns.
+fn simple_projection(
     stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    rows: Vec<Row>,
-) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
-    // Resolve the projection into output columns + source indices.
-    let (columns, indices): (Vec<Column>, Vec<usize>) = match &stmt.projection {
-        Projection::Star => (
+) -> Result<(Vec<Column>, Vec<usize>), ExecError> {
+    match &stmt.projection {
+        Projection::Star => Ok((
             combined_schema.columns.clone(),
             (0..combined_schema.width()).collect(),
-        ),
+        )),
         Projection::Items(items) => {
             let mut columns = Vec::with_capacity(items.len());
             let mut indices = Vec::with_capacity(items.len());
@@ -245,9 +431,23 @@ fn plan_simple(
                     SelectItem::Aggregate { .. } => unreachable!("aggregate in simple plan"),
                 }
             }
-            (columns, indices)
+            Ok((columns, indices))
         }
-    };
+    }
+}
+
+/// Non-aggregate path. Without DISTINCT, ORDER BY resolves against the input
+/// scope (so it may name a non-selected column) and is applied before
+/// projection. With DISTINCT, the rows are projected and deduped first, then
+/// ORDER BY resolves against the OUTPUT columns.
+fn plan_simple(
+    stmt: &SelectStmt,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+    rows: Vec<Row>,
+) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
+    // Resolve the projection into output columns + source indices.
+    let (columns, indices) = simple_projection(stmt, scope, combined_schema)?;
 
     let project = |rows: Vec<Row>| -> Vec<Row> {
         rows.into_iter()
@@ -296,6 +496,7 @@ fn plan_aggregate(
     scope: &[Bound],
     combined_schema: &RelSchema,
     rows: Vec<Row>,
+    params: &[Value],
 ) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
     // Resolve GROUP BY columns to global indices.
     let mut group_cols = Vec::with_capacity(stmt.group_by.len());
@@ -383,7 +584,7 @@ fn plan_aggregate(
         let resolve = |op: &Operand| map[&OperandKey::of(op)];
         internal_rows
             .into_iter()
-            .filter(|r| eval_kleene(h, r, &resolve) == Some(true))
+            .filter(|r| eval_kleene(h, r, params, &resolve) == Some(true))
             .collect()
     } else {
         internal_rows
@@ -423,6 +624,45 @@ fn plan_aggregate(
     };
 
     Ok((out_columns, out_rows))
+}
+
+/// Derive the OUTPUT columns of an aggregate-mode query (SELECT list only),
+/// without computing any aggregate values. Each plain column must be a GROUP BY
+/// column (else `NotGrouped`); each aggregate yields its `count`/`sum`/… column.
+/// Shared by [`describe`] (and mirrors the column derivation inside
+/// [`plan_aggregate`]).
+fn aggregate_output_columns(
+    stmt: &SelectStmt,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+) -> Result<Vec<Column>, ExecError> {
+    let mut group_cols = Vec::with_capacity(stmt.group_by.len());
+    for cr in &stmt.group_by {
+        group_cols.push(resolve_column(scope, cr)?);
+    }
+
+    let items = match &stmt.projection {
+        Projection::Star => return Err(ExecError::NotGrouped("*".into())),
+        Projection::Items(items) => items,
+    };
+
+    let mut out_columns = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Column(cr) => {
+                let gi = resolve_column(scope, cr)?;
+                if !group_cols.contains(&gi) {
+                    return Err(ExecError::NotGrouped(cr.qualified_name()));
+                }
+                out_columns.push(combined_schema.columns[gi].clone());
+            }
+            SelectItem::Aggregate { func, arg } => {
+                let arg_col = resolve_agg_arg(arg, scope)?;
+                out_columns.push(aggregate_column(*func, arg_col, combined_schema));
+            }
+        }
+    }
+    Ok(out_columns)
 }
 
 /// Identity of an aggregate for deduplication: its function plus arg-column
@@ -713,7 +953,66 @@ mod tests {
     }
 
     fn run(sql: &str) -> QueryResult {
-        execute(&parse(sql).unwrap(), &catalog(), "public").unwrap()
+        execute(&parse(sql).unwrap(), &catalog(), "public", &[]).unwrap()
+    }
+
+    #[test]
+    fn execute_substitutes_a_bound_parameter() {
+        // The M1 join with `$1` substituted by Int(1) returns alice's two orders.
+        let stmt = parse(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = $1",
+        )
+        .unwrap();
+        let r = execute(&stmt, &catalog(), "public", &[Value::Int(1)]).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        for row in &r.rows {
+            assert_eq!(row.get(0), &Value::Text("alice".into()));
+        }
+        // A different bound value selects bob's single order.
+        let r2 = execute(&stmt, &catalog(), "public", &[Value::Int(2)]).unwrap();
+        assert_eq!(r2.rows.len(), 1);
+        assert_eq!(r2.rows[0].get(0), &Value::Text("bob".into()));
+    }
+
+    #[test]
+    fn missing_parameter_fails_loud() {
+        let stmt = parse("SELECT name FROM users WHERE id = $1").unwrap();
+        // No params bound ⇒ MissingParameter(1), not an empty/wrong result.
+        let err = execute(&stmt, &catalog(), "public", &[]).unwrap_err();
+        assert!(matches!(err, ExecError::MissingParameter(1)));
+    }
+
+    #[test]
+    fn describe_returns_output_columns_for_a_param_query_without_binding() {
+        // describe works with NO params bound: it returns only the column shape.
+        let stmt = parse(
+            "SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = $1",
+        )
+        .unwrap();
+        let cols = describe(&stmt, &catalog(), "public").unwrap();
+        assert_eq!(
+            cols.iter()
+                .map(|c| (c.name.as_str(), c.ty))
+                .collect::<Vec<_>>(),
+            [("name", ColumnType::Text), ("oid", ColumnType::Int)]
+        );
+    }
+
+    #[test]
+    fn describe_matches_execute_columns_for_aggregate() {
+        let stmt = parse("SELECT region, COUNT(*) FROM sales GROUP BY region").unwrap();
+        let described = describe(&stmt, &sales_catalog(), "public").unwrap();
+        let executed = execute(&stmt, &sales_catalog(), "public", &[])
+            .unwrap()
+            .columns;
+        assert_eq!(described, executed);
+    }
+
+    #[test]
+    fn describe_fails_loud_on_unknown_table() {
+        let stmt = parse("SELECT * FROM nope").unwrap();
+        let err = describe(&stmt, &catalog(), "public").unwrap_err();
+        assert!(matches!(err, ExecError::NoSuchTable { .. }));
     }
 
     #[test]
@@ -764,7 +1063,13 @@ mod tests {
 
     #[test]
     fn unknown_table_fails_loud() {
-        let err = execute(&parse("SELECT * FROM nope").unwrap(), &catalog(), "public").unwrap_err();
+        let err = execute(
+            &parse("SELECT * FROM nope").unwrap(),
+            &catalog(),
+            "public",
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, ExecError::NoSuchTable { .. }));
     }
 
@@ -774,6 +1079,7 @@ mod tests {
             &parse("SELECT zzz FROM users").unwrap(),
             &catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::NoSuchColumn(_)));
@@ -797,7 +1103,7 @@ mod tests {
     }
 
     fn run_sales(sql: &str) -> QueryResult {
-        execute(&parse(sql).unwrap(), &sales_catalog(), "public").unwrap()
+        execute(&parse(sql).unwrap(), &sales_catalog(), "public", &[]).unwrap()
     }
 
     #[test]
@@ -866,6 +1172,7 @@ mod tests {
             &parse("SELECT AVG(nope) FROM sales").unwrap(),
             &sales_catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::NoSuchColumn(_)));
@@ -936,6 +1243,7 @@ mod tests {
             &parse("SELECT region, amount FROM sales GROUP BY region").unwrap(),
             &sales_catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::NotGrouped(_)));
@@ -959,6 +1267,7 @@ mod tests {
             &parse("SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY 5").unwrap(),
             &sales_catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::InvalidOrderBy(_)));
@@ -975,6 +1284,7 @@ mod tests {
             .unwrap(),
             &catalog(),
             "public",
+            &[],
         )
         .unwrap();
         assert_eq!(r.columns[0].name, "name");
@@ -1011,7 +1321,7 @@ mod tests {
     }
 
     fn run_t(sql: &str) -> QueryResult {
-        execute(&parse(sql).unwrap(), &nullable_catalog(), "public").unwrap()
+        execute(&parse(sql).unwrap(), &nullable_catalog(), "public", &[]).unwrap()
     }
 
     #[test]
@@ -1081,6 +1391,7 @@ mod tests {
             &parse("SELECT a FROM t WHERE COUNT(*) > 1").unwrap(),
             &nullable_catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::AggregateInWhere(_)));
@@ -1140,6 +1451,7 @@ mod tests {
             &parse("SELECT region FROM sales GROUP BY region HAVING amount > 1").unwrap(),
             &sales_catalog(),
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::NotGrouped(_)));
@@ -1186,6 +1498,7 @@ mod tests {
             &parse("SELECT x FROM a JOIN b ON a.x = b.x").unwrap(),
             &cat,
             "public",
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::AmbiguousColumn(_)));
