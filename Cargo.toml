@@ -9,6 +9,7 @@ members = [
     "ferrosa-graph",
     "ferrosa-index",
     "ferrosa-net",
+    "ferrosa-postgres",
     "ferrosa-schema",
     "ferrosa-sstable",
     "ferrosa-storage",
