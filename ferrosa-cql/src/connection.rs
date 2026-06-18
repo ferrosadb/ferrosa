@@ -2829,27 +2829,29 @@ mod tests {
 
         (
             SharedState {
-                engine: engine.clone(),
-                schema: schema.clone(),
-                node_config,
-                cluster_state: Arc::new(ArcSwap::from_pointee(
-                    ferrosa_cluster::ClusterStateHolder::Standalone,
-                )),
-                write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
-                ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                core: Arc::new(ferrosa_session::SessionCore {
+                    engine: engine.clone(),
+                    schema: schema.clone(),
+                    node_config,
+                    cluster_state: Arc::new(ArcSwap::from_pointee(
+                        ferrosa_cluster::ClusterStateHolder::Standalone,
+                    )),
+                    write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+                    ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                    udf_executor,
+                    mode_controller,
+                    auth_warn: false,
+                    peer_manager: None,
+                    accord_clock: None,
+                }),
                 prepared_cache: Arc::new(PreparedCache::new(1024 * 1024)),
                 connection_tracker: Arc::new(ConnectionTracker::new()),
                 query_tracker: Arc::new(crate::virtual_tables::QueryTracker::new()),
                 full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
                 index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
-                udf_executor,
                 event_sender: tokio::sync::broadcast::channel(64).0,
-                mode_controller,
                 cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
                 topology_policy: crate::topology::ClientTopologyPolicy::default(),
-                auth_warn: false,
-                peer_manager: None,
-                accord_clock: None,
             },
             dir,
         )
