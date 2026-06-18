@@ -397,9 +397,11 @@ mod tests {
         assert_eq!(type_oid("counter"), 20);
         assert_eq!(type_oid("boolean"), 16);
         assert_eq!(type_oid("uuid"), 2950);
+        assert_eq!(type_oid("timeuuid"), 2950);
         assert_eq!(type_oid("float"), 700);
         assert_eq!(type_oid("double"), 701);
         assert_eq!(type_oid("blob"), 17);
+        assert_eq!(type_oid("bytes"), 17);
         assert_eq!(type_oid("timestamp"), 1114);
     }
 

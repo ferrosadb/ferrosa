@@ -27,6 +27,9 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 sha2 = "0.10"
 tokio = { version = "1", features = ["net", "rt", "io-util", "macros", "sync"] }
+# Used by query.rs to render/parse the Postgres `uuid` type (OID 2950) carried
+# by `ferrosa_sql::Value::Uuid`, and by storage_provider for CqlValue::Uuid.
+uuid = "1"
 
 [dev-dependencies]
 indexmap = { version = "2", features = ["serde"] }
