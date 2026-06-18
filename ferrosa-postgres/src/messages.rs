@@ -49,6 +49,18 @@ impl TransactionStatus {
     }
 }
 
+/// One field (column) in a `RowDescription`.
+///
+/// `type_size` is the on-wire fixed length for a fixed-width type (e.g. 4 for
+/// int4, 1 for bool) or `-1` for a variable-length type (e.g. text). `type_oid`
+/// is the Postgres type OID the driver uses to decode each `DataRow` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDescription {
+    pub name: String,
+    pub type_oid: i32,
+    pub type_size: i16,
+}
+
 /// A backend (server → client) message. First-slice subset sufficient for the
 /// handshake and a `ReadyForQuery` turnaround.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +81,13 @@ pub enum BackendMessage {
     ParameterStatus { name: String, value: String },
     /// `E` — an error response; `fields` are `(field-type byte, value)` pairs.
     ErrorResponse { fields: Vec<(u8, String)> },
+    /// `T` — describes the columns of a result set (one per query).
+    RowDescription { fields: Vec<FieldDescription> },
+    /// `D` — one data row; each column is `Some(bytes)` (text format) or `None`
+    /// for SQL NULL.
+    DataRow { columns: Vec<Option<Vec<u8>>> },
+    /// `C` — command completion, carrying the command tag (e.g. `"SELECT 2"`).
+    CommandComplete { tag: String },
 }
 
 impl BackendMessage {
@@ -83,6 +102,9 @@ impl BackendMessage {
             BackendMessage::BackendKeyData { .. } => b'K',
             BackendMessage::ParameterStatus { .. } => b'S',
             BackendMessage::ErrorResponse { .. } => b'E',
+            BackendMessage::RowDescription { .. } => b'T',
+            BackendMessage::DataRow { .. } => b'D',
+            BackendMessage::CommandComplete { .. } => b'C',
         }
     }
 
@@ -124,6 +146,31 @@ impl BackendMessage {
                 }
                 body.put_u8(0); // field-list terminator
             }
+            BackendMessage::RowDescription { fields } => {
+                body.put_i16(fields.len() as i16);
+                for field in fields {
+                    put_cstring(body, &field.name);
+                    body.put_i32(0); // table OID (not from a known relation)
+                    body.put_i16(0); // column attribute number
+                    body.put_i32(field.type_oid);
+                    body.put_i16(field.type_size);
+                    body.put_i32(-1); // type modifier (none)
+                    body.put_i16(0); // format code: 0 = text
+                }
+            }
+            BackendMessage::DataRow { columns } => {
+                body.put_i16(columns.len() as i16);
+                for col in columns {
+                    match col {
+                        None => body.put_i32(-1), // SQL NULL: length -1, no bytes
+                        Some(bytes) => {
+                            body.put_i32(bytes.len() as i32);
+                            body.extend_from_slice(bytes);
+                        }
+                    }
+                }
+            }
+            BackendMessage::CommandComplete { tag } => put_cstring(body, tag),
         }
     }
 
@@ -182,4 +229,73 @@ pub enum StartupFrame {
     Startup(StartupMessage),
     SslRequest,
     CancelRequest { process_id: i32, secret_key: i32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_description_frames_one_int_field() {
+        let mut out = BytesMut::new();
+        BackendMessage::RowDescription {
+            fields: vec![FieldDescription {
+                name: "id".to_string(),
+                type_oid: 23, // int4
+                type_size: 4,
+            }],
+        }
+        .encode(&mut out);
+        // 'T', i32 length, i16 field-count, then the field body.
+        assert_eq!(out[0], b'T');
+        // body = field-count(2) + name "id\0"(3) + tableOid(4) + attnum(2)
+        //        + typeOid(4) + typeSize(2) + typeMod(4) + format(2) = 23
+        // length counts itself (4) + body(23) = 27
+        let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
+        assert_eq!(len, 27);
+        let body = &out[5..];
+        assert_eq!(i16::from_be_bytes(body[0..2].try_into().unwrap()), 1); // 1 field
+        assert_eq!(&body[2..5], b"id\x00"); // name cstring
+        assert_eq!(i32::from_be_bytes(body[5..9].try_into().unwrap()), 0); // table oid
+        assert_eq!(i16::from_be_bytes(body[9..11].try_into().unwrap()), 0); // attnum
+        assert_eq!(i32::from_be_bytes(body[11..15].try_into().unwrap()), 23); // type oid
+        assert_eq!(i16::from_be_bytes(body[15..17].try_into().unwrap()), 4); // type size
+        assert_eq!(i32::from_be_bytes(body[17..21].try_into().unwrap()), -1); // type modifier
+        assert_eq!(i16::from_be_bytes(body[21..23].try_into().unwrap()), 0); // format = text
+    }
+
+    #[test]
+    fn data_row_encodes_value_and_null() {
+        let mut out = BytesMut::new();
+        BackendMessage::DataRow {
+            columns: vec![Some(b"abc".to_vec()), None],
+        }
+        .encode(&mut out);
+        // 'D', i32 length, i16 col-count, col0 (len 3 + "abc"), col1 (len -1, NULL)
+        assert_eq!(out[0], b'D');
+        // body = col-count(2) + [len(4)+"abc"(3)] + [len(4)] = 13; length = 4 + 13 = 17
+        let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
+        assert_eq!(len, 17);
+        let body = &out[5..];
+        assert_eq!(i16::from_be_bytes(body[0..2].try_into().unwrap()), 2); // 2 columns
+        assert_eq!(i32::from_be_bytes(body[2..6].try_into().unwrap()), 3); // col0 len
+        assert_eq!(&body[6..9], b"abc");
+        assert_eq!(i32::from_be_bytes(body[9..13].try_into().unwrap()), -1); // col1 NULL
+        assert_eq!(body.len(), 13, "no bytes follow a NULL length");
+    }
+
+    #[test]
+    fn command_complete_encodes_tag_cstring() {
+        let mut out = BytesMut::new();
+        BackendMessage::CommandComplete {
+            tag: "SELECT 2".to_string(),
+        }
+        .encode(&mut out);
+        // 'C', i32 length, "SELECT 2\0"
+        assert_eq!(out[0], b'C');
+        // length = 4 + ("SELECT 2\0" = 9) = 13
+        let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
+        assert_eq!(len, 13);
+        assert_eq!(&out[5..], b"SELECT 2\x00");
+    }
 }
