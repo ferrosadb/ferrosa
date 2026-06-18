@@ -31,6 +31,15 @@ tokio = { version = "1", features = ["net", "rt", "io-util", "macros", "sync"] }
 # by `ferrosa_sql::Value::Uuid`, and by storage_provider for CqlValue::Uuid.
 uuid = "1"
 
+[features]
+# Opt-in gate for tests that require external infrastructure (a real
+# PostgreSQL container via podman/docker). Default `cargo test` does NOT
+# enable this, so the differential oracle compiles to nothing and needs no
+# container runtime. Enable together with `FERROSA_TEST_CONTAINERS=1`:
+#   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-postgres \
+#     --features live-infra-tests --test differential_oracle -- --nocapture
+live-infra-tests = []
+
 [dev-dependencies]
 indexmap = { version = "2", features = ["serde"] }
 proptest = "1"
