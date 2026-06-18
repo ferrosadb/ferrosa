@@ -8,10 +8,12 @@
 
 use std::fmt;
 
-use crate::ast::{ColumnRef, Projection, SelectStmt, TableRef};
+use crate::ast::{AggArg, ColumnRef, Projection, SelectItem, SelectStmt, TableRef};
 use crate::catalog::Catalog;
-use crate::exec::{hash_join, seq_scan, Predicate};
-use crate::types::{Column, RelSchema, Row};
+use crate::exec::{
+    hash_aggregate, hash_join, limit_offset, seq_scan, sort, AggFunc, Predicate, SortKey,
+};
+use crate::types::{Column, ColumnType, RelSchema, Row};
 
 /// The result of executing a query: output column metadata + materialized rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,10 +24,17 @@ pub struct QueryResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
-    NoSuchTable { schema: String, table: String },
+    NoSuchTable {
+        schema: String,
+        table: String,
+    },
     NoSuchColumn(String),
     AmbiguousColumn(String),
     UnknownQualifier(String),
+    /// A non-aggregated column in the SELECT list is absent from `GROUP BY`.
+    NotGrouped(String),
+    /// An `ORDER BY` ordinal is out of range of the output columns.
+    InvalidOrderBy(String),
 }
 
 impl fmt::Display for ExecError {
@@ -38,6 +47,13 @@ impl fmt::Display for ExecError {
             ExecError::AmbiguousColumn(c) => write!(f, "column reference \"{c}\" is ambiguous"),
             ExecError::UnknownQualifier(q) => {
                 write!(f, "missing FROM-clause entry for table \"{q}\"")
+            }
+            ExecError::NotGrouped(c) => write!(
+                f,
+                "column \"{c}\" must appear in the GROUP BY clause or be used in an aggregate function"
+            ),
+            ExecError::InvalidOrderBy(c) => {
+                write!(f, "ORDER BY position \"{c}\" is not in select list")
             }
         }
     }
@@ -112,30 +128,202 @@ pub fn execute(
         base_rows
     };
 
-    // SELECT list
+    // Aggregate mode iff GROUP BY is present or any select item is an aggregate.
+    let is_aggregate = !stmt.group_by.is_empty()
+        || matches!(&stmt.projection, Projection::Items(items)
+            if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
+
+    let (columns, rows) = if is_aggregate {
+        plan_aggregate(stmt, &scope, &combined_schema, filtered)?
+    } else {
+        plan_simple(stmt, &scope, &combined_schema, filtered)?
+    };
+
+    // LIMIT / OFFSET apply to the final output rows.
+    let offset = stmt.offset.unwrap_or(0) as usize;
+    let limit = stmt.limit.map(|n| n as usize);
+    let rows = limit_offset(rows, offset, limit);
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// Non-aggregate path: ORDER BY (resolved against the scope) then projection.
+fn plan_simple(
+    stmt: &SelectStmt,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+    rows: Vec<Row>,
+) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
+    // ORDER BY resolves against the input scope, so it may name a non-selected
+    // column. Apply it to the joined/filtered rows before projecting.
+    let rows = if stmt.order_by.is_empty() {
+        rows
+    } else {
+        let mut keys = Vec::with_capacity(stmt.order_by.len());
+        for item in &stmt.order_by {
+            let col = resolve_column(scope, &item.column)?;
+            keys.push(SortKey { col, dir: item.dir });
+        }
+        sort(rows, &keys)
+    };
+
     let (columns, indices): (Vec<Column>, Vec<usize>) = match &stmt.projection {
         Projection::Star => (
             combined_schema.columns.clone(),
             (0..combined_schema.width()).collect(),
         ),
-        Projection::Columns(refs) => {
-            let mut columns = Vec::with_capacity(refs.len());
-            let mut indices = Vec::with_capacity(refs.len());
-            for cr in refs {
-                let gi = resolve_column(&scope, cr)?;
-                indices.push(gi);
-                columns.push(combined_schema.columns[gi].clone());
+        Projection::Items(items) => {
+            let mut columns = Vec::with_capacity(items.len());
+            let mut indices = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    SelectItem::Column(cr) => {
+                        let gi = resolve_column(scope, cr)?;
+                        indices.push(gi);
+                        columns.push(combined_schema.columns[gi].clone());
+                    }
+                    // Unreachable: an aggregate item forces aggregate mode.
+                    SelectItem::Aggregate { .. } => unreachable!("aggregate in simple plan"),
+                }
             }
             (columns, indices)
         }
     };
 
-    let rows = filtered
+    let out = rows
         .into_iter()
         .map(|r| Row(indices.iter().map(|&i| r.0[i].clone()).collect()))
         .collect();
+    Ok((columns, out))
+}
 
-    Ok(QueryResult { columns, rows })
+/// Aggregate path: resolve group/agg columns, validate, run `hash_aggregate`,
+/// reorder into SELECT-list order, then ORDER BY against the output.
+fn plan_aggregate(
+    stmt: &SelectStmt,
+    scope: &[Bound],
+    combined_schema: &RelSchema,
+    rows: Vec<Row>,
+) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
+    // Resolve GROUP BY columns to global indices.
+    let mut group_cols = Vec::with_capacity(stmt.group_by.len());
+    for cr in &stmt.group_by {
+        group_cols.push(resolve_column(scope, cr)?);
+    }
+
+    let items = match &stmt.projection {
+        // `SELECT *` with GROUP BY is not meaningfully supported here; treat
+        // every grouped column as the projection is out of scope — reject.
+        Projection::Star => return Err(ExecError::NotGrouped("*".into())),
+        Projection::Items(items) => items,
+    };
+
+    // Build the aggregate definitions and validate plain columns are grouped.
+    let mut aggs: Vec<(AggFunc, Option<usize>)> = Vec::new();
+    // For each SELECT item, record where its value lives in the hash_aggregate
+    // output layout `[group_cols..., aggs...]`: Group(group_index) or Agg(agg_index).
+    enum Slot {
+        Group(usize),
+        Agg(usize),
+    }
+    let mut slots: Vec<Slot> = Vec::with_capacity(items.len());
+    // Output column metadata, parallel to SELECT-list order.
+    let mut out_columns: Vec<Column> = Vec::with_capacity(items.len());
+
+    for item in items {
+        match item {
+            SelectItem::Column(cr) => {
+                let gi = resolve_column(scope, cr)?;
+                // Must be one of the GROUP BY columns (by global index).
+                let pos = group_cols
+                    .iter()
+                    .position(|&g| g == gi)
+                    .ok_or_else(|| ExecError::NotGrouped(cr.qualified_name()))?;
+                slots.push(Slot::Group(pos));
+                out_columns.push(combined_schema.columns[gi].clone());
+            }
+            SelectItem::Aggregate { func, arg } => {
+                let arg_col = match arg {
+                    AggArg::Star => None,
+                    AggArg::Column(cr) => Some(resolve_column(scope, cr)?),
+                };
+                let agg_index = aggs.len();
+                aggs.push((*func, arg_col));
+                slots.push(Slot::Agg(agg_index));
+                out_columns.push(aggregate_column(*func, arg_col, combined_schema));
+            }
+        }
+    }
+
+    let agg_rows = hash_aggregate(rows, &group_cols, &aggs);
+
+    // hash_aggregate output layout is [group values..., agg values...]; project
+    // into SELECT-list order via the recorded slots.
+    let group_len = group_cols.len();
+    let reordered: Vec<Row> = agg_rows
+        .into_iter()
+        .map(|r| {
+            let values = slots
+                .iter()
+                .map(|slot| match slot {
+                    Slot::Group(i) => r.0[*i].clone(),
+                    Slot::Agg(i) => r.0[group_len + *i].clone(),
+                })
+                .collect();
+            Row(values)
+        })
+        .collect();
+
+    // ORDER BY in aggregate mode resolves against the OUTPUT columns: by name or
+    // by 1-based ordinal.
+    let out_rows = if stmt.order_by.is_empty() {
+        reordered
+    } else {
+        let mut keys = Vec::with_capacity(stmt.order_by.len());
+        for item in &stmt.order_by {
+            let col = resolve_output_position(&item.column, &out_columns)?;
+            keys.push(SortKey { col, dir: item.dir });
+        }
+        sort(reordered, &keys)
+    };
+
+    Ok((out_columns, out_rows))
+}
+
+/// The output column for an aggregate: name `count`/`sum`/`min`/`max`; type
+/// `Int` for Count/Sum, the argument column's type for Min/Max.
+fn aggregate_column(func: AggFunc, arg_col: Option<usize>, schema: &RelSchema) -> Column {
+    let (name, ty) = match func {
+        AggFunc::Count => ("count", ColumnType::Int),
+        AggFunc::Sum => ("sum", ColumnType::Int),
+        AggFunc::Min => ("min", arg_ty(arg_col, schema)),
+        AggFunc::Max => ("max", arg_ty(arg_col, schema)),
+    };
+    Column::new(name, ty)
+}
+
+fn arg_ty(arg_col: Option<usize>, schema: &RelSchema) -> ColumnType {
+    match arg_col {
+        Some(c) => schema.columns[c].ty,
+        None => ColumnType::Int,
+    }
+}
+
+/// Resolve an ORDER BY key against the aggregate output columns: a bare integer
+/// name is a 1-based ordinal; otherwise match by column name.
+fn resolve_output_position(col: &ColumnRef, out_columns: &[Column]) -> Result<usize, ExecError> {
+    if col.qualifier.is_none() {
+        if let Ok(ordinal) = col.name.parse::<usize>() {
+            if ordinal == 0 || ordinal > out_columns.len() {
+                return Err(ExecError::InvalidOrderBy(col.name.clone()));
+            }
+            return Ok(ordinal - 1);
+        }
+    }
+    out_columns
+        .iter()
+        .position(|c| c.name == col.name)
+        .ok_or_else(|| ExecError::NoSuchColumn(col.name.clone()))
 }
 
 /// One bound relation in the FROM/JOIN scope.
@@ -326,6 +514,173 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ExecError::NoSuchColumn(_)));
+    }
+
+    fn sales_catalog() -> MapCatalog {
+        // region (text), amount (nullable int)
+        let sales = Arc::new(InMemoryTable::new(
+            RelSchema::new(vec![
+                Column::new("region", ColumnType::Text),
+                Column::new("amount", ColumnType::Int),
+            ]),
+            vec![
+                Row::new(vec![Value::Text("east".into()), Value::Int(10)]),
+                Row::new(vec![Value::Text("west".into()), Value::Int(5)]),
+                Row::new(vec![Value::Text("east".into()), Value::Int(20)]),
+                Row::new(vec![Value::Text("west".into()), Value::Null]),
+            ],
+        ));
+        MapCatalog::new().with_table("public", "sales", sales)
+    }
+
+    fn run_sales(sql: &str) -> QueryResult {
+        execute(&parse(sql).unwrap(), &sales_catalog(), "public").unwrap()
+    }
+
+    #[test]
+    fn group_by_with_count_and_sum() {
+        let r = run_sales("SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY region");
+        assert_eq!(
+            r.columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.ty))
+                .collect::<Vec<_>>(),
+            [
+                ("region", ColumnType::Text),
+                ("count", ColumnType::Int),
+                ("sum", ColumnType::Int),
+            ]
+        );
+        // east: count 2, sum 30; west: count 2, sum 5 (one NULL ignored).
+        assert_eq!(
+            r.rows[0].0,
+            vec![Value::Text("east".into()), Value::Int(2), Value::Int(30)]
+        );
+        assert_eq!(
+            r.rows[1].0,
+            vec![Value::Text("west".into()), Value::Int(2), Value::Int(5)]
+        );
+    }
+
+    #[test]
+    fn ungrouped_count_star_over_table() {
+        let r = run_sales("SELECT COUNT(*) FROM sales");
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.columns[0].name, "count");
+        assert_eq!(r.rows, vec![Row::new(vec![Value::Int(4)])]);
+    }
+
+    #[test]
+    fn min_max_aggregate() {
+        let r = run_sales("SELECT MIN(amount), MAX(amount) FROM sales");
+        assert_eq!(r.columns[0].name, "min");
+        assert_eq!(r.columns[1].name, "max");
+        assert_eq!(r.columns[0].ty, ColumnType::Int);
+        assert_eq!(r.rows[0].0, vec![Value::Int(5), Value::Int(20)]);
+    }
+
+    #[test]
+    fn order_by_asc_and_desc_with_null() {
+        // ASC ⇒ NULLS LAST
+        let r = run_sales("SELECT amount FROM sales ORDER BY amount ASC");
+        assert_eq!(
+            r.rows.iter().map(|r| r.get(0).clone()).collect::<Vec<_>>(),
+            vec![Value::Int(5), Value::Int(10), Value::Int(20), Value::Null]
+        );
+        // DESC ⇒ NULLS FIRST
+        let r = run_sales("SELECT amount FROM sales ORDER BY amount DESC");
+        assert_eq!(
+            r.rows.iter().map(|r| r.get(0).clone()).collect::<Vec<_>>(),
+            vec![Value::Null, Value::Int(20), Value::Int(10), Value::Int(5)]
+        );
+    }
+
+    #[test]
+    fn order_by_non_selected_column() {
+        // Order by amount but only select region.
+        let r = run_sales("SELECT region FROM sales ORDER BY amount ASC");
+        assert_eq!(r.columns.len(), 1);
+        // First by amount asc: 5(west),10(east),20(east),NULL(west)
+        assert_eq!(
+            r.rows.iter().map(|r| r.get(0).clone()).collect::<Vec<_>>(),
+            vec![
+                Value::Text("west".into()),
+                Value::Text("east".into()),
+                Value::Text("east".into()),
+                Value::Text("west".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn limit_and_offset() {
+        let r = run_sales("SELECT amount FROM sales ORDER BY amount ASC LIMIT 2 OFFSET 1");
+        assert_eq!(
+            r.rows.iter().map(|r| r.get(0).clone()).collect::<Vec<_>>(),
+            vec![Value::Int(10), Value::Int(20)]
+        );
+    }
+
+    #[test]
+    fn non_grouped_column_fails_loud() {
+        let err = execute(
+            &parse("SELECT region, amount FROM sales GROUP BY region").unwrap(),
+            &sales_catalog(),
+            "public",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::NotGrouped(_)));
+    }
+
+    #[test]
+    fn order_by_ordinal_against_output() {
+        let r = run_sales("SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY 2 DESC");
+        // both groups have count 2; stable, so order preserved (east, west).
+        // Make it discriminating: order by region desc via ordinal 1.
+        let r2 = run_sales("SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY 1 DESC");
+        assert_eq!(r2.rows[0].0[0], Value::Text("west".into()));
+        assert_eq!(r2.rows[1].0[0], Value::Text("east".into()));
+        // ordinal-2 sort still yields both rows.
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn order_by_ordinal_out_of_range_fails_loud() {
+        let err = execute(
+            &parse("SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY 5").unwrap(),
+            &sales_catalog(),
+            "public",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::InvalidOrderBy(_)));
+    }
+
+    #[test]
+    fn aggregate_with_where_and_join() {
+        // users(id,name) JOIN orders(oid,uid); count orders per user, filtered.
+        let r = execute(
+            &parse(
+                "SELECT u.name, COUNT(*) FROM users u JOIN orders o ON u.id = o.uid \
+                 WHERE u.id = 1 GROUP BY u.name",
+            )
+            .unwrap(),
+            &catalog(),
+            "public",
+        )
+        .unwrap();
+        assert_eq!(r.columns[0].name, "name");
+        assert_eq!(r.columns[1].name, "count");
+        assert_eq!(
+            r.rows,
+            vec![Row::new(vec![Value::Text("alice".into()), Value::Int(2)])]
+        );
+    }
+
+    #[test]
+    fn ungrouped_aggregate_over_empty_filter_yields_one_row() {
+        let r = run_sales("SELECT COUNT(*), SUM(amount) FROM sales WHERE amount > 1000");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].0, vec![Value::Int(0), Value::Null]);
     }
 
     #[test]

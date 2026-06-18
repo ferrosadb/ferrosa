@@ -91,6 +91,8 @@ fn exec_error_response(err: &ExecError) -> BackendMessage {
         ExecError::NoSuchTable { .. } => ("42P01", err.to_string()),
         ExecError::NoSuchColumn(_) | ExecError::UnknownQualifier(_) => ("42703", err.to_string()),
         ExecError::AmbiguousColumn(_) => ("42702", err.to_string()),
+        ExecError::NotGrouped(_) => ("42803", err.to_string()),
+        ExecError::InvalidOrderBy(_) => ("42P10", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
