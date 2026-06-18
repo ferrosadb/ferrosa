@@ -2146,6 +2146,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-sql"
+version = "0.13.0"
+
+[[package]]
 name = "ferrosa-sstable"
 version = "0.13.0"
 dependencies = [

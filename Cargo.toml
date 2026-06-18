@@ -12,6 +12,7 @@ members = [
     "ferrosa-postgres",
     "ferrosa-schema",
     "ferrosa-session",
+    "ferrosa-sql",
     "ferrosa-sstable",
     "ferrosa-storage",
     "ferrosa-udf",
