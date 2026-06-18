@@ -14,6 +14,9 @@ on:
       - 'ferrosa-sstable/**'
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   cluster-data-loss:
     name: 3-Node Data Loss Regression
@@ -26,11 +29,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Build Ferrosa image
-        run: docker build -t ferrosa-test .
+      - name: Download nightly Ferrosa .deb
+        id: nightly_deb
+        uses: ./.github/actions/ferrosa-nightly-deb
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Ferrosa nightly runtime image
+        run: |
+          set -euo pipefail
+          cp "${{ steps.nightly_deb.outputs.deb_path }}" tests/ferrosa.deb
+          docker build -f tests/Dockerfile.nightly-deb -t ferrosa-nightly:latest tests/
+          rm -f tests/ferrosa.deb
+
+      - name: Build Ferrosa image (fallback)
+        if: steps.nightly_deb.outputs.deb_path == ''
+        run: docker build -t ferrosa-nightly .
 
       - name: Start 3-node cluster
+        env:
+          FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
         run: |
+          set -euo pipefail
           docker compose -f tests/docker-compose.cluster.yml --profile trio up -d
           echo "Waiting for cluster formation..."
           for i in $(seq 1 60); do
