@@ -648,6 +648,23 @@ impl Parser {
     }
 
     fn parse_value(&mut self) -> Result<Value, ParseError> {
+        // Typed literal: a type-keyword identifier immediately followed by a
+        // string literal — `TIMESTAMP '2024-01-15 10:30:00'`, `DATE '2024-01-15'`,
+        // `TIME '10:30:00'`, `INET '10.0.0.1'`, `NUMERIC '123.45'` (also `DECIMAL`).
+        // This is how a typed value reaches a WHERE comparison against a
+        // timestamp/date/time/inet/numeric column. We parse the string body into
+        // the engine's value repr here so `sql_cmp` compares like-with-like.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if let Some(kind) = typed_literal_kind(w) {
+                if let Some(Tok::Str(_)) = self.toks.get(self.pos + 1) {
+                    self.next(); // type keyword
+                    let Some(Tok::Str(body)) = self.next() else {
+                        unreachable!("peeked a Str above");
+                    };
+                    return parse_typed_literal(kind, &body);
+                }
+            }
+        }
         match self.next() {
             Some(Tok::Int(n)) => Ok(Value::Int(n)),
             Some(Tok::Float(f)) => Ok(Value::float(f)),
@@ -668,6 +685,100 @@ impl Parser {
             None => Err(ParseError::UnexpectedEnd),
         }
     }
+}
+
+/// The kind of typed literal a leading keyword introduces (`TIMESTAMP '...'` etc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypedLiteral {
+    Timestamp,
+    Date,
+    Time,
+    Inet,
+    Numeric,
+}
+
+/// Map an identifier to the typed-literal kind it introduces, if any
+/// (case-insensitive). `DECIMAL` is an alias for `NUMERIC`.
+fn typed_literal_kind(word: &str) -> Option<TypedLiteral> {
+    match word.to_ascii_uppercase().as_str() {
+        "TIMESTAMP" => Some(TypedLiteral::Timestamp),
+        "DATE" => Some(TypedLiteral::Date),
+        "TIME" => Some(TypedLiteral::Time),
+        "INET" => Some(TypedLiteral::Inet),
+        "NUMERIC" | "DECIMAL" => Some(TypedLiteral::Numeric),
+        _ => None,
+    }
+}
+
+/// Parse the string body of a typed literal into the engine's [`Value`] repr.
+/// A malformed body is a parse error (fail loud — never silently a `Text`).
+fn parse_typed_literal(kind: TypedLiteral, body: &str) -> Result<Value, ParseError> {
+    let bad = || ParseError::Unexpected {
+        expected: "valid typed literal body",
+        found: body.to_string(),
+    };
+    match kind {
+        TypedLiteral::Timestamp => {
+            let s = body.trim();
+            let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+                .map_err(|_| bad())?;
+            Ok(Value::Timestamp(naive.and_utc().timestamp_micros()))
+        }
+        TypedLiteral::Date => {
+            let date =
+                chrono::NaiveDate::parse_from_str(body.trim(), "%Y-%m-%d").map_err(|_| bad())?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch valid");
+            let days = (date - epoch).num_days();
+            Ok(Value::Date(i32::try_from(days).map_err(|_| bad())?))
+        }
+        TypedLiteral::Time => {
+            let s = body.trim();
+            let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+                .map_err(|_| bad())?;
+            let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight valid");
+            let micros = (t - midnight).num_microseconds().ok_or_else(bad)?;
+            Ok(Value::Time(micros))
+        }
+        TypedLiteral::Inet => body
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .map(Value::Inet)
+            .map_err(|_| bad()),
+        TypedLiteral::Numeric => parse_numeric_literal(body.trim()),
+    }
+}
+
+/// Parse a plain decimal string (`[+-]ddd[.ddd]`, no exponent) into a normalized
+/// [`Value::Numeric`]. A malformed body is a parse error.
+fn parse_numeric_literal(s: &str) -> Result<Value, ParseError> {
+    use num_bigint::BigInt;
+    let bad = || ParseError::Unexpected {
+        expected: "decimal numeric literal",
+        found: s.to_string(),
+    };
+    if s.is_empty() {
+        return Err(bad());
+    }
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i8, r),
+        None => (1i8, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = rest.split_once('.').unwrap_or((rest, ""));
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return Err(bad());
+    }
+    let digits = format!("{int_part}{frac_part}");
+    let magnitude = digits.parse::<BigInt>().map_err(|_| bad())?;
+    let unscaled = if sign < 0 { -magnitude } else { magnitude };
+    let scale = i32::try_from(frac_part.len()).map_err(|_| bad())?;
+    Ok(Value::numeric(unscaled, scale))
 }
 
 #[cfg(test)]
@@ -790,6 +901,47 @@ mod tests {
         let str_stmt = parse("SELECT * FROM users WHERE name = 'alice'").unwrap();
         let f = str_stmt.filter.unwrap();
         assert_eq!(*compare_literal(&f), Value::Text("alice".into()));
+    }
+
+    #[test]
+    fn parses_typed_literals_in_where() {
+        use num_bigint::BigInt;
+        // TIMESTAMP literal.
+        let ts =
+            parse("SELECT id FROM events WHERE at >= TIMESTAMP '2024-01-15 10:30:00'").unwrap();
+        match compare_literal(&ts.filter.unwrap()) {
+            Value::Timestamp(_) => {}
+            other => panic!("expected Timestamp literal, got {other:?}"),
+        }
+        // DATE literal resolves to the right day count (1970-01-02 == day 1).
+        let d = parse("SELECT id FROM events WHERE on_day < DATE '1970-01-02'").unwrap();
+        assert_eq!(*compare_literal(&d.filter.unwrap()), Value::Date(1));
+        // TIME literal (1 second past midnight).
+        let t = parse("SELECT id FROM events WHERE at_time > TIME '00:00:01'").unwrap();
+        assert_eq!(*compare_literal(&t.filter.unwrap()), Value::Time(1_000_000));
+        // INET literal.
+        let inet = parse("SELECT id FROM events WHERE src = INET '10.0.0.1'").unwrap();
+        assert_eq!(
+            *compare_literal(&inet.filter.unwrap()),
+            Value::Inet("10.0.0.1".parse().unwrap())
+        );
+        // NUMERIC literal (and DECIMAL alias).
+        let n = parse("SELECT id FROM events WHERE amt > NUMERIC '1.5'").unwrap();
+        assert_eq!(
+            *compare_literal(&n.filter.unwrap()),
+            Value::numeric(BigInt::from(15), 1)
+        );
+        let dec = parse("SELECT id FROM events WHERE amt > DECIMAL '2'").unwrap();
+        assert_eq!(
+            *compare_literal(&dec.filter.unwrap()),
+            Value::numeric(BigInt::from(2), 0)
+        );
+    }
+
+    #[test]
+    fn malformed_typed_literal_is_a_parse_error() {
+        assert!(parse("SELECT id FROM events WHERE at = TIMESTAMP 'not-a-time'").is_err());
+        assert!(parse("SELECT id FROM events WHERE amt = NUMERIC '1.2.3'").is_err());
     }
 
     #[test]

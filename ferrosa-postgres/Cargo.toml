@@ -30,6 +30,13 @@ tokio = { version = "1", features = ["net", "rt", "io-util", "macros", "sync"] }
 # Used by query.rs to render/parse the Postgres `uuid` type (OID 2950) carried
 # by `ferrosa_sql::Value::Uuid`, and by storage_provider for CqlValue::Uuid.
 uuid = "1"
+# Calendar math for the temporal types: render `Value::Timestamp`/`Date`/`Time`
+# (Unix-epoch micros/days) into Postgres's exact text forms, and parse them back
+# in `decode_param`. `std` only — no wall-clock/`clock` feature needed.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `Value::Numeric` carries a `num_bigint::BigInt`; query.rs renders/parses the
+# Postgres `numeric` text form from it. Workspace dep (ferrosa-common uses it).
+num-bigint = "0.4"
 
 [features]
 # Opt-in gate for tests that require external infrastructure (a real
