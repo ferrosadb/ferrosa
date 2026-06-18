@@ -31,9 +31,7 @@ use crate::tui::{TuiDashboard, TuiFrame};
 /// fails with `BadCredentials`. Supplying credentials works against BOTH
 /// auth-on and auth-off servers (the client only sends an AUTH_RESPONSE if the
 /// server actually challenges).
-async fn connect_authed(
-    addr: SocketAddr,
-) -> Result<CqlClient, ferrosa_cql::error::CqlError> {
+async fn connect_authed(addr: SocketAddr) -> Result<CqlClient, ferrosa_cql::error::CqlError> {
     let user = std::env::var("FERROSA_CQL_USER").unwrap_or_else(|_| "ferrosa_admin".to_string());
     let pass =
         std::env::var("FERROSA_CQL_PASSWORD").unwrap_or_else(|_| "ferrosa_admin".to_string());
