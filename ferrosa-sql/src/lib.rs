@@ -16,7 +16,7 @@ pub mod provider;
 pub mod types;
 
 pub use ast::SelectStmt;
-pub use ast::{AggArg, OrderItem, Projection, SelectItem};
+pub use ast::{AggArg, Expr, Operand, OrderItem, Projection, SelectItem};
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
     filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort, AggFunc, CmpOp,

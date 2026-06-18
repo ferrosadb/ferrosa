@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Filter, Join, OrderItem, Projection, SelectItem, SelectStmt, TableRef,
+    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, SelectItem, SelectStmt, TableRef,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -42,6 +42,12 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     let mut p = Parser { toks, pos: 0 };
 
     p.expect(&Tok::Select, "SELECT")?;
+    let distinct = if matches!(p.peek(), Some(Tok::Distinct)) {
+        p.next();
+        true
+    } else {
+        false
+    };
     let projection = p.parse_projection()?;
     p.expect(&Tok::From, "FROM")?;
     let from = p.parse_table_ref()?;
@@ -52,7 +58,7 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     };
     let filter = if matches!(p.peek(), Some(Tok::Where)) {
         p.next();
-        Some(p.parse_filter()?)
+        Some(p.parse_expr()?)
     } else {
         None
     };
@@ -62,6 +68,12 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
         p.parse_column_list()?
     } else {
         Vec::new()
+    };
+    let having = if matches!(p.peek(), Some(Tok::Having)) {
+        p.next();
+        Some(p.parse_expr()?)
+    } else {
+        None
     };
     let order_by = if matches!(p.peek(), Some(Tok::Order)) {
         p.next();
@@ -93,11 +105,13 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
         });
     }
     Ok(SelectStmt {
+        distinct,
         projection,
         from,
         join,
         filter,
         group_by,
+        having,
         order_by,
         limit,
         offset,
@@ -115,11 +129,16 @@ enum Tok {
     As,
     Group,
     By,
+    Having,
     Order,
     Asc,
     Desc,
     Limit,
     Offset,
+    And,
+    Or,
+    Not,
+    Distinct,
     Ident(String),
     Int(i64),
     Float(f64),
@@ -264,11 +283,16 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
                     "AS" => Tok::As,
                     "GROUP" => Tok::Group,
                     "BY" => Tok::By,
+                    "HAVING" => Tok::Having,
                     "ORDER" => Tok::Order,
                     "ASC" => Tok::Asc,
                     "DESC" => Tok::Desc,
                     "LIMIT" => Tok::Limit,
                     "OFFSET" => Tok::Offset,
+                    "AND" => Tok::And,
+                    "OR" => Tok::Or,
+                    "NOT" => Tok::Not,
+                    "DISTINCT" => Tok::Distinct,
                     _ => Tok::Ident(word),
                 });
             }
@@ -490,11 +514,93 @@ impl Parser {
         Ok(Join { table, left, right })
     }
 
-    fn parse_filter(&mut self) -> Result<Filter, ParseError> {
-        let column = self.parse_column_ref()?;
+    /// Boolean expression grammar with precedence
+    /// OR (lowest) < AND < NOT < primary.
+    ///
+    /// ```text
+    /// or_expr   := and_expr ( OR and_expr )*
+    /// and_expr  := not_expr ( AND not_expr )*
+    /// not_expr  := NOT not_expr | primary
+    /// primary   := '(' or_expr ')' | comparison
+    /// ```
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(Tok::Or)) {
+            self.next();
+            let right = self.parse_and()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_not()?;
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.next();
+            let right = self.parse_not()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), Some(Tok::Not)) {
+            self.next();
+            let inner = self.parse_not()?;
+            Ok(Expr::Not(Box::new(inner)))
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), Some(Tok::LParen)) {
+            self.next();
+            let inner = self.parse_or()?;
+            self.expect(&Tok::RParen, ")")?;
+            Ok(inner)
+        } else {
+            self.parse_comparison()
+        }
+    }
+
+    /// `comparison := operand op value`, where operand is a column ref or an
+    /// aggregate call (`COUNT(*)` / `FUNC(col)`).
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_operand()?;
         let op = self.parse_cmp_op()?;
         let value = self.parse_value()?;
-        Ok(Filter { column, op, value })
+        Ok(Expr::Compare { left, op, value })
+    }
+
+    /// An operand in a comparison: an aggregate `FUNC(...)` if an identifier
+    /// whose uppercase name is a known aggregate is immediately followed by `(`,
+    /// otherwise a plain column reference. (Mirrors `parse_select_item`.)
+    fn parse_operand(&mut self) -> Result<Operand, ParseError> {
+        if let Some(Tok::Ident(word)) = self.peek() {
+            if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
+                let raw = word.clone();
+                self.next(); // function name
+                self.next(); // (
+                let func = aggregate_func(&raw).ok_or(ParseError::Unexpected {
+                    expected: "supported aggregate",
+                    found: raw,
+                })?;
+                let arg = if matches!(self.peek(), Some(Tok::Star)) {
+                    self.next();
+                    AggArg::Star
+                } else {
+                    AggArg::Column(self.parse_column_ref()?)
+                };
+                self.expect(&Tok::RParen, ")")?;
+                return Ok(Operand::Aggregate { func, arg });
+            }
+        }
+        Ok(Operand::Column(self.parse_column_ref()?))
     }
 
     fn parse_cmp_op(&mut self) -> Result<CmpOp, ParseError> {
@@ -615,22 +721,39 @@ mod tests {
         );
     }
 
+    /// Unwrap a single `Compare` from a filter `Expr` for assertion ergonomics.
+    fn as_compare(expr: &Expr) -> (&Operand, CmpOp, &Value) {
+        match expr {
+            Expr::Compare { left, op, value } => (left, *op, value),
+            other => panic!("expected Compare, got {other:?}"),
+        }
+    }
+
+    fn compare_column(expr: &Expr) -> &ColumnRef {
+        match as_compare(expr).0 {
+            Operand::Column(c) => c,
+            other => panic!("expected column operand, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_where_with_int_and_string_literals() {
         let int_stmt = parse("SELECT * FROM users u WHERE u.id = 1").unwrap();
         let f = int_stmt.filter.unwrap();
         assert_eq!(
-            f.column,
+            *compare_column(&f),
             ColumnRef {
                 qualifier: Some("u".into()),
                 name: "id".into()
             }
         );
-        assert_eq!(f.op, CmpOp::Eq);
-        assert_eq!(f.value, Value::Int(1));
+        let (_, op, value) = as_compare(&f);
+        assert_eq!(op, CmpOp::Eq);
+        assert_eq!(*value, Value::Int(1));
 
         let str_stmt = parse("SELECT * FROM users WHERE name = 'alice'").unwrap();
-        assert_eq!(str_stmt.filter.unwrap().value, Value::Text("alice".into()));
+        let f = str_stmt.filter.unwrap();
+        assert_eq!(*as_compare(&f).2, Value::Text("alice".into()));
     }
 
     #[test]
@@ -714,28 +837,123 @@ mod tests {
     #[test]
     fn parses_float_literal_in_where() {
         let stmt = parse("SELECT * FROM t WHERE x = 1.5").unwrap();
-        assert_eq!(stmt.filter.unwrap().value, Value::float(1.5));
+        let f = stmt.filter.unwrap();
+        assert_eq!(*as_compare(&f).2, Value::float(1.5));
     }
 
     #[test]
     fn parses_float_literal_variants() {
         // Negative fractional.
         let a = parse("SELECT * FROM t WHERE x = -0.25").unwrap();
-        assert_eq!(a.filter.unwrap().value, Value::float(-0.25));
+        assert_eq!(*as_compare(&a.filter.unwrap()).2, Value::float(-0.25));
         // Trailing dot with no fractional digits.
         let b = parse("SELECT * FROM t WHERE x = 10.").unwrap();
-        assert_eq!(b.filter.unwrap().value, Value::float(10.0));
+        assert_eq!(*as_compare(&b.filter.unwrap()).2, Value::float(10.0));
         // A plain integer (no dot) stays an Int.
         let c = parse("SELECT * FROM t WHERE x = 10").unwrap();
-        assert_eq!(c.filter.unwrap().value, Value::Int(10));
+        assert_eq!(*as_compare(&c.filter.unwrap()).2, Value::Int(10));
     }
 
     #[test]
     fn float_in_comparison_predicate() {
         let stmt = parse("SELECT * FROM t WHERE score > 3.5").unwrap();
         let f = stmt.filter.unwrap();
-        assert_eq!(f.op, CmpOp::Gt);
-        assert_eq!(f.value, Value::float(3.5));
+        let (_, op, value) = as_compare(&f);
+        assert_eq!(op, CmpOp::Gt);
+        assert_eq!(*value, Value::float(3.5));
+    }
+
+    #[test]
+    fn parses_where_and() {
+        let stmt = parse("SELECT * FROM t WHERE a = 1 AND b = 2").unwrap();
+        match stmt.filter.unwrap() {
+            Expr::And(l, r) => {
+                assert_eq!(compare_column(&l).name, "a");
+                assert_eq!(compare_column(&r).name, "b");
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_where_or() {
+        let stmt = parse("SELECT * FROM t WHERE a = 1 OR b = 2").unwrap();
+        assert!(matches!(stmt.filter.unwrap(), Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn parses_where_not() {
+        let stmt = parse("SELECT * FROM t WHERE NOT a = 1").unwrap();
+        match stmt.filter.unwrap() {
+            Expr::Not(inner) => assert_eq!(compare_column(&inner).name, "a"),
+            other => panic!("expected Not, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // `a = 1 OR b = 2 AND c = 3` parses as `a OR (b AND c)`.
+        let stmt = parse("SELECT * FROM t WHERE a = 1 OR b = 2 AND c = 3").unwrap();
+        match stmt.filter.unwrap() {
+            Expr::Or(l, r) => {
+                assert_eq!(compare_column(&l).name, "a");
+                assert!(matches!(*r, Expr::And(_, _)));
+            }
+            other => panic!("expected Or at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        // `(a = 1 OR b = 2) AND c = 3` parses as `(a OR b) AND c`.
+        let stmt = parse("SELECT * FROM t WHERE (a = 1 OR b = 2) AND c = 3").unwrap();
+        match stmt.filter.unwrap() {
+            Expr::And(l, r) => {
+                assert!(matches!(*l, Expr::Or(_, _)));
+                assert_eq!(compare_column(&r).name, "c");
+            }
+            other => panic!("expected And at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_distinct() {
+        let stmt = parse("SELECT DISTINCT region FROM t").unwrap();
+        assert!(stmt.distinct);
+        let plain = parse("SELECT region FROM t").unwrap();
+        assert!(!plain.distinct);
+    }
+
+    #[test]
+    fn parses_having_with_aggregate_operand() {
+        let stmt =
+            parse("SELECT region, COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > 1").unwrap();
+        let having = stmt.having.expect("having");
+        match having {
+            Expr::Compare { left, op, value } => {
+                assert_eq!(
+                    left,
+                    Operand::Aggregate {
+                        func: AggFunc::Count,
+                        arg: AggArg::Star
+                    }
+                );
+                assert_eq!(op, CmpOp::Gt);
+                assert_eq!(value, Value::Int(1));
+            }
+            other => panic!("expected Compare, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn having_after_group_by_before_order_by() {
+        let stmt = parse(
+            "SELECT region, SUM(amount) FROM t GROUP BY region \
+             HAVING SUM(amount) > 100 ORDER BY 2 DESC",
+        )
+        .unwrap();
+        assert!(stmt.having.is_some());
+        assert_eq!(stmt.order_by.len(), 1);
     }
 
     #[test]
