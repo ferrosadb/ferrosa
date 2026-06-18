@@ -28,12 +28,15 @@
 //! ## Column ordering (mirrors the CQL SELECT read path)
 //!
 //! Partition decomposition is delegated to
-//! [`ferrosa_cql::bridge::partition_to_rows_with_storage_mapping`] — the *same*
-//! helper the CQL `route_select` path uses (see `ferrosa-cql/src/router.rs`,
-//! `decode_agreed_row_to_map` / `route_select_user_table`). Output rows follow the
-//! table's **declared column order** (`TableMetadata.columns`, an `IndexMap`):
-//! partition-key, clustering-key, and regular/static columns in their DDL order.
-//! We do not invent an ordering — reusing the bridge guarantees parity with CQL.
+//! [`ferrosa_row_bridge::partition_to_rows_with_storage_mapping`] — the *same*
+//! helper the CQL `route_select` path uses (ferrosa-cql re-exports it as
+//! `ferrosa_cql::bridge::partition_to_rows_with_storage_mapping`; see
+//! `ferrosa-cql/src/router.rs`, `decode_agreed_row_to_map` /
+//! `route_select_user_table`). Output rows follow the table's **declared column
+//! order** (`TableMetadata.columns`, an `IndexMap`): partition-key,
+//! clustering-key, and regular/static columns in their DDL order. We do not
+//! invent an ordering — reusing the shared bridge guarantees parity with CQL
+//! while keeping ferrosa-postgres free of any ferrosa-cql dependency (D10).
 //!
 //! ## Lossy [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
 //!
@@ -275,7 +278,7 @@ pub async fn load_table(
     let col_types = meta
         .columns
         .values()
-        .map(|c| ferrosa_cql::bridge::parse_cql_type_in_keyspace(&c.column_type, keyspace, schema))
+        .map(|c| ferrosa_row_bridge::parse_cql_type_in_keyspace(&c.column_type, keyspace, schema))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| LoadError::Storage(format!("failed to resolve column type: {e}")))?;
     let pk_idx = pk_indices(meta);
@@ -291,7 +294,7 @@ pub async fn load_table(
         let partition = item.map_err(|e| LoadError::Storage(e.to_string()))?;
         // Mirror the CQL SELECT path: one engine row per logical CQL row, with
         // values in the table's declared column order.
-        for cql_row in ferrosa_cql::bridge::partition_to_rows_with_storage_mapping(
+        for cql_row in ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
             &partition,
             &col_names,
             &col_types,

@@ -886,7 +886,7 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
     }
 
     // events: encode each scalar into its CQL on-wire cell bytes using the
-    // reused `ferrosa_cql::types::encode_value` encoder (built from the canonical
+    // reused `ferrosa_row_bridge::encode_value` encoder (built from the canonical
     // string literal — the SAME source of truth Postgres got), so the seed and
     // the decode path share one serialization and cannot drift.
     let events_tid = TableId::new("public", "events");
@@ -911,9 +911,9 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
     engine
 }
 
-/// Reuse the canonical CQL cell encoder (no reinvention).
+/// Reuse the canonical cell encoder (no reinvention).
 fn cql_bytes(v: &ferrosa_common::CqlValue) -> Vec<u8> {
-    ferrosa_cql::types::encode_value(v)
+    ferrosa_row_bridge::encode_value(v)
 }
 
 /// `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC, no tz) → `CqlValue::Timestamp(millis)`.

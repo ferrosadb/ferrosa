@@ -1,0 +1,22 @@
+[package]
+name = "ferrosa-row-bridge"
+description = "Neutral storage-row decode/codec + Partition->row decomposition shared by ferrosa-cql and ferrosa-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# CqlType / CqlValue live here (re-exported by ferrosa-cql); DecoratedKey,
+# PartitionKey, CellValue also come from common.
+ferrosa-common = { path = "../ferrosa-common" }
+# Storage row/partition types (`Partition`, `Row`, `CellValue` liveness helpers).
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+# `Schema` for UDT-aware type-name resolution in `parse_cql_type_in_keyspace`.
+ferrosa-schema = { path = "../ferrosa-schema" }
+num-bigint = "0.4"
+tracing = "0.1"
+uuid = "1"
+
+[dev-dependencies]
+num-bigint = "0.4"
