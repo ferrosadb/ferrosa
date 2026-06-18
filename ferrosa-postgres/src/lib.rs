@@ -13,8 +13,11 @@
 //! that the connection state machine and SCRAM exchange build on.
 
 pub mod codec;
+pub mod handshake;
 pub mod messages;
 pub mod scram;
+
+pub use handshake::{Handshake, HandshakeError, VerifierStore};
 
 pub use codec::{CodecError, MAX_MESSAGE_LEN};
 pub use messages::{
