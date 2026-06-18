@@ -19,6 +19,7 @@ pub mod handshake;
 pub mod messages;
 pub mod scram;
 pub mod server;
+pub mod storage_provider;
 pub mod store;
 
 pub use connection::{ConnError, Connection};
