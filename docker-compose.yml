@@ -66,7 +66,10 @@ services:
     restart: "no"
 
   node1:
-    build: .
+    image: ferrosa-smoke:latest
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -101,7 +104,10 @@ services:
       start_period: 30s
 
   node2:
-    build: .
+    image: ferrosa-smoke:latest
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -130,7 +136,10 @@ services:
       start_period: 30s
 
   node3:
-    build: .
+    image: ferrosa-smoke:latest
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
