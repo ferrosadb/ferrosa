@@ -11,13 +11,15 @@ ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sql = { path = "../ferrosa-sql" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-common = { path = "../ferrosa-common" }
-# Used by storage_provider to (a) name the `Partition` type that
-# `StorageEngine::range_iter` streams, and (b) reuse the canonical CQL
-# SELECT partition->row decomposition (`bridge::partition_to_rows_with_storage_mapping`,
-# `bridge::decode_value`, `bridge::parse_cql_type_in_keyspace`) so the column
+# Reuse the canonical SELECT partition->row decomposition
+# (`partition_to_rows_with_storage_mapping`, `parse_cql_type_in_keyspace`,
+# `encode_value`/`decode_value`) from the neutral row-bridge crate so the column
 # ordering matches the CQL read path exactly rather than being reinvented.
-# ferrosa-cql does NOT depend on ferrosa-postgres, so this introduces no cycle.
-ferrosa-cql = { path = "../ferrosa-cql" }
+# Decision D10: this is the SAME code ferrosa-cql uses (ferrosa-cql re-exports
+# from here), so there is no row-ordering divergence AND no dependency on the
+# ~54k-LOC ferrosa-cql crate.
+ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
+# Names the `Partition` type that `StorageEngine::range_iter` streams.
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 futures = "0.3"
 base64 = "0.22"
