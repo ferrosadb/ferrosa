@@ -99,30 +99,32 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
     let mode_controller =
         ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
     let state = Arc::new(SharedState {
-        engine: engine.clone(),
-        schema: schema.clone(),
-        node_config,
-        cluster_state: Arc::new(ArcSwap::from_pointee(
-            ferrosa_cluster::ClusterStateHolder::Standalone,
-        )),
-        write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
-        ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
-            schema,
-            engine,
-        })),
+        core: Arc::new(ferrosa_session::SessionCore {
+            engine: engine.clone(),
+            schema: schema.clone(),
+            node_config,
+            cluster_state: Arc::new(ArcSwap::from_pointee(
+                ferrosa_cluster::ClusterStateHolder::Standalone,
+            )),
+            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+            ddl_path: Arc::new(ArcSwap::from_pointee(ferrosa_cluster::DdlPath::Direct {
+                schema,
+                engine,
+            })),
+            udf_executor,
+            mode_controller,
+            auth_warn: false,
+            peer_manager: None,
+            accord_clock: None,
+        }),
         prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
         connection_tracker: Arc::new(ConnectionTracker::new()),
         query_tracker: Arc::new(QueryTracker::new()),
         full_scan_tracker: Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new()),
         index_usage_tracker: Arc::new(ferrosa_cql::virtual_tables::IndexUsageTracker::new()),
-        udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
-        mode_controller,
         topology_policy: ClientTopologyPolicy::default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
-        auth_warn: false,
-        peer_manager: None,
-        accord_clock: None,
     });
     (state, dir)
 }

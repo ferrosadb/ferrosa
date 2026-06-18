@@ -19,6 +19,7 @@ ferrosa-graph = { path = "../ferrosa-graph" }
 ferrosa-sparql = { path = "../ferrosa-sparql" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-session = { path = "../ferrosa-session" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }
 dashmap = "6"
