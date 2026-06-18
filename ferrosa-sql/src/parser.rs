@@ -122,6 +122,7 @@ enum Tok {
     Offset,
     Ident(String),
     Int(i64),
+    Float(f64),
     Str(String),
     Star,
     Comma,
@@ -225,11 +226,27 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
                 }
+                // A single '.' makes this a float literal (e.g. `1.5`, `10.`,
+                // `-0.25`). Consume the dot and any trailing fractional digits.
+                let is_float = i < chars.len() && chars[i] == '.';
+                if is_float {
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
                 let text: String = chars[start..i].iter().collect();
-                let n = text
-                    .parse::<i64>()
-                    .map_err(|_| ParseError::BadToken(text))?;
-                toks.push(Tok::Int(n));
+                if is_float {
+                    let f = text
+                        .parse::<f64>()
+                        .map_err(|_| ParseError::BadToken(text))?;
+                    toks.push(Tok::Float(f));
+                } else {
+                    let n = text
+                        .parse::<i64>()
+                        .map_err(|_| ParseError::BadToken(text))?;
+                    toks.push(Tok::Int(n));
+                }
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
@@ -262,8 +279,7 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
 }
 
 /// Whether an identifier names an aggregate function (used to decide whether a
-/// `FUNC(` is an aggregate call). `AVG` is included so it can be rejected with a
-/// clear error rather than mis-parsed as a column.
+/// `FUNC(` is an aggregate call).
 fn is_aggregate_name(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
@@ -271,13 +287,14 @@ fn is_aggregate_name(word: &str) -> bool {
     )
 }
 
-/// Map a (non-AVG) aggregate identifier to its [`AggFunc`].
+/// Map an aggregate identifier to its [`AggFunc`].
 fn aggregate_func(word: &str) -> Option<AggFunc> {
     match word.to_ascii_uppercase().as_str() {
         "COUNT" => Some(AggFunc::Count),
         "SUM" => Some(AggFunc::Sum),
         "MIN" => Some(AggFunc::Min),
         "MAX" => Some(AggFunc::Max),
+        "AVG" => Some(AggFunc::Avg),
         _ => None,
     }
 }
@@ -348,7 +365,7 @@ impl Parser {
                 self.next(); // function name
                 self.next(); // (
                 let func = aggregate_func(&raw).ok_or(ParseError::Unexpected {
-                    expected: "supported aggregate (AVG not supported)",
+                    expected: "supported aggregate",
                     found: raw,
                 })?;
                 let arg = if matches!(self.peek(), Some(Tok::Star)) {
@@ -499,6 +516,7 @@ impl Parser {
     fn parse_value(&mut self) -> Result<Value, ParseError> {
         match self.next() {
             Some(Tok::Int(n)) => Ok(Value::Int(n)),
+            Some(Tok::Float(f)) => Ok(Value::float(f)),
             Some(Tok::Str(s)) => Ok(Value::Text(s)),
             Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
                 "TRUE" => Ok(Value::Bool(true)),
@@ -676,8 +694,48 @@ mod tests {
     }
 
     #[test]
-    fn avg_is_rejected() {
-        assert!(parse("SELECT AVG(x) FROM t").is_err());
+    fn parses_avg_aggregate() {
+        let stmt = parse("SELECT AVG(amount) FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => assert_eq!(
+                items[0],
+                SelectItem::Aggregate {
+                    func: AggFunc::Avg,
+                    arg: AggArg::Column(ColumnRef {
+                        qualifier: None,
+                        name: "amount".into()
+                    })
+                }
+            ),
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_float_literal_in_where() {
+        let stmt = parse("SELECT * FROM t WHERE x = 1.5").unwrap();
+        assert_eq!(stmt.filter.unwrap().value, Value::float(1.5));
+    }
+
+    #[test]
+    fn parses_float_literal_variants() {
+        // Negative fractional.
+        let a = parse("SELECT * FROM t WHERE x = -0.25").unwrap();
+        assert_eq!(a.filter.unwrap().value, Value::float(-0.25));
+        // Trailing dot with no fractional digits.
+        let b = parse("SELECT * FROM t WHERE x = 10.").unwrap();
+        assert_eq!(b.filter.unwrap().value, Value::float(10.0));
+        // A plain integer (no dot) stays an Int.
+        let c = parse("SELECT * FROM t WHERE x = 10").unwrap();
+        assert_eq!(c.filter.unwrap().value, Value::Int(10));
+    }
+
+    #[test]
+    fn float_in_comparison_predicate() {
+        let stmt = parse("SELECT * FROM t WHERE score > 3.5").unwrap();
+        let f = stmt.filter.unwrap();
+        assert_eq!(f.op, CmpOp::Gt);
+        assert_eq!(f.value, Value::float(3.5));
     }
 
     #[test]

@@ -37,13 +37,13 @@
 //!
 //! ## Lossy [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
 //!
-//! The first-slice [`ferrosa_sql::Value`] only models `Null | Int(i64) | Text |
-//! Bool`. [`cql_to_value`] maps the integral / textual / boolean CQL scalars onto
-//! it losslessly. Every other CQL type is **known-lossy** and converts to
-//! `Value::Null` (with a code comment, never a panic). Widening `Value` to carry
-//! these is tracked as follow-up. The lossy types are:
+//! The first-slice [`ferrosa_sql::Value`] models `Null | Int(i64) | Text | Bool
+//! | Float(f64)`. [`cql_to_value`] maps the integral / textual / boolean /
+//! floating-point CQL scalars onto it losslessly (f32 widens to f64). Every other
+//! CQL type is **known-lossy** and converts to `Value::Null` (with a code comment,
+//! never a panic). Widening `Value` to carry these is tracked as follow-up. The
+//! lossy types are:
 //!
-//! - Floating point: `Float`, `Double`
 //! - Arbitrary precision: `Decimal`, `Varint`
 //! - Temporal: `Timestamp`, `Date`, `Time`, `Duration`
 //! - Identifiers / binary: `Uuid`, `Timeuuid`, `Inet`, `Blob`
@@ -59,11 +59,11 @@ use futures::StreamExt;
 
 /// Convert a single ferrosa [`CqlValue`] to the engine's [`ferrosa_sql::Value`].
 ///
-/// Lossless for the integral / textual / boolean scalars; every other variant is
-/// a documented lossy gap that maps to [`Value::Null`] (see the module docs for
-/// the full list). This is deliberately **not** a panic — widening `Value` to
-/// represent these types is follow-up work, and a query over a wider table should
-/// still run, treating the as-yet-unmodelled columns as NULL.
+/// Lossless for the integral / textual / boolean / floating-point scalars; every
+/// other variant is a documented lossy gap that maps to [`Value::Null`] (see the
+/// module docs for the full list). This is deliberately **not** a panic — widening
+/// `Value` to represent these types is follow-up work, and a query over a wider
+/// table should still run, treating the as-yet-unmodelled columns as NULL.
 pub fn cql_to_value(v: &CqlValue) -> Value {
     match v {
         CqlValue::Null => Value::Null,
@@ -76,13 +76,15 @@ pub fn cql_to_value(v: &CqlValue) -> Value {
         CqlValue::Text(s) | CqlValue::Ascii(s) => Value::Text(s.clone()),
         // Boolean.
         CqlValue::Boolean(b) => Value::Bool(*b),
+        // Floating point: `Float`/`Double` carry IEEE-754 bit patterns (so the
+        // CQL value type can be Eq/Ord). Reconstruct the float and widen f32→f64.
+        CqlValue::Float(bits) => Value::float(f32::from_bits(*bits) as f64),
+        CqlValue::Double(bits) => Value::float(f64::from_bits(*bits)),
         // ── Known lossy gaps ──────────────────────────────────────────────
         // The first-slice `ferrosa_sql::Value` cannot represent these yet, so
         // they read as NULL rather than panicking. Widen `Value` (and update
         // this match) when real support lands. See the module-level doc list.
-        CqlValue::Float(_)
-        | CqlValue::Double(_)
-        | CqlValue::Decimal { .. }
+        CqlValue::Decimal { .. }
         | CqlValue::Varint(_)
         | CqlValue::Timestamp(_)
         | CqlValue::Date(_)
@@ -336,8 +338,6 @@ mod tests {
     #[test]
     fn cql_to_value_maps_lossy_types_to_null() {
         // A representative lossy scalar, temporal, identifier, and collection.
-        assert_eq!(cql_to_value(&CqlValue::Double(0)), Value::Null);
-        assert_eq!(cql_to_value(&CqlValue::Float(0)), Value::Null);
         assert_eq!(cql_to_value(&CqlValue::Timestamp(123)), Value::Null);
         assert_eq!(cql_to_value(&CqlValue::Uuid(Uuid::nil())), Value::Null);
         assert_eq!(cql_to_value(&CqlValue::Blob(vec![1, 2, 3])), Value::Null);
@@ -345,6 +345,22 @@ mod tests {
             cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])),
             Value::Null
         );
+    }
+
+    #[test]
+    fn cql_to_value_maps_floats() {
+        // `Float`/`Double` carry IEEE-754 bit patterns; reconstruct + widen.
+        assert_eq!(
+            cql_to_value(&CqlValue::Double(1.5f64.to_bits())),
+            Value::float(1.5)
+        );
+        assert_eq!(
+            cql_to_value(&CqlValue::Float((-0.5f32).to_bits())),
+            Value::float(-0.5)
+        );
+        // Zero bits decode to 0.0 (not NULL).
+        assert_eq!(cql_to_value(&CqlValue::Double(0)), Value::float(0.0));
+        assert_eq!(cql_to_value(&CqlValue::Float(0)), Value::float(0.0));
     }
 
     #[test]

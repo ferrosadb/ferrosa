@@ -76,21 +76,29 @@ pub fn limit_offset(rows: Vec<Row>, offset: usize, limit: Option<usize>) -> Vec<
     }
 }
 
-/// A supported aggregate function. `AVG` is deliberately absent — [`Value`] has
-/// no float variant — and is rejected at parse time.
+/// A supported aggregate function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
     Count,
     Sum,
     Min,
     Max,
+    Avg,
 }
 
 /// One accumulator, paired with its `(func, arg-column)` definition.
+///
+/// SUM/AVG track an integer running sum (`int_sum`) and a float running sum
+/// (`float_sum`) plus `saw_float`: an Int column sums into `int_sum` and yields
+/// `Int`, a Float column sums into `float_sum` and yields `Float`, and a mixed
+/// column promotes to `Float`. `numeric_count` is the count of non-NULL numeric
+/// values feeding SUM/AVG; AVG divides the total by it.
 struct Accumulator {
     count: i64,
-    sum: i64,
-    has_sum: bool,
+    int_sum: i64,
+    float_sum: f64,
+    saw_float: bool,
+    numeric_count: i64,
     extreme: Option<Value>,
 }
 
@@ -98,9 +106,29 @@ impl Accumulator {
     fn new() -> Self {
         Self {
             count: 0,
-            sum: 0,
-            has_sum: false,
+            int_sum: 0,
+            float_sum: 0.0,
+            saw_float: false,
+            numeric_count: 0,
             extreme: None,
+        }
+    }
+
+    /// Accumulate one non-NULL numeric value into the SUM/AVG running totals.
+    /// Non-numeric values are skipped (the count is unaffected).
+    fn add_numeric(&mut self, v: &Value) {
+        match v {
+            Value::Int(n) => {
+                self.int_sum += *n;
+                self.float_sum += *n as f64;
+                self.numeric_count += 1;
+            }
+            Value::Float(f) => {
+                self.float_sum += f.0;
+                self.saw_float = true;
+                self.numeric_count += 1;
+            }
+            _ => {}
         }
     }
 
@@ -115,12 +143,9 @@ impl Accumulator {
                     }
                 }
             },
-            AggFunc::Sum => {
+            AggFunc::Sum | AggFunc::Avg => {
                 if let Some(c) = arg {
-                    if let Value::Int(n) = &row.0[c] {
-                        self.sum += *n;
-                        self.has_sum = true;
-                    }
+                    self.add_numeric(&row.0[c]);
                 }
             }
             AggFunc::Min | AggFunc::Max => {
@@ -151,12 +176,23 @@ impl Accumulator {
     fn finish(&self, func: AggFunc) -> Value {
         match func {
             AggFunc::Count => Value::Int(self.count),
-            // Postgres: SUM over no non-null rows is NULL.
+            // Postgres: SUM over no non-null rows is NULL. A Float column (or any
+            // float seen) yields Float; a pure-Int column yields Int.
             AggFunc::Sum => {
-                if self.has_sum {
-                    Value::Int(self.sum)
-                } else {
+                if self.numeric_count == 0 {
                     Value::Null
+                } else if self.saw_float {
+                    Value::float(self.float_sum)
+                } else {
+                    Value::Int(self.int_sum)
+                }
+            }
+            // AVG always yields Float (or NULL over no non-null numeric rows).
+            AggFunc::Avg => {
+                if self.numeric_count == 0 {
+                    Value::Null
+                } else {
+                    Value::float(self.float_sum / self.numeric_count as f64)
                 }
             }
             AggFunc::Min | AggFunc::Max => self.extreme.clone().unwrap_or(Value::Null),
@@ -639,6 +675,80 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, vec![Value::Null, Value::Int(2)]);
         assert_eq!(out[1].0, vec![Value::Int(1), Value::Int(1)]);
+    }
+
+    #[test]
+    fn aggregate_avg_ungrouped_integer_column_gives_fractional() {
+        // AVG over an Int column: (1 + 2) / 2 = 1.5, a fractional result.
+        let rows = vec![
+            r(vec![Value::Int(1)]),
+            r(vec![Value::Null]),
+            r(vec![Value::Int(2)]),
+        ];
+        let out = hash_aggregate(rows, &[], &[(AggFunc::Avg, Some(0))]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, vec![Value::float(1.5)]);
+    }
+
+    #[test]
+    fn aggregate_avg_grouped() {
+        // col0 = region (group), col1 = amount
+        let rows = vec![
+            r(vec![Value::Text("east".into()), Value::Int(10)]),
+            r(vec![Value::Text("west".into()), Value::Int(5)]),
+            r(vec![Value::Text("east".into()), Value::Int(20)]),
+        ];
+        let out = hash_aggregate(rows, &[0], &[(AggFunc::Avg, Some(1))]);
+        // east: (10+20)/2 = 15.0; west: 5/1 = 5.0
+        assert_eq!(
+            out[0].0,
+            vec![Value::Text("east".into()), Value::float(15.0)]
+        );
+        assert_eq!(
+            out[1].0,
+            vec![Value::Text("west".into()), Value::float(5.0)]
+        );
+    }
+
+    #[test]
+    fn aggregate_avg_no_rows_is_null() {
+        let rows = vec![r(vec![Value::Null])];
+        let out = hash_aggregate(rows, &[], &[(AggFunc::Avg, Some(0))]);
+        assert_eq!(out[0].0, vec![Value::Null]);
+    }
+
+    #[test]
+    fn aggregate_sum_over_float_column_yields_float() {
+        let rows = vec![
+            r(vec![Value::float(1.5)]),
+            r(vec![Value::Null]),
+            r(vec![Value::float(2.25)]),
+        ];
+        let out = hash_aggregate(rows, &[], &[(AggFunc::Sum, Some(0))]);
+        assert_eq!(out[0].0, vec![Value::float(3.75)]);
+    }
+
+    #[test]
+    fn aggregate_sum_over_int_column_stays_int() {
+        let rows = vec![r(vec![Value::Int(2)]), r(vec![Value::Int(3)])];
+        let out = hash_aggregate(rows, &[], &[(AggFunc::Sum, Some(0))]);
+        assert_eq!(out[0].0, vec![Value::Int(5)]);
+    }
+
+    #[test]
+    fn aggregate_min_max_over_floats() {
+        let rows = vec![
+            r(vec![Value::float(5.5)]),
+            r(vec![Value::Null]),
+            r(vec![Value::float(2.25)]),
+            r(vec![Value::float(9.0)]),
+        ];
+        let out = hash_aggregate(
+            rows,
+            &[],
+            &[(AggFunc::Min, Some(0)), (AggFunc::Max, Some(0))],
+        );
+        assert_eq!(out[0].0, vec![Value::float(2.25), Value::float(9.0)]);
     }
 
     #[test]

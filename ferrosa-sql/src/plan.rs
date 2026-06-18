@@ -290,12 +290,14 @@ fn plan_aggregate(
     Ok((out_columns, out_rows))
 }
 
-/// The output column for an aggregate: name `count`/`sum`/`min`/`max`; type
-/// `Int` for Count/Sum, the argument column's type for Min/Max.
+/// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
+/// COUNT is always `Int`; AVG is always `Float`; SUM and MIN/MAX take the
+/// argument column's type.
 fn aggregate_column(func: AggFunc, arg_col: Option<usize>, schema: &RelSchema) -> Column {
     let (name, ty) = match func {
         AggFunc::Count => ("count", ColumnType::Int),
-        AggFunc::Sum => ("sum", ColumnType::Int),
+        AggFunc::Sum => ("sum", arg_ty(arg_col, schema)),
+        AggFunc::Avg => ("avg", ColumnType::Float),
         AggFunc::Min => ("min", arg_ty(arg_col, schema)),
         AggFunc::Max => ("max", arg_ty(arg_col, schema)),
     };
@@ -560,6 +562,52 @@ mod tests {
             r.rows[1].0,
             vec![Value::Text("west".into()), Value::Int(2), Value::Int(5)]
         );
+    }
+
+    #[test]
+    fn avg_ungrouped_gives_fractional_float() {
+        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 11.666...
+        let r = run_sales("SELECT AVG(amount) FROM sales");
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.columns[0].name, "avg");
+        assert_eq!(r.columns[0].ty, ColumnType::Float);
+        let Value::Float(of) = &r.rows[0].0[0] else {
+            panic!("expected float avg");
+        };
+        assert!((of.0 - 35.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn avg_grouped_output_types_and_values() {
+        let r = run_sales("SELECT region, AVG(amount) FROM sales GROUP BY region");
+        assert_eq!(
+            r.columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.ty))
+                .collect::<Vec<_>>(),
+            [("region", ColumnType::Text), ("avg", ColumnType::Float)]
+        );
+        // east: (10+20)/2 = 15.0; west: 5/1 = 5.0 (NULL ignored).
+        assert_eq!(
+            r.rows[0].0,
+            vec![Value::Text("east".into()), Value::float(15.0)]
+        );
+        assert_eq!(
+            r.rows[1].0,
+            vec![Value::Text("west".into()), Value::float(5.0)]
+        );
+    }
+
+    #[test]
+    fn avg_unknown_arg_column_fails_loud() {
+        // AVG's argument must resolve like any other aggregate argument.
+        let err = execute(
+            &parse("SELECT AVG(nope) FROM sales").unwrap(),
+            &sales_catalog(),
+            "public",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::NoSuchColumn(_)));
     }
 
     #[test]
