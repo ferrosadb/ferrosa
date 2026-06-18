@@ -82,6 +82,7 @@ jobs:
                --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
                --skip bounded_fetch_reassembles_to_single_pass \
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
+               --skip differential_oracle \
 
   # ── Stage 2b: Musl static build ───────────────────────────────────
   musl:

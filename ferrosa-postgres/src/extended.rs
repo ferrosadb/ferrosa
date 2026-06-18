@@ -21,7 +21,7 @@
 //!
 //! After any error inside an extended-query sequence, the backend ignores every
 //! subsequent message until the next `Sync`, then emits `ReadyForQuery`. The
-//! [`Session::error_pending`] flag implements that skip; `Sync` clears it.
+//! the `Session::error_pending` flag implements that skip; `Sync` clears it.
 
 use std::collections::HashMap;
 

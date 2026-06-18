@@ -6,7 +6,7 @@
 //!
 //! 1. `parse(sql)` → [`ferrosa_sql::SelectStmt`] (syntax errors → `42601`).
 //! 2. For every referenced table (`FROM` plus an optional `JOIN`), resolve its
-//!    keyspace and [`storage_provider::load_table`] it into an in-memory snapshot,
+//!    keyspace and `storage_provider::load_table`s it into an in-memory snapshot,
 //!    registering it in a [`ferrosa_sql::MapCatalog`]. A missing table is
 //!    `42P01` (undefined_table) — never a silently-empty relation (the R15 guard).
 //! 3. `execute(&stmt, &catalog, default_schema)` runs the sync operators.
@@ -552,7 +552,7 @@ fn be_int(raw: &[u8], width: usize) -> Option<i64> {
 /// `1` binary) for a column of declared `col_type`, or `None` for SQL NULL.
 ///
 /// The binary encoding is kept consistent with the OID/size advertised in
-/// [`column_type_oid`] / [`column_type_size`]: `ColumnType::Int` ⇒ int4 (OID 23,
+/// `column_type_oid` / `column_type_size`: `ColumnType::Int` ⇒ int4 (OID 23,
 /// 4 bytes), so an `Int` always emits a 4-byte big-endian `i32` (a value that
 /// overflows `i32` saturates rather than corrupting the frame). `Float` ⇒
 /// float8 (OID 701, 8 bytes).

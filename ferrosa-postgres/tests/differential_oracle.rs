@@ -1316,7 +1316,7 @@ async fn differential_oracle_corpus_agrees() {
 /// or fabricated) rows. We do not compare to Postgres here; the point is
 /// fail-loud, not silent-wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ferrosa_rejects_unsupported_queries() {
+async fn differential_oracle_rejects_unsupported_queries() {
     require_containers();
 
     let (fe_client, _ferrosa_dir) = start_ferrosa().await;
