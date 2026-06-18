@@ -206,6 +206,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
+      - name: Download latest nightly .deb release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The nightly-release workflow now runs at 00:17 UTC, so the latest
+          # nightly .deb should already be published before this 03:00 job.
+          # Find the most recent nightly prerelease that contains an amd64 .deb.
+          set -euo pipefail
+          release_json=$(gh api \
+            "repos/${{ github.repository }}/releases" \
+            --jq '.[] | select(.prerelease == true) | {tag_name:.tag_name, id:.id, assets:.assets}' \
+            | head -n 200)
+          asset_url=$(echo "$release_json" \
+            | gh api "repos/${{ github.repository }}/releases" --jq \
+              '.[] | select(.prerelease == true) | .assets[] | select(.name | test("ferrosa_.*_amd64\\.deb$")) | .browser_download_url' \
+            | head -n 1)
+          if [[ -z "$asset_url" ]]; then
+            echo "::error::No nightly .deb asset found in prereleases. Did the nightly-release workflow run and publish?"
+            exit 1
+          fi
+          echo "Downloading nightly .deb: $asset_url"
+          curl -fsSL -o tests/ferrosa.deb "$asset_url"
+          ls -lh tests/ferrosa.deb
+          dpkg-deb -I tests/ferrosa.deb | grep -E 'Package|Version|Architecture'
+
+      - name: Build smoke-test runtime image
+        run: docker build -f tests/Dockerfile.smoke -t ferrosa-smoke:latest tests/
+
       - name: Run Docker smoke test
         env:
           PAIR_CQL_TIMEOUT: 240

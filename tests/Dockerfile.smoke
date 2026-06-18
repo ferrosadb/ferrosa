@@ -1,0 +1,34 @@
+# Smoke-test runtime image for Ferrosa pair-mode/cluster CI.
+#
+# This image installs a prebuilt Ferrosa .deb package instead of compiling the
+# workspace from source. The source build in Dockerfile takes 10+ minutes on
+# GitHub-hosted runners and was consuming most of the nightly smoke-test job
+# timeout, causing the test to be killed before nodes became CQL-ready.
+#
+# CI downloads the latest nightly .deb (or a specific release artifact) and
+# places it next to this file as ferrosa.deb before building.
+#
+# Local usage:
+#   cp /path/to/ferrosa_VERSION_amd64.deb tests/ferrosa.deb
+#   docker build -f tests/Dockerfile.smoke -t ferrosa-smoke:latest tests/
+
+FROM debian:trixie-slim
+
+# Runtime debugging tools so crashes in CI produce readable backtraces.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gdb \
+        procps \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# The caller must supply ferrosa.deb (nightly release artifact).
+COPY ferrosa.deb /tmp/ferrosa.deb
+RUN dpkg -i /tmp/ferrosa.deb || (apt-get update && apt-get install -f -y) \
+    && rm /tmp/ferrosa.deb \
+    && which ferrosa \
+    && ferrosa --version
+
+EXPOSE 9042 7000 9090
+ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+CMD ["ferrosa"]
