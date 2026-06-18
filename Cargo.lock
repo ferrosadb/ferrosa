@@ -2078,6 +2078,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-session"
+version = "0.13.0"
+dependencies = [
+ "arc-swap",
+ "ferrosa-cluster",
+ "ferrosa-common",
+ "ferrosa-net",
+ "ferrosa-schema",
+ "ferrosa-storage",
+ "ferrosa-udf",
+]
+
+[[package]]
 name = "ferrosa-sim"
 version = "0.13.0"
 dependencies = [
