@@ -441,3 +441,69 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         "DESC orders the highest uid first"
     );
 }
+
+#[tokio::test]
+async fn where_having_distinct_over_a_real_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seed_engine(dir.path());
+    let schema = create_schema();
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    let client = connect(port).await;
+
+    let collect = |msgs: Vec<tokio_postgres::SimpleQueryMessage>| {
+        msgs.into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Boolean WHERE (AND): exactly order 10 belongs to uid 1.
+    let anded = collect(
+        client
+            .simple_query("SELECT o.oid FROM orders o WHERE o.uid = 1 AND o.oid = 10")
+            .await
+            .expect("WHERE AND should work"),
+    );
+    assert_eq!(anded.len(), 1);
+    assert_eq!(anded[0].get(0), Some("10"));
+
+    // Boolean WHERE (OR + parens): all three orders.
+    let ored = collect(
+        client
+            .simple_query("SELECT o.oid FROM orders o WHERE (o.uid = 1 OR o.uid = 2)")
+            .await
+            .expect("WHERE OR should work"),
+    );
+    assert_eq!(ored.len(), 3);
+
+    // HAVING filters groups by aggregate: only uid 1 has more than one order.
+    let having = collect(
+        client
+            .simple_query("SELECT o.uid, COUNT(*) FROM orders o GROUP BY o.uid HAVING COUNT(*) > 1")
+            .await
+            .expect("HAVING should work"),
+    );
+    assert_eq!(having.len(), 1);
+    assert_eq!((having[0].get(0), having[0].get(1)), (Some("1"), Some("2")));
+
+    // DISTINCT collapses the two uid=1 orders to one distinct uid.
+    let distinct = collect(
+        client
+            .simple_query("SELECT DISTINCT o.uid FROM orders o ORDER BY o.uid")
+            .await
+            .expect("DISTINCT should work"),
+    );
+    assert_eq!(distinct.len(), 2, "two distinct uids");
+    assert_eq!(distinct[0].get(0), Some("1"));
+    assert_eq!(distinct[1].get(0), Some("2"));
+}
