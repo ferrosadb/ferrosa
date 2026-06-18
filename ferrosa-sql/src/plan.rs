@@ -8,12 +8,15 @@
 
 use std::fmt;
 
-use crate::ast::{AggArg, ColumnRef, Projection, SelectItem, SelectStmt, TableRef};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+
+use crate::ast::{AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef};
 use crate::catalog::Catalog;
 use crate::exec::{
-    hash_aggregate, hash_join, limit_offset, seq_scan, sort, AggFunc, Predicate, SortKey,
+    hash_aggregate, hash_join, limit_offset, seq_scan, sort, AggFunc, CmpOp, SortKey,
 };
-use crate::types::{Column, ColumnType, RelSchema, Row};
+use crate::types::{Column, ColumnType, RelSchema, Row, Value};
 
 /// The result of executing a query: output column metadata + materialized rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,10 +34,14 @@ pub enum ExecError {
     NoSuchColumn(String),
     AmbiguousColumn(String),
     UnknownQualifier(String),
-    /// A non-aggregated column in the SELECT list is absent from `GROUP BY`.
+    /// A non-aggregated column in the SELECT list (or a HAVING column that is
+    /// neither a group column nor an aggregate) is absent from `GROUP BY`.
     NotGrouped(String),
     /// An `ORDER BY` ordinal is out of range of the output columns.
     InvalidOrderBy(String),
+    /// An aggregate function was used in a `WHERE` clause (illegal — aggregates
+    /// belong in `HAVING`).
+    AggregateInWhere(String),
 }
 
 impl fmt::Display for ExecError {
@@ -55,7 +62,65 @@ impl fmt::Display for ExecError {
             ExecError::InvalidOrderBy(c) => {
                 write!(f, "ORDER BY position \"{c}\" is not in select list")
             }
+            ExecError::AggregateInWhere(a) => write!(
+                f,
+                "aggregate functions are not allowed in WHERE: \"{a}\" (use HAVING)"
+            ),
         }
+    }
+}
+
+/// Apply a [`CmpOp`] to a definite ordering.
+fn apply_cmp(op: CmpOp, ord: Ordering) -> bool {
+    match op {
+        CmpOp::Eq => ord == Ordering::Equal,
+        CmpOp::Ne => ord != Ordering::Equal,
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
+    }
+}
+
+/// Evaluate a boolean expression over `row` under three-valued Kleene logic,
+/// returning `None` for UNKNOWN. `resolve` maps each leaf comparison's operand
+/// to the value to compare (its column/aggregate slot in `row`); a comparison
+/// is UNKNOWN when [`Value::sql_cmp`] is `None`.
+fn eval_kleene(expr: &Expr, row: &Row, resolve: &dyn Fn(&Operand) -> usize) -> Option<bool> {
+    match expr {
+        Expr::Compare { left, op, value } => {
+            let idx = resolve(left);
+            row.0[idx].sql_cmp(value).map(|ord| apply_cmp(*op, ord))
+        }
+        Expr::Not(inner) => eval_kleene(inner, row, resolve).map(|b| !b),
+        Expr::And(l, r) => {
+            let a = eval_kleene(l, row, resolve);
+            let b = eval_kleene(r, row, resolve);
+            kleene_and(a, b)
+        }
+        Expr::Or(l, r) => {
+            let a = eval_kleene(l, row, resolve);
+            let b = eval_kleene(r, row, resolve);
+            kleene_or(a, b)
+        }
+    }
+}
+
+/// Kleene AND: `Some(false)` dominates; else UNKNOWN if either is UNKNOWN.
+fn kleene_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+/// Kleene OR: `Some(true)` dominates; else UNKNOWN if either is UNKNOWN.
+fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
     }
 }
 
@@ -115,21 +180,24 @@ pub fn execute(
         combined_schema = from_schema;
     }
 
-    // WHERE
+    // WHERE: pre-resolve every comparison's column operand to a scope index
+    // (aggregates are illegal here), then keep rows that evaluate to Some(true)
+    // under Kleene logic.
     let filtered: Vec<Row> = if let Some(f) = &stmt.filter {
-        let idx = resolve_column(&scope, &f.column)?;
-        let pred = Predicate {
-            col: idx,
-            op: f.op,
-            value: f.value.clone(),
-        };
-        base_rows.into_iter().filter(|r| pred.eval(r)).collect()
+        let idx_map = resolve_where_operands(f, &scope)?;
+        let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
+        base_rows
+            .into_iter()
+            .filter(|r| eval_kleene(f, r, &resolve) == Some(true))
+            .collect()
     } else {
         base_rows
     };
 
-    // Aggregate mode iff GROUP BY is present or any select item is an aggregate.
+    // Aggregate mode iff GROUP BY is present, any select item is an aggregate,
+    // or HAVING is present.
     let is_aggregate = !stmt.group_by.is_empty()
+        || stmt.having.is_some()
         || matches!(&stmt.projection, Projection::Items(items)
             if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
 
@@ -147,26 +215,17 @@ pub fn execute(
     Ok(QueryResult { columns, rows })
 }
 
-/// Non-aggregate path: ORDER BY (resolved against the scope) then projection.
+/// Non-aggregate path. Without DISTINCT, ORDER BY resolves against the input
+/// scope (so it may name a non-selected column) and is applied before
+/// projection. With DISTINCT, the rows are projected and deduped first, then
+/// ORDER BY resolves against the OUTPUT columns.
 fn plan_simple(
     stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
     rows: Vec<Row>,
 ) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
-    // ORDER BY resolves against the input scope, so it may name a non-selected
-    // column. Apply it to the joined/filtered rows before projecting.
-    let rows = if stmt.order_by.is_empty() {
-        rows
-    } else {
-        let mut keys = Vec::with_capacity(stmt.order_by.len());
-        for item in &stmt.order_by {
-            let col = resolve_column(scope, &item.column)?;
-            keys.push(SortKey { col, dir: item.dir });
-        }
-        sort(rows, &keys)
-    };
-
+    // Resolve the projection into output columns + source indices.
     let (columns, indices): (Vec<Column>, Vec<usize>) = match &stmt.projection {
         Projection::Star => (
             combined_schema.columns.clone(),
@@ -190,15 +249,48 @@ fn plan_simple(
         }
     };
 
-    let out = rows
-        .into_iter()
-        .map(|r| Row(indices.iter().map(|&i| r.0[i].clone()).collect()))
-        .collect();
-    Ok((columns, out))
+    let project = |rows: Vec<Row>| -> Vec<Row> {
+        rows.into_iter()
+            .map(|r| Row(indices.iter().map(|&i| r.0[i].clone()).collect()))
+            .collect()
+    };
+
+    if stmt.distinct {
+        // DISTINCT: project + dedup first, then ORDER BY against output columns.
+        let deduped = dedup_rows(project(rows));
+        let out = if stmt.order_by.is_empty() {
+            deduped
+        } else {
+            let mut keys = Vec::with_capacity(stmt.order_by.len());
+            for item in &stmt.order_by {
+                let col = resolve_output_position(&item.column, &columns)?;
+                keys.push(SortKey { col, dir: item.dir });
+            }
+            sort(deduped, &keys)
+        };
+        return Ok((columns, out));
+    }
+
+    // No DISTINCT: ORDER BY against the input scope, applied before projecting.
+    let rows = if stmt.order_by.is_empty() {
+        rows
+    } else {
+        let mut keys = Vec::with_capacity(stmt.order_by.len());
+        for item in &stmt.order_by {
+            let col = resolve_column(scope, &item.column)?;
+            keys.push(SortKey { col, dir: item.dir });
+        }
+        sort(rows, &keys)
+    };
+
+    Ok((columns, project(rows)))
 }
 
-/// Aggregate path: resolve group/agg columns, validate, run `hash_aggregate`,
-/// reorder into SELECT-list order, then ORDER BY against the output.
+/// Aggregate path. Compute the UNION of aggregates referenced by the SELECT list
+/// and by HAVING into an internal layout `[group_cols..., all_unique_aggs...]`,
+/// evaluate HAVING against that layout (keep groups where it is `Some(true)`),
+/// then project the SELECT items, dedup if DISTINCT, and ORDER BY against the
+/// output columns.
 fn plan_aggregate(
     stmt: &SelectStmt,
     scope: &[Bound],
@@ -212,29 +304,30 @@ fn plan_aggregate(
     }
 
     let items = match &stmt.projection {
-        // `SELECT *` with GROUP BY is not meaningfully supported here; treat
-        // every grouped column as the projection is out of scope — reject.
+        // `SELECT *` with GROUP BY is not meaningfully supported here; reject.
         Projection::Star => return Err(ExecError::NotGrouped("*".into())),
         Projection::Items(items) => items,
     };
 
-    // Build the aggregate definitions and validate plain columns are grouped.
-    let mut aggs: Vec<(AggFunc, Option<usize>)> = Vec::new();
-    // For each SELECT item, record where its value lives in the hash_aggregate
-    // output layout `[group_cols..., aggs...]`: Group(group_index) or Agg(agg_index).
+    // The internal aggregate set: the union of aggregates from SELECT and HAVING.
+    // `agg_defs` is parallel to the agg tail of the hash_aggregate layout; an
+    // operand is deduplicated by its (func, arg-global-index) identity.
+    let mut agg_defs: Vec<(AggFunc, Option<usize>)> = Vec::new();
+    let mut agg_keys: Vec<AggKey> = Vec::new();
+
+    // Where each SELECT item lives in the internal layout `[group..., aggs...]`.
     enum Slot {
         Group(usize),
         Agg(usize),
     }
     let mut slots: Vec<Slot> = Vec::with_capacity(items.len());
-    // Output column metadata, parallel to SELECT-list order.
     let mut out_columns: Vec<Column> = Vec::with_capacity(items.len());
 
+    // SELECT list: plain columns must be grouped; aggregates feed the union.
     for item in items {
         match item {
             SelectItem::Column(cr) => {
                 let gi = resolve_column(scope, cr)?;
-                // Must be one of the GROUP BY columns (by global index).
                 let pos = group_cols
                     .iter()
                     .position(|&g| g == gi)
@@ -243,24 +336,61 @@ fn plan_aggregate(
                 out_columns.push(combined_schema.columns[gi].clone());
             }
             SelectItem::Aggregate { func, arg } => {
-                let arg_col = match arg {
-                    AggArg::Star => None,
-                    AggArg::Column(cr) => Some(resolve_column(scope, cr)?),
-                };
-                let agg_index = aggs.len();
-                aggs.push((*func, arg_col));
+                let arg_col = resolve_agg_arg(arg, scope)?;
+                let agg_index = intern_agg(*func, arg_col, &mut agg_defs, &mut agg_keys);
                 slots.push(Slot::Agg(agg_index));
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
             }
         }
     }
 
-    let agg_rows = hash_aggregate(rows, &group_cols, &aggs);
+    // HAVING: resolve its operands into the internal layout. A HAVING column must
+    // be a group column; a HAVING aggregate joins the union (computing it even if
+    // it is absent from the SELECT list).
+    let having_map = if let Some(h) = &stmt.having {
+        let mut operands = Vec::new();
+        collect_operands(h, &mut operands);
+        let mut map = std::collections::HashMap::new();
+        for op in operands {
+            let internal_idx = match op {
+                Operand::Column(cr) => {
+                    let gi = resolve_column(scope, cr)?;
+                    let pos = group_cols
+                        .iter()
+                        .position(|&g| g == gi)
+                        .ok_or_else(|| ExecError::NotGrouped(cr.qualified_name()))?;
+                    pos // group columns occupy the front of the layout
+                }
+                Operand::Aggregate { func, arg } => {
+                    let arg_col = resolve_agg_arg(arg, scope)?;
+                    let agg_index = intern_agg(*func, arg_col, &mut agg_defs, &mut agg_keys);
+                    group_cols.len() + agg_index
+                }
+            };
+            map.insert(OperandKey::of(op), internal_idx);
+        }
+        Some(map)
+    } else {
+        None
+    };
 
-    // hash_aggregate output layout is [group values..., agg values...]; project
-    // into SELECT-list order via the recorded slots.
+    // Compute the internal layout `[group values..., union agg values...]`.
+    let internal_rows = hash_aggregate(rows, &group_cols, &agg_defs);
+
+    // HAVING filter over the internal layout (Kleene; keep Some(true)).
     let group_len = group_cols.len();
-    let reordered: Vec<Row> = agg_rows
+    let kept: Vec<Row> = if let (Some(h), Some(map)) = (&stmt.having, &having_map) {
+        let resolve = |op: &Operand| map[&OperandKey::of(op)];
+        internal_rows
+            .into_iter()
+            .filter(|r| eval_kleene(h, r, &resolve) == Some(true))
+            .collect()
+    } else {
+        internal_rows
+    };
+
+    // Project the SELECT items out of the internal layout.
+    let projected: Vec<Row> = kept
         .into_iter()
         .map(|r| {
             let values = slots
@@ -274,20 +404,67 @@ fn plan_aggregate(
         })
         .collect();
 
-    // ORDER BY in aggregate mode resolves against the OUTPUT columns: by name or
-    // by 1-based ordinal.
+    // DISTINCT dedup (first-occurrence order), then ORDER BY against output.
+    let deduped = if stmt.distinct {
+        dedup_rows(projected)
+    } else {
+        projected
+    };
+
     let out_rows = if stmt.order_by.is_empty() {
-        reordered
+        deduped
     } else {
         let mut keys = Vec::with_capacity(stmt.order_by.len());
         for item in &stmt.order_by {
             let col = resolve_output_position(&item.column, &out_columns)?;
             keys.push(SortKey { col, dir: item.dir });
         }
-        sort(reordered, &keys)
+        sort(deduped, &keys)
     };
 
     Ok((out_columns, out_rows))
+}
+
+/// Identity of an aggregate for deduplication: its function plus arg-column
+/// global index (`None` for `COUNT(*)`).
+type AggKey = (AggFunc, Option<usize>);
+
+/// Resolve an aggregate argument to a global column index (`None` for `*`).
+fn resolve_agg_arg(arg: &AggArg, scope: &[Bound]) -> Result<Option<usize>, ExecError> {
+    match arg {
+        AggArg::Star => Ok(None),
+        AggArg::Column(cr) => Ok(Some(resolve_column(scope, cr)?)),
+    }
+}
+
+/// Intern an aggregate into the union, returning its index in the agg tail.
+/// Reuses an existing slot when an identical `(func, arg-index)` is already
+/// present.
+fn intern_agg(
+    func: AggFunc,
+    arg_col: Option<usize>,
+    agg_defs: &mut Vec<(AggFunc, Option<usize>)>,
+    agg_keys: &mut Vec<AggKey>,
+) -> usize {
+    let key = (func, arg_col);
+    if let Some(pos) = agg_keys.iter().position(|k| *k == key) {
+        return pos;
+    }
+    agg_defs.push((func, arg_col));
+    agg_keys.push(key);
+    agg_defs.len() - 1
+}
+
+/// Deduplicate rows preserving first-occurrence order.
+fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut seen: HashSet<Vec<Value>> = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        if seen.insert(r.0.clone()) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
@@ -326,6 +503,90 @@ fn resolve_output_position(col: &ColumnRef, out_columns: &[Column]) -> Result<us
         .iter()
         .position(|c| c.name == col.name)
         .ok_or_else(|| ExecError::NoSuchColumn(col.name.clone()))
+}
+
+/// A cheap, hashable identity for an [`Operand`] so resolved indices can be
+/// memoized per distinct operand without deriving `Hash` on the AST.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum OperandKey {
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
+    Aggregate {
+        func: AggFunc,
+        arg: Option<String>,
+    },
+}
+
+impl OperandKey {
+    fn of(op: &Operand) -> OperandKey {
+        match op {
+            Operand::Column(c) => OperandKey::Column {
+                qualifier: c.qualifier.clone(),
+                name: c.name.clone(),
+            },
+            Operand::Aggregate { func, arg } => OperandKey::Aggregate {
+                func: *func,
+                arg: match arg {
+                    AggArg::Star => None,
+                    AggArg::Column(c) => Some(c.qualified_name()),
+                },
+            },
+        }
+    }
+}
+
+/// Collect every operand referenced by a boolean expression (in first-seen
+/// order), pushing each into `out`.
+fn collect_operands<'a>(expr: &'a Expr, out: &mut Vec<&'a Operand>) {
+    match expr {
+        Expr::Compare { left, .. } => out.push(left),
+        Expr::Not(inner) => collect_operands(inner, out),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_operands(l, out);
+            collect_operands(r, out);
+        }
+    }
+}
+
+/// Resolve every operand in a WHERE expression to a scope index. An aggregate
+/// operand in WHERE is a fail-loud error.
+fn resolve_where_operands(
+    expr: &Expr,
+    scope: &[Bound],
+) -> Result<std::collections::HashMap<OperandKey, usize>, ExecError> {
+    let mut operands = Vec::new();
+    collect_operands(expr, &mut operands);
+    let mut map = std::collections::HashMap::new();
+    for op in operands {
+        match op {
+            Operand::Column(c) => {
+                let idx = resolve_column(scope, c)?;
+                map.insert(OperandKey::of(op), idx);
+            }
+            Operand::Aggregate { func, arg } => {
+                let rendered = render_aggregate(*func, arg);
+                return Err(ExecError::AggregateInWhere(rendered));
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Render an aggregate call for diagnostics, e.g. `COUNT(*)` or `SUM(amount)`.
+fn render_aggregate(func: AggFunc, arg: &AggArg) -> String {
+    let name = match func {
+        AggFunc::Count => "COUNT",
+        AggFunc::Sum => "SUM",
+        AggFunc::Min => "MIN",
+        AggFunc::Max => "MAX",
+        AggFunc::Avg => "AVG",
+    };
+    match arg {
+        AggArg::Star => format!("{name}(*)"),
+        AggArg::Column(c) => format!("{name}({})", c.qualified_name()),
+    }
 }
 
 /// One bound relation in the FROM/JOIN scope.
@@ -729,6 +990,186 @@ mod tests {
         let r = run_sales("SELECT COUNT(*), SUM(amount) FROM sales WHERE amount > 1000");
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0].0, vec![Value::Int(0), Value::Null]);
+    }
+
+    // region (text), amount (nullable int) — one row has a NULL amount so a
+    // comparison on it yields UNKNOWN under Kleene logic.
+    fn nullable_catalog() -> MapCatalog {
+        let t = Arc::new(InMemoryTable::new(
+            RelSchema::new(vec![
+                Column::new("a", ColumnType::Int),
+                Column::new("b", ColumnType::Int),
+            ]),
+            vec![
+                Row::new(vec![Value::Int(1), Value::Int(2)]),
+                Row::new(vec![Value::Int(1), Value::Int(9)]),
+                Row::new(vec![Value::Int(5), Value::Int(2)]),
+                Row::new(vec![Value::Int(1), Value::Null]),
+            ],
+        ));
+        MapCatalog::new().with_table("public", "t", t)
+    }
+
+    fn run_t(sql: &str) -> QueryResult {
+        execute(&parse(sql).unwrap(), &nullable_catalog(), "public").unwrap()
+    }
+
+    #[test]
+    fn where_and_filters_rows() {
+        // a = 1 AND b = 2 ⇒ only row (1,2).
+        let r = run_t("SELECT a, b FROM t WHERE a = 1 AND b = 2");
+        assert_eq!(r.rows, vec![Row::new(vec![Value::Int(1), Value::Int(2)])]);
+    }
+
+    #[test]
+    fn where_or_filters_rows() {
+        // a = 5 OR b = 9 ⇒ rows (1,9) and (5,2).
+        let r = run_t("SELECT a, b FROM t WHERE a = 5 OR b = 9");
+        assert_eq!(r.rows.len(), 2);
+        assert!(r
+            .rows
+            .contains(&Row::new(vec![Value::Int(1), Value::Int(9)])));
+        assert!(r
+            .rows
+            .contains(&Row::new(vec![Value::Int(5), Value::Int(2)])));
+    }
+
+    #[test]
+    fn where_not_filters_rows() {
+        // NOT a = 1 ⇒ only the row with a = 5.
+        let r = run_t("SELECT a, b FROM t WHERE NOT a = 1");
+        assert_eq!(r.rows, vec![Row::new(vec![Value::Int(5), Value::Int(2)])]);
+    }
+
+    #[test]
+    fn where_parentheses_override_precedence() {
+        // (a = 1 OR a = 5) AND b = 2 ⇒ rows (1,2) and (5,2).
+        let r = run_t("SELECT a, b FROM t WHERE (a = 1 OR a = 5) AND b = 2");
+        assert_eq!(r.rows.len(), 2);
+        assert!(r
+            .rows
+            .contains(&Row::new(vec![Value::Int(1), Value::Int(2)])));
+        assert!(r
+            .rows
+            .contains(&Row::new(vec![Value::Int(5), Value::Int(2)])));
+    }
+
+    #[test]
+    fn where_null_unknown_row_is_excluded() {
+        // The (1, NULL) row: `b = 2` is UNKNOWN, so `a = 1 AND b = 2` is
+        // UNKNOWN ⇒ excluded (only the literal (1,2) row qualifies).
+        let r = run_t("SELECT a, b FROM t WHERE a = 1 AND b = 2");
+        assert_eq!(r.rows.len(), 1);
+        // And NOT (b = 2) over the NULL row stays UNKNOWN ⇒ excluded too.
+        let r2 = run_t("SELECT a, b FROM t WHERE NOT b = 2");
+        // b = 2 is true for (1,2) and (5,2); NOT ⇒ those drop. (1,9) keeps,
+        // (1,NULL) is UNKNOWN ⇒ excluded. So exactly one row: (1,9).
+        assert_eq!(r2.rows, vec![Row::new(vec![Value::Int(1), Value::Int(9)])]);
+    }
+
+    #[test]
+    fn where_or_with_null_can_still_pass() {
+        // (b = 9) OR (a = 1): for (1,NULL), b=9 is UNKNOWN but a=1 is true ⇒
+        // Kleene OR ⇒ true, row kept. All three a=1 rows plus none else.
+        let r = run_t("SELECT a, b FROM t WHERE b = 9 OR a = 1");
+        assert_eq!(r.rows.len(), 3); // (1,2),(1,9),(1,NULL)
+    }
+
+    #[test]
+    fn aggregate_in_where_fails_loud() {
+        let err = execute(
+            &parse("SELECT a FROM t WHERE COUNT(*) > 1").unwrap(),
+            &nullable_catalog(),
+            "public",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::AggregateInWhere(_)));
+    }
+
+    #[test]
+    fn having_count_filters_groups() {
+        // east: count 2, west: count 2 in the sales catalog. HAVING COUNT(*) > 1
+        // keeps both; > 2 keeps none.
+        let r = run_sales("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1");
+        assert_eq!(r.rows.len(), 2);
+        let none =
+            run_sales("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 2");
+        assert!(none.rows.is_empty());
+    }
+
+    #[test]
+    fn having_on_sum_filters_groups() {
+        // east sum 30, west sum 5. HAVING SUM(amount) > 10 keeps only east.
+        let r = run_sales(
+            "SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 10",
+        );
+        assert_eq!(
+            r.rows,
+            vec![Row::new(vec![Value::Text("east".into()), Value::Int(30)])]
+        );
+    }
+
+    #[test]
+    fn having_aggregate_not_in_select_list_is_still_computed() {
+        // SELECT only region + COUNT(*), but HAVING filters on SUM(amount),
+        // which is absent from the SELECT list and must still be computed.
+        let r =
+            run_sales("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING SUM(amount) > 10");
+        // Only east (sum 30 > 10); output has just region + count columns.
+        assert_eq!(r.columns.len(), 2);
+        assert_eq!(
+            r.rows,
+            vec![Row::new(vec![Value::Text("east".into()), Value::Int(2)])]
+        );
+    }
+
+    #[test]
+    fn having_without_group_by_is_whole_table_group() {
+        // No GROUP BY: one whole-table group. COUNT(*) is 4 > 3 ⇒ one row kept.
+        let r = run_sales("SELECT COUNT(*) FROM sales HAVING COUNT(*) > 3");
+        assert_eq!(r.rows, vec![Row::new(vec![Value::Int(4)])]);
+        // COUNT(*) is 4, not > 10 ⇒ zero rows.
+        let none = run_sales("SELECT COUNT(*) FROM sales HAVING COUNT(*) > 10");
+        assert!(none.rows.is_empty());
+    }
+
+    #[test]
+    fn having_non_grouped_column_fails_loud() {
+        // `amount` is neither a group column nor an aggregate ⇒ NotGrouped.
+        let err = execute(
+            &parse("SELECT region FROM sales GROUP BY region HAVING amount > 1").unwrap(),
+            &sales_catalog(),
+            "public",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::NotGrouped(_)));
+    }
+
+    #[test]
+    fn select_distinct_dedups_rows() {
+        // region has duplicates (east, west each twice) ⇒ DISTINCT yields 2 rows
+        // in first-occurrence order.
+        let r = run_sales("SELECT DISTINCT region FROM sales");
+        assert_eq!(
+            r.rows,
+            vec![
+                Row::new(vec![Value::Text("east".into())]),
+                Row::new(vec![Value::Text("west".into())]),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_with_order_by_resolves_against_output() {
+        // DISTINCT region ORDER BY region DESC ⇒ west, east.
+        let r = run_sales("SELECT DISTINCT region FROM sales ORDER BY region DESC");
+        assert_eq!(
+            r.rows,
+            vec![
+                Row::new(vec![Value::Text("west".into())]),
+                Row::new(vec![Value::Text("east".into())]),
+            ]
+        );
     }
 
     #[test]

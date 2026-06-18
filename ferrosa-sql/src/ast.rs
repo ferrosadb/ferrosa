@@ -1,20 +1,48 @@
-//! Logical AST for the SQL subset: `SELECT <list|*> FROM t [alias]
-//! [INNER JOIN t2 [alias] ON a.x = b.y] [WHERE a.x <op> <literal>]
-//! [GROUP BY ...] [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]`.
+//! Logical AST for the SQL subset: `SELECT [DISTINCT] <list|*> FROM t [alias]
+//! [INNER JOIN t2 [alias] ON a.x = b.y] [WHERE <bool-expr>]
+//! [GROUP BY ...] [HAVING <bool-expr>] [ORDER BY ... [ASC|DESC]]
+//! [LIMIT n] [OFFSET m]`.
 
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStmt {
+    pub distinct: bool,
     pub projection: Projection,
     pub from: TableRef,
     pub join: Option<Join>,
-    pub filter: Option<Filter>,
+    /// `WHERE` boolean expression (operands must be plain columns).
+    pub filter: Option<Expr>,
     pub group_by: Vec<ColumnRef>,
+    /// `HAVING` boolean expression (operands may be columns or aggregates).
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// A boolean WHERE/HAVING expression: comparisons combined with AND/OR/NOT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    Not(Box<Expr>),
+    /// A single comparison `<operand> <op> <literal>`.
+    Compare {
+        left: Operand,
+        op: CmpOp,
+        value: Value,
+    },
+}
+
+/// The left-hand side of a comparison: a column reference or an aggregate call.
+/// Aggregates are only legal in `HAVING`; an aggregate operand in `WHERE` is a
+/// fail-loud error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    Column(ColumnRef),
+    Aggregate { func: AggFunc, arg: AggArg },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,12 +112,4 @@ pub struct Join {
     pub table: TableRef,
     pub left: ColumnRef,
     pub right: ColumnRef,
-}
-
-/// A single-column comparison against a literal: `WHERE <column> <op> <value>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Filter {
-    pub column: ColumnRef,
-    pub op: CmpOp,
-    pub value: Value,
 }
