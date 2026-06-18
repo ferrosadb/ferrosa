@@ -56,7 +56,10 @@ pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 /// The Postgres type OID for a relational [`ColumnType`].
 ///
 /// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool),
-/// `Float -> 701` (float8), `Uuid -> 2950` (uuid), `Bytea -> 17` (bytea).
+/// `Float -> 701` (float8), `Uuid -> 2950` (uuid), `Bytea -> 17` (bytea),
+/// `Timestamp -> 1114` (timestamp without tz), `Date -> 1082` (date),
+/// `Time -> 1083` (time without tz), `Inet -> 869` (inet),
+/// `Numeric -> 1700` (numeric).
 pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
     match ty {
         ColumnType::Int => 23,
@@ -65,18 +68,27 @@ pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
         ColumnType::Float => 701,
         ColumnType::Uuid => 2950,
         ColumnType::Bytea => 17,
+        ColumnType::Timestamp => 1114,
+        ColumnType::Date => 1082,
+        ColumnType::Time => 1083,
+        ColumnType::Inet => 869,
+        ColumnType::Numeric => 1700,
     }
 }
 
 /// The on-wire fixed size for a column type (`-1` for variable-length text /
-/// bytea). `Uuid` is a fixed 16 bytes.
+/// bytea / inet / numeric). `Uuid` is a fixed 16 bytes; `Timestamp`/`Time` are
+/// 8-byte integers and `Date` is a 4-byte integer (matching the binary encodings
+/// in [`encode_value`]).
 fn column_type_size(ty: ColumnType) -> i16 {
     match ty {
         ColumnType::Int => 4,
         ColumnType::Bool => 1,
         ColumnType::Float => 8,
         ColumnType::Uuid => 16,
-        ColumnType::Text | ColumnType::Bytea => -1,
+        ColumnType::Timestamp | ColumnType::Time => 8,
+        ColumnType::Date => 4,
+        ColumnType::Text | ColumnType::Bytea | ColumnType::Inet | ColumnType::Numeric => -1,
     }
 }
 
@@ -114,7 +126,104 @@ fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
         // Postgres bytea text output (default `hex` format): `\x` followed by
         // lowercase hex of the bytes; empty bytea ⇒ just `\x`.
         SqlValue::Bytea(bytes) => Some(bytea_hex_text(bytes)),
+        // Temporal / network / numeric: exact Postgres text forms.
+        SqlValue::Timestamp(micros) => Some(render_timestamp_text(*micros).into_bytes()),
+        SqlValue::Date(days) => Some(render_date_text(*days).into_bytes()),
+        SqlValue::Time(micros) => Some(render_time_text(*micros).into_bytes()),
+        // `IpAddr`'s Display is the canonical IP string, exactly Postgres `inet`
+        // text output for a plain host address.
+        SqlValue::Inet(ip) => Some(ip.to_string().into_bytes()),
+        SqlValue::Numeric { unscaled, scale } => {
+            Some(render_numeric_text(unscaled, *scale).into_bytes())
+        }
     }
+}
+
+/// Render a [`SqlValue::Timestamp`] (Unix-epoch microseconds, UTC) as Postgres
+/// `timestamp` text: `YYYY-MM-DD HH:MM:SS` with up to 6 fractional digits, the
+/// fraction having TRAILING ZEROS TRIMMED and the dot dropped entirely when the
+/// microsecond part is zero (e.g. `2024-01-15 10:30:00`, `2024-01-15 10:30:00.5`).
+fn render_timestamp_text(micros: i64) -> String {
+    let (secs, sub_micros) = div_floor_rem(micros, 1_000_000);
+    let dt = chrono::DateTime::from_timestamp(secs, 0).expect("timestamp micros in chrono range");
+    let date_time = dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+    format!("{date_time}{}", fractional_suffix(sub_micros as u32))
+}
+
+/// Render a [`SqlValue::Date`] (days since the Unix epoch) as Postgres `date`
+/// text: `YYYY-MM-DD`.
+fn render_date_text(days: i32) -> String {
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
+    // Signed day offset (works for pre-1970 negative days too).
+    let d = epoch
+        .checked_add_signed(chrono::Duration::days(i64::from(days)))
+        .expect("date days in chrono range");
+    d.format("%Y-%m-%d").to_string()
+}
+
+/// Render a [`SqlValue::Time`] (microseconds since midnight) as Postgres `time`
+/// text: `HH:MM:SS` with up to 6 fractional digits trimmed exactly like the
+/// timestamp fraction.
+fn render_time_text(micros: i64) -> String {
+    let total_secs = micros.div_euclid(1_000_000);
+    let sub_micros = micros.rem_euclid(1_000_000) as u32;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}{}", fractional_suffix(sub_micros))
+}
+
+/// Build the fractional-seconds suffix for a microsecond remainder, Postgres
+/// style: empty when zero, otherwise `.` + the 6-digit fraction with trailing
+/// zeros trimmed (`500000` ⇒ `.5`, `123000` ⇒ `.123`, `1` ⇒ `.000001`).
+fn fractional_suffix(sub_micros: u32) -> String {
+    if sub_micros == 0 {
+        return String::new();
+    }
+    let s = format!("{sub_micros:06}");
+    format!(".{}", s.trim_end_matches('0'))
+}
+
+/// Floor division + non-negative remainder for an `i64` over a positive divisor,
+/// so a pre-1970 (negative) microsecond timestamp maps to the correct second and
+/// a NON-NEGATIVE sub-second remainder (Postgres never prints a negative fraction).
+fn div_floor_rem(n: i64, d: i64) -> (i64, i64) {
+    (n.div_euclid(d), n.rem_euclid(d))
+}
+
+/// Render a normalized `(unscaled, scale)` decimal as Postgres `numeric` plain
+/// text (no exponent for the magnitudes this path sees): place the decimal point
+/// `scale` digits from the right of the unscaled magnitude, prefixing a `-` for
+/// negative values and left-padding with zeros for `0.0x` cases. A negative scale
+/// appends `|scale|` trailing zeros (the value is scaled up).
+fn render_numeric_text(unscaled: &num_bigint::BigInt, scale: i32) -> String {
+    use num_bigint::Sign;
+    let sign = if unscaled.sign() == Sign::Minus {
+        "-"
+    } else {
+        ""
+    };
+    let digits = unscaled.magnitude().to_str_radix(10); // absolute value, no sign
+    let body = if scale <= 0 {
+        // Integer value, optionally scaled up by |scale| trailing zeros.
+        let mut s = digits;
+        for _ in 0..(-scale) {
+            s.push('0');
+        }
+        s
+    } else {
+        let scale = scale as usize;
+        if digits.len() > scale {
+            // Split into integer and fractional parts.
+            let point = digits.len() - scale;
+            format!("{}.{}", &digits[..point], &digits[point..])
+        } else {
+            // 0.00..digits — pad the fraction with leading zeros to `scale`.
+            let zeros = scale - digits.len();
+            format!("0.{}{}", "0".repeat(zeros), digits)
+        }
+    };
+    format!("{sign}{body}")
 }
 
 /// Render bytes as Postgres `hex`-format bytea text: `\x` then lowercase hex.
@@ -183,9 +292,92 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> SqlValue {
         // bytea: a `\x<hex>` string decodes to raw bytes; a malformed hex body
         // falls back to NULL (documented lenient fallback, no panic).
         17 => decode_bytea_hex_text(s).unwrap_or(SqlValue::Null),
+        // timestamp (1114): `YYYY-MM-DD HH:MM:SS[.ffffff]`. A malformed value
+        // falls back to NULL (documented lenient fallback, no panic).
+        1114 => parse_timestamp_text(s).unwrap_or(SqlValue::Null),
+        // date (1082): `YYYY-MM-DD`.
+        1082 => parse_date_text(s).unwrap_or(SqlValue::Null),
+        // time (1083): `HH:MM:SS[.ffffff]`.
+        1083 => parse_time_text(s).unwrap_or(SqlValue::Null),
+        // inet (869): a canonical IP string parses to an `IpAddr`.
+        869 => s
+            .parse::<std::net::IpAddr>()
+            .map(SqlValue::Inet)
+            .unwrap_or(SqlValue::Null),
+        // numeric (1700): a plain decimal string. Numeric params are TEXT-only
+        // (binary numeric is out of scope — see `encode_value`/`decode_param_binary`).
+        1700 => parse_numeric_text(s).unwrap_or(SqlValue::Null),
         // OID 0 (unspecified) or any unknown OID: lenient — keep as text.
         _ => SqlValue::Text(s.to_string()),
     }
+}
+
+/// Parse Postgres `timestamp` text (`YYYY-MM-DD HH:MM:SS[.ffffff]`, also
+/// tolerating the ISO `T` separator) into [`SqlValue::Timestamp`] (Unix-epoch
+/// micros, UTC). Returns `None` on a malformed value (lenient, no panic).
+fn parse_timestamp_text(s: &str) -> Option<SqlValue> {
+    let s = s.trim();
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+        .ok()?;
+    let micros = naive.and_utc().timestamp_micros();
+    Some(SqlValue::Timestamp(micros))
+}
+
+/// Parse Postgres `date` text (`YYYY-MM-DD`) into [`SqlValue::Date`] (days since
+/// the Unix epoch).
+fn parse_date_text(s: &str) -> Option<SqlValue> {
+    let date = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    let days = (date - epoch).num_days();
+    Some(SqlValue::Date(i32::try_from(days).ok()?))
+}
+
+/// Parse Postgres `time` text (`HH:MM:SS[.ffffff]`) into [`SqlValue::Time`]
+/// (microseconds since midnight).
+fn parse_time_text(s: &str) -> Option<SqlValue> {
+    let t = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S"))
+        .ok()?;
+    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0)?;
+    let micros = (t - midnight).num_microseconds()?;
+    Some(SqlValue::Time(micros))
+}
+
+/// Parse a plain Postgres `numeric` text body (`[-]ddd[.ddd]`, no exponent) into
+/// a normalized [`SqlValue::Numeric`]. Returns `None` for malformed input.
+fn parse_numeric_text(s: &str) -> Option<SqlValue> {
+    use num_bigint::BigInt;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i8, r),
+        None => (1i8, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    // Both parts must be all-ASCII-digits (int part may be empty for `.5`).
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut digits = String::new();
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = digits.parse::<BigInt>().ok()?;
+    let unscaled = if sign < 0 { -magnitude } else { magnitude };
+    let scale = i32::try_from(frac_part.len()).ok()?;
+    Some(SqlValue::numeric(unscaled, scale))
 }
 
 /// Decode a Postgres `hex`-format bytea text body (`\x<hex>`) into raw bytes.
@@ -253,11 +445,92 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> SqlValue {
             .unwrap_or(SqlValue::Null),
         // bytea: the raw bytes, copied verbatim.
         17 => SqlValue::Bytea(raw.to_vec()),
+        // timestamp (1114): BE i64 microseconds since the Postgres epoch
+        // (2000-01-01). Shift to the Unix-epoch micros our `Value` carries.
+        1114 => be_int(raw, 8)
+            .map(|pg| SqlValue::Timestamp(pg + PG_EPOCH_MICROS))
+            .unwrap_or(SqlValue::Null),
+        // date (1082): BE i32 days since the Postgres epoch (2000-01-01). Shift
+        // to days since the Unix epoch.
+        1082 => {
+            if raw.len() == 4 {
+                let pg_days = i32::from_be_bytes(raw.try_into().unwrap());
+                SqlValue::Date(pg_days + PG_EPOCH_DAYS)
+            } else {
+                SqlValue::Null
+            }
+        }
+        // time (1083): BE i64 microseconds since midnight (same origin as our repr).
+        1083 => be_int(raw, 8).map(SqlValue::Time).unwrap_or(SqlValue::Null),
+        // inet (869): the Postgres inet binary (family, bits, is_cidr, len, addr).
+        869 => decode_inet_binary(raw).unwrap_or(SqlValue::Null),
         // Unknown OID: best-effort text, else NULL (documented fallback — no panic).
+        // NOTE: binary `numeric` (1700) is intentionally NOT decoded here — it
+        // falls through to this best-effort arm. Binary numeric is out of scope
+        // (numeric params are text-only); the differential oracle uses
+        // simple_query (text), so this path is never exercised for numeric.
         _ => std::str::from_utf8(raw)
             .map(|s| SqlValue::Text(s.to_string()))
             .unwrap_or(SqlValue::Null),
     }
+}
+
+/// Microseconds between the Unix epoch (1970-01-01) and the Postgres epoch
+/// (2000-01-01): `946_684_800` seconds. Adding this to a Postgres-epoch micros
+/// value yields Unix-epoch micros (our `Value::Timestamp` repr).
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
+/// Days between the Unix epoch and the Postgres epoch (2000-01-01): 10957.
+const PG_EPOCH_DAYS: i32 = 10_957;
+
+/// Decode the Postgres `inet` binary format into [`SqlValue::Inet`]:
+/// `[family][bits][is_cidr][addr_len][address bytes]`. Family 2 = IPv4 (4-byte
+/// address), family 3 = IPv6 (16-byte address). Returns `None` on any shape
+/// mismatch.
+fn decode_inet_binary(raw: &[u8]) -> Option<SqlValue> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if raw.len() < 4 {
+        return None;
+    }
+    let family = raw[0];
+    let addr_len = raw[3] as usize;
+    let addr = raw.get(4..4 + addr_len)?;
+    match (family, addr_len) {
+        (2, 4) => {
+            let octets: [u8; 4] = addr.try_into().ok()?;
+            Some(SqlValue::Inet(IpAddr::V4(Ipv4Addr::from(octets))))
+        }
+        (3, 16) => {
+            let octets: [u8; 16] = addr.try_into().ok()?;
+            Some(SqlValue::Inet(IpAddr::V6(Ipv6Addr::from(octets))))
+        }
+        _ => None,
+    }
+}
+
+/// Encode an `IpAddr` into the Postgres `inet` binary format (host address, not
+/// CIDR): `[family][bits][is_cidr=0][addr_len][address bytes]`. Family 2 = IPv4
+/// with `bits=32`; family 3 = IPv6 with `bits=128`.
+fn encode_inet_binary(ip: &std::net::IpAddr) -> Vec<u8> {
+    use std::net::IpAddr;
+    let mut out = Vec::with_capacity(20);
+    match ip {
+        IpAddr::V4(v4) => {
+            out.push(2); // AF_INET (Postgres uses 2 for IPv4)
+            out.push(32); // bits
+            out.push(0); // is_cidr = false
+            out.push(4); // address length
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(3); // PGSQL_AF_INET6
+            out.push(128); // bits
+            out.push(0); // is_cidr = false
+            out.push(16); // address length
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+    out
 }
 
 /// Read a big-endian signed integer of `width` bytes (2/4/8) into i64, or `None`
@@ -298,6 +571,22 @@ pub fn encode_value(format: i16, col_type: ColumnType, v: &SqlValue) -> Option<V
         SqlValue::Uuid(u) => Some(u.as_bytes().to_vec()),
         // bytea (OID 17): the raw bytes verbatim.
         SqlValue::Bytea(bytes) => Some(bytes.clone()),
+        // timestamp (OID 1114): BE i64 micros since the POSTGRES epoch
+        // (2000-01-01) — shift our Unix-epoch micros down by the epoch delta.
+        SqlValue::Timestamp(micros) => Some((micros - PG_EPOCH_MICROS).to_be_bytes().to_vec()),
+        // date (OID 1082): BE i32 days since the Postgres epoch.
+        SqlValue::Date(days) => Some((days - PG_EPOCH_DAYS).to_be_bytes().to_vec()),
+        // time (OID 1083): BE i64 micros since midnight (same origin as our repr).
+        SqlValue::Time(micros) => Some(micros.to_be_bytes().to_vec()),
+        // inet (OID 869): the Postgres inet binary (family/bits/is_cidr/len/addr).
+        SqlValue::Inet(ip) => Some(encode_inet_binary(ip)),
+        // numeric (OID 1700): binary numeric is OUT OF SCOPE. A client that
+        // requests binary results for a numeric column falls back to the TEXT
+        // bytes (documented). The differential oracle uses simple_query (text),
+        // so this path is never exercised by the gate.
+        SqlValue::Numeric { unscaled, scale } => {
+            Some(render_numeric_text(unscaled, *scale).into_bytes())
+        }
     }
 }
 
@@ -707,6 +996,250 @@ mod tests {
         assert_eq!(encode_value(1, ColumnType::Bytea, &SqlValue::Null), None);
         assert_eq!(decode_param(0, 2950, None), SqlValue::Null);
         assert_eq!(decode_param(1, 17, None), SqlValue::Null);
+    }
+
+    // ── Temporal / inet / numeric: OIDs + sizes ───────────────────────────
+
+    #[test]
+    fn new_type_oids_and_sizes() {
+        assert_eq!(column_type_oid(ColumnType::Timestamp), 1114);
+        assert_eq!(column_type_size(ColumnType::Timestamp), 8);
+        assert_eq!(column_type_oid(ColumnType::Date), 1082);
+        assert_eq!(column_type_size(ColumnType::Date), 4);
+        assert_eq!(column_type_oid(ColumnType::Time), 1083);
+        assert_eq!(column_type_size(ColumnType::Time), 8);
+        assert_eq!(column_type_oid(ColumnType::Inet), 869);
+        assert_eq!(column_type_size(ColumnType::Inet), -1);
+        assert_eq!(column_type_oid(ColumnType::Numeric), 1700);
+        assert_eq!(column_type_size(ColumnType::Numeric), -1);
+    }
+
+    // ── Timestamp text rendering (fractional trimming) ────────────────────
+
+    #[test]
+    fn render_timestamp_trims_fraction_postgres_style() {
+        // 2024-01-15 10:30:00 UTC, no fraction ⇒ no dot.
+        let base = parse_timestamp_text("2024-01-15 10:30:00").unwrap();
+        let SqlValue::Timestamp(micros) = base else {
+            panic!("expected Timestamp");
+        };
+        assert_eq!(
+            render_value(&SqlValue::Timestamp(micros)),
+            Some(b"2024-01-15 10:30:00".to_vec())
+        );
+        // .5 second ⇒ ".5" (one digit, trailing zeros trimmed).
+        assert_eq!(
+            render_value(&SqlValue::Timestamp(micros + 500_000)),
+            Some(b"2024-01-15 10:30:00.5".to_vec())
+        );
+        // .123 ⇒ "123".
+        assert_eq!(
+            render_value(&SqlValue::Timestamp(micros + 123_000)),
+            Some(b"2024-01-15 10:30:00.123".to_vec())
+        );
+        // 1 microsecond ⇒ ".000001" (all 6 digits significant).
+        assert_eq!(
+            render_value(&SqlValue::Timestamp(micros + 1)),
+            Some(b"2024-01-15 10:30:00.000001".to_vec())
+        );
+    }
+
+    #[test]
+    fn render_timestamp_handles_pre_1970() {
+        // 1969-12-31 23:59:59.5 UTC ⇒ -500_000 micros. The fraction stays
+        // non-negative (.5) and the second floors correctly.
+        let micros = -500_000;
+        assert_eq!(
+            render_value(&SqlValue::Timestamp(micros)),
+            Some(b"1969-12-31 23:59:59.5".to_vec())
+        );
+    }
+
+    #[test]
+    fn render_date_text_form() {
+        let SqlValue::Date(days) = parse_date_text("2024-01-15").unwrap() else {
+            panic!("expected Date");
+        };
+        assert_eq!(
+            render_value(&SqlValue::Date(days)),
+            Some(b"2024-01-15".to_vec())
+        );
+        // The Unix epoch is day 0.
+        assert_eq!(
+            render_value(&SqlValue::Date(0)),
+            Some(b"1970-01-01".to_vec())
+        );
+        // A pre-epoch (negative) day renders correctly.
+        assert_eq!(
+            render_value(&SqlValue::Date(-1)),
+            Some(b"1969-12-31".to_vec())
+        );
+    }
+
+    #[test]
+    fn render_time_text_form_trims_fraction() {
+        // 10:30:00 ⇒ no fraction.
+        let micros = (10 * 3600 + 30 * 60) * 1_000_000;
+        assert_eq!(
+            render_value(&SqlValue::Time(micros)),
+            Some(b"10:30:00".to_vec())
+        );
+        // + .25 second.
+        assert_eq!(
+            render_value(&SqlValue::Time(micros + 250_000)),
+            Some(b"10:30:00.25".to_vec())
+        );
+        // Midnight.
+        assert_eq!(render_value(&SqlValue::Time(0)), Some(b"00:00:00".to_vec()));
+    }
+
+    #[test]
+    fn render_inet_text_is_canonical_ip() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(
+            render_value(&SqlValue::Inet(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)))),
+            Some(b"192.168.0.1".to_vec())
+        );
+        assert_eq!(
+            render_value(&SqlValue::Inet(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+            Some(b"::1".to_vec())
+        );
+    }
+
+    // ── Numeric text rendering ────────────────────────────────────────────
+
+    #[test]
+    fn render_numeric_text_forms() {
+        use num_bigint::BigInt;
+        // 123.45 (unscaled 12345, scale 2).
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(12345), 2)),
+            Some(b"123.45".to_vec())
+        );
+        // Integer (scale 0).
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(42), 0)),
+            Some(b"42".to_vec())
+        );
+        // Negative.
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(-12345), 2)),
+            Some(b"-123.45".to_vec())
+        );
+        // 0.05 (leading-zero fraction padding).
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(5), 2)),
+            Some(b"0.05".to_vec())
+        );
+        // Zero.
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(0), 4)),
+            Some(b"0".to_vec())
+        );
+        // Trailing-zero normalization: 1.50 ⇒ "1.5".
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(150), 2)),
+            Some(b"1.5".to_vec())
+        );
+        // Negative scale (value scaled up): 12 * 10^2 = 1200.
+        assert_eq!(
+            render_value(&SqlValue::numeric(BigInt::from(12), -2)),
+            Some(b"1200".to_vec())
+        );
+    }
+
+    // ── Text decode (parse the canonical forms) ───────────────────────────
+
+    #[test]
+    fn decode_param_text_for_new_types() {
+        use num_bigint::BigInt;
+        use std::net::IpAddr;
+        // timestamp.
+        assert_eq!(
+            decode_param(0, 1114, Some(b"2024-01-15 10:30:00.5")),
+            parse_timestamp_text("2024-01-15 10:30:00.5").unwrap()
+        );
+        // date.
+        assert_eq!(
+            decode_param(0, 1082, Some(b"1970-01-02")),
+            SqlValue::Date(1)
+        );
+        // time.
+        assert_eq!(
+            decode_param(0, 1083, Some(b"00:00:01")),
+            SqlValue::Time(1_000_000)
+        );
+        // inet.
+        assert_eq!(
+            decode_param(0, 869, Some(b"10.0.0.1")),
+            SqlValue::Inet("10.0.0.1".parse::<IpAddr>().unwrap())
+        );
+        // numeric (text-only).
+        assert_eq!(
+            decode_param(0, 1700, Some(b"123.45")),
+            SqlValue::numeric(BigInt::from(12345), 2)
+        );
+        // numeric with a leading dot.
+        assert_eq!(
+            decode_param(0, 1700, Some(b".5")),
+            SqlValue::numeric(BigInt::from(5), 1)
+        );
+        // Malformed values ⇒ NULL (lenient, no panic).
+        assert_eq!(decode_param(0, 1114, Some(b"not-a-time")), SqlValue::Null);
+        assert_eq!(decode_param(0, 1700, Some(b"1.2.3")), SqlValue::Null);
+    }
+
+    // ── Binary round-trips for timestamp/date/time/inet ───────────────────
+
+    #[test]
+    fn binary_round_trip_temporal_and_inet() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // timestamp: encode (Postgres-epoch micros) then decode back.
+        let ts = parse_timestamp_text("2024-06-17 12:00:00.123456").unwrap();
+        let enc = encode_value(1, ColumnType::Timestamp, &ts).unwrap();
+        assert_eq!(enc.len(), 8);
+        assert_eq!(decode_param(1, 1114, Some(&enc)), ts);
+
+        // date.
+        let d = SqlValue::Date(19_876); // arbitrary day count
+        let enc = encode_value(1, ColumnType::Date, &d).unwrap();
+        assert_eq!(enc.len(), 4);
+        assert_eq!(decode_param(1, 1082, Some(&enc)), d);
+
+        // time.
+        let t = SqlValue::Time(45_000_123_456);
+        let enc = encode_value(1, ColumnType::Time, &t).unwrap();
+        assert_eq!(enc.len(), 8);
+        assert_eq!(decode_param(1, 1083, Some(&enc)), t);
+
+        // inet v4 + v6.
+        let v4 = SqlValue::Inet(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+        let enc = encode_value(1, ColumnType::Inet, &v4).unwrap();
+        assert_eq!(decode_param(1, 869, Some(&enc)), v4);
+        let v6 = SqlValue::Inet(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+        let enc = encode_value(1, ColumnType::Inet, &v6).unwrap();
+        assert_eq!(decode_param(1, 869, Some(&enc)), v6);
+    }
+
+    #[test]
+    fn timestamp_binary_uses_postgres_epoch() {
+        // The Postgres epoch (2000-01-01 00:00:00) encodes to all-zero BE i64.
+        let ts = parse_timestamp_text("2000-01-01 00:00:00").unwrap();
+        let enc = encode_value(1, ColumnType::Timestamp, &ts).unwrap();
+        assert_eq!(enc, 0i64.to_be_bytes().to_vec());
+        // And the Unix-epoch micros value equals PG_EPOCH_MICROS.
+        assert_eq!(ts, SqlValue::Timestamp(PG_EPOCH_MICROS));
+    }
+
+    #[test]
+    fn numeric_binary_falls_back_to_text() {
+        use num_bigint::BigInt;
+        // Out-of-scope binary numeric ⇒ the TEXT bytes (documented fallback).
+        let n = SqlValue::numeric(BigInt::from(12345), 2);
+        assert_eq!(
+            encode_value(1, ColumnType::Numeric, &n),
+            Some(b"123.45".to_vec())
+        );
     }
 
     #[test]
