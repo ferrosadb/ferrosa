@@ -73,6 +73,17 @@ impl<'a, S: VerifierStore> Connection<'a, S> {
         self.phase == Phase::Closed
     }
 
+    /// Take ownership of any bytes still buffered after the handshake reached
+    /// `Ready`, leaving the connection's buffer empty.
+    ///
+    /// A client may pipeline its first `Query` in the same TCP segment as the
+    /// SASL final response; those bytes land in `inbuf` while the handshake
+    /// completes. The server's post-auth loop seeds its own read buffer with
+    /// this so a pipelined first query is not lost.
+    pub fn take_inbuf(&mut self) -> BytesMut {
+        std::mem::take(&mut self.inbuf)
+    }
+
     /// Feed received bytes; return the bytes to write back (possibly empty when
     /// more input is needed). Drives as many complete frames as are buffered.
     pub fn on_bytes(&mut self, input: &[u8]) -> Result<Vec<u8>, ConnError> {
