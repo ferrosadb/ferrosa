@@ -2062,6 +2062,7 @@ version = "0.13.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "ferrosa-common",
  "ferrosa-cql",
  "ferrosa-schema",
@@ -2071,6 +2072,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "indexmap 2.14.0",
+ "num-bigint",
  "pbkdf2 0.12.2",
  "proptest",
  "rand 0.8.6",
@@ -2159,6 +2161,8 @@ dependencies = [
 name = "ferrosa-sql"
 version = "0.13.0"
 dependencies = [
+ "chrono",
+ "num-bigint",
  "ordered-float",
  "uuid",
 ]

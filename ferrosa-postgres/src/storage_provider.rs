@@ -38,17 +38,17 @@
 //! ## Lossy [`CqlValue`] -> [`ferrosa_sql::Value`] conversion
 //!
 //! The [`ferrosa_sql::Value`] model covers `Null | Int(i64) | Text | Bool |
-//! Float(f64) | Uuid(uuid::Uuid) | Bytea(Vec<u8>)`. [`cql_to_value`] maps the
-//! integral / textual / boolean / floating-point CQL scalars onto it losslessly
-//! (f32 widens to f64); `uuid`/`timeuuid` map to `Value::Uuid` and `blob` to
-//! `Value::Bytea` (both have exact Postgres text representations). Every other
-//! CQL type is **known-lossy** and converts to `Value::Null` (with a code
-//! comment, never a panic). Widening `Value` to carry these is tracked as
-//! follow-up. The remaining lossy types are:
+//! Float(f64) | Uuid | Bytea | Timestamp(i64 micros) | Date(i32 days) |
+//! Time(i64 micros) | Inet(IpAddr) | Numeric{unscaled,scale}`. [`cql_to_value`]
+//! maps the integral / textual / boolean / floating-point CQL scalars onto it
+//! losslessly (f32 widens to f64); `uuid`/`timeuuid` → `Value::Uuid`, `blob` →
+//! `Value::Bytea`; the temporal (`timestamp`/`date`/`time`), network (`inet`),
+//! and arbitrary-precision (`decimal`/`varint`) scalars now map through to their
+//! exact-Postgres-text engine variants. Every remaining CQL type is
+//! **known-lossy** and converts to `Value::Null` (with a code comment, never a
+//! panic). The remaining lossy types (OUT OF SCOPE — large separate efforts) are:
 //!
-//! - Arbitrary precision: `Decimal`, `Varint`
-//! - Temporal: `Timestamp`, `Date`, `Time`, `Duration`
-//! - Network: `Inet`
+//! - Temporal: `Duration` (no clean Postgres-scalar mapping)
 //! - Collections / composites: `List`, `Set`, `Map`, `Tuple`, `Udt`, `Vector`
 
 use std::fmt;
@@ -87,19 +87,26 @@ pub fn cql_to_value(v: &CqlValue) -> Value {
         // OID 17). Both have exact, unambiguous Postgres text representations.
         CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Value::Uuid(*u),
         CqlValue::Blob(bytes) => Value::Bytea(bytes.clone()),
-        // ── Known lossy gaps ──────────────────────────────────────────────
-        // The first-slice `ferrosa_sql::Value` cannot represent these yet, so
-        // they read as NULL rather than panicking. Widen `Value` (and update
-        // this match) when real support lands. See the module-level doc list.
-        // Future widenings with exact Postgres text reprs: `timestamp`,
-        // `decimal`/`numeric`, `inet`.
-        CqlValue::Decimal { .. }
-        | CqlValue::Varint(_)
-        | CqlValue::Timestamp(_)
-        | CqlValue::Date(_)
-        | CqlValue::Time(_)
-        | CqlValue::Duration { .. }
-        | CqlValue::Inet(_)
+        // ── Temporal / network / arbitrary-precision (exact Postgres text) ──
+        // `Timestamp` carries i64 MILLIS since the Unix epoch; the engine's
+        // `Value::Timestamp` is MICROS, so widen by 1000.
+        CqlValue::Timestamp(ms) => Value::Timestamp(ms * 1000),
+        // `Date` carries u32 days centered at 2^31 (CQL epoch encoding); the
+        // engine's `Value::Date` is signed days since the Unix epoch.
+        CqlValue::Date(d) => Value::Date((i64::from(*d) - 2_147_483_648) as i32),
+        // `Time` carries i64 NANOS since midnight; `Value::Time` is MICROS.
+        CqlValue::Time(nanos) => Value::Time(nanos / 1000),
+        // `Inet` carries an `IpAddr` directly.
+        CqlValue::Inet(ip) => Value::Inet(*ip),
+        // `Decimal` ⇒ normalized `Value::Numeric`. `Varint` is an integer ⇒ a
+        // numeric with scale 0.
+        CqlValue::Decimal { scale, unscaled } => Value::numeric(unscaled.clone(), *scale),
+        CqlValue::Varint(b) => Value::numeric(b.clone(), 0),
+        // ── Known lossy gaps (OUT OF SCOPE — large separate efforts) ───────
+        // The engine's `Value` cannot represent these yet, so they read as NULL
+        // rather than panicking. `Duration` has no clean Postgres-scalar mapping;
+        // collections (List/Set/Map/Tuple/UDT/Vector) are a separate widening.
+        CqlValue::Duration { .. }
         | CqlValue::List(_)
         | CqlValue::Set(_)
         | CqlValue::Map(_)
@@ -146,11 +153,19 @@ impl std::error::Error for LoadError {}
 /// representation — consistent with `catalog::type_oid`'s text fallback.
 fn engine_column_type(cql_type: &str) -> ColumnType {
     match normalize_type_head(cql_type).as_str() {
-        "int" | "bigint" | "counter" | "smallint" | "tinyint" | "varint" => ColumnType::Int,
+        "int" | "bigint" | "counter" | "smallint" | "tinyint" => ColumnType::Int,
         "boolean" | "bool" => ColumnType::Bool,
         "text" | "varchar" | "ascii" => ColumnType::Text,
         "uuid" | "timeuuid" => ColumnType::Uuid,
         "blob" | "bytes" => ColumnType::Bytea,
+        // Temporal / network / arbitrary-precision now map to widened engine
+        // types (exact Postgres text). `varint` is an arbitrary-precision integer
+        // ⇒ numeric (so a value outside i64 range is not silently lost).
+        "timestamp" | "datetime" => ColumnType::Timestamp,
+        "date" => ColumnType::Date,
+        "time" => ColumnType::Time,
+        "inet" => ColumnType::Inet,
+        "decimal" | "varint" => ColumnType::Numeric,
         // Unknown / not-yet-modelled types default to Text (documented fallback).
         _ => ColumnType::Text,
     }
@@ -345,12 +360,53 @@ mod tests {
 
     #[test]
     fn cql_to_value_maps_lossy_types_to_null() {
-        // A representative lossy scalar, temporal, and collection. (Uuid /
-        // Timeuuid / Blob are no longer lossy — see the dedicated test below.)
-        assert_eq!(cql_to_value(&CqlValue::Timestamp(123)), Value::Null);
+        // The remaining out-of-scope types: Duration (no Postgres-scalar mapping)
+        // and collections. (Timestamp/Date/Time/Inet/Decimal/Varint are no longer
+        // lossy — see the dedicated test below.)
+        assert_eq!(
+            cql_to_value(&CqlValue::Duration {
+                months: 1,
+                days: 2,
+                nanos: 3
+            }),
+            Value::Null
+        );
         assert_eq!(
             cql_to_value(&CqlValue::List(vec![CqlValue::Int(1)])),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn cql_to_value_maps_temporal_network_and_numeric() {
+        use num_bigint::BigInt;
+        use std::net::IpAddr;
+        // Timestamp: CQL millis → engine micros.
+        assert_eq!(
+            cql_to_value(&CqlValue::Timestamp(1_705_315_800_000)),
+            Value::Timestamp(1_705_315_800_000_000)
+        );
+        // Date: CQL epoch-centered days (2^31) → signed days since Unix epoch.
+        // 2^31 is the CQL encoding of day 0 (1970-01-01).
+        assert_eq!(cql_to_value(&CqlValue::Date(2_147_483_648)), Value::Date(0));
+        assert_eq!(cql_to_value(&CqlValue::Date(2_147_483_649)), Value::Date(1));
+        // Time: CQL nanos → engine micros.
+        assert_eq!(cql_to_value(&CqlValue::Time(1_500_000)), Value::Time(1500));
+        // Inet passes through.
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        assert_eq!(cql_to_value(&CqlValue::Inet(ip)), Value::Inet(ip));
+        // Decimal → normalized Numeric.
+        assert_eq!(
+            cql_to_value(&CqlValue::Decimal {
+                scale: 2,
+                unscaled: BigInt::from(12345)
+            }),
+            Value::numeric(BigInt::from(12345), 2)
+        );
+        // Varint → Numeric scale 0.
+        assert_eq!(
+            cql_to_value(&CqlValue::Varint(BigInt::from(9_999_999_999i64))),
+            Value::numeric(BigInt::from(9_999_999_999i64), 0)
         );
     }
 
@@ -393,6 +449,13 @@ mod tests {
         assert_eq!(engine_column_type("uuid"), ColumnType::Uuid);
         assert_eq!(engine_column_type("timeuuid"), ColumnType::Uuid);
         assert_eq!(engine_column_type("blob"), ColumnType::Bytea);
+        // Temporal / network / arbitrary-precision map to the new engine types.
+        assert_eq!(engine_column_type("timestamp"), ColumnType::Timestamp);
+        assert_eq!(engine_column_type("date"), ColumnType::Date);
+        assert_eq!(engine_column_type("time"), ColumnType::Time);
+        assert_eq!(engine_column_type("inet"), ColumnType::Inet);
+        assert_eq!(engine_column_type("decimal"), ColumnType::Numeric);
+        assert_eq!(engine_column_type("varint"), ColumnType::Numeric);
         // Unknown / not-yet-modelled -> Text fallback.
         assert_eq!(engine_column_type("map<text, text>"), ColumnType::Text);
     }

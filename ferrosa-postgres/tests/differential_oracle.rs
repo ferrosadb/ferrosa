@@ -91,6 +91,29 @@ struct OrderRow {
     price: f64,
 }
 
+/// `public.events(id int PK, at timestamp, on_day date, at_time time, src inet,
+/// amt numeric)` — one row per scalar-type combination, chosen to exercise the
+/// exact-text renderers (fractional-second trimming, leading-zero numeric
+/// fractions, IPv4 + IPv6, pre-epoch is avoided so the two systems agree on the
+/// literal forms).
+///
+/// Every field is a CANONICAL Postgres text literal so the same string seeds
+/// Postgres (as a SQL literal) and is the source of truth for the ferrosa cell
+/// bytes (parsed into the CQL wire encoding by the seed helpers).
+struct EventRow {
+    id: i32,
+    /// `YYYY-MM-DD HH:MM:SS[.ffffff]` (no tz).
+    at: &'static str,
+    /// `YYYY-MM-DD`.
+    on_day: &'static str,
+    /// `HH:MM:SS[.ffffff]`.
+    at_time: &'static str,
+    /// canonical IP string (v4 or v6).
+    src: &'static str,
+    /// plain decimal string.
+    amt: &'static str,
+}
+
 fn users() -> Vec<UserRow> {
     vec![
         UserRow {
@@ -169,6 +192,54 @@ fn orders() -> Vec<OrderRow> {
             uid: 5,
             amount: 75,
             price: 7.5,
+        },
+    ]
+}
+
+fn events() -> Vec<EventRow> {
+    vec![
+        EventRow {
+            id: 1,
+            at: "2024-01-15 10:30:00",
+            on_day: "2024-01-15",
+            at_time: "10:30:00",
+            src: "10.0.0.1",
+            amt: "123.45",
+        },
+        EventRow {
+            id: 2,
+            at: "2024-01-15 10:30:00.5",
+            on_day: "2024-02-29",
+            at_time: "23:59:59.123",
+            src: "192.168.1.100",
+            amt: "0.05",
+        },
+        EventRow {
+            id: 3,
+            // `at` (CQL timestamp) is millisecond-resolution, so its fraction must
+            // be a whole number of milliseconds. Sub-millisecond precision is
+            // exercised by the `at_time` column (CQL time = microsecond-resolution).
+            at: "2024-03-01 00:00:00.001",
+            on_day: "2023-12-31",
+            at_time: "00:00:00",
+            src: "203.0.113.7",
+            amt: "1000",
+        },
+        EventRow {
+            id: 4,
+            at: "2025-06-17 12:00:00.25",
+            on_day: "2025-06-17",
+            at_time: "12:00:00.5",
+            src: "2001:db8::1",
+            amt: "-42.5",
+        },
+        EventRow {
+            id: 5,
+            at: "2020-02-29 06:15:45",
+            on_day: "2020-02-29",
+            at_time: "06:15:45.999999",
+            src: "172.16.0.42",
+            amt: "99999.999",
         },
     ]
 }
@@ -363,7 +434,8 @@ async fn seed_postgres(client: &tokio_postgres::Client) {
     client
         .batch_execute(
             "CREATE TABLE users (id int PRIMARY KEY, name text, dept text, email text);\n\
-             CREATE TABLE orders (oid int PRIMARY KEY, uid int, amount int, price double precision);",
+             CREATE TABLE orders (oid int PRIMARY KEY, uid int, amount int, price double precision);\n\
+             CREATE TABLE events (id int PRIMARY KEY, at timestamp, on_day date, at_time time, src inet, amt numeric);",
         )
         .await
         .expect("create pg tables");
@@ -395,6 +467,20 @@ async fn seed_postgres(client: &tokio_postgres::Client) {
             )
             .await
             .expect("insert pg order");
+    }
+    for e in events() {
+        // Typed literals so Postgres stores the exact temporal/inet/numeric value.
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO events (id, at, on_day, at_time, src, amt) VALUES \
+                     ({}, TIMESTAMP '{}', DATE '{}', TIME '{}', INET '{}', NUMERIC '{}')",
+                    e.id, e.at, e.on_day, e.at_time, e.src, e.amt
+                ),
+                &[],
+            )
+            .await
+            .expect("insert pg event");
     }
 }
 
@@ -574,6 +660,52 @@ fn create_schema() -> Schema {
         )
         .expect("create table orders");
 
+    // events(id int PK, at timestamp, on_day date, at_time time, src inet,
+    // amt decimal). CQL has no `numeric`; `decimal` is the arbitrary-precision
+    // type that the front-end maps to Postgres numeric (OID 1700).
+    let mut events_cols = IndexMap::new();
+    events_cols.insert(
+        "id".to_string(),
+        column("id", ColumnKind::PartitionKey, "int"),
+    );
+    events_cols.insert(
+        "at".to_string(),
+        column("at", ColumnKind::Regular, "timestamp"),
+    );
+    events_cols.insert(
+        "on_day".to_string(),
+        column("on_day", ColumnKind::Regular, "date"),
+    );
+    events_cols.insert(
+        "at_time".to_string(),
+        column("at_time", ColumnKind::Regular, "time"),
+    );
+    events_cols.insert(
+        "src".to_string(),
+        column("src", ColumnKind::Regular, "inet"),
+    );
+    events_cols.insert(
+        "amt".to_string(),
+        column("amt", ColumnKind::Regular, "decimal"),
+    );
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "public".to_string(),
+                name: "events".to_string(),
+                id: Uuid::new_v4(),
+                columns: events_cols,
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: HashMap::new(),
+                is_system: false,
+            },
+            &auth,
+        )
+        .expect("create table events");
+
     schema
 }
 
@@ -605,6 +737,47 @@ fn users_storage_schema() -> ferrosa_common::schema::TableSchema {
             col("dept", text_marshal()),
             col("email", text_marshal()),
             col("name", text_marshal()),
+        ],
+        extensions: Default::default(),
+    }
+}
+
+fn timestamp_marshal() -> &'static str {
+    "org.apache.cassandra.db.marshal.TimestampType"
+}
+fn date_marshal() -> &'static str {
+    "org.apache.cassandra.db.marshal.SimpleDateType"
+}
+fn time_marshal() -> &'static str {
+    "org.apache.cassandra.db.marshal.TimeType"
+}
+fn inet_marshal() -> &'static str {
+    "org.apache.cassandra.db.marshal.InetAddressType"
+}
+fn decimal_marshal() -> &'static str {
+    "org.apache.cassandra.db.marshal.DecimalType"
+}
+
+fn events_storage_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    let col = |n: &str, t: &str| ColumnDefinition {
+        name: n.to_string(),
+        type_name: t.to_string(),
+    };
+    TableSchema {
+        keyspace: "public".to_string(),
+        table: "events".to_string(),
+        key_type: int_marshal().to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        // Regular columns in Cassandra's name-sorted storage order:
+        // amt, at, at_time, on_day, src.
+        regular_columns: vec![
+            col("amt", decimal_marshal()),
+            col("at", timestamp_marshal()),
+            col("at_time", time_marshal()),
+            col("on_day", date_marshal()),
+            col("src", inet_marshal()),
         ],
         extensions: Default::default(),
     }
@@ -673,6 +846,7 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
     let engine = StorageEngine::new(engine_config(dir), None).unwrap();
     engine.register_table(users_storage_schema()).unwrap();
     engine.register_table(orders_storage_schema()).unwrap();
+    engine.register_table(events_storage_schema()).unwrap();
 
     let users_tid = TableId::new("public", "users");
     let orders_tid = TableId::new("public", "orders");
@@ -710,7 +884,105 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
             .unwrap();
         ts += 1;
     }
+
+    // events: encode each scalar into its CQL on-wire cell bytes using the
+    // reused `ferrosa_cql::types::encode_value` encoder (built from the canonical
+    // string literal — the SAME source of truth Postgres got), so the seed and
+    // the decode path share one serialization and cannot drift.
+    let events_tid = TableId::new("public", "events");
+    let e_at = storage_ord(schema, "events", "at");
+    let e_on_day = storage_ord(schema, "events", "on_day");
+    let e_at_time = storage_ord(schema, "events", "at_time");
+    let e_src = storage_ord(schema, "events", "src");
+    let e_amt = storage_ord(schema, "events", "amt");
+    for e in events() {
+        let cells = vec![
+            (e_at, cql_bytes(&cql_timestamp(e.at))),
+            (e_on_day, cql_bytes(&cql_date(e.on_day))),
+            (e_at_time, cql_bytes(&cql_time(e.at_time))),
+            (e_src, cql_bytes(&cql_inet(e.src))),
+            (e_amt, cql_bytes(&cql_decimal(e.amt))),
+        ];
+        engine
+            .write(&events_tid, &pk(e.id), row_with_cells(cells, ts), ts)
+            .unwrap();
+        ts += 1;
+    }
     engine
+}
+
+/// Reuse the canonical CQL cell encoder (no reinvention).
+fn cql_bytes(v: &ferrosa_common::CqlValue) -> Vec<u8> {
+    ferrosa_cql::types::encode_value(v)
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]` (UTC, no tz) → `CqlValue::Timestamp(millis)`.
+/// Postgres stores `timestamp` to microsecond precision; the corpus values use
+/// at most millisecond precision OR exact micros that are whole milliseconds —
+/// EXCEPT id=3 (`.000001`) and id=5 (`.999999`), which carry sub-millisecond
+/// micros. CQL `timestamp` is millisecond-resolution, so those would truncate.
+/// To keep the two systems bit-identical we therefore only place values whose
+/// sub-second part is a whole millisecond here; the corpus is chosen so the
+/// timestamp column never needs sub-ms precision (the sub-ms cases live only in
+/// the `at_time` column, which is microsecond-resolution `time`).
+fn cql_timestamp(s: &str) -> ferrosa_common::CqlValue {
+    let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .unwrap_or_else(|e| panic!("bad timestamp literal {s:?}: {e}"));
+    let micros = naive.and_utc().timestamp_micros();
+    assert_eq!(
+        micros % 1000,
+        0,
+        "corpus timestamp {s:?} has sub-millisecond precision; CQL timestamp is \
+         millisecond-resolution and would truncate"
+    );
+    ferrosa_common::CqlValue::Timestamp(micros / 1000)
+}
+
+/// `YYYY-MM-DD` → `CqlValue::Date(days + 2^31)` (CQL epoch-centered encoding).
+fn cql_date(s: &str) -> ferrosa_common::CqlValue {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .unwrap_or_else(|e| panic!("bad date literal {s:?}: {e}"));
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let days = (date - epoch).num_days();
+    let encoded = (days + 2_147_483_648) as u32;
+    ferrosa_common::CqlValue::Date(encoded)
+}
+
+/// `HH:MM:SS[.ffffff]` → `CqlValue::Time(nanos since midnight)`.
+fn cql_time(s: &str) -> ferrosa_common::CqlValue {
+    let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M:%S"))
+        .unwrap_or_else(|e| panic!("bad time literal {s:?}: {e}"));
+    let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let nanos = (t - midnight)
+        .num_nanoseconds()
+        .expect("time within a day fits in i64 nanos");
+    ferrosa_common::CqlValue::Time(nanos)
+}
+
+/// canonical IP string → `CqlValue::Inet`.
+fn cql_inet(s: &str) -> ferrosa_common::CqlValue {
+    ferrosa_common::CqlValue::Inet(s.parse().unwrap_or_else(|e| panic!("bad inet {s:?}: {e}")))
+}
+
+/// plain decimal string → `CqlValue::Decimal { scale, unscaled }`.
+fn cql_decimal(s: &str) -> ferrosa_common::CqlValue {
+    use num_bigint::BigInt;
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i8, r),
+        None => (1i8, s),
+    };
+    let (int_part, frac_part) = rest.split_once('.').unwrap_or((rest, ""));
+    let digits = format!("{int_part}{frac_part}");
+    let magnitude = digits
+        .parse::<BigInt>()
+        .unwrap_or_else(|e| panic!("bad decimal {s:?}: {e}"));
+    let unscaled = if sign < 0 { -magnitude } else { magnitude };
+    ferrosa_common::CqlValue::Decimal {
+        scale: frac_part.len() as i32,
+        unscaled,
+    }
 }
 
 /// Start the ferrosa-postgres front-end over the seeded engine, returning a
@@ -913,6 +1185,45 @@ fn corpus() -> Vec<Case> {
         c(
             "group_order_desc",
             "SELECT uid, SUM(amount) FROM orders GROUP BY uid ORDER BY uid DESC",
+        ),
+        // ── New scalar types: timestamp / date / time / inet / numeric ─────
+        // 19. project ALL new-type columns, ordered by numeric PK. Exercises the
+        //     exact-text renderers for every type at once.
+        c(
+            "events_project_all",
+            "SELECT id, at, on_day, at_time, src, amt FROM events ORDER BY id",
+        ),
+        // 20. WHERE on a timestamp range (typed literal both sides).
+        c(
+            "events_ts_range",
+            "SELECT id FROM events WHERE at >= TIMESTAMP '2024-03-01 00:00:00' ORDER BY id",
+        ),
+        // 21. WHERE on a date range.
+        c(
+            "events_date_range",
+            "SELECT id, on_day FROM events WHERE on_day < DATE '2024-01-01' ORDER BY id",
+        ),
+        // 22. ORDER BY a timestamp column (deterministic monotone order).
+        c(
+            "events_order_by_ts",
+            "SELECT id, at FROM events ORDER BY at",
+        ),
+        // 23. MIN/MAX over timestamp.
+        c("events_min_max_ts", "SELECT MIN(at), MAX(at) FROM events"),
+        // 24. DISTINCT over inet, ordered (every src is distinct → 5 rows).
+        c(
+            "events_distinct_inet",
+            "SELECT DISTINCT src FROM events ORDER BY src",
+        ),
+        // 25. WHERE on a numeric value (typed literal), projecting numeric.
+        c(
+            "events_numeric_filter",
+            "SELECT id, amt FROM events WHERE amt > NUMERIC '1' ORDER BY id",
+        ),
+        // 26. ORDER BY a time column.
+        c(
+            "events_order_by_time",
+            "SELECT id, at_time FROM events ORDER BY at_time",
         ),
     ]
 }

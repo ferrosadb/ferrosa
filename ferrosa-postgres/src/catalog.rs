@@ -45,9 +45,9 @@ const FIRST_USER_OID: u32 = 16_384;
 pub fn type_oid(column_type: &str) -> u32 {
     let normalized = normalize_type_name(column_type);
     match normalized.as_str() {
-        "text" | "varchar" | "ascii" | "inet" => 25,    // text
+        "text" | "varchar" | "ascii" => 25,             // text
         "int" | "int32" | "smallint" | "tinyint" => 23, // int4
-        "bigint" | "counter" | "long" | "time" => 20,   // int8
+        "bigint" | "counter" | "long" => 20,            // int8
         "boolean" | "bool" => 16,                       // bool
         "uuid" | "timeuuid" => 2950,                    // uuid
         "float" => 700,                                 // float4
@@ -55,9 +55,12 @@ pub fn type_oid(column_type: &str) -> u32 {
         "blob" | "bytes" => 17,                         // bytea
         "timestamp" | "datetime" => 1114,               // timestamp (without tz)
         "date" => 1082,                                 // date
-        // Unknown / unsupported CQL types (collections, UDTs, decimal, …) are
-        // surfaced to drivers as `text` rather than dropped. Widen this map as
-        // the engine grows real support for the underlying types.
+        "time" => 1083,                                 // time (without tz)
+        "inet" => 869,                                  // inet
+        "decimal" | "varint" => 1700,                   // numeric
+        // Unknown / unsupported CQL types (collections, UDTs, …) are surfaced to
+        // drivers as `text` rather than dropped. Widen this map as the engine
+        // grows real support for the underlying types.
         _ => 25,
     }
 }
@@ -266,6 +269,9 @@ fn type_name(oid: u32) -> &'static str {
         17 => "bytea",
         1114 => "timestamp",
         1082 => "date",
+        1083 => "time",
+        869 => "inet",
+        1700 => "numeric",
         _ => "text",
     }
 }
@@ -403,6 +409,11 @@ mod tests {
         assert_eq!(type_oid("blob"), 17);
         assert_eq!(type_oid("bytes"), 17);
         assert_eq!(type_oid("timestamp"), 1114);
+        assert_eq!(type_oid("date"), 1082);
+        assert_eq!(type_oid("time"), 1083);
+        assert_eq!(type_oid("inet"), 869);
+        assert_eq!(type_oid("decimal"), 1700);
+        assert_eq!(type_oid("varint"), 1700);
     }
 
     #[test]
