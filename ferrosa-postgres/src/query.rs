@@ -114,7 +114,7 @@ fn exec_error_response(err: &ExecError) -> BackendMessage {
         ExecError::NoSuchTable { .. } => ("42P01", err.to_string()),
         ExecError::NoSuchColumn(_) | ExecError::UnknownQualifier(_) => ("42703", err.to_string()),
         ExecError::AmbiguousColumn(_) => ("42702", err.to_string()),
-        ExecError::NotGrouped(_) => ("42803", err.to_string()),
+        ExecError::NotGrouped(_) | ExecError::AggregateInWhere(_) => ("42803", err.to_string()),
         ExecError::InvalidOrderBy(_) => ("42P10", err.to_string()),
     };
     error_response(sqlstate, &message)
@@ -283,6 +283,14 @@ mod tests {
         assert!(matches!(
             ambiguous,
             BackendMessage::ErrorResponse { ref fields } if fields[1] == (b'C', "42702".to_string())
+        ));
+
+        // An aggregate in WHERE is a grouping_error (42803), same family as
+        // NotGrouped.
+        let agg_in_where = exec_error_response(&ExecError::AggregateInWhere("COUNT(*)".into()));
+        assert!(matches!(
+            agg_in_where,
+            BackendMessage::ErrorResponse { ref fields } if fields[1] == (b'C', "42803".to_string())
         ));
     }
 

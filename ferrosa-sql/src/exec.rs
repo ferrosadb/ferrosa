@@ -77,7 +77,7 @@ pub fn limit_offset(rows: Vec<Row>, offset: usize, limit: Option<usize>) -> Vec<
 }
 
 /// A supported aggregate function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggFunc {
     Count,
     Sum,
