@@ -1603,11 +1603,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("invalid FERROSA_POSTGRES_BIND");
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
+        let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
+            engine: storage.clone(),
+            schema: schema.clone(),
+            default_schema: "public".into(),
+        });
         runtimes.background.spawn(async move {
             match tokio::net::TcpListener::bind(pg_bind).await {
                 Ok(listener) => {
                     tracing::info!(%pg_bind, "Postgres server listening");
-                    if let Err(e) = ferrosa_postgres::server::serve(listener, pg_store).await {
+                    if let Err(e) =
+                        ferrosa_postgres::server::serve(listener, pg_store, query_ctx).await
+                    {
                         tracing::error!(%e, "Postgres server failed");
                     }
                 }

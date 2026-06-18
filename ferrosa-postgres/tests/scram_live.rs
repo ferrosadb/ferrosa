@@ -3,11 +3,20 @@
 //! exercises the full random-nonce SCRAM-SHA-256 exchange and the run-time
 //! parameter / ReadyForQuery sequence that the RFC-vector unit tests cannot.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferrosa_postgres::handshake::VerifierStore;
 use ferrosa_postgres::scram::ScramVerifier;
-use ferrosa_postgres::server;
+use ferrosa_postgres::{server, QueryContext};
+use ferrosa_schema::{
+    AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+    RateLimitConfig, Schema, SchemaConfig, TestAuditSink,
+};
+use ferrosa_storage::{
+    CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+};
 use tokio::net::TcpListener;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Config, NoTls};
@@ -31,16 +40,71 @@ fn dev_store() -> Arc<OneRole> {
     })
 }
 
-async fn spawn_server(store: Arc<OneRole>) -> u16 {
+fn schema_config() -> SchemaConfig {
+    SchemaConfig {
+        hasher: PasswordHasher::Bcrypt { cost: 4 },
+        password_policy: PasswordPolicy::permissive(),
+        auth_method: AuthMethod::Password,
+        rate_limit: RateLimitConfig::default(),
+        audit_sink: Box::new(TestAuditSink::new()),
+        secrets: Box::new(EnvSecretsProvider),
+        mode: DeploymentMode::Development,
+    }
+}
+
+fn engine_config(dir: &Path) -> StorageEngineConfig {
+    StorageEngineConfig {
+        commit_log: CommitLogConfig {
+            segment_size: 256 * 1024,
+            max_segment_age: Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Batch,
+            batch: Default::default(),
+            log_dir: dir.join("commitlog"),
+            checkpoint_dir: dir.join("commitlog"),
+            archive: None,
+        },
+        compaction: CompactionConfig::from_env(dir.join("compaction")),
+        object_store: None,
+        local_cache_max_bytes: 1024 * 1024,
+        local_disk_free_reserve_bytes: 0,
+        flush_threshold_bytes: 4096,
+        memtable_backpressure_bytes: u64::MAX,
+        flush_max_age_secs: 5,
+        data_dir: dir.to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
+        write_verify: false,
+    }
+}
+
+/// A minimal `QueryContext` over a temp engine and bare schema. The returned
+/// `TempDir` guard must outlive the server (its `Drop` removes the data dir).
+fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+    let schema = Schema::new(schema_config()).expect("schema bootstraps");
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+    });
+    (ctx, dir)
+}
+
+async fn spawn_server(store: Arc<OneRole>, ctx: Arc<QueryContext>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(server::serve(listener, store));
+    tokio::spawn(server::serve(listener, store, ctx));
     port
 }
 
 #[tokio::test]
 async fn real_driver_completes_scram_then_query_fails_loud() {
-    let port = spawn_server(dev_store()).await;
+    let (ctx, _dir) = minimal_ctx();
+    let port = spawn_server(dev_store(), ctx).await;
 
     // tokio-postgres performs a real SCRAM-SHA-256 exchange with random nonces.
     let (client, connection) = Config::new()
@@ -57,15 +121,17 @@ async fn real_driver_completes_scram_then_query_fails_loud() {
         let _ = connection.await;
     });
 
-    // Auth succeeded and the session reached ReadyForQuery. The query itself
-    // fails loud (no relational engine yet) with SQLSTATE 0A000.
+    // Auth succeeded and the session reached ReadyForQuery. The engine is now
+    // wired in: `SELECT 1` (no FROM clause) is outside the M1 subset, so it
+    // fails loud at parse time with SQLSTATE 42601 (syntax_error) rather than
+    // returning a fake row.
     let err = client
         .simple_query("SELECT 1")
         .await
-        .expect_err("query should fail loud until the engine lands");
+        .expect_err("a no-FROM query is outside the M1 subset and must fail loud");
     assert_eq!(
         err.code().map(|c| c.code()),
-        Some("0A000"),
+        Some("42601"),
         "unexpected error: {err}"
     );
 
@@ -75,7 +141,8 @@ async fn real_driver_completes_scram_then_query_fails_loud() {
 
 #[tokio::test]
 async fn wrong_password_is_rejected_by_real_driver() {
-    let port = spawn_server(dev_store()).await;
+    let (ctx, _dir) = minimal_ctx();
+    let port = spawn_server(dev_store(), ctx).await;
 
     let result = Config::new()
         .host("127.0.0.1")

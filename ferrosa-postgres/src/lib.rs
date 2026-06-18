@@ -17,6 +17,7 @@ pub mod codec;
 pub mod connection;
 pub mod handshake;
 pub mod messages;
+pub mod query;
 pub mod scram;
 pub mod server;
 pub mod storage_provider;
@@ -28,6 +29,8 @@ pub use store::SchemaVerifierStore;
 
 pub use codec::{CodecError, MAX_MESSAGE_LEN};
 pub use messages::{
-    BackendMessage, FrontendMessage, StartupFrame, StartupMessage, TransactionStatus,
+    BackendMessage, FieldDescription, FrontendMessage, StartupFrame, StartupMessage,
+    TransactionStatus,
 };
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
+pub use server::QueryContext;
