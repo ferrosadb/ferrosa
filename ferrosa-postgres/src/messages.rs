@@ -54,11 +54,27 @@ impl TransactionStatus {
 /// `type_size` is the on-wire fixed length for a fixed-width type (e.g. 4 for
 /// int4, 1 for bool) or `-1` for a variable-length type (e.g. text). `type_oid`
 /// is the Postgres type OID the driver uses to decode each `DataRow` value.
+/// `format_code` is the wire format the matching `DataRow` column is encoded in:
+/// `0` = text, `1` = binary. The simple-query path always uses `0`; the extended
+/// path honors the portal's result-format codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescription {
     pub name: String,
     pub type_oid: i32,
     pub type_size: i16,
+    pub format_code: i16,
+}
+
+impl FieldDescription {
+    /// A text-format field (`format_code = 0`) — the simple-query default.
+    pub fn text(name: impl Into<String>, type_oid: i32, type_size: i16) -> Self {
+        Self {
+            name: name.into(),
+            type_oid,
+            type_size,
+            format_code: 0,
+        }
+    }
 }
 
 /// A backend (server → client) message. First-slice subset sufficient for the
@@ -88,6 +104,19 @@ pub enum BackendMessage {
     DataRow { columns: Vec<Option<Vec<u8>>> },
     /// `C` — command completion, carrying the command tag (e.g. `"SELECT 2"`).
     CommandComplete { tag: String },
+    /// `1` — Parse completed (extended protocol; empty body).
+    ParseComplete,
+    /// `2` — Bind completed (extended protocol; empty body).
+    BindComplete,
+    /// `3` — Close completed (extended protocol; empty body).
+    CloseComplete,
+    /// `t` — ParameterDescription: the parameter type OIDs of a prepared
+    /// statement (i16 count + that many i32 OIDs).
+    ParameterDescription { type_oids: Vec<i32> },
+    /// `n` — NoData: the statement/portal produces no result columns.
+    NoData,
+    /// `I` — EmptyQueryResponse: the query string was empty.
+    EmptyQueryResponse,
 }
 
 impl BackendMessage {
@@ -105,6 +134,12 @@ impl BackendMessage {
             BackendMessage::RowDescription { .. } => b'T',
             BackendMessage::DataRow { .. } => b'D',
             BackendMessage::CommandComplete { .. } => b'C',
+            BackendMessage::ParseComplete => b'1',
+            BackendMessage::BindComplete => b'2',
+            BackendMessage::CloseComplete => b'3',
+            BackendMessage::ParameterDescription { .. } => b't',
+            BackendMessage::NoData => b'n',
+            BackendMessage::EmptyQueryResponse => b'I',
         }
     }
 
@@ -155,7 +190,7 @@ impl BackendMessage {
                     body.put_i32(field.type_oid);
                     body.put_i16(field.type_size);
                     body.put_i32(-1); // type modifier (none)
-                    body.put_i16(0); // format code: 0 = text
+                    body.put_i16(field.format_code); // 0 = text, 1 = binary
                 }
             }
             BackendMessage::DataRow { columns } => {
@@ -171,6 +206,18 @@ impl BackendMessage {
                 }
             }
             BackendMessage::CommandComplete { tag } => put_cstring(body, tag),
+            // Empty-body extended-protocol acknowledgements.
+            BackendMessage::ParseComplete
+            | BackendMessage::BindComplete
+            | BackendMessage::CloseComplete
+            | BackendMessage::NoData
+            | BackendMessage::EmptyQueryResponse => {}
+            BackendMessage::ParameterDescription { type_oids } => {
+                body.put_i16(type_oids.len() as i16);
+                for oid in type_oids {
+                    body.put_i32(*oid);
+                }
+            }
         }
     }
 
@@ -193,6 +240,33 @@ impl BackendMessage {
 pub enum FrontendMessage {
     /// `Q` — a simple query string.
     Query(String),
+    /// `P` — Parse: create a prepared statement. `stmt_name` empty ⇒ the unnamed
+    /// statement; `param_types` are the client-declared parameter type OIDs
+    /// (0 = unspecified, server infers).
+    Parse {
+        stmt_name: String,
+        query: String,
+        param_types: Vec<i32>,
+    },
+    /// `B` — Bind: create a portal from a prepared statement.
+    Bind {
+        portal: String,
+        stmt_name: String,
+        /// Per-parameter format codes (0 = text, 1 = binary). Length 0 ⇒ all
+        /// text; length 1 ⇒ that one code applies to every parameter; else one
+        /// code per parameter.
+        param_formats: Vec<i16>,
+        /// Parameter values: `None` is SQL NULL (wire length -1).
+        param_values: Vec<Option<Vec<u8>>>,
+        /// Per-result-column format codes (same 0/1 + 0/1/many fan-out rule).
+        result_formats: Vec<i16>,
+    },
+    /// `D` — Describe a statement (`S`) or portal (`P`) by name.
+    Describe { kind: u8, name: String },
+    /// `E` — Execute a portal; `max_rows` of 0 means "all rows".
+    Execute { portal: String, max_rows: i32 },
+    /// `C` — Close a statement (`S`) or portal (`P`) by name.
+    Close { kind: u8, name: String },
     /// `S` — sync (extended-query boundary).
     Sync,
     /// `X` — terminate the connection.
@@ -239,11 +313,7 @@ mod tests {
     fn row_description_frames_one_int_field() {
         let mut out = BytesMut::new();
         BackendMessage::RowDescription {
-            fields: vec![FieldDescription {
-                name: "id".to_string(),
-                type_oid: 23, // int4
-                type_size: 4,
-            }],
+            fields: vec![FieldDescription::text("id", 23, 4)], // int4, text format
         }
         .encode(&mut out);
         // 'T', i32 length, i16 field-count, then the field body.
@@ -282,6 +352,57 @@ mod tests {
         assert_eq!(&body[6..9], b"abc");
         assert_eq!(i32::from_be_bytes(body[9..13].try_into().unwrap()), -1); // col1 NULL
         assert_eq!(body.len(), 13, "no bytes follow a NULL length");
+    }
+
+    #[test]
+    fn row_description_field_can_be_binary_format() {
+        let mut out = BytesMut::new();
+        BackendMessage::RowDescription {
+            fields: vec![FieldDescription {
+                name: "id".to_string(),
+                type_oid: 23,
+                type_size: 4,
+                format_code: 1, // binary
+            }],
+        }
+        .encode(&mut out);
+        let body = &out[5..];
+        // The trailing format code (last 2 bytes of the field) is 1 = binary.
+        assert_eq!(i16::from_be_bytes(body[21..23].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn empty_body_extended_acks_frame_with_zero_length_body() {
+        for (msg, tag) in [
+            (BackendMessage::ParseComplete, b'1'),
+            (BackendMessage::BindComplete, b'2'),
+            (BackendMessage::CloseComplete, b'3'),
+            (BackendMessage::NoData, b'n'),
+            (BackendMessage::EmptyQueryResponse, b'I'),
+        ] {
+            let mut out = BytesMut::new();
+            msg.encode(&mut out);
+            // tag + length(=4, body empty); nothing follows.
+            assert_eq!(out[0], tag, "tag byte for {msg:?}");
+            assert_eq!(&out[..], &[tag, 0, 0, 0, 4]);
+        }
+    }
+
+    #[test]
+    fn parameter_description_encodes_count_and_oids() {
+        let mut out = BytesMut::new();
+        BackendMessage::ParameterDescription {
+            type_oids: vec![23, 25],
+        }
+        .encode(&mut out);
+        assert_eq!(out[0], b't');
+        // length = 4 + count(2) + 2*oid(4) = 14
+        let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
+        assert_eq!(len, 14);
+        let body = &out[5..];
+        assert_eq!(i16::from_be_bytes(body[0..2].try_into().unwrap()), 2);
+        assert_eq!(i32::from_be_bytes(body[2..6].try_into().unwrap()), 23);
+        assert_eq!(i32::from_be_bytes(body[6..10].try_into().unwrap()), 25);
     }
 
     #[test]

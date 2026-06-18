@@ -43,7 +43,7 @@ use crate::storage_provider::{load_table, LoadError};
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
-fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
+pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
     BackendMessage::ErrorResponse {
         fields: vec![
             (b'S', "ERROR".to_string()),
@@ -57,7 +57,7 @@ fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 ///
 /// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool),
 /// `Float -> 701` (float8).
-fn column_type_oid(ty: ColumnType) -> i32 {
+pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
     match ty {
         ColumnType::Int => 23,
         ColumnType::Text => 25,
@@ -107,38 +107,201 @@ fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
     }
 }
 
+/// Decode one bound parameter value into a [`SqlValue`].
+///
+/// `format` is the Bind format code (`0` = text, `1` = binary); `type_oid` is
+/// the parameter's declared Postgres type OID (`0` = unspecified ⇒ lenient
+/// text). `bytes` is `None` for SQL NULL. For unknown OIDs we fall back to a
+/// best-effort textual decode (or NULL) rather than panic.
+pub fn decode_param(format: i16, type_oid: i32, bytes: Option<&[u8]>) -> SqlValue {
+    let Some(raw) = bytes else {
+        return SqlValue::Null;
+    };
+    if format == 1 {
+        decode_param_binary(type_oid, raw)
+    } else {
+        decode_param_text(type_oid, raw)
+    }
+}
+
+/// Text-format parameter decode: parse the UTF-8 string per the declared OID.
+fn decode_param_text(type_oid: i32, raw: &[u8]) -> SqlValue {
+    // A non-UTF-8 text parameter is a client protocol error; treat as NULL
+    // rather than panic (documented lenient fallback).
+    let Ok(s) = std::str::from_utf8(raw) else {
+        return SqlValue::Null;
+    };
+    match type_oid {
+        // int4 / int8 / int2: decimal integer.
+        23 | 20 | 21 => s
+            .parse::<i64>()
+            .map(SqlValue::Int)
+            .unwrap_or(SqlValue::Null),
+        // text / varchar / name.
+        25 | 1043 | 19 => SqlValue::Text(s.to_string()),
+        16 => decode_bool_text(s),
+        // float4 / float8.
+        700 | 701 => s
+            .parse::<f64>()
+            .map(SqlValue::float)
+            .unwrap_or(SqlValue::Null),
+        // OID 0 (unspecified) or any unknown OID: lenient — keep as text.
+        _ => SqlValue::Text(s.to_string()),
+    }
+}
+
+/// Postgres bool text spellings the driver may send.
+fn decode_bool_text(s: &str) -> SqlValue {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "t" | "true" | "1" | "y" | "yes" | "on" => SqlValue::Bool(true),
+        "f" | "false" | "0" | "n" | "no" | "off" => SqlValue::Bool(false),
+        _ => SqlValue::Null,
+    }
+}
+
+/// Binary-format parameter decode: big-endian per the declared OID.
+fn decode_param_binary(type_oid: i32, raw: &[u8]) -> SqlValue {
+    match type_oid {
+        // int4 (BE i32).
+        23 => be_int(raw, 4).map_or(SqlValue::Null, SqlValue::Int),
+        // int8 (BE i64).
+        20 => be_int(raw, 8).map_or(SqlValue::Null, SqlValue::Int),
+        // int2 (BE i16).
+        21 => be_int(raw, 2).map_or(SqlValue::Null, SqlValue::Int),
+        // text / varchar.
+        25 | 1043 => std::str::from_utf8(raw)
+            .map(|s| SqlValue::Text(s.to_string()))
+            .unwrap_or(SqlValue::Null),
+        // bool: any non-zero byte is true.
+        16 => raw
+            .first()
+            .map_or(SqlValue::Null, |b| SqlValue::Bool(*b != 0)),
+        // float4 (BE f32 bits).
+        700 if raw.len() == 4 => {
+            SqlValue::float(f32::from_be_bytes(raw.try_into().unwrap()) as f64)
+        }
+        // float8 (BE f64 bits).
+        701 if raw.len() == 8 => SqlValue::float(f64::from_be_bytes(raw.try_into().unwrap())),
+        // Unknown OID: best-effort text, else NULL (documented fallback — no panic).
+        _ => std::str::from_utf8(raw)
+            .map(|s| SqlValue::Text(s.to_string()))
+            .unwrap_or(SqlValue::Null),
+    }
+}
+
+/// Read a big-endian signed integer of `width` bytes (2/4/8) into i64, or `None`
+/// if the byte length doesn't match.
+fn be_int(raw: &[u8], width: usize) -> Option<i64> {
+    if raw.len() != width {
+        return None;
+    }
+    let val = match width {
+        2 => i64::from(i16::from_be_bytes(raw.try_into().ok()?)),
+        4 => i64::from(i32::from_be_bytes(raw.try_into().ok()?)),
+        8 => i64::from_be_bytes(raw.try_into().ok()?),
+        _ => return None,
+    };
+    Some(val)
+}
+
+/// Encode a [`SqlValue`] to its wire bytes in the requested `format` (`0` text,
+/// `1` binary) for a column of declared `col_type`, or `None` for SQL NULL.
+///
+/// The binary encoding is kept consistent with the OID/size advertised in
+/// [`column_type_oid`] / [`column_type_size`]: `ColumnType::Int` ⇒ int4 (OID 23,
+/// 4 bytes), so an `Int` always emits a 4-byte big-endian `i32` (a value that
+/// overflows `i32` saturates rather than corrupting the frame). `Float` ⇒
+/// float8 (OID 701, 8 bytes).
+pub fn encode_value(format: i16, col_type: ColumnType, v: &SqlValue) -> Option<Vec<u8>> {
+    if format != 1 {
+        return render_value(v); // text format: reuse the existing renderer
+    }
+    match v {
+        SqlValue::Null => None,
+        SqlValue::Int(i) => Some(encode_int_binary(col_type, *i)),
+        SqlValue::Text(s) => Some(s.clone().into_bytes()),
+        SqlValue::Bool(b) => Some(vec![u8::from(*b)]),
+        // Floats are advertised as float8 (OID 701); emit 8-byte BE bits.
+        SqlValue::Float(of) => Some(of.0.to_be_bytes().to_vec()),
+    }
+}
+
+/// Binary integer encoding honoring the column's declared width: `ColumnType::Int`
+/// is int4 ⇒ 4-byte BE (saturating to `i32` range); anything else falls back to
+/// int8 ⇒ 8-byte BE. Keeps the bytes consistent with the RowDescription OID/size.
+fn encode_int_binary(col_type: ColumnType, i: i64) -> Vec<u8> {
+    match col_type {
+        ColumnType::Int => {
+            let v = i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            v.to_be_bytes().to_vec()
+        }
+        _ => i.to_be_bytes().to_vec(),
+    }
+}
+
 /// Map an [`ExecError`] from the binder/executor to a single fail-loud
 /// `ErrorResponse` with the appropriate SQLSTATE.
-fn exec_error_response(err: &ExecError) -> BackendMessage {
+pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
     let (sqlstate, message) = match err {
         ExecError::NoSuchTable { .. } => ("42P01", err.to_string()),
         ExecError::NoSuchColumn(_) | ExecError::UnknownQualifier(_) => ("42703", err.to_string()),
         ExecError::AmbiguousColumn(_) => ("42702", err.to_string()),
         ExecError::NotGrouped(_) | ExecError::AggregateInWhere(_) => ("42803", err.to_string()),
         ExecError::InvalidOrderBy(_) => ("42P10", err.to_string()),
+        // A `$N` with no bound value: undefined_parameter.
+        ExecError::MissingParameter(_) => ("42P02", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
 
-/// Render a successful [`QueryResult`] into `RowDescription` + `DataRow`s +
-/// `CommandComplete`.
-fn render_result(result: QueryResult) -> Vec<BackendMessage> {
-    let mut out = Vec::with_capacity(result.rows.len() + 2);
+/// The wire format code (`0` text, `1` binary) for result column `i`, applying
+/// the Postgres fan-out rule: an empty list ⇒ all text; a single code ⇒ that
+/// code for every column; otherwise the per-column code.
+fn result_format_for(formats: &[i16], i: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats.get(i).copied().unwrap_or(0),
+    }
+}
 
-    let fields = result
-        .columns
+/// Build the `RowDescription` fields for a column list under `result_formats`,
+/// so each field's advertised format code matches how its `DataRow` bytes are
+/// later encoded.
+pub(crate) fn row_description_fields(
+    columns: &[ferrosa_sql::Column],
+    result_formats: &[i16],
+) -> Vec<FieldDescription> {
+    columns
         .iter()
-        .map(|col| FieldDescription {
+        .enumerate()
+        .map(|(i, col)| FieldDescription {
             name: col.name.clone(),
             type_oid: column_type_oid(col.ty),
             type_size: column_type_size(col.ty),
+            format_code: result_format_for(result_formats, i),
         })
-        .collect();
+        .collect()
+}
+
+/// Render a successful [`QueryResult`] into `RowDescription` + `DataRow`s +
+/// `CommandComplete`, encoding each column per `result_formats` (text or binary).
+/// The simple-query path passes `&[]` (all text).
+fn render_result(result: QueryResult, result_formats: &[i16]) -> Vec<BackendMessage> {
+    let mut out = Vec::with_capacity(result.rows.len() + 2);
+
+    let fields = row_description_fields(&result.columns, result_formats);
     out.push(BackendMessage::RowDescription { fields });
 
+    let col_types: Vec<ColumnType> = result.columns.iter().map(|c| c.ty).collect();
     let nrows = result.rows.len();
     for row in &result.rows {
-        let columns = row.0.iter().map(render_value).collect();
+        let columns = row
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, v)| encode_value(result_format_for(result_formats, i), col_types[i], v))
+            .collect();
         out.push(BackendMessage::DataRow { columns });
     }
 
@@ -165,6 +328,32 @@ pub async fn execute_query(
 
     // 2. Load every referenced table into a catalog. The R15 guard lives in
     //    `load_table`: a missing table is `NoSuchTable`, never an empty scan.
+    let catalog = match load_catalog(engine, schema, &stmt, default_schema).await {
+        Ok(catalog) => catalog,
+        Err(err_msg) => return vec![err_msg],
+    };
+
+    // 3. Bind + execute over the materialized snapshots (simple query: no
+    //    bound parameters).
+    match execute(&stmt, &catalog, default_schema, &[]) {
+        Ok(result) => render_result(result, &[]), // simple query: all text format
+        Err(e) => vec![exec_error_response(&e)],
+    }
+}
+
+/// Load every table referenced by `stmt` (FROM + optional JOIN) into a
+/// [`MapCatalog`], so the sync engine can scan them. Returns the populated
+/// catalog, or a single fail-loud [`BackendMessage::ErrorResponse`] (undefined
+/// table `42P01` or storage error `58000`) — never a silently-empty relation.
+///
+/// Shared by the simple-query path ([`execute_query`]) and the extended-query
+/// path (Describe/Execute), so both resolve tables identically.
+pub(crate) async fn load_catalog(
+    engine: &StorageEngine,
+    schema: &Schema,
+    stmt: &ferrosa_sql::SelectStmt,
+    default_schema: &str,
+) -> Result<MapCatalog, BackendMessage> {
     let mut catalog = MapCatalog::new();
     let referenced = std::iter::once(&stmt.from).chain(stmt.join.as_ref().map(|j| &j.table));
     for table_ref in referenced {
@@ -175,17 +364,46 @@ pub async fn execute_query(
             }
             Err(LoadError::NoSuchTable { .. }) => {
                 let msg = format!("relation \"{keyspace}.{}\" does not exist", table_ref.table);
-                return vec![error_response("42P01", &msg)];
+                return Err(error_response("42P01", &msg));
             }
             Err(e @ LoadError::Storage(_)) => {
-                return vec![error_response("58000", &e.to_string())];
+                return Err(error_response("58000", &e.to_string()));
             }
         }
     }
+    Ok(catalog)
+}
 
-    // 3. Bind + execute over the materialized snapshots.
-    match execute(&stmt, &catalog, default_schema) {
-        Ok(result) => render_result(result),
+/// Render a `QueryResult` (or an `ExecError`) into backend messages for the
+/// extended-query **Execute** path: `DataRow`s (encoded per `result_formats`) +
+/// `CommandComplete`, with **no** leading `RowDescription` (the client already
+/// learned the columns from `Describe`) and no `ReadyForQuery` (that follows
+/// `Sync`). An error yields a single `ErrorResponse`.
+pub(crate) fn render_execute_result(
+    result: Result<QueryResult, ExecError>,
+    result_formats: &[i16],
+) -> Vec<BackendMessage> {
+    match result {
+        Ok(result) => {
+            let col_types: Vec<ColumnType> = result.columns.iter().map(|c| c.ty).collect();
+            let nrows = result.rows.len();
+            let mut out = Vec::with_capacity(nrows + 1);
+            for row in &result.rows {
+                let columns = row
+                    .0
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        encode_value(result_format_for(result_formats, i), col_types[i], v)
+                    })
+                    .collect();
+                out.push(BackendMessage::DataRow { columns });
+            }
+            out.push(BackendMessage::CommandComplete {
+                tag: format!("SELECT {nrows}"),
+            });
+            out
+        }
         Err(e) => vec![exec_error_response(&e)],
     }
 }
@@ -244,6 +462,108 @@ mod tests {
             render_value(&SqlValue::float(f64::NEG_INFINITY)),
             Some(b"-Infinity".to_vec())
         );
+    }
+
+    #[test]
+    fn decode_param_text_by_oid() {
+        // int4 / int8 / int2 parse to Int.
+        assert_eq!(decode_param(0, 23, Some(b"42")), SqlValue::Int(42));
+        assert_eq!(decode_param(0, 20, Some(b"-7")), SqlValue::Int(-7));
+        // text / varchar / name stay text.
+        assert_eq!(
+            decode_param(0, 25, Some(b"hi")),
+            SqlValue::Text("hi".into())
+        );
+        // bool spellings.
+        assert_eq!(decode_param(0, 16, Some(b"t")), SqlValue::Bool(true));
+        assert_eq!(decode_param(0, 16, Some(b"false")), SqlValue::Bool(false));
+        // float8.
+        assert_eq!(decode_param(0, 701, Some(b"1.5")), SqlValue::float(1.5));
+        // OID 0 (unspecified) is lenient text.
+        assert_eq!(
+            decode_param(0, 0, Some(b"raw")),
+            SqlValue::Text("raw".into())
+        );
+        // NULL.
+        assert_eq!(decode_param(0, 23, None), SqlValue::Null);
+    }
+
+    #[test]
+    fn decode_param_binary_by_oid() {
+        // int4: 4-byte BE.
+        assert_eq!(
+            decode_param(1, 23, Some(&1i32.to_be_bytes())),
+            SqlValue::Int(1)
+        );
+        // int8: 8-byte BE.
+        assert_eq!(
+            decode_param(1, 20, Some(&9_000_000_000i64.to_be_bytes())),
+            SqlValue::Int(9_000_000_000)
+        );
+        // int2: 2-byte BE.
+        assert_eq!(
+            decode_param(1, 21, Some(&7i16.to_be_bytes())),
+            SqlValue::Int(7)
+        );
+        // text.
+        assert_eq!(
+            decode_param(1, 25, Some(b"hi")),
+            SqlValue::Text("hi".into())
+        );
+        // bool: non-zero byte ⇒ true.
+        assert_eq!(decode_param(1, 16, Some(&[1])), SqlValue::Bool(true));
+        assert_eq!(decode_param(1, 16, Some(&[0])), SqlValue::Bool(false));
+        // float4 / float8 from BE bits.
+        assert_eq!(
+            decode_param(1, 700, Some(&1.5f32.to_be_bytes())),
+            SqlValue::float(1.5)
+        );
+        assert_eq!(
+            decode_param(1, 701, Some(&(-0.25f64).to_be_bytes())),
+            SqlValue::float(-0.25)
+        );
+        // NULL.
+        assert_eq!(decode_param(1, 23, None), SqlValue::Null);
+    }
+
+    #[test]
+    fn encode_value_text_and_binary_round_trip() {
+        // Text format reuses render_value.
+        assert_eq!(
+            encode_value(0, ColumnType::Int, &SqlValue::Int(42)),
+            Some(b"42".to_vec())
+        );
+        // Binary int4 round-trips with decode_param.
+        let enc = encode_value(1, ColumnType::Int, &SqlValue::Int(258)).unwrap();
+        assert_eq!(enc, 258i32.to_be_bytes().to_vec());
+        assert_eq!(decode_param(1, 23, Some(&enc)), SqlValue::Int(258));
+        // Binary text.
+        assert_eq!(
+            encode_value(1, ColumnType::Text, &SqlValue::Text("hi".into())),
+            Some(b"hi".to_vec())
+        );
+        // Binary bool.
+        assert_eq!(
+            encode_value(1, ColumnType::Bool, &SqlValue::Bool(true)),
+            Some(vec![1])
+        );
+        // Binary float8 round-trips.
+        let f = encode_value(1, ColumnType::Float, &SqlValue::float(3.5)).unwrap();
+        assert_eq!(decode_param(1, 701, Some(&f)), SqlValue::float(3.5));
+        // NULL ⇒ None in both formats.
+        assert_eq!(encode_value(0, ColumnType::Int, &SqlValue::Null), None);
+        assert_eq!(encode_value(1, ColumnType::Int, &SqlValue::Null), None);
+    }
+
+    #[test]
+    fn result_format_fan_out_rule() {
+        // Empty ⇒ all text (0).
+        assert_eq!(result_format_for(&[], 3), 0);
+        // Single ⇒ applies to every column.
+        assert_eq!(result_format_for(&[1], 5), 1);
+        // Per-column.
+        assert_eq!(result_format_for(&[0, 1], 1), 1);
+        assert_eq!(result_format_for(&[0, 1], 0), 0);
     }
 
     #[test]
@@ -307,7 +627,7 @@ mod tests {
                 Row::new(vec![SqlValue::Null, SqlValue::Int(2)]),
             ],
         };
-        let msgs = render_result(result);
+        let msgs = render_result(result, &[]);
         // RowDescription, two DataRows, then CommandComplete.
         assert_eq!(msgs.len(), 4);
         assert!(matches!(msgs[0], BackendMessage::RowDescription { .. }));

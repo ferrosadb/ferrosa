@@ -22,17 +22,29 @@ pub struct SelectStmt {
     pub offset: Option<u64>,
 }
 
+/// The right-hand side of a comparison: either an inline literal or a bound
+/// parameter placeholder (`$N`, 1-based). Parameters are substituted with a
+/// concrete [`Value`] at execute time (the prepared/extended-query path);
+/// the simple-query path uses only literals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Term {
+    Literal(Value),
+    /// A `$N` placeholder, carrying the 1-based parameter index `N`.
+    Param(usize),
+}
+
 /// A boolean WHERE/HAVING expression: comparisons combined with AND/OR/NOT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
-    /// A single comparison `<operand> <op> <literal>`.
+    /// A single comparison `<operand> <op> <term>`, where the term is a literal
+    /// or a `$N` parameter placeholder.
     Compare {
         left: Operand,
         op: CmpOp,
-        value: Value,
+        value: Term,
     },
 }
 

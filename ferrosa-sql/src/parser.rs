@@ -3,7 +3,8 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, SelectItem, SelectStmt, TableRef,
+    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, SelectItem, SelectStmt,
+    TableRef, Term,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -143,6 +144,8 @@ enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A `$N` parameter placeholder, carrying the 1-based index `N`.
+    Param(usize),
     Star,
     Comma,
     Dot,
@@ -212,6 +215,20 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
             '!' if chars.get(i + 1) == Some(&'=') => {
                 toks.push(Tok::Ne);
                 i += 2;
+            }
+            '$' if chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()) => {
+                // A `$N` bound-parameter placeholder: `$` followed by one or
+                // more digits, yielding the 1-based parameter index N.
+                i += 1; // consume '$'
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let digits: String = chars[start..i].iter().collect();
+                let n = digits
+                    .parse::<usize>()
+                    .map_err(|_| ParseError::BadToken(format!("${digits}")))?;
+                toks.push(Tok::Param(n));
             }
             '\'' => {
                 let mut s = String::new();
@@ -573,8 +590,19 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_operand()?;
         let op = self.parse_cmp_op()?;
-        let value = self.parse_value()?;
+        let value = self.parse_term()?;
         Ok(Expr::Compare { left, op, value })
+    }
+
+    /// The right-hand side of a comparison: a `$N` parameter placeholder
+    /// ([`Term::Param`]) or a literal value ([`Term::Literal`]).
+    fn parse_term(&mut self) -> Result<Term, ParseError> {
+        if let Some(Tok::Param(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            return Ok(Term::Param(n));
+        }
+        Ok(Term::Literal(self.parse_value()?))
     }
 
     /// An operand in a comparison: an aggregate `FUNC(...)` if an identifier
@@ -722,10 +750,18 @@ mod tests {
     }
 
     /// Unwrap a single `Compare` from a filter `Expr` for assertion ergonomics.
-    fn as_compare(expr: &Expr) -> (&Operand, CmpOp, &Value) {
+    fn as_compare(expr: &Expr) -> (&Operand, CmpOp, &Term) {
         match expr {
             Expr::Compare { left, op, value } => (left, *op, value),
             other => panic!("expected Compare, got {other:?}"),
+        }
+    }
+
+    /// Unwrap the literal value of a comparison's term, panicking on a param.
+    fn compare_literal(expr: &Expr) -> &Value {
+        match as_compare(expr).2 {
+            Term::Literal(v) => v,
+            other => panic!("expected literal term, got {other:?}"),
         }
     }
 
@@ -747,13 +783,46 @@ mod tests {
                 name: "id".into()
             }
         );
-        let (_, op, value) = as_compare(&f);
+        let (_, op, _) = as_compare(&f);
         assert_eq!(op, CmpOp::Eq);
-        assert_eq!(*value, Value::Int(1));
+        assert_eq!(*compare_literal(&f), Value::Int(1));
 
         let str_stmt = parse("SELECT * FROM users WHERE name = 'alice'").unwrap();
         let f = str_stmt.filter.unwrap();
-        assert_eq!(*as_compare(&f).2, Value::Text("alice".into()));
+        assert_eq!(*compare_literal(&f), Value::Text("alice".into()));
+    }
+
+    #[test]
+    fn parses_parameter_placeholder_in_where() {
+        let stmt = parse("SELECT * FROM users u WHERE u.id = $1").unwrap();
+        let f = stmt.filter.unwrap();
+        let (operand, op, term) = as_compare(&f);
+        match operand {
+            Operand::Column(c) => assert_eq!(c.name, "id"),
+            other => panic!("expected column operand, got {other:?}"),
+        }
+        assert_eq!(op, CmpOp::Eq);
+        assert_eq!(*term, Term::Param(1));
+    }
+
+    #[test]
+    fn parses_multi_digit_and_distinct_parameter_indices() {
+        let stmt = parse("SELECT * FROM t WHERE a = $1 AND b = $12").unwrap();
+        match stmt.filter.unwrap() {
+            Expr::And(l, r) => {
+                assert_eq!(*as_compare(&l).2, Term::Param(1));
+                assert_eq!(*as_compare(&r).2, Term::Param(12));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameter_in_having_term() {
+        let stmt =
+            parse("SELECT region, COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > $1").unwrap();
+        let having = stmt.having.expect("having");
+        assert_eq!(*as_compare(&having).2, Term::Param(1));
     }
 
     #[test]
@@ -838,29 +907,29 @@ mod tests {
     fn parses_float_literal_in_where() {
         let stmt = parse("SELECT * FROM t WHERE x = 1.5").unwrap();
         let f = stmt.filter.unwrap();
-        assert_eq!(*as_compare(&f).2, Value::float(1.5));
+        assert_eq!(*compare_literal(&f), Value::float(1.5));
     }
 
     #[test]
     fn parses_float_literal_variants() {
         // Negative fractional.
         let a = parse("SELECT * FROM t WHERE x = -0.25").unwrap();
-        assert_eq!(*as_compare(&a.filter.unwrap()).2, Value::float(-0.25));
+        assert_eq!(*compare_literal(&a.filter.unwrap()), Value::float(-0.25));
         // Trailing dot with no fractional digits.
         let b = parse("SELECT * FROM t WHERE x = 10.").unwrap();
-        assert_eq!(*as_compare(&b.filter.unwrap()).2, Value::float(10.0));
+        assert_eq!(*compare_literal(&b.filter.unwrap()), Value::float(10.0));
         // A plain integer (no dot) stays an Int.
         let c = parse("SELECT * FROM t WHERE x = 10").unwrap();
-        assert_eq!(*as_compare(&c.filter.unwrap()).2, Value::Int(10));
+        assert_eq!(*compare_literal(&c.filter.unwrap()), Value::Int(10));
     }
 
     #[test]
     fn float_in_comparison_predicate() {
         let stmt = parse("SELECT * FROM t WHERE score > 3.5").unwrap();
         let f = stmt.filter.unwrap();
-        let (_, op, value) = as_compare(&f);
+        let (_, op, _) = as_compare(&f);
         assert_eq!(op, CmpOp::Gt);
-        assert_eq!(*value, Value::float(3.5));
+        assert_eq!(*compare_literal(&f), Value::float(3.5));
     }
 
     #[test]
@@ -939,7 +1008,7 @@ mod tests {
                     }
                 );
                 assert_eq!(op, CmpOp::Gt);
-                assert_eq!(value, Value::Int(1));
+                assert_eq!(value, Term::Literal(Value::Int(1)));
             }
             other => panic!("expected Compare, got {other:?}"),
         }
