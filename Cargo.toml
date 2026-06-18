@@ -10,6 +10,7 @@ members = [
     "ferrosa-index",
     "ferrosa-net",
     "ferrosa-postgres",
+    "ferrosa-row-bridge",
     "ferrosa-schema",
     "ferrosa-session",
     "ferrosa-sql",

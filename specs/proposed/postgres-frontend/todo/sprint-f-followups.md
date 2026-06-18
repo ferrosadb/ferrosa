@@ -44,16 +44,28 @@ Captured during the auth-spine implementation (commits `1b77761c`..`ef76352b`).
    algorithm. Both are RFC-checked independently; consider consolidating into one
    neutral location if a third consumer appears.
 
-8. **`ferrosa-postgres` → `ferrosa-cql` coupling (regresses D10).** The storage-backed
-   table loader (`storage_provider.rs`) reuses `ferrosa_cql::bridge::partition_to_rows_with_storage_mapping`
-   (+ `decode_value`, `parse_cql_type_in_keyspace`) so its Partition→row ordering matches
-   the canonical CQL SELECT path exactly — but that pulls the ~54k-LOC `ferrosa-cql` crate
-   back in as a dependency of `ferrosa-postgres`, which D10 deliberately removed (no cycle,
-   but the heavy coupling is back). **Fix:** extract the partition-decode/row-decomposition
-   bridge into a neutral lower crate (e.g. `ferrosa-sstable` or a new `ferrosa-row-bridge`)
-   that both `ferrosa-cql` and `ferrosa-postgres` depend on — restoring the decoupling
-   *without* duplicating the ordering logic (duplication would risk silently-wrong row
-   order, FMEA's top risk class). Higher priority than the other items here.
+8. **`ferrosa-postgres` → `ferrosa-cql` coupling (regresses D10). — RESOLVED.** The
+   storage-backed table loader (`storage_provider.rs`) had reused
+   `ferrosa_cql::bridge::partition_to_rows_with_storage_mapping` (+ `decode_value`,
+   `parse_cql_type_in_keyspace`) so its Partition→row ordering matched the canonical CQL
+   SELECT path exactly — but that pulled the ~54k-LOC `ferrosa-cql` crate back in as a
+   dependency of `ferrosa-postgres`, which D10 deliberately removed.
+
+   **Resolution:** extracted the partition-decode / row-decomposition + value codec + CQL
+   type-name parser into a new neutral crate **`ferrosa-row-bridge`** (depends only on
+   `ferrosa-common`, `ferrosa-sstable`, `ferrosa-schema`, `num-bigint`, `uuid`, `tracing` —
+   never `ferrosa-cql`). `ferrosa-cql` now **re-exports** those functions at their original
+   public paths (`ferrosa_cql::bridge::partition_to_rows_with_storage_mapping` /
+   `parse_cql_type_in_keyspace`, `ferrosa_cql::types::{encode_value, decode_value}`), mapping
+   the new crate's `RowBridgeError` back to `CqlError::Invalid` so its hundreds of internal
+   callers and its full test suite needed zero changes. `ferrosa-postgres` now depends on
+   `ferrosa-row-bridge` and the `ferrosa-cql` dependency is removed from its `Cargo.toml`.
+   The logic is shared (not duplicated), so there is no risk of silently-divergent row
+   ordering (FMEA's top risk class).
+
+   **Evidence:** `cargo tree -p ferrosa-postgres -e normal | grep -c ferrosa-cql` = 0; full
+   `ferrosa-cql` suite green (935 lib tests + integration binaries, 0 failed); the live
+   differential-vs-Postgres oracle reports 26/26 Match.
 
 9. **`ferrosa_sql::Value` is lossy for non-scalar types.** `cql_to_value` maps Float/Double/
    Decimal/Varint/Timestamp/Date/Time/Duration/Uuid/Inet/Blob/List/Set/Map/Tuple/UDT/Vector
