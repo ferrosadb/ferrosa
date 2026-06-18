@@ -74,6 +74,7 @@ services:
   # other node so cluster bring-up does not depend on a single bootstrap host.
   # ---------------------------------------------------------------------------
   node1:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile

@@ -3,6 +3,11 @@ name: Nightly Multi-DC Jepsen Tier
 # Sprint 7 W7.11. Brings up the T3 (3+3 dual-DC) topology and runs
 # the bank workload at QUORUM under `dc-partition + dc-slow` for
 # 1 hour. Failure files a GitHub issue tagged sprint-7.
+#
+# The Ferrosa server image is NOT built from source here. We consume the
+# nightly .deb produced by the 00:17 UTC nightly-release workflow to avoid
+# compiling the workspace 6 times on a single hosted runner, which was causing
+# exit-143 runner terminations (OOM/eviction) before the workload started.
 
 on:
   schedule:
@@ -48,7 +53,22 @@ jobs:
       - name: Pre-build workload binary (before bring-up, avoids rebuild under load)
         run: cargo build --release -p ferrosa-jepsen
 
+      - name: Download nightly Ferrosa .deb
+        id: nightly_deb
+        uses: ./.github/actions/ferrosa-nightly-deb
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Ferrosa nightly runtime image
+        run: |
+          set -euo pipefail
+          cp "${{ steps.nightly_deb.outputs.deb_path }}" tests/ferrosa.deb
+          docker build -f tests/Dockerfile.nightly-deb -t ferrosa-nightly:latest tests/
+          rm -f tests/ferrosa.deb
+
       - name: Bring up T3 (3+3 dual-DC) topology
+        env:
+          FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
         run: |
           set -euo pipefail
           docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \

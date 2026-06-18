@@ -89,6 +89,7 @@ services:
   # NotImplemented).
   # ---------------------------------------------------------------------------
   dc1-node1:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile

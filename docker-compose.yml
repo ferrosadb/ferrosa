@@ -66,7 +66,7 @@ services:
     restart: "no"
 
   node1:
-    image: ferrosa-smoke:latest
+    image: ${FERROSA_SMOKE_IMAGE:-ferrosa-smoke:latest}
     build:
       context: .
       dockerfile: tests/Dockerfile.smoke
