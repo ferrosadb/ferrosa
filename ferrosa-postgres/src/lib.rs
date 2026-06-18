@@ -17,6 +17,7 @@ pub mod connection;
 pub mod handshake;
 pub mod messages;
 pub mod scram;
+pub mod server;
 
 pub use connection::{ConnError, Connection};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};

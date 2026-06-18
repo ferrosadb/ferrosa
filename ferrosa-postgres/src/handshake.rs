@@ -9,7 +9,7 @@
 //! socket (harness layer H1). The connection/transport layer wires this to the
 //! codec and the real `ferrosa-schema` role store later.
 
-use crate::messages::{BackendMessage, StartupMessage, TransactionStatus};
+use crate::messages::{BackendMessage, StartupMessage};
 use crate::scram::{self, ScramServerFirst, ScramVerifier};
 
 /// The only mechanism offered/accepted in v1 (channel binding is Q4-deferred).
@@ -118,12 +118,13 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
                 let server_final = scram::verify_client_final(&ctx, client_final, &verifier)
                     .map_err(HandshakeError::Scram)?;
                 self.phase = Phase::Authenticated;
+                // The connection layer appends ParameterStatus + BackendKeyData
+                // + ReadyForQuery once authentication completes.
                 Ok(vec![
                     BackendMessage::AuthenticationSaslFinal {
                         data: server_final.into_bytes(),
                     },
                     BackendMessage::AuthenticationOk,
-                    BackendMessage::ReadyForQuery(TransactionStatus::Idle),
                 ])
             }
             _ => Err(HandshakeError::UnexpectedMessage),
@@ -236,7 +237,6 @@ mod tests {
                     data: SERVER_FINAL.as_bytes().to_vec()
                 },
                 BackendMessage::AuthenticationOk,
-                BackendMessage::ReadyForQuery(TransactionStatus::Idle),
             ]
         );
         assert!(hs.is_authenticated());
