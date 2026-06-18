@@ -76,10 +76,10 @@ services:
   # Node 1 — first seed; no FERROSA_SEED (it IS the seed)
   # ---------------------------------------------------------------------------
   node1:
-    image: ferrosa-smoke:latest
+    image: ferrosa-test-node:latest
     build:
       context: ..
-      dockerfile: tests/Dockerfile.smoke
+      dockerfile: Dockerfile
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -114,10 +114,10 @@ services:
   # Node 2
   # ---------------------------------------------------------------------------
   node2:
-    image: ferrosa-smoke:latest
+    image: ferrosa-test-node:latest
     build:
       context: ..
-      dockerfile: tests/Dockerfile.smoke
+      dockerfile: Dockerfile
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -153,10 +153,10 @@ services:
   # Node 3
   # ---------------------------------------------------------------------------
   node3:
-    image: ferrosa-smoke:latest
+    image: ferrosa-test-node:latest
     build:
       context: ..
-      dockerfile: tests/Dockerfile.smoke
+      dockerfile: Dockerfile
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -192,10 +192,10 @@ services:
   # Node 4 — quint profile only
   # ---------------------------------------------------------------------------
   node4:
-    image: ferrosa-smoke:latest
+    image: ferrosa-test-node:latest
     build:
       context: ..
-      dockerfile: tests/Dockerfile.smoke
+      dockerfile: Dockerfile
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -231,10 +231,10 @@ services:
   # Node 5 — quint profile only
   # ---------------------------------------------------------------------------
   node5:
-    image: ferrosa-smoke:latest
+    image: ferrosa-test-node:latest
     build:
       context: ..
-      dockerfile: tests/Dockerfile.smoke
+      dockerfile: Dockerfile
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
