@@ -56,23 +56,27 @@ pub(crate) fn error_response(sqlstate: &str, message: &str) -> BackendMessage {
 /// The Postgres type OID for a relational [`ColumnType`].
 ///
 /// `Int -> 23` (int4), `Text -> 25` (text), `Bool -> 16` (bool),
-/// `Float -> 701` (float8).
+/// `Float -> 701` (float8), `Uuid -> 2950` (uuid), `Bytea -> 17` (bytea).
 pub(crate) fn column_type_oid(ty: ColumnType) -> i32 {
     match ty {
         ColumnType::Int => 23,
         ColumnType::Text => 25,
         ColumnType::Bool => 16,
         ColumnType::Float => 701,
+        ColumnType::Uuid => 2950,
+        ColumnType::Bytea => 17,
     }
 }
 
-/// The on-wire fixed size for a column type (`-1` for variable-length text).
+/// The on-wire fixed size for a column type (`-1` for variable-length text /
+/// bytea). `Uuid` is a fixed 16 bytes.
 fn column_type_size(ty: ColumnType) -> i16 {
     match ty {
         ColumnType::Int => 4,
         ColumnType::Bool => 1,
         ColumnType::Float => 8,
-        ColumnType::Text => -1,
+        ColumnType::Uuid => 16,
+        ColumnType::Text | ColumnType::Bytea => -1,
     }
 }
 
@@ -104,6 +108,31 @@ fn render_value(value: &SqlValue) -> Option<Vec<u8>> {
             };
             Some(s.into_bytes())
         }
+        // `uuid::Uuid`'s Display is the canonical lowercase hyphenated form,
+        // which is exactly Postgres's uuid text output.
+        SqlValue::Uuid(u) => Some(u.to_string().into_bytes()),
+        // Postgres bytea text output (default `hex` format): `\x` followed by
+        // lowercase hex of the bytes; empty bytea ⇒ just `\x`.
+        SqlValue::Bytea(bytes) => Some(bytea_hex_text(bytes)),
+    }
+}
+
+/// Render bytes as Postgres `hex`-format bytea text: `\x` then lowercase hex.
+fn bytea_hex_text(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + bytes.len() * 2);
+    out.extend_from_slice(b"\\x");
+    for b in bytes {
+        out.push(hex_digit(b >> 4));
+        out.push(hex_digit(b & 0x0f));
+    }
+    out
+}
+
+/// Lowercase hex digit for a 0..=15 nibble.
+fn hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        _ => b'a' + (nibble - 10),
     }
 }
 
@@ -145,8 +174,44 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> SqlValue {
             .parse::<f64>()
             .map(SqlValue::float)
             .unwrap_or(SqlValue::Null),
+        // uuid: parse the canonical hyphenated form. A malformed value falls
+        // back to best-effort Text rather than panicking (documented lenient
+        // fallback, consistent with the unknown-OID arm).
+        2950 => uuid::Uuid::parse_str(s)
+            .map(SqlValue::Uuid)
+            .unwrap_or_else(|_| SqlValue::Text(s.to_string())),
+        // bytea: a `\x<hex>` string decodes to raw bytes; a malformed hex body
+        // falls back to NULL (documented lenient fallback, no panic).
+        17 => decode_bytea_hex_text(s).unwrap_or(SqlValue::Null),
         // OID 0 (unspecified) or any unknown OID: lenient — keep as text.
         _ => SqlValue::Text(s.to_string()),
+    }
+}
+
+/// Decode a Postgres `hex`-format bytea text body (`\x<hex>`) into raw bytes.
+/// Returns `None` when the prefix is missing or the hex is malformed.
+fn decode_bytea_hex_text(s: &str) -> Option<SqlValue> {
+    let hex = s.strip_prefix("\\x")?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let chars: Vec<u8> = hex.bytes().collect();
+    for pair in chars.chunks_exact(2) {
+        let hi = hex_value(pair[0])?;
+        let lo = hex_value(pair[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(SqlValue::Bytea(bytes))
+}
+
+/// Parse a single ASCII hex digit (case-insensitive) into its 0..=15 value.
+fn hex_value(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -182,6 +247,12 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> SqlValue {
         }
         // float8 (BE f64 bits).
         701 if raw.len() == 8 => SqlValue::float(f64::from_be_bytes(raw.try_into().unwrap())),
+        // uuid: 16 big-endian bytes. A wrong length falls back to NULL (no panic).
+        2950 => uuid::Uuid::from_slice(raw)
+            .map(SqlValue::Uuid)
+            .unwrap_or(SqlValue::Null),
+        // bytea: the raw bytes, copied verbatim.
+        17 => SqlValue::Bytea(raw.to_vec()),
         // Unknown OID: best-effort text, else NULL (documented fallback — no panic).
         _ => std::str::from_utf8(raw)
             .map(|s| SqlValue::Text(s.to_string()))
@@ -223,6 +294,10 @@ pub fn encode_value(format: i16, col_type: ColumnType, v: &SqlValue) -> Option<V
         SqlValue::Bool(b) => Some(vec![u8::from(*b)]),
         // Floats are advertised as float8 (OID 701); emit 8-byte BE bits.
         SqlValue::Float(of) => Some(of.0.to_be_bytes().to_vec()),
+        // uuid (OID 2950): its 16 big-endian bytes.
+        SqlValue::Uuid(u) => Some(u.as_bytes().to_vec()),
+        // bytea (OID 17): the raw bytes verbatim.
+        SqlValue::Bytea(bytes) => Some(bytes.clone()),
     }
 }
 
@@ -553,6 +628,85 @@ mod tests {
         // NULL ⇒ None in both formats.
         assert_eq!(encode_value(0, ColumnType::Int, &SqlValue::Null), None);
         assert_eq!(encode_value(1, ColumnType::Int, &SqlValue::Null), None);
+    }
+
+    #[test]
+    fn uuid_text_render_is_canonical_lowercase_hyphenated() {
+        let u = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            render_value(&SqlValue::Uuid(u)),
+            Some(b"550e8400-e29b-41d4-a716-446655440000".to_vec())
+        );
+    }
+
+    #[test]
+    fn bytea_text_render_is_postgres_hex() {
+        assert_eq!(
+            render_value(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])),
+            Some(b"\\xdeadbeef".to_vec())
+        );
+        // Empty bytea ⇒ just the `\x` prefix.
+        assert_eq!(
+            render_value(&SqlValue::Bytea(vec![])),
+            Some(b"\\x".to_vec())
+        );
+    }
+
+    #[test]
+    fn uuid_and_bytea_oid_and_size() {
+        assert_eq!(column_type_oid(ColumnType::Uuid), 2950);
+        assert_eq!(column_type_size(ColumnType::Uuid), 16);
+        assert_eq!(column_type_oid(ColumnType::Bytea), 17);
+        assert_eq!(column_type_size(ColumnType::Bytea), -1);
+    }
+
+    #[test]
+    fn uuid_binary_encode_is_16_be_bytes_and_round_trips() {
+        let u = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let enc = encode_value(1, ColumnType::Uuid, &SqlValue::Uuid(u)).unwrap();
+        assert_eq!(enc, u.as_bytes().to_vec());
+        assert_eq!(enc.len(), 16);
+        assert_eq!(decode_param(1, 2950, Some(&enc)), SqlValue::Uuid(u));
+    }
+
+    #[test]
+    fn bytea_binary_encode_is_raw_bytes_and_round_trips() {
+        let raw = vec![0x00, 0x01, 0xff, 0x10];
+        let enc = encode_value(1, ColumnType::Bytea, &SqlValue::Bytea(raw.clone())).unwrap();
+        assert_eq!(enc, raw);
+        assert_eq!(decode_param(1, 17, Some(&enc)), SqlValue::Bytea(raw));
+    }
+
+    #[test]
+    fn uuid_text_decode_parses_hyphenated() {
+        let s = "550e8400-e29b-41d4-a716-446655440000";
+        let u = uuid::Uuid::parse_str(s).unwrap();
+        assert_eq!(decode_param(0, 2950, Some(s.as_bytes())), SqlValue::Uuid(u));
+        // A malformed uuid text falls back to best-effort Text (no panic).
+        assert_eq!(
+            decode_param(0, 2950, Some(b"not-a-uuid")),
+            SqlValue::Text("not-a-uuid".into())
+        );
+    }
+
+    #[test]
+    fn bytea_text_decode_parses_hex_prefixed() {
+        assert_eq!(
+            decode_param(0, 17, Some(b"\\xdeadbeef")),
+            SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        // Empty hex.
+        assert_eq!(decode_param(0, 17, Some(b"\\x")), SqlValue::Bytea(vec![]));
+    }
+
+    #[test]
+    fn uuid_and_bytea_null_encode_and_decode() {
+        assert_eq!(encode_value(0, ColumnType::Uuid, &SqlValue::Null), None);
+        assert_eq!(encode_value(1, ColumnType::Uuid, &SqlValue::Null), None);
+        assert_eq!(encode_value(0, ColumnType::Bytea, &SqlValue::Null), None);
+        assert_eq!(encode_value(1, ColumnType::Bytea, &SqlValue::Null), None);
+        assert_eq!(decode_param(0, 2950, None), SqlValue::Null);
+        assert_eq!(decode_param(1, 17, None), SqlValue::Null);
     }
 
     #[test]
