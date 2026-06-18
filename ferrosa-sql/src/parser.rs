@@ -2,8 +2,10 @@
 
 use std::fmt;
 
-use crate::ast::{ColumnRef, Filter, Join, Projection, SelectStmt, TableRef};
-use crate::exec::CmpOp;
+use crate::ast::{
+    AggArg, ColumnRef, Filter, Join, OrderItem, Projection, SelectItem, SelectStmt, TableRef,
+};
+use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,36 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     } else {
         None
     };
+    let group_by = if matches!(p.peek(), Some(Tok::Group)) {
+        p.next();
+        p.expect(&Tok::By, "BY")?;
+        p.parse_column_list()?
+    } else {
+        Vec::new()
+    };
+    let order_by = if matches!(p.peek(), Some(Tok::Order)) {
+        p.next();
+        p.expect(&Tok::By, "BY")?;
+        p.parse_order_by()?
+    } else {
+        Vec::new()
+    };
+    // LIMIT and OFFSET in either order, both optional.
+    let mut limit = None;
+    let mut offset = None;
+    loop {
+        match p.peek() {
+            Some(Tok::Limit) if limit.is_none() => {
+                p.next();
+                limit = Some(p.parse_u64()?);
+            }
+            Some(Tok::Offset) if offset.is_none() => {
+                p.next();
+                offset = Some(p.parse_u64()?);
+            }
+            _ => break,
+        }
+    }
     if let Some(t) = p.peek() {
         return Err(ParseError::Unexpected {
             expected: "end of statement",
@@ -65,6 +97,10 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
         from,
         join,
         filter,
+        group_by,
+        order_by,
+        limit,
+        offset,
     })
 }
 
@@ -77,12 +113,21 @@ enum Tok {
     On,
     Where,
     As,
+    Group,
+    By,
+    Order,
+    Asc,
+    Desc,
+    Limit,
+    Offset,
     Ident(String),
     Int(i64),
     Str(String),
     Star,
     Comma,
     Dot,
+    LParen,
+    RParen,
     Eq,
     Ne,
     Lt,
@@ -109,6 +154,14 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
             }
             '.' => {
                 toks.push(Tok::Dot);
+                i += 1;
+            }
+            '(' => {
+                toks.push(Tok::LParen);
+                i += 1;
+            }
+            ')' => {
+                toks.push(Tok::RParen);
                 i += 1;
             }
             '=' => {
@@ -192,6 +245,13 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
                     "ON" => Tok::On,
                     "WHERE" => Tok::Where,
                     "AS" => Tok::As,
+                    "GROUP" => Tok::Group,
+                    "BY" => Tok::By,
+                    "ORDER" => Tok::Order,
+                    "ASC" => Tok::Asc,
+                    "DESC" => Tok::Desc,
+                    "LIMIT" => Tok::Limit,
+                    "OFFSET" => Tok::Offset,
                     _ => Tok::Ident(word),
                 });
             }
@@ -199,6 +259,27 @@ fn lex(sql: &str) -> Result<Vec<Tok>, ParseError> {
         }
     }
     Ok(toks)
+}
+
+/// Whether an identifier names an aggregate function (used to decide whether a
+/// `FUNC(` is an aggregate call). `AVG` is included so it can be rejected with a
+/// clear error rather than mis-parsed as a column.
+fn is_aggregate_name(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+    )
+}
+
+/// Map a (non-AVG) aggregate identifier to its [`AggFunc`].
+fn aggregate_func(word: &str) -> Option<AggFunc> {
+    match word.to_ascii_uppercase().as_str() {
+        "COUNT" => Some(AggFunc::Count),
+        "SUM" => Some(AggFunc::Sum),
+        "MIN" => Some(AggFunc::Min),
+        "MAX" => Some(AggFunc::Max),
+        _ => None,
+    }
 }
 
 struct Parser {
@@ -242,16 +323,101 @@ impl Parser {
     }
 
     fn parse_projection(&mut self) -> Result<Projection, ParseError> {
-        if matches!(self.peek(), Some(Tok::Star)) {
+        // A single bare `*` is `SELECT *`.
+        if matches!(self.peek(), Some(Tok::Star))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::From))
+        {
             self.next();
             return Ok(Projection::Star);
         }
+        let mut items = vec![self.parse_select_item()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            items.push(self.parse_select_item()?);
+        }
+        Ok(Projection::Items(items))
+    }
+
+    /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
+    /// whose uppercase name is a known aggregate is immediately followed by
+    /// `(`, otherwise a plain column reference.
+    fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
+        if let Some(Tok::Ident(word)) = self.peek() {
+            if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
+                let raw = word.clone();
+                self.next(); // function name
+                self.next(); // (
+                let func = aggregate_func(&raw).ok_or(ParseError::Unexpected {
+                    expected: "supported aggregate (AVG not supported)",
+                    found: raw,
+                })?;
+                let arg = if matches!(self.peek(), Some(Tok::Star)) {
+                    self.next();
+                    AggArg::Star
+                } else {
+                    AggArg::Column(self.parse_column_ref()?)
+                };
+                self.expect(&Tok::RParen, ")")?;
+                return Ok(SelectItem::Aggregate { func, arg });
+            }
+        }
+        Ok(SelectItem::Column(self.parse_column_ref()?))
+    }
+
+    fn parse_column_list(&mut self) -> Result<Vec<ColumnRef>, ParseError> {
         let mut cols = vec![self.parse_column_ref()?];
         while matches!(self.peek(), Some(Tok::Comma)) {
             self.next();
             cols.push(self.parse_column_ref()?);
         }
-        Ok(Projection::Columns(cols))
+        Ok(cols)
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderItem>, ParseError> {
+        let mut items = vec![self.parse_order_item()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            items.push(self.parse_order_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_order_item(&mut self) -> Result<OrderItem, ParseError> {
+        // An integer is an output-ordinal (aggregate mode); carry it as the
+        // column name so the planner can interpret it.
+        let column = if let Some(Tok::Int(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            ColumnRef {
+                qualifier: None,
+                name: n.to_string(),
+            }
+        } else {
+            self.parse_column_ref()?
+        };
+        let dir = match self.peek() {
+            Some(Tok::Asc) => {
+                self.next();
+                SortDir::Asc
+            }
+            Some(Tok::Desc) => {
+                self.next();
+                SortDir::Desc
+            }
+            _ => SortDir::Asc,
+        };
+        Ok(OrderItem { column, dir })
+    }
+
+    fn parse_u64(&mut self) -> Result<u64, ParseError> {
+        match self.next() {
+            Some(Tok::Int(n)) if n >= 0 => Ok(n as u64),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: "non-negative integer",
+                found: format!("{t:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEnd),
+        }
     }
 
     fn parse_column_ref(&mut self) -> Result<ColumnRef, ParseError> {
@@ -371,12 +537,17 @@ mod tests {
         assert_eq!(stmt.from.table, "users");
         assert_eq!(stmt.from.alias.as_deref(), Some("u"));
         match stmt.projection {
-            Projection::Columns(cols) => {
-                assert_eq!(cols.len(), 1);
-                assert_eq!(cols[0].name, "id");
-                assert!(cols[0].qualifier.is_none());
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    SelectItem::Column(c) => {
+                        assert_eq!(c.name, "id");
+                        assert!(c.qualifier.is_none());
+                    }
+                    other => panic!("expected column, got {other:?}"),
+                }
             }
-            other => panic!("expected columns, got {other:?}"),
+            other => panic!("expected items, got {other:?}"),
         }
     }
 
@@ -384,23 +555,23 @@ mod tests {
     fn parses_qualified_projection_columns() {
         let stmt = parse("SELECT u.name, o.oid FROM users u").unwrap();
         match stmt.projection {
-            Projection::Columns(cols) => {
+            Projection::Items(items) => {
                 assert_eq!(
-                    cols[0],
-                    ColumnRef {
+                    items[0],
+                    SelectItem::Column(ColumnRef {
                         qualifier: Some("u".into()),
                         name: "name".into()
-                    }
+                    })
                 );
                 assert_eq!(
-                    cols[1],
-                    ColumnRef {
+                    items[1],
+                    SelectItem::Column(ColumnRef {
                         qualifier: Some("o".into()),
                         name: "oid".into()
-                    }
+                    })
                 );
             }
-            other => panic!("expected columns, got {other:?}"),
+            other => panic!("expected items, got {other:?}"),
         }
     }
 
@@ -449,9 +620,120 @@ mod tests {
         let stmt =
             parse("SELECT u.name, o.oid FROM users u JOIN orders o ON u.id = o.uid WHERE u.id = 1")
                 .unwrap();
-        assert!(matches!(stmt.projection, Projection::Columns(_)));
+        assert!(matches!(stmt.projection, Projection::Items(_)));
         assert!(stmt.join.is_some());
         assert!(stmt.filter.is_some());
+    }
+
+    #[test]
+    fn parses_aggregates_in_select_list() {
+        let stmt = parse("SELECT region, COUNT(*), SUM(amount) FROM sales").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(
+                    items[0],
+                    SelectItem::Column(ColumnRef {
+                        qualifier: None,
+                        name: "region".into()
+                    })
+                );
+                assert_eq!(
+                    items[1],
+                    SelectItem::Aggregate {
+                        func: AggFunc::Count,
+                        arg: AggArg::Star
+                    }
+                );
+                assert_eq!(
+                    items[2],
+                    SelectItem::Aggregate {
+                        func: AggFunc::Sum,
+                        arg: AggArg::Column(ColumnRef {
+                            qualifier: None,
+                            name: "amount".into()
+                        })
+                    }
+                );
+            }
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_named_like_aggregate_not_followed_by_paren_stays_column() {
+        let stmt = parse("SELECT count FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => assert_eq!(
+                items[0],
+                SelectItem::Column(ColumnRef {
+                    qualifier: None,
+                    name: "count".into()
+                })
+            ),
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avg_is_rejected() {
+        assert!(parse("SELECT AVG(x) FROM t").is_err());
+    }
+
+    #[test]
+    fn parses_group_by() {
+        let stmt = parse("SELECT region, COUNT(*) FROM sales GROUP BY region").unwrap();
+        assert_eq!(stmt.group_by.len(), 1);
+        assert_eq!(stmt.group_by[0].name, "region");
+    }
+
+    #[test]
+    fn parses_order_by_default_and_explicit_dirs() {
+        let stmt = parse("SELECT id FROM t ORDER BY id").unwrap();
+        assert_eq!(stmt.order_by.len(), 1);
+        assert_eq!(stmt.order_by[0].dir, SortDir::Asc);
+
+        let stmt = parse("SELECT id FROM t ORDER BY a ASC, b DESC").unwrap();
+        assert_eq!(stmt.order_by.len(), 2);
+        assert_eq!(stmt.order_by[0].dir, SortDir::Asc);
+        assert_eq!(stmt.order_by[1].dir, SortDir::Desc);
+    }
+
+    #[test]
+    fn parses_order_by_ordinal() {
+        let stmt = parse("SELECT region, COUNT(*) FROM t GROUP BY region ORDER BY 2 DESC").unwrap();
+        assert_eq!(stmt.order_by[0].column.name, "2");
+        assert_eq!(stmt.order_by[0].dir, SortDir::Desc);
+    }
+
+    #[test]
+    fn parses_limit_and_offset_either_order() {
+        let a = parse("SELECT id FROM t LIMIT 5 OFFSET 2").unwrap();
+        assert_eq!(a.limit, Some(5));
+        assert_eq!(a.offset, Some(2));
+
+        let b = parse("SELECT id FROM t OFFSET 3 LIMIT 1").unwrap();
+        assert_eq!(b.limit, Some(1));
+        assert_eq!(b.offset, Some(3));
+
+        let c = parse("SELECT id FROM t LIMIT 4").unwrap();
+        assert_eq!(c.limit, Some(4));
+        assert_eq!(c.offset, None);
+    }
+
+    #[test]
+    fn parses_combined_full_query() {
+        let stmt = parse(
+            "SELECT region, COUNT(*) FROM sales WHERE amount > 0 \
+             GROUP BY region ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+        )
+        .unwrap();
+        assert!(matches!(stmt.projection, Projection::Items(_)));
+        assert!(stmt.filter.is_some());
+        assert_eq!(stmt.group_by.len(), 1);
+        assert_eq!(stmt.order_by.len(), 1);
+        assert_eq!(stmt.limit, Some(10));
+        assert_eq!(stmt.offset, Some(1));
     }
 
     #[test]
