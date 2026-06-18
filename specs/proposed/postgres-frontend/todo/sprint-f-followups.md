@@ -43,3 +43,20 @@ Captured during the auth-spine implementation (commits `1b77761c`..`ef76352b`).
    `ferrosa_postgres::scram::ScramVerifier::from_password` implement the same standard
    algorithm. Both are RFC-checked independently; consider consolidating into one
    neutral location if a third consumer appears.
+
+8. **`ferrosa-postgres` → `ferrosa-cql` coupling (regresses D10).** The storage-backed
+   table loader (`storage_provider.rs`) reuses `ferrosa_cql::bridge::partition_to_rows_with_storage_mapping`
+   (+ `decode_value`, `parse_cql_type_in_keyspace`) so its Partition→row ordering matches
+   the canonical CQL SELECT path exactly — but that pulls the ~54k-LOC `ferrosa-cql` crate
+   back in as a dependency of `ferrosa-postgres`, which D10 deliberately removed (no cycle,
+   but the heavy coupling is back). **Fix:** extract the partition-decode/row-decomposition
+   bridge into a neutral lower crate (e.g. `ferrosa-sstable` or a new `ferrosa-row-bridge`)
+   that both `ferrosa-cql` and `ferrosa-postgres` depend on — restoring the decoupling
+   *without* duplicating the ordering logic (duplication would risk silently-wrong row
+   order, FMEA's top risk class). Higher priority than the other items here.
+
+9. **`ferrosa_sql::Value` is lossy for non-scalar types.** `cql_to_value` maps Float/Double/
+   Decimal/Varint/Timestamp/Date/Time/Duration/Uuid/Inet/Blob/List/Set/Map/Tuple/UDT/Vector
+   to `Value::Null` (documented, never panics). Widen the engine `Value`/`ColumnType` to
+   carry these before they reach the differential-vs-Postgres oracle (tracked on the board
+   as `t_f16cbbff`).

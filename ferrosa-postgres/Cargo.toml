@@ -9,6 +9,17 @@ repository.workspace = true
 [dependencies]
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sql = { path = "../ferrosa-sql" }
+ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-common = { path = "../ferrosa-common" }
+# Used by storage_provider to (a) name the `Partition` type that
+# `StorageEngine::range_iter` streams, and (b) reuse the canonical CQL
+# SELECT partition->row decomposition (`bridge::partition_to_rows_with_storage_mapping`,
+# `bridge::decode_value`, `bridge::parse_cql_type_in_keyspace`) so the column
+# ordering matches the CQL read path exactly rather than being reinvented.
+# ferrosa-cql does NOT depend on ferrosa-postgres, so this introduces no cycle.
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+futures = "0.3"
 base64 = "0.22"
 bytes = "1"
 hmac = "0.12"
@@ -23,3 +34,4 @@ proptest = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7"
+tempfile = "3"
