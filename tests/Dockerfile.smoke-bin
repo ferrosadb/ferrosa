@@ -1,0 +1,27 @@
+# Smoke-test runtime image for Ferrosa pair-mode/cluster CI (binary fallback).
+#
+# Used when a prebuilt .deb is not available (e.g. right after merging the fix
+# before the first 00:17 UTC nightly release has run). The caller builds the
+# x86_64-unknown-linux-musl static binary and copies it next to this file as
+# `ferrosa` before building.
+#
+# Local usage:
+#   cargo build --release --target x86_64-unknown-linux-musl -p ferrosa
+#   cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
+#   docker build -f tests/Dockerfile.smoke-bin -t ferrosa-smoke:latest tests/
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gdb \
+        procps \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ferrosa /usr/local/bin/ferrosa
+RUN chmod +x /usr/local/bin/ferrosa && ferrosa --version
+
+EXPOSE 9042 7000 9090
+ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+CMD ["ferrosa"]
