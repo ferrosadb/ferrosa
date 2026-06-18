@@ -151,6 +151,9 @@ pub fn read_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Code
         }
         b'S' => Ok(Some(FrontendMessage::Sync)),
         b'X' => Ok(Some(FrontendMessage::Terminate)),
+        b'p' => Ok(Some(FrontendMessage::SaslResponse {
+            data: frame.to_vec(),
+        })),
         other => Ok(Some(FrontendMessage::Unknown {
             tag: other,
             body: frame.to_vec(),
@@ -214,6 +217,54 @@ mod tests {
         let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
         assert_eq!(len, 22);
         assert_eq!(&out[5..], b"server_version\x0016\x00");
+    }
+
+    #[test]
+    fn authentication_sasl_encodes_subtype_10_and_mechanism_list() {
+        let mut out = BytesMut::new();
+        BackendMessage::AuthenticationSasl {
+            mechanisms: vec!["SCRAM-SHA-256".into()],
+        }
+        .encode(&mut out);
+        assert_eq!(out[0], b'R');
+        assert_eq!(i32::from_be_bytes(out[5..9].try_into().unwrap()), 10);
+        // mechanism cstring followed by the list terminator
+        assert_eq!(&out[9..], b"SCRAM-SHA-256\x00\x00");
+    }
+
+    #[test]
+    fn authentication_sasl_continue_and_final_carry_subtypes_11_and_12() {
+        let mut cont = BytesMut::new();
+        BackendMessage::AuthenticationSaslContinue {
+            data: b"r=abc".to_vec(),
+        }
+        .encode(&mut cont);
+        assert_eq!(cont[0], b'R');
+        assert_eq!(i32::from_be_bytes(cont[5..9].try_into().unwrap()), 11);
+        assert_eq!(&cont[9..], b"r=abc");
+
+        let mut fin = BytesMut::new();
+        BackendMessage::AuthenticationSaslFinal {
+            data: b"v=xyz".to_vec(),
+        }
+        .encode(&mut fin);
+        assert_eq!(i32::from_be_bytes(fin[5..9].try_into().unwrap()), 12);
+        assert_eq!(&fin[9..], b"v=xyz");
+    }
+
+    #[test]
+    fn sasl_response_frontend_message_carries_raw_body() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'p');
+        let payload = b"c=biws,r=abc,p=proof";
+        buf.put_i32((payload.len() + 4) as i32);
+        buf.extend_from_slice(payload);
+        assert_eq!(
+            read_frontend(&mut buf).unwrap(),
+            Some(FrontendMessage::SaslResponse {
+                data: payload.to_vec()
+            })
+        );
     }
 
     #[test]

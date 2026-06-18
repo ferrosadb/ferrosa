@@ -55,6 +55,12 @@ impl TransactionStatus {
 pub enum BackendMessage {
     /// `R` with payload `0` — authentication succeeded.
     AuthenticationOk,
+    /// `R` with payload `10` — offer SASL mechanisms (e.g. `SCRAM-SHA-256`).
+    AuthenticationSasl { mechanisms: Vec<String> },
+    /// `R` with payload `11` — SASL challenge (carries `server-first`).
+    AuthenticationSaslContinue { data: Vec<u8> },
+    /// `R` with payload `12` — SASL completion (carries `server-final`).
+    AuthenticationSaslFinal { data: Vec<u8> },
     /// `Z` — ready for the next query, carrying the transaction status.
     ReadyForQuery(TransactionStatus),
     /// `K` — cancellation key material for this backend.
@@ -69,7 +75,10 @@ impl BackendMessage {
     /// The message type tag byte.
     pub fn tag(&self) -> u8 {
         match self {
-            BackendMessage::AuthenticationOk => b'R',
+            BackendMessage::AuthenticationOk
+            | BackendMessage::AuthenticationSasl { .. }
+            | BackendMessage::AuthenticationSaslContinue { .. }
+            | BackendMessage::AuthenticationSaslFinal { .. } => b'R',
             BackendMessage::ReadyForQuery(_) => b'Z',
             BackendMessage::BackendKeyData { .. } => b'K',
             BackendMessage::ParameterStatus { .. } => b'S',
@@ -81,6 +90,21 @@ impl BackendMessage {
     fn encode_body(&self, body: &mut BytesMut) {
         match self {
             BackendMessage::AuthenticationOk => body.put_i32(0),
+            BackendMessage::AuthenticationSasl { mechanisms } => {
+                body.put_i32(10);
+                for m in mechanisms {
+                    put_cstring(body, m);
+                }
+                body.put_u8(0); // mechanism-list terminator
+            }
+            BackendMessage::AuthenticationSaslContinue { data } => {
+                body.put_i32(11);
+                body.extend_from_slice(data);
+            }
+            BackendMessage::AuthenticationSaslFinal { data } => {
+                body.put_i32(12);
+                body.extend_from_slice(data);
+            }
             BackendMessage::ReadyForQuery(status) => body.put_u8(status.to_byte()),
             BackendMessage::BackendKeyData {
                 process_id,
@@ -126,6 +150,9 @@ pub enum FrontendMessage {
     Sync,
     /// `X` — terminate the connection.
     Terminate,
+    /// `p` — a SASL message (SASLInitialResponse or SASLResponse). The body is
+    /// returned verbatim; the handshake state machine interprets it by phase.
+    SaslResponse { data: Vec<u8> },
     /// Any other tagged message, preserved verbatim for later handling.
     Unknown { tag: u8, body: Vec<u8> },
 }
