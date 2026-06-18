@@ -13,7 +13,6 @@ use std::fs;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -21,22 +20,22 @@ use sha2::{Digest, Sha256};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
-use ferrosa_cluster::{DdlPath, WritePath};
+use ferrosa_cluster::DdlPath;
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
-    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
-    Resource, RoleMetadata, RoleUpdates, RowPredicate, Schema, TableMetadata, TableParams,
-    TableUpdates, UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata,
-    VirtualColumnUpdate, VirtualTableUpdate,
+    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, Permission, ReplicationParams, Resource,
+    RoleMetadata, RoleUpdates, RowPredicate, Schema, TableMetadata, TableParams, TableUpdates,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnUpdate,
+    VirtualTableUpdate,
 };
+use ferrosa_session::SessionCore;
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
 use ferrosa_storage::FILTER_PREDICATE_OPTION_KEY;
-use ferrosa_udf::UdfExecutor;
 
 use crate::ast::*;
 use crate::bridge;
@@ -858,12 +857,9 @@ enum ResolvedFunctionKind {
 
 /// Shared state available to all request handlers.
 pub struct SharedState {
-    pub engine: Arc<StorageEngine>,
-    pub schema: Arc<Schema>,
-    pub node_config: Arc<NodeConfig>,
-    pub cluster_state: Arc<ArcSwap<ferrosa_cluster::ClusterStateHolder>>,
-    pub write_path: Arc<ArcSwap<WritePath>>,
-    pub ddl_path: Arc<ArcSwap<DdlPath>>,
+    /// Protocol-agnostic engine state (storage, schema, routing, cluster mode,
+    /// Accord clock, peer manager), shared with other front-ends via `Deref`.
+    pub core: Arc<SessionCore>,
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
@@ -871,32 +867,44 @@ pub struct SharedState {
     pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
     /// Records secondary-index usage for `system_observability.index_usage`.
     pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
-    /// WASM UDF executor for compiling and invoking user-defined functions.
-    pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
-    /// Mode controller for checking CQL readiness (pair mode gating).
-    pub mode_controller: Arc<ferrosa_cluster::ModeController>,
     /// CQL request metrics (per-opcode counters and error counter).
     pub cql_metrics: Arc<CqlMetrics>,
     /// Decides whether a given connection should see public or internal
     /// topology addresses in `system.local` / `system.peers_v2`.
     pub topology_policy: ClientTopologyPolicy,
-    /// When `true`, permission failures are logged as warnings and allowed
-    /// through instead of returning 0x2100 Unauthorized.  Set from
-    /// `FERROSA_AUTH_WARN=true` to enable the soak observation period.
-    pub auth_warn: bool,
-    /// Peer connection manager for Accord coordinator fanout.
-    ///
-    /// `None` in standalone mode or when the cluster layer has not yet
-    /// provided a `PeerManager` (e.g. in unit tests).  When `None`, LWT
-    /// statements in cluster mode return a fail-loud `ServerError` instead
-    /// of routing through Accord.
-    pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
-    /// Hybrid logical clock used to generate monotone transaction timestamps.
-    ///
-    /// `None` when `peer_manager` is `None`.
-    pub accord_clock: Option<Arc<ferrosa_common::accord::HybridLogicalClock>>,
+}
+
+impl std::ops::Deref for SharedState {
+    type Target = SessionCore;
+    fn deref(&self) -> &SessionCore {
+        &self.core
+    }
+}
+
+#[cfg(test)]
+impl SharedState {
+    /// Rebuild `core` with a replacement `node_config`, preserving all other
+    /// neutral fields. Test-only helper: `core` is an `Arc<SessionCore>`, so a
+    /// neutral field can no longer be reassigned in place via `Deref` (which is
+    /// `&`-only); tests that reconfigure addressing rebuild the core instead.
+    fn set_node_config_for_test(&mut self, node_config: Arc<ferrosa_schema::NodeConfig>) {
+        let old = &*self.core;
+        self.core = Arc::new(SessionCore {
+            engine: old.engine.clone(),
+            schema: old.schema.clone(),
+            node_config,
+            cluster_state: old.cluster_state.clone(),
+            write_path: old.write_path.clone(),
+            ddl_path: old.ddl_path.clone(),
+            udf_executor: old.udf_executor.clone(),
+            mode_controller: old.mode_controller.clone(),
+            auth_warn: old.auth_warn,
+            peer_manager: old.peer_manager.clone(),
+            accord_clock: old.accord_clock.clone(),
+        });
+    }
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -11143,6 +11151,9 @@ mod tests {
     use super::*;
     use crate::virtual_tables::active_queries::ActiveQueriesTable;
     use crate::virtual_tables::connections::ConnectionsTable;
+    use arc_swap::ArcSwap;
+    use ferrosa_cluster::WritePath;
+    use ferrosa_schema::NodeConfig;
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
@@ -11222,27 +11233,29 @@ mod tests {
         let mode_controller =
             ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
         let state = SharedState {
-            engine: engine.clone(),
-            schema: schema.clone(),
-            node_config,
-            cluster_state: Arc::new(ArcSwap::from_pointee(
-                ferrosa_cluster::ClusterStateHolder::Standalone,
-            )),
-            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
-            ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+            core: Arc::new(ferrosa_session::SessionCore {
+                engine: engine.clone(),
+                schema: schema.clone(),
+                node_config,
+                cluster_state: Arc::new(ArcSwap::from_pointee(
+                    ferrosa_cluster::ClusterStateHolder::Standalone,
+                )),
+                write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+                ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                udf_executor,
+                mode_controller,
+                auth_warn: false,
+                peer_manager: None,
+                accord_clock: None,
+            }),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
-            udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
-            mode_controller,
             cql_metrics: Arc::new(CqlMetrics::new()),
             topology_policy: ClientTopologyPolicy::default(),
-            auth_warn: false,
-            peer_manager: None,
-            accord_clock: None,
         };
         (state, dir)
     }
@@ -11952,7 +11965,7 @@ mod tests {
         node_config.rpc_port = 19042;
         node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
         node_config.internal_rpc_port = 9042;
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
         state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
 
         let ctx = RequestContext {
@@ -11989,7 +12002,7 @@ mod tests {
         node_config.internal_rpc_port = 9042;
         node_config.listen_address = "10.89.1.48".parse().unwrap();
         node_config.broadcast_address = "10.89.1.48".parse().unwrap();
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
         state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
 
         let ctx = RequestContext {
@@ -12022,7 +12035,7 @@ mod tests {
         let mut node_config = (*state.node_config).clone();
         node_config.rpc_address = "127.0.0.1".parse().unwrap();
         node_config.rpc_port = 19042;
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
 
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -12252,7 +12265,7 @@ mod tests {
         node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
         node_config.listen_address = "10.89.1.48".parse().unwrap();
         node_config.broadcast_address = "10.89.1.48".parse().unwrap();
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
 
         let local_id = 1_u64;
         let peer_id = 2_u64;

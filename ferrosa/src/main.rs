@@ -1215,42 +1215,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_cql::wasm_aggregate::UdfTimeSeriesAggregateExecutor::new(Arc::clone(&udf_executor)),
     ));
     let shared_state = Arc::new(ferrosa_cql::router::SharedState {
-        engine: storage.clone(),
-        schema: schema.clone(),
-        node_config,
-        cluster_state: handles.cluster_state,
-        write_path: handles.write_path,
-        ddl_path: handles.ddl_path,
+        core: Arc::new(ferrosa_session::SessionCore {
+            engine: storage.clone(),
+            schema: schema.clone(),
+            node_config,
+            cluster_state: handles.cluster_state,
+            write_path: handles.write_path,
+            ddl_path: handles.ddl_path,
+            udf_executor,
+            mode_controller: Arc::clone(&mode_controller),
+            auth_warn: storage_auth_warn,
+            // p0-03c: wire the real PeerManager and a process-wide HLC into
+            // SessionCore so LWT statements in cluster mode route through
+            // AccordCoordinatorDriver over TCP instead of returning ServerError.
+            // The PeerManager was constructed above (step 6) and is already used
+            // for heartbeats and DDL forwarding — reuse the same Arc so there is
+            // exactly one peer map per process.
+            peer_manager: Some(peer_manager.clone()),
+            // Derive a stable u64 node identifier from the first 8 bytes of
+            // host_id (big-endian). The HLC is created once per process; all
+            // Accord transactions on this node share it to guarantee monotone
+            // timestamp ordering across concurrent LWT coordinators.
+            accord_clock: {
+                let host_bytes = host_id.as_bytes();
+                let node_id =
+                    u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
+                Some(Arc::new(ferrosa_common::accord::HybridLogicalClock::new(
+                    node_id, 0, // use default 500 ms max drift
+                )))
+            },
+        }),
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
         query_tracker,
         full_scan_tracker: full_scan_tracker.clone(),
         index_usage_tracker: index_usage_tracker.clone(),
-        udf_executor,
         event_sender: tokio::sync::broadcast::channel(64).0,
-        mode_controller: Arc::clone(&mode_controller),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
-        auth_warn: storage_auth_warn,
-        // p0-03c: wire the real PeerManager and a process-wide HLC into
-        // SharedState so LWT statements in cluster mode route through
-        // AccordCoordinatorDriver over TCP instead of returning ServerError.
-        // The PeerManager was constructed above (step 6) and is already used
-        // for heartbeats and DDL forwarding — reuse the same Arc so there is
-        // exactly one peer map per process.
-        peer_manager: Some(peer_manager.clone()),
-        // Derive a stable u64 node identifier from the first 8 bytes of
-        // host_id (big-endian). The HLC is created once per process; all
-        // Accord transactions on this node share it to guarantee monotone
-        // timestamp ordering across concurrent LWT coordinators.
-        accord_clock: {
-            let host_bytes = host_id.as_bytes();
-            let node_id =
-                u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
-            Some(Arc::new(ferrosa_common::accord::HybridLogicalClock::new(
-                node_id, 0, // use default 500 ms max drift
-            )))
-        },
     });
     let auth_disabled = cql_config.auth_disabled;
 
