@@ -213,7 +213,7 @@ sequenceDiagram
     participant Leaving as Departing Follower
     participant F2 as Remaining Follower
 
-    Op->>Leader: ferrosa-ctl decommission <follower_id>
+    Op->>Leader: ferrosa-ctl decommission &lt;follower_id&gt;
     Leader->>Leader: Propose LeaveNode via Raft
     Leader->>F2: Raft commit: node state -> Leaving
     Leader->>Leader: Propose ReassignTokens via Raft
@@ -254,7 +254,7 @@ sequenceDiagram
     participant F1 as Follower 1
     participant F2 as Follower 2
 
-    Op->>L: ferrosa-ctl decommission <leader_id>
+    Op->>L: ferrosa-ctl decommission &lt;leader_id&gt;
     Note over L: I'm the leader — transfer first
 
     L->>F1: Raft: transfer_leader
@@ -713,7 +713,7 @@ sequenceDiagram
         N1->>N1: Propose JoinNode via Raft
     else auto_join=false (prod)
         Note over N1: Reject: not approved
-        Note over N4: Operator: ferrosa-ctl add-node <host_id>
+        Note over N4: Operator: ferrosa-ctl add-node &lt;host_id&gt;
         N1->>N1: Propose JoinNode via Raft
     end
 
