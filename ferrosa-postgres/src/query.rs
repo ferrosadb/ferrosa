@@ -728,7 +728,7 @@ pub async fn execute_query(
 /// `SELECT current_database()`) into a one-row [`QueryResult`]. Literals are
 /// returned as-is; a small set of info/session functions are evaluated from the
 /// connection's context.
-fn execute_scalar_select(
+pub(crate) fn execute_scalar_select(
     items: &[ScalarItem],
     default_schema: &str,
 ) -> Result<QueryResult, BackendMessage> {

@@ -197,6 +197,46 @@ async fn real_driver_scram_then_select1_succeeds_and_txn_fails_loud() {
 }
 
 #[tokio::test]
+async fn real_driver_extended_protocol_expression_select() {
+    let (ctx, _dir) = minimal_ctx();
+    let port = spawn_server(dev_store(), ctx).await;
+    let (client, connection) = Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user("ferrosa_user")
+        .password("devpass")
+        .dbname("ferrosa")
+        .ssl_mode(SslMode::Disable)
+        .connect(NoTls)
+        .await
+        .expect("SCRAM handshake should succeed");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // `client.query` drives the EXTENDED protocol (Parse/Bind/Describe/Execute/
+    // Sync) — exercising the SelectExprs path through the prepared-statement
+    // machinery, not just simple-query.
+    let rows = client
+        .query("SELECT version()", &[])
+        .await
+        .expect("extended-protocol version() should succeed");
+    assert_eq!(rows.len(), 1);
+    let v: &str = rows[0].get(0);
+    assert!(v.contains("ferrosa"), "version() = {v}");
+
+    let rows = client
+        .query("SELECT 1", &[])
+        .await
+        .expect("extended-protocol SELECT 1 should succeed");
+    let n: i32 = rows[0].get(0);
+    assert_eq!(n, 1);
+
+    drop(client);
+    let _ = conn_task.await;
+}
+
+#[tokio::test]
 async fn wrong_password_is_rejected_by_real_driver() {
     let (ctx, _dir) = minimal_ctx();
     let port = spawn_server(dev_store(), ctx).await;
