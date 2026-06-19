@@ -1,19 +1,29 @@
 # Data Flow
 
-> Last updated: 2026-04-05
+> Last updated: 2026-06-19
 > Status: Approved
 
 ## Overview
 
 Ferrosa uses a write-behind async S3 storage model. Writes go to local ephemeral storage first, then are asynchronously uploaded to S3. Reads check memtable, local cache, then fall back to S3 on cache miss. Transactional writes (LWT, BEGIN TRANSACTION) route through the Accord consensus protocol for serializable isolation before reaching the storage engine.
 
-Five protocol endpoints share the same storage engine:
+Protocol endpoints share the same storage engine:
 
 - **CQL** (port 9042) — CQL native protocol v4/v5 with CRC integrity (v5)
+- **PostgreSQL wire** (port 5432) — PostgreSQL v3 protocol + SCRAM-SHA-256; `SELECT`, single-row DML, transactions (developer preview)
+- **Arrow Flight** (gRPC) — CQL `SELECT` executed and streamed back as Arrow record batches; bearer-token auth
 - **Bolt** (port 7687) — Neo4j driver compatibility for Cypher
 - **Graph HTTP** (port 7474) — Cypher queries via HTTP/JSON
 - **SPARQL** (port 8080) — SPARQL 1.1 Query/Update with RDF* and content negotiation
 - **Web console** (port 9090) — Observability dashboard and metrics
+
+### PostgreSQL front-end data flow
+
+A Postgres client statement is parsed by `ferrosa-sql` (`parse_statement` → `Statement`). A `SELECT` lowers onto the `ferrosa-sql` physical operators reading the same storage engine via the storage provider (decode through `ferrosa-row-bridge`). A single-row `INSERT`/`UPDATE`/`DELETE` materializes a row from the table schema, encodes it with the shared `ferrosa-row-bridge` codec (`build_decorated_key`/`build_row`/`build_delete_row`), and writes via `StorageEngine::write_atomic_batch` — the same bytes the CQL read path decodes. Transaction control moves the connection through the `I`/`T`/`E` `ReadyForQuery` states; multi-statement atomicity via Accord is in progress.
+
+### Arrow Flight read-path data flow
+
+A Flight client `Handshake`s (CQL credentials → signed bearer token), then places a CQL `SELECT` string in the `DoGet` ticket / `GetFlightInfo` descriptor. `ferrosa-cql` executes it (`route_select_raw`) producing typed `column_types` + rows; `ferrosa-flight`'s `convert::rows_to_record_batch` builds an Arrow `RecordBatch` (fail-loud on unsupported types) which is streamed back via the Flight encoder. v1 materializes a single batch; paged/streaming `DoGet` and the CDC `DoExchange` channel (over `ferrosa-cdc`) are tracked follow-ups.
 
 ## Write Path
 
