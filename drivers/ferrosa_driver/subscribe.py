@@ -89,7 +89,7 @@ def subscribe(
 ) -> SubscribeStream:
     """Open a live SUBSCRIBE against ``contact_point:port`` and stream changes.
 
-    >>> with subscribe("127.0.0.1", "SUBSCRIBE ks.t ON COMMITTED",
+    >>> with subscribe("127.0.0.1", "SUBSCRIBE SELECT * FROM ks.t ON COMMITTED",
     ...                 username="cassandra", password="cassandra") as stream:
     ...     for change in stream:
     ...         print(change)
