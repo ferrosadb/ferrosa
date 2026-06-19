@@ -1508,4 +1508,25 @@ async fn differential_oracle_dml_agrees() {
         "after_update_null",
     )
     .await;
+
+    // ── DELETE ──────────────────────────────────────────────────────────────
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 3").await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_delete",
+    )
+    .await;
+
+    // Delete the remaining rows — the table must be empty on both sides.
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 1").await;
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 2").await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_delete_all",
+    )
+    .await;
 }
