@@ -31,6 +31,17 @@ pub enum Statement {
     Set { name: String, value: String },
     /// `RESET <name>` (`RESET ALL` carries name `ALL`).
     Reset { name: String },
+    /// `INSERT INTO t (cols) VALUES (...)`. Boxed for size parity with `Select`.
+    Insert(Box<InsertStmt>),
+}
+
+/// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Single-row, with
+/// literal or `$N` values (one per named column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertStmt {
+    pub table: TableRef,
+    pub columns: Vec<String>,
+    pub values: Vec<ScalarValue>,
 }
 
 /// One projected scalar in a no-`FROM` SELECT, with an optional `AS` alias.

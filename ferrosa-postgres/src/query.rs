@@ -721,6 +721,11 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
+        // DML write path (materialize + engine write) is the next slice.
+        Statement::Insert(_) => vec![error_response(
+            "0A000",
+            "INSERT is not yet implemented (write path in progress)",
+        )],
     }
 }
 
