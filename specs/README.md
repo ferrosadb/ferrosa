@@ -25,10 +25,18 @@ specs/
   todo/          Genuinely open + partial work with remaining implementation
   decisions/     Architecture Decision Records (ADRs), carried over wholesale
   security/      Threat models — re-status against code before citing as evidence
+  crates.md          Crate-centric index → every crate's README + per-crate specs/
   README.md          This index
   ROADMAP.md         Now / Next / Later, grounded in the audit
   SECURITY-STATUS.md Honest security posture (deferred / unconfirmed items)
 ```
+
+> **Per-crate documentation.** Each of the 25 workspace crates carries its own
+> `README.md` (what's implemented, how it works, dependencies) and a `specs/`
+> directory (overview / FMEA / roadmap). [`crates.md`](crates.md) is the
+> crate-centric map + the runtime dependency graph; the detail lives with each
+> crate. Updating a crate's docs is part of the definition of done for any change
+> to it (see [`../CLAUDE.md`](../CLAUDE.md) / [`../AGENTS.md`](../AGENTS.md)).
 
 ## Taxonomy
 
