@@ -832,10 +832,12 @@ fn execute_insert(
                 Ok(cv) => cv,
                 Err(msg) => return vec![msg],
             },
-            ScalarValue::Param(_) => return vec![error_response(
+            ScalarValue::Param(_) => {
+                return vec![error_response(
                 "0A000",
                 "$N parameters in INSERT require the extended-query protocol (not yet supported)",
-            )],
+            )]
+            }
             ScalarValue::Func(_) => {
                 return vec![error_response(
                     "0A000",
