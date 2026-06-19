@@ -11,6 +11,7 @@ arc-swap = "1.7"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dashmap = "6"
+ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-net = { path = "../ferrosa-net" }
