@@ -36,7 +36,7 @@ use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
     execute, parse_statement, Column, ColumnType, ExecError, InsertStmt, MapCatalog, QueryResult,
-    Row, ScalarItem, ScalarValue, Statement, Value as SqlValue,
+    Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -722,8 +722,9 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DML: single-row INSERT writes through the engine.
+        // DML: single-row INSERT / UPDATE write through the engine.
         Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema),
+        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema),
     }
 }
 
@@ -898,6 +899,157 @@ fn execute_insert(
     match engine.write_atomic_batch(vec![mutation]) {
         Ok(()) => vec![BackendMessage::CommandComplete {
             tag: "INSERT 0 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+    }
+}
+
+/// Resolve a `(column, value)` pair from a DML statement to its `CqlValue`,
+/// looking up the column's CQL type from `meta`. Returns the column metadata
+/// alongside so the caller can classify it (key vs regular). `$N`/function
+/// values fail loud (extended-protocol / unsupported).
+fn resolve_dml_value<'a>(
+    meta: &'a ferrosa_schema::TableMetadata,
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    col_name: &str,
+    sv: &ScalarValue,
+) -> Result<(&'a ferrosa_schema::ColumnMetadata, CqlValue), BackendMessage> {
+    let col_meta = meta.columns.get(col_name).ok_or_else(|| {
+        error_response(
+            "42703",
+            &format!("column \"{col_name}\" of relation \"{table}\" does not exist"),
+        )
+    })?;
+    let cql_type =
+        ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            .map_err(|e| error_response("42704", &e.to_string()))?;
+    let value = match sv {
+        ScalarValue::Literal(v) => value_to_cql(v, &cql_type)?,
+        ScalarValue::Param(_) => {
+            return Err(error_response(
+                "0A000",
+                "$N parameters require the extended-query protocol (not yet supported)",
+            ))
+        }
+        ScalarValue::Func(_) => {
+            return Err(error_response(
+                "0A000",
+                "function calls in DML values are not supported",
+            ))
+        }
+    };
+    Ok((col_meta, value))
+}
+
+/// Execute a single-row `UPDATE`: a Cassandra-style upsert. The equality `WHERE`
+/// supplies the full primary key (which identifies the row); `SET` supplies the
+/// regular/static cells. Returns `CommandComplete "UPDATE 1"` — the engine write
+/// is a blind upsert, so the affected-row count is reported as 1 when the write
+/// lands (Cassandra has no match count; this is the documented semantic).
+fn execute_update(
+    engine: &StorageEngine,
+    schema: &Schema,
+    upd: &UpdateStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = upd.table.schema.as_deref().unwrap_or(default_schema);
+    let table = upd.table.table.as_str();
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), table.to_string())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{table}\" does not exist"),
+            )]
+        }
+    };
+
+    // SET assignments -> regular/static cells (by storage index).
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for (col_name, sv) in &upd.assignments {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            return vec![error_response(
+                "0A000",
+                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
+            )];
+        }
+        match meta.storage_column_index(col_name) {
+            Some(idx) => regular_cells.push((idx, value)),
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!("column \"{col_name}\" not found in storage schema"),
+                )]
+            }
+        }
+    }
+
+    // WHERE equality -> key values (must be key columns).
+    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    for (col_name, sv) in &upd.where_eq {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(
+            col_meta.kind,
+            ColumnKind::PartitionKey | ColumnKind::Clustering
+        ) {
+            return vec![error_response(
+                "0A000",
+                &format!("UPDATE WHERE supports only key columns; \"{col_name}\" is not a key"),
+            )];
+        }
+        key_values.insert(col_name.clone(), value);
+    }
+
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match key_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match key_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
+    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "UPDATE 1".to_string(),
         }],
         Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
     }

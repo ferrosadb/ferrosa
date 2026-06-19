@@ -18,7 +18,7 @@ pub mod types;
 pub use ast::SelectStmt;
 pub use ast::{
     AggArg, Expr, InsertStmt, Operand, OrderItem, Projection, ScalarItem, ScalarValue, SelectItem,
-    Statement, Term,
+    Statement, Term, UpdateStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{

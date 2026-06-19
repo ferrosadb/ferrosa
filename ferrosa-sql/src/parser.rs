@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::ast::{
     AggArg, ColumnRef, Expr, InsertStmt, Join, Operand, OrderItem, Projection, ScalarItem,
-    ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term,
+    ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -149,6 +149,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "SET" => p.parse_set(),
             "RESET" => p.parse_reset(),
             "INSERT" => p.parse_insert(),
+            "UPDATE" => p.parse_update(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -609,6 +610,60 @@ impl Parser {
             columns,
             values,
         })))
+    }
+
+    /// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`.
+    /// Assumes `self.pos` is at the `UPDATE` ident. `WHERE` is equality-only
+    /// (the key columns identify the row, Cassandra-style upsert).
+    fn parse_update(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // UPDATE
+        let table = self.parse_qualified_table()?;
+
+        self.expect_ident_kw("SET")?;
+        let mut assignments = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            assignments.push(self.parse_assignment()?);
+        }
+
+        self.expect(&Tok::Where, "WHERE")?;
+        let mut where_eq = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.next();
+            where_eq.push(self.parse_assignment()?);
+        }
+        self.expect_end()?;
+
+        Ok(Statement::Update(Box::new(UpdateStmt {
+            table,
+            assignments,
+            where_eq,
+        })))
+    }
+
+    /// Parse `[schema.]table` with NO trailing alias — for DML targets, where a
+    /// following ident (`SET`, `WHERE`) is a keyword, not an alias.
+    fn parse_qualified_table(&mut self) -> Result<TableRef, ParseError> {
+        let first = self.ident()?;
+        let (schema, table) = if matches!(self.peek(), Some(Tok::Dot)) {
+            self.next();
+            (Some(first), self.ident()?)
+        } else {
+            (None, first)
+        };
+        Ok(TableRef {
+            schema,
+            table,
+            alias: None,
+        })
+    }
+
+    /// A `col = value` pair (used by `UPDATE`'s SET list and equality WHERE).
+    fn parse_assignment(&mut self) -> Result<(String, ScalarValue), ParseError> {
+        let col = self.ident()?;
+        self.expect(&Tok::Eq, "=")?;
+        let value = self.parse_scalar_value()?;
+        Ok((col, value))
     }
 
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
@@ -1588,6 +1643,51 @@ mod tests {
     #[test]
     fn parse_statement_insert_rejects_arity_mismatch() {
         assert!(parse_statement("INSERT INTO t (a, b) VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn parse_statement_update() {
+        let stmt =
+            parse_statement("UPDATE demo.t SET v = 'x', n = 3 WHERE id = 1 AND ck = 2").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(u.table.schema.as_deref(), Some("demo"));
+                assert_eq!(u.table.table, "t");
+                assert_eq!(
+                    u.assignments,
+                    vec![
+                        (
+                            "v".to_string(),
+                            ScalarValue::Literal(Value::Text("x".into()))
+                        ),
+                        ("n".to_string(), ScalarValue::Literal(Value::Int(3))),
+                    ]
+                );
+                assert_eq!(
+                    u.where_eq,
+                    vec![
+                        ("id".to_string(), ScalarValue::Literal(Value::Int(1))),
+                        ("ck".to_string(), ScalarValue::Literal(Value::Int(2))),
+                    ]
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_update_with_params() {
+        let stmt = parse_statement("UPDATE t SET v = $1 WHERE id = $2").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(
+                    u.assignments,
+                    vec![("v".to_string(), ScalarValue::Param(1))]
+                );
+                assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
     }
 
     #[test]
