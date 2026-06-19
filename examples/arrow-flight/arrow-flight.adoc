@@ -56,4 +56,19 @@ For *streaming* changes rather than point-in-time reads, use CQL `SUBSCRIBE` via
 
 == Reference client
 
-A runnable `pyarrow.flight` client (handshake → `GetFlightInfo` → `DoGet`/`DoPut`) and its CI execution are tracked in the runnable-examples work (forge `t_0c1f92ee`): the client needs `pyarrow` plus a custom auth handler that performs the `username\0password` handshake above and attaches the `authorization: Bearer` header, and a CI job that runs it against a `flight`-enabled server. Until that lands, this page documents the wire contract; the `schema.cql` above is exercised by the existing "Example CQL Scripts" CI job.
+`flight_demo.py` is a runnable `pyarrow.flight` client that performs the handshake above (custom `ClientAuthHandler` sending `username\0password`, capturing the token, then attaching `authorization: Bearer`), calls `GetFlightInfo`, and `DoGet`s each endpoint as Arrow. It is verified live against a `flight`-enabled server (`pip install pyarrow`):
+
+[source,python]
+----
+include::flight_demo.py[lines=39..72]
+----
+
+Running it against the seeded `schema.cql` prints the two sensor rows read back over Arrow:
+
+----
+[flight] authenticated, token 109 bytes
+[flight] GetFlightInfo: 1 endpoint(s), columns ['sensor_id', 'ts', 'temperature', 'humidity']
+[flight] read 2 rows over Arrow Flight
+----
+
+NOTE: Wiring `flight_demo.py` into CI (a job that boots a `flight`-enabled server and runs it, alongside the existing "Example CQL Scripts" job which already runs `schema.cql`) is tracked in forge `t_0c1f92ee`.
