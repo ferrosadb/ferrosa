@@ -26,7 +26,7 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=0, help="stop after N changes (0 = forever)")
     args = ap.parse_args()
 
-    query = f"SUBSCRIBE {args.keyspace}.{args.table} ON {args.stream}"
+    query = f"SUBSCRIBE SELECT * FROM {args.keyspace}.{args.table} ON {args.stream}"
     print(f"[subscriber] {query}  ({args.host}:{args.port})", flush=True)
     n = 0
     with subscribe(
