@@ -1030,6 +1030,42 @@ mod tests {
         );
     }
 
+    /// v1 collation contract (oracle R10): ferrosa orders text by raw BYTE order
+    /// (C / POSIX collation), NOT locale collation — so uppercase sorts before
+    /// lowercase (`B`=0x42 < `a`=0x61), unlike an en_US locale. The differential
+    /// oracle relies on this (its corpus uses C-collation-safe ASCII), so pin it
+    /// with a self-contained known-answer test.
+    #[test]
+    fn text_order_by_is_c_collation_byte_order() {
+        let t = Arc::new(InMemoryTable::new(
+            RelSchema::new(vec![Column::new("s", ColumnType::Text)]),
+            vec![
+                Row::new(vec![Value::Text("apple".into())]),
+                Row::new(vec![Value::Text("Banana".into())]),
+                Row::new(vec![Value::Text("apricot".into())]),
+                Row::new(vec![Value::Text("Cherry".into())]),
+            ],
+        ));
+        let cat = MapCatalog::new().with_table("public", "t", t);
+        let r = execute(
+            &parse("SELECT s FROM t ORDER BY s").unwrap(),
+            &cat,
+            "public",
+            &[],
+        )
+        .unwrap();
+        let got: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| match row.get(0) {
+                Value::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            })
+            .collect();
+        // Byte order: uppercase 'B'/'C' (0x42/0x43) precede lowercase 'a' (0x61).
+        assert_eq!(got, vec!["Banana", "Cherry", "apple", "apricot"]);
+    }
+
     #[test]
     fn missing_parameter_fails_loud() {
         let stmt = parse("SELECT name FROM users WHERE id = $1").unwrap();
