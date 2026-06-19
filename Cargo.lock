@@ -2656,6 +2656,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-view"
+version = "0.13.0"
+dependencies = [
+ "ferrosa-schema",
+ "indexmap 2.14.0",
+ "proptest",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "ferrosa-worker"
 version = "0.13.0"
 dependencies = [
