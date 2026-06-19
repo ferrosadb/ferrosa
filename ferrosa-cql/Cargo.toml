@@ -48,6 +48,8 @@ uuid = { version = "1", features = ["v4"] }
 asc-udf = ["ferrosa-udf/asc-udf"]
 # Opt-in tests needing external infrastructure (e.g. the asc toolchain bundle).
 live-infra-tests = []
+# Exposes test_util::standalone_for_test for downstream crates' integration tests.
+test-util = []
 
 [dev-dependencies]
 proptest = "1"
