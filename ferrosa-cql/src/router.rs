@@ -4687,6 +4687,87 @@ pub async fn route_select_raw(
     route_select_user_table(state, ctx, ks, s).await
 }
 
+/// Encode a single CDC change event's rows (one mutation, for `ks.{select.table}`)
+/// into a CQL RESULT frame matching `select`'s projection.
+///
+/// Reuses the exact row-mapping pipeline as the SELECT read path
+/// (`build_column_info` + `storage_to_table_indices` +
+/// `partition_to_rows_with_storage_mapping` + `select_columns` + `encode_rows`)
+/// so a change event encodes identically to how the same rows would read back.
+///
+/// Streaming by construction: it handles **one event's rows** (a single write),
+/// never a materialized result set. Returns `Ok(None)` if the table is unknown
+/// (e.g. dropped between subscribe and delivery) so the caller can skip it.
+// Justification for allow(dead_code): the non-test caller is the CDC SUBSCRIBE
+// consumer (spawn_cdc_subscription), landing in the next slice (t_d30ecb1f).
+// This function is already exercised + correctness-checked by the test
+// `cdc_event_frame_matches_select_for_same_row` (byte-equivalence vs the SELECT
+// read path). The allow is removed when the consumer wires it in.
+#[allow(dead_code)]
+pub(crate) fn cdc_event_to_result_frame(
+    schema: &Schema,
+    ks: &str,
+    select: &SelectStatement,
+    key: ferrosa_common::DecoratedKey,
+    rows: Vec<ferrosa_sstable::types::Row>,
+) -> Result<Option<BytesMut>, CqlError> {
+    let snap = schema.snapshot();
+    let table_meta = match snap.tables.get(&(ks.to_string(), select.table.clone())) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let (col_names, col_types) = build_column_info(table_meta, &select.columns, ks, schema)?;
+    let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+    let all_col_types: Vec<CqlType> = table_meta
+        .columns
+        .values()
+        .map(|c| resolve_col_type(&c.column_type, ks, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_indices: Vec<usize> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("partition key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ck_indices: Vec<usize> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("clustering key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage_to_table = storage_to_table_indices(table_meta);
+
+    let partition = ferrosa_sstable::types::Partition {
+        key,
+        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+        static_row: None,
+        rows,
+    };
+    let all_rows = bridge::partition_to_rows_with_storage_mapping(
+        &partition,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+        &storage_to_table,
+    );
+    let selected = select_columns(&all_rows, &all_col_names, &col_names);
+    Ok(Some(result::encode_rows(
+        &col_names,
+        &col_types,
+        ks,
+        &select.table,
+        &selected,
+    )))
+}
+
 // ── Virtual table helpers ────────────────────────────────────────────────
 
 /// Convert a `DataType` (from ferrosa-common) to the CQL protocol `CqlType`.
@@ -11580,6 +11661,65 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// The CDC change-event encoder must produce the *same* RESULT frame as the
+    /// proven SELECT read path for the same stored row — encoding-equivalence,
+    /// which guards against the CDC path mis-mapping columns/types/values.
+    #[tokio::test]
+    async fn cdc_event_frame_matches_select_for_same_row() {
+        use futures::StreamExt;
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.users (id int PRIMARY KEY, name text)",
+            "INSERT INTO ks.users (id, name) VALUES (1, 'alice')",
+        ] {
+            let stmt = crate::parser::parse(ddl).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // Expected: how the SELECT read path encodes this row.
+        let select = match crate::parser::parse("SELECT * FROM ks.users").unwrap() {
+            Statement::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
+        let raw = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(raw.rows.len(), 1, "exactly one row was inserted");
+        let expected = crate::result::encode_rows(
+            &raw.column_names,
+            &raw.column_types,
+            "ks",
+            "users",
+            &raw.rows,
+        );
+
+        // Actual: encode the stored partition's rows as a CDC change event.
+        let table_id = TableId::new("ks", "users");
+        let mut stream = state.engine.range_iter(&table_id, None, None);
+        let partition = stream
+            .next()
+            .await
+            .expect("one partition present")
+            .expect("partition read ok");
+        let frame =
+            cdc_event_to_result_frame(&state.schema, "ks", &select, partition.key, partition.rows)
+                .unwrap()
+                .expect("table exists");
+
+        assert_eq!(
+            frame, expected,
+            "CDC event frame must byte-match the SELECT-path frame for the same row"
+        );
     }
 
     /// Transient replication ('<full>/<transient>') must be rejected at the
