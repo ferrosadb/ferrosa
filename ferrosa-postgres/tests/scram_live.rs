@@ -150,17 +150,47 @@ async fn real_driver_scram_then_select1_succeeds_and_txn_fails_loud() {
         "version() should report a ferrosa version string"
     );
 
-    // Transactions route through Accord and are not yet wired: `BEGIN` must
-    // fail loud (SQLSTATE 0A000, feature_not_supported) — never a fake success.
-    let err = client
+    // Transaction protocol state: BEGIN/COMMIT drive the session, and a read
+    // inside the block works. (Write atomicity routes through Accord once DML
+    // lands; the front-end is read-only today.)
+    client
         .simple_query("BEGIN")
         .await
-        .expect_err("transactions are not yet implemented and must fail loud");
+        .expect("BEGIN should succeed");
+    let in_txn = client
+        .simple_query("SELECT 1")
+        .await
+        .expect("SELECT inside a transaction should succeed");
+    assert!(in_txn
+        .iter()
+        .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))));
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("COMMIT should succeed");
+
+    // Failed-transaction semantics: an error inside a txn aborts it; subsequent
+    // statements are rejected with 25P02 until ROLLBACK clears it.
+    client.simple_query("BEGIN").await.expect("BEGIN");
+    let _ = client.simple_query("SELECT bogus_unsupported_fn()").await; // errors
+    let aborted = client
+        .simple_query("SELECT 1")
+        .await
+        .expect_err("an aborted transaction must reject further statements");
     assert_eq!(
-        err.code().map(|c| c.code()),
-        Some("0A000"),
-        "unexpected error: {err}"
+        aborted.code().map(|c| c.code()),
+        Some("25P02"),
+        "unexpected error: {aborted}"
     );
+    client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK should clear the aborted transaction");
+    // The session is usable again after ROLLBACK.
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("session usable after ROLLBACK");
 
     drop(client);
     let _ = conn_task.await;

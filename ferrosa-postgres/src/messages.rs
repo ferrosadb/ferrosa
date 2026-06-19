@@ -28,9 +28,10 @@ pub const CANCEL_REQUEST_CODE: i32 = 80877102;
 ///
 /// This is the wire signal the blueprint's D11 hangs off of: entering a `T`
 /// block is the trigger to route the transaction through Accord.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransactionStatus {
     /// `I` — idle (not in a transaction block).
+    #[default]
     Idle,
     /// `T` — in a transaction block.
     InTransaction,
