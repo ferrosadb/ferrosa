@@ -68,22 +68,60 @@ pub type ClusterPartitionStream =
 type BoxedFragmentStream = Pin<Box<dyn Stream<Item = Result<Partition, ClusterError>> + Send>>;
 
 impl ClusterCoordinator {
-    /// COUNT(*) fast path. Returns the local replica's row count
-    /// for `[start, end]` on `table_id`. Bypasses the streaming
-    /// range-read RPC entirely — calls `StorageEngine::count_range`
-    /// which uses the metadata-only merger
-    /// (`range_merger::merger_for_metadata_sources`) so cell
-    /// payloads are byte-skipped at every SSTable.
+    /// COUNT(*) over the whole token ring for `table_id`.
     ///
-    /// Consistency: returns the LOCAL replica's view. For
-    /// quorum / all consistency on COUNT(*), shipping partition
-    /// keys across replicas would defeat the optimization — that
-    /// is a separate design (and matches Cassandra's "COUNT is
-    /// eventually consistent by default" semantics).
-    pub fn coordinate_range_count(&self, table_id: &TableId) -> crate::error::Result<u64> {
-        self.storage
-            .count_range(table_id, None, None)
-            .map_err(ClusterError::Storage)
+    /// Fast path: when the local node provably owns every token range at the
+    /// configured consistency (`range_read_remotes` empty — e.g. CL=ONE with
+    /// the keyspace RF spanning the cluster), count locally via
+    /// `StorageEngine::count_range`, which uses the metadata-only merger
+    /// (`range_merger::merger_for_metadata_sources`) so cell payloads are
+    /// byte-skipped at every SSTable.
+    ///
+    /// Fan-out path: otherwise the local replica holds only the partitions in
+    /// its owned token ranges, so a local-only count would UNDERCOUNT. The
+    /// count then drives the same CL-selected, token-deduped streaming
+    /// range-read fan-out the full `SELECT` uses and sums the live rows.
+    pub async fn coordinate_range_count(&self, table_id: &TableId) -> crate::error::Result<u64> {
+        // Correctness over speed (forge t_8c4e44e8): the local replica only
+        // holds the partitions whose tokens fall in ITS owned ranges. When the
+        // keyspace RF does not span the whole ring (`RF < node_count`, or any
+        // CL that demands more than the local response), the local-only
+        // metadata count silently returns a nondeterministic UNDERCOUNT — it
+        // tallies only the locally-resident subset while a full `SELECT`
+        // (which fans out + dedups by token) sees every row.
+        //
+        // Reuse the same CL/RF fan-out decision the streaming range read uses.
+        // When `range_read_remotes` is empty the local node provably owns every
+        // token range at this CL, so the fast metadata path is exact. Otherwise
+        // we MUST fan out across replicas and count the token-deduped result —
+        // never the local subset.
+        let remotes = self.range_read_remotes(self.default_cl, self.default_rf);
+        if remotes.is_empty() {
+            return self
+                .storage
+                .count_range(table_id, None, None)
+                .map_err(ClusterError::Storage);
+        }
+
+        // Fan out the unbounded streaming range read (local + CL-selected
+        // remotes, token-aware N-way merge, deduped by token) and count the
+        // live rows. Fragments of one partition share a key, so summing
+        // `rows.len()` across fragments yields that partition's row count; the
+        // static row only rides the first fragment. This matches
+        // `StorageEngine::count_range`'s COUNT(*) semantics (one per row, plus
+        // one for a present static row) but over the WHOLE ring.
+        let mut stream = self
+            .coordinate_range_read_stream_all_with(table_id, 0, self.default_cl, self.default_rf)
+            .await?;
+        let mut total: u64 = 0;
+        while let Some(item) = stream.next().await {
+            let partition = item?;
+            total = total.saturating_add(partition.rows.len() as u64);
+            if partition.static_row.is_some() {
+                total = total.saturating_add(1);
+            }
+        }
+        Ok(total)
     }
 }
 

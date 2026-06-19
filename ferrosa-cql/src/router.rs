@@ -19511,6 +19511,82 @@ mod tests {
         assert_eq!(count_value, 7);
     }
 
+    /// Regression for the COUNT(*) undercount bug (forge t_8c4e44e8): a bare
+    /// `SELECT COUNT(*)` over N distinct single-row partitions returned a
+    /// nondeterministic undercount (observed 12/15/23 for N=50) even though a
+    /// full `SELECT id` scan saw all N. The undercount only manifests when the
+    /// rows are spread across MANY token-overlapping SSTables plus the active
+    /// memtable — exactly the LSM state a fresh load produces once the active
+    /// memtable crosses `flush_threshold_bytes` several times. The earlier
+    /// store-level regression only ever produced a single SSTable, so it never
+    /// exercised the multi-run metadata merge that drops partitions.
+    ///
+    /// COUNT(*) goes through the ADR-020 metadata fast path
+    /// (`WritePath::count_range`); the full scan streams partitions. Both must
+    /// equal N regardless of how many SSTable runs the partitions land in.
+    #[tokio::test]
+    async fn count_star_counts_every_partition_across_many_sstable_runs() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_runs WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("CREATE TABLE cnt_runs.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        const N: i32 = 50;
+        let table_id = ferrosa_storage::TableId::new("cnt_runs", "t");
+        // Insert N distinct partitions, flushing every 10 rows so the rows end
+        // up spread across several SSTables (each holding a token-interleaved
+        // subset of the murmur3-hashed keys) plus the trailing active memtable.
+        for i in 0..N {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_runs.t (id, v) VALUES ({i}, 'v{i}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+            if i % 10 == 9 {
+                state.engine.flush(&table_id).unwrap();
+            }
+        }
+
+        // Bare COUNT(*) — ADR-020 metadata fast path.
+        let count_stmt = crate::parser::parse("SELECT COUNT(*) FROM cnt_runs.t").unwrap();
+        let count_value = match &route(&state, &ctx, count_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected count result"),
+        };
+
+        // Full scan — must see every partition.
+        let scan_stmt = crate::parser::parse("SELECT id FROM cnt_runs.t").unwrap();
+        let scanned_rows = match &route(&state, &ctx, scan_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected scan result"),
+        };
+
+        assert_eq!(
+            scanned_rows, N,
+            "full SELECT must see every partition (got {scanned_rows})"
+        );
+        assert_eq!(
+            count_value, N as i64,
+            "COUNT(*) must equal the {N} inserted partitions across all SSTable \
+             runs + memtable, got {count_value}"
+        );
+    }
+
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────
 
     /// With a phonetic index on a text column, WHERE col = 'Jon Smyth'
