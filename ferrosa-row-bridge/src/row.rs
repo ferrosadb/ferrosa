@@ -443,3 +443,47 @@ pub fn build_row(
         primary_key_liveness,
     }
 }
+
+/// Build a storage [`Row`] representing a deletion. Empty `delete_columns` is a
+/// row-level deletion (a partition/row tombstone); a non-empty list tombstones
+/// each named column. `clustering_values` locate the row; `timestamp` is micros.
+pub fn build_delete_row(
+    delete_columns: &[u16],
+    clustering_values: &[CqlValue],
+    timestamp: i64,
+) -> Row {
+    let clustering = encode_clustering(clustering_values);
+
+    // System clock: the one allowed unwrap.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    if delete_columns.is_empty() {
+        Row {
+            clustering,
+            cells: vec![],
+            deletion: DeletionTime::new(timestamp, now_secs),
+            primary_key_liveness: LivenessInfo::NONE,
+        }
+    } else {
+        // Column-level deletion: tombstone each specified column. Cells MUST be
+        // sorted by column index — same requirement as build_row.
+        let mut cells: Vec<(u16, CellValue)> = delete_columns
+            .iter()
+            .map(|&idx| {
+                let ldt = i32::try_from(now_secs).unwrap_or(i32::MAX);
+                (idx, CellValue::tombstone(timestamp, ldt))
+            })
+            .collect();
+        cells.sort_by_key(|(idx, _)| *idx);
+
+        Row {
+            clustering,
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        }
+    }
+}

@@ -35,8 +35,8 @@ use std::sync::Arc;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    execute, parse_statement, Column, ColumnType, ExecError, InsertStmt, MapCatalog, QueryResult,
-    Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
+    execute, parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
+    QueryResult, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -722,9 +722,10 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DML: single-row INSERT / UPDATE write through the engine.
+        // DML: single-row INSERT / UPDATE / DELETE write through the engine.
         Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema),
         Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema),
+        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema),
     }
 }
 
@@ -1050,6 +1051,93 @@ fn execute_update(
     match engine.write_atomic_batch(vec![mutation]) {
         Ok(()) => vec![BackendMessage::CommandComplete {
             tag: "UPDATE 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+    }
+}
+
+/// Execute a single-row `DELETE`: a row-level tombstone. The equality `WHERE`
+/// supplies the full primary key identifying the row. Returns `CommandComplete
+/// "DELETE 1"` — the engine writes a tombstone unconditionally, so the count is
+/// reported as 1 when the write lands (Cassandra has no match count).
+fn execute_delete(
+    engine: &StorageEngine,
+    schema: &Schema,
+    del: &DeleteStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = del.table.schema.as_deref().unwrap_or(default_schema);
+    let table = del.table.table.as_str();
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), table.to_string())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{table}\" does not exist"),
+            )]
+        }
+    };
+
+    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    for (col_name, sv) in &del.where_eq {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(
+            col_meta.kind,
+            ColumnKind::PartitionKey | ColumnKind::Clustering
+        ) {
+            return vec![error_response(
+                "0A000",
+                &format!("DELETE WHERE supports only key columns; \"{col_name}\" is not a key"),
+            )];
+        }
+        key_values.insert(col_name.clone(), value);
+    }
+
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match key_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match key_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    // Empty delete-columns => row-level tombstone.
+    let row = ferrosa_row_bridge::build_delete_row(&[], &ck_values, timestamp);
+    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "DELETE 1".to_string(),
         }],
         Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
     }
