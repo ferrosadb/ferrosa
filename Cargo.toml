@@ -19,6 +19,7 @@ members = [
     "ferrosa-sstable",
     "ferrosa-storage",
     "ferrosa-udf",
+    "ferrosa-view",
     "ferrosa-worker",
     "ferrosa-jepsen",
     "ferrosa-loadgen",
