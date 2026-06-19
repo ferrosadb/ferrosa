@@ -4,7 +4,10 @@
 //! executed by `ferrosa-cql` (`route_select_raw`) and the result is converted
 //! to Arrow and streamed back. `DoPut` writes Arrow rows into the
 //! `ferrosa-table` (`keyspace.table` metadata header) as CQL INSERTs.
-//! `DoExchange` and `ListFlights` remain `Unimplemented`.
+//! `DoExchange` is a bidirectional streaming upsert: it consumes the same
+//! inbound Arrow batches as `DoPut` and emits one `FlightData` acknowledgement
+//! per batch (rows-applied count in `app_metadata`). `ListFlights` remains
+//! `Unimplemented`.
 //!
 //! Auth (decision D4): `Handshake` validates CQL credentials via
 //! `Schema::authenticate` and returns a signed bearer token; every other RPC
@@ -118,6 +121,25 @@ impl FerrosaFlight {
         })
     }
 
+    /// Extract and validate the `ferrosa-table` (`keyspace.table`) write target
+    /// from request metadata. Shared by `do_put` and `do_exchange`.
+    #[allow(clippy::result_large_err)] // tonic Status is the uniform RPC error type
+    fn target_table(&self, metadata: &tonic::metadata::MetadataMap) -> Result<String, Status> {
+        let table = metadata
+            .get("ferrosa-table")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                Status::invalid_argument("missing 'ferrosa-table' metadata (keyspace.table)")
+            })?
+            .to_string();
+        if !valid_table(&table) {
+            return Err(Status::invalid_argument(
+                "'ferrosa-table' must be keyspace.table identifiers",
+            ));
+        }
+        Ok(table)
+    }
+
     /// Parse a Flight command, requiring a `SELECT`.
     #[allow(clippy::result_large_err)] // tonic Status is the uniform RPC error type
     fn parse_select(cql: &str) -> Result<ferrosa_cql::ast::SelectStatement, Status> {
@@ -212,6 +234,50 @@ fn cql_literal(v: &CqlValue) -> Option<String> {
         CqlValue::Blob(b) => format!("0x{}", hex::encode(b)),
         _ => return None,
     })
+}
+
+/// A `DoExchange` acknowledgement for one applied batch: an otherwise-empty
+/// `FlightData` carrying the decimal rows-applied count in `app_metadata`
+/// (same count convention as `do_put`'s `PutResult.app_metadata`).
+fn ack_flight_data(written: i64) -> FlightData {
+    FlightData::new().with_app_metadata(written.to_string().into_bytes())
+}
+
+/// Write every row of one decoded Arrow batch into `table` via the normal CQL
+/// write path (`do_put` / `do_exchange` share this). Returns the number of rows
+/// applied. Fail-loud: a conversion, parse, or write error propagates as
+/// `Status` — a batch is never silently dropped.
+#[allow(clippy::result_large_err)] // tonic Status is the uniform RPC error type
+async fn write_batch(
+    state: &SharedState,
+    auth: &ferrosa_schema::AuthContext,
+    table: &str,
+    batch: &RecordBatch,
+) -> Result<i64, Status> {
+    let (names, rows) = crate::convert::record_batch_to_rows(batch)
+        .map_err(|e| Status::invalid_argument(format!("Arrow conversion failed: {e}")))?;
+    let mut written: i64 = 0;
+    for row in &rows {
+        let Some(sql) = build_insert(table, &names, row)? else {
+            continue;
+        };
+        let stmt = ferrosa_cql::parser::parse(&sql)
+            .map_err(|e| Status::internal(format!("generated CQL parse error: {e}")))?;
+        let ks: Option<String> = None;
+        let ctx = RequestContext {
+            auth,
+            current_keyspace: &ks,
+            consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: ferrosa_cql::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        ferrosa_cql::router::route(state, &ctx, stmt)
+            .await
+            .map_err(|e| Status::internal(format!("write failed: {e}")))?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// Build an `INSERT INTO <table> (...) VALUES (...)` for one row, including only
@@ -438,19 +504,7 @@ impl FlightService for FerrosaFlight {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let auth = self.authenticate(request.metadata())?;
-        let table = request
-            .metadata()
-            .get("ferrosa-table")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                Status::invalid_argument("missing 'ferrosa-table' metadata (keyspace.table)")
-            })?
-            .to_string();
-        if !valid_table(&table) {
-            return Err(Status::invalid_argument(
-                "'ferrosa-table' must be keyspace.table identifiers",
-            ));
-        }
+        let table = self.target_table(request.metadata())?;
 
         let stream = request
             .into_inner()
@@ -464,28 +518,7 @@ impl FlightService for FerrosaFlight {
             .await
             .map_err(|e| Status::invalid_argument(format!("Flight decode error: {e}")))?
         {
-            let (names, rows) = crate::convert::record_batch_to_rows(&batch)
-                .map_err(|e| Status::invalid_argument(format!("Arrow conversion failed: {e}")))?;
-            for row in &rows {
-                let Some(sql) = build_insert(&table, &names, row)? else {
-                    continue;
-                };
-                let stmt = ferrosa_cql::parser::parse(&sql)
-                    .map_err(|e| Status::internal(format!("generated CQL parse error: {e}")))?;
-                let ks: Option<String> = None;
-                let ctx = RequestContext {
-                    auth: &auth,
-                    current_keyspace: &ks,
-                    consistency: ferrosa_cluster::consistency::ConsistencyLevel::One,
-                    serial_consistency: None,
-                    paging: ferrosa_cql::paging::PagingParams::default(),
-                    client_address: String::new(),
-                };
-                ferrosa_cql::router::route(&self.state, &ctx, stmt)
-                    .await
-                    .map_err(|e| Status::internal(format!("write failed: {e}")))?;
-                written += 1;
-            }
+            written += write_batch(&self.state, &auth, &table, &batch).await?;
         }
 
         let result = arrow_flight::PutResult {
@@ -496,13 +529,56 @@ impl FlightService for FerrosaFlight {
         ))
     }
 
+    /// Bidirectional streaming upsert with per-batch acknowledgement. The client
+    /// pushes a stream of `FlightData` (decoded to `RecordBatch`es); each batch's
+    /// rows are written into the `ferrosa-table` (`keyspace.table` header) via the
+    /// same write path as `do_put`, and for every processed batch the server emits
+    /// one outbound `FlightData` whose `app_metadata` is the decimal rows-applied
+    /// count for that batch. Fail-loud: a decode/conversion/write error ends the
+    /// stream with a `Status` rather than silently dropping a batch.
+    ///
+    /// Out of scope (post-v1): a live-subscribe channel over `DoExchange`.
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented(
-            "DoExchange not implemented (channel slice pending)",
-        ))
+        let auth = self.authenticate(request.metadata())?;
+        let table = self.target_table(request.metadata())?;
+        let state = Arc::clone(&self.state);
+
+        let inbound = request
+            .into_inner()
+            .map_err(|s| FlightError::ExternalError(Box::new(s)));
+        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(inbound);
+
+        // One ack per inbound batch. `unfold` keeps the upsert strictly ordered
+        // (apply batch N, ack N, then poll batch N+1) and stops on the first
+        // error, so a failure is never hidden behind a later "success" ack.
+        let acks = futures::stream::unfold(batches, move |mut batches| {
+            let auth = auth.clone();
+            let table = table.clone();
+            let state = Arc::clone(&state);
+            async move {
+                let batch = match batches.try_next().await {
+                    Ok(Some(b)) => b,
+                    Ok(None) => return None,
+                    Err(e) => {
+                        return Some((
+                            Err(Status::invalid_argument(format!(
+                                "Flight decode error: {e}"
+                            ))),
+                            batches,
+                        ))
+                    }
+                };
+                let ack = write_batch(&state, &auth, &table, &batch)
+                    .await
+                    .map(ack_flight_data);
+                Some((ack, batches))
+            }
+        });
+
+        Ok(Response::new(Box::pin(acks) as Self::DoExchangeStream))
     }
 
     async fn do_action(
