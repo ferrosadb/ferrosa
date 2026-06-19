@@ -86,6 +86,17 @@ Always apply Rust idioms and best practices. Use the language's type system to p
 3. `cargo test -p <crate>` — affected crate tests pass
 4. `cargo build --all-targets` — full workspace compiles clean
 5. Feature branch — never commit to main directly
+6. **Update the modified crate's docs** — see the rule below.
+
+### Per-crate docs are part of "done"
+
+Every crate carries its own `README.md` (what's implemented, how it works, its
+dependencies/dependents) and a `specs/` directory (`overview.md`, `fmea.md`,
+`roadmap.md`). **Changing a crate's behavior, public API, dependency set, or
+known-issue/roadmap status is not done until that crate's `README.md` + `specs/`
+are updated to match.** A crate's docs must reflect its *current* implementation
+and dependency set — stale crate docs are treated like a failing check. The
+crate-centric index lives at [`specs/crates.md`](specs/crates.md).
 
 ### CI must pass before pushing
 
