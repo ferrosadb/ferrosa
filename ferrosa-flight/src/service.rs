@@ -6,8 +6,8 @@
 //! `ferrosa-table` (`keyspace.table` metadata header) as CQL INSERTs.
 //! `DoExchange` is a bidirectional streaming upsert: it consumes the same
 //! inbound Arrow batches as `DoPut` and emits one `FlightData` acknowledgement
-//! per batch (rows-applied count in `app_metadata`). `ListFlights` remains
-//! `Unimplemented`.
+//! per batch (rows-applied count in `app_metadata`). `ListFlights`,
+//! `PollFlightInfo`, `DoAction`, and `ListActions` are implemented.
 //!
 //! Auth (decision D4): `Handshake` validates CQL credentials via
 //! `Schema::authenticate` and returns a signed bearer token; every other RPC
@@ -181,6 +181,47 @@ impl FerrosaFlight {
 
         crate::convert::rows_to_record_batch(&raw.column_names, &raw.column_types, &raw.rows)
             .map_err(|e| Status::internal(format!("Arrow conversion failed: {e}")))
+    }
+
+    /// Build the `FlightInfo` for a CQL command `descriptor`: its Arrow schema
+    /// plus a single self-endpoint whose ticket is the same command (the client
+    /// redeems it via `do_get`). Shared by `get_flight_info` and
+    /// `poll_flight_info`.
+    #[allow(clippy::result_large_err)] // tonic Status is the uniform RPC error type
+    async fn flight_info_for(
+        &self,
+        descriptor: FlightDescriptor,
+        auth: &ferrosa_schema::AuthContext,
+    ) -> Result<FlightInfo, Status> {
+        let cql = String::from_utf8(descriptor.cmd.to_vec())
+            .map_err(|_| Status::invalid_argument("descriptor.cmd is not valid UTF-8 CQL"))?;
+        let batch = self.query_to_batch(&cql, auth).await?;
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: descriptor.cmd.clone(),
+        });
+        FlightInfo::new()
+            .try_with_schema(&batch.schema())
+            .map_err(|e| Status::internal(format!("schema encode error: {e}")))
+            .map(|info| info.with_descriptor(descriptor).with_endpoint(endpoint))
+    }
+
+    /// The `SELECT * FROM ks.t` commands for every queryable (non-system) table,
+    /// sorted for determinism, optionally filtered to tables whose `ks.table`
+    /// name starts with `prefix`.
+    fn queryable_table_commands(&self, prefix: &str) -> Vec<String> {
+        let snapshot = self.state.schema.snapshot();
+        let mut tables: Vec<(String, String)> = snapshot
+            .tables
+            .keys()
+            .filter(|(ks, _)| !ferrosa_schema::is_system_keyspace(ks))
+            .filter(|(ks, tbl)| format!("{ks}.{tbl}").starts_with(prefix))
+            .cloned()
+            .collect();
+        tables.sort();
+        tables
+            .into_iter()
+            .map(|(ks, tbl)| format!("SELECT * FROM {ks}.{tbl}"))
+            .collect()
     }
 }
 
@@ -401,22 +442,9 @@ impl FlightService for FerrosaFlight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let auth = self.authenticate(request.metadata())?;
-        let descriptor = request.into_inner();
-        let cql = String::from_utf8(descriptor.cmd.to_vec())
-            .map_err(|_| Status::invalid_argument("descriptor.cmd is not valid UTF-8 CQL"))?;
-        let batch = self.query_to_batch(&cql, &auth).await?;
-        let schema = batch.schema();
-
         // Single endpoint: the client redeems the same CQL ticket on this
         // connection (distributed per-token-range endpoints are W-002).
-        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
-            ticket: descriptor.cmd.clone(),
-        });
-        let info = FlightInfo::new()
-            .try_with_schema(&schema)
-            .map_err(|e| Status::internal(format!("schema encode error: {e}")))?
-            .with_descriptor(descriptor)
-            .with_endpoint(endpoint);
+        let info = self.flight_info_for(request.into_inner(), &auth).await?;
         Ok(Response::new(info))
     }
 
@@ -481,18 +509,44 @@ impl FlightService for FerrosaFlight {
         ))
     }
 
+    /// Enumerate the queryable (non-system) tables as `FlightInfo` entries: one
+    /// per table, each carrying its Arrow schema and a `SELECT * FROM ks.t`
+    /// ticket that `do_get` accepts. An optional `Criteria.expression` (UTF-8)
+    /// filters to tables whose `ks.table` name starts with that prefix.
     async fn list_flights(
         &self,
-        _request: Request<Criteria>,
+        request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("ListFlights not implemented"))
+        let auth = self.authenticate(request.metadata())?;
+        let prefix = String::from_utf8(request.into_inner().expression.to_vec())
+            .map_err(|_| Status::invalid_argument("criteria expression is not valid UTF-8"))?;
+
+        let mut flights = Vec::new();
+        for cql in self.queryable_table_commands(&prefix) {
+            let descriptor = FlightDescriptor::new_cmd(cql.into_bytes());
+            flights.push(self.flight_info_for(descriptor, &auth).await?);
+        }
+        let stream = futures::stream::iter(flights.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(stream) as Self::ListFlightsStream))
     }
 
+    /// Resolve a query descriptor to its `FlightInfo` (the same one
+    /// `get_flight_info` produces) and report it complete: the result is ready
+    /// immediately, so progress is `1.0` and there is no continuation
+    /// descriptor (long-running async polling is W-002).
     async fn poll_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("PollFlightInfo not implemented"))
+        let auth = self.authenticate(request.metadata())?;
+        let info = self.flight_info_for(request.into_inner(), &auth).await?;
+        let poll = PollInfo {
+            info: Some(info),
+            flight_descriptor: None,
+            progress: Some(1.0),
+            expiration_time: None,
+        };
+        Ok(Response::new(poll))
     }
 
     /// Write Arrow rows into `keyspace.table` (from the `ferrosa-table`
@@ -581,17 +635,66 @@ impl FlightService for FerrosaFlight {
         Ok(Response::new(Box::pin(acks) as Self::DoExchangeStream))
     }
 
+    /// Handle a supported action (see [`SUPPORTED_ACTIONS`]). `server.info`
+    /// reports the service name + crate version; `token.validate` echoes the
+    /// verified bearer identity. Both require auth; any other type is rejected
+    /// with `InvalidArgument`.
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("DoAction not implemented"))
+        let auth = self.authenticate(request.metadata())?;
+        let action = request.into_inner();
+        let body: Vec<u8> = match action.r#type.as_str() {
+            "server.info" => format!(
+                "{{\"service\":\"ferrosa-flight\",\"version\":\"{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            )
+            .into_bytes(),
+            "token.validate" => format!(
+                "{{\"role\":\"{}\",\"is_superuser\":{}}}",
+                auth.role, auth.is_superuser
+            )
+            .into_bytes(),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown action type {other:?}"
+                )))
+            }
+        };
+        let result = arrow_flight::Result { body: body.into() };
+        Ok(Response::new(
+            Box::pin(futures::stream::once(async move { Ok(result) })) as Self::DoActionStream,
+        ))
     }
 
+    /// Advertise the actions [`do_action`](Self::do_action) supports.
     async fn list_actions(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("ListActions not implemented"))
+        self.authenticate(request.metadata())?;
+        let actions: Vec<ActionType> = SUPPORTED_ACTIONS
+            .iter()
+            .map(|(r#type, description)| ActionType {
+                r#type: (*r#type).to_string(),
+                description: (*description).to_string(),
+            })
+            .collect();
+        let stream = futures::stream::iter(actions.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(stream) as Self::ListActionsStream))
     }
 }
+
+/// Action types `do_action` handles, with their descriptions. `list_actions`
+/// advertises exactly this set, so the two stay in lock-step.
+const SUPPORTED_ACTIONS: &[(&str, &str)] = &[
+    (
+        "server.info",
+        "Return the Flight service name and crate version as JSON.",
+    ),
+    (
+        "token.validate",
+        "Validate the presented bearer token and return its verified role.",
+    ),
+];
