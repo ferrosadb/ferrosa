@@ -1,0 +1,18 @@
+[package]
+name = "ferrosa-cdc"
+description = "Change-data-capture event types and bus for Ferrosa SUBSCRIBE streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Foundation-only dependencies (see specs/proposed/arrow-flight-endpoint/dsm-analysis.md):
+# ferrosa-cdc must NOT depend on ferrosa-storage (which depends on ferrosa-cdc),
+# so CdcEvent reuses ferrosa_sstable::Row rather than ferrosa_storage::Mutation.
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-sstable = { path = "../ferrosa-sstable" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
