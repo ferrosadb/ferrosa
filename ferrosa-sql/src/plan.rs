@@ -974,6 +974,62 @@ mod tests {
         assert_eq!(r2.rows[0].get(0), &Value::Text("bob".into()));
     }
 
+    /// Self-contained NULL / three-valued-logic known-answer corpus (oracle R11).
+    /// No container, no Postgres — fixed expected results assert ferrosa's 3VL
+    /// at the SELECT level: comparisons with NULL are UNKNOWN and excluded;
+    /// AND/OR/NOT follow Kleene logic. Runs in the default test gate.
+    #[test]
+    fn null_3vl_known_answer_corpus() {
+        // t(id int, v text NULL, n int NULL) with NULLs in v and/or n.
+        let t = Arc::new(InMemoryTable::new(
+            RelSchema::new(vec![
+                Column::new("id", ColumnType::Int),
+                Column::new("v", ColumnType::Text),
+                Column::new("n", ColumnType::Int),
+            ]),
+            vec![
+                Row::new(vec![Value::Int(1), Value::Text("x".into()), Value::Int(10)]),
+                Row::new(vec![Value::Int(2), Value::Null, Value::Int(20)]),
+                Row::new(vec![Value::Int(3), Value::Text("y".into()), Value::Null]),
+                Row::new(vec![Value::Int(4), Value::Null, Value::Null]),
+            ],
+        ));
+        let cat = MapCatalog::new().with_table("public", "t", t);
+        let ids = |sql: &str| -> Vec<i64> {
+            let r = execute(&parse(sql).unwrap(), &cat, "public", &[]).unwrap();
+            let mut v: Vec<i64> = r
+                .rows
+                .iter()
+                .map(|row| match row.get(0) {
+                    Value::Int(i) => *i,
+                    other => panic!("expected int id, got {other:?}"),
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Equality / inequality against a NULL operand is UNKNOWN -> row excluded.
+        assert_eq!(ids("SELECT id FROM t WHERE v = 'x' ORDER BY id"), vec![1]);
+        assert_eq!(ids("SELECT id FROM t WHERE v != 'x' ORDER BY id"), vec![3]);
+        assert_eq!(ids("SELECT id FROM t WHERE n >= 20 ORDER BY id"), vec![2]);
+        // AND: UNKNOWN unless the false branch short-circuits.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE v = 'x' AND n = 10 ORDER BY id"),
+            vec![1]
+        );
+        // OR: TRUE if either branch is TRUE, even when the other is UNKNOWN.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE v = 'x' OR n = 20 ORDER BY id"),
+            vec![1, 2]
+        );
+        // NOT UNKNOWN is UNKNOWN -> NULL rows still excluded.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE NOT (v = 'x') ORDER BY id"),
+            vec![3]
+        );
+    }
+
     #[test]
     fn missing_parameter_fails_loud() {
         let stmt = parse("SELECT name FROM users WHERE id = $1").unwrap();
