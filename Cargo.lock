@@ -1838,6 +1838,7 @@ dependencies = [
  "bytes",
  "chrono",
  "dashmap",
+ "ferrosa-cdc",
  "ferrosa-cluster",
  "ferrosa-common",
  "ferrosa-index",

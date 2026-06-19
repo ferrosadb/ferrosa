@@ -629,32 +629,37 @@ pub(crate) async fn handle_connection<S>(
                         inner,
                         interval,
                         delta,
+                        streams,
                     } => {
-                        let interval = match interval {
-                            Some(d) => d,
-                            None => {
-                                // Change-driven mode not yet implemented
-                                let err = CqlError::Invalid(
-                                    "SUBSCRIBE without EVERY not yet supported; \
-                                     use SUBSCRIBE ... EVERY <interval>"
-                                        .into(),
-                                );
-                                let body = err.encode_body().freeze();
-                                let frame = CqlFrame {
-                                    header: FrameHeader {
-                                        version: VERSION_RESPONSE,
-                                        flags: 0,
-                                        stream_id,
-                                        opcode: Opcode::Error,
-                                        length: 0,
-                                    },
-                                    body,
-                                };
-                                if framed.send(frame).await.is_err() {
-                                    break;
+                        // Snapshot mode requires EVERY <interval>; event-driven CDC
+                        // mode (ON LOCAL|COMMITTED) needs no interval.
+                        let snapshot_interval = match streams {
+                            crate::ast::SubscribeStreams::Cdc { .. } => None,
+                            crate::ast::SubscribeStreams::Snapshot => match interval {
+                                Some(d) => Some(d),
+                                None => {
+                                    let err = CqlError::Invalid(
+                                        "SUBSCRIBE without EVERY not yet supported; \
+                                         use SUBSCRIBE ... EVERY <interval>"
+                                            .into(),
+                                    );
+                                    let body = err.encode_body().freeze();
+                                    let frame = CqlFrame {
+                                        header: FrameHeader {
+                                            version: VERSION_RESPONSE,
+                                            flags: 0,
+                                            stream_id,
+                                            opcode: Opcode::Error,
+                                            length: 0,
+                                        },
+                                        body,
+                                    };
+                                    if framed.send(frame).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
+                            },
                         };
 
                         // Create a cancellation token and register the subscription.
@@ -705,23 +710,39 @@ pub(crate) async fn handle_connection<S>(
                             must_change_password: false,
                         });
 
-                        crate::subscribe::spawn_subscription_poll(
-                            stream_id,
-                            interval,
-                            state.clone(),
-                            auth,
-                            current_keyspace.clone(),
-                            *inner,
-                            sub_tx.clone(),
-                            cancel,
-                            delta,
-                            task_pool.clone(),
-                        );
+                        match streams {
+                            crate::ast::SubscribeStreams::Cdc { local, committed } => {
+                                crate::subscribe::spawn_cdc_subscription(
+                                    stream_id,
+                                    state.clone(),
+                                    auth,
+                                    current_keyspace.clone(),
+                                    *inner,
+                                    sub_tx.clone(),
+                                    cancel,
+                                    local,
+                                    committed,
+                                    task_pool.clone(),
+                                );
+                            }
+                            crate::ast::SubscribeStreams::Snapshot => {
+                                crate::subscribe::spawn_subscription_poll(
+                                    stream_id,
+                                    snapshot_interval
+                                        .expect("snapshot mode resolves an interval above"),
+                                    state.clone(),
+                                    auth,
+                                    current_keyspace.clone(),
+                                    *inner,
+                                    sub_tx.clone(),
+                                    cancel,
+                                    delta,
+                                    task_pool.clone(),
+                                );
+                            }
+                        }
 
-                        debug!(
-                            "subscription started for {peer} stream={stream_id} interval={:?}",
-                            interval
-                        );
+                        debug!("subscription started for {peer} stream={stream_id}");
                     }
                     HandleResult::CancelSubscription { stream_id: sub_id } => {
                         subscription_state.cancel(sub_id);
@@ -829,26 +850,33 @@ where
             inner,
             interval,
             delta,
+            streams,
         } => {
-            let interval = match interval {
-                Some(d) => d,
-                None => {
-                    let err = CqlError::Invalid(
-                        "SUBSCRIBE without EVERY not yet supported; use SUBSCRIBE ... EVERY <interval>"
-                            .into(),
-                    );
-                    let frame = CqlFrame {
-                        header: FrameHeader {
-                            version: VERSION_RESPONSE,
-                            flags: 0,
-                            stream_id,
-                            opcode: Opcode::Error,
-                            length: 0,
-                        },
-                        body: err.encode_body().freeze(),
-                    };
-                    return framed.send(frame).await.is_ok();
-                }
+            use crate::ast::SubscribeStreams;
+            // Snapshot mode (no ON clause) requires EVERY <interval>; event-driven
+            // CDC mode (ON LOCAL|COMMITTED) needs no interval.
+            let snapshot_interval = match streams {
+                SubscribeStreams::Cdc { .. } => None,
+                SubscribeStreams::Snapshot => match interval {
+                    Some(d) => Some(d),
+                    None => {
+                        let err = CqlError::Invalid(
+                            "SUBSCRIBE without EVERY not yet supported; use SUBSCRIBE ... EVERY <interval>"
+                                .into(),
+                        );
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode: Opcode::Error,
+                                length: 0,
+                            },
+                            body: err.encode_body().freeze(),
+                        };
+                        return framed.send(frame).await.is_ok();
+                    }
+                },
             };
             let cancel = tokio_util::sync::CancellationToken::new();
             let handle = crate::subscribe::SubscriptionHandle {
@@ -888,18 +916,36 @@ where
                 is_superuser: true,
                 must_change_password: false,
             });
-            crate::subscribe::spawn_subscription_poll(
-                stream_id,
-                interval,
-                state.clone(),
-                auth,
-                current_keyspace.clone(),
-                *inner,
-                sub_tx.clone(),
-                cancel,
-                delta,
-                TaskPool::current("cql-subscription"),
-            );
+            match streams {
+                SubscribeStreams::Cdc { local, committed } => {
+                    crate::subscribe::spawn_cdc_subscription(
+                        stream_id,
+                        state.clone(),
+                        auth,
+                        current_keyspace.clone(),
+                        *inner,
+                        sub_tx.clone(),
+                        cancel,
+                        local,
+                        committed,
+                        TaskPool::current("cql-cdc-subscription"),
+                    );
+                }
+                SubscribeStreams::Snapshot => {
+                    crate::subscribe::spawn_subscription_poll(
+                        stream_id,
+                        snapshot_interval.expect("snapshot mode resolves an interval above"),
+                        state.clone(),
+                        auth,
+                        current_keyspace.clone(),
+                        *inner,
+                        sub_tx.clone(),
+                        cancel,
+                        delta,
+                        TaskPool::current("cql-subscription"),
+                    );
+                }
+            }
             true
         }
         HandleResult::CancelSubscription { stream_id: sub_id } => {
@@ -977,11 +1023,13 @@ pub(crate) enum HandleResult {
     /// Close immediately without sending anything (reserved for future use).
     #[allow(dead_code)]
     CloseNow,
-    /// Subscription accepted — send void ACK, then spawn polling task.
+    /// Subscription accepted — send void ACK, then spawn the delivery task
+    /// (snapshot poll, or an event-driven CDC subscriber per `streams`).
     StartSubscription {
         inner: Box<crate::ast::Statement>,
         interval: Option<Duration>,
         delta: bool,
+        streams: crate::ast::SubscribeStreams,
     },
     /// Unsubscribe — cancel one or all subscriptions.
     CancelSubscription { stream_id: Option<u16> },
@@ -1405,10 +1453,12 @@ async fn handle_query(
             inner,
             interval,
             delta,
+            streams,
         }) => HandleResult::StartSubscription {
             inner,
             interval,
             delta,
+            streams,
         },
         Ok(RouteResult::Unsubscribe { stream_id }) => {
             HandleResult::CancelSubscription { stream_id }

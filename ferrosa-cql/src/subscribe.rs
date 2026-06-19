@@ -314,6 +314,125 @@ pub fn spawn_subscription_poll(
     });
 }
 
+/// Spawn an event-driven CDC subscription (`SUBSCRIBE ... ON LOCAL|COMMITTED`).
+///
+/// Reads change events from the engine's shared CDC bus for the selected
+/// stream(s), filters them to the SELECT's target table, encodes each event to
+/// a CQL RESULT frame via [`crate::router::cdc_event_to_result_frame`], and
+/// pushes it to the connection. **Streaming**: one event at a time, bounded by
+/// the bus; never materializes the change stream. A lagging consumer receives a
+/// loud gap log (the bounded bus drops oldest); the connection-closed or
+/// cancelled cases stop the task.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_cdc_subscription(
+    stream_id: i16,
+    state: Arc<SharedState>,
+    auth: AuthContext,
+    keyspace: Option<String>,
+    inner: Statement,
+    push_tx: mpsc::Sender<SubscriptionPush>,
+    cancel: CancellationToken,
+    local: bool,
+    committed: bool,
+    task_pool: TaskPool,
+) {
+    task_pool.spawn(async move {
+        // Permission was already enforced at SUBSCRIBE time (router check).
+        let _ = &auth;
+
+        let select = match inner {
+            Statement::Select(s) => s,
+            _ => {
+                tracing::error!(stream_id, "CDC subscription inner is not a SELECT");
+                return;
+            }
+        };
+        let ks = match select.keyspace.clone().or(keyspace) {
+            Some(k) => k,
+            None => {
+                tracing::error!(stream_id, "CDC subscription has no keyspace");
+                return;
+            }
+        };
+        let table = select.table.clone();
+
+        // The shared CDC bus is attached to the engine in production startup.
+        let bus = match state.engine.cdc_bus() {
+            Some(b) => b,
+            None => {
+                tracing::error!(
+                    stream_id, %ks, %table,
+                    "CDC SUBSCRIBE requested but no CDC bus is attached to the engine"
+                );
+                return;
+            }
+        };
+
+        let mut local_sub = local.then(|| bus.subscribe(ferrosa_cdc::CdcStream::WrittenOnNode));
+        let mut committed_sub =
+            committed.then(|| bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster));
+
+        loop {
+            // Await the next event from whichever stream(s) are active, or stop
+            // on cancel. One event at a time — backpressure is the bounded bus.
+            let event = match (local_sub.as_mut(), committed_sub.as_mut()) {
+                (Some(l), Some(c)) => tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    e = l.recv() => e,
+                    e = c.recv() => e,
+                },
+                (Some(s), None) | (None, Some(s)) => tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    e = s.recv() => e,
+                },
+                (None, None) => break,
+            };
+
+            match event {
+                Ok(ev) => {
+                    // Only deliver changes for this subscription's table.
+                    if ev.keyspace != ks || ev.table != table {
+                        continue;
+                    }
+                    match crate::router::cdc_event_to_result_frame(
+                        &state.schema,
+                        &ks,
+                        &select,
+                        ev.key,
+                        ev.rows,
+                    ) {
+                        Ok(Some(body)) => {
+                            let push = SubscriptionPush {
+                                stream_id,
+                                body: body.freeze(),
+                            };
+                            if push_tx.send(push).await.is_err() {
+                                break; // connection writer gone
+                            }
+                        }
+                        Ok(None) => { /* table dropped between subscribe and event */ }
+                        Err(e) => {
+                            tracing::error!(stream_id, %ks, %table, error = %e, "CDC encode failed");
+                        }
+                    }
+                }
+                Err(ferrosa_cdc::CdcRecvError::Lagged { skipped }) => {
+                    // Fail-loud gap: the consumer fell behind and the bounded bus
+                    // dropped events. Log; a future refinement emits an explicit
+                    // gap marker so clients can resync.
+                    tracing::warn!(
+                        stream_id, %ks, %table, skipped,
+                        "CDC subscription lagged — change events were dropped"
+                    );
+                }
+                Err(ferrosa_cdc::CdcRecvError::Closed) => break,
+                Err(ferrosa_cdc::CdcRecvError::Empty) => {}
+            }
+        }
+        tracing::debug!(stream_id, "CDC subscription ended");
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +602,86 @@ mod tests {
             kind, 0x0002,
             "expected Rows RESULT kind (0x0002), got 0x{kind:04X}"
         );
+    }
+
+    /// End-to-end CDC: a write must publish a WrittenOnNode change event that
+    /// the CDC subscription encodes and delivers as a RESULT frame — proving
+    /// the producer (commit-log tap) -> bus -> consumer path is live.
+    #[tokio::test]
+    async fn cdc_subscription_delivers_frame_on_write() {
+        use crate::router::{route, RequestContext};
+        use ferrosa_cluster::consistency::ConsistencyLevel;
+
+        let (state, _dir) = test_shared_state();
+        // Attach the shared CDC bus (production does this in main.rs).
+        let bus = ferrosa_cdc::CdcBus::new(64);
+        state.engine.set_cdc_bus(bus.clone());
+
+        let auth = superuser_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (id int PRIMARY KEY, v text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Spawn the CDC subscription (written-on-node) BEFORE the write.
+        let (tx, mut rx) = mpsc::channel::<SubscriptionPush>(8);
+        let cancel = CancellationToken::new();
+        let inner = crate::parser::parse("SELECT * FROM ks.t").unwrap();
+        spawn_cdc_subscription(
+            9,
+            state.clone(),
+            superuser_auth(),
+            None,
+            inner,
+            tx,
+            cancel,
+            true,  // local (written-on-node)
+            false, // committed
+            TaskPool::current("test-cdc"),
+        );
+
+        // Wait until the subscriber has registered on the bus so the write
+        // actually publishes (the has_subscribers guard).
+        for _ in 0..2000 {
+            if bus.has_subscribers(ferrosa_cdc::CdcStream::WrittenOnNode) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            bus.has_subscribers(ferrosa_cdc::CdcStream::WrittenOnNode),
+            "CDC subscriber must register on the bus"
+        );
+
+        // Write a row — the commit-log append publishes a WrittenOnNode event.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("INSERT INTO ks.t (id, v) VALUES (1, 'x')").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // The subscription must deliver a Rows RESULT frame for the change.
+        let push = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for CDC frame")
+            .expect("channel closed without a frame");
+        assert_eq!(push.stream_id, 9);
+        let kind = i32::from_be_bytes([push.body[0], push.body[1], push.body[2], push.body[3]]);
+        assert_eq!(kind, 0x0002, "expected Rows RESULT kind, got 0x{kind:04X}");
     }
 
     /// After cancellation the polling task must stop sending frames and the
