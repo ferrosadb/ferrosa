@@ -1113,15 +1113,28 @@ fn result_sets_agree(pg: &ResultSet, fe: &ResultSet) -> bool {
     })
 }
 
+/// Compare two cells soundly (oracle R10 "canonicalizer compares decoded values,
+/// no rounding"). Exact text equality is the primary test — it covers ints,
+/// text, uuids, inet, dates, etc. with NO tolerance. A numeric tolerance is
+/// applied ONLY to absorb a genuine FLOAT text-format gap: both sides must parse
+/// as `f64` AND at least one must be in float/scientific form (contains `.`,
+/// `e`, or `E`). This means two integers like `100` vs `101` are never fuzzily
+/// matched, and a text column is never rounded — only `1.5` vs
+/// `1.5000000000000000` (float8 vs numeric formatting) is reconciled.
 fn cells_agree(a: &Cell, b: &Cell) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
-            if let (Ok(fx), Ok(fy)) = (x.parse::<f64>(), y.parse::<f64>()) {
-                (fx - fy).abs() <= 1e-9 * fx.abs().max(fy.abs()).max(1.0)
-            } else {
-                x == y
+            if x == y {
+                return true;
             }
+            let float_formatted = |s: &str| s.contains('.') || s.contains('e') || s.contains('E');
+            if float_formatted(x) || float_formatted(y) {
+                if let (Ok(fx), Ok(fy)) = (x.parse::<f64>(), y.parse::<f64>()) {
+                    return (fx - fy).abs() <= 1e-9 * fx.abs().max(fy.abs()).max(1.0);
+                }
+            }
+            false
         }
         _ => false,
     }
