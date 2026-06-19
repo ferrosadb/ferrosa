@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, ScalarItem, ScalarValue,
-    SelectItem, SelectStmt, Statement, TableRef, Term,
+    AggArg, ColumnRef, Expr, InsertStmt, Join, Operand, OrderItem, Projection, ScalarItem,
+    ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -148,6 +148,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "ROLLBACK" | "ABORT" => Ok(Statement::Rollback),
             "SET" => p.parse_set(),
             "RESET" => p.parse_reset(),
+            "INSERT" => p.parse_insert(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -545,6 +546,69 @@ impl Parser {
                 found: format!("{t:?}"),
             }),
         }
+    }
+
+    /// Consume an identifier that case-insensitively equals `kw` (for the
+    /// keyword-like idents the lexer leaves as `Ident`: `INTO`, `VALUES`).
+    fn expect_ident_kw(&mut self, kw: &'static str) -> Result<(), ParseError> {
+        match self.next() {
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw) => Ok(()),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: kw,
+                found: format!("{t:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// A scalar value in a `VALUES` list: a `$N` parameter or a literal.
+    fn parse_scalar_value(&mut self) -> Result<ScalarValue, ParseError> {
+        if let Some(Tok::Param(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            Ok(ScalarValue::Param(n))
+        } else {
+            Ok(ScalarValue::Literal(self.parse_value()?))
+        }
+    }
+
+    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Assumes
+    /// `self.pos` is at the `INSERT` ident. Single-row; values are literals or
+    /// `$N` parameters, one per named column.
+    fn parse_insert(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // INSERT
+        self.expect_ident_kw("INTO")?;
+        let table = self.parse_table_ref()?;
+
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns = vec![self.ident()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            columns.push(self.ident()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+
+        self.expect_ident_kw("VALUES")?;
+        self.expect(&Tok::LParen, "(")?;
+        let mut values = vec![self.parse_scalar_value()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            values.push(self.parse_scalar_value()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        self.expect_end()?;
+
+        if columns.len() != values.len() {
+            return Err(ParseError::Unexpected {
+                expected: "matching column and value counts",
+                found: format!("{} columns, {} values", columns.len(), values.len()),
+            });
+        }
+        Ok(Statement::Insert(Box::new(InsertStmt {
+            table,
+            columns,
+            values,
+        })))
     }
 
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
@@ -1483,6 +1547,47 @@ mod tests {
                 alias: None,
             }])
         );
+    }
+
+    #[test]
+    fn parse_statement_insert() {
+        let stmt = parse_statement("INSERT INTO demo.t (id, v) VALUES (1, 'x')").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table.schema.as_deref(), Some("demo"));
+                assert_eq!(ins.table.table, "t");
+                assert_eq!(ins.columns, vec!["id".to_string(), "v".to_string()]);
+                assert_eq!(
+                    ins.values,
+                    vec![
+                        ScalarValue::Literal(Value::Int(1)),
+                        ScalarValue::Literal(Value::Text("x".into())),
+                    ]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_with_params_and_unqualified_table() {
+        let stmt = parse_statement("INSERT INTO t (a, b) VALUES ($1, $2)").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table.schema, None);
+                assert_eq!(ins.table.table, "t");
+                assert_eq!(
+                    ins.values,
+                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_rejects_arity_mismatch() {
+        assert!(parse_statement("INSERT INTO t (a, b) VALUES (1)").is_err());
     }
 
     #[test]
