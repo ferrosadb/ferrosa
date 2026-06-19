@@ -1,0 +1,17 @@
+[package]
+name = "ferrosa-view"
+description = "Materialized view core: metadata, DDL validation, and pure view-delta computation (protocol-agnostic, no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrosa-schema = { path = "../ferrosa-schema" }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+serde_json = "1"
+indexmap = { version = "2", features = ["serde"] }
+proptest = "1"
