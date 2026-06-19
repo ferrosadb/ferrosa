@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, InsertStmt, Join, Operand, OrderItem, Projection, ScalarItem,
-    ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term, UpdateStmt,
+    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, Join, Operand, OrderItem, Projection,
+    ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -150,6 +150,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "RESET" => p.parse_reset(),
             "INSERT" => p.parse_insert(),
             "UPDATE" => p.parse_update(),
+            "DELETE" => p.parse_delete(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -639,6 +640,24 @@ impl Parser {
             assignments,
             where_eq,
         })))
+    }
+
+    /// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Assumes `self.pos`
+    /// is at the `DELETE` ident. `WHERE` is equality-only on key columns.
+    fn parse_delete(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // DELETE
+        self.expect(&Tok::From, "FROM")?;
+        let table = self.parse_qualified_table()?;
+
+        self.expect(&Tok::Where, "WHERE")?;
+        let mut where_eq = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.next();
+            where_eq.push(self.parse_assignment()?);
+        }
+        self.expect_end()?;
+
+        Ok(Statement::Delete(Box::new(DeleteStmt { table, where_eq })))
     }
 
     /// Parse `[schema.]table` with NO trailing alias — for DML targets, where a
@@ -1687,6 +1706,25 @@ mod tests {
                 assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
             }
             other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_delete() {
+        let stmt = parse_statement("DELETE FROM demo.t WHERE id = 1 AND ck = 2").unwrap();
+        match stmt {
+            Statement::Delete(d) => {
+                assert_eq!(d.table.schema.as_deref(), Some("demo"));
+                assert_eq!(d.table.table, "t");
+                assert_eq!(
+                    d.where_eq,
+                    vec![
+                        ("id".to_string(), ScalarValue::Literal(Value::Int(1))),
+                        ("ck".to_string(), ScalarValue::Literal(Value::Int(2))),
+                    ]
+                );
+            }
+            other => panic!("expected Delete, got {other:?}"),
         }
     }
 
