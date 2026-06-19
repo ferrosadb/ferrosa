@@ -1545,7 +1545,7 @@ pub async fn route(
                 inner,
                 interval,
                 delta,
-                streams: _streams,
+                streams,
             } = spec;
             // Validate: inner must be a Select
             match inner.as_ref() {
@@ -1567,11 +1567,25 @@ pub async fn route(
                     ))
                 }
             }
-            Ok(RouteResult::Subscribe {
-                inner,
-                interval,
-                delta,
-            })
+            match streams {
+                // Legacy snapshot mode (no ON clause): re-execute the SELECT on
+                // an interval. Unchanged behavior.
+                crate::ast::SubscribeStreams::Snapshot => Ok(RouteResult::Subscribe {
+                    inner,
+                    interval,
+                    delta,
+                }),
+                // Event-driven CDC (ON LOCAL|COMMITTED): the producer side is
+                // wired (commit-log + Accord apply publish to the engine's CDC
+                // bus), but the streaming consumer that reads the bus, filters,
+                // and encodes change events to RESULT frames is not yet built.
+                // Fail loud rather than silently behaving like a poll.
+                crate::ast::SubscribeStreams::Cdc { .. } => Err(CqlError::Invalid(
+                    "SUBSCRIBE ... ON LOCAL|COMMITTED (event-driven change-data-capture) \
+                     is not yet supported"
+                        .into(),
+                )),
+            }
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
         Statement::CreateType {
