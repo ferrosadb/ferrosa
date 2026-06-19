@@ -21,7 +21,7 @@ use crate::codec::{self, CodecError};
 use crate::connection::{ConnError, Connection};
 use crate::extended::{self, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
-use crate::messages::{BackendMessage, FrontendMessage, TransactionStatus};
+use crate::messages::{BackendMessage, FrontendMessage};
 use crate::query;
 
 /// Shared context for the post-auth query phase: the storage engine and schema
@@ -178,12 +178,11 @@ where
     let mut out = BytesMut::new();
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs =
-                query::execute_query(&ctx.engine, &ctx.schema, &sql, &ctx.default_schema).await;
+            let msgs = execute_simple(ctx, session, &sql).await;
             for m in &msgs {
                 m.encode(&mut out);
             }
-            BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
+            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
         }
         FrontendMessage::Parse {
             stmt_name,
@@ -226,7 +225,7 @@ where
         }
         FrontendMessage::Sync => {
             session.on_sync();
-            BackendMessage::ReadyForQuery(TransactionStatus::Idle).encode(&mut out);
+            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
         }
         FrontendMessage::Terminate => return Ok(true),
         // SASL after auth, or any other unexpected message: ignore.
@@ -237,6 +236,77 @@ where
         stream.write_all(&out).await?;
     }
     Ok(false)
+}
+
+/// Execute one simple-query string with transaction-state awareness.
+///
+/// `BEGIN`/`COMMIT`/`ROLLBACK` drive the session's protocol transaction state
+/// (reported in the following `ReadyForQuery`). The front-end is read-only
+/// today, so a `COMMIT` has an empty write-set and nothing to apply; once DML
+/// lands, the accumulated writes commit here via Accord (blueprint D11 / the
+/// `T`-block-triggers-Accord seam). All other statements delegate to the
+/// stateless executor; an error inside a transaction aborts it (`T` → `E`), and
+/// while aborted only `COMMIT`/`ROLLBACK` are accepted (PG `25P02`).
+async fn execute_simple(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+) -> Vec<BackendMessage> {
+    let stmt = match ferrosa_sql::parse_statement(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            session.mark_txn_failed();
+            return vec![query::error_response("42601", &e.to_string())];
+        }
+    };
+
+    if session.in_failed_txn()
+        && !matches!(
+            stmt,
+            ferrosa_sql::Statement::Commit | ferrosa_sql::Statement::Rollback
+        )
+    {
+        return vec![query::error_response(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )];
+    }
+
+    match stmt {
+        ferrosa_sql::Statement::Begin => {
+            session.begin_txn();
+            vec![BackendMessage::CommandComplete {
+                tag: "BEGIN".to_string(),
+            }]
+        }
+        ferrosa_sql::Statement::Commit => {
+            // Accord commit seam: read-only front-end ⇒ empty write-set today.
+            session.end_txn();
+            vec![BackendMessage::CommandComplete {
+                tag: "COMMIT".to_string(),
+            }]
+        }
+        ferrosa_sql::Statement::Rollback => {
+            session.end_txn();
+            vec![BackendMessage::CommandComplete {
+                tag: "ROLLBACK".to_string(),
+            }]
+        }
+        // Data + session statements: delegate to the stateless executor. (It
+        // re-parses; cheap, and keeps the executor self-contained.)
+        _ => {
+            let msgs =
+                query::execute_query(&ctx.engine, &ctx.schema, sql, &ctx.default_schema).await;
+            if session.in_txn()
+                && msgs
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+            {
+                session.mark_txn_failed();
+            }
+            msgs
+        }
+    }
 }
 
 /// Handle `Describe`: for a statement (`S`), reply `ParameterDescription` then a

@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use ferrosa_sql::{parse, SelectStmt, Value as SqlValue};
 
-use crate::messages::BackendMessage;
+use crate::messages::{BackendMessage, TransactionStatus};
 use crate::query::{decode_param, error_response, exec_error_response, row_description_fields};
 
 /// A prepared statement: the parsed SELECT plus the client-declared parameter
@@ -55,6 +55,10 @@ pub struct Session {
     portals: HashMap<String, Portal>,
     /// Set when an error occurs mid-sequence; skip messages until `Sync`.
     error_pending: bool,
+    /// Protocol-level transaction state, reported in every `ReadyForQuery`
+    /// (`I`/`T`/`E`). Entering a `T` block is the trigger to route the
+    /// transaction's writes through Accord once DML lands (blueprint D11).
+    txn: TransactionStatus,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -102,6 +106,43 @@ impl Session {
     /// `ReadyForQuery`.
     pub fn on_sync(&mut self) {
         self.error_pending = false;
+    }
+
+    /// The protocol transaction status to report in `ReadyForQuery`.
+    pub fn txn_status(&self) -> TransactionStatus {
+        self.txn
+    }
+
+    /// Whether the session is inside an open (non-failed) transaction block.
+    pub fn in_txn(&self) -> bool {
+        matches!(self.txn, TransactionStatus::InTransaction)
+    }
+
+    /// Whether the session is inside an aborted transaction block (only
+    /// `COMMIT`/`ROLLBACK` are accepted until it ends — PG `25P02`).
+    pub fn in_failed_txn(&self) -> bool {
+        matches!(self.txn, TransactionStatus::Failed)
+    }
+
+    /// `BEGIN`: enter a transaction block. A `BEGIN` while already in one keeps
+    /// the session in-transaction (PG warns but stays `T`).
+    pub fn begin_txn(&mut self) {
+        if matches!(self.txn, TransactionStatus::Idle) {
+            self.txn = TransactionStatus::InTransaction;
+        }
+    }
+
+    /// `COMMIT`/`ROLLBACK`: leave the transaction block, back to idle.
+    pub fn end_txn(&mut self) {
+        self.txn = TransactionStatus::Idle;
+    }
+
+    /// An error while executing a statement inside a transaction aborts it
+    /// (`T` → `E`); a no-op outside a transaction.
+    pub fn mark_txn_failed(&mut self) {
+        if matches!(self.txn, TransactionStatus::InTransaction) {
+            self.txn = TransactionStatus::Failed;
+        }
     }
 
     /// Handle `Parse`: parse the SQL and store the prepared statement. On a
@@ -341,5 +382,36 @@ mod tests {
             describe_statement_rows(&cols),
             BackendMessage::RowDescription { .. }
         ));
+    }
+
+    #[test]
+    fn transaction_state_machine() {
+        let mut s = Session::new();
+        // Starts idle.
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+        assert!(!s.in_txn() && !s.in_failed_txn());
+
+        // BEGIN -> in transaction.
+        s.begin_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
+        assert!(s.in_txn());
+
+        // An error inside the txn aborts it (T -> E).
+        s.mark_txn_failed();
+        assert_eq!(s.txn_status(), TransactionStatus::Failed);
+        assert!(s.in_failed_txn() && !s.in_txn());
+
+        // ROLLBACK/COMMIT clears it back to idle.
+        s.end_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+
+        // mark_txn_failed is a no-op outside a transaction.
+        s.mark_txn_failed();
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+
+        // BEGIN while already in a transaction stays in-transaction.
+        s.begin_txn();
+        s.begin_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
     }
 }
