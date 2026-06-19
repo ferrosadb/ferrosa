@@ -33,6 +33,8 @@ pub enum Statement {
     Reset { name: String },
     /// `INSERT INTO t (cols) VALUES (...)`. Boxed for size parity with `Select`.
     Insert(Box<InsertStmt>),
+    /// `UPDATE t SET ... WHERE ...`. Boxed for size parity with `Select`.
+    Update(Box<UpdateStmt>),
 }
 
 /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Single-row, with
@@ -42,6 +44,16 @@ pub struct InsertStmt {
     pub table: TableRef,
     pub columns: Vec<String>,
     pub values: Vec<ScalarValue>,
+}
+
+/// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`. The
+/// `WHERE` is restricted to equality on key columns (Cassandra-style upsert: the
+/// full primary key identifies the row); `assignments` are the SET cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStmt {
+    pub table: TableRef,
+    pub assignments: Vec<(String, ScalarValue)>,
+    pub where_eq: Vec<(String, ScalarValue)>,
 }
 
 /// One projected scalar in a no-`FROM` SELECT, with an optional `AS` alias.
