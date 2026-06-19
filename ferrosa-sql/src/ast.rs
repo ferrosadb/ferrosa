@@ -6,6 +6,53 @@
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
 
+/// A parsed top-level SQL statement — the unit a Postgres-wire client sends.
+///
+/// `parse_statement` returns this; the legacy `parse` returns just the
+/// [`SelectStmt`] for table queries (kept for callers that only do table
+/// scans). Transaction-control and session statements are *parsed* here; the
+/// front-end gives them their real semantics (transactions route through
+/// Accord — they are never silently no-op'd).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {
+    /// A table query: `SELECT ... FROM ...`. Boxed — `SelectStmt` is far larger
+    /// than the other variants.
+    Select(Box<SelectStmt>),
+    /// A no-`FROM` expression query (`SELECT 1`, `SELECT version()`,
+    /// `SELECT $1`) — yields exactly one row.
+    SelectExprs(Vec<ScalarItem>),
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin,
+    /// `COMMIT` / `END`.
+    Commit,
+    /// `ROLLBACK` / `ABORT`.
+    Rollback,
+    /// `SET <name> [=|TO] <value>`.
+    Set { name: String, value: String },
+    /// `RESET <name>` (`RESET ALL` carries name `ALL`).
+    Reset { name: String },
+}
+
+/// One projected scalar in a no-`FROM` SELECT, with an optional `AS` alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarItem {
+    pub value: ScalarValue,
+    pub alias: Option<String>,
+}
+
+/// A scalar value in a no-`FROM` SELECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarValue {
+    /// An inline literal (`1`, `'x'`, `TRUE`, `NULL`).
+    Literal(Value),
+    /// A bare (zero-arg) function call (`version()`, `current_database()`, …),
+    /// carrying the uppercased function name. The front-end evaluates it (it
+    /// owns the session context the function needs).
+    Func(String),
+    /// A `$N` parameter placeholder (extended-query path).
+    Param(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStmt {
     pub distinct: bool,
