@@ -1,0 +1,28 @@
+# Minimal runtime image for the ferrosa engine.
+# COPY-only: the musl static binaries are built upstream (release.yml) and
+# downloaded into dist/<arch>/ before this build. No compilation happens here,
+# so the multi-arch build needs no QEMU emulation.
+FROM alpine:3.20
+
+# ca-certificates: required for TLS to S3. tzdata: correct timestamps/logs.
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S ferrosa \
+    && adduser -S -G ferrosa -u 10001 ferrosa \
+    && mkdir -p /etc/ferrosa /var/lib/ferrosa \
+    && chown -R ferrosa:ferrosa /var/lib/ferrosa
+
+# buildx sets TARGETARCH automatically per --platform entry (amd64 | arm64).
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/ferrosa     /usr/local/bin/ferrosa
+COPY dist/${TARGETARCH}/ferrosa-ctl /usr/local/bin/ferrosa-ctl
+# Reference only — NOT the active config. Operators inject via env or a mount.
+COPY config/ferrosa.example.toml    /etc/ferrosa/ferrosa.example.toml
+
+ENV FERROSA_CONFIG=/etc/ferrosa/ferrosa.toml \
+    FERROSA_DATA_DIR=/var/lib/ferrosa
+
+# CQL, internode RPC, web/Prometheus, graph HTTP, Bolt, Arrow Flight gRPC.
+EXPOSE 9042 17000 9090 7474 7687 8815
+VOLUME /var/lib/ferrosa
+USER ferrosa
+ENTRYPOINT ["ferrosa"]
