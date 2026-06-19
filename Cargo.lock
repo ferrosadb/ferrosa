@@ -2206,6 +2206,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-skiplist",
  "dashmap",
+ "ferrosa-cdc",
  "ferrosa-common",
  "ferrosa-index",
  "ferrosa-schema",
