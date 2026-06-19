@@ -1216,6 +1216,10 @@ impl ModeController {
         {
             let storage = self.storage.clone();
             let accord_state = accord_state_for_maintenance;
+            // Honor shutdown: without this the maintenance loop ignores the
+            // cancel token and shutdown() blocks the full 10s drain deadline
+            // before abort_all() force-kills it (×3 nodes = ~30s in tests).
+            let maint_cancel = self.cancel.clone();
             self.spawn_tracked(async move {
                 let urgent_flush_interval_millis =
                     std::env::var("FERROSA_URGENT_FLUSH_INTERVAL_MILLIS")
@@ -1228,7 +1232,11 @@ impl ModeController {
                 ));
                 let mut ticks = 0u64;
                 loop {
-                    interval.tick().await;
+                    // Stop promptly on shutdown instead of being force-aborted.
+                    tokio::select! {
+                        _ = maint_cancel.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     ticks = ticks.wrapping_add(1);
 
                     if storage.take_flush_request() {
