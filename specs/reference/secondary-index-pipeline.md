@@ -177,7 +177,7 @@ sequenceDiagram
     SE->>SI: lookup(key) for each SSTable sidecar
     SI-->>SE: [RowPosition(pk2, ck2), ...]
     SE->>SE: fetch rows by RowPosition, merge, deduplicate
-    SE-->>R: Vec<(DecoratedKey, Vec<Row>)>
+    SE-->>R: Vec&lt;(DecoratedKey, Vec&lt;Row&gt;)&gt;
     R-->>C: RESULT rows
 ```
 

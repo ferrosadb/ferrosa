@@ -32,11 +32,13 @@
 
 use std::sync::Arc;
 
-use ferrosa_schema::Schema;
+use ferrosa_common::{CqlType, CqlValue};
+use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    execute, parse, ColumnType, ExecError, MapCatalog, QueryResult, Value as SqlValue,
+    execute, parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
+    QueryResult, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
-use ferrosa_storage::StorageEngine;
+use ferrosa_storage::{Mutation, StorageEngine};
 
 use crate::messages::{BackendMessage, FieldDescription};
 use crate::storage_provider::{load_table, LoadError};
@@ -684,24 +686,540 @@ pub async fn execute_query(
     sql: &str,
     default_schema: &str,
 ) -> Vec<BackendMessage> {
-    // 1. Parse.
-    let stmt = match parse(sql) {
+    // 1. Parse the top-level statement.
+    let stmt = match parse_statement(sql) {
         Ok(stmt) => stmt,
         Err(e) => return vec![error_response("42601", &e.to_string())],
     };
 
-    // 2. Load every referenced table into a catalog. The R15 guard lives in
-    //    `load_table`: a missing table is `NoSuchTable`, never an empty scan.
-    let catalog = match load_catalog(engine, schema, &stmt, default_schema).await {
-        Ok(catalog) => catalog,
-        Err(err_msg) => return vec![err_msg],
+    match stmt {
+        // Table query: load referenced tables (the R15 guard lives in
+        // `load_table` — a missing table is `NoSuchTable`, never an empty
+        // scan), then execute over the materialized snapshots.
+        Statement::Select(select) => {
+            let catalog = match load_catalog(engine, schema, &select, default_schema).await {
+                Ok(catalog) => catalog,
+                Err(err_msg) => return vec![err_msg],
+            };
+            match execute(&select, &catalog, default_schema, &[]) {
+                Ok(result) => render_result(result, &[]), // simple query: all text
+                Err(e) => vec![exec_error_response(&e)],
+            }
+        }
+        // No-`FROM` expression query: `SELECT 1`, `SELECT version()`, etc.
+        Statement::SelectExprs(items) => match execute_scalar_select(&items, default_schema) {
+            Ok(result) => render_result(result, &[]),
+            Err(err_msg) => vec![err_msg],
+        },
+        // Transaction control routes through Accord; execution is wired
+        // separately (t_0f96cb47). Fail loud rather than fake atomicity.
+        Statement::Begin | Statement::Commit | Statement::Rollback => vec![error_response(
+            "0A000",
+            "transactions are not yet implemented (Accord-backed transactions are in progress)",
+        )],
+        // Session GUCs are not modeled yet.
+        Statement::Set { .. } | Statement::Reset { .. } => vec![error_response(
+            "0A000",
+            "SET/RESET session statements are not yet implemented",
+        )],
+        // DML: single-row INSERT / UPDATE / DELETE write through the engine.
+        Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema),
+        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema),
+        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema),
+    }
+}
+
+/// Convert a SQL [`SqlValue`] literal to the [`CqlValue`] the engine stores,
+/// driven by the target column's [`CqlType`]. The inverse of
+/// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
+/// and a type mismatch fails loud (`42804`) rather than silently coercing.
+fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessage> {
+    if matches!(value, SqlValue::Null) {
+        return Ok(CqlValue::Null);
+    }
+    let out = match (ty, value) {
+        (CqlType::Int, SqlValue::Int(i)) => CqlValue::Int(
+            i32::try_from(*i).map_err(|_| error_response("22003", "integer out of int4 range"))?,
+        ),
+        (CqlType::Bigint, SqlValue::Int(i)) => CqlValue::Bigint(*i),
+        (CqlType::Counter, SqlValue::Int(i)) => CqlValue::Counter(*i),
+        (CqlType::Smallint, SqlValue::Int(i)) => CqlValue::Smallint(
+            i16::try_from(*i).map_err(|_| error_response("22003", "out of smallint range"))?,
+        ),
+        (CqlType::Tinyint, SqlValue::Int(i)) => CqlValue::Tinyint(
+            i8::try_from(*i).map_err(|_| error_response("22003", "out of tinyint range"))?,
+        ),
+        (CqlType::Varchar, SqlValue::Text(s)) => CqlValue::Text(s.clone()),
+        (CqlType::Ascii, SqlValue::Text(s)) => CqlValue::Ascii(s.clone()),
+        (CqlType::Boolean, SqlValue::Bool(b)) => CqlValue::Boolean(*b),
+        (CqlType::Float, SqlValue::Float(f)) => CqlValue::Float((f.into_inner() as f32).to_bits()),
+        (CqlType::Double, SqlValue::Float(f)) => CqlValue::Double(f.into_inner().to_bits()),
+        (CqlType::Float, SqlValue::Int(i)) => CqlValue::Float((*i as f32).to_bits()),
+        (CqlType::Double, SqlValue::Int(i)) => CqlValue::Double((*i as f64).to_bits()),
+        (CqlType::Uuid, SqlValue::Uuid(u)) => CqlValue::Uuid(*u),
+        (CqlType::Timeuuid, SqlValue::Uuid(u)) => CqlValue::Timeuuid(*u),
+        (CqlType::Blob, SqlValue::Bytea(b)) => CqlValue::Blob(b.clone()),
+        (CqlType::Timestamp, SqlValue::Timestamp(micros)) => CqlValue::Timestamp(micros / 1000),
+        (CqlType::Date, SqlValue::Date(d)) => {
+            CqlValue::Date((i64::from(*d) + 2_147_483_648) as u32)
+        }
+        (CqlType::Time, SqlValue::Time(micros)) => CqlValue::Time(micros * 1000),
+        (CqlType::Inet, SqlValue::Inet(ip)) => CqlValue::Inet(*ip),
+        (CqlType::Decimal, SqlValue::Numeric { unscaled, scale }) => CqlValue::Decimal {
+            scale: *scale,
+            unscaled: unscaled.clone(),
+        },
+        (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
+            CqlValue::Varint(unscaled.clone())
+        }
+        _ => {
+            return Err(error_response(
+                "42804",
+                &format!("value does not match column type {ty:?}"),
+            ))
+        }
+    };
+    Ok(out)
+}
+
+/// Execute a single-row `INSERT`: materialize the row from the table schema and
+/// write it through the engine. Returns `CommandComplete "INSERT 0 1"` (Postgres
+/// reports oid 0 + a 1-row count). The row encoder is the shared
+/// `ferrosa-row-bridge` one — the SAME bytes the engine + CQL reads decode.
+fn execute_insert(
+    engine: &StorageEngine,
+    schema: &Schema,
+    ins: &InsertStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), ins.table.table.clone())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{}\" does not exist", ins.table.table),
+            )]
+        }
     };
 
-    // 3. Bind + execute over the materialized snapshots (simple query: no
-    //    bound parameters).
-    match execute(&stmt, &catalog, default_schema, &[]) {
-        Ok(result) => render_result(result, &[]), // simple query: all text format
-        Err(e) => vec![exec_error_response(&e)],
+    // Convert each named column's value (per its CQL type); collect regular/
+    // static cells by storage index, and all values by name for key ordering.
+    let mut col_values: HashMap<String, CqlValue> = HashMap::new();
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for (i, col_name) in ins.columns.iter().enumerate() {
+        let col_meta = match meta.columns.get(col_name) {
+            Some(c) => c,
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!(
+                        "column \"{col_name}\" of relation \"{}\" does not exist",
+                        ins.table.table
+                    ),
+                )]
+            }
+        };
+        let cql_type =
+            match ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            {
+                Ok(t) => t,
+                Err(e) => return vec![error_response("42704", &e.to_string())],
+            };
+        let value = match &ins.values[i] {
+            ScalarValue::Literal(v) => match value_to_cql(v, &cql_type) {
+                Ok(cv) => cv,
+                Err(msg) => return vec![msg],
+            },
+            ScalarValue::Param(_) => {
+                return vec![error_response(
+                "0A000",
+                "$N parameters in INSERT require the extended-query protocol (not yet supported)",
+            )]
+            }
+            ScalarValue::Func(_) => {
+                return vec![error_response(
+                    "0A000",
+                    "function calls in INSERT VALUES are not supported",
+                )]
+            }
+        };
+        if matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            if let Some(idx) = meta.storage_column_index(col_name) {
+                regular_cells.push((idx, value.clone()));
+            }
+        }
+        col_values.insert(col_name.clone(), value);
+    }
+
+    // Partition-key and clustering values in key order — all required for INSERT.
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match col_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in INSERT"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match col_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in INSERT"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
+    let mutation = Mutation::new(
+        ks.to_string(),
+        ins.table.table.clone(),
+        key,
+        vec![row],
+        timestamp,
+    );
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "INSERT 0 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+    }
+}
+
+/// Resolve a `(column, value)` pair from a DML statement to its `CqlValue`,
+/// looking up the column's CQL type from `meta`. Returns the column metadata
+/// alongside so the caller can classify it (key vs regular). `$N`/function
+/// values fail loud (extended-protocol / unsupported).
+fn resolve_dml_value<'a>(
+    meta: &'a ferrosa_schema::TableMetadata,
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    col_name: &str,
+    sv: &ScalarValue,
+) -> Result<(&'a ferrosa_schema::ColumnMetadata, CqlValue), BackendMessage> {
+    let col_meta = meta.columns.get(col_name).ok_or_else(|| {
+        error_response(
+            "42703",
+            &format!("column \"{col_name}\" of relation \"{table}\" does not exist"),
+        )
+    })?;
+    let cql_type =
+        ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            .map_err(|e| error_response("42704", &e.to_string()))?;
+    let value = match sv {
+        ScalarValue::Literal(v) => value_to_cql(v, &cql_type)?,
+        ScalarValue::Param(_) => {
+            return Err(error_response(
+                "0A000",
+                "$N parameters require the extended-query protocol (not yet supported)",
+            ))
+        }
+        ScalarValue::Func(_) => {
+            return Err(error_response(
+                "0A000",
+                "function calls in DML values are not supported",
+            ))
+        }
+    };
+    Ok((col_meta, value))
+}
+
+/// Execute a single-row `UPDATE`: a Cassandra-style upsert. The equality `WHERE`
+/// supplies the full primary key (which identifies the row); `SET` supplies the
+/// regular/static cells. Returns `CommandComplete "UPDATE 1"` — the engine write
+/// is a blind upsert, so the affected-row count is reported as 1 when the write
+/// lands (Cassandra has no match count; this is the documented semantic).
+fn execute_update(
+    engine: &StorageEngine,
+    schema: &Schema,
+    upd: &UpdateStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = upd.table.schema.as_deref().unwrap_or(default_schema);
+    let table = upd.table.table.as_str();
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), table.to_string())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{table}\" does not exist"),
+            )]
+        }
+    };
+
+    // SET assignments -> regular/static cells (by storage index).
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for (col_name, sv) in &upd.assignments {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            return vec![error_response(
+                "0A000",
+                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
+            )];
+        }
+        match meta.storage_column_index(col_name) {
+            Some(idx) => regular_cells.push((idx, value)),
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!("column \"{col_name}\" not found in storage schema"),
+                )]
+            }
+        }
+    }
+
+    // WHERE equality -> key values (must be key columns).
+    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    for (col_name, sv) in &upd.where_eq {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(
+            col_meta.kind,
+            ColumnKind::PartitionKey | ColumnKind::Clustering
+        ) {
+            return vec![error_response(
+                "0A000",
+                &format!("UPDATE WHERE supports only key columns; \"{col_name}\" is not a key"),
+            )];
+        }
+        key_values.insert(col_name.clone(), value);
+    }
+
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match key_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match key_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
+    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "UPDATE 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+    }
+}
+
+/// Execute a single-row `DELETE`: a row-level tombstone. The equality `WHERE`
+/// supplies the full primary key identifying the row. Returns `CommandComplete
+/// "DELETE 1"` — the engine writes a tombstone unconditionally, so the count is
+/// reported as 1 when the write lands (Cassandra has no match count).
+fn execute_delete(
+    engine: &StorageEngine,
+    schema: &Schema,
+    del: &DeleteStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = del.table.schema.as_deref().unwrap_or(default_schema);
+    let table = del.table.table.as_str();
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), table.to_string())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{table}\" does not exist"),
+            )]
+        }
+    };
+
+    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    for (col_name, sv) in &del.where_eq {
+        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(
+            col_meta.kind,
+            ColumnKind::PartitionKey | ColumnKind::Clustering
+        ) {
+            return vec![error_response(
+                "0A000",
+                &format!("DELETE WHERE supports only key columns; \"{col_name}\" is not a key"),
+            )];
+        }
+        key_values.insert(col_name.clone(), value);
+    }
+
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match key_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match key_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in WHERE"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    // Empty delete-columns => row-level tombstone.
+    let row = ferrosa_row_bridge::build_delete_row(&[], &ck_values, timestamp);
+    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "DELETE 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+    }
+}
+
+/// Evaluate a no-`FROM` expression SELECT (`SELECT 1`, `SELECT version()`,
+/// `SELECT current_database()`) into a one-row [`QueryResult`]. Literals are
+/// returned as-is; a small set of info/session functions are evaluated from the
+/// connection's context.
+pub(crate) fn execute_scalar_select(
+    items: &[ScalarItem],
+    default_schema: &str,
+) -> Result<QueryResult, BackendMessage> {
+    let mut columns = Vec::with_capacity(items.len());
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let value = match &item.value {
+            ScalarValue::Literal(v) => v.clone(),
+            ScalarValue::Func(name) => eval_scalar_func(name, default_schema)?,
+            ScalarValue::Param(_) => {
+                return Err(error_response(
+                    "0A000",
+                    "$N parameters require the extended-query protocol",
+                ))
+            }
+        };
+        let ty = value_column_type(&value);
+        let name = item
+            .alias
+            .clone()
+            .unwrap_or_else(|| default_scalar_name(&item.value));
+        columns.push(Column::new(name, ty));
+        values.push(value);
+    }
+    Ok(QueryResult {
+        columns,
+        rows: vec![Row(values)],
+    })
+}
+
+/// Evaluate a zero-arg info/session function. Unsupported names fail loud
+/// (`0A000`) rather than returning a guessed value.
+fn eval_scalar_func(name: &str, default_schema: &str) -> Result<SqlValue, BackendMessage> {
+    match name {
+        // Keep in step with the `server_version` ParameterStatus (connection.rs).
+        "VERSION" => Ok(SqlValue::Text("PostgreSQL 16.0 (ferrosa)".to_string())),
+        "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" => {
+            Ok(SqlValue::Text(default_schema.to_string()))
+        }
+        other => Err(error_response(
+            "0A000",
+            &format!(
+                "function {}() is not supported yet",
+                other.to_ascii_lowercase()
+            ),
+        )),
+    }
+}
+
+/// The Postgres result type for a value (NULL defaults to text).
+fn value_column_type(v: &SqlValue) -> ColumnType {
+    match v {
+        SqlValue::Int(_) => ColumnType::Int,
+        SqlValue::Text(_) | SqlValue::Null => ColumnType::Text,
+        SqlValue::Bool(_) => ColumnType::Bool,
+        SqlValue::Float(_) => ColumnType::Float,
+        SqlValue::Numeric { .. } => ColumnType::Numeric,
+        SqlValue::Uuid(_) => ColumnType::Uuid,
+        SqlValue::Bytea(_) => ColumnType::Bytea,
+        SqlValue::Timestamp(_) => ColumnType::Timestamp,
+        SqlValue::Date(_) => ColumnType::Date,
+        SqlValue::Time(_) => ColumnType::Time,
+        SqlValue::Inet(_) => ColumnType::Inet,
+    }
+}
+
+/// The default output column name with no `AS` alias: the lowercased function
+/// name for a function call, else Postgres's `?column?`.
+fn default_scalar_name(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Func(name) => name.to_ascii_lowercase(),
+        _ => "?column?".to_string(),
     }
 }
 
@@ -1332,5 +1850,78 @@ mod tests {
             }
             other => panic!("expected DataRow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scalar_select_literal_and_info_functions() {
+        let items = vec![
+            ScalarItem {
+                value: ScalarValue::Literal(SqlValue::Int(1)),
+                alias: None,
+            },
+            ScalarItem {
+                value: ScalarValue::Func("VERSION".into()),
+                alias: None,
+            },
+            ScalarItem {
+                value: ScalarValue::Func("CURRENT_DATABASE".into()),
+                alias: Some("db".into()),
+            },
+        ];
+        let result = execute_scalar_select(&items, "myks").expect("scalar select");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.columns.len(), 3);
+        // Default names: ?column? for a literal, the function name for a call.
+        assert_eq!(result.columns[0].name, "?column?");
+        assert_eq!(result.columns[1].name, "version");
+        assert_eq!(result.columns[2].name, "db");
+        let row = &result.rows[0].0;
+        assert_eq!(row[0], SqlValue::Int(1));
+        assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
+        assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+    }
+
+    #[test]
+    fn value_to_cql_maps_per_target_type() {
+        use ferrosa_common::CqlValue as C;
+        assert_eq!(
+            value_to_cql(&SqlValue::Int(5), &CqlType::Int).unwrap(),
+            C::Int(5)
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Int(5), &CqlType::Bigint).unwrap(),
+            C::Bigint(5)
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Text("x".into()), &CqlType::Varchar).unwrap(),
+            C::Text("x".to_string())
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Bool(true), &CqlType::Boolean).unwrap(),
+            C::Boolean(true)
+        );
+        // NULL maps to a tombstone for any target type.
+        assert_eq!(
+            value_to_cql(&SqlValue::Null, &CqlType::Int).unwrap(),
+            C::Null
+        );
+        // float bit-pattern round-trips.
+        assert_eq!(
+            value_to_cql(&SqlValue::float(9.5), &CqlType::Double).unwrap(),
+            C::Double(9.5f64.to_bits())
+        );
+        // out-of-range int into int4, and a type mismatch, both fail loud.
+        assert!(value_to_cql(&SqlValue::Int(i64::MAX), &CqlType::Int).is_err());
+        assert!(value_to_cql(&SqlValue::Text("x".into()), &CqlType::Int).is_err());
+    }
+
+    #[test]
+    fn scalar_select_unsupported_function_fails_loud() {
+        // An unmodeled function errors (0A000) rather than guessing a value.
+        let items = vec![ScalarItem {
+            value: ScalarValue::Func("NOW".into()),
+            alias: None,
+        }];
+        assert!(execute_scalar_select(&items, "ks").is_err());
     }
 }

@@ -25,17 +25,29 @@
 
 use std::collections::HashMap;
 
-use ferrosa_sql::{parse, SelectStmt, Value as SqlValue};
+use ferrosa_sql::{
+    parse_statement, ScalarItem, ScalarValue, SelectStmt, Statement, Value as SqlValue,
+};
 
-use crate::messages::BackendMessage;
+use crate::messages::{BackendMessage, TransactionStatus};
 use crate::query::{decode_param, error_response, exec_error_response, row_description_fields};
 
-/// A prepared statement: the parsed SELECT plus the client-declared parameter
+/// What a prepared statement parses to: a table query, or a no-`FROM`
+/// expression query (`SELECT version()`, `SELECT 1`). Transaction-control and
+/// session statements are handled on the simple-query path, not prepared here.
+/// `Select` is boxed — `SelectStmt` is far larger than the other variant.
+#[derive(Debug, Clone)]
+pub enum PreparedKind {
+    Select(Box<SelectStmt>),
+    Exprs(Vec<ScalarItem>),
+}
+
+/// A prepared statement: the parsed query plus the client-declared parameter
 /// type OIDs (used to decode bound values and to answer `Describe` for the
 /// `ParameterDescription`). A `0` OID means "unspecified" (decode leniently).
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    pub parsed: SelectStmt,
+    pub parsed: PreparedKind,
     pub param_oids: Vec<i32>,
 }
 
@@ -55,6 +67,10 @@ pub struct Session {
     portals: HashMap<String, Portal>,
     /// Set when an error occurs mid-sequence; skip messages until `Sync`.
     error_pending: bool,
+    /// Protocol-level transaction state, reported in every `ReadyForQuery`
+    /// (`I`/`T`/`E`). Entering a `T` block is the trigger to route the
+    /// transaction's writes through Accord once DML lands (blueprint D11).
+    txn: TransactionStatus,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -104,6 +120,43 @@ impl Session {
         self.error_pending = false;
     }
 
+    /// The protocol transaction status to report in `ReadyForQuery`.
+    pub fn txn_status(&self) -> TransactionStatus {
+        self.txn
+    }
+
+    /// Whether the session is inside an open (non-failed) transaction block.
+    pub fn in_txn(&self) -> bool {
+        matches!(self.txn, TransactionStatus::InTransaction)
+    }
+
+    /// Whether the session is inside an aborted transaction block (only
+    /// `COMMIT`/`ROLLBACK` are accepted until it ends — PG `25P02`).
+    pub fn in_failed_txn(&self) -> bool {
+        matches!(self.txn, TransactionStatus::Failed)
+    }
+
+    /// `BEGIN`: enter a transaction block. A `BEGIN` while already in one keeps
+    /// the session in-transaction (PG warns but stays `T`).
+    pub fn begin_txn(&mut self) {
+        if matches!(self.txn, TransactionStatus::Idle) {
+            self.txn = TransactionStatus::InTransaction;
+        }
+    }
+
+    /// `COMMIT`/`ROLLBACK`: leave the transaction block, back to idle.
+    pub fn end_txn(&mut self) {
+        self.txn = TransactionStatus::Idle;
+    }
+
+    /// An error while executing a statement inside a transaction aborts it
+    /// (`T` → `E`); a no-op outside a transaction.
+    pub fn mark_txn_failed(&mut self) {
+        if matches!(self.txn, TransactionStatus::InTransaction) {
+            self.txn = TransactionStatus::Failed;
+        }
+    }
+
     /// Handle `Parse`: parse the SQL and store the prepared statement. On a
     /// parse error, set `error_pending` and return an `ErrorResponse` (42601) —
     /// no `ParseComplete`. On success return `ParseComplete`.
@@ -113,22 +166,46 @@ impl Session {
         query: &str,
         param_types: Vec<i32>,
     ) -> BackendMessage {
-        match parse(query) {
-            Ok(parsed) => {
-                self.statements.insert(
-                    stmt_name,
-                    PreparedStatement {
-                        parsed,
-                        param_oids: param_types,
-                    },
+        let parsed = match parse_statement(query) {
+            Ok(Statement::Select(select)) => PreparedKind::Select(select),
+            Ok(Statement::SelectExprs(items)) => {
+                // Parameterized expression selects need $N type inference with no
+                // column to infer from — not supported via the extended protocol
+                // yet. Fail loud rather than guess.
+                if items
+                    .iter()
+                    .any(|it| matches!(it.value, ScalarValue::Param(_)))
+                {
+                    self.error_pending = true;
+                    return error_response(
+                        "0A000",
+                        "$N parameters in expression selects are not supported via the \
+                         extended-query protocol yet",
+                    );
+                }
+                PreparedKind::Exprs(items)
+            }
+            Ok(_) => {
+                // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
+                self.error_pending = true;
+                return error_response(
+                    "0A000",
+                    "only SELECT statements can be prepared via the extended-query protocol",
                 );
-                BackendMessage::ParseComplete
             }
             Err(e) => {
                 self.error_pending = true;
-                error_response("42601", &e.to_string())
+                return error_response("42601", &e.to_string());
             }
-        }
+        };
+        self.statements.insert(
+            stmt_name,
+            PreparedStatement {
+                parsed,
+                param_oids: param_types,
+            },
+        );
+        BackendMessage::ParseComplete
     }
 
     /// Handle `Bind`: decode each parameter value against the prepared
@@ -341,5 +418,36 @@ mod tests {
             describe_statement_rows(&cols),
             BackendMessage::RowDescription { .. }
         ));
+    }
+
+    #[test]
+    fn transaction_state_machine() {
+        let mut s = Session::new();
+        // Starts idle.
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+        assert!(!s.in_txn() && !s.in_failed_txn());
+
+        // BEGIN -> in transaction.
+        s.begin_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
+        assert!(s.in_txn());
+
+        // An error inside the txn aborts it (T -> E).
+        s.mark_txn_failed();
+        assert_eq!(s.txn_status(), TransactionStatus::Failed);
+        assert!(s.in_failed_txn() && !s.in_txn());
+
+        // ROLLBACK/COMMIT clears it back to idle.
+        s.end_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+
+        // mark_txn_failed is a no-op outside a transaction.
+        s.mark_txn_failed();
+        assert_eq!(s.txn_status(), TransactionStatus::Idle);
+
+        // BEGIN while already in a transaction stays in-transaction.
+        s.begin_txn();
+        s.begin_txn();
+        assert_eq!(s.txn_status(), TransactionStatus::InTransaction);
     }
 }

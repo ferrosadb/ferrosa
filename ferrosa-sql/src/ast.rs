@@ -6,6 +6,86 @@
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
 
+/// A parsed top-level SQL statement — the unit a Postgres-wire client sends.
+///
+/// `parse_statement` returns this; the legacy `parse` returns just the
+/// [`SelectStmt`] for table queries (kept for callers that only do table
+/// scans). Transaction-control and session statements are *parsed* here; the
+/// front-end gives them their real semantics (transactions route through
+/// Accord — they are never silently no-op'd).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {
+    /// A table query: `SELECT ... FROM ...`. Boxed — `SelectStmt` is far larger
+    /// than the other variants.
+    Select(Box<SelectStmt>),
+    /// A no-`FROM` expression query (`SELECT 1`, `SELECT version()`,
+    /// `SELECT $1`) — yields exactly one row.
+    SelectExprs(Vec<ScalarItem>),
+    /// `BEGIN` / `START TRANSACTION`.
+    Begin,
+    /// `COMMIT` / `END`.
+    Commit,
+    /// `ROLLBACK` / `ABORT`.
+    Rollback,
+    /// `SET <name> [=|TO] <value>`.
+    Set { name: String, value: String },
+    /// `RESET <name>` (`RESET ALL` carries name `ALL`).
+    Reset { name: String },
+    /// `INSERT INTO t (cols) VALUES (...)`. Boxed for size parity with `Select`.
+    Insert(Box<InsertStmt>),
+    /// `UPDATE t SET ... WHERE ...`. Boxed for size parity with `Select`.
+    Update(Box<UpdateStmt>),
+    /// `DELETE FROM t WHERE ...`. Boxed for size parity with `Select`.
+    Delete(Box<DeleteStmt>),
+}
+
+/// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Single-row, with
+/// literal or `$N` values (one per named column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertStmt {
+    pub table: TableRef,
+    pub columns: Vec<String>,
+    pub values: Vec<ScalarValue>,
+}
+
+/// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`. The
+/// `WHERE` is restricted to equality on key columns (Cassandra-style upsert: the
+/// full primary key identifies the row); `assignments` are the SET cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStmt {
+    pub table: TableRef,
+    pub assignments: Vec<(String, ScalarValue)>,
+    pub where_eq: Vec<(String, ScalarValue)>,
+}
+
+/// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Row-level delete; the
+/// equality `WHERE` supplies the full primary key identifying the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteStmt {
+    pub table: TableRef,
+    pub where_eq: Vec<(String, ScalarValue)>,
+}
+
+/// One projected scalar in a no-`FROM` SELECT, with an optional `AS` alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarItem {
+    pub value: ScalarValue,
+    pub alias: Option<String>,
+}
+
+/// A scalar value in a no-`FROM` SELECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarValue {
+    /// An inline literal (`1`, `'x'`, `TRUE`, `NULL`).
+    Literal(Value),
+    /// A bare (zero-arg) function call (`version()`, `current_database()`, …),
+    /// carrying the uppercased function name. The front-end evaluates it (it
+    /// owns the session context the function needs).
+    Func(String),
+    /// A `$N` parameter placeholder (extended-query path).
+    Param(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectStmt {
     pub distinct: bool,

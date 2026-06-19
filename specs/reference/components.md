@@ -1,11 +1,11 @@
 # Component Architecture
 
-> Last updated: 2026-04-05
+> Last updated: 2026-06-19
 > Status: Approved
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 12 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently.
+Ferrosa is a Cargo workspace of 25 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently. Three client surfaces sit over the same storage/schema/transaction core: **CQL** (`ferrosa-cql`, port 9042), the **PostgreSQL wire** front-end (`ferrosa-postgres`, port 5432, developer preview), and an **Arrow Flight** gRPC endpoint (`ferrosa-flight`). The graph (`ferrosa-graph`, Bolt/HTTP) and SPARQL (`ferrosa-sparql`) engines add query models on top.
 
 ## Dependency Graph
 
@@ -21,6 +21,11 @@ graph BT
     CQL[ferrosa-cql<br/>CQL protocol v5]
     Graph[ferrosa-graph<br/>Graph query engine]
     SPARQL[ferrosa-sparql<br/>SPARQL 1.1 endpoint]
+    PG[ferrosa-postgres<br/>PostgreSQL wire]
+    SQLEng[ferrosa-sql<br/>Bespoke SQL engine]
+    RowBridge[ferrosa-row-bridge<br/>Shared CQL row codec]
+    Flight[ferrosa-flight<br/>Arrow Flight gRPC]
+    CDC[ferrosa-cdc<br/>Change-data bus]
     Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
     Ctl[ferrosa-ctl<br/>CLI admin + TUI]
     Bin[ferrosa<br/>Binary]
@@ -49,8 +54,25 @@ graph BT
     Cluster --> Storage
     Cluster --> Schema
     Ctl --> CQL
+    SQLEng --> Common
+    RowBridge --> Common
+    RowBridge --> SST
+    CQL --> RowBridge
+    PG --> Common
+    PG --> Schema
+    PG --> Storage
+    PG --> SQLEng
+    PG --> RowBridge
+    Flight --> Common
+    Flight --> CQL
+    CDC --> Common
+    Storage --> CDC
+    Cluster --> CDC
+    CQL --> CDC
     Bin --> CQL
     Bin --> Graph
+    Bin --> PG
+    Bin --> Flight
     Bin --> Cluster
     Bin --> Common
 ```
@@ -280,6 +302,53 @@ graph BT
 - **Port**: 8080 (configurable via `FERROSA_SPARQL_BIND`), enabled via `FERROSA_SPARQL_ENABLED=true`
 - **Tests**: 77 unit tests covering parser, planner, executor, filter, results, property paths, RDF*, update
 
+### ferrosa-postgres
+
+- **Purpose**: PostgreSQL frontend/backend wire protocol (v3) front-end — a second client surface over the same data as CQL (developer preview)
+- **Location**: `ferrosa-postgres/`
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-storage`, `ferrosa-sql`, `ferrosa-row-bridge`
+- **Key interfaces**:
+  - `server::serve` — accepts connections, SCRAM-SHA-256 auth, simple + extended (Parse/Bind/Describe/Execute/Sync) query protocols
+  - `QueryContext` — `{ engine, schema, default_schema }` execution context
+  - `query::execute_query` — dispatches a parsed `Statement`: `SELECT` (table + no-`FROM` expression selects), single-row `INSERT`/`UPDATE`/`DELETE`
+  - transaction protocol state (`ReadyForQuery` `I`/`T`/`E`; failed-txn `25P02`)
+- **Boundary**: parses/plans SQL via `ferrosa-sql`; writes via the shared `ferrosa-row-bridge` encoder so rows written over Postgres decode identically over CQL. Does **not** depend on `ferrosa-cql` (decision D10).
+- **Verification**: differential oracle vs a real PostgreSQL 16 in CI (`postgres-oracle` job). See [postgres-differential-oracle](../implemented/postgres-differential-oracle.md) and the public [PostgreSQL wire reference](../../docs/database/postgres.html).
+
+### ferrosa-sql
+
+- **Purpose**: Bespoke relational query engine (decision D3 — no DataFusion/Arrow) backing the Postgres front-end
+- **Location**: `ferrosa-sql/`
+- **Dependencies**: `ferrosa-common`
+- **Key interfaces**: `parse` / `parse_statement` (lexer + recursive-descent parser → `Statement` / `SelectStmt`), the value/row model (`Value`, `Row`, `Column`, `RelSchema`), physical operators (`seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `limit_offset`), and `execute` over a `Catalog`/`TableProvider`
+- **Boundary**: pure query engine; three-valued NULL logic and `C`-collation ordering live here, exercised by a self-contained known-answer corpus
+
+### ferrosa-row-bridge
+
+- **Purpose**: The single canonical CQL row encoder/decoder shared by both front-ends (decision D10) — a divergent row codec is the top SQL-front-end FMEA risk
+- **Location**: `ferrosa-row-bridge/`
+- **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `ferrosa-schema`
+- **Key interfaces**: `encode_value`/`decode_value` (CQL wire codec), `build_decorated_key`, `build_row`, `build_delete_row`, `encode_clustering`, `partition_to_rows*` (storage `Partition` → result rows)
+- **Boundary**: `ferrosa-cql` re-exports these so the CQL and Postgres write paths produce byte-identical storage rows; `ferrosa-postgres` reuses it **without** depending on the ~54k-LOC `ferrosa-cql`
+
+### ferrosa-flight
+
+- **Purpose**: Apache Arrow Flight gRPC query endpoint — executes CQL `SELECT` and streams results as Arrow record batches
+- **Location**: `ferrosa-flight/`
+- **Dependencies**: `ferrosa-cql` (execution via `route_select_raw`/`SharedState`), `ferrosa-common`, `arrow`, `arrow-flight`, `tonic`
+- **Key interfaces**:
+  - `FerrosaFlight` `FlightService` — `Handshake` (validates CQL credentials → signed bearer token, decision D4), `DoGet`/`GetFlightInfo`/`GetSchema`
+  - `convert::rows_to_record_batch` — CQL result set → Arrow `RecordBatch` (fail-loud on unsupported types)
+- **Boundary**: every non-`Handshake` RPC requires `authorization: Bearer <token>`; no anonymous access. v1 materializes a single batch (paged/streaming `DoGet` is a tracked follow-up). A CDC `DoExchange` channel over `ferrosa-cdc` is designed in [arrow-flight-endpoint](../proposed/arrow-flight-endpoint/).
+
+### ferrosa-cdc
+
+- **Purpose**: Bounded change-data-capture bus carrying two event streams — `WrittenOnNode` (local commit-log apply) and `CommittedToCluster` (Accord/quorum commit) — that back CQL `SUBSCRIBE` and the Flight CDC channel
+- **Location**: `ferrosa-cdc/`
+- **Dependencies**: `ferrosa-common` only (leaf; producers convert `Mutation`/`Row` → `CdcEvent` at the tap to avoid a dependency cycle)
+- **Key interfaces**: `CdcEvent`, `CdcBus`/`CdcPublisher`, subscription handles with bounded per-subscriber queues and an explicit gap signal
+- **Producers**: `ferrosa-storage` (`CommitLog::append`) and `ferrosa-cluster` (`EngineStorageApplier::apply`, coordinator quorum-ack)
+
 ### ferrosa-ctl
 
 - **Purpose**: CLI admin tool with TUI monitor for inspecting and managing a running Ferrosa node
@@ -381,6 +450,34 @@ graph BT
   - `web/index.html` — Single-file HTML/CSS/JS dashboard with auto-refresh, connection/query/storage panels
 - **Startup sequence**: tracing init → host_id load/generate → `StorageEngine::new()` → `Schema::new()` → `ModeController::new()` → `PeerManager::new()` → RPC server on :7000 → `CqlServer::start_background()` → optional `GraphEngine` + HTTP → web admin + cluster API on :9090 → background seed connection → ctrl-c → graceful shutdown
 - **Environment variables**: `FERROSA_CQL_BIND`, `FERROSA_CQL_BROADCAST` (advertised CQL address for system.peers, hostname resolution supported), `FERROSA_AUTH_DISABLED`, `FERROSA_GRAPH_ENABLED`, `FERROSA_WEB_BIND`, `FERROSA_DATA_DIR`, `FERROSA_HOST_ID`, `FERROSA_INTERNODE_BIND`, `FERROSA_INTERNODE_BROADCAST`, `FERROSA_SEED`, `FERROSA_CLUSTER_NAME`, plus storage/schema/S3 env vars
+
+### ferrosa-worker
+
+- **Purpose**: Background task management (scheduling/lifecycle for engine background work)
+- **Location**: `ferrosa-worker/`
+- **Dependencies**: `ferrosa-common`, `tokio`
+
+### ferrosa-view
+
+- **Purpose**: Materialized-view primitives — view metadata, definition validation, and incremental delta computation (conflict-free island; integration in progress)
+- **Location**: `ferrosa-view/`
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`
+- **Key interfaces**: `ViewMetadata`, `validate_view_def`, `compute_view_delta`
+- **Status**: crate landed with unit tests; engine/Accord wiring tracked separately
+
+### ferrosa-session
+
+- **Purpose**: Connection/session state extracted for reuse across front-ends (extraction in progress)
+- **Location**: `ferrosa-session/`
+- **Dependencies**: `ferrosa-common`
+
+### Testing & simulation crates
+
+Not part of the runtime composition; built and run by CI/tooling:
+
+- **`ferrosa-jepsen`** — distributed correctness harness (Firecracker/Docker-based), behind the `live-infra-tests` feature
+- **`ferrosa-loadgen`** — load generator (UCS compaction stress, integrity checks)
+- **`ferrosa-sim`** — deterministic simulation harness
 
 ## Build Order
 

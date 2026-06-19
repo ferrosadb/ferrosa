@@ -8,6 +8,11 @@ on:
   # With `branches: [main]` these were skipped entirely — only the
   # path-filtered Driver Smoke ran — so stacked PRs went unexercised.
   pull_request:
+  # Run in the merge queue too: when a PR is queued, GitHub builds a temporary
+  # `merge_group` ref (the PR rebased on the latest main + entries ahead of it)
+  # and these checks must report on it for the queue to merge. Without this
+  # trigger the queue's required checks never run and entries would stall.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,6 +88,33 @@ jobs:
                --skip bounded_fetch_reassembles_to_single_pass \
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
+
+  # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
+  # The `test` job above skips `differential_oracle` because it has no
+  # container runtime; this dedicated job runs it against a real postgres:16
+  # (started by the test harness via the runner's docker), comparing the
+  # ferrosa Postgres front-end's SELECT/DML semantics to PostgreSQL.
+  postgres-oracle:
+    name: Differential Oracle (vs PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: false
+      - name: Verify docker is available
+        run: docker --version
+      - name: Pre-pull postgres:16
+        run: docker pull postgres:16
+      - name: Run differential oracle (corpus + restricted-query + DML)
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+        run: |
+          cargo test -p ferrosa-postgres --features live-infra-tests \
+            --test differential_oracle -- --test-threads=1 --nocapture
 
   # ── Stage 2b: Musl static build ───────────────────────────────────
   musl:

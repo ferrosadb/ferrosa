@@ -435,7 +435,8 @@ async fn seed_postgres(client: &tokio_postgres::Client) {
         .batch_execute(
             "CREATE TABLE users (id int PRIMARY KEY, name text, dept text, email text);\n\
              CREATE TABLE orders (oid int PRIMARY KEY, uid int, amount int, price double precision);\n\
-             CREATE TABLE events (id int PRIMARY KEY, at timestamp, on_day date, at_time time, src inet, amt numeric);",
+             CREATE TABLE events (id int PRIMARY KEY, at timestamp, on_day date, at_time time, src inet, amt numeric);\n\
+             CREATE TABLE kv (id int PRIMARY KEY, v text, n int);",
         )
         .await
         .expect("create pg tables");
@@ -706,7 +707,52 @@ fn create_schema() -> Schema {
         )
         .expect("create table events");
 
+    // kv(id int PK, v text, n int) — starts EMPTY; the DML oracle populates it
+    // over the wire on both sides, exercising the INSERT/UPDATE/DELETE executors.
+    let mut kv_cols = IndexMap::new();
+    kv_cols.insert(
+        "id".to_string(),
+        column("id", ColumnKind::PartitionKey, "int"),
+    );
+    kv_cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+    kv_cols.insert("n".to_string(), column("n", ColumnKind::Regular, "int"));
     schema
+        .create_table(
+            TableMetadata {
+                keyspace: "public".to_string(),
+                name: "kv".to_string(),
+                id: Uuid::new_v4(),
+                columns: kv_cols,
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: HashMap::new(),
+                is_system: false,
+            },
+            &auth,
+        )
+        .expect("create table kv");
+
+    schema
+}
+
+fn kv_storage_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    let col = |n: &str, t: &str| ColumnDefinition {
+        name: n.to_string(),
+        type_name: t.to_string(),
+    };
+    TableSchema {
+        keyspace: "public".to_string(),
+        table: "kv".to_string(),
+        key_type: int_marshal().to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        // Cassandra name-sorted storage order: n, v.
+        regular_columns: vec![col("n", int_marshal()), col("v", text_marshal())],
+        extensions: Default::default(),
+    }
 }
 
 fn text_marshal() -> &'static str {
@@ -847,6 +893,8 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
     engine.register_table(users_storage_schema()).unwrap();
     engine.register_table(orders_storage_schema()).unwrap();
     engine.register_table(events_storage_schema()).unwrap();
+    // kv is registered but seeded with NO rows — the DML oracle populates it.
+    engine.register_table(kv_storage_schema()).unwrap();
 
     let users_tid = TableId::new("public", "users");
     let orders_tid = TableId::new("public", "orders");
@@ -1065,15 +1113,28 @@ fn result_sets_agree(pg: &ResultSet, fe: &ResultSet) -> bool {
     })
 }
 
+/// Compare two cells soundly (oracle R10 "canonicalizer compares decoded values,
+/// no rounding"). Exact text equality is the primary test — it covers ints,
+/// text, uuids, inet, dates, etc. with NO tolerance. A numeric tolerance is
+/// applied ONLY to absorb a genuine FLOAT text-format gap: both sides must parse
+/// as `f64` AND at least one must be in float/scientific form (contains `.`,
+/// `e`, or `E`). This means two integers like `100` vs `101` are never fuzzily
+/// matched, and a text column is never rounded — only `1.5` vs
+/// `1.5000000000000000` (float8 vs numeric formatting) is reconciled.
 fn cells_agree(a: &Cell, b: &Cell) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
-            if let (Ok(fx), Ok(fy)) = (x.parse::<f64>(), y.parse::<f64>()) {
-                (fx - fy).abs() <= 1e-9 * fx.abs().max(fy.abs()).max(1.0)
-            } else {
-                x == y
+            if x == y {
+                return true;
             }
+            let float_formatted = |s: &str| s.contains('.') || s.contains('e') || s.contains('E');
+            if float_formatted(x) || float_formatted(y) {
+                if let (Ok(fx), Ok(fy)) = (x.parse::<f64>(), y.parse::<f64>()) {
+                    return (fx - fy).abs() <= 1e-9 * fx.abs().max(fy.abs()).max(1.0);
+                }
+            }
+            false
         }
         _ => false,
     }
@@ -1225,6 +1286,29 @@ fn corpus() -> Vec<Case> {
             "events_order_by_time",
             "SELECT id, at_time FROM events ORDER BY at_time",
         ),
+        // ── Aggregate / ordering edge cases ──────────────────────────────────
+        // COUNT over an empty result is 0 (never NULL) on both sides.
+        c("count_empty", "SELECT COUNT(*) FROM users WHERE id > 1000"),
+        // SUM / MIN over an empty result is SQL NULL — the 3VL aggregate edge.
+        c(
+            "sum_empty_is_null",
+            "SELECT SUM(amount) FROM orders WHERE oid > 1000",
+        ),
+        c(
+            "min_empty_is_null",
+            "SELECT MIN(amount) FROM orders WHERE oid > 1000",
+        ),
+        // LIMIT 0 returns no rows; OFFSET past the end returns no rows.
+        c("limit_zero", "SELECT id FROM users ORDER BY id LIMIT 0"),
+        c(
+            "offset_beyond_end",
+            "SELECT id FROM users ORDER BY id OFFSET 100",
+        ),
+        // Multi-key ORDER BY (uid asc, oid asc) — deterministic tie-break.
+        c(
+            "order_by_multi_key",
+            "SELECT oid, uid FROM orders ORDER BY uid, oid",
+        ),
     ]
 }
 
@@ -1321,14 +1405,29 @@ async fn differential_oracle_rejects_unsupported_queries() {
 
     let (fe_client, _ferrosa_dir) = start_ferrosa().await;
 
-    // (label, sql) — each must error rather than return rows.
+    // (label, sql) — each must error rather than return rows. NOTE: no-`FROM`
+    // expression selects (`SELECT 1`, `SELECT version()`) are now a SUPPORTED
+    // feature (handled by the SelectExprs path), so they are deliberately NOT in
+    // this list — they belong to the corpus, not the restricted-query oracle.
     let rejects = [
-        ("no_from", "SELECT 1"),
         (
             "subquery",
             "SELECT id FROM users WHERE id IN (SELECT uid FROM orders)",
         ),
         ("missing_table", "SELECT * FROM nonexistent_table"),
+        // Grammar ferrosa's M1 subset does not implement — each must surface a
+        // clean parse/feature error, never silently-wrong rows.
+        ("cte", "WITH e AS (SELECT id FROM users) SELECT id FROM e"),
+        ("union", "SELECT id FROM users UNION SELECT uid FROM orders"),
+        ("window_fn", "SELECT id, COUNT(*) OVER () FROM users"),
+        ("missing_column", "SELECT no_such_col FROM users"),
+        // `IS [NOT] NULL` is not yet in the M1 grammar (tracked separately). It
+        // must fail loud, not silently match the `= NULL`/`!= NULL` paths.
+        ("is_null", "SELECT id FROM users WHERE email IS NULL"),
+        (
+            "is_not_null",
+            "SELECT id FROM users WHERE email IS NOT NULL",
+        ),
     ];
 
     for (label, sql) in rejects {
@@ -1340,4 +1439,137 @@ async fn differential_oracle_rejects_unsupported_queries() {
         );
         eprintln!("  {label:<14} correctly rejected: {}", sql);
     }
+}
+
+/// Run a mutation over the wire on BOTH sides; both must succeed.
+async fn apply_both(pg: &tokio_postgres::Client, fe: &tokio_postgres::Client, sql: &str) {
+    pg.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("postgres failed `{sql}`: {e}"));
+    fe.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("ferrosa failed `{sql}`: {e}"));
+}
+
+/// Assert a `SELECT` returns identical rows across both sides.
+async fn assert_dml_agrees(
+    pg: &tokio_postgres::Client,
+    fe: &tokio_postgres::Client,
+    sql: &str,
+    label: &str,
+) {
+    let p = run_simple(pg, sql)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] postgres errored: {e}"));
+    let f = run_simple(fe, sql)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] ferrosa errored: {e}"));
+    assert!(
+        result_sets_agree(&p, &f),
+        "[{label}] DML divergence:\n  pg = {p:?}\n  fe = {f:?}"
+    );
+    eprintln!("  {label:<22} MATCH");
+}
+
+/// DML differential oracle: apply the SAME INSERT/UPDATE/DELETE over the wire to
+/// BOTH Postgres and ferrosa (the empty `kv` table), asserting a SELECT agrees
+/// after each mutation. Exercises the write executors against real Postgres
+/// semantics — the cross-check that the front-end's writes are sound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differential_oracle_dml_agrees() {
+    require_containers();
+
+    let pg = PgContainer::start().await;
+    let pg_client = pg.connect().await;
+    seed_postgres(&pg_client).await;
+    let (fe_client, _ferrosa_dir) = start_ferrosa().await;
+
+    // ── INSERT ──────────────────────────────────────────────────────────────
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (1, 'one', 10)",
+    )
+    .await;
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (2, 'two', 20)",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_insert",
+    )
+    .await;
+
+    // INSERT with a NULL column — Postgres stores SQL NULL, ferrosa stores a
+    // cell tombstone; both must read back as NULL (not "" / 0).
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (3, NULL, 30)",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_null_insert",
+    )
+    .await;
+
+    // ── UPDATE ──────────────────────────────────────────────────────────────
+    // Update a regular column on an existing row.
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "UPDATE kv SET v = 'ONE', n = 11 WHERE id = 1",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_update",
+    )
+    .await;
+
+    // Update setting a column to NULL (delete-cell semantics on ferrosa).
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "UPDATE kv SET n = NULL WHERE id = 2",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_update_null",
+    )
+    .await;
+
+    // ── DELETE ──────────────────────────────────────────────────────────────
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 3").await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_delete",
+    )
+    .await;
+
+    // Delete the remaining rows — the table must be empty on both sides.
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 1").await;
+    apply_both(&pg_client, &fe_client, "DELETE FROM kv WHERE id = 2").await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_delete_all",
+    )
+    .await;
 }
