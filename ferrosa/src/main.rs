@@ -1406,7 +1406,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     service = service.with_previous_keys(previous_keys);
                 }
                 runtimes.background.spawn(async move {
-                    if let Err(e) = ferrosa_flight::server::serve_service(flight_addr, service).await
+                    if let Err(e) =
+                        ferrosa_flight::server::serve_service(flight_addr, service).await
                     {
                         tracing::error!(error = %e, "Arrow Flight server exited");
                     }
