@@ -310,14 +310,14 @@ jobs:
       - name: Build and push multi-arch image
         run: |
           set -euo pipefail
-          tag_args=""
+          tag_args=()
           for t in ${{ steps.tags.outputs.tags }}; do
-            tag_args="${tag_args} -t ${t}"
+            tag_args+=(-t "${t}")
           done
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             -f Dockerfile.release \
-            ${tag_args} \
+            "${tag_args[@]}" \
             --push \
             .
 
