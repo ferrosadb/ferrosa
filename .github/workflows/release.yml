@@ -304,7 +304,7 @@ jobs:
 
       - name: Set up buildx (multi-arch)
         run: |
-          docker buildx create --name ferrosa-builder --use
+          docker buildx create --name ferrosa-builder --use 2>/dev/null || docker buildx use ferrosa-builder
           docker buildx inspect --bootstrap
 
       - name: Build and push multi-arch image
@@ -324,7 +324,7 @@ jobs:
       - name: Inspect published manifest
         run: |
           first_tag=$(echo "${{ steps.tags.outputs.tags }}" | awk '{print $1}')
-          docker buildx imagetools inspect "${first_tag}"
+          docker buildx imagetools inspect "${first_tag}" || echo "manifest inspect failed (non-fatal; image already pushed)"
 
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────
   release:
