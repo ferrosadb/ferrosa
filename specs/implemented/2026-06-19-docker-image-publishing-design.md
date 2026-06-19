@@ -35,9 +35,10 @@ Publish an official `ferrosa` container image from CI for both the **nightly** a
   for the aarch64 cross build.
 - **No `ferrosa` binary image is published today.** `ci.yml` pushes a glibc
   `ferrosa-test-node` image to GHCR for internal test reuse only.
-- The `ferrosa` binary's only optional feature is `otel`. `asc-udf` lives in
-  `ferrosa-cql`/`ferrosa-udf`, is **not** wired into the `ferrosa` binary, and pulls
-  `rquickjs` (bundled QuickJS C source) + `wasmtime`.
+- The `ferrosa` binary's optional features are `otel` (OpenTelemetry) and `flight`
+  (Arrow Flight gRPC query endpoint on port 8815, via `dep:ferrosa-flight`). The heavier
+  `asc-udf` lives in `ferrosa-cql`/`ferrosa-udf`, is **not** wired into the `ferrosa`
+  binary, and pulls `rquickjs` (bundled QuickJS C source) + `wasmtime`.
 - Configuration is **already fully env-var injectable**: `FERROSA_CONFIG` selects the
   config file (default `/etc/ferrosa/ferrosa.toml`; a missing file is tolerated), and
   every setting has a `FERROSA_*` override (CQL bind, internode bind/broadcast, S3
@@ -63,12 +64,14 @@ Add a curated `full` feature to `ferrosa/Cargo.toml`:
 ```toml
 [features]
 default = []
+flight = ["dep:ferrosa-flight"]
 otel = [ "tracing-opentelemetry", "opentelemetry", "opentelemetry-otlp", "opentelemetry_sdk" ]
-full = ["otel", "ferrosa-cql/asc-udf"]
+full = ["otel", "flight", "ferrosa-cql/asc-udf"]
 ```
 
 `ferrosa-cql/asc-udf` already forwards to `ferrosa-udf/asc-udf`. The feature is **curated,
-not `--all-features`**: it deliberately **excludes**
+not `--all-features`**: it includes all shippable optional features (`otel`, `flight`,
+`asc-udf`) and deliberately **excludes**
 
 - `live-infra-tests` (test-only opt-in across several crates), and
 - `ferrosa-cluster/sprint-03-engine-transfer` (in-progress, not shippable).
@@ -133,8 +136,8 @@ COPY config/ferrosa.example.toml    /etc/ferrosa/ferrosa.example.toml
 ENV FERROSA_CONFIG=/etc/ferrosa/ferrosa.toml \
     FERROSA_DATA_DIR=/var/lib/ferrosa
 
-# CQL, internode RPC, web/Prometheus, graph HTTP, Bolt
-EXPOSE 9042 17000 9090 7474 7687
+# CQL, internode RPC, web/Prometheus, graph HTTP, Bolt, Arrow Flight gRPC
+EXPOSE 9042 17000 9090 7474 7687 8815
 VOLUME /var/lib/ferrosa
 USER ferrosa
 ENTRYPOINT ["ferrosa"]
@@ -150,7 +153,7 @@ ENTRYPOINT ["ferrosa"]
   - mounting a config file at `/etc/ferrosa/ferrosa.toml` (or pointing `FERROSA_CONFIG`
     elsewhere).
 - `EXPOSE` corrects the stale `7000` in the existing Dockerfiles to the real internode
-  port `17000`, and adds graph HTTP `7474` and Bolt `7687`.
+  port `17000`, and adds graph HTTP `7474`, Bolt `7687`, and Arrow Flight `8815`.
 - Runs as non-root `ferrosa` (UID 10001); only `/var/lib/ferrosa` is written, so the
   container is `--read-only` rootfs compatible when that volume is mounted.
 
