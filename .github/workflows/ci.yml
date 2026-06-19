@@ -131,7 +131,7 @@ jobs:
       - name: Install musl tools and capnproto
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
       - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
       - name: Verify statically linked
         run: |
           file target/x86_64-unknown-linux-musl/release/ferrosa
