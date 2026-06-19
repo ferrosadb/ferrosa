@@ -1331,6 +1331,12 @@ async fn differential_oracle_rejects_unsupported_queries() {
             "SELECT id FROM users WHERE id IN (SELECT uid FROM orders)",
         ),
         ("missing_table", "SELECT * FROM nonexistent_table"),
+        // Grammar ferrosa's M1 subset does not implement — each must surface a
+        // clean parse/feature error, never silently-wrong rows.
+        ("cte", "WITH e AS (SELECT id FROM users) SELECT id FROM e"),
+        ("union", "SELECT id FROM users UNION SELECT uid FROM orders"),
+        ("window_fn", "SELECT id, COUNT(*) OVER () FROM users"),
+        ("missing_column", "SELECT no_such_col FROM users"),
     ];
 
     for (label, sql) in rejects {
