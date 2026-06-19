@@ -318,7 +318,7 @@ pub fn spawn_subscription_poll(
 ///
 /// Reads change events from the engine's shared CDC bus for the selected
 /// stream(s), filters them to the SELECT's target table, encodes each event to
-/// a CQL RESULT frame via [`crate::router::cdc_event_to_result_frame`], and
+/// a CQL RESULT frame via `crate::router::cdc_event_to_result_frame`, and
 /// pushes it to the connection. **Streaming**: one event at a time, bounded by
 /// the bus; never materializes the change stream. A lagging consumer receives a
 /// loud gap log (the bounded bus drops oldest); the connection-closed or
