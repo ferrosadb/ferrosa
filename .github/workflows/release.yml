@@ -246,6 +246,86 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  # ── Multi-arch container image (GHCR) ────────────────────────────────
+  docker-image:
+    name: Build & push container image (GHCR)
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download Linux musl tarball artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: artifacts
+
+      - name: Extract per-arch binaries into dist/<arch>/
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          x86_tar=$(find artifacts -name 'ferrosa-*-x86_64-unknown-linux-musl.tar.gz' | head -n1)
+          arm_tar=$(find artifacts -name 'ferrosa-*-aarch64-unknown-linux-musl.tar.gz' | head -n1)
+          test -n "$x86_tar" || { echo "ERROR: x86_64 tarball not found" >&2; exit 1; }
+          test -n "$arm_tar" || { echo "ERROR: aarch64 tarball not found" >&2; exit 1; }
+          tar -xzf "$x86_tar" -C dist/amd64 ferrosa ferrosa-ctl
+          tar -xzf "$arm_tar" -C dist/arm64 ferrosa ferrosa-ctl
+          chmod 0755 dist/amd64/ferrosa dist/amd64/ferrosa-ctl dist/arm64/ferrosa dist/arm64/ferrosa-ctl
+          ls -l dist/amd64 dist/arm64
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa"
+          REF="${GITHUB_REF_NAME}"          # e.g. v0.13.0 or v2026.06.19.0017
+          VERSION="${REF#v}"
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          TAGS=""
+          if [ "${PRERELEASE}" = "false" ]; then
+            # Stable: latest + full + rolling major.minor + major.
+            MAJOR="${VERSION%%.*}"
+            MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
+            TAGS="${IMAGE}:latest ${IMAGE}:v${VERSION} ${IMAGE}:${MAJOR}.${MINOR} ${IMAGE}:${MAJOR}"
+          else
+            # Nightly: moving :nightly + the exact CalVer ref.
+            TAGS="${IMAGE}:nightly ${IMAGE}:${REF}"
+          fi
+          echo "Computed tags: ${TAGS}"
+          # Emit as space-separated for the build step.
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up buildx (multi-arch)
+        run: |
+          docker buildx create --name ferrosa-builder --use
+          docker buildx inspect --bootstrap
+
+      - name: Build and push multi-arch image
+        run: |
+          set -euo pipefail
+          tag_args=""
+          for t in ${{ steps.tags.outputs.tags }}; do
+            tag_args="${tag_args} -t ${t}"
+          done
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -f Dockerfile.release \
+            ${tag_args} \
+            --push \
+            .
+
+      - name: Inspect published manifest
+        run: |
+          first_tag=$(echo "${{ steps.tags.outputs.tags }}" | awk '{print $1}')
+          docker buildx imagetools inspect "${first_tag}"
+
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────
   release:
     name: Create Release
