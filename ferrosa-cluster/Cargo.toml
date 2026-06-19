@@ -10,6 +10,7 @@ bincode = "1"
 bytes = "1"
 crc32fast = "1"
 dashmap = "6"
+ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-net = { path = "../ferrosa-net" }
