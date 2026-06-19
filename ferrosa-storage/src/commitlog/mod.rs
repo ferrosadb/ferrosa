@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use ferrosa_cdc::{CdcBus, CdcEvent, CdcStream};
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::Row;
@@ -384,10 +384,12 @@ pub struct CommitLog {
     /// None when archiving is disabled.
     archive_tx: Option<tokio::sync::mpsc::Sender<u64>>,
 
-    /// Optional CDC bus. When attached and a `WrittenOnNode` subscriber is live,
-    /// each successful append publishes a change event. `None` (the default)
-    /// keeps the append hot path entirely free of CDC cost.
-    cdc: Option<Arc<CdcBus>>,
+    /// Optional CDC bus, attachable at runtime via [`set_cdc`](Self::set_cdc).
+    /// When attached and a `WrittenOnNode` subscriber is live, each successful
+    /// append publishes a change event. Empty (the default) keeps the append hot
+    /// path entirely free of CDC cost. `ArcSwapOption` so the bus can be injected
+    /// after the engine is built (lock-free load on the hot path).
+    cdc: ArcSwapOption<CdcBus>,
 }
 
 impl CommitLog {
@@ -424,16 +426,28 @@ impl CommitLog {
             next_segment_id: AtomicU64::new(first_segment_id + 1),
             archived: Mutex::new(HashSet::new()),
             archive_tx: None,
-            cdc: None,
+            cdc: ArcSwapOption::empty(),
         })
     }
 
     /// Attaches a CDC bus so successful appends publish `WrittenOnNode` change
     /// events (the local change-data-capture stream). Builder-style; returns
     /// `self` for chaining at construction.
-    pub fn with_cdc(mut self, bus: Arc<CdcBus>) -> Self {
-        self.cdc = Some(bus);
+    pub fn with_cdc(self, bus: Arc<CdcBus>) -> Self {
+        self.cdc.store(Some(bus));
         self
+    }
+
+    /// Attaches (or replaces) the CDC bus at runtime — used to inject the shared
+    /// bus after the engine is constructed. Lock-free; safe to call while
+    /// appends are in flight.
+    pub fn set_cdc(&self, bus: Arc<CdcBus>) {
+        self.cdc.store(Some(bus));
+    }
+
+    /// The attached CDC bus, if any.
+    pub fn cdc(&self) -> Option<Arc<CdcBus>> {
+        self.cdc.load_full()
     }
 
     /// Publishes a `WrittenOnNode` CDC event for a just-appended mutation.
@@ -450,7 +464,8 @@ impl CommitLog {
         timestamp: i64,
         mutation_id: [u8; 16],
     ) {
-        let Some(bus) = &self.cdc else { return };
+        let guard = self.cdc.load();
+        let Some(bus) = guard.as_ref() else { return };
         if !bus.has_subscribers(CdcStream::WrittenOnNode) {
             return;
         }
@@ -1326,6 +1341,28 @@ mod tests {
         let config = CommitLogConfig::test_config(dir.path());
         let cl = CommitLog::new(config).unwrap();
         cl.append(&simple_mutation()).unwrap();
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn set_cdc_attaches_bus_at_runtime() {
+        // The bus can be injected AFTER construction (the production wiring path).
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+
+        let bus = CdcBus::new(16);
+        cl.set_cdc(Arc::clone(&bus)); // runtime attach
+        let mut sub = bus.subscribe(CdcStream::WrittenOnNode);
+
+        let m = simple_mutation();
+        cl.append(&m).unwrap();
+
+        let event = sub
+            .try_recv()
+            .expect("runtime-attached bus receives WrittenOnNode events");
+        assert_eq!(event.mutation_id, m.mutation_id);
+
         cl.shutdown().unwrap();
     }
 

@@ -5371,6 +5371,19 @@ impl StorageEngine {
         }
     }
 
+    /// Attach (or replace) the CDC bus used by the commit log to publish
+    /// `WrittenOnNode` change-data-capture events. Inject the shared bus here
+    /// after the engine is constructed; lock-free and safe under concurrent
+    /// writes.
+    pub fn set_cdc_bus(&self, bus: std::sync::Arc<ferrosa_cdc::CdcBus>) {
+        self.commit_log.set_cdc(bus);
+    }
+
+    /// The CDC bus attached to this engine's commit log, if any.
+    pub fn cdc_bus(&self) -> Option<std::sync::Arc<ferrosa_cdc::CdcBus>> {
+        self.commit_log.cdc()
+    }
+
     /// Reads a partition from a table, merging memtable and SSTable sources.
     pub fn read(
         &self,
