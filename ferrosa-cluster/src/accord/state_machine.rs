@@ -790,9 +790,19 @@ pub fn build_accord_state_machine(
     sync_writer: Arc<dyn SyncWriter>,
     storage: Arc<ferrosa_storage::engine::StorageEngine>,
 ) -> AccordStateMachine {
-    let applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
+    let engine_applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
         storage.clone(),
     ));
+    // When a CDC bus is attached, publish CommittedToCluster on apply so live
+    // CQL SUBSCRIBE ... ON COMMITTED (and Arrow Flight) see Accord-committed
+    // writes; otherwise use the engine applier directly.
+    let applier: Arc<dyn crate::accord::apply::StorageApplier> = match storage.cdc_bus() {
+        Some(bus) => Arc::new(crate::accord::apply::CdcPublishingApplier::new(
+            engine_applier,
+            bus,
+        )),
+        None => engine_applier,
+    };
     let reader = Arc::new(crate::accord::apply::EngineStorageReader::new(storage));
     AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader)
 }
