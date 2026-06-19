@@ -34,7 +34,8 @@ use std::sync::Arc;
 
 use ferrosa_schema::Schema;
 use ferrosa_sql::{
-    execute, parse, ColumnType, ExecError, MapCatalog, QueryResult, Value as SqlValue,
+    execute, parse_statement, Column, ColumnType, ExecError, MapCatalog, QueryResult, Row,
+    ScalarItem, ScalarValue, Statement, Value as SqlValue,
 };
 use ferrosa_storage::StorageEngine;
 
@@ -684,24 +685,122 @@ pub async fn execute_query(
     sql: &str,
     default_schema: &str,
 ) -> Vec<BackendMessage> {
-    // 1. Parse.
-    let stmt = match parse(sql) {
+    // 1. Parse the top-level statement.
+    let stmt = match parse_statement(sql) {
         Ok(stmt) => stmt,
         Err(e) => return vec![error_response("42601", &e.to_string())],
     };
 
-    // 2. Load every referenced table into a catalog. The R15 guard lives in
-    //    `load_table`: a missing table is `NoSuchTable`, never an empty scan.
-    let catalog = match load_catalog(engine, schema, &stmt, default_schema).await {
-        Ok(catalog) => catalog,
-        Err(err_msg) => return vec![err_msg],
-    };
+    match stmt {
+        // Table query: load referenced tables (the R15 guard lives in
+        // `load_table` — a missing table is `NoSuchTable`, never an empty
+        // scan), then execute over the materialized snapshots.
+        Statement::Select(select) => {
+            let catalog = match load_catalog(engine, schema, &select, default_schema).await {
+                Ok(catalog) => catalog,
+                Err(err_msg) => return vec![err_msg],
+            };
+            match execute(&select, &catalog, default_schema, &[]) {
+                Ok(result) => render_result(result, &[]), // simple query: all text
+                Err(e) => vec![exec_error_response(&e)],
+            }
+        }
+        // No-`FROM` expression query: `SELECT 1`, `SELECT version()`, etc.
+        Statement::SelectExprs(items) => match execute_scalar_select(&items, default_schema) {
+            Ok(result) => render_result(result, &[]),
+            Err(err_msg) => vec![err_msg],
+        },
+        // Transaction control routes through Accord; execution is wired
+        // separately (t_0f96cb47). Fail loud rather than fake atomicity.
+        Statement::Begin | Statement::Commit | Statement::Rollback => vec![error_response(
+            "0A000",
+            "transactions are not yet implemented (Accord-backed transactions are in progress)",
+        )],
+        // Session GUCs are not modeled yet.
+        Statement::Set { .. } | Statement::Reset { .. } => vec![error_response(
+            "0A000",
+            "SET/RESET session statements are not yet implemented",
+        )],
+    }
+}
 
-    // 3. Bind + execute over the materialized snapshots (simple query: no
-    //    bound parameters).
-    match execute(&stmt, &catalog, default_schema, &[]) {
-        Ok(result) => render_result(result, &[]), // simple query: all text format
-        Err(e) => vec![exec_error_response(&e)],
+/// Evaluate a no-`FROM` expression SELECT (`SELECT 1`, `SELECT version()`,
+/// `SELECT current_database()`) into a one-row [`QueryResult`]. Literals are
+/// returned as-is; a small set of info/session functions are evaluated from the
+/// connection's context.
+fn execute_scalar_select(
+    items: &[ScalarItem],
+    default_schema: &str,
+) -> Result<QueryResult, BackendMessage> {
+    let mut columns = Vec::with_capacity(items.len());
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let value = match &item.value {
+            ScalarValue::Literal(v) => v.clone(),
+            ScalarValue::Func(name) => eval_scalar_func(name, default_schema)?,
+            ScalarValue::Param(_) => {
+                return Err(error_response(
+                    "0A000",
+                    "$N parameters require the extended-query protocol",
+                ))
+            }
+        };
+        let ty = value_column_type(&value);
+        let name = item
+            .alias
+            .clone()
+            .unwrap_or_else(|| default_scalar_name(&item.value));
+        columns.push(Column::new(name, ty));
+        values.push(value);
+    }
+    Ok(QueryResult {
+        columns,
+        rows: vec![Row(values)],
+    })
+}
+
+/// Evaluate a zero-arg info/session function. Unsupported names fail loud
+/// (`0A000`) rather than returning a guessed value.
+fn eval_scalar_func(name: &str, default_schema: &str) -> Result<SqlValue, BackendMessage> {
+    match name {
+        // Keep in step with the `server_version` ParameterStatus (connection.rs).
+        "VERSION" => Ok(SqlValue::Text("PostgreSQL 16.0 (ferrosa)".to_string())),
+        "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" => {
+            Ok(SqlValue::Text(default_schema.to_string()))
+        }
+        other => Err(error_response(
+            "0A000",
+            &format!(
+                "function {}() is not supported yet",
+                other.to_ascii_lowercase()
+            ),
+        )),
+    }
+}
+
+/// The Postgres result type for a value (NULL defaults to text).
+fn value_column_type(v: &SqlValue) -> ColumnType {
+    match v {
+        SqlValue::Int(_) => ColumnType::Int,
+        SqlValue::Text(_) | SqlValue::Null => ColumnType::Text,
+        SqlValue::Bool(_) => ColumnType::Bool,
+        SqlValue::Float(_) => ColumnType::Float,
+        SqlValue::Numeric { .. } => ColumnType::Numeric,
+        SqlValue::Uuid(_) => ColumnType::Uuid,
+        SqlValue::Bytea(_) => ColumnType::Bytea,
+        SqlValue::Timestamp(_) => ColumnType::Timestamp,
+        SqlValue::Date(_) => ColumnType::Date,
+        SqlValue::Time(_) => ColumnType::Time,
+        SqlValue::Inet(_) => ColumnType::Inet,
+    }
+}
+
+/// The default output column name with no `AS` alias: the lowercased function
+/// name for a function call, else Postgres's `?column?`.
+fn default_scalar_name(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Func(name) => name.to_ascii_lowercase(),
+        _ => "?column?".to_string(),
     }
 }
 
@@ -1332,5 +1431,44 @@ mod tests {
             }
             other => panic!("expected DataRow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scalar_select_literal_and_info_functions() {
+        let items = vec![
+            ScalarItem {
+                value: ScalarValue::Literal(SqlValue::Int(1)),
+                alias: None,
+            },
+            ScalarItem {
+                value: ScalarValue::Func("VERSION".into()),
+                alias: None,
+            },
+            ScalarItem {
+                value: ScalarValue::Func("CURRENT_DATABASE".into()),
+                alias: Some("db".into()),
+            },
+        ];
+        let result = execute_scalar_select(&items, "myks").expect("scalar select");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.columns.len(), 3);
+        // Default names: ?column? for a literal, the function name for a call.
+        assert_eq!(result.columns[0].name, "?column?");
+        assert_eq!(result.columns[1].name, "version");
+        assert_eq!(result.columns[2].name, "db");
+        let row = &result.rows[0].0;
+        assert_eq!(row[0], SqlValue::Int(1));
+        assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
+        assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+    }
+
+    #[test]
+    fn scalar_select_unsupported_function_fails_loud() {
+        // An unmodeled function errors (0A000) rather than guessing a value.
+        let items = vec![ScalarItem {
+            value: ScalarValue::Func("NOW".into()),
+            alias: None,
+        }];
+        assert!(execute_scalar_select(&items, "ks").is_err());
     }
 }

@@ -102,7 +102,7 @@ async fn spawn_server(store: Arc<OneRole>, ctx: Arc<QueryContext>) -> u16 {
 }
 
 #[tokio::test]
-async fn real_driver_completes_scram_then_query_fails_loud() {
+async fn real_driver_scram_then_select1_succeeds_and_txn_fails_loud() {
     let (ctx, _dir) = minimal_ctx();
     let port = spawn_server(dev_store(), ctx).await;
 
@@ -121,17 +121,44 @@ async fn real_driver_completes_scram_then_query_fails_loud() {
         let _ = connection.await;
     });
 
-    // Auth succeeded and the session reached ReadyForQuery. The engine is now
-    // wired in: `SELECT 1` (no FROM clause) is outside the M1 subset, so it
-    // fails loud at parse time with SQLSTATE 42601 (syntax_error) rather than
-    // returning a fake row.
-    let err = client
+    // Auth succeeded and the session reached ReadyForQuery. No-FROM expression
+    // SELECTs are now supported: `SELECT 1` returns one row with value 1.
+    let msgs = client
         .simple_query("SELECT 1")
         .await
-        .expect_err("a no-FROM query is outside the M1 subset and must fail loud");
+        .expect("SELECT 1 should succeed");
+    let one = msgs
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected a data row from SELECT 1");
+    assert_eq!(one.get(0), Some("1"));
+
+    // `version()` is evaluated from the connection context.
+    let vmsgs = client
+        .simple_query("SELECT version()")
+        .await
+        .expect("version() should succeed");
+    assert!(
+        vmsgs.iter().any(|m| matches!(
+            m,
+            tokio_postgres::SimpleQueryMessage::Row(r)
+                if r.get(0).unwrap_or_default().contains("ferrosa")
+        )),
+        "version() should report a ferrosa version string"
+    );
+
+    // Transactions route through Accord and are not yet wired: `BEGIN` must
+    // fail loud (SQLSTATE 0A000, feature_not_supported) — never a fake success.
+    let err = client
+        .simple_query("BEGIN")
+        .await
+        .expect_err("transactions are not yet implemented and must fail loud");
     assert_eq!(
         err.code().map(|c| c.code()),
-        Some("42601"),
+        Some("0A000"),
         "unexpected error: {err}"
     );
 
