@@ -62,8 +62,9 @@ impl std::error::Error for RowBridgeError {}
 
 pub use codec::{decode_value, encode_value, parse_cql_type, parse_cql_type_in_keyspace};
 pub use row::{
-    decode_clustering, decode_pk, partition_to_rows, partition_to_rows_with_clustering,
-    partition_to_rows_with_storage_mapping, write_partition_raw_rows_with_storage_mapping,
+    build_decorated_key, build_row, decode_clustering, decode_pk, encode_clustering,
+    partition_to_rows, partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
+    write_partition_raw_rows_with_storage_mapping,
 };
 
 // Liveness helpers are re-exported for `ferrosa-cql`'s remaining metadata
