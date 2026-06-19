@@ -1,6 +1,6 @@
 # System Overview
 
-> Last updated: 2026-06-04
+> Last updated: 2026-06-19
 > Status: Approved
 
 ## Overview
@@ -17,10 +17,14 @@ graph TB
         D3[ferrosa-ctl<br/>CLI + TUI Monitor]
         D4[Graph Clients<br/>Bolt / HTTP]
         D5[SPARQL Clients<br/>HTTP]
+        D6[Postgres Clients<br/>psql / psycopg2]
+        D7[Flight Clients<br/>Arrow]
     end
 
     subgraph "Ferrosa Node"
         CQL[ferrosa-cql<br/>CQL Protocol v4/v5]
+        PG[ferrosa-postgres<br/>PostgreSQL wire :5432]
+        Flight[ferrosa-flight<br/>Arrow Flight gRPC]
         Graph[ferrosa-graph<br/>Cypher + Bolt v5]
         SPARQL[ferrosa-sparql<br/>SPARQL 1.1 Query/Update]
         Schema[ferrosa-schema<br/>DDL, Auth, Audit]
@@ -49,6 +53,11 @@ graph TB
     D3 -->|CQL + HTTP| CQL & Web
     D4 -->|Bolt v5 / HTTP| Graph
     D5 -->|HTTP SPARQL Protocol| SPARQL
+    D6 -->|PostgreSQL v3 + SCRAM| PG
+    D7 -->|Flight gRPC + bearer token| Flight
+    PG --> Schema
+    PG --> Storage
+    Flight --> CQL
     CQL --> Schema
     CQL --> Storage
     CQL --> Cluster
@@ -146,6 +155,7 @@ during the apply phase is documented in [memtable-backpressure.md](memtable-back
 | Storage | Write-behind async S3 | Minimal write latency, quorum mitigates loss window |
 | SSTable | Phased: BTI read+write first, Big read later | Focus on modern format, migration path preserved |
 | Protocol | CQL client compatibility target, own internode | Common driver paths work; full conformance remains tracked work |
+| Client surfaces | CQL (9042) + PostgreSQL wire (5432, preview) + Arrow Flight (gRPC) over one core | Reach Postgres/analytics clients without a second storage stack; PG writes share the CQL row codec (D10) |
 | Consensus | Raft metadata, tunable CL | Proven Rust libs + Cassandra semantics |
 | Transactions | Accord consensus (serializable) | Cassandra 5.x compatible, no dedicated coordinator |
 | Partitioner | Murmur3Partitioner | Cassandra SSTable compatibility |
