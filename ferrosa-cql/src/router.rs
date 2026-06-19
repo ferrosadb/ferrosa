@@ -965,11 +965,13 @@ pub enum RouteResult {
     Result(BytesMut),
     /// USE keyspace: returns the new keyspace name and a SetKeyspace frame body.
     SetKeyspace(String, BytesMut),
-    /// Subscription accepted — connection should spawn a polling task.
+    /// Subscription accepted — connection should spawn the delivery task
+    /// (snapshot poll, or an event-driven CDC subscriber per `streams`).
     Subscribe {
         inner: Box<Statement>,
         interval: Option<std::time::Duration>,
         delta: bool,
+        streams: crate::ast::SubscribeStreams,
     },
     /// Unsubscribe — cancel one or all subscriptions.
     Unsubscribe { stream_id: Option<u16> },
@@ -1567,25 +1569,16 @@ pub async fn route(
                     ))
                 }
             }
-            match streams {
-                // Legacy snapshot mode (no ON clause): re-execute the SELECT on
-                // an interval. Unchanged behavior.
-                crate::ast::SubscribeStreams::Snapshot => Ok(RouteResult::Subscribe {
-                    inner,
-                    interval,
-                    delta,
-                }),
-                // Event-driven CDC (ON LOCAL|COMMITTED): the producer side is
-                // wired (commit-log + Accord apply publish to the engine's CDC
-                // bus), but the streaming consumer that reads the bus, filters,
-                // and encodes change events to RESULT frames is not yet built.
-                // Fail loud rather than silently behaving like a poll.
-                crate::ast::SubscribeStreams::Cdc { .. } => Err(CqlError::Invalid(
-                    "SUBSCRIBE ... ON LOCAL|COMMITTED (event-driven change-data-capture) \
-                     is not yet supported"
-                        .into(),
-                )),
-            }
+            // Snapshot mode re-executes the SELECT on an interval; CDC mode
+            // (ON LOCAL|COMMITTED) streams change events from the engine's CDC
+            // bus. The connection layer spawns the right delivery task per
+            // `streams`.
+            Ok(RouteResult::Subscribe {
+                inner,
+                interval,
+                delta,
+                streams,
+            })
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
         Statement::CreateType {
@@ -4698,12 +4691,6 @@ pub async fn route_select_raw(
 /// Streaming by construction: it handles **one event's rows** (a single write),
 /// never a materialized result set. Returns `Ok(None)` if the table is unknown
 /// (e.g. dropped between subscribe and delivery) so the caller can skip it.
-// Justification for allow(dead_code): the non-test caller is the CDC SUBSCRIBE
-// consumer (spawn_cdc_subscription), landing in the next slice (t_d30ecb1f).
-// This function is already exercised + correctness-checked by the test
-// `cdc_event_frame_matches_select_for_same_row` (byte-equivalence vs the SELECT
-// read path). The allow is removed when the consumer wires it in.
-#[allow(dead_code)]
 pub(crate) fn cdc_event_to_result_frame(
     schema: &Schema,
     ks: &str,
