@@ -93,6 +93,39 @@ fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
     }
 }
 
+/// Build a `CommittedToCluster` CDC event for a regular-CL write, if the
+/// engine's shared CDC bus has a committed-stream subscriber.
+///
+/// Coordinator-side: a regular-CL write reaches "committed to cluster" when the
+/// coordinator achieves its consistency level (the caller publishes only after
+/// the write returns `Ok`). Ordered by the write `timestamp` — there is no
+/// Accord timestamp for non-Accord writes (decision O-8). Returns the bus +
+/// event so the row is cloned only when a subscriber is actually listening; the
+/// caller publishes after success. `None` (no allocation) otherwise.
+fn committed_cdc_event(
+    storage: &StorageEngine,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    rows: &[Row],
+    timestamp: i64,
+) -> Option<(Arc<ferrosa_cdc::CdcBus>, ferrosa_cdc::CdcEvent)> {
+    let bus = storage.cdc_bus()?;
+    if !bus.has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster) {
+        return None;
+    }
+    let event = ferrosa_cdc::CdcEvent {
+        stream: ferrosa_cdc::CdcStream::CommittedToCluster,
+        keyspace: table_id.keyspace.clone(),
+        table: table_id.table.clone(),
+        key: key.clone(),
+        rows: rows.to_vec(),
+        timestamp,
+        accord_ts: None,
+        mutation_id: uuid::Uuid::new_v4().into_bytes(),
+    };
+    Some((bus, event))
+}
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -153,13 +186,44 @@ impl WritePath {
                         .coordinate_write(&m)
                         .await
                         .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                    if let Some((bus, ev)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        &TableId::new(&m.keyspace, &m.table),
+                        &m.key,
+                        &m.rows,
+                        m.timestamp,
+                    ) {
+                        bus.publish(ev);
+                    }
                 }
                 Ok(())
             }
-            Self::Cluster(coordinator) => coordinator
-                .coordinate_logged_batch(mutations)
-                .await
-                .map_err(cluster_error_to_common),
+            Self::Cluster(coordinator) => {
+                // Capture committed-CDC events before `mutations` is moved into
+                // the batch (clones only when a committed subscriber exists).
+                let pending: Vec<_> = mutations
+                    .iter()
+                    .filter_map(|m| {
+                        committed_cdc_event(
+                            &coordinator.storage,
+                            &TableId::new(&m.keyspace, &m.table),
+                            &m.key,
+                            &m.rows,
+                            m.timestamp,
+                        )
+                    })
+                    .collect();
+                let res = coordinator
+                    .coordinate_logged_batch(mutations)
+                    .await
+                    .map_err(cluster_error_to_common);
+                if res.is_ok() {
+                    for (bus, ev) in pending {
+                        bus.publish(ev);
+                    }
+                }
+                res
+            }
         }
     }
 
@@ -744,21 +808,57 @@ impl WritePath {
                     vec![row],
                     timestamp,
                 );
-                coordinator
+                let res = coordinator
                     .coordinate_write(&mutation)
                     .await
-                    .map_err(cluster_error_to_common)
+                    .map_err(cluster_error_to_common);
+                if res.is_ok() {
+                    if let Some((bus, ev)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        table_id,
+                        &mutation.key,
+                        &mutation.rows,
+                        mutation.timestamp,
+                    ) {
+                        bus.publish(ev);
+                    }
+                }
+                res
             }
-            Self::Cluster(coordinator) => match strategy {
-                ReplicationStrategy::Simple { replication_factor } => coordinator
-                    .coordinate_write_with(table_id, key, row, timestamp, cl, *replication_factor)
-                    .await
-                    .map_err(cluster_error_to_common),
-                ReplicationStrategy::NetworkTopology { .. } => coordinator
-                    .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
-                    .await
-                    .map_err(cluster_error_to_common),
-            },
+            Self::Cluster(coordinator) => {
+                // Capture the committed-CDC payload before `row` is moved into
+                // the coordinate call; clones only if a subscriber is listening.
+                let pending = committed_cdc_event(
+                    &coordinator.storage,
+                    table_id,
+                    key,
+                    std::slice::from_ref(&row),
+                    timestamp,
+                );
+                let res = match strategy {
+                    ReplicationStrategy::Simple { replication_factor } => coordinator
+                        .coordinate_write_with(
+                            table_id,
+                            key,
+                            row,
+                            timestamp,
+                            cl,
+                            *replication_factor,
+                        )
+                        .await
+                        .map_err(cluster_error_to_common),
+                    ReplicationStrategy::NetworkTopology { .. } => coordinator
+                        .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
+                        .await
+                        .map_err(cluster_error_to_common),
+                };
+                if res.is_ok() {
+                    if let Some((bus, ev)) = pending {
+                        bus.publish(ev);
+                    }
+                }
+                res
+            }
         }
     }
 }
@@ -860,6 +960,43 @@ mod tests {
         // Verify data was written
         let result = storage.read(&table_id, &key).unwrap();
         assert!(result.is_some(), "DirectWritePath should write to storage");
+    }
+
+    #[test]
+    fn committed_cdc_event_only_when_subscribed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let bus = ferrosa_cdc::CdcBus::new(16);
+        storage.set_cdc_bus(bus.clone());
+
+        let table_id = TableId::new("ks", "t");
+        let key = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::new(vec![1]),
+        };
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+
+        // No committed-stream subscriber → no event built (no allocation).
+        assert!(
+            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+                .is_none()
+        );
+
+        // With a subscriber → event built with the right fields, accord_ts None.
+        let _sub = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+        let (_bus, ev) =
+            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+                .expect("committed CDC event built when subscribed");
+        assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
+        assert_eq!(ev.keyspace, "ks");
+        assert_eq!(ev.table, "t");
+        assert_eq!(ev.rows, vec![row]);
+        assert!(ev.accord_ts.is_none());
     }
 
     #[tokio::test]
