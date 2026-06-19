@@ -1354,11 +1354,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone write_path and ddl_path before shared_state is moved into the CQL server.
     let cluster_write_path = shared_state.write_path.clone();
     let cluster_ddl_path = shared_state.ddl_path.clone();
+    // Clone the shared execution state for the Flight endpoint before it is
+    // moved into the CQL server (feature-gated so it is not an unused clone).
+    #[cfg(feature = "flight")]
+    let flight_state = shared_state.clone();
     let cql_server = ferrosa_cql::server::CqlServer::new(cql_config, shared_state).with_task_pool(
         ferrosa_net::task_pool::TaskPool::runtime("cql", runtimes.cql.clone()),
     );
     let cql_addr = cql_server.start_background().await?;
     tracing::info!(%cql_addr, "CQL server listening");
+
+    // 9c. Arrow Flight (gRPC) query endpoint — port 8815, behind the `flight`
+    // feature. Auth is enforced per-RPC (signed bearer tokens); only
+    // anonymous-safe because every read RPC requires a verified token.
+    #[cfg(feature = "flight")]
+    {
+        let flight_bind =
+            std::env::var("FERROSA_FLIGHT_BIND").unwrap_or_else(|_| "0.0.0.0:8815".to_string());
+        match flight_bind.parse::<std::net::SocketAddr>() {
+            Ok(flight_addr) => {
+                let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
+                    Ok(k) if !k.is_empty() => k.into_bytes(),
+                    _ => {
+                        tracing::warn!(
+                            "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
+                             key; bearer tokens will not survive a restart or work across nodes. \
+                             Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
+                        );
+                        uuid::Uuid::new_v4().into_bytes().to_vec()
+                    }
+                };
+                let previous_keys: Vec<Vec<u8>> =
+                    std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
+                        .ok()
+                        .into_iter()
+                        .flat_map(|v| {
+                            v.split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.as_bytes().to_vec())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                let token_ttl_secs: u64 = std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3600);
+                let mut service =
+                    ferrosa_flight::service::FerrosaFlight::new(flight_state, signing_key)
+                        .with_token_ttl(token_ttl_secs);
+                if !previous_keys.is_empty() {
+                    service = service.with_previous_keys(previous_keys);
+                }
+                runtimes.background.spawn(async move {
+                    if let Err(e) = ferrosa_flight::server::serve_service(flight_addr, service).await
+                    {
+                        tracing::error!(error = %e, "Arrow Flight server exited");
+                    }
+                });
+                tracing::info!(%flight_addr, "Arrow Flight server listening");
+            }
+            Err(e) => tracing::error!(
+                bind = %flight_bind,
+                error = %e,
+                "invalid FERROSA_FLIGHT_BIND — Flight server not started"
+            ),
+        }
+    }
 
     // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
