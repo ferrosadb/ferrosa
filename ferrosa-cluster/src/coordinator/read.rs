@@ -3590,6 +3590,111 @@ mod tests {
         );
     }
 
+    /// Regression for the COUNT(*) undercount bug (forge t_8c4e44e8). When the
+    /// keyspace RF does not span the ring, the local replica holds only the
+    /// partitions in its owned token ranges. The OLD `coordinate_range_count`
+    /// called `storage.count_range` directly and silently returned that local
+    /// SUBSET as the answer — a nondeterministic undercount, while a full
+    /// `SELECT` (which fans out + dedups by token) saw every row.
+    ///
+    /// The fix routes COUNT(*) through the same CL-selected, token-deduped
+    /// fan-out the streaming read uses. So when the required remote owners are
+    /// unreachable, COUNT(*) must FAIL LOUD (exactly like
+    /// `coordinate_range_read`) rather than report local-only partial data as a
+    /// complete count.
+    #[tokio::test]
+    async fn coordinate_range_count_errors_when_required_remote_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        // Remote peer with no connection pool — sends will fail.
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[150]);
+
+        // RF=1 over a 2-node ring => the local node does NOT own every token
+        // range, so `range_read_remotes` is non-empty and COUNT(*) must fan out.
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        // Write a partition locally. The OLD code would have happily returned
+        // count=1 here — but that is only the LOCAL view; node2 may hold more.
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        let result = coordinator.coordinate_range_count(&table_id).await;
+        assert!(
+            result.is_err(),
+            "COUNT(*) must not report the local-only subset as a complete count \
+             when a required remote owner is unreachable"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("fire failed"),
+            "error should name the remote fanout failure, got: {message}"
+        );
+    }
+
+    /// Companion to the undercount regression: when the local node owns the
+    /// entire ring at the configured CL (`range_read_remotes` empty), COUNT(*)
+    /// keeps the exact local metadata fast path and returns the true count.
+    #[tokio::test]
+    async fn coordinate_range_count_single_node_returns_exact_local_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        let count = coordinator
+            .coordinate_range_count(&table_id)
+            .await
+            .expect("single-node COUNT(*) should succeed via the local fast path");
+        assert_eq!(count, 1, "COUNT(*) must equal the one written partition");
+    }
+
     struct GeneratorRangeStorage {
         generated_rows: usize,
     }
