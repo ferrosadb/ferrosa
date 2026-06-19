@@ -157,6 +157,29 @@ is planned behind a feature flag.
 
 Distributed transactions (Accord-style) exist in the implementation and test specs, but public Jepsen-style verification is still a planned evidence item rather than a release guarantee.
 
+### PostgreSQL Wire Protocol (developer preview)
+
+Alongside CQL, Ferrosa speaks the PostgreSQL v3 wire protocol on port `5432` with
+SCRAM-SHA-256 auth, so standard clients (`psql`, `psycopg2`, `tokio-postgres`) connect
+to the same data. The current surface covers:
+
+- **Queries:** `SELECT` with projection, `WHERE` (`=`/`!=`/range, `AND`/`OR`/`NOT`),
+  inner `JOIN`, `GROUP BY` + `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, `HAVING`, `DISTINCT`,
+  `ORDER BY`/`LIMIT`/`OFFSET`, three-valued NULL logic, and no-`FROM` expression
+  selects (`SELECT 1`, `version()`).
+- **Writes:** single-row `INSERT`/`UPDATE`/`DELETE` (with `NULL` handling), sharing the
+  same storage engine and row encoder as the CQL path — a row written over Postgres
+  reads back identically over CQL.
+- **Transactions:** `BEGIN`/`COMMIT`/`ROLLBACK` protocol state (idle/in-txn/failed);
+  Accord-backed atomicity is in progress.
+
+Both the simple and extended (Parse/Bind/Execute) query protocols are supported. The
+front-end's behavior is continuously cross-checked against a real PostgreSQL 16 by a
+differential oracle in CI (the `postgres-oracle` job): the same data and SQL run against
+both systems and the result sets must agree; unsupported SQL fails loud rather than
+returning wrong rows. See [the PostgreSQL wire reference](docs/database/postgres.html)
+and [`specs/implemented/postgres-differential-oracle.md`](specs/implemented/postgres-differential-oracle.md).
+
 ## Crates
 
 | Crate | Description |
