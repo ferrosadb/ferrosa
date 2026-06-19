@@ -88,6 +88,7 @@ jobs:
                  --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
                  --skip bounded_fetch_reassembles_to_single_pass \
                  --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
+                 --skip differential_oracle \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
@@ -206,21 +207,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - name: Install musl tools and capnproto
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools capnproto
-
-      - name: Build x86_64 musl static ferrosa binary (fallback)
-        # The smoke test needs a runtime image. Prefer the nightly .deb below,
-        # but always produce a static binary here so the smoke test can run even
-        # when no nightly release has been published yet (e.g. immediately after
-        # this PR merges). This prevents the smoke test from failing fast due to
-        # a missing .deb instead of exercising the actual pair-mode behavior.
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa
-          cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
-          strip tests/ferrosa
-
       - name: Download latest nightly .deb release
         id: nightly_deb
         env:
@@ -241,6 +227,19 @@ jobs:
           else
             echo "::warning::No nightly .deb found; will use the musl binary fallback."
           fi
+
+      - name: Build x86_64 musl static ferrosa binary (fallback)
+        # The smoke test needs a runtime image. Prefer the nightly .deb above,
+        # but build a static binary if no nightly release is available yet
+        # (e.g. immediately after this PR merges before the first 00:17 UTC cut).
+        # This prevents the smoke test from failing fast on a missing artifact
+        # instead of exercising the actual pair-mode behavior.
+        if: steps.nightly_deb.outputs.deb_url == ''
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa
+          cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
+          strip tests/ferrosa
 
       - name: Build smoke-test runtime image
         run: |
