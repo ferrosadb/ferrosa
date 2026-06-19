@@ -548,6 +548,55 @@ impl DepWaitApplier {
 }
 
 // ===========================================================================
+// CdcPublishingApplier — publish CommittedToCluster CDC on durable apply
+// ===========================================================================
+
+/// Decorates a [`StorageApplier`] to publish a `CommittedToCluster` CDC event
+/// after a successful durable apply, so live CQL `SUBSCRIBE ... ON COMMITTED`
+/// (and the Arrow Flight endpoint) receive Accord-committed writes. No-op when
+/// no committed-stream subscriber is attached. The inner applier's fail-loud
+/// contract is preserved — the event is published only after `inner.apply`
+/// returns `Ok`.
+pub struct CdcPublishingApplier {
+    inner: Arc<dyn StorageApplier>,
+    cdc: Arc<ferrosa_cdc::CdcBus>,
+}
+
+impl CdcPublishingApplier {
+    pub fn new(inner: Arc<dyn StorageApplier>, cdc: Arc<ferrosa_cdc::CdcBus>) -> Self {
+        Self { inner, cdc }
+    }
+}
+
+impl StorageApplier for CdcPublishingApplier {
+    fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
+        // Build the CDC event before `mutation` is consumed, and only if a
+        // committed-stream subscriber is actually listening.
+        let event = if self.cdc.has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster) {
+            Mutation::deserialize_from(&mutation.data)
+                .ok()
+                .map(|m| ferrosa_cdc::CdcEvent {
+                    stream: ferrosa_cdc::CdcStream::CommittedToCluster,
+                    keyspace: m.keyspace.clone(),
+                    table: m.table.clone(),
+                    key: m.key.clone(),
+                    rows: m.rows.clone(),
+                    timestamp: m.timestamp,
+                    accord_ts: Some(mutation.t),
+                    mutation_id: m.mutation_id,
+                })
+        } else {
+            None
+        };
+        self.inner.apply(txn_id, mutation)?;
+        if let Some(ev) = event {
+            self.cdc.publish(ev);
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
