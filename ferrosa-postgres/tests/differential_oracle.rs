@@ -1398,6 +1398,13 @@ async fn differential_oracle_rejects_unsupported_queries() {
         ("union", "SELECT id FROM users UNION SELECT uid FROM orders"),
         ("window_fn", "SELECT id, COUNT(*) OVER () FROM users"),
         ("missing_column", "SELECT no_such_col FROM users"),
+        // `IS [NOT] NULL` is not yet in the M1 grammar (tracked separately). It
+        // must fail loud, not silently match the `= NULL`/`!= NULL` paths.
+        ("is_null", "SELECT id FROM users WHERE email IS NULL"),
+        (
+            "is_not_null",
+            "SELECT id FROM users WHERE email IS NOT NULL",
+        ),
     ];
 
     for (label, sql) in rejects {
