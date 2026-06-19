@@ -117,6 +117,48 @@ Channel resolution:
 - **stable** → `GET /repos/ferrosadb/ferrosa/releases/latest` (non-prerelease only)
 - **nightly** → `GET /repos/ferrosadb/ferrosa/releases?per_page=1` (newest, incl. prerelease)
 
+## Container image
+
+Every release publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+`ghcr.io/ferrosadb/ferrosa`, built by the `docker-image` job in `release.yml`.
+
+- **Base:** `alpine:3.20` + `ca-certificates` + `tzdata`. Built by COPYing the
+  prebuilt musl static binary — no compilation in Docker, no QEMU.
+- **Features:** built with `--features ferrosa/full` (otel + flight + asc-udf),
+  identical to the `.deb`/tarball binaries.
+- **Tags:**
+  - Stable (`prerelease=false`): `:latest`, `:vX.Y.Z`, `:X.Y`, `:X`.
+  - Nightly (`prerelease=true`): `:nightly`, `:<CalVer>` (e.g. `:v2026.06.19.0017`).
+- **Runs as** non-root UID 10001; `--read-only` rootfs compatible (only the
+  `/var/lib/ferrosa` volume is written).
+- **Exposed ports:** 9042 (CQL), 17000 (internode), 9090 (web/Prometheus),
+  7474 (graph HTTP), 7687 (Bolt), 8815 (Arrow Flight gRPC).
+
+### Configuration injection
+
+No active config is baked in. Configure via either:
+
+- `FERROSA_*` environment variables (e.g. `FERROSA_CQL_BIND`, `FERROSA_S3_*`,
+  `FERROSA_INTERNODE_BROADCAST`, `FERROSA_DATA_DIR`) — no file required; a missing
+  `FERROSA_CONFIG` file is tolerated, or
+- mounting a TOML file at `/etc/ferrosa/ferrosa.toml` (or set `FERROSA_CONFIG`).
+
+A reference config ships at `/etc/ferrosa/ferrosa.example.toml`.
+
+Example:
+
+```bash
+docker run -d --name ferrosa \
+  -e FERROSA_MODE=production \
+  -e FERROSA_CQL_BIND=0.0.0.0:9042 \
+  -e FERROSA_INTERNODE_BROADCAST=10.0.0.5:17000 \
+  -e FERROSA_S3_ENDPOINT=https://s3.example.com \
+  -e FERROSA_S3_BUCKET=ferrosa \
+  -v ferrosa-data:/var/lib/ferrosa \
+  -p 9042:9042 \
+  ghcr.io/ferrosadb/ferrosa:latest
+```
+
 ## Runbook — the nightly release failed
 
 1. `gh run list --workflow=nightly-release.yml` → open the failed run.
