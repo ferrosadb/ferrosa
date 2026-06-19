@@ -589,7 +589,7 @@ impl WritePath {
                 .local_storage()
                 .count_range(table_id, None, None)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id),
+            Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id).await,
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "count_range unavailable: write path is in degraded mode".into(),
             )),
