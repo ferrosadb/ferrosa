@@ -44,6 +44,39 @@ const TOKEN_TTL_SECS: u64 = 3600;
 /// than materializing the whole result set.
 const DEFAULT_PAGE_SIZE: usize = 1024;
 
+/// Default Flight gRPC port advertised in distributed `FlightEndpoint`
+/// locations. Used for remote replicas (whose ring metadata records only the
+/// internode address) when `FERROSA_FLIGHT_PORT` is unset.
+const DEFAULT_FLIGHT_PORT: u16 = 50051;
+
+/// Env var: this node's externally-reachable Flight address advertised to
+/// clients (e.g. `grpc://flight.example.com:50051`). Used as the location for
+/// ranges this node owns.
+const ENV_FLIGHT_BROADCAST: &str = "FERROSA_FLIGHT_BROADCAST";
+
+/// Env var: the Flight gRPC port to combine with a remote replica's internode
+/// host when building its advertised location.
+const ENV_FLIGHT_PORT: &str = "FERROSA_FLIGHT_PORT";
+
+/// Resolve the Flight gRPC port for remote replica locations from the
+/// environment, falling back to [`DEFAULT_FLIGHT_PORT`].
+fn flight_port_from_env() -> u16 {
+    std::env::var(ENV_FLIGHT_PORT)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_FLIGHT_PORT)
+}
+
+/// This node's advertised Flight address from [`ENV_FLIGHT_BROADCAST`], if set.
+/// Fail-loud contract: when unset we return `None` and the caller advertises no
+/// location for self-owned ranges (the client falls back to the connection it
+/// queried on) rather than fabricating an address that may be unreachable.
+fn flight_broadcast_from_env() -> Option<String> {
+    std::env::var(ENV_FLIGHT_BROADCAST)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Ferrosa's Arrow Flight service. Executes CQL queries and streams Arrow.
 pub struct FerrosaFlight {
     state: Arc<SharedState>,
@@ -55,6 +88,14 @@ pub struct FerrosaFlight {
     token_ttl_secs: u64,
     /// Rows per `DoGet` page (peak-memory bound).
     page_size: usize,
+    /// This node's externally-reachable Flight address, advertised as the
+    /// location for ranges this node owns. `None` when `FERROSA_FLIGHT_BROADCAST`
+    /// is unset — self-owned ranges then advertise no location (the client
+    /// falls back to the connection it queried on) rather than a faked address.
+    flight_advertise: Option<String>,
+    /// Flight gRPC port combined with a remote replica's internode host to
+    /// build its advertised location (the ring records only internode addrs).
+    flight_port: u16,
 }
 
 fn now_secs() -> u64 {
@@ -73,7 +114,22 @@ impl FerrosaFlight {
             signing_keys: vec![signing_key],
             token_ttl_secs: TOKEN_TTL_SECS,
             page_size: DEFAULT_PAGE_SIZE,
+            flight_advertise: flight_broadcast_from_env(),
+            flight_port: flight_port_from_env(),
         }
+    }
+
+    /// Override this node's advertised Flight address (the location used for
+    /// ranges this node owns). Overrides `FERROSA_FLIGHT_BROADCAST`.
+    pub fn with_flight_advertise(mut self, addr: impl Into<String>) -> Self {
+        self.flight_advertise = Some(addr.into());
+        self
+    }
+
+    /// Override the Flight gRPC port used to build remote replica locations.
+    pub fn with_flight_port(mut self, port: u16) -> Self {
+        self.flight_port = port;
+        self
     }
 
     /// Add previous signing keys still accepted on verify (rotation overlap).
@@ -222,6 +278,101 @@ impl FerrosaFlight {
             .into_iter()
             .map(|(ks, tbl)| format!("SELECT * FROM {ks}.{tbl}"))
             .collect()
+    }
+
+    /// Resolve the keyspace for a `SELECT`: the explicit `ks.table` prefix wins,
+    /// else there is none (this front-end has no per-session keyspace), which we
+    /// surface to the caller as "cannot scope to a single table".
+    fn select_keyspace(select: &ferrosa_cql::ast::SelectStatement) -> Option<&str> {
+        select.keyspace.as_deref()
+    }
+
+    /// The partition-key columns of `ks.table`, in key order, from the live
+    /// schema snapshot. `None` if the table is unknown (then we cannot build
+    /// `token(...)` bounds and fall back to a single endpoint).
+    fn partition_key_columns(&self, ks: &str, table: &str) -> Option<Vec<String>> {
+        let snap = self.state.schema.snapshot();
+        snap.tables
+            .get(&(ks.to_string(), table.to_string()))
+            .map(|t| t.partition_key.clone())
+    }
+
+    /// The keyspace's replication strategy from the live schema snapshot,
+    /// defaulting to `Simple{rf:1}` when unknown (matches the router's default).
+    fn keyspace_strategy(&self, ks: &str) -> ferrosa_cluster::ring::strategy::ReplicationStrategy {
+        use ferrosa_cluster::ring::strategy::ReplicationStrategy;
+        let snap = self.state.schema.snapshot();
+        snap.keyspaces
+            .get(ks)
+            .and_then(|km| ReplicationStrategy::try_from(&km.replication).ok())
+            .unwrap_or(ReplicationStrategy::Simple {
+                replication_factor: 1,
+            })
+    }
+
+    /// Map a ring node-id to its advertised Flight URI.
+    ///
+    /// The local node (matched by `host_id` → ring node-id) advertises
+    /// `self.flight_advertise`; remote nodes combine their ring internode host
+    /// with `self.flight_port`. Returns `None` when the address is unknown so
+    /// the planner omits it rather than fabricating an unreachable location.
+    fn resolve_flight_addr(
+        &self,
+        ring: &ferrosa_cluster::ring::TokenRing,
+        local_node_id: u64,
+        node_id: u64,
+    ) -> Option<String> {
+        if node_id == local_node_id {
+            return self.flight_advertise.clone();
+        }
+        let info = ring.get_node(node_id)?;
+        let host = info
+            .addr
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(&info.addr);
+        Some(format!("grpc://{host}:{}", self.flight_port))
+    }
+
+    /// Build the distributed `FlightEndpoint` list for `select`.
+    ///
+    /// Returns one endpoint per ring token range when a cluster ring is present
+    /// and the table is known; otherwise `None`, signalling the caller to keep
+    /// the single self-endpoint (standalone / unknown-table behavior).
+    fn distributed_endpoints(
+        &self,
+        select: &ferrosa_cql::ast::SelectStatement,
+        base_cql: &str,
+    ) -> Option<Vec<FlightEndpoint>> {
+        let ring = self.state.core.mode_controller.token_ring()?;
+        let ks = Self::select_keyspace(select)?;
+        let pk = self.partition_key_columns(ks, &select.table)?;
+        let strategy = self.keyspace_strategy(ks);
+        let local_node_id =
+            ferrosa_cluster::raft::uuid_to_node_id(self.state.core.mode_controller.host_id());
+
+        let plans = crate::plan::distributed_endpoints(base_cql, &pk, &ring, &strategy, |nid| {
+            self.resolve_flight_addr(&ring, local_node_id, nid)
+        });
+        // A single whole-ring plan is indistinguishable from the standalone
+        // case — let the caller emit its self-endpoint instead.
+        if plans.len() <= 1 {
+            return None;
+        }
+        Some(
+            plans
+                .into_iter()
+                .map(|p| {
+                    let mut ep = FlightEndpoint::new().with_ticket(Ticket {
+                        ticket: p.ticket_cql.into_bytes().into(),
+                    });
+                    for loc in p.locations {
+                        ep = ep.with_location(loc);
+                    }
+                    ep
+                })
+                .collect(),
+        )
     }
 }
 
@@ -436,15 +587,42 @@ impl FlightService for FerrosaFlight {
         Ok(Response::new(Box::pin(flight_data) as Self::DoGetStream))
     }
 
-    /// Return the schema (and a single self-endpoint) for a CQL command.
+    /// Return the schema and the Flight endpoints for a CQL command.
+    ///
+    /// On a cluster topology with a known table, emits one `FlightEndpoint` per
+    /// token range — each ticket a token-bounded `SELECT`, located on the
+    /// replica(s) that own the range — so a client can read ranges in parallel
+    /// (W-002). On a standalone topology (or an unknown table) it emits a single
+    /// endpoint redeeming the original command on this connection.
     async fn get_flight_info(
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let auth = self.authenticate(request.metadata())?;
-        // Single endpoint: the client redeems the same CQL ticket on this
-        // connection (distributed per-token-range endpoints are W-002).
-        let info = self.flight_info_for(request.into_inner(), &auth).await?;
+        let descriptor = request.into_inner();
+        let cql = String::from_utf8(descriptor.cmd.to_vec())
+            .map_err(|_| Status::invalid_argument("descriptor.cmd is not valid UTF-8 CQL"))?;
+        let select = Self::parse_select(&cql)?;
+        let batch = self.query_to_batch(&cql, &auth).await?;
+        let schema = batch.schema();
+
+        let endpoints = self
+            .distributed_endpoints(&select, &cql)
+            .unwrap_or_else(|| {
+                // Standalone / unknown table: redeem the same CQL ticket on this
+                // connection (single self-endpoint, no explicit location).
+                vec![FlightEndpoint::new().with_ticket(Ticket {
+                    ticket: descriptor.cmd.clone(),
+                })]
+            });
+
+        let mut info = FlightInfo::new()
+            .try_with_schema(&schema)
+            .map_err(|e| Status::internal(format!("schema encode error: {e}")))?
+            .with_descriptor(descriptor);
+        for endpoint in endpoints {
+            info = info.with_endpoint(endpoint);
+        }
         Ok(Response::new(info))
     }
 
