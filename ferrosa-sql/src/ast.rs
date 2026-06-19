@@ -35,6 +35,8 @@ pub enum Statement {
     Insert(Box<InsertStmt>),
     /// `UPDATE t SET ... WHERE ...`. Boxed for size parity with `Select`.
     Update(Box<UpdateStmt>),
+    /// `DELETE FROM t WHERE ...`. Boxed for size parity with `Select`.
+    Delete(Box<DeleteStmt>),
 }
 
 /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Single-row, with
@@ -53,6 +55,14 @@ pub struct InsertStmt {
 pub struct UpdateStmt {
     pub table: TableRef,
     pub assignments: Vec<(String, ScalarValue)>,
+    pub where_eq: Vec<(String, ScalarValue)>,
+}
+
+/// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Row-level delete; the
+/// equality `WHERE` supplies the full primary key identifying the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteStmt {
+    pub table: TableRef,
     pub where_eq: Vec<(String, ScalarValue)>,
 }
 

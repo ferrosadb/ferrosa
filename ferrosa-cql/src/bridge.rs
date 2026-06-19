@@ -8,10 +8,7 @@
 //! in `build_delete_row`.
 
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferrosa_common::CellValue;
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use num_bigint::BigInt;
 
 use crate::ast::{CqlTypeName, Term};
@@ -742,59 +739,6 @@ fn resolve_builtin_type(name: &str) -> Option<CqlType> {
 }
 
 // ---------------------------------------------------------------------------
-// Function 5: build_delete_row
-// ---------------------------------------------------------------------------
-
-/// Build a storage [`Row`] representing a deletion.
-///
-/// - `delete_columns`: column indices to delete. If empty, this is a row-level
-///   deletion (range tombstone).
-/// - `clustering_values`: CQL values for clustering columns.
-/// - `timestamp`: deletion timestamp (microseconds).
-pub fn build_delete_row(
-    delete_columns: &[u16],
-    clustering_values: &[CqlValue],
-    timestamp: i64,
-) -> Row {
-    let clustering = encode_clustering(clustering_values);
-
-    // System clock: the one allowed unwrap
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as u32;
-
-    if delete_columns.is_empty() {
-        // Row-level deletion
-        Row {
-            clustering,
-            cells: vec![],
-            deletion: DeletionTime::new(timestamp, now_secs),
-            primary_key_liveness: LivenessInfo::NONE,
-        }
-    } else {
-        // Column-level deletion: tombstone each specified column.
-        // Must be sorted by column index — same requirement as build_row.
-        let mut cells: Vec<(u16, CellValue)> = delete_columns
-            .iter()
-            .map(|&idx| {
-                // CellValue.local_deletion_time is i32, DeletionTime.local_deletion_time is u32
-                let ldt = i32::try_from(now_secs).unwrap_or(i32::MAX);
-                (idx, CellValue::tombstone(timestamp, ldt))
-            })
-            .collect();
-        cells.sort_by_key(|(idx, _)| *idx);
-
-        Row {
-            clustering,
-            cells,
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::NONE,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Function 6: partition_to_rows  (moved to ferrosa-row-bridge — D10 decoupling)
 // ---------------------------------------------------------------------------
 //
@@ -808,9 +752,9 @@ pub fn build_delete_row(
 // (used internally below) maps RowBridgeError back to CqlError via the
 // `crate::types::decode_value` wrapper.
 pub use ferrosa_row_bridge::{
-    build_decorated_key, build_row, decode_clustering, decode_pk, encode_clustering,
-    partition_to_rows, partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
-    write_partition_raw_rows_with_storage_mapping,
+    build_decorated_key, build_delete_row, build_row, decode_clustering, decode_pk,
+    encode_clustering, partition_to_rows, partition_to_rows_with_clustering,
+    partition_to_rows_with_storage_mapping, write_partition_raw_rows_with_storage_mapping,
 };
 
 // ---------------------------------------------------------------------------
@@ -1195,8 +1139,9 @@ mod tests {
     use super::*;
     // Encoders moved to ferrosa-row-bridge (re-exported above); the tests below
     // still reference these directly.
-    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_row_bridge::encode_value;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
     #[test]
     fn term_int_to_cql_int() {
