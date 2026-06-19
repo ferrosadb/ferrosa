@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 
 use crate::codec::{self, CodecError};
 use crate::connection::{ConnError, Connection};
-use crate::extended::{self, Session};
+use crate::extended::{self, PreparedKind, Session};
 use crate::handshake::{HandshakeError, VerifierStore};
 use crate::messages::{BackendMessage, FrontendMessage};
 use crate::query;
@@ -329,24 +329,39 @@ async fn describe(
             };
             let parsed = stmt.parsed.clone();
             let declared = stmt.param_oids.clone();
-
-            // ParameterDescription: a driver (e.g. tokio-postgres) relies on this
-            // to serialize bound parameters. Use the client-declared OID where
-            // given (non-zero), else infer the parameter's type from the column
-            // it is compared against.
-            let param_oids = match infer_param_oids(ctx, session, &parsed, &declared).await {
-                Ok(oids) => oids,
-                Err(err) => return vec![err],
-            };
-            // Persist the resolved OIDs so a later Bind decodes binary params
-            // against the same types the driver was told to serialize with.
-            session.set_param_oids(name, param_oids.clone());
-            let mut msgs = vec![extended::parameter_description(&param_oids)];
-            match describe_columns(ctx, session, &parsed).await {
-                Ok(columns) => msgs.push(extended::describe_statement_rows(&columns)),
-                Err(err) => return vec![err], // describe_columns already set the flag
+            match parsed {
+                PreparedKind::Select(select) => {
+                    // ParameterDescription: a driver (e.g. tokio-postgres) relies
+                    // on this to serialize bound parameters. Use the
+                    // client-declared OID where given (non-zero), else infer the
+                    // parameter's type from the column it is compared against.
+                    let param_oids = match infer_param_oids(ctx, session, &select, &declared).await
+                    {
+                        Ok(oids) => oids,
+                        Err(err) => return vec![err],
+                    };
+                    // Persist the resolved OIDs so a later Bind decodes binary
+                    // params against the types the driver was told to serialize.
+                    session.set_param_oids(name, param_oids.clone());
+                    let mut msgs = vec![extended::parameter_description(&param_oids)];
+                    match describe_columns(ctx, session, &select).await {
+                        Ok(columns) => msgs.push(extended::describe_statement_rows(&columns)),
+                        Err(err) => return vec![err], // describe_columns set the flag
+                    }
+                    msgs
+                }
+                // No-FROM expression select: no parameters (rejected at parse),
+                // so an empty ParameterDescription + columns from the scalars.
+                PreparedKind::Exprs(items) => {
+                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                        Ok(result) => vec![
+                            extended::parameter_description(&[]),
+                            extended::describe_statement_rows(&result.columns),
+                        ],
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
             }
-            msgs
         }
         b'P' => {
             let Some(portal) = session.portal(name) else {
@@ -364,9 +379,26 @@ async fn describe(
                 ))];
             };
             let parsed = stmt.parsed.clone();
-            match describe_columns(ctx, session, &parsed).await {
-                Ok(columns) => vec![extended::describe_portal_rows(&columns, &result_formats)],
-                Err(err) => vec![err],
+            match parsed {
+                PreparedKind::Select(select) => {
+                    match describe_columns(ctx, session, &select).await {
+                        Ok(columns) => {
+                            vec![extended::describe_portal_rows(&columns, &result_formats)]
+                        }
+                        Err(err) => vec![err],
+                    }
+                }
+                PreparedKind::Exprs(items) => {
+                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                        Ok(result) => {
+                            vec![extended::describe_portal_rows(
+                                &result.columns,
+                                &result_formats,
+                            )]
+                        }
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
             }
         }
         _ => vec![session.fail(query::error_response(
@@ -452,21 +484,33 @@ async fn execute_portal(
     };
     let parsed = stmt.parsed.clone();
 
-    let catalog =
-        match query::load_catalog(&ctx.engine, &ctx.schema, &parsed, &ctx.default_schema).await {
-            Ok(catalog) => catalog,
-            Err(err) => return vec![session.fail(err)],
-        };
-
-    let result = ferrosa_sql::execute(&parsed, &catalog, &ctx.default_schema, &params);
-    let errored = result.is_err();
-    let msgs = query::render_execute_result(result, &result_formats);
-    // On an execution error, set the skip flag so the rest of the sequence is
-    // ignored until Sync (Postgres semantics).
-    if errored {
-        session.mark_error();
+    match parsed {
+        PreparedKind::Select(select) => {
+            let catalog =
+                match query::load_catalog(&ctx.engine, &ctx.schema, &select, &ctx.default_schema)
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(err) => return vec![session.fail(err)],
+                };
+            let result = ferrosa_sql::execute(&select, &catalog, &ctx.default_schema, &params);
+            let errored = result.is_err();
+            let msgs = query::render_execute_result(result, &result_formats);
+            // On an execution error, set the skip flag so the rest of the
+            // sequence is ignored until Sync (Postgres semantics).
+            if errored {
+                session.mark_error();
+            }
+            msgs
+        }
+        // No-FROM expression select: no tables, no params. Evaluate and render.
+        PreparedKind::Exprs(items) => {
+            match query::execute_scalar_select(&items, &ctx.default_schema) {
+                Ok(result) => query::render_execute_result(Ok(result), &result_formats),
+                Err(msg) => vec![session.fail(msg)],
+            }
+        }
     }
-    msgs
 }
 
 /// SQLSTATE for a codec-level framing error (always a protocol violation).

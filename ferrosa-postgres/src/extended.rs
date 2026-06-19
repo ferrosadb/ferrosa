@@ -25,17 +25,29 @@
 
 use std::collections::HashMap;
 
-use ferrosa_sql::{parse, SelectStmt, Value as SqlValue};
+use ferrosa_sql::{
+    parse_statement, ScalarItem, ScalarValue, SelectStmt, Statement, Value as SqlValue,
+};
 
 use crate::messages::{BackendMessage, TransactionStatus};
 use crate::query::{decode_param, error_response, exec_error_response, row_description_fields};
 
-/// A prepared statement: the parsed SELECT plus the client-declared parameter
+/// What a prepared statement parses to: a table query, or a no-`FROM`
+/// expression query (`SELECT version()`, `SELECT 1`). Transaction-control and
+/// session statements are handled on the simple-query path, not prepared here.
+/// `Select` is boxed — `SelectStmt` is far larger than the other variant.
+#[derive(Debug, Clone)]
+pub enum PreparedKind {
+    Select(Box<SelectStmt>),
+    Exprs(Vec<ScalarItem>),
+}
+
+/// A prepared statement: the parsed query plus the client-declared parameter
 /// type OIDs (used to decode bound values and to answer `Describe` for the
 /// `ParameterDescription`). A `0` OID means "unspecified" (decode leniently).
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    pub parsed: SelectStmt,
+    pub parsed: PreparedKind,
     pub param_oids: Vec<i32>,
 }
 
@@ -154,22 +166,46 @@ impl Session {
         query: &str,
         param_types: Vec<i32>,
     ) -> BackendMessage {
-        match parse(query) {
-            Ok(parsed) => {
-                self.statements.insert(
-                    stmt_name,
-                    PreparedStatement {
-                        parsed,
-                        param_oids: param_types,
-                    },
+        let parsed = match parse_statement(query) {
+            Ok(Statement::Select(select)) => PreparedKind::Select(select),
+            Ok(Statement::SelectExprs(items)) => {
+                // Parameterized expression selects need $N type inference with no
+                // column to infer from — not supported via the extended protocol
+                // yet. Fail loud rather than guess.
+                if items
+                    .iter()
+                    .any(|it| matches!(it.value, ScalarValue::Param(_)))
+                {
+                    self.error_pending = true;
+                    return error_response(
+                        "0A000",
+                        "$N parameters in expression selects are not supported via the \
+                         extended-query protocol yet",
+                    );
+                }
+                PreparedKind::Exprs(items)
+            }
+            Ok(_) => {
+                // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
+                self.error_pending = true;
+                return error_response(
+                    "0A000",
+                    "only SELECT statements can be prepared via the extended-query protocol",
                 );
-                BackendMessage::ParseComplete
             }
             Err(e) => {
                 self.error_pending = true;
-                error_response("42601", &e.to_string())
+                return error_response("42601", &e.to_string());
             }
-        }
+        };
+        self.statements.insert(
+            stmt_name,
+            PreparedStatement {
+                parsed,
+                param_oids: param_types,
+            },
+        );
+        BackendMessage::ParseComplete
     }
 
     /// Handle `Bind`: decode each parameter value against the prepared
