@@ -61,7 +61,7 @@ def test_decode_rows_typed_values():
 def test_subscribe_stream_yields_namedtuples():
     # Two pushed frames, one row each — the continuous-push shape.
     stream_bytes = _result_frame(_rows_body([(10, "x")])) + _result_frame(_rows_body([(20, "y")]))
-    stream = SubscribeStream(FakeSocket(stream_bytes), "SUBSCRIBE demo.t ON COMMITTED")
+    stream = SubscribeStream(FakeSocket(stream_bytes), "SUBSCRIBE SELECT * FROM demo.t ON COMMITTED")
     first = next(stream)
     assert (first.id, first.name) == (10, "x")
     second = next(stream)
@@ -71,7 +71,7 @@ def test_subscribe_stream_yields_namedtuples():
 def test_empty_frame_is_skipped_then_next_delivered():
     # An empty (0-row) keep-alive frame followed by a real one.
     stream_bytes = _result_frame(_rows_body([])) + _result_frame(_rows_body([(7, "z")]))
-    stream = SubscribeStream(FakeSocket(stream_bytes), "SUBSCRIBE demo.t ON LOCAL")
+    stream = SubscribeStream(FakeSocket(stream_bytes), "SUBSCRIBE SELECT * FROM demo.t ON LOCAL")
     row = next(stream)
     assert (row.id, row.name) == (7, "z")
 

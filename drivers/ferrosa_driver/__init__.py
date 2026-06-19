@@ -19,7 +19,7 @@ over a dedicated connection via :func:`subscribe` (or the added
                       auth_provider=PlainTextAuthProvider("cassandra", "cassandra"))
     session = cluster.connect()
     session.execute("INSERT INTO ks.t (id, v) VALUES (1, 'a')")   # standard path
-    with session.subscribe("SUBSCRIBE ks.t ON COMMITTED") as stream:
+    with session.subscribe("SUBSCRIBE SELECT * FROM ks.t ON COMMITTED") as stream:
         for change in stream:                                      # pushed in real time
             print(change)
 """
