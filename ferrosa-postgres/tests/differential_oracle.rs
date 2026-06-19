@@ -1321,9 +1321,11 @@ async fn differential_oracle_rejects_unsupported_queries() {
 
     let (fe_client, _ferrosa_dir) = start_ferrosa().await;
 
-    // (label, sql) — each must error rather than return rows.
+    // (label, sql) — each must error rather than return rows. NOTE: no-`FROM`
+    // expression selects (`SELECT 1`, `SELECT version()`) are now a SUPPORTED
+    // feature (handled by the SelectExprs path), so they are deliberately NOT in
+    // this list — they belong to the corpus, not the restricted-query oracle.
     let rejects = [
-        ("no_from", "SELECT 1"),
         (
             "subquery",
             "SELECT id FROM users WHERE id IN (SELECT uid FROM orders)",
