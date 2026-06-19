@@ -1477,4 +1477,35 @@ async fn differential_oracle_dml_agrees() {
         "after_null_insert",
     )
     .await;
+
+    // ── UPDATE ──────────────────────────────────────────────────────────────
+    // Update a regular column on an existing row.
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "UPDATE kv SET v = 'ONE', n = 11 WHERE id = 1",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_update",
+    )
+    .await;
+
+    // Update setting a column to NULL (delete-cell semantics on ferrosa).
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "UPDATE kv SET n = NULL WHERE id = 2",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_update_null",
+    )
+    .await;
 }
