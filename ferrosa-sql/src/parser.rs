@@ -3,8 +3,8 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, SelectItem, SelectStmt,
-    TableRef, Term,
+    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, ScalarItem, ScalarValue,
+    SelectItem, SelectStmt, Statement, TableRef, Term,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -117,6 +117,48 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
         limit,
         offset,
     })
+}
+
+/// Parse a top-level statement off the Postgres wire: a table `SELECT`, a
+/// no-`FROM` expression `SELECT` (`SELECT 1`, `SELECT version()`), transaction
+/// control (`BEGIN`/`COMMIT`/`ROLLBACK`), or a session statement (`SET`/`RESET`).
+///
+/// Transaction-control and session statements are recognized here so the
+/// front-end can give them real semantics — they are not silently accepted.
+pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = lex(trimmed)?;
+    let mut p = Parser { toks, pos: 0 };
+    match p.peek() {
+        Some(Tok::Select) => {
+            if p.is_expr_select() {
+                let items = p.parse_scalar_select()?;
+                p.expect_end()?;
+                Ok(Statement::SelectExprs(items))
+            } else {
+                // Table query: reuse the full SELECT grammar on the same SQL.
+                Ok(Statement::Select(Box::new(parse(trimmed)?)))
+            }
+        }
+        Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
+            // Transaction control: `BEGIN [TRANSACTION|WORK]`, `START TRANSACTION`,
+            // `COMMIT|END`, `ROLLBACK|ABORT`. Trailing modifier words are ignored.
+            "BEGIN" | "START" => Ok(Statement::Begin),
+            "COMMIT" | "END" => Ok(Statement::Commit),
+            "ROLLBACK" | "ABORT" => Ok(Statement::Rollback),
+            "SET" => p.parse_set(),
+            "RESET" => p.parse_reset(),
+            other => Err(ParseError::Unexpected {
+                expected: "a statement",
+                found: other.to_string(),
+            }),
+        },
+        Some(t) => Err(ParseError::Unexpected {
+            expected: "a statement",
+            found: format!("{t:?}"),
+        }),
+        None => Err(ParseError::UnexpectedEnd),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -394,6 +436,115 @@ impl Parser {
             items.push(self.parse_select_item()?);
         }
         Ok(Projection::Items(items))
+    }
+
+    /// After a leading `SELECT`, decide whether this is a no-`FROM` expression
+    /// select (`SELECT 1`, `SELECT version()`, `SELECT $1`, `SELECT TRUE`) vs a
+    /// table select. `self.pos` is at the `SELECT` token.
+    fn is_expr_select(&self) -> bool {
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_)) => true,
+            Some(Tok::Ident(w)) => {
+                let up = w.to_ascii_uppercase();
+                matches!(up.as_str(), "TRUE" | "FALSE" | "NULL")
+                    || (!is_aggregate_name(w)
+                        && matches!(self.toks.get(self.pos + 2), Some(Tok::LParen)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Parse `SELECT <scalar> [, <scalar>]*` with no `FROM`. Assumes `self.pos`
+    /// is at the `SELECT` token.
+    fn parse_scalar_select(&mut self) -> Result<Vec<ScalarItem>, ParseError> {
+        self.expect(&Tok::Select, "SELECT")?;
+        let mut items = vec![self.parse_scalar_item()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            items.push(self.parse_scalar_item()?);
+        }
+        Ok(items)
+    }
+
+    /// One scalar select item: a `$N` param, a zero-arg function call, or a
+    /// literal — with an optional `AS`/bare alias.
+    fn parse_scalar_item(&mut self) -> Result<ScalarItem, ParseError> {
+        let value = if let Some(Tok::Param(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            ScalarValue::Param(n)
+        } else if matches!(self.peek(), Some(Tok::Ident(_)))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+        {
+            let Some(Tok::Ident(w)) = self.next() else {
+                unreachable!("peeked an Ident above");
+            };
+            self.expect(&Tok::LParen, "(")?;
+            self.expect(&Tok::RParen, ")")?;
+            ScalarValue::Func(w.to_ascii_uppercase())
+        } else {
+            ScalarValue::Literal(self.parse_value()?)
+        };
+        let alias = self.parse_optional_alias()?;
+        Ok(ScalarItem { value, alias })
+    }
+
+    /// An optional output alias: `AS name` or a bare `name`.
+    fn parse_optional_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if matches!(self.peek(), Some(Tok::As | Tok::Ident(_))) {
+            if matches!(self.peek(), Some(Tok::As)) {
+                self.next();
+            }
+            Ok(Some(self.ident()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `SET <name> [=|TO] <value>`. Assumes `self.pos` is at the `SET` ident.
+    fn parse_set(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // SET
+        let name = self.ident()?;
+        match self.peek() {
+            Some(Tok::Eq) => {
+                self.next();
+            }
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("TO") => {
+                self.next();
+            }
+            _ => {}
+        }
+        let value = match self.next() {
+            Some(Tok::Str(s)) => s,
+            Some(Tok::Int(n)) => n.to_string(),
+            Some(Tok::Ident(w)) => w,
+            Some(t) => {
+                return Err(ParseError::Unexpected {
+                    expected: "SET value",
+                    found: format!("{t:?}"),
+                })
+            }
+            None => return Err(ParseError::UnexpectedEnd),
+        };
+        Ok(Statement::Set { name, value })
+    }
+
+    /// `RESET <name>` (`RESET ALL` → name `ALL`). Assumes `self.pos` is at `RESET`.
+    fn parse_reset(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // RESET
+        let name = self.ident()?;
+        Ok(Statement::Reset { name })
+    }
+
+    /// Error unless all tokens are consumed (statement fully parsed).
+    fn expect_end(&self) -> Result<(), ParseError> {
+        match self.peek() {
+            None => Ok(()),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: "end of statement",
+                found: format!("{t:?}"),
+            }),
+        }
     }
 
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
@@ -1244,5 +1395,115 @@ mod tests {
         assert!(parse("DELETE FROM users").is_err());
         assert!(parse("SELECT").is_err());
         assert!(parse("SELECT * FROM").is_err());
+    }
+
+    // ---- parse_statement: the Postgres-wire entry point ----
+
+    #[test]
+    fn parse_statement_routes_table_select() {
+        assert!(matches!(
+            parse_statement("SELECT id FROM users"),
+            Ok(Statement::Select(_))
+        ));
+        assert!(matches!(
+            parse_statement("SELECT * FROM users WHERE id = 1"),
+            Ok(Statement::Select(_))
+        ));
+        assert!(matches!(
+            parse_statement("SELECT COUNT(*) FROM users"),
+            Ok(Statement::Select(_))
+        ));
+    }
+
+    #[test]
+    fn parse_statement_transaction_control() {
+        assert_eq!(parse_statement("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(
+            parse_statement("begin transaction").unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(
+            parse_statement("START TRANSACTION").unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(parse_statement("COMMIT").unwrap(), Statement::Commit);
+        assert_eq!(parse_statement("END").unwrap(), Statement::Commit);
+        assert_eq!(parse_statement("ROLLBACK").unwrap(), Statement::Rollback);
+        assert_eq!(parse_statement("ABORT").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parse_statement_literal_select() {
+        assert_eq!(
+            parse_statement("SELECT 1").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Literal(Value::Int(1)),
+                alias: None,
+            }])
+        );
+        assert_eq!(
+            parse_statement("SELECT 'hello'").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Literal(Value::Text("hello".into())),
+                alias: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn parse_statement_function_and_alias_select() {
+        assert_eq!(
+            parse_statement("SELECT version()").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Func("VERSION".into()),
+                alias: None,
+            }])
+        );
+        assert_eq!(
+            parse_statement("SELECT current_database() AS db, 1 AS one").unwrap(),
+            Statement::SelectExprs(vec![
+                ScalarItem {
+                    value: ScalarValue::Func("CURRENT_DATABASE".into()),
+                    alias: Some("db".into()),
+                },
+                ScalarItem {
+                    value: ScalarValue::Literal(Value::Int(1)),
+                    alias: Some("one".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_statement_param_select() {
+        assert_eq!(
+            parse_statement("SELECT $1").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Param(1),
+                alias: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn parse_statement_set_and_reset() {
+        assert_eq!(
+            parse_statement("SET client_encoding = 'UTF8'").unwrap(),
+            Statement::Set {
+                name: "client_encoding".into(),
+                value: "UTF8".into(),
+            }
+        );
+        assert_eq!(
+            parse_statement("SET search_path TO public").unwrap(),
+            Statement::Set {
+                name: "search_path".into(),
+                value: "public".into(),
+            }
+        );
+        assert_eq!(
+            parse_statement("RESET ALL").unwrap(),
+            Statement::Reset { name: "ALL".into() }
+        );
     }
 }
