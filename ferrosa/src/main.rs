@@ -711,6 +711,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let storage = Arc::new(storage);
 
+    // Attach the push-based CDC bus to the engine's commit log so live CQL
+    // SUBSCRIBE (WrittenOnNode / CommittedToCluster) and the Arrow Flight
+    // endpoint receive change events. Bounded ring; lock-free, runtime-attached.
+    const CDC_BUS_CAPACITY: usize = 1024;
+    storage.set_cdc_bus(ferrosa_cdc::CdcBus::new(CDC_BUS_CAPACITY));
+
     // Register persisted system tables before any local schema restore or
     // cluster-mode Raft replay. Without this, the cluster state machine's
     // SystemTableWriter hits "table not registered: system_schema.*" during
