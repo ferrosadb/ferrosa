@@ -572,7 +572,10 @@ impl StorageApplier for CdcPublishingApplier {
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         // Build the CDC event before `mutation` is consumed, and only if a
         // committed-stream subscriber is actually listening.
-        let event = if self.cdc.has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster) {
+        let event = if self
+            .cdc
+            .has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster)
+        {
             Mutation::deserialize_from(&mutation.data)
                 .ok()
                 .map(|m| ferrosa_cdc::CdcEvent {
@@ -1220,13 +1223,28 @@ mod engine_applier_tests {
         for i in 0..(WARMUP + N) {
             let key = make_key(&format!("accord{i}"));
             let t = accord_ts(10_000 + i as u64);
-            let m = encoded_mutation(key, format!("v{i}").as_bytes(), 10_000 + i as i64, t, vec![]);
+            let m = encoded_mutation(
+                key,
+                format!("v{i}").as_bytes(),
+                10_000 + i as i64,
+                t,
+                vec![],
+            );
             let t0 = std::time::Instant::now();
-            applier.apply(txn(1, 10_000 + i as u64), m).expect("accord apply");
-            let ev = committed.recv().await.expect("CommittedToCluster delivered");
+            applier
+                .apply(txn(1, 10_000 + i as u64), m)
+                .expect("accord apply");
+            let ev = committed
+                .recv()
+                .await
+                .expect("CommittedToCluster delivered");
             let dt = t0.elapsed();
             assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
-            assert_eq!(ev.accord_ts, Some(t), "committed event carries the accord ts");
+            assert_eq!(
+                ev.accord_ts,
+                Some(t),
+                "committed event carries the accord ts"
+            );
             // Drain the WrittenOnNode the inner write produced, so the local
             // subscriber does not lag.
             local.recv().await.expect("inner WrittenOnNode");
@@ -1269,10 +1287,8 @@ mod engine_applier_tests {
         let mut sub_b_committed = bus_b.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
 
         // Node B applies cluster-committed writes (replica apply path).
-        let applier_b = CdcPublishingApplier::new(
-            Arc::new(EngineStorageApplier::new(engine_b.clone())),
-            bus_b,
-        );
+        let applier_b =
+            CdcPublishingApplier::new(Arc::new(EngineStorageApplier::new(engine_b.clone())), bus_b);
 
         const N: usize = 200;
         let mut a_local_ns = Vec::with_capacity(N);
@@ -1287,7 +1303,9 @@ mod engine_applier_tests {
                 1_000 + i as i64,
             );
             let t0 = std::time::Instant::now();
-            engine_a.write_atomic_batch(vec![m_a]).expect("node A write");
+            engine_a
+                .write_atomic_batch(vec![m_a])
+                .expect("node A write");
             sub_a_local.recv().await.expect("A WrittenOnNode delivered");
             a_local_ns.push(t0.elapsed().as_nanos() as u64);
 
@@ -1301,12 +1319,20 @@ mod engine_applier_tests {
                 vec![],
             );
             let t1 = std::time::Instant::now();
-            applier_b.apply(txn(2, 100_000 + i as u64), m_b).expect("node B apply");
-            sub_b_committed.recv().await.expect("B CommittedToCluster delivered");
+            applier_b
+                .apply(txn(2, 100_000 + i as u64), m_b)
+                .expect("node B apply");
+            sub_b_committed
+                .recv()
+                .await
+                .expect("B CommittedToCluster delivered");
             b_committed_ns.push(t1.elapsed().as_nanos() as u64);
         }
         report("node A local-commit (WrittenOnNode)", &mut a_local_ns);
-        report("node B cluster-committed (CommittedToCluster)", &mut b_committed_ns);
+        report(
+            "node B cluster-committed (CommittedToCluster)",
+            &mut b_committed_ns,
+        );
 
         // --- Push-vs-poll discriminator: idle, then ONE committed write. A
         //     poll-based CDC would deliver no sooner than its next tick; a push
@@ -1315,7 +1341,9 @@ mod engine_applier_tests {
         let t = accord_ts(900_000);
         let m = encoded_mutation(make_key("idle"), b"x", 900_000, t, vec![]);
         let t0 = std::time::Instant::now();
-        applier_b.apply(txn(2, 900_000), m).expect("post-idle apply");
+        applier_b
+            .apply(txn(2, 900_000), m)
+            .expect("post-idle apply");
         let ev = sub_b_committed
             .recv()
             .await
