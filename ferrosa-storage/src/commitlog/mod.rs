@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use ferrosa_cdc::{CdcBus, CdcEvent, CdcStream};
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_sstable::types::Row;
 use parking_lot::Mutex;
@@ -382,6 +383,11 @@ pub struct CommitLog {
     /// Channel sender for notifying the archiver of closed segments.
     /// None when archiving is disabled.
     archive_tx: Option<tokio::sync::mpsc::Sender<u64>>,
+
+    /// Optional CDC bus. When attached and a `WrittenOnNode` subscriber is live,
+    /// each successful append publishes a change event. `None` (the default)
+    /// keeps the append hot path entirely free of CDC cost.
+    cdc: Option<Arc<CdcBus>>,
 }
 
 impl CommitLog {
@@ -418,7 +424,46 @@ impl CommitLog {
             next_segment_id: AtomicU64::new(first_segment_id + 1),
             archived: Mutex::new(HashSet::new()),
             archive_tx: None,
+            cdc: None,
         })
+    }
+
+    /// Attaches a CDC bus so successful appends publish `WrittenOnNode` change
+    /// events (the local change-data-capture stream). Builder-style; returns
+    /// `self` for chaining at construction.
+    pub fn with_cdc(mut self, bus: Arc<CdcBus>) -> Self {
+        self.cdc = Some(bus);
+        self
+    }
+
+    /// Publishes a `WrittenOnNode` CDC event for a just-appended mutation.
+    ///
+    /// No-op (and no allocation) when no bus is attached or no subscriber is
+    /// listening — the row clone happens only when an event will be delivered,
+    /// so this stays off the cost path for the common no-CDC case.
+    fn emit_written_on_node(
+        &self,
+        keyspace: &str,
+        table: &str,
+        key: &DecoratedKey,
+        rows: &[Row],
+        timestamp: i64,
+        mutation_id: [u8; 16],
+    ) {
+        let Some(bus) = &self.cdc else { return };
+        if !bus.has_subscribers(CdcStream::WrittenOnNode) {
+            return;
+        }
+        bus.publish(CdcEvent {
+            stream: CdcStream::WrittenOnNode,
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key: key.clone(),
+            rows: rows.to_vec(),
+            timestamp,
+            accord_ts: None,
+            mutation_id,
+        });
     }
 
     /// Opens an existing commit log directory, replays uncommitted mutations,
@@ -660,6 +705,17 @@ impl CommitLog {
             sync_notify_start.elapsed(),
         );
 
+        // CDC: publish the local change-data-capture event after the write is
+        // durable in the segment buffer (WrittenOnNode stream).
+        self.emit_written_on_node(
+            &mutation.keyspace,
+            &mutation.table,
+            &mutation.key,
+            &mutation.rows,
+            mutation.timestamp,
+            mutation.mutation_id,
+        );
+
         Ok(position)
     }
 
@@ -711,9 +767,10 @@ impl CommitLog {
         );
 
         let write_start = Instant::now();
+        let mutation_id = Uuid::new_v4().into_bytes();
         let position = segment.write_single_row_entry(
             offset,
-            Uuid::new_v4().into_bytes(),
+            mutation_id,
             &table_id.keyspace,
             &table_id.table,
             key,
@@ -743,6 +800,16 @@ impl CommitLog {
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL,
             &COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX,
             sync_notify_start.elapsed(),
+        );
+
+        // CDC: publish the local change-data-capture event (WrittenOnNode).
+        self.emit_written_on_node(
+            &table_id.keyspace,
+            &table_id.table,
+            key,
+            std::slice::from_ref(row),
+            timestamp,
+            mutation_id,
         );
 
         Ok(position)
@@ -1138,6 +1205,7 @@ fn parse_segment_id(filename: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrosa_cdc::{CdcBus, CdcRecvError, CdcStream};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
@@ -1173,6 +1241,92 @@ mod tests {
             }],
             timestamp: 42_000,
         }
+    }
+
+    #[test]
+    fn append_publishes_written_on_node_cdc_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let bus = CdcBus::new(16);
+        let cl = CommitLog::new(config).unwrap().with_cdc(Arc::clone(&bus));
+        // Subscribe BEFORE the write so the event is captured.
+        let mut sub = bus.subscribe(CdcStream::WrittenOnNode);
+
+        let m = simple_mutation();
+        cl.append(&m).unwrap();
+
+        let event = sub.try_recv().expect("CDC event published on append");
+        assert_eq!(event.stream, CdcStream::WrittenOnNode);
+        assert_eq!(event.keyspace, m.keyspace);
+        assert_eq!(event.table, m.table);
+        assert_eq!(event.key, m.key);
+        assert_eq!(event.rows, m.rows);
+        assert_eq!(event.timestamp, m.timestamp);
+        assert_eq!(event.mutation_id, m.mutation_id);
+        assert!(event.accord_ts.is_none());
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn append_single_row_publishes_written_on_node_cdc_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let bus = CdcBus::new(16);
+        let cl = CommitLog::new(config).unwrap().with_cdc(Arc::clone(&bus));
+        let mut sub = bus.subscribe(CdcStream::WrittenOnNode);
+
+        let table_id = TableId::new("ks2", "t2");
+        let key = DecoratedKey::new(PartitionKey::new(b"pk_single".to_vec()));
+        let row = Row {
+            clustering: vec![9],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 2000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        cl.append_single_row(&table_id, &key, &row, 99_000).unwrap();
+
+        let event = sub
+            .try_recv()
+            .expect("CDC event published on single-row append");
+        assert_eq!(event.stream, CdcStream::WrittenOnNode);
+        assert_eq!(event.keyspace, "ks2");
+        assert_eq!(event.table, "t2");
+        assert_eq!(event.key, key);
+        assert_eq!(event.rows, vec![row]);
+        assert_eq!(event.timestamp, 99_000);
+        // mutation_id is generated by the single-row path; just confirm it is non-legacy.
+        assert_ne!(event.mutation_id, [0u8; 16]);
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn append_without_cdc_subscriber_does_not_publish() {
+        // Bus attached, but nobody subscribed: append succeeds and produces no
+        // event (and the hot path skips the row clone).
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let bus = CdcBus::new(16);
+        let cl = CommitLog::new(config).unwrap().with_cdc(Arc::clone(&bus));
+
+        cl.append(&simple_mutation()).unwrap();
+
+        // Subscribe only now; the earlier write must not be replayed to us.
+        let mut late = bus.subscribe(CdcStream::WrittenOnNode);
+        assert_eq!(late.try_recv(), Err(CdcRecvError::Empty));
+
+        cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn append_without_cdc_bus_works() {
+        // No bus attached at all (the default): append is unaffected.
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig::test_config(dir.path());
+        let cl = CommitLog::new(config).unwrap();
+        cl.append(&simple_mutation()).unwrap();
+        cl.shutdown().unwrap();
     }
 
     #[test]
