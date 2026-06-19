@@ -1540,11 +1540,13 @@ pub async fn route(
         Statement::DropIndex(di) => route_drop_index(state, ctx, di)
             .await
             .map(RouteResult::Result),
-        Statement::Subscribe {
-            inner,
-            interval,
-            delta,
-        } => {
+        Statement::Subscribe(spec) => {
+            let crate::ast::SubscribeSpec {
+                inner,
+                interval,
+                delta,
+                streams: _streams,
+            } = spec;
             // Validate: inner must be a Select
             match inner.as_ref() {
                 Statement::Select(s) => {

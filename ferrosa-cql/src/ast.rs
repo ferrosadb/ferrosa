@@ -6,6 +6,40 @@
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Which change stream(s) a `SUBSCRIBE` follows.
+///
+/// `Snapshot` is the legacy poll-and-diff behavior (re-execute the SELECT every
+/// `interval`). `Cdc` selects the event-driven change-data-capture streams via
+/// an explicit `ON LOCAL | COMMITTED` clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubscribeStreams {
+    /// No `ON` clause — legacy snapshot polling (re-runs the SELECT).
+    #[default]
+    Snapshot,
+    /// Event-driven CDC: `written-on-node` (local) and/or `committed-to-cluster`.
+    Cdc {
+        /// `ON LOCAL` — local commit-log (written-on-node) change stream.
+        local: bool,
+        /// `ON COMMITTED` — cluster-committed change stream.
+        committed: bool,
+    },
+}
+
+/// Parameters of a `SUBSCRIBE` statement, grouped so they can be threaded as a
+/// unit through the AST → router → connection layers without re-listing each
+/// field at every site (and so new CDC options are a one-field change).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscribeSpec {
+    /// The inner statement being subscribed to (must be a SELECT).
+    pub inner: Box<Statement>,
+    /// `EVERY <duration>` poll interval (snapshot mode).
+    pub interval: Option<Duration>,
+    /// `DELTA` — deliver only changed rows (snapshot mode).
+    pub delta: bool,
+    /// Which change stream(s) to follow (`ON LOCAL | COMMITTED`).
+    pub streams: SubscribeStreams,
+}
+
 /// Top-level parsed statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -108,11 +142,7 @@ pub enum Statement {
         arg_types: Option<Vec<CqlTypeName>>,
         if_exists: bool,
     },
-    Subscribe {
-        inner: Box<Statement>,
-        interval: Option<Duration>,
-        delta: bool,
-    },
+    Subscribe(SubscribeSpec),
     Unsubscribe {
         stream_id: Option<u16>,
     },
@@ -711,12 +741,13 @@ mod tests {
             geo_nearest: None,
             geo_predicates: vec![],
         });
-        let stmt = Statement::Subscribe {
+        let stmt = Statement::Subscribe(SubscribeSpec {
             inner: Box::new(inner),
             interval: None,
             delta: false,
-        };
-        assert!(matches!(stmt, Statement::Subscribe { .. }));
+            streams: SubscribeStreams::Snapshot,
+        });
+        assert!(matches!(stmt, Statement::Subscribe(_)));
     }
 
     #[test]
