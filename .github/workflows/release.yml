@@ -41,7 +41,7 @@ jobs:
 
       - name: Build x86_64 musl static binaries
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+          cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
           strip target/x86_64-unknown-linux-musl/release/ferrosa
           strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           file target/x86_64-unknown-linux-musl/release/ferrosa target/x86_64-unknown-linux-musl/release/ferrosa-ctl
@@ -167,7 +167,7 @@ jobs:
 
       - name: Build aarch64 musl static binaries
         run: |
-          cross build --release --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+          cross build --release --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
           # `strip` from binutils handles foreign ELF; use the cross toolchain's
           # aarch64 strip if present, fall back to plain strip which on modern
           # binutils is multi-arch capable.
@@ -213,7 +213,7 @@ jobs:
 
       - name: Build aarch64-apple-darwin binaries
         run: |
-          cargo build --release --target aarch64-apple-darwin -p ferrosa -p ferrosa-ctl
+          cargo build --release --target aarch64-apple-darwin -p ferrosa -p ferrosa-ctl --features ferrosa/full
           strip target/aarch64-apple-darwin/release/ferrosa
           strip target/aarch64-apple-darwin/release/ferrosa-ctl
 
