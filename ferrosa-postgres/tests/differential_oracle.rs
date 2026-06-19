@@ -435,7 +435,8 @@ async fn seed_postgres(client: &tokio_postgres::Client) {
         .batch_execute(
             "CREATE TABLE users (id int PRIMARY KEY, name text, dept text, email text);\n\
              CREATE TABLE orders (oid int PRIMARY KEY, uid int, amount int, price double precision);\n\
-             CREATE TABLE events (id int PRIMARY KEY, at timestamp, on_day date, at_time time, src inet, amt numeric);",
+             CREATE TABLE events (id int PRIMARY KEY, at timestamp, on_day date, at_time time, src inet, amt numeric);\n\
+             CREATE TABLE kv (id int PRIMARY KEY, v text, n int);",
         )
         .await
         .expect("create pg tables");
@@ -706,7 +707,52 @@ fn create_schema() -> Schema {
         )
         .expect("create table events");
 
+    // kv(id int PK, v text, n int) — starts EMPTY; the DML oracle populates it
+    // over the wire on both sides, exercising the INSERT/UPDATE/DELETE executors.
+    let mut kv_cols = IndexMap::new();
+    kv_cols.insert(
+        "id".to_string(),
+        column("id", ColumnKind::PartitionKey, "int"),
+    );
+    kv_cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+    kv_cols.insert("n".to_string(), column("n", ColumnKind::Regular, "int"));
     schema
+        .create_table(
+            TableMetadata {
+                keyspace: "public".to_string(),
+                name: "kv".to_string(),
+                id: Uuid::new_v4(),
+                columns: kv_cols,
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: HashMap::new(),
+                is_system: false,
+            },
+            &auth,
+        )
+        .expect("create table kv");
+
+    schema
+}
+
+fn kv_storage_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    let col = |n: &str, t: &str| ColumnDefinition {
+        name: n.to_string(),
+        type_name: t.to_string(),
+    };
+    TableSchema {
+        keyspace: "public".to_string(),
+        table: "kv".to_string(),
+        key_type: int_marshal().to_string(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        // Cassandra name-sorted storage order: n, v.
+        regular_columns: vec![col("n", int_marshal()), col("v", text_marshal())],
+        extensions: Default::default(),
+    }
 }
 
 fn text_marshal() -> &'static str {
@@ -847,6 +893,8 @@ fn seed_engine(dir: &Path, schema: &Schema) -> StorageEngine {
     engine.register_table(users_storage_schema()).unwrap();
     engine.register_table(orders_storage_schema()).unwrap();
     engine.register_table(events_storage_schema()).unwrap();
+    // kv is registered but seeded with NO rows — the DML oracle populates it.
+    engine.register_table(kv_storage_schema()).unwrap();
 
     let users_tid = TableId::new("public", "users");
     let orders_tid = TableId::new("public", "orders");
@@ -1348,4 +1396,69 @@ async fn differential_oracle_rejects_unsupported_queries() {
         );
         eprintln!("  {label:<14} correctly rejected: {}", sql);
     }
+}
+
+/// Run a mutation over the wire on BOTH sides; both must succeed.
+async fn apply_both(pg: &tokio_postgres::Client, fe: &tokio_postgres::Client, sql: &str) {
+    pg.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("postgres failed `{sql}`: {e}"));
+    fe.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("ferrosa failed `{sql}`: {e}"));
+}
+
+/// Assert a `SELECT` returns identical rows across both sides.
+async fn assert_dml_agrees(
+    pg: &tokio_postgres::Client,
+    fe: &tokio_postgres::Client,
+    sql: &str,
+    label: &str,
+) {
+    let p = run_simple(pg, sql)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] postgres errored: {e}"));
+    let f = run_simple(fe, sql)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] ferrosa errored: {e}"));
+    assert!(
+        result_sets_agree(&p, &f),
+        "[{label}] DML divergence:\n  pg = {p:?}\n  fe = {f:?}"
+    );
+    eprintln!("  {label:<22} MATCH");
+}
+
+/// DML differential oracle: apply the SAME INSERT/UPDATE/DELETE over the wire to
+/// BOTH Postgres and ferrosa (the empty `kv` table), asserting a SELECT agrees
+/// after each mutation. Exercises the write executors against real Postgres
+/// semantics — the cross-check that the front-end's writes are sound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn differential_oracle_dml_agrees() {
+    require_containers();
+
+    let pg = PgContainer::start().await;
+    let pg_client = pg.connect().await;
+    seed_postgres(&pg_client).await;
+    let (fe_client, _ferrosa_dir) = start_ferrosa().await;
+
+    // ── INSERT ──────────────────────────────────────────────────────────────
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (1, 'one', 10)",
+    )
+    .await;
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (2, 'two', 20)",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_insert",
+    )
+    .await;
 }
