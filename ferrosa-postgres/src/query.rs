@@ -32,12 +32,13 @@
 
 use std::sync::Arc;
 
-use ferrosa_schema::Schema;
+use ferrosa_common::{CqlType, CqlValue};
+use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    execute, parse_statement, Column, ColumnType, ExecError, MapCatalog, QueryResult, Row,
-    ScalarItem, ScalarValue, Statement, Value as SqlValue,
+    execute, parse_statement, Column, ColumnType, ExecError, InsertStmt, MapCatalog, QueryResult,
+    Row, ScalarItem, ScalarValue, Statement, Value as SqlValue,
 };
-use ferrosa_storage::StorageEngine;
+use ferrosa_storage::{Mutation, StorageEngine};
 
 use crate::messages::{BackendMessage, FieldDescription};
 use crate::storage_provider::{load_table, LoadError};
@@ -721,11 +722,182 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DML write path (materialize + engine write) is the next slice.
-        Statement::Insert(_) => vec![error_response(
-            "0A000",
-            "INSERT is not yet implemented (write path in progress)",
-        )],
+        // DML: single-row INSERT writes through the engine.
+        Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema),
+    }
+}
+
+/// Convert a SQL [`SqlValue`] literal to the [`CqlValue`] the engine stores,
+/// driven by the target column's [`CqlType`]. The inverse of
+/// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
+/// and a type mismatch fails loud (`42804`) rather than silently coercing.
+fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessage> {
+    if matches!(value, SqlValue::Null) {
+        return Ok(CqlValue::Null);
+    }
+    let out = match (ty, value) {
+        (CqlType::Int, SqlValue::Int(i)) => CqlValue::Int(
+            i32::try_from(*i).map_err(|_| error_response("22003", "integer out of int4 range"))?,
+        ),
+        (CqlType::Bigint, SqlValue::Int(i)) => CqlValue::Bigint(*i),
+        (CqlType::Counter, SqlValue::Int(i)) => CqlValue::Counter(*i),
+        (CqlType::Smallint, SqlValue::Int(i)) => CqlValue::Smallint(
+            i16::try_from(*i).map_err(|_| error_response("22003", "out of smallint range"))?,
+        ),
+        (CqlType::Tinyint, SqlValue::Int(i)) => CqlValue::Tinyint(
+            i8::try_from(*i).map_err(|_| error_response("22003", "out of tinyint range"))?,
+        ),
+        (CqlType::Varchar, SqlValue::Text(s)) => CqlValue::Text(s.clone()),
+        (CqlType::Ascii, SqlValue::Text(s)) => CqlValue::Ascii(s.clone()),
+        (CqlType::Boolean, SqlValue::Bool(b)) => CqlValue::Boolean(*b),
+        (CqlType::Float, SqlValue::Float(f)) => CqlValue::Float((f.into_inner() as f32).to_bits()),
+        (CqlType::Double, SqlValue::Float(f)) => CqlValue::Double(f.into_inner().to_bits()),
+        (CqlType::Float, SqlValue::Int(i)) => CqlValue::Float((*i as f32).to_bits()),
+        (CqlType::Double, SqlValue::Int(i)) => CqlValue::Double((*i as f64).to_bits()),
+        (CqlType::Uuid, SqlValue::Uuid(u)) => CqlValue::Uuid(*u),
+        (CqlType::Timeuuid, SqlValue::Uuid(u)) => CqlValue::Timeuuid(*u),
+        (CqlType::Blob, SqlValue::Bytea(b)) => CqlValue::Blob(b.clone()),
+        (CqlType::Timestamp, SqlValue::Timestamp(micros)) => CqlValue::Timestamp(micros / 1000),
+        (CqlType::Date, SqlValue::Date(d)) => {
+            CqlValue::Date((i64::from(*d) + 2_147_483_648) as u32)
+        }
+        (CqlType::Time, SqlValue::Time(micros)) => CqlValue::Time(micros * 1000),
+        (CqlType::Inet, SqlValue::Inet(ip)) => CqlValue::Inet(*ip),
+        (CqlType::Decimal, SqlValue::Numeric { unscaled, scale }) => CqlValue::Decimal {
+            scale: *scale,
+            unscaled: unscaled.clone(),
+        },
+        (CqlType::Varint, SqlValue::Numeric { unscaled, scale }) if *scale == 0 => {
+            CqlValue::Varint(unscaled.clone())
+        }
+        _ => {
+            return Err(error_response(
+                "42804",
+                &format!("value does not match column type {ty:?}"),
+            ))
+        }
+    };
+    Ok(out)
+}
+
+/// Execute a single-row `INSERT`: materialize the row from the table schema and
+/// write it through the engine. Returns `CommandComplete "INSERT 0 1"` (Postgres
+/// reports oid 0 + a 1-row count). The row encoder is the shared
+/// `ferrosa-row-bridge` one — the SAME bytes the engine + CQL reads decode.
+fn execute_insert(
+    engine: &StorageEngine,
+    schema: &Schema,
+    ins: &InsertStmt,
+    default_schema: &str,
+) -> Vec<BackendMessage> {
+    use std::collections::HashMap;
+
+    let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let meta = match snap.tables.get(&(ks.to_string(), ins.table.table.clone())) {
+        Some(m) => m,
+        None => {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{ks}.{}\" does not exist", ins.table.table),
+            )]
+        }
+    };
+
+    // Convert each named column's value (per its CQL type); collect regular/
+    // static cells by storage index, and all values by name for key ordering.
+    let mut col_values: HashMap<String, CqlValue> = HashMap::new();
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    for (i, col_name) in ins.columns.iter().enumerate() {
+        let col_meta = match meta.columns.get(col_name) {
+            Some(c) => c,
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!(
+                        "column \"{col_name}\" of relation \"{}\" does not exist",
+                        ins.table.table
+                    ),
+                )]
+            }
+        };
+        let cql_type =
+            match ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            {
+                Ok(t) => t,
+                Err(e) => return vec![error_response("42704", &e.to_string())],
+            };
+        let value = match &ins.values[i] {
+            ScalarValue::Literal(v) => match value_to_cql(v, &cql_type) {
+                Ok(cv) => cv,
+                Err(msg) => return vec![msg],
+            },
+            ScalarValue::Param(_) => return vec![error_response(
+                "0A000",
+                "$N parameters in INSERT require the extended-query protocol (not yet supported)",
+            )],
+            ScalarValue::Func(_) => {
+                return vec![error_response(
+                    "0A000",
+                    "function calls in INSERT VALUES are not supported",
+                )]
+            }
+        };
+        if matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            if let Some(idx) = meta.storage_column_index(col_name) {
+                regular_cells.push((idx, value.clone()));
+            }
+        }
+        col_values.insert(col_name.clone(), value);
+    }
+
+    // Partition-key and clustering values in key order — all required for INSERT.
+    let mut pk_values = Vec::with_capacity(meta.partition_key.len());
+    for name in &meta.partition_key {
+        match col_values.get(name) {
+            Some(v) => pk_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("partition key column \"{name}\" must be specified in INSERT"),
+                )]
+            }
+        }
+    }
+    let mut ck_values = Vec::new();
+    for (name, _order) in &meta.clustering_key {
+        match col_values.get(name) {
+            Some(v) => ck_values.push(v.clone()),
+            None => {
+                return vec![error_response(
+                    "23502",
+                    &format!("clustering column \"{name}\" must be specified in INSERT"),
+                )]
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
+        Ok(k) => k,
+        Err(e) => return vec![error_response("22000", &e.to_string())],
+    };
+    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
+    let mutation = Mutation::new(
+        ks.to_string(),
+        ins.table.table.clone(),
+        key,
+        vec![row],
+        timestamp,
+    );
+    match engine.write_atomic_batch(vec![mutation]) {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: "INSERT 0 1".to_string(),
+        }],
+        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
     }
 }
 
@@ -1465,6 +1637,40 @@ mod tests {
         assert_eq!(row[0], SqlValue::Int(1));
         assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
         assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+    }
+
+    #[test]
+    fn value_to_cql_maps_per_target_type() {
+        use ferrosa_common::CqlValue as C;
+        assert_eq!(
+            value_to_cql(&SqlValue::Int(5), &CqlType::Int).unwrap(),
+            C::Int(5)
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Int(5), &CqlType::Bigint).unwrap(),
+            C::Bigint(5)
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Text("x".into()), &CqlType::Varchar).unwrap(),
+            C::Text("x".to_string())
+        );
+        assert_eq!(
+            value_to_cql(&SqlValue::Bool(true), &CqlType::Boolean).unwrap(),
+            C::Boolean(true)
+        );
+        // NULL maps to a tombstone for any target type.
+        assert_eq!(
+            value_to_cql(&SqlValue::Null, &CqlType::Int).unwrap(),
+            C::Null
+        );
+        // float bit-pattern round-trips.
+        assert_eq!(
+            value_to_cql(&SqlValue::float(9.5), &CqlType::Double).unwrap(),
+            C::Double(9.5f64.to_bits())
+        );
+        // out-of-range int into int4, and a type mismatch, both fail loud.
+        assert!(value_to_cql(&SqlValue::Int(i64::MAX), &CqlType::Int).is_err());
+        assert!(value_to_cql(&SqlValue::Text("x".into()), &CqlType::Int).is_err());
     }
 
     #[test]
