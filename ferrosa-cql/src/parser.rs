@@ -2177,6 +2177,40 @@ impl<'input> Parser<'input> {
         }
         let inner = self.parse_select().map(Statement::Select)?;
 
+        // Optional `ON LOCAL | COMMITTED | LOCAL, COMMITTED` — selects the
+        // event-driven change-data-capture stream(s). Absent => snapshot mode.
+        let streams = if self.lexer.eat(&TokenKind::Keyword(Keyword::On))? {
+            let mut local = false;
+            let mut committed = false;
+            loop {
+                // Scope the peek borrow so we can advance the lexer afterwards.
+                let which = {
+                    let tok = self.lexer.peek()?;
+                    match &tok.kind {
+                        TokenKind::Ident(s) if s.eq_ignore_ascii_case("local") => 0u8,
+                        TokenKind::Ident(s) if s.eq_ignore_ascii_case("committed") => 1u8,
+                        _ => {
+                            return Err(CqlError::SyntaxError(
+                                "SUBSCRIBE ... ON expects LOCAL and/or COMMITTED".to_string(),
+                            ))
+                        }
+                    }
+                };
+                self.lexer.next_token()?;
+                if which == 0 {
+                    local = true;
+                } else {
+                    committed = true;
+                }
+                if !self.lexer.eat(&TokenKind::Comma)? {
+                    break;
+                }
+            }
+            SubscribeStreams::Cdc { local, committed }
+        } else {
+            SubscribeStreams::Snapshot
+        };
+
         // Optional EVERY <duration>
         let interval = if self.lexer.eat(&TokenKind::Keyword(Keyword::Every))? {
             let dur = self.parse_duration()?;
@@ -2194,11 +2228,12 @@ impl<'input> Parser<'input> {
         // Optional DELTA
         let delta = self.lexer.eat(&TokenKind::Keyword(Keyword::Delta))?;
 
-        Ok(Statement::Subscribe {
+        Ok(Statement::Subscribe(SubscribeSpec {
             inner: Box::new(inner),
             interval,
             delta,
-        })
+            streams,
+        }))
     }
 
     fn parse_unsubscribe(&mut self) -> Result<Statement, CqlError> {
@@ -4941,14 +4976,12 @@ mod tests {
     fn parse_subscribe_select() {
         let stmt = parse("SUBSCRIBE SELECT * FROM users WHERE active = true").unwrap();
         match stmt {
-            Statement::Subscribe {
-                inner,
-                interval,
-                delta,
-            } => {
-                assert!(interval.is_none());
-                assert!(!delta);
-                assert!(matches!(*inner, Statement::Select { .. }));
+            Statement::Subscribe(spec) => {
+                assert!(spec.interval.is_none());
+                assert!(!spec.delta);
+                assert!(matches!(*spec.inner, Statement::Select { .. }));
+                // No ON clause => legacy snapshot mode.
+                assert_eq!(spec.streams, SubscribeStreams::Snapshot);
             }
             _ => panic!("expected Subscribe"),
         }
@@ -4958,8 +4991,8 @@ mod tests {
     fn parse_subscribe_with_every() {
         let stmt = parse("SUBSCRIBE SELECT * FROM t EVERY 5s").unwrap();
         match stmt {
-            Statement::Subscribe { interval, .. } => {
-                assert_eq!(interval, Some(Duration::from_secs(5)));
+            Statement::Subscribe(spec) => {
+                assert_eq!(spec.interval, Some(Duration::from_secs(5)));
             }
             _ => panic!("expected Subscribe"),
         }
@@ -4969,20 +5002,69 @@ mod tests {
     fn parse_subscribe_with_delta() {
         let stmt = parse("SUBSCRIBE SELECT * FROM t DELTA").unwrap();
         match stmt {
-            Statement::Subscribe { delta, .. } => assert!(delta),
+            Statement::Subscribe(spec) => assert!(spec.delta),
             _ => panic!("expected Subscribe"),
         }
+    }
+
+    #[test]
+    fn parse_subscribe_on_committed() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM t ON COMMITTED").unwrap();
+        match stmt {
+            Statement::Subscribe(spec) => assert_eq!(
+                spec.streams,
+                SubscribeStreams::Cdc {
+                    local: false,
+                    committed: true
+                }
+            ),
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_on_local() {
+        let stmt = parse("SUBSCRIBE SELECT * FROM t ON LOCAL").unwrap();
+        match stmt {
+            Statement::Subscribe(spec) => assert_eq!(
+                spec.streams,
+                SubscribeStreams::Cdc {
+                    local: true,
+                    committed: false
+                }
+            ),
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_on_local_and_committed() {
+        // Case-insensitive, comma-separated, order-independent.
+        let stmt = parse("SUBSCRIBE SELECT * FROM t on local, Committed").unwrap();
+        match stmt {
+            Statement::Subscribe(spec) => assert_eq!(
+                spec.streams,
+                SubscribeStreams::Cdc {
+                    local: true,
+                    committed: true
+                }
+            ),
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[test]
+    fn parse_subscribe_on_rejects_unknown_stream() {
+        assert!(parse("SUBSCRIBE SELECT * FROM t ON BOGUS").is_err());
     }
 
     #[test]
     fn parse_subscribe_every_and_delta() {
         let stmt = parse("SUBSCRIBE SELECT * FROM t EVERY 1s DELTA").unwrap();
         match stmt {
-            Statement::Subscribe {
-                interval, delta, ..
-            } => {
-                assert_eq!(interval, Some(Duration::from_secs(1)));
-                assert!(delta);
+            Statement::Subscribe(spec) => {
+                assert_eq!(spec.interval, Some(Duration::from_secs(1)));
+                assert!(spec.delta);
             }
             _ => panic!("expected Subscribe"),
         }
