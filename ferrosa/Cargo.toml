@@ -12,9 +12,11 @@ path = "src/main.rs"
 arc-swap = "1.7"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-flight = { path = "../ferrosa-flight", optional = true }
 ferrosa-graph = { path = "../ferrosa-graph" }
 ferrosa-sparql = { path = "../ferrosa-sparql" }
 ferrosa-net = { path = "../ferrosa-net" }
@@ -44,6 +46,8 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 
 [features]
 default = []
+# Arrow Flight (gRPC) query endpoint on port 8815 (see ferrosa-flight).
+flight = ["dep:ferrosa-flight"]
 otel = [
     "tracing-opentelemetry",
     "opentelemetry",
