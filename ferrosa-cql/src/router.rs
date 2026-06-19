@@ -9042,6 +9042,111 @@ fn evaluate_where_rhs_term(
     bridge::term_to_cql_value(term, expected_type)
 }
 
+/// Compute the Murmur3 partition token for a candidate `row` on the Direct
+/// (standalone) read path.
+///
+/// Gathers the partition-key column values in declared PK order and decorates
+/// them with the same composite encoding the engine uses for placement. Returns
+/// `Ok(None)` when any partition-key column is absent or NULL in the row — such
+/// a row cannot satisfy a `token()` bound, so the caller rejects it.
+fn row_partition_token(
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    table_meta: &TableMetadata,
+) -> Result<Option<ferrosa_common::Token>, CqlError> {
+    let mut pk_values: Vec<CqlValue> = Vec::with_capacity(table_meta.partition_key.len());
+    let mut pk_types: Vec<CqlType> = Vec::with_capacity(table_meta.partition_key.len());
+    for pk_col in &table_meta.partition_key {
+        let Some(idx) = all_col_names.iter().position(|n| n == pk_col) else {
+            return Ok(None);
+        };
+        let Some(value) = row.get(idx).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        pk_values.push(value.clone());
+        pk_types.push(all_col_types[idx].clone());
+    }
+    if pk_values.is_empty() {
+        return Ok(None);
+    }
+    let dk = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    Ok(Some(dk.token))
+}
+
+/// Resolve the bound token on the RHS of a `token(pk) op <bound>` predicate.
+///
+/// Two RHS shapes are accepted, matching the parser and Cassandra:
+/// - `token(<literal>)` — a `FunctionCall` whose argument is encoded and hashed
+///   exactly like a partition key, yielding its ring position.
+/// - a bare integer literal — the raw token value itself (`Token(n)`).
+fn token_bound_value(term: &Term) -> Result<ferrosa_common::Token, CqlError> {
+    match term {
+        Term::FunctionCall { name, args, .. } if name.eq_ignore_ascii_case("token") => {
+            if args.len() != 1 {
+                return Err(CqlError::Invalid(
+                    "token() bound must take exactly one argument".into(),
+                ));
+            }
+            let value = bridge::term_to_cql_value(&args[0], &CqlType::Varchar).or_else(|_| {
+                // Numeric/other literals: infer the encoding from the literal
+                // itself rather than forcing a text coercion.
+                bridge::term_to_cql_value(&args[0], &literal_inferred_type(&args[0]))
+            })?;
+            let dk = bridge::build_decorated_key(&[value], &[CqlType::Varchar])?;
+            Ok(dk.token)
+        }
+        Term::IntegerLiteral(n) => Ok(ferrosa_common::Token(*n)),
+        other => Err(CqlError::Invalid(format!(
+            "token() bound must be token(<value>) or an integer literal, got {other:?}"
+        ))),
+    }
+}
+
+/// Best-effort CQL type for a literal term, used when a `token(<literal>)`
+/// argument is not text and must be encoded with its natural representation.
+fn literal_inferred_type(term: &Term) -> CqlType {
+    match term {
+        Term::IntegerLiteral(_) => CqlType::Bigint,
+        Term::FloatLiteral(_) => CqlType::Double,
+        Term::BoolLiteral(_) => CqlType::Boolean,
+        Term::UuidLiteral(_) => CqlType::Uuid,
+        Term::BlobLiteral(_) => CqlType::Blob,
+        _ => CqlType::Varchar,
+    }
+}
+
+/// Apply a single `token(pk) op <bound>` predicate to a candidate row on the
+/// Direct read path. Returns whether the row's partition token satisfies the
+/// bound. The coordinator path routes by token range and never reaches here.
+fn token_clause_matches(
+    wc: &WhereClause,
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    table_meta: &TableMetadata,
+) -> Result<bool, CqlError> {
+    let Some(row_token) = row_partition_token(row, all_col_names, all_col_types, table_meta)?
+    else {
+        return Ok(false);
+    };
+    let bound = token_bound_value(&wc.value)?;
+    let matches = match &wc.op {
+        ComparisonOp::Gt => row_token > bound,
+        ComparisonOp::Lt => row_token < bound,
+        ComparisonOp::Ge => row_token >= bound,
+        ComparisonOp::Le => row_token <= bound,
+        ComparisonOp::Eq => row_token == bound,
+        ComparisonOp::Ne => row_token != bound,
+        other => {
+            return Err(CqlError::Invalid(format!(
+                "unsupported operator {other:?} on a token() WHERE predicate"
+            )));
+        }
+    };
+    Ok(matches)
+}
+
 /// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
 fn evaluate_where_predicates(
     row: &[Option<CqlValue>],
@@ -9053,10 +9158,16 @@ fn evaluate_where_predicates(
     state: &SharedState,
 ) -> Result<bool, CqlError> {
     for wc in where_clauses {
-        // Skip token() predicates — token range filtering is handled by
-        // the scan bounds, not by post-filter row evaluation.
+        // token() predicates: on the Direct/standalone read path there is no
+        // coordinator routing by token range, so the bound must be applied here
+        // by computing the candidate row's partition token. (The cluster
+        // coordinator path routes to replicas by token and never reaches this
+        // function, so it is unaffected.)
         if wc.token_fn {
-            continue;
+            if token_clause_matches(wc, row, all_col_names, all_col_types, table_meta)? {
+                continue;
+            }
+            return Ok(false);
         }
         // Skip fts_match() predicates — full-text search is handled by
         // the FTI lookup path, not by post-filter row evaluation.
@@ -19091,6 +19202,150 @@ mod tests {
             "evaluate_where_predicates with fts_match + matching PK clause \
              should return true"
         );
+    }
+
+    // ── token() WHERE bounds on the standalone Direct read path ─────────
+
+    /// Regression test: on the Direct/standalone read path,
+    /// `evaluate_where_predicates` must apply `token(pk)` lower/upper bounds
+    /// by computing each candidate row's partition token and comparing it
+    /// against the bound tokens. Before the fix it skipped `token_fn` clauses
+    /// entirely, so `SELECT ... WHERE token(pk) > A AND token(pk) <= B`
+    /// returned ALL rows instead of only those in the half-open range `(A, B]`.
+    #[tokio::test]
+    async fn evaluate_where_predicates_applies_token_bounds_on_direct_path() {
+        use crate::ast::{ComparisonOp, Term, WhereClause};
+        use ferrosa_common::cql_type::CqlValue;
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE tok_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE tok_ks.parts (id text PRIMARY KEY, v int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("tok_ks".to_string(), "parts".to_string()))
+            .unwrap();
+
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = all_col_names
+            .iter()
+            .map(|name| {
+                resolve_col_type(
+                    &table_meta.columns[name].column_type,
+                    "tok_ks",
+                    &state.schema,
+                )
+                .unwrap()
+            })
+            .collect();
+        let id_idx = all_col_names.iter().position(|n| n == "id").unwrap();
+
+        // Candidate partition keys. Compute each one's Murmur3 token with the
+        // SAME helper the fix uses, so the expected set is derived, not magic.
+        let keys = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let mut tokens: Vec<(String, i64)> = keys
+            .iter()
+            .map(|k| {
+                let dk = bridge::build_decorated_key(
+                    &[CqlValue::Text((*k).to_string())],
+                    &[CqlType::Varchar],
+                )
+                .unwrap();
+                ((*k).to_string(), dk.token.0)
+            })
+            .collect();
+        tokens.sort_by_key(|(_, t)| *t);
+
+        // Choose bounds so a strict subset lies in (A, B]: drop the lowest
+        // token (excluded by `>`) and keep the rest up to the 2nd-highest.
+        let lower_key = tokens[0].0.clone();
+        let upper_key = tokens[tokens.len() - 2].0.clone();
+        let lower_token = tokens[0].1;
+        let upper_token = tokens[tokens.len() - 2].1;
+
+        let lower_clause = WhereClause {
+            column: "id".to_string(),
+            op: ComparisonOp::Gt,
+            value: Term::FunctionCall {
+                keyspace: None,
+                name: "token".to_string(),
+                args: vec![Term::StringLiteral(lower_key)],
+            },
+            token_fn: true,
+        };
+        let upper_clause = WhereClause {
+            column: "id".to_string(),
+            op: ComparisonOp::Le,
+            value: Term::FunctionCall {
+                keyspace: None,
+                name: "token".to_string(),
+                args: vec![Term::StringLiteral(upper_key)],
+            },
+            token_fn: true,
+        };
+
+        let mut kept = 0usize;
+        for (key, tok) in &tokens {
+            let row: Vec<Option<CqlValue>> = all_col_names
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i == id_idx {
+                        Some(CqlValue::Text(key.clone()))
+                    } else {
+                        Some(CqlValue::Int(0))
+                    }
+                })
+                .collect();
+
+            let in_range = *tok > lower_token && *tok <= upper_token;
+            let result = evaluate_where_predicates(
+                &row,
+                &[lower_clause.clone(), upper_clause.clone()],
+                &all_col_names,
+                &all_col_types,
+                table_meta,
+                "tok_ks",
+                &state,
+            )
+            .unwrap();
+            assert_eq!(
+                result, in_range,
+                "row key={key} token={tok} expected in_range={in_range} \
+                 for bounds ({lower_token}, {upper_token}]; token() WHERE \
+                 bounds must be applied on the Direct path"
+            );
+            if in_range {
+                kept += 1;
+            }
+        }
+
+        // Sanity: the bounds must actually exclude at least the lowest row,
+        // otherwise the test would pass even if token bounds were ignored.
+        assert!(
+            kept < tokens.len(),
+            "test bounds must exclude at least one row; got kept={kept} of {}",
+            tokens.len()
+        );
+        assert!(kept > 0, "test bounds must keep at least one row");
     }
 
     // ── ferrosa_bugs: COUNT(*) column name ──────────────────────────────
