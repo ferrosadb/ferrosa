@@ -137,8 +137,8 @@ sequenceDiagram
     P->>P: plan() → SingleIndex(idx_val)
 
     par Merge index sources
-        P->>MI: lookup("x") → Vec<RowPosition>
-        P->>SC: lookup("x") per SSTable → Vec<RowPosition>
+        P->>MI: lookup("x") → Vec&lt;RowPosition&gt;
+        P->>SC: lookup("x") per SSTable → Vec&lt;RowPosition&gt;
     end
 
     P->>Store: Fetch rows by RowPosition
@@ -241,7 +241,7 @@ sequenceDiagram
         Exec-->>Coord: SessionStats { in, out, timestamp_ties }
     end
 
-    Coord-->>Web: Vec<SessionResult>
+    Coord-->>Web: Vec&lt;SessionResult&gt;
     Web-->>CLI: JSON summary (total, ok, failed, streamed_in, streamed_out, timestamp_ties)
     CLI-->>Op: Pretty-printed result
 ```
@@ -712,9 +712,9 @@ sequenceDiagram
     C->>Router: SELECT * FROM system_observability.connections
     Router->>VTR: get("system_observability", "connections")
     alt Found in registry
-        VTR->>Router: Arc<dyn VirtualTable>
+        VTR->>Router: Arc&lt;dyn VirtualTable&gt;
         Router->>VT: table.read(predicate)
-        VT->>Router: Vec<VirtualRow>
+        VT->>Router: Vec&lt;VirtualRow&gt;
         Router->>C: CQL RESULT frame (rows)
     else Not found
         Router->>Router: Fall through to user table lookup
@@ -798,7 +798,7 @@ sequenceDiagram
     P->>HTTP: GET /metrics
     HTTP->>Prom: render_metrics(registry)
     Prom->>VTR: list("system_observability")
-    VTR->>Prom: Vec<Arc<dyn VirtualTable>>
+    VTR->>Prom: Vec&lt;Arc&lt;dyn VirtualTable&gt;&gt;
 
     loop Each virtual table
         Prom->>Prom: table.read(None)
@@ -827,9 +827,9 @@ sequenceDiagram
     Browser->>Axum: GET /api/connections
     Axum->>API: get_connections(State(registry))
     API->>VTR: get("system_observability", "connections")
-    VTR->>API: Arc<dyn VirtualTable>
+    VTR->>API: Arc&lt;dyn VirtualTable&gt;
     API->>VT: table.read(None)
-    VT->>API: Vec<VirtualRow>
+    VT->>API: Vec&lt;VirtualRow&gt;
     API->>API: virtual_table_to_json() — decode cells by DataType
     API->>Axum: Json(Value)
     Axum->>Browser: HTTP 200 application/json
