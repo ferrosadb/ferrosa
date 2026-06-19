@@ -1286,6 +1286,29 @@ fn corpus() -> Vec<Case> {
             "events_order_by_time",
             "SELECT id, at_time FROM events ORDER BY at_time",
         ),
+        // ── Aggregate / ordering edge cases ──────────────────────────────────
+        // COUNT over an empty result is 0 (never NULL) on both sides.
+        c("count_empty", "SELECT COUNT(*) FROM users WHERE id > 1000"),
+        // SUM / MIN over an empty result is SQL NULL — the 3VL aggregate edge.
+        c(
+            "sum_empty_is_null",
+            "SELECT SUM(amount) FROM orders WHERE oid > 1000",
+        ),
+        c(
+            "min_empty_is_null",
+            "SELECT MIN(amount) FROM orders WHERE oid > 1000",
+        ),
+        // LIMIT 0 returns no rows; OFFSET past the end returns no rows.
+        c("limit_zero", "SELECT id FROM users ORDER BY id LIMIT 0"),
+        c(
+            "offset_beyond_end",
+            "SELECT id FROM users ORDER BY id OFFSET 100",
+        ),
+        // Multi-key ORDER BY (uid asc, oid asc) — deterministic tie-break.
+        c(
+            "order_by_multi_key",
+            "SELECT oid, uid FROM orders ORDER BY uid, oid",
+        ),
     ]
 }
 
