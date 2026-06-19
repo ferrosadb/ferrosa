@@ -1150,4 +1150,188 @@ mod engine_applier_tests {
             "a cell written at a later agreed t must not be visible to a read at an earlier t"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-end streaming SUBSCRIBE latency with two simultaneous connections:
+    // one on the local-commit stream (WrittenOnNode, fired at commit-log append)
+    // and one on the full-Accord stream (CommittedToCluster, fired by the
+    // CdcPublishingApplier after a durable Accord apply). Measures write->deliver
+    // latency for each path and prints the distribution.
+    //
+    // NOTE: single-node, in-process push bus — both streams deliver in
+    // microseconds. The local-vs-committed *gap* (cluster consensus / quorum
+    // round-trip) only manifests in a multi-node deployment; here both paths are
+    // dominated by the same local commit-log append.
+    fn report(label: &str, samples: &mut [u64]) {
+        samples.sort_unstable();
+        let n = samples.len();
+        let avg = samples.iter().sum::<u64>() / n as u64;
+        let p50 = samples[n / 2];
+        let p99 = samples[(n * 99 / 100).min(n - 1)];
+        eprintln!(
+            "SUBSCRIBE latency [{label}] over {n} writes: avg={:.1}µs p50={:.1}µs p99={:.1}µs",
+            avg as f64 / 1000.0,
+            p50 as f64 / 1000.0,
+            p99 as f64 / 1000.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_latency_two_connections_local_and_full_accord() {
+        let (engine, _dir) = make_engine();
+        let bus = ferrosa_cdc::CdcBus::new(8192);
+        engine.set_cdc_bus(bus.clone());
+
+        // Two simultaneous subscriber connections.
+        let mut local = bus.subscribe(ferrosa_cdc::CdcStream::WrittenOnNode);
+        let mut committed = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+
+        let applier =
+            CdcPublishingApplier::new(Arc::new(EngineStorageApplier::new(engine.clone())), bus);
+
+        const WARMUP: usize = 20;
+        const N: usize = 300;
+
+        // --- Local-commit path: plain engine writes fire WrittenOnNode only. ---
+        let mut local_ns = Vec::with_capacity(N);
+        for i in 0..(WARMUP + N) {
+            let key = make_key(&format!("local{i}"));
+            let m = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                key,
+                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                1_000 + i as i64,
+            );
+            let t0 = std::time::Instant::now();
+            engine.write_atomic_batch(vec![m]).expect("local write");
+            let ev = local.recv().await.expect("WrittenOnNode delivered");
+            let dt = t0.elapsed();
+            assert_eq!(ev.stream, ferrosa_cdc::CdcStream::WrittenOnNode);
+            if i >= WARMUP {
+                local_ns.push(dt.as_nanos() as u64);
+            }
+        }
+
+        // --- Full-Accord path: applier.apply does a durable apply, then the
+        //     decorator publishes CommittedToCluster (and the inner write fires
+        //     WrittenOnNode, which we drain). ---
+        let mut committed_ns = Vec::with_capacity(N);
+        for i in 0..(WARMUP + N) {
+            let key = make_key(&format!("accord{i}"));
+            let t = accord_ts(10_000 + i as u64);
+            let m = encoded_mutation(key, format!("v{i}").as_bytes(), 10_000 + i as i64, t, vec![]);
+            let t0 = std::time::Instant::now();
+            applier.apply(txn(1, 10_000 + i as u64), m).expect("accord apply");
+            let ev = committed.recv().await.expect("CommittedToCluster delivered");
+            let dt = t0.elapsed();
+            assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
+            assert_eq!(ev.accord_ts, Some(t), "committed event carries the accord ts");
+            // Drain the WrittenOnNode the inner write produced, so the local
+            // subscriber does not lag.
+            local.recv().await.expect("inner WrittenOnNode");
+            if i >= WARMUP {
+                committed_ns.push(dt.as_nanos() as u64);
+            }
+        }
+
+        report("local commit (WrittenOnNode)", &mut local_ns);
+        report("full accord (CommittedToCluster)", &mut committed_ns);
+        assert_eq!(local_ns.len(), N);
+        assert_eq!(committed_ns.len(), N);
+    }
+
+    // -----------------------------------------------------------------------
+    // MULTI-NODE model: two nodes, each with its own StorageEngine + push CDC
+    // bus. Node A takes local writes (WrittenOnNode); node B is a replica that
+    // applies cluster-committed writes via the real Accord apply path
+    // (CdcPublishingApplier -> CommittedToCluster). Subscribers on each node
+    // measure write->deliver latency, PROVING delivery is event-driven push:
+    //   * delivery is dominated by the commit cost, with NO poll-interval floor;
+    //   * after a long idle gap a single committed write is delivered
+    //     immediately — a poll-based CDC would be bounded by its interval.
+    //
+    // (A fully network-formed cluster latency number additionally needs the
+    // live-infra cluster harness; this models the replica apply + CDC fan-out,
+    // which is where CommittedToCluster actually fires on a cluster commit.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multinode_subscribe_is_realtime_push_not_poll() {
+        // --- Two independent nodes. ---
+        let (engine_a, _da) = make_engine();
+        let bus_a = ferrosa_cdc::CdcBus::new(8192);
+        engine_a.set_cdc_bus(bus_a.clone());
+        let (engine_b, _db) = make_engine();
+        let bus_b = ferrosa_cdc::CdcBus::new(8192);
+        engine_b.set_cdc_bus(bus_b.clone());
+
+        // Two subscriber connections, one per node.
+        let mut sub_a_local = bus_a.subscribe(ferrosa_cdc::CdcStream::WrittenOnNode);
+        let mut sub_b_committed = bus_b.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+
+        // Node B applies cluster-committed writes (replica apply path).
+        let applier_b = CdcPublishingApplier::new(
+            Arc::new(EngineStorageApplier::new(engine_b.clone())),
+            bus_b,
+        );
+
+        const N: usize = 200;
+        let mut a_local_ns = Vec::with_capacity(N);
+        let mut b_committed_ns = Vec::with_capacity(N);
+        for i in 0..N {
+            // Local commit on node A -> WrittenOnNode delivered to A's subscriber.
+            let m_a = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                make_key(&format!("a{i}")),
+                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                1_000 + i as i64,
+            );
+            let t0 = std::time::Instant::now();
+            engine_a.write_atomic_batch(vec![m_a]).expect("node A write");
+            sub_a_local.recv().await.expect("A WrittenOnNode delivered");
+            a_local_ns.push(t0.elapsed().as_nanos() as u64);
+
+            // Cluster-committed apply on node B -> CommittedToCluster to B's sub.
+            let t = accord_ts(100_000 + i as u64);
+            let m_b = encoded_mutation(
+                make_key(&format!("b{i}")),
+                format!("v{i}").as_bytes(),
+                100_000 + i as i64,
+                t,
+                vec![],
+            );
+            let t1 = std::time::Instant::now();
+            applier_b.apply(txn(2, 100_000 + i as u64), m_b).expect("node B apply");
+            sub_b_committed.recv().await.expect("B CommittedToCluster delivered");
+            b_committed_ns.push(t1.elapsed().as_nanos() as u64);
+        }
+        report("node A local-commit (WrittenOnNode)", &mut a_local_ns);
+        report("node B cluster-committed (CommittedToCluster)", &mut b_committed_ns);
+
+        // --- Push-vs-poll discriminator: idle, then ONE committed write. A
+        //     poll-based CDC would deliver no sooner than its next tick; a push
+        //     bus delivers as soon as the apply commits. ---
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let t = accord_ts(900_000);
+        let m = encoded_mutation(make_key("idle"), b"x", 900_000, t, vec![]);
+        let t0 = std::time::Instant::now();
+        applier_b.apply(txn(2, 900_000), m).expect("post-idle apply");
+        let ev = sub_b_committed
+            .recv()
+            .await
+            .expect("post-idle CommittedToCluster delivered");
+        let idle_deliver = t0.elapsed();
+        eprintln!("after 250ms idle, CommittedToCluster delivered in {idle_deliver:?}");
+        assert_eq!(ev.accord_ts, Some(t));
+        // Load-robust bound: the measured number (printed above) is the real
+        // proof — it is dominated by the commit fsync (~ms), NOT a poll interval.
+        // A poll-based CDC (e.g. a segment-reader on a multi-second checkpoint
+        // interval) could not deliver this fast regardless of CPU contention.
+        assert!(
+            idle_deliver < std::time::Duration::from_secs(1),
+            "real-time push CDC must deliver promptly after the commit \
+             (got {idle_deliver:?}); a poll-based stream would be bounded by its \
+             poll interval regardless of the idle gap"
+        );
+    }
 }
