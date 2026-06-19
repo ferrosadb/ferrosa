@@ -1461,4 +1461,20 @@ async fn differential_oracle_dml_agrees() {
         "after_insert",
     )
     .await;
+
+    // INSERT with a NULL column — Postgres stores SQL NULL, ferrosa stores a
+    // cell tombstone; both must read back as NULL (not "" / 0).
+    apply_both(
+        &pg_client,
+        &fe_client,
+        "INSERT INTO kv (id, v, n) VALUES (3, NULL, 30)",
+    )
+    .await;
+    assert_dml_agrees(
+        &pg_client,
+        &fe_client,
+        "SELECT id, v, n FROM kv ORDER BY id",
+        "after_null_insert",
+    )
+    .await;
 }
