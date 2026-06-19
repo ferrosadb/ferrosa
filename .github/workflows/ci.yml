@@ -8,6 +8,11 @@ on:
   # With `branches: [main]` these were skipped entirely — only the
   # path-filtered Driver Smoke ran — so stacked PRs went unexercised.
   pull_request:
+  # Run in the merge queue too: when a PR is queued, GitHub builds a temporary
+  # `merge_group` ref (the PR rebased on the latest main + entries ahead of it)
+  # and these checks must report on it for the queue to merge. Without this
+  # trigger the queue's required checks never run and entries would stall.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
