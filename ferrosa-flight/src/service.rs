@@ -813,7 +813,7 @@ impl FlightService for FerrosaFlight {
         Ok(Response::new(Box::pin(acks) as Self::DoExchangeStream))
     }
 
-    /// Handle a supported action (see [`SUPPORTED_ACTIONS`]). `server.info`
+    /// Handle a supported action (see `SUPPORTED_ACTIONS`). `server.info`
     /// reports the service name + crate version; `token.validate` echoes the
     /// verified bearer identity. Both require auth; any other type is rejected
     /// with `InvalidArgument`.
