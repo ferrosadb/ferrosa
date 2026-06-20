@@ -98,6 +98,12 @@ are updated to match.** A crate's docs must reflect its *current* implementation
 and dependency set — stale crate docs are treated like a failing check. The
 crate-centric index lives at [`specs/crates.md`](specs/crates.md).
 
+The `crate-docs-reminder` pre-commit hook (in `.pre-commit-config.yaml`, script
+`scripts/crate-docs-reminder.sh`) enforces this at commit time: it lists every
+crate with a staged `src/**.rs` change but no staged `README.md`/`specs/*.md`
+update. It warns by default (some changes are genuinely doc-neutral); set
+`FERROSA_CRATE_DOCS_STRICT=1` to make it block.
+
 ### CI must pass before pushing
 
 Agents MUST verify that all CI checks will pass locally before pushing to a remote branch or creating a PR. This means running `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test` across the full workspace — not just the crate you touched. A CI failure that could have been caught locally is a wasted round-trip. Do not push and hope.
