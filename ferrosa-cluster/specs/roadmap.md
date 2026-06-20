@@ -20,6 +20,16 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   regression-tested. *Still open:* route `handle_apply` itself through
   `DepWaitApplier` so dep-ordering is enforced at the state-machine apply path
   (today it applies directly via `EngineStorageApplier`) — see Next / t_59629c9b.
+- **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
+  carries no partition key, so its hits span every token range, but the served
+  path consulted only the coordinator's local FTI — returning 0/1
+  non-deterministically depending on which node coordinated. Added a
+  `FulltextSearchRequest`/`Response` internode RPC + `FulltextSearchHandler`, a
+  `ClusterCoordinator::coordinate_fulltext_search` that fans out to every node and
+  unions/de-dupes the matching keys, and `WritePath::fulltext_search`
+  (Direct/Pair → local, Cluster → fan-out). The CQL router now routes the FTI
+  lookup through the write path. In-process 2-node fan-out + dedup test in
+  `coordinator/read.rs`.
 
 ## Now (highest value)
 

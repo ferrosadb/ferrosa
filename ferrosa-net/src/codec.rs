@@ -144,6 +144,9 @@ pub enum MsgType {
     // Secondary index scatter-gather
     IndexReadRequest = 0x62,
     IndexReadResponse = 0x63,
+    // Full-text index scatter-gather (fts_match across every node's local FTI)
+    FulltextSearchRequest = 0x64,
+    FulltextSearchResponse = 0x65,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -264,6 +267,8 @@ impl TryFrom<u8> for MsgType {
             0x61 => Ok(Self::IndexBuildComplete),
             0x62 => Ok(Self::IndexReadRequest),
             0x63 => Ok(Self::IndexReadResponse),
+            0x64 => Ok(Self::FulltextSearchRequest),
+            0x65 => Ok(Self::FulltextSearchResponse),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),

@@ -1321,6 +1321,83 @@ impl RpcHandler for IndexReadHandler {
     }
 }
 
+/// Payload for a remote full-text search request (fts_match lookup on one node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FulltextSearchRequestPayload {
+    pub keyspace: String,
+    pub table: String,
+    pub index_name: String,
+    pub query: String,
+}
+
+/// Payload for a remote full-text search response: the matching partition keys
+/// (raw `PartitionKey` bytes) found in this node's local FTI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FulltextSearchResponsePayload {
+    pub matching_keys: Vec<Vec<u8>>,
+}
+
+/// Handles inbound `FulltextSearchRequest` RPCs from remote coordinators.
+///
+/// Runs `fulltext_search` on local storage and returns the matching partition
+/// keys. `fts_match` has no partition key, so the coordinator fans this out to
+/// every node and unions the results — fixing the coordinator-local lookup that
+/// made `fts_match` non-deterministic on a cluster (BUG-F-007).
+pub struct FulltextSearchHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl FulltextSearchHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for FulltextSearchHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let bytes = match msg {
+            Message::FulltextSearchRequest(b) => b,
+            _ => return None,
+        };
+
+        let req: FulltextSearchRequestPayload = bincode::deserialize(&bytes)
+            .map_err(|e| {
+                tracing::warn!("FulltextSearchHandler: failed to deserialize request: {e}");
+                e
+            })
+            .ok()?;
+
+        let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
+
+        let matching_keys =
+            match self
+                .storage
+                .fulltext_search(&table_id, &req.index_name, &req.query)
+            {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!("FulltextSearchHandler: fulltext_search failed: {e}");
+                    vec![]
+                }
+            };
+
+        let payload = FulltextSearchResponsePayload { matching_keys };
+        let resp_bytes = match bincode::serialize(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("FulltextSearchHandler: failed to serialize response: {e}");
+                bincode::serialize(&FulltextSearchResponsePayload {
+                    matching_keys: vec![],
+                })
+                .unwrap_or_default()
+            }
+        };
+
+        Some(Message::FulltextSearchResponse(Bytes::from(resp_bytes)))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
