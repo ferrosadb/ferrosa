@@ -34,7 +34,9 @@ use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnS
 use ferrosa_storage::accord::sync_writer::SyncWriter;
 use tokio::sync::Notify;
 
-use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier, StorageReader};
+use crate::accord::apply::{
+    ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier, StorageReader,
+};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -88,11 +90,15 @@ pub struct AccordStateMachine {
     committed_txns: HashSet<TxnId>,
     /// Notified waiters from the last commit (for test inspection).
     last_notified: Vec<TxnId>,
-    /// Storage integration seam: persists the committed mutation to the local
-    /// `StorageEngine` during `handle_apply`. Defaults to [`NoopStorageApplier`]
-    /// for protocol-only tests; production wires a real engine-backed applier
-    /// via [`AccordStateMachine::with_applier`].
-    applier: Arc<dyn StorageApplier>,
+    /// Dep-ordered apply engine: wraps the storage [`StorageApplier`] in a
+    /// [`DepWaitApplier`] so a committed transaction is persisted only after all
+    /// of its dependencies have applied on this replica. `handle_apply` routes
+    /// every real write through this (never the raw applier directly), which is
+    /// what enforces dependency order at the replica apply path — the prerequisite
+    /// for serializable multi-key transactions. The inner applier defaults to
+    /// [`NoopStorageApplier`] for protocol-only tests; production wires a real
+    /// engine-backed applier via [`AccordStateMachine::with_applier`].
+    apply_engine: Arc<DepWaitApplier>,
     /// Optional storage read seam for the generic-`IF` linearizable read-at-`t`
     /// (Gap 4). `None` keeps the conflict-index existence path used by
     /// `INSERT IF NOT EXISTS`. Production wires an engine-backed reader via
@@ -126,7 +132,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier: Arc::new(NoopStorageApplier::new()),
+            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -148,7 +154,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier: Arc::new(NoopStorageApplier::new()),
+            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -172,7 +178,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier,
+            apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -199,7 +205,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier,
+            apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
         }
@@ -547,16 +553,27 @@ impl AccordStateMachine {
     // Apply handler
     // -----------------------------------------------------------------------
 
-    /// Handle an Apply (fire-and-forget).
+    /// Handle an Apply (fire-and-forget) — **dep-ordered** at the replica.
     ///
-    /// 1. Idempotent no-op if already Applied.
-    /// 2. Persist the protocol-log marker BEFORE applying (recovery ordering).
-    /// 3. Persist the real mutation to local storage via the [`StorageApplier`]
-    ///    — closes the phantom-write gap (`bug-accord-lwt-acks-phantom-write.md`):
-    ///    the row must be durably written to the engine, not merely logged.
-    /// 4. Only after the mutation is durable do we set the Applied flag and mark
-    ///    the conflict index — so a crash before the storage write leaves the txn
-    ///    recoverable (re-Apply), never falsely Applied (persist-before-Applied).
+    /// 1. Idempotent no-op if already Applied; ignore an unknown txn.
+    /// 2. No-write finalize (empty payload): an LWT whose IF condition did NOT
+    ///    hold still *commits* but writes no row. It touches no storage, so there
+    ///    is no dependency order to respect — advance it to `Applied` directly,
+    ///    then ask the apply engine which parked waiters this unblocks and
+    ///    advance them too (so a later read at `t' > t` does not block on this
+    ///    phantom dependency until its dep-wait timeout).
+    /// 3. Real write: route the mutation through the [`DepWaitApplier`]. If every
+    ///    dependency has already applied on this replica, it persists the row
+    ///    immediately and cascades to any waiters this unblocks; otherwise it
+    ///    parks the mutation and returns an empty list — and we must NOT advance
+    ///    the txn to `Applied`. Routing through the engine (never the raw applier)
+    ///    is what enforces dependency order at the replica apply path.
+    /// 4. For every transaction the engine actually persisted (the primary plus
+    ///    any cascade-woken waiters), run [`bookkeep_applied`](Self::bookkeep_applied):
+    ///    the protocol-log marker, `Applied` flag, conflict-index GC, and the
+    ///    dep-wait wake. The storage write precedes the marker; the applier is
+    ///    idempotent on `(txn_id, t)`, so a crash between them is recovered by the
+    ///    per-txn Apply retry (never a falsely-`Applied` txn).
     pub fn handle_apply(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> SmResponse {
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
         // so the mutation we hand to storage carries the real `(t, deps)`.
@@ -572,39 +589,75 @@ impl AccordStateMachine {
             None => return SmResponse::None,
         };
 
-        // Persist the protocol-log marker BEFORE applying the mutation.
-        let data = format!("Applied:{}", txn_id.0.time);
-        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
-            // Fsync failed: do NOT apply or set the applied flag.
+        // No-write finalize (empty payload): nothing to persist and no dependency
+        // ordering to respect. Advance it to Applied, then advance any waiters it
+        // unblocks in the dep-wait graph.
+        if result_data.is_empty() {
+            if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
+                // Marker fsync failed — fail loud, leave Committed; Apply retries.
+                return SmResponse::None;
+            }
+            for (woken_id, woken_data) in self.apply_engine.notify_applied(txn_id) {
+                // Best-effort: a fsync failure here leaves that waiter Committed,
+                // and its own Apply retry re-drives it (storage apply is
+                // idempotent). Never a falsely-Applied txn.
+                let _ = self.bookkeep_applied(woken_id, woken_data);
+            }
             return SmResponse::None;
         }
 
-        // No-write finalize: an LWT whose IF condition did NOT hold still
-        // *commits* (it is ordered by Accord), but applies NO row write — the
-        // coordinator sends an Apply with an EMPTY payload to finalize it. We
-        // must still advance the txn to `Applied` (and wake dep-waiters / GC the
-        // conflict index) so it stops being a phantom dependency: a later read at
-        // `t' > t` that waited on this conflict would otherwise block until its
-        // dep-wait timeout. We deliberately skip the storage applier (there is no
-        // row to write), which also avoids decoding empty bytes as a Mutation.
-        if !result_data.is_empty() {
-            // Persist the real mutation to local storage. The applier is
-            // idempotent on (txn_id, t) and must durably write before returning
-            // Ok. If it fails we MUST NOT advance to Applied — fail loud, never
-            // fake success: the coordinator gets no implicit ack and the Apply
-            // can be retried.
-            let mutation = ApplyMutation {
-                data: result_data.clone(),
-                t,
-                deps,
-            };
-            if let Err(e) = self.applier.apply(txn_id, mutation) {
+        // Real write: route through the dep-ordered apply engine. The engine
+        // persists the row (idempotent on `(txn_id, t)`) only once every
+        // dependency has applied on this replica; otherwise it parks the mutation.
+        let mutation = ApplyMutation {
+            data: result_data,
+            t,
+            deps,
+        };
+        let applied = match self.apply_engine.try_apply(txn_id, mutation) {
+            Ok(applied) => applied,
+            Err(e) => {
+                // Storage apply failed: do NOT advance to Applied — fail loud,
+                // never fake success. The coordinator gets no implicit ack and
+                // the Apply can be retried.
                 tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
                 return SmResponse::None;
             }
+        };
+
+        if applied.is_empty() {
+            // Parked behind an unapplied dependency. This txn advances to Applied
+            // later, when its last dependency's `handle_apply` cascades to it.
+            return SmResponse::None;
         }
 
-        // Durable in storage — now safe to mark Applied and GC the conflict index.
+        // Persisted: the primary plus any cascade-woken waiters, in apply order.
+        for (applied_id, applied_data) in applied {
+            // Best-effort bookkeep (see the no-write branch): a per-txn Apply
+            // retry re-drives any whose marker fsync failed.
+            let _ = self.bookkeep_applied(applied_id, applied_data);
+        }
+
+        SmResponse::None
+    }
+
+    /// Post-apply bookkeeping for a transaction the apply engine has **already
+    /// persisted** (or a no-write finalize): persist the protocol-log marker,
+    /// advance the in-memory state to `Applied`, GC the conflict index, and wake
+    /// any `ReadVote` dep-wait parked on this transaction.
+    ///
+    /// Returns `Err(())` if the marker fsync fails — the caller must then leave
+    /// the txn `Committed` (never falsely `Applied`); the per-txn Apply retry
+    /// re-drives it, and because the storage applier is idempotent on
+    /// `(txn_id, t)` the re-driven apply is a no-op on storage.
+    fn bookkeep_applied(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> Result<(), ()> {
+        // Persist the protocol-log marker. Fail loud (return Err) on fsync
+        // failure so the caller does not advance a non-durable apply.
+        let data = format!("Applied:{}", txn_id.0.time);
+        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+            return Err(());
+        }
+
         if let Some(state) = self.txn_states.get_mut(&txn_id) {
             state.apply(result_data);
         }
@@ -615,7 +668,7 @@ impl AccordStateMachine {
         // the lock); see [`Self::applied_notify`].
         self.applied_notify.notify_waiters();
 
-        SmResponse::None
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1543,6 +1596,52 @@ mod tests {
         assert_eq!(
             *got_t, t,
             "applier must receive the agreed execution timestamp"
+        );
+    }
+
+    /// RED (Phase 0, t_59629c9b): the replica apply path must be DEP-ORDERED.
+    /// Two committed txns on the same key, B depends on A. If Apply(B) is
+    /// delivered before Apply(A), B's mutation must NOT hit storage until A has
+    /// applied — then both apply in dependency order. Today `handle_apply` calls
+    /// the applier DIRECTLY (no dep-wait at the state-machine apply path), so B
+    /// applies immediately and out of order — this test fails until the apply
+    /// path routes through dep-ordered application.
+    #[test]
+    fn sm_apply_is_dep_ordered_parks_until_dependency_applies() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer.clone(), applier.clone());
+
+        let a = txn(1, 1000);
+        let b = txn(2, 2000);
+        let ta = ts(1001);
+        let tb = ts(2001);
+        let key = b"shared-key";
+
+        // Commit A (no deps) and B (deps = [A]) on the same key.
+        sm.handle_preaccept(a, ts(1000), key, BallotNumber(0), 0);
+        sm.handle_accept(a, ts(1000), ta, vec![], BallotNumber(1));
+        sm.handle_commit(a, ts(1000), ta, vec![]);
+
+        sm.handle_preaccept(b, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(b, ts(2000), tb, vec![a], BallotNumber(1));
+        sm.handle_commit(b, ts(2000), tb, vec![a]);
+
+        // Deliver Apply(B) BEFORE Apply(A). B depends on A (not yet applied), so
+        // B must PARK — its write must not reach storage out of dependency order.
+        sm.handle_apply(b, b"write-b".to_vec());
+        assert!(
+            applier.captured().is_empty(),
+            "B must not apply before its dependency A (dep-ordered apply)"
+        );
+
+        // Now apply A → the cascade must then apply B, in dependency order.
+        sm.handle_apply(a, b"write-a".to_vec());
+        let ids: Vec<_> = applier.captured().iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![a, b],
+            "after A applies, A then B must apply in dependency order"
         );
     }
 

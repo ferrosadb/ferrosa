@@ -11,15 +11,29 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Replica apply path is now dep-ordered (Phase 0, t_59629c9b).** `handle_apply`
+  used to call the storage applier **directly**, ignoring the transaction's
+  dependency set — so an `Apply(B)` delivered before its dependency `A` applied
+  would persist `B` out of order. It now routes every real write through the
+  `DepWaitApplier`: a mutation persists only once all of its dependencies have
+  applied on this replica, otherwise it parks and the cascade applies it (in
+  dependency order) when the last dependency lands. `try_apply`/`cascade`/
+  `notify_applied` return the `(txn_id, data)` of every transaction actually
+  persisted, and the state machine runs its post-apply bookkeeping
+  (`bookkeep_applied`: protocol-log marker → `Applied` flag → conflict-index GC →
+  ReadVote wake) for exactly those. The storage write precedes the marker and the
+  applier is idempotent on `(txn_id, t)`, so a crash between them is recovered by
+  the per-txn Apply retry — never a falsely-`Applied` txn. This is the single-key
+  prerequisite for the multi-key/multi-partition transaction work (Phases 1+).
+  Regression test: `sm_apply_is_dep_ordered_parks_until_dependency_applies`.
 - **Dep-wait cascade replayed queued txns with empty data — fixed (PR #159).**
   `DepWaitApplier` parked dependency waiters but never stored their mutation, so
   when the last dependency resolved the cascade re-applied each waiter with
   `ApplyMutation { data: vec![] }` — silently dropping the write. It now parks the
   real mutation and replays it (transitively); applier errors fail loud rather than
   committing a lost write. `NoopStorageApplier` now records payloads so this is
-  regression-tested. *Still open:* route `handle_apply` itself through
-  `DepWaitApplier` so dep-ordering is enforced at the state-machine apply path
-  (today it applies directly via `EngineStorageApplier`) — see Next / t_59629c9b.
+  regression-tested. (The previously-open follow-up — route `handle_apply` itself
+  through `DepWaitApplier` — is now done; see the dep-ordered apply entry above.)
 - **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
   carries no partition key, so its hits span every token range, but the served
   path consulted only the coordinator's local FTI — returning 0/1
