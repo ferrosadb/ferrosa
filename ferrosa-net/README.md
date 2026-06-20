@@ -34,7 +34,8 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `LegacyPayload` until peers negotiate the Cap'n Proto format.
 - **Message model** (`message`) — the `Message` enum with hand-rolled
   length-prefixed encode/decode for lifecycle, Raft, mutation/read, repair,
-  streaming, pair-mode, batchlog, index, Accord, and bootstrap message types
+  streaming, pair-mode, batchlog, index (incl. full-text scatter-gather), Accord,
+  and bootstrap message types
   (`MsgType` discriminants `0x01`..=`0x83`). Optional trailing fields decode to
   `None` on pre-extension peers for backward compatibility.
 - **PSK-HMAC handshake** (`handshake`) — `initiate_handshake` /
