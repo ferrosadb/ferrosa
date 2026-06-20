@@ -57,8 +57,8 @@ use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
 use crate::raft::handlers::{
-    IndexReadHandler, RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler,
-    ReadRequestHandler,
+    FulltextSearchHandler, IndexReadHandler, RaftAppendHandler, RaftSnapshotHandler,
+    RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -1079,6 +1079,10 @@ impl ModeController {
         let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
         self.registry
             .register(MsgType::IndexReadRequest, index_read_handler);
+
+        let fulltext_search_handler = Arc::new(FulltextSearchHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::FulltextSearchRequest, fulltext_search_handler);
 
         let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
         self.registry.register(MsgType::ReadRequest, read_handler);

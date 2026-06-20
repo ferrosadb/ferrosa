@@ -251,6 +251,10 @@ pub enum Message {
     IndexReadRequest(Bytes),
     IndexReadResponse(Bytes),
 
+    // Full-text index scatter-gather (fts_match across every node's local FTI)
+    FulltextSearchRequest(Bytes),
+    FulltextSearchResponse(Bytes),
+
     // Accord consensus — opaque payloads, ferrosa-cluster interprets
     AccordPreAccept(Bytes),
     AccordPreAcceptOK(Bytes),
@@ -356,6 +360,8 @@ impl Message {
             Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
             Self::IndexReadRequest(_) => MsgType::IndexReadRequest,
             Self::IndexReadResponse(_) => MsgType::IndexReadResponse,
+            Self::FulltextSearchRequest(_) => MsgType::FulltextSearchRequest,
+            Self::FulltextSearchResponse(_) => MsgType::FulltextSearchResponse,
             Self::AccordPreAccept(_) => MsgType::AccordPreAccept,
             Self::AccordPreAcceptOK(_) => MsgType::AccordPreAcceptOK,
             Self::AccordAccept(_) => MsgType::AccordAccept,
@@ -507,6 +513,8 @@ impl Message {
             | Self::IndexBuildComplete(b)
             | Self::IndexReadRequest(b)
             | Self::IndexReadResponse(b)
+            | Self::FulltextSearchRequest(b)
+            | Self::FulltextSearchResponse(b)
             | Self::AccordPreAccept(b)
             | Self::AccordPreAcceptOK(b)
             | Self::AccordAccept(b)
@@ -727,6 +735,12 @@ impl Message {
             }
             MsgType::IndexReadRequest => Self::IndexReadRequest(body.split_to(body.remaining())),
             MsgType::IndexReadResponse => Self::IndexReadResponse(body.split_to(body.remaining())),
+            MsgType::FulltextSearchRequest => {
+                Self::FulltextSearchRequest(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchResponse => {
+                Self::FulltextSearchResponse(body.split_to(body.remaining()))
+            }
             MsgType::AccordPreAccept => Self::AccordPreAccept(body.split_to(body.remaining())),
             MsgType::AccordPreAcceptOK => Self::AccordPreAcceptOK(body.split_to(body.remaining())),
             MsgType::AccordAccept => Self::AccordAccept(body.split_to(body.remaining())),

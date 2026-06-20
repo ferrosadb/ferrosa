@@ -3388,9 +3388,16 @@ async fn route_select_user_table(
             .index_usage_tracker
             .record(ks, &s.table, index_name, "FullText");
 
+        // Route the FTI lookup through the write path so it scatter-gathers
+        // across the cluster. `fts_match` carries no partition key, so its hits
+        // span all token ranges; a coordinator-local lookup returned 0/1
+        // depending on which node served the query (BUG-F-007 / t_0d08aa43).
+        // Standalone/pair still resolves locally via the same call.
         let matching_pks = state
-            .engine
+            .write_path
+            .load()
             .fulltext_search(&table_id, index_name, fts_query)
+            .await
             .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
 
         // Fetch each matching partition and apply post-filter.
