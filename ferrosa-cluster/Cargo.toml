@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 ferrosa-storage = { path = "../ferrosa-storage", features = ["test-generators"] }
+fs2 = "0.4"
 indexmap = "2"
 proptest = "1"
 rand = "0.10"

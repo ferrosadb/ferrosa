@@ -11,7 +11,7 @@
 //! ```no_run
 //! # async fn doctest() {
 //! let cluster = TestCluster::with_voters(3).await;
-//! let _ = cluster.wait_for_leader(std::time::Duration::from_secs(5)).await;
+//! cluster.require_leader(std::time::Duration::from_secs(5)).await; // fail loud if no leader
 //! cluster.shutdown().await;
 //! # }
 //! ```
@@ -448,6 +448,13 @@ impl TestNode {
     }
 }
 
+// The cross-process concurrency slot that bounds multi-node harness
+// oversubscription lives in the shared `harness_slot` module so every multi-node
+// harness (this one and the real-TCP harnesses) draws from the SAME `K` slots.
+// It is held only across cluster *formation* (build + election), never for the
+// cluster's lifetime — see `with_voters` for why (deadlock-freedom).
+use super::harness_slot::acquire_harness_slot;
+
 // ---------------------------------------------------------------------------
 // TestCluster
 // ---------------------------------------------------------------------------
@@ -541,6 +548,14 @@ impl TestCluster {
     pub async fn with_voters(n: usize) -> Self {
         assert!(n >= 1, "TestCluster requires at least 1 node");
 
+        // Bound cross-binary oversubscription across the build + election window
+        // (the timing-sensitive part) so the short raft timers stay serviceable
+        // and election is deterministic. The slot is a local — dropped before this
+        // function returns — so a single test that forms MULTIPLE clusters (e.g.
+        // the cross-DC tests) never holds two slots at once and cannot self-
+        // deadlock when `K == 1` on a low-core CI runner. See `harness_slot.rs`.
+        let slot = acquire_harness_slot().await;
+
         let registry = NodeRegistry::default();
 
         // Reserve N node IDs.  Use 1..=N so they're easy to read in test
@@ -585,12 +600,20 @@ impl TestCluster {
             .await
             .expect("initial seed initialize");
 
-        Self {
+        let cluster = Self {
             nodes,
             registry,
             extra_nodes: Arc::new(StdMutex::new(Vec::new())),
             raft_lib_config,
-        }
+        };
+
+        // Hold the slot through the election (the oversubscription-sensitive
+        // window), then release it. Bounded so a cluster that intentionally does
+        // not elect a leader still returns; the test proceeds exactly as before.
+        let _ = cluster.wait_for_leader(Duration::from_secs(10)).await;
+        drop(slot);
+
+        cluster
     }
 
     /// Spin up a new `TestNode` with the given `node_id`, register its
@@ -652,6 +675,26 @@ impl TestCluster {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Like [`wait_for_leader`](Self::wait_for_leader) but **fails loud** when no
+    /// leader is elected in time, naming the real precondition. Use this for the
+    /// common "bring up the cluster, then test X" setup so a missed election is
+    /// reported at its source — not as a confusing downstream `leader_node()`
+    /// panic. Returns the leader's node id.
+    ///
+    /// With the harness concurrency slot (see `acquire_harness_slot`) bounding
+    /// oversubscription, the 50/200–400 ms raft timers are serviced reliably, so
+    /// a timeout here means election genuinely failed to converge — a real bug,
+    /// not host load.
+    pub async fn require_leader(&self, timeout: Duration) -> u64 {
+        match self.wait_for_leader(timeout).await {
+            Some(id) => id,
+            None => panic!(
+                "no leader elected within {timeout:?} — Raft election failed to converge \
+                 (call require_leader before any leader-dependent step)"
+            ),
         }
     }
 
