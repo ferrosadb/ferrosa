@@ -579,7 +579,7 @@ impl DepWaitApplier {
     /// row write (a no-write LWT finalize) or when a remote coordinator
     /// acknowledges its apply (via `ApplyOK`). Unblocks any waiting transactions
     /// and returns the `(txn_id, mutation_data)` of every waiter that was
-    /// actually persisted as a result, in apply order (see [`cascade`](Self::cascade)).
+    /// actually persisted as a result, in apply order (see the `cascade` helper).
     pub fn notify_applied(&self, txn_id: TxnId) -> Vec<(TxnId, Vec<u8>)> {
         // Mark the externally-applied dependency and apply any waiters it
         // unblocks, using their real parked mutations (see `cascade`).
