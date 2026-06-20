@@ -569,7 +569,7 @@ impl AccordStateMachine {
     ///    the txn to `Applied`. Routing through the engine (never the raw applier)
     ///    is what enforces dependency order at the replica apply path.
     /// 4. For every transaction the engine actually persisted (the primary plus
-    ///    any cascade-woken waiters), run [`bookkeep_applied`](Self::bookkeep_applied):
+    ///    any cascade-woken waiters), run the `bookkeep_applied` helper:
     ///    the protocol-log marker, `Applied` flag, conflict-index GC, and the
     ///    dep-wait wake. The storage write precedes the marker; the applier is
     ///    idempotent on `(txn_id, t)`, so a crash between them is recovered by the
