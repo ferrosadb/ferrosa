@@ -1592,7 +1592,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::AccordApply
             | MsgType::AccordApplyOK
             | MsgType::AccordRecover
-            | MsgType::AccordRecoverOK,
+            | MsgType::AccordRecoverOK
+            | MsgType::AccordPreAcceptV2
+            | MsgType::AccordApplyV2,
         ) => MessageFamily::Accord,
         Ok(MsgType::BootstrapComplete | MsgType::BootstrapCompleteAck) => MessageFamily::Bootstrap,
         Ok(MsgType::ClusterMembershipForward | MsgType::ClusterMembershipForwardAck) => {

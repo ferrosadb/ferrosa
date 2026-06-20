@@ -55,6 +55,49 @@ pub(crate) struct RecoverPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-key (multi-partition) transactions — additive V2 wire family.
+//
+// bincode is NOT self-describing, so we cannot append fields to the shipped
+// single-key payloads above without breaking the wire format. Multi-key
+// transactions therefore travel on NEW message variants
+// (`AccordPreAcceptV2`/`AccordApplyV2`) carrying V2 payloads. The single-key
+// path keeps its exact bytes; a single-key transaction is the degenerate
+// `writes.len() == 1` case of the multi-key path. The intermediate
+// Accept/Commit phases carry only `txn_id`/`t`/`deps`, which are
+// key-independent, so they REUSE the v1 [`AcceptPayload`] / [`CommitPayload`]
+// rather than introducing redundant V2 twins.
+//
+// Only the types with a consumer in *this* phase are defined here:
+// [`WriteSetEntry`] + [`ApplyV2Payload`] back the single-node multi-key apply
+// path. `PreAcceptV2Payload` (the key-union PreAccept) lands with the Phase 2
+// multi-shard PreAccept fan-out that first constructs it; the wire code
+// `AccordPreAcceptV2` is reserved now (round-trip tested in `ferrosa-net`).
+// ---------------------------------------------------------------------------
+
+/// One write in a multi-key transaction's write-set: the raw partition-key
+/// bytes (used for Accord conflict ordering and replica/shard routing) paired
+/// with the encoded commit-log `Mutation` to apply for that key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WriteSetEntry {
+    /// Raw partition-key bytes for this write (conflict ordering + routing).
+    pub(crate) key: Vec<u8>,
+    /// Encoded self-describing commit-log `Mutation` to apply for this key.
+    pub(crate) mutation: Vec<u8>,
+}
+
+/// Apply request for a multi-key transaction.
+///
+/// Carries the full write-set; each replica applies the mutations for the keys
+/// it owns (in dependency order via the `DepWaitApplier`). The single-key
+/// [`ApplyPayload`] is the degenerate one-entry case.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ApplyV2Payload {
+    pub(crate) txn_id: TxnId,
+    /// All `(key, mutation)` writes for this transaction.
+    pub(crate) writes: Vec<WriteSetEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Replica → Coordinator
 // ---------------------------------------------------------------------------
 
@@ -236,6 +279,46 @@ mod tests {
                 keyspace: "ks".into(),
                 table: "t".into(),
             },
+        });
+    }
+
+    #[test]
+    fn multikey_v2_payloads_roundtrip_including_single_key_degenerate_case() {
+        let txn_id = txn(7, 1_000, 2, 11);
+
+        // Two-key write-set: distinct keys, distinct mutation bytes.
+        assert_bincode_roundtrip(&ApplyV2Payload {
+            txn_id,
+            writes: vec![
+                WriteSetEntry {
+                    key: b"key-alpha".to_vec(),
+                    mutation: b"mutation-for-alpha".to_vec(),
+                },
+                WriteSetEntry {
+                    key: b"key-beta\0bin".to_vec(),
+                    mutation: b"mutation-for-beta".to_vec(),
+                },
+            ],
+        });
+
+        // Degenerate single-key case: a one-entry V2 write-set round-trips and
+        // carries exactly the same key+mutation a single-key txn would.
+        let single = ApplyV2Payload {
+            txn_id,
+            writes: vec![WriteSetEntry {
+                key: b"only-key".to_vec(),
+                mutation: b"only-mutation".to_vec(),
+            }],
+        };
+        assert_bincode_roundtrip(&single);
+        assert_eq!(single.writes.len(), 1);
+        assert_eq!(single.writes[0].key, b"only-key");
+        assert_eq!(single.writes[0].mutation, b"only-mutation");
+
+        // Empty write-set (read-only / protocol-only) round-trips too.
+        assert_bincode_roundtrip(&ApplyV2Payload {
+            txn_id,
+            writes: vec![],
         });
     }
 

@@ -11,6 +11,20 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Multi-key Accord — additive V2 wire foundation + `new_multi` API (Phase 1).**
+  Multi-key (multi-partition) transactions will travel on new
+  `AccordPreAcceptV2`/`AccordApplyV2` message codes (bincode is not
+  self-describing, so the single-key payloads keep their exact bytes). Landed so
+  far: `WriteSetEntry` + `ApplyV2Payload` wire types, the reserved net message
+  codes (round-trip tested in `ferrosa-net`), and
+  `AccordCoordinatorDriver::new_multi(write_set)` (with `new` delegating as the
+  one-entry degenerate case) so the CQL/Postgres front-ends can be built against
+  the API in parallel. Multi-key *execution* is **deliberately fail-loud for now**
+  (`AccordDriverError::MultiKeyNotYetExecutable`): a `(txn_id, t)`-idempotent
+  applier would no-op writes 2..N of one transaction, so correct multi-key apply
+  needs the participant-set/per-shard quorum (Phase 2) and the `(txn_id, key)`
+  apply keying (Phase 3) before it can run — fail loud rather than silently drop
+  writes. Single-key LWT is unchanged.
 - **Replica apply path is now dep-ordered (Phase 0, t_59629c9b).** `handle_apply`
   used to call the storage applier **directly**, ignoring the transaction's
   dependency set — so an `Apply(B)` delivered before its dependency `A` applied
