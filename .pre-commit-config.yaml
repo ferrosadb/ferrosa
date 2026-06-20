@@ -30,6 +30,20 @@ repos:
 
   - repo: local
     hooks:
+      # Pre-commit: remind that crates with staged code changes also need their
+      # docs updated (the per-crate-docs rule in CLAUDE.md / AGENTS.md — a crate
+      # change is not done until its README + specs reflect it). Fast: it diffs
+      # the staged file list and lists each crate with a staged `src/**.rs`
+      # change but no staged `README.md`/`specs/*.md`. Warns by default (some
+      # changes are genuinely doc-neutral); set FERROSA_CRATE_DOCS_STRICT=1 to
+      # make it block.
+      - id: crate-docs-reminder
+        name: per-crate docs reminder (changed crates need README/specs updates)
+        entry: bash scripts/crate-docs-reminder.sh
+        language: system
+        types: [rust]
+        pass_filenames: false
+
       # Pre-commit: format check only. Anything slower belongs on pre-push.
       - id: cargo-fmt
         name: cargo fmt --check
