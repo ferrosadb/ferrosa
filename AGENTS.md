@@ -21,6 +21,11 @@ known-issue/roadmap status is **not finished until that crate's `README.md` +
 implementation and dependency set. Treat stale crate docs the same as a failing
 test — do not open a PR with code changes whose crate docs are out of date.
 
+The `crate-docs-reminder` pre-commit hook (`.pre-commit-config.yaml` →
+`scripts/crate-docs-reminder.sh`) flags this automatically: on commit it lists
+each crate with a staged `src/**.rs` change but no staged `README.md`/`specs/*.md`
+update. It warns by default; `FERROSA_CRATE_DOCS_STRICT=1` makes it block.
+
 The crate-centric map (all crates + the runtime dependency graph) lives at
 [`specs/crates.md`](specs/crates.md). Cross-cutting topic specs live under
 [`specs/reference/`](specs/reference/).
