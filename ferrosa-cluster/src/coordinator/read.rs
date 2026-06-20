@@ -1731,7 +1731,7 @@ impl ClusterCoordinator {
         }
 
         if let Some(err) = first_error {
-            if all_keys.is_empty() {
+            if failed_nodes == total_nodes {
                 tracing::error!(
                     failed_nodes,
                     "coordinate_fulltext_search: all nodes failed, returning error"
@@ -2231,6 +2231,58 @@ mod tests {
         );
 
         server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A remote FTI failure must not turn a legitimate empty local result into
+    /// a user-visible query failure. The fmem hybrid_search path fans out
+    /// `fts_match` and can hit transient remote stream failures such as
+    /// `ChannelClosedBeforeDone`; if at least one node completed, the result is
+    /// a partial union, even when that union is empty. Only all nodes failing is
+    /// fatal.
+    #[tokio::test]
+    async fn coordinate_fulltext_search_degrades_to_empty_when_some_nodes_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let remote_host_id = Uuid::new_v4();
+        let mut remote = make_node("127.0.0.1:1");
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::Quorum,
+        );
+
+        let keys = coordinator
+            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token")
+            .await
+            .expect("one successful empty FTI shard should degrade remote failure to empty union");
+
+        assert!(
+            keys.is_empty(),
+            "expected an empty partial union when local FTI succeeds and remote FTI fails"
+        );
     }
 
     // -----------------------------------------------------------------------
