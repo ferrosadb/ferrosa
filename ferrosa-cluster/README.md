@@ -69,7 +69,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   repair in background* (LOCKED DESIGN). Also hosts the index scatter-gathers:
   `coordinate_index_read` (secondary index) and `coordinate_fulltext_search`
   (`fts_match` — fans out to every node's local FTI and unions/de-dupes the
-  matching keys, since full-text hits span all token ranges; BUG-F-007).
+  matching keys, since full-text hits span all token ranges; BUG-F-007). FTI
+  scatter-gather is partial-failure tolerant: if at least one node completes, the
+  union is returned even when it is empty, so a transient remote stream failure
+  does not turn a valid no-hit search into a user-visible error.
 - `coordinator/cl_routing.rs` — W8.4 learner-aware routing (voter-only quorums,
   leader-only serial, cross-DC Accord routing).
 - `coordinator/batch.rs` — 3-phase logged batchlog (write → fan out → delete only
