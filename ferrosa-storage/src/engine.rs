@@ -18267,6 +18267,66 @@ mod tests {
         );
     }
 
+    /// Regression for t_0d08aa43 (BUG-F-007): `fts_match` returned 0/1
+    /// non-deterministically on a cluster. Root cause (on-disk half): FTI
+    /// sidecars are built ONLY on flush — compaction merges SSTables and
+    /// removes the old per-gen FTI sidecars WITHOUT writing one for the merged
+    /// generation, so a compacted node silently loses the row from full-text
+    /// search. A row found via FTI before compaction must still be found after.
+    #[tokio::test]
+    async fn fts_match_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        // 5 flushed batches → ≥4 SSTables (each with its own FTI sidecar), so
+        // STCS will compact them. A unique probe term lives in the first row.
+        const PROBE: &str = "ferrosaftscompactprobe";
+        for batch in 0..5u64 {
+            for i in 0..25u64 {
+                let n = batch * 25 + i;
+                let key = make_key(&format!("doc_{n:04}"));
+                let text = if n == 0 {
+                    format!("{PROBE} distributed database")
+                } else {
+                    format!("filler distributed database row {n}")
+                };
+                let ts = (n as i64) + 1;
+                engine
+                    .write(&tid, &key, make_row(text.as_bytes(), ts), ts)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        // Before compaction: the probe is found via the per-gen FTI sidecars.
+        let before = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "probe must be found via FTI before compaction"
+        );
+
+        // Compact (STCS triggers at ≥4 SSTables): merges gens, removing the old
+        // per-gen FTI sidecars.
+        engine.poll_compactions().await;
+
+        // After compaction the probe MUST still be found.
+        let after = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let keys: Vec<String> = after
+            .iter()
+            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["doc_0000".to_string()],
+            "fts_match must still find the probe row after compaction (compaction must rebuild the FTI sidecar)"
+        );
+    }
+
     /// Concurrent writes + flushes + compaction — reproduces the loadgen data loss.
     #[tokio::test]
     async fn concurrent_write_flush_compact_no_data_loss() {
