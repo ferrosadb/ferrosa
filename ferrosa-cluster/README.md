@@ -113,8 +113,15 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
-  Commit → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
+  Commit → Apply, fast/slow quorum math, HLC timestamps + `TxnId`. The replica
+  apply path is **dep-ordered**: `handle_apply` routes every real write through
+  `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of its
+  dependencies have applied locally (otherwise it parks and the cascade applies
+  it in order).
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
+- `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam, idempotent on
+  `(txn_id, t)`) + `EngineStorageApplier`/`EngineStorageReader` (real persistence
+  and linearizable read-at-`t`).
 - `dep_wait.rs` — waits-for graph with deterministic cycle-breaking.
 - `cross_shard.rs` / `cross_dc_adapter.rs` — multi-shard atomicity, cross-DC glue.
 - `electorate.rs` / `epoch.rs` — JoinElectorate membership gates, epoch tracking.
