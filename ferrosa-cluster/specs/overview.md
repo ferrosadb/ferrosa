@@ -64,6 +64,13 @@ digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newe
 copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
 to a healthy replica and enqueues a background anti-entropy refill.
 
+**Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
+index lookup out to every node — its hits span all token ranges (there is no
+partition key) — running each node's local FTI via a `FulltextSearchRequest` RPC
+and unioning/de-duping the matching keys (partial-failure tolerant). Routed
+through `WritePath::fulltext_search` (Direct/Pair resolve locally). Fixes the
+coordinator-local non-determinism of BUG-F-007.
+
 **DDL / membership.** Mutations are wrapped as `RaftOp`, proposed via
 `raft.client_write` (forwarded to the leader if needed via `raft_forward`),
 committed, and applied deterministically into `RaftState` on every node.
