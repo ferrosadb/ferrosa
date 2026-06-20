@@ -2181,6 +2181,7 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-sstable",
  "ferrosa-storage",
+ "fs2",
  "futures",
  "indexmap 2.14.0",
  "openraft",

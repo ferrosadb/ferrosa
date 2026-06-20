@@ -899,6 +899,7 @@ fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn lane_handle_is_clone() {
@@ -965,7 +966,12 @@ mod tests {
         handle.shutdown().await;
     }
 
+    // Drives a lane to `Dormant`, which mutates the process-wide
+    // `DORMANT_PEER_COUNT` metric. Share the `dormant_peer_counter` serial key
+    // with the counter assertions in `reconnect.rs` so this never increments the
+    // global concurrently with their absolute-value checks.
     #[tokio::test]
+    #[serial(dormant_peer_counter)]
     async fn mark_failed_transitions_through_exhaustion_to_dormant() {
         let handle = spawn_lane_actor(
             Lane::Bulk,

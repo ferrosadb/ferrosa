@@ -153,6 +153,15 @@ Notable integration suites: `failure_mode_matrix` (44), `raft_election_storm`
 `accord_nemesis` (15), `correctness` (11), `cluster_formation` (10). All run on
 deterministic in-process harnesses unless gated behind `live-infra-tests`.
 
+The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
+openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep
+election convergence deterministic when `cargo test` runs many runtime-heavy test
+binaries in parallel, the harness holds one of `K = ceil(cores/4)`
+**cross-process** slots (an `fs2` advisory file lock) for each cluster's lifetime,
+bounding aggregate raft-worker oversubscription. Leader-dependent setup uses
+`require_leader(timeout)`, which fails loud at the real precondition rather than
+panicking later in `leader_node()`.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — subsystem map, invariants, position

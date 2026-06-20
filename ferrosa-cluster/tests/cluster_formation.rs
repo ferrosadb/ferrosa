@@ -240,8 +240,15 @@ impl TestClusterNode {
 ///   - Root cause: simultaneous raft.initialize() calls or simultaneous first
 ///     elections without staggered timeouts, combined with Vote RPC timeouts
 ///     caused by network transport issues on the Raft lane
+// Bound multi-node harness oversubscription across all test binaries so the
+// short raft election timers stay serviceable (deterministic election). See the
+// shared module for the full rationale.
+#[path = "common/harness_slot.rs"]
+mod harness_slot;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_elects_raft_leader() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     // Use deterministic UUIDs so the test is reproducible.
     // Node1 has the highest UUID so it becomes Primary in pair mode,
     // which means it will be the seed that calls raft.initialize().

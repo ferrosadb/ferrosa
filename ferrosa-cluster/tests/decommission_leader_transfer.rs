@@ -47,7 +47,7 @@ fn host_id_for(node_id: u64) -> Uuid {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn decommission_leader_transfers_first() {
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     let leader_node_id = cluster.leader_node().node_id;
     let leader_host_id = host_id_for(leader_node_id);
