@@ -378,6 +378,21 @@ pub enum AccordDriverError {
     },
     /// F+1 apply acknowledgements were not received within the timeout.
     ApplyQuorumUnavailable,
+    /// A multi-key (multi-partition) transaction was driven, but multi-key
+    /// *execution* is not yet wired: the multi-shard participant set + per-shard
+    /// quorum (Phase 2) and the multi-key replica apply with `(txn_id, key)`
+    /// idempotency keying (Phase 3) are still to come. Until then a multi-key
+    /// write-set fails loud here rather than silently dropping writes — both over
+    /// the single-key wire (remote) and at the `(txn_id, t)`-idempotent applier
+    /// (which would no-op writes 2..N of one transaction at the same agreed `t`).
+    /// The additive V2 wire + `new_multi` API exist now so the front-ends can be
+    /// built against them in parallel.
+    MultiKeyNotYetExecutable {
+        /// Number of keys in the write-set.
+        keys: usize,
+        /// Number of replicas in the participant list.
+        replicas: usize,
+    },
 }
 
 impl std::fmt::Display for AccordDriverError {
@@ -388,6 +403,11 @@ impl std::fmt::Display for AccordDriverError {
             Self::Codec(e) => write!(f, "Accord codec error: {e}"),
             Self::ConditionNotMet { .. } => write!(f, "Accord LWT condition not met"),
             Self::ApplyQuorumUnavailable => write!(f, "Accord apply quorum unavailable"),
+            Self::MultiKeyNotYetExecutable { keys, replicas } => write!(
+                f,
+                "multi-key Accord execution not yet wired: {keys} keys across {replicas} replicas \
+                 (additive V2 wire + new_multi exist; fan-out is Phase 2, multi-key apply is Phase 3)"
+            ),
         }
     }
 }
@@ -432,6 +452,14 @@ pub struct AccordCoordinatorDriver {
     /// for Accord conflict ordering). An empty vector means "no mutation"
     /// (read-only / protocol-only transactions).
     mutation: Vec<u8>,
+    /// The transaction's full write-set: one `(key, mutation)` entry per
+    /// partition written. A single-key transaction (the [`Self::new`] path) has
+    /// exactly one entry whose `mutation` equals [`Self::mutation`] above; a
+    /// multi-key transaction ([`Self::new_multi`]) has several. The coordinator's
+    /// own-replica Apply iterates this set so every key it owns is persisted.
+    /// Multi-shard fan-out over this set is Phase 2/3 (see
+    /// [`AccordDriverError::MultiKeyNotYetExecutable`]).
+    write_set: Vec<crate::accord::wire::WriteSetEntry>,
     /// How replicas should answer the Gap-4 read-vote: existence semantics for
     /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
     /// IF predicate this coordinator evaluates after collecting F+1 agreed rows.
@@ -522,11 +550,53 @@ impl AccordCoordinatorDriver {
         key: Vec<u8>,
         mutation: Vec<u8>,
     ) -> Self {
+        // A single-key transaction is the degenerate one-entry write-set.
+        Self::new_multi(
+            node_id,
+            replica_ids,
+            peers,
+            is_leaseholder,
+            clock,
+            vec![(key, mutation)],
+        )
+    }
+
+    /// Build a driver for a multi-key (multi-partition) transaction.
+    ///
+    /// `write_set` is one `(partition_key, encoded_mutation)` per key the
+    /// transaction writes; it must be non-empty. The first key drives Accord
+    /// conflict ordering for now (single-shard); the full multi-shard participant
+    /// set + per-shard quorum is Phase 2. The coordinator applies every entry it
+    /// owns locally during the Apply phase, so an RF=1 / coordinator-is-sole-
+    /// replica multi-key transaction commits all keys atomically today. A
+    /// multi-key transaction with remote replicas fails loud
+    /// ([`AccordDriverError::MultiKeyNotYetExecutable`]) rather than silently
+    /// dropping the other keys' writes over the single-key wire.
+    pub fn new_multi(
+        node_id: u64,
+        replica_ids: Vec<uuid::Uuid>,
+        peers: Arc<PeerManager>,
+        is_leaseholder: bool,
+        clock: &HybridLogicalClock,
+        write_set: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
         let rf = replica_ids.len();
         assert!(rf > 0, "replica_ids must be non-empty");
+        assert!(!write_set.is_empty(), "write_set must be non-empty");
 
         let t0 = clock.now();
         let txn_id = TxnId::new(node_id, t0);
+
+        // Representative key for conflict ordering (the inner coordinator is
+        // single-key for now); the per-key union is Phase 2.
+        let key = write_set[0].0.clone();
+        // Keep `mutation` = the first entry so the single-key wire path (PreAccept
+        // key, v1 Apply payload) is byte-identical for a one-entry write-set.
+        let mutation = write_set[0].1.clone();
+        let write_set: Vec<crate::accord::wire::WriteSetEntry> = write_set
+            .into_iter()
+            .map(|(key, mutation)| crate::accord::wire::WriteSetEntry { key, mutation })
+            .collect();
 
         let coordinator = AccordCoordinator::new(txn_id, t0, key, node_id, rf, is_leaseholder);
 
@@ -549,6 +619,7 @@ impl AccordCoordinatorDriver {
             replica_ids,
             self_id,
             mutation,
+            write_set,
             read_predicate: crate::accord::wire::ReadPredicate::NotExists,
             last_read_row: None,
             local_reader: None,
@@ -658,6 +729,18 @@ impl AccordCoordinatorDriver {
         bincode::serialize(&apply_payload).map_err(|e| AccordDriverError::Codec(e.to_string()))
     }
 
+    /// The multi-key Apply payload for this transaction: the full write-set the
+    /// coordinator (and, once Phase 2 wires fan-out, each replica) applies. The
+    /// coordinator's own-replica Apply iterates `writes`; the single-key path is
+    /// the degenerate one-entry case. This is the canonical in-memory form that
+    /// Phase 2 will serialize onto [`Message::AccordApplyV2`](ferrosa_net::Message).
+    fn apply_v2_payload(&self) -> crate::accord::wire::ApplyV2Payload {
+        crate::accord::wire::ApplyV2Payload {
+            txn_id: self.coordinator.txn_id,
+            writes: self.write_set.clone(),
+        }
+    }
+
     /// Finalize this transaction as a *no-write* commit across the cluster after
     /// the IF condition was found NOT to hold.
     ///
@@ -748,6 +831,16 @@ impl AccordCoordinatorDriver {
             AcceptOkPayload, AcceptPayload, ApplyOkPayload, CommitPayload, PreAcceptOkPayload,
             PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
         };
+
+        // Multi-key execution is not yet wired (Phase 2 fan-out + Phase 3 apply
+        // keying). Fail loud before any side effect rather than silently dropping
+        // writes 2..N. Single-key (the `new` path, one write-set entry) proceeds.
+        if self.write_set.len() > 1 {
+            return Err(AccordDriverError::MultiKeyNotYetExecutable {
+                keys: self.write_set.len(),
+                replicas: self.replica_ids.len(),
+            });
+        }
 
         let txn_id = self.coordinator.txn_id;
         let t0 = self.coordinator.t0;
@@ -1173,20 +1266,33 @@ impl AccordCoordinatorDriver {
         // handle_apply) before counting the implicit ack. Without this the
         // coordinator node never persists what it coordinates. Fail loud: a local
         // apply error must abort, never fake the implicit ack.
-        if self_is_replica && !self.mutation.is_empty() {
+        if self_is_replica {
             if let Some(applier) = &self.local_applier {
-                applier
-                    .apply(
-                        txn_id,
-                        crate::accord::apply::ApplyMutation {
-                            data: self.mutation.clone(),
-                            t: commit_t,
-                            deps: commit_deps.iter().copied().collect(),
-                        },
-                    )
-                    .map_err(|e| {
-                        AccordDriverError::Network(format!("coordinator local apply failed: {e}"))
-                    })?;
+                // Apply every write in the transaction's write-set that this
+                // node owns. For a single-key txn this is exactly one entry
+                // (== `self.mutation`); the write-set form is what the multi-key
+                // path (guarded above until Phase 2/3) will iterate.
+                let apply = self.apply_v2_payload();
+                let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
+                for write in &apply.writes {
+                    if write.mutation.is_empty() {
+                        continue; // no-write entry (read-only / protocol-only)
+                    }
+                    applier
+                        .apply(
+                            txn_id,
+                            crate::accord::apply::ApplyMutation {
+                                data: write.mutation.clone(),
+                                t: commit_t,
+                                deps: deps.clone(),
+                            },
+                        )
+                        .map_err(|e| {
+                            AccordDriverError::Network(format!(
+                                "coordinator local apply failed: {e}"
+                            ))
+                        })?;
+                }
             }
         }
 
@@ -2059,6 +2165,131 @@ mod tests {
             decoded.result_data, key,
             "Apply result_data must NOT be the raw partition key — that is the \
              phantom-write bug this increment closes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1 (multi-key Accord): the additive `new_multi` API + V2 wire.
+    // -----------------------------------------------------------------------
+
+    struct NoopListener;
+    impl ferrosa_net::peer::PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+        fn on_peer_recovered(&self, _: uuid::Uuid) {}
+        fn on_peer_failed(&self, _: uuid::Uuid) {}
+    }
+
+    /// Build (node_id, self_uuid, peers) for a single-node driver test.
+    fn single_node_peers() -> (
+        u64,
+        uuid::Uuid,
+        std::sync::Arc<ferrosa_net::peer::PeerManager>,
+    ) {
+        use ferrosa_net::config::NetConfig;
+        use ferrosa_net::peer::PeerManager;
+        use std::sync::Arc;
+        let self_uuid = uuid::Uuid::new_v4();
+        let node_id =
+            u64::from_be_bytes(self_uuid.as_bytes()[..8].try_into().expect("uuid 16 bytes"));
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            self_uuid,
+            Arc::new(NoopListener),
+        ));
+        (node_id, self_uuid, peers)
+    }
+
+    /// A single-key transaction is the degenerate one-entry write-set: `new`
+    /// delegates to `new_multi`, the V2 Apply payload has exactly one write, and
+    /// the v1 Apply wire bytes still carry that single mutation unchanged.
+    #[test]
+    fn new_multi_single_entry_is_degenerate_single_key() {
+        use crate::accord::wire::ApplyPayload;
+        use ferrosa_common::accord::HybridLogicalClock;
+
+        let (node_id, self_uuid, peers) = single_node_peers();
+        let clock = HybridLogicalClock::new(node_id, 0);
+        let key = b"pk-bytes".to_vec();
+        let mutation = b"ENCODED-MUTATION".to_vec();
+
+        let via_new = AccordCoordinatorDriver::new(
+            node_id,
+            vec![self_uuid],
+            peers.clone(),
+            true,
+            &clock,
+            key.clone(),
+            mutation.clone(),
+        );
+        let via_multi = AccordCoordinatorDriver::new_multi(
+            node_id,
+            vec![self_uuid],
+            peers,
+            true,
+            &clock,
+            vec![(key.clone(), mutation.clone())],
+        );
+
+        for driver in [&via_new, &via_multi] {
+            let v2 = driver.apply_v2_payload();
+            assert_eq!(
+                v2.writes.len(),
+                1,
+                "single-key txn has a one-entry write-set"
+            );
+            assert_eq!(v2.writes[0].key, key);
+            assert_eq!(v2.writes[0].mutation, mutation);
+
+            // v1 Apply wire bytes are byte-identical in shape: result_data == mutation.
+            let bytes = driver
+                .apply_payload_bytes()
+                .expect("apply payload serializes");
+            let decoded: ApplyPayload =
+                bincode::deserialize(&bytes).expect("apply payload round-trips");
+            assert_eq!(decoded.result_data, mutation);
+        }
+    }
+
+    /// A genuine multi-key transaction must FAIL LOUD until multi-key execution
+    /// is wired (Phase 2 fan-out + Phase 3 apply keying) — never silently drop
+    /// writes. No write reaches the local applier before the error.
+    #[tokio::test]
+    async fn multi_key_run_transaction_fails_loud_before_any_apply() {
+        use crate::accord::apply::NoopStorageApplier;
+        use ferrosa_common::accord::HybridLogicalClock;
+        use std::sync::Arc;
+
+        let (node_id, self_uuid, peers) = single_node_peers();
+        let clock = HybridLogicalClock::new(node_id, 0);
+        let applier = Arc::new(NoopStorageApplier::new());
+
+        let mut driver = AccordCoordinatorDriver::new_multi(
+            node_id,
+            vec![self_uuid],
+            peers,
+            true,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), b"mutation-1".to_vec()),
+                (b"key-2".to_vec(), b"mutation-2".to_vec()),
+            ],
+        )
+        .with_local_applier(applier.clone());
+
+        let result = driver.run_transaction().await;
+        match result {
+            Err(AccordDriverError::MultiKeyNotYetExecutable { keys, replicas }) => {
+                assert_eq!(keys, 2, "error reports the write-set key count");
+                assert_eq!(replicas, 1, "error reports the participant count");
+            }
+            other => panic!("multi-key txn must fail loud, got {other:?}"),
+        }
+        assert_eq!(
+            applier.apply_count(),
+            0,
+            "fail-loud must precede any write — no partial multi-key apply"
         );
     }
 }

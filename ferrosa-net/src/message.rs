@@ -267,6 +267,12 @@ pub enum Message {
     AccordApplyOK(Bytes),
     AccordRecover(Bytes),
     AccordRecoverOK(Bytes),
+    // Multi-key (multi-partition) Accord — additive V2 variants carrying the
+    // multi-key PreAccept (key union) and Apply (write-set) payloads. The
+    // single-key variants above keep their exact bytes; the intermediate
+    // Accept/Commit/Read phases are key-agnostic and reuse the v1 variants.
+    AccordPreAcceptV2(Bytes),
+    AccordApplyV2(Bytes),
 
     // Bootstrap coordination
     /// Sent by a non-leader node to the leader after bootstrap streaming completes.
@@ -373,6 +379,8 @@ impl Message {
             Self::AccordApplyOK(_) => MsgType::AccordApplyOK,
             Self::AccordRecover(_) => MsgType::AccordRecover,
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
+            Self::AccordPreAcceptV2(_) => MsgType::AccordPreAcceptV2,
+            Self::AccordApplyV2(_) => MsgType::AccordApplyV2,
             Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
             Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
             Self::ClusterMembershipForward(_) => MsgType::ClusterMembershipForward,
@@ -526,6 +534,8 @@ impl Message {
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
             | Self::AccordRecoverOK(b)
+            | Self::AccordPreAcceptV2(b)
+            | Self::AccordApplyV2(b)
             | Self::ClusterMembershipForward(b)
             | Self::ClusterMembershipForwardAck(b) => buf.put_slice(b),
             Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
@@ -752,6 +762,8 @@ impl Message {
             MsgType::AccordApplyOK => Self::AccordApplyOK(body.split_to(body.remaining())),
             MsgType::AccordRecover => Self::AccordRecover(body.split_to(body.remaining())),
             MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
+            MsgType::AccordPreAcceptV2 => Self::AccordPreAcceptV2(body.split_to(body.remaining())),
+            MsgType::AccordApplyV2 => Self::AccordApplyV2(body.split_to(body.remaining())),
             MsgType::BootstrapComplete => {
                 let mut id_bytes = [0u8; 16];
                 if body.remaining() >= 16 {

@@ -125,6 +125,13 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam, idempotent on
   `(txn_id, t)`) + `EngineStorageApplier`/`EngineStorageReader` (real persistence
   and linearizable read-at-`t`).
+- `wire.rs` — bincode payloads for each protocol message. **Multi-key (Phase 1):**
+  `WriteSetEntry` + `ApplyV2Payload` back the additive `AccordPreAcceptV2`/
+  `AccordApplyV2` wire codes; `AccordCoordinatorDriver::new_multi(write_set)` is
+  the multi-key constructor (`new` is the one-entry degenerate case). Multi-key
+  *execution* fails loud (`AccordDriverError::MultiKeyNotYetExecutable`) until the
+  participant set/per-shard quorum (Phase 2) and `(txn_id, key)` apply keying
+  (Phase 3) land — never a silently-dropped write.
 - `dep_wait.rs` — waits-for graph with deterministic cycle-breaking.
 - `cross_shard.rs` / `cross_dc_adapter.rs` — multi-shard atomicity, cross-DC glue.
 - `electorate.rs` / `epoch.rs` — JoinElectorate membership gates, epoch tracking.
