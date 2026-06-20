@@ -9,6 +9,18 @@ last_updated: 2026-06-19
 Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code deprecation markers,
 reference/decision specs, and the dependency/usage review. Ordered by value.
 
+## Recently addressed
+
+- **Dep-wait cascade replayed queued txns with empty data — fixed (PR #159).**
+  `DepWaitApplier` parked dependency waiters but never stored their mutation, so
+  when the last dependency resolved the cascade re-applied each waiter with
+  `ApplyMutation { data: vec![] }` — silently dropping the write. It now parks the
+  real mutation and replays it (transitively); applier errors fail loud rather than
+  committing a lost write. `NoopStorageApplier` now records payloads so this is
+  regression-tested. *Still open:* route `handle_apply` itself through
+  `DepWaitApplier` so dep-ordering is enforced at the state-machine apply path
+  (today it applies directly via `EngineStorageApplier`) — see Next / t_59629c9b.
+
 ## Now (highest value)
 
 - **Build the external Jepsen harness (FMEA CL-1).** `ferrosa-jepsen` is designed
