@@ -77,6 +77,13 @@ storage, decomposes them to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
+it resolves the matching partition keys through the cluster write path
+(`WritePath::fulltext_search`) — which scatter-gathers across every node's local
+FTI and unions the keys — then fetches and post-filters those partitions. A
+coordinator-local index lookup previously made `fts_match` non-deterministic on a
+cluster (BUG-F-007); standalone/pair still resolve locally.
+
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 
 ## Key invariants
