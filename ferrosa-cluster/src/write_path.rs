@@ -765,6 +765,37 @@ impl WritePath {
         }
     }
 
+    /// Full-text (`fts_match`) index lookup, returning matching partition keys.
+    ///
+    /// In standalone/pair mode this hits local storage. In cluster mode the
+    /// coordinator fans out to every node and unions the matching keys, because
+    /// `fts_match` carries no partition key and its hits span all token ranges —
+    /// a coordinator-local lookup made the result non-deterministic (BUG-F-007).
+    pub async fn fulltext_search(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &str,
+    ) -> crate::error::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Direct(engine) => engine
+                .fulltext_search(table_id, index_name, query)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .fulltext_search(table_id, index_name, query)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_fulltext_search(table_id, index_name, query)
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "fulltext search unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
