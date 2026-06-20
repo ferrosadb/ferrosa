@@ -22,7 +22,7 @@
 //! `DepWaitApplier` uses a `parking_lot::Mutex` for the dep-wait graph so it
 //! can be shared across the coordinator thread and the replica handler thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use ferrosa_common::accord::{Timestamp, TxnId};
@@ -243,12 +243,17 @@ impl StorageReader for EngineStorageReader {
 pub struct NoopStorageApplier {
     /// Log of (txn_id, t) pairs that were applied.
     applied: Mutex<Vec<(TxnId, Timestamp)>>,
+    /// Log of (txn_id, mutation.data) — the actual payload each apply received.
+    /// Recorded so tests can assert the cascade replays the REAL queued data
+    /// (not an empty placeholder).
+    payloads: Mutex<Vec<(TxnId, Vec<u8>)>>,
 }
 
 impl NoopStorageApplier {
     pub fn new() -> Self {
         Self {
             applied: Mutex::new(Vec::new()),
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -266,6 +271,18 @@ impl NoopStorageApplier {
     pub fn apply_count(&self) -> usize {
         self.applied.lock().len()
     }
+
+    /// The mutation payload the given txn was applied with (most recent), or
+    /// `None` if it was never applied. Used to assert the dep-cascade replays
+    /// the queued transaction's real data.
+    pub fn applied_data(&self, txn_id: &TxnId) -> Option<Vec<u8>> {
+        self.payloads
+            .lock()
+            .iter()
+            .rev()
+            .find(|(id, _)| id == txn_id)
+            .map(|(_, d)| d.clone())
+    }
 }
 
 impl Default for NoopStorageApplier {
@@ -277,6 +294,7 @@ impl Default for NoopStorageApplier {
 impl StorageApplier for NoopStorageApplier {
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         self.applied.lock().push((txn_id, mutation.t));
+        self.payloads.lock().push((txn_id, mutation.data));
         Ok(())
     }
 }
@@ -435,6 +453,11 @@ impl StorageApplier for EngineStorageApplier {
 pub struct DepWaitApplier {
     graph: Mutex<DepWaitGraph>,
     applier: Arc<dyn StorageApplier>,
+    /// Mutations for transactions parked waiting on dependencies, keyed by
+    /// txn id. When the last dependency resolves, the cascade pulls the real
+    /// mutation from here and applies it — fixing the bug where queued txns were
+    /// re-applied with an empty (`data: vec![]`) placeholder, losing their write.
+    pending: Mutex<HashMap<TxnId, ApplyMutation>>,
 }
 
 impl DepWaitApplier {
@@ -442,6 +465,7 @@ impl DepWaitApplier {
         Self {
             graph: Mutex::new(DepWaitGraph::new()),
             applier,
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -478,36 +502,53 @@ impl DepWaitApplier {
         }
 
         if waiting {
-            // Store the mutation for later application.
-            // For simplicity in this implementation, we apply eagerly once
-            // notify_applied cascades — see notify_applied below.
+            // Park the mutation so the cascade replays its REAL data when the
+            // last dependency resolves — not an empty placeholder.
             drop(graph);
+            self.pending.lock().insert(txn_id, mutation);
             return Ok(false);
         }
 
         drop(graph);
 
-        // All deps satisfied — apply now.
+        // All deps satisfied — apply now, then cascade to any waiters whose
+        // last dependency this transaction resolves.
         self.applier.apply(txn_id, mutation)?;
-
-        // Mark applied in the graph and cascade to waiters.
-        let woken = self.graph.lock().mark_applied(txn_id);
-        for waiter_id in woken {
-            // Waiters were registered with empty mutations (data=vec![]).
-            // In production this would look up the queued mutation from a
-            // per-txn store. For Gap 5 happy path, we apply with empty data.
-            let _ = self.applier.apply(
-                waiter_id,
-                ApplyMutation {
-                    data: vec![],
-                    t: txn_id.0, // use dep's timestamp as placeholder
-                    deps: vec![],
-                },
-            );
-            let _ = self.graph.lock().mark_applied(waiter_id);
-        }
+        self.cascade(txn_id);
 
         Ok(true)
+    }
+
+    /// Mark `just_applied` as applied and apply — in dependency order — every
+    /// transaction whose *last* remaining dependency this resolves, using each
+    /// waiter's parked mutation (its real data). Cascades transitively, since a
+    /// woken waiter may itself unblock further waiters.
+    fn cascade(&self, just_applied: TxnId) {
+        let mut queue: VecDeque<TxnId> = self
+            .graph
+            .lock()
+            .mark_applied(just_applied)
+            .into_iter()
+            .collect();
+        while let Some(waiter) = queue.pop_front() {
+            // Pull the waiter's parked mutation (stored when it parked in
+            // `try_apply`). If absent — e.g. a no-write finalize that parked no
+            // mutation — there is nothing to persist; still mark it applied so
+            // its own waiters proceed.
+            if let Some(mutation) = self.pending.lock().remove(&waiter) {
+                if let Err(e) = self.applier.apply(waiter, mutation) {
+                    // Fail loud: the parked write did not persist. Do NOT mark
+                    // applied or cascade past it — its dependents stay parked
+                    // rather than committing on a lost write. The txn is
+                    // re-driven by the coordinator's Apply retry.
+                    tracing::error!(%e, txn = waiter.0.time, "accord dep-cascade: applier failed for parked waiter — leaving it un-applied");
+                    continue;
+                }
+            }
+            for woken in self.graph.lock().mark_applied(waiter) {
+                queue.push_back(woken);
+            }
+        }
     }
 
     /// Notify the applier that `txn_id` has been applied externally.
@@ -515,20 +556,9 @@ impl DepWaitApplier {
     /// Called when a dependency transaction's apply is acknowledged by the
     /// remote coordinator (via `ApplyOK`). Unblocks any waiting transactions.
     pub fn notify_applied(&self, txn_id: TxnId) {
-        let woken = self.graph.lock().mark_applied(txn_id);
-        for waiter_id in woken {
-            // Waiter is now unblocked — apply with empty mutation (will be
-            // superseded by real data in the production implementation).
-            let _ = self.applier.apply(
-                waiter_id,
-                ApplyMutation {
-                    data: vec![],
-                    t: txn_id.0,
-                    deps: vec![],
-                },
-            );
-            let _ = self.graph.lock().mark_applied(waiter_id);
-        }
+        // Mark the externally-applied dependency and apply any waiters it
+        // unblocks, using their real parked mutations (see `cascade`).
+        self.cascade(txn_id);
     }
 
     /// Check if a transaction has been applied.
@@ -714,6 +744,106 @@ mod tests {
         // Txn should now be applied (woken from the dep-wait graph).
         // The waiter should have been called via cascade in notify_applied.
         assert_eq!(noop.apply_count(), 1, "cascade must apply the waiter");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression (t_cb5180f9): the dep cascade must replay a queued waiter
+    // with its REAL parked mutation, not an empty `data: vec![]` placeholder
+    // (which silently dropped the waiter's write).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cascade_replays_queued_mutation_real_data() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let a = txn_id(1, 500);
+        let b = txn_id(2, 1000);
+
+        // B depends on A (not yet applied) → B parks.
+        let queued = applier
+            .try_apply(
+                b,
+                ApplyMutation {
+                    data: b"write-from-B".to_vec(),
+                    t: ts(1000),
+                    deps: vec![a],
+                },
+            )
+            .unwrap();
+        assert!(!queued, "B must be queued behind A");
+        assert!(!noop.was_applied(&b));
+
+        // A applies (no deps) → cascade wakes B.
+        let applied = applier
+            .try_apply(
+                a,
+                ApplyMutation {
+                    data: b"write-from-A".to_vec(),
+                    t: ts(500),
+                    deps: vec![],
+                },
+            )
+            .unwrap();
+        assert!(applied, "A applies immediately");
+
+        assert!(
+            noop.was_applied(&b),
+            "cascade must apply the queued waiter B"
+        );
+        assert_eq!(
+            noop.applied_data(&b).as_deref(),
+            Some(b"write-from-B".as_slice()),
+            "B must be re-applied with its REAL parked mutation, not data: vec![]",
+        );
+        assert_eq!(
+            noop.applied_data(&a).as_deref(),
+            Some(b"write-from-A".as_slice())
+        );
+    }
+
+    #[test]
+    fn cascade_is_transitive_with_real_data() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+        let (a, b, c) = (txn_id(1, 100), txn_id(2, 200), txn_id(3, 300));
+
+        // Queue C (waits on B) and B (waits on A); both park.
+        assert!(!applier
+            .try_apply(
+                c,
+                ApplyMutation {
+                    data: b"C".to_vec(),
+                    t: ts(300),
+                    deps: vec![b]
+                }
+            )
+            .unwrap());
+        assert!(!applier
+            .try_apply(
+                b,
+                ApplyMutation {
+                    data: b"B".to_vec(),
+                    t: ts(200),
+                    deps: vec![a]
+                }
+            )
+            .unwrap());
+        // A applies → B unblocks → C unblocks, each with its own data.
+        assert!(applier
+            .try_apply(
+                a,
+                ApplyMutation {
+                    data: b"A".to_vec(),
+                    t: ts(100),
+                    deps: vec![]
+                }
+            )
+            .unwrap());
+
+        assert_eq!(noop.applied_data(&a).as_deref(), Some(b"A".as_slice()));
+        assert_eq!(noop.applied_data(&b).as_deref(), Some(b"B".as_slice()));
+        assert_eq!(noop.applied_data(&c).as_deref(), Some(b"C".as_slice()));
     }
 
     // -----------------------------------------------------------------------
