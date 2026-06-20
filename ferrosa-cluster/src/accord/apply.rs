@@ -472,15 +472,26 @@ impl DepWaitApplier {
     /// Attempt to apply a committed transaction.
     ///
     /// If all dependencies in `deps` are already applied, calls `applier.apply`
-    /// immediately and propagates the "applied" signal through the graph.
+    /// immediately and propagates the "applied" signal through the graph,
+    /// transitively waking any parked waiters this resolves.
     ///
     /// If any dependencies are not yet applied, registers this transaction as
-    /// a waiter and returns `Ok(false)`. The transaction will be applied
-    /// automatically when the last dependency calls `notify_applied`.
+    /// a waiter and returns an empty `Vec`. The transaction will be applied
+    /// automatically when the last dependency calls
+    /// [`notify_applied`](Self::notify_applied) or [`try_apply`](Self::try_apply).
     ///
-    /// Returns `Ok(true)` if the transaction was applied immediately, or
-    /// `Ok(false)` if it was queued to wait.
-    pub fn try_apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<bool, ApplyError> {
+    /// Returns the `(txn_id, mutation_data)` of every transaction that was
+    /// **actually persisted** by this call, in apply order — the primary first,
+    /// then each cascade-woken waiter. The caller (the Accord state machine) uses
+    /// this list to advance exactly those transactions to `Applied` and fire
+    /// their post-apply bookkeeping (protocol-log marker, conflict-index GC,
+    /// dep-wait wake). An **empty** `Vec` means the transaction parked behind an
+    /// unapplied dependency and must NOT be marked applied.
+    pub fn try_apply(
+        &self,
+        txn_id: TxnId,
+        mutation: ApplyMutation,
+    ) -> Result<Vec<(TxnId, Vec<u8>)>, ApplyError> {
         let deps: Vec<TxnId> = mutation.deps.clone();
 
         // Fast path: check all deps without holding the lock.
@@ -506,24 +517,32 @@ impl DepWaitApplier {
             // last dependency resolves — not an empty placeholder.
             drop(graph);
             self.pending.lock().insert(txn_id, mutation);
-            return Ok(false);
+            return Ok(Vec::new());
         }
 
         drop(graph);
 
         // All deps satisfied — apply now, then cascade to any waiters whose
-        // last dependency this transaction resolves.
+        // last dependency this transaction resolves. Capture the payload before
+        // the mutation is moved into the applier so we can report it back.
+        let data = mutation.data.clone();
         self.applier.apply(txn_id, mutation)?;
-        self.cascade(txn_id);
-
-        Ok(true)
+        let mut applied = vec![(txn_id, data)];
+        applied.extend(self.cascade(txn_id));
+        Ok(applied)
     }
 
     /// Mark `just_applied` as applied and apply — in dependency order — every
     /// transaction whose *last* remaining dependency this resolves, using each
     /// waiter's parked mutation (its real data). Cascades transitively, since a
     /// woken waiter may itself unblock further waiters.
-    fn cascade(&self, just_applied: TxnId) {
+    ///
+    /// Returns the `(txn_id, mutation_data)` of every waiter that was actually
+    /// persisted, in apply order — so the caller can advance exactly those to
+    /// `Applied`. A waiter whose apply *fails* is left un-applied and is NOT in
+    /// the returned list (fail loud; its dependents stay parked).
+    fn cascade(&self, just_applied: TxnId) -> Vec<(TxnId, Vec<u8>)> {
+        let mut applied: Vec<(TxnId, Vec<u8>)> = Vec::new();
         let mut queue: VecDeque<TxnId> = self
             .graph
             .lock()
@@ -536,6 +555,7 @@ impl DepWaitApplier {
             // mutation — there is nothing to persist; still mark it applied so
             // its own waiters proceed.
             if let Some(mutation) = self.pending.lock().remove(&waiter) {
+                let data = mutation.data.clone();
                 if let Err(e) = self.applier.apply(waiter, mutation) {
                     // Fail loud: the parked write did not persist. Do NOT mark
                     // applied or cascade past it — its dependents stay parked
@@ -544,21 +564,26 @@ impl DepWaitApplier {
                     tracing::error!(%e, txn = waiter.0.time, "accord dep-cascade: applier failed for parked waiter — leaving it un-applied");
                     continue;
                 }
+                applied.push((waiter, data));
             }
             for woken in self.graph.lock().mark_applied(waiter) {
                 queue.push_back(woken);
             }
         }
+        applied
     }
 
     /// Notify the applier that `txn_id` has been applied externally.
     ///
-    /// Called when a dependency transaction's apply is acknowledged by the
-    /// remote coordinator (via `ApplyOK`). Unblocks any waiting transactions.
-    pub fn notify_applied(&self, txn_id: TxnId) {
+    /// Called when a dependency transaction reaches `Applied` without a local
+    /// row write (a no-write LWT finalize) or when a remote coordinator
+    /// acknowledges its apply (via `ApplyOK`). Unblocks any waiting transactions
+    /// and returns the `(txn_id, mutation_data)` of every waiter that was
+    /// actually persisted as a result, in apply order (see [`cascade`](Self::cascade)).
+    pub fn notify_applied(&self, txn_id: TxnId) -> Vec<(TxnId, Vec<u8>)> {
         // Mark the externally-applied dependency and apply any waiters it
         // unblocks, using their real parked mutations (see `cascade`).
-        self.cascade(txn_id);
+        self.cascade(txn_id)
     }
 
     /// Check if a transaction has been applied.
@@ -666,7 +691,11 @@ mod tests {
         let txn = txn_id(1, 1000);
         let result = applier.try_apply(txn, mutation(vec![])).unwrap();
 
-        assert!(result, "transaction with no deps must apply immediately");
+        assert_eq!(
+            result.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![txn],
+            "transaction with no deps must apply immediately and be reported"
+        );
         assert!(
             noop.was_applied(&txn),
             "noop applier must record the application"
@@ -702,7 +731,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            result,
+            !result.is_empty(),
             "transaction with already-applied dep must apply immediately"
         );
         assert!(noop.was_applied(&txn));
@@ -732,14 +761,23 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!result, "transaction with pending dep must be queued");
+        assert!(
+            result.is_empty(),
+            "transaction with pending dep must be queued (empty applied list)"
+        );
         assert!(
             !noop.was_applied(&txn),
             "txn must not be applied while dep is pending"
         );
 
-        // Dep becomes available — notify the applier.
-        applier.notify_applied(dep);
+        // Dep becomes available — notify the applier. The woken waiter is
+        // returned so the caller can advance it to Applied.
+        let woken = applier.notify_applied(dep);
+        assert_eq!(
+            woken.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![txn],
+            "notify_applied must report the cascaded waiter"
+        );
 
         // Txn should now be applied (woken from the dep-wait graph).
         // The waiter should have been called via cascade in notify_applied.
@@ -771,10 +809,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(!queued, "B must be queued behind A");
+        assert!(queued.is_empty(), "B must be queued behind A");
         assert!(!noop.was_applied(&b));
 
-        // A applies (no deps) → cascade wakes B.
+        // A applies (no deps) → cascade wakes B. The returned list reports A
+        // then B in dependency order.
         let applied = applier
             .try_apply(
                 a,
@@ -785,7 +824,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(applied, "A applies immediately");
+        assert_eq!(
+            applied.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![a, b],
+            "A applies immediately then cascades to B, in dependency order"
+        );
 
         assert!(
             noop.was_applied(&b),
@@ -809,7 +852,7 @@ mod tests {
         let (a, b, c) = (txn_id(1, 100), txn_id(2, 200), txn_id(3, 300));
 
         // Queue C (waits on B) and B (waits on A); both park.
-        assert!(!applier
+        assert!(applier
             .try_apply(
                 c,
                 ApplyMutation {
@@ -818,8 +861,9 @@ mod tests {
                     deps: vec![b]
                 }
             )
-            .unwrap());
-        assert!(!applier
+            .unwrap()
+            .is_empty());
+        assert!(applier
             .try_apply(
                 b,
                 ApplyMutation {
@@ -828,18 +872,26 @@ mod tests {
                     deps: vec![a]
                 }
             )
-            .unwrap());
-        // A applies → B unblocks → C unblocks, each with its own data.
-        assert!(applier
-            .try_apply(
-                a,
-                ApplyMutation {
-                    data: b"A".to_vec(),
-                    t: ts(100),
-                    deps: vec![]
-                }
-            )
-            .unwrap());
+            .unwrap()
+            .is_empty());
+        // A applies → B unblocks → C unblocks, each with its own data, reported
+        // in transitive dependency order.
+        assert_eq!(
+            applier
+                .try_apply(
+                    a,
+                    ApplyMutation {
+                        data: b"A".to_vec(),
+                        t: ts(100),
+                        deps: vec![]
+                    }
+                )
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![a, b, c],
+        );
 
         assert_eq!(noop.applied_data(&a).as_deref(), Some(b"A".as_slice()));
         assert_eq!(noop.applied_data(&b).as_deref(), Some(b"B".as_slice()));
@@ -891,7 +943,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(result, "txn_b must apply immediately (dep already applied)");
+        assert!(
+            !result.is_empty(),
+            "txn_b must apply immediately (dep already applied)"
+        );
         assert!(noop.was_applied(&txn_b));
 
         // Verify apply log order.
