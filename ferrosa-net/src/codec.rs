@@ -159,6 +159,9 @@ pub enum MsgType {
     AccordApplyOK = 0x78,
     AccordRecover = 0x79,
     AccordRecoverOK = 0x7A,
+    // Multi-key Accord (additive V2 — see message.rs)
+    AccordPreAcceptV2 = 0x7B,
+    AccordApplyV2 = 0x7C,
     // Bootstrap coordination
     BootstrapComplete = 0x80,
     BootstrapCompleteAck = 0x81,
@@ -280,6 +283,8 @@ impl TryFrom<u8> for MsgType {
             0x78 => Ok(Self::AccordApplyOK),
             0x79 => Ok(Self::AccordRecover),
             0x7A => Ok(Self::AccordRecoverOK),
+            0x7B => Ok(Self::AccordPreAcceptV2),
+            0x7C => Ok(Self::AccordApplyV2),
             0x80 => Ok(Self::BootstrapComplete),
             0x81 => Ok(Self::BootstrapCompleteAck),
             0x82 => Ok(Self::ClusterMembershipForward),

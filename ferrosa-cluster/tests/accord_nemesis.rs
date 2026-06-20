@@ -331,6 +331,9 @@ enum BatchAtomicityResult {
     NetworkError,
     /// Codec error (should not happen).
     CodecError,
+    /// Multi-key execution not yet wired — must NOT occur for these single-key
+    /// batch LWTs; if it does it signals a bug (like `CodecError`).
+    MultiKeyNotYetExecutable,
 }
 
 impl BatchAtomicityResult {
@@ -342,13 +345,17 @@ impl BatchAtomicityResult {
             Err(AccordDriverError::ApplyQuorumUnavailable) => Self::ApplyQuorumUnavailable,
             Err(AccordDriverError::Network(_)) => Self::NetworkError,
             Err(AccordDriverError::Codec(_)) => Self::CodecError,
+            Err(AccordDriverError::MultiKeyNotYetExecutable { .. }) => {
+                Self::MultiKeyNotYetExecutable
+            }
         }
     }
 
     /// Whether this result is valid under nemesis (no partial visibility).
     fn is_atomically_valid(&self) -> bool {
-        // Codec errors indicate a bug, not nemesis-induced failure.
-        !matches!(self, Self::CodecError)
+        // Codec errors (and an unexpected multi-key path for these single-key
+        // batches) indicate a bug, not a nemesis-induced failure.
+        !matches!(self, Self::CodecError | Self::MultiKeyNotYetExecutable)
     }
 }
 

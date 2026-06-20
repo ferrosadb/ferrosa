@@ -105,6 +105,41 @@ mod tests {
     }
 
     #[test]
+    fn accord_v2_multikey_message_roundtrip() {
+        // The additive multi-key V2 variants encode/decode through the codec and
+        // report the right MsgType, exactly like the single-key family.
+        let payload = Bytes::from_static(b"multikey-v2-opaque-payload");
+        let variants = [
+            (
+                MsgType::AccordPreAcceptV2,
+                Message::AccordPreAcceptV2(payload.clone()),
+            ),
+            (
+                MsgType::AccordApplyV2,
+                Message::AccordApplyV2(payload.clone()),
+            ),
+        ];
+        for (msg_type, msg) in variants {
+            assert_eq!(
+                msg.msg_type(),
+                msg_type,
+                "msg_type() mismatch for {msg_type:?}"
+            );
+            let mut buf = BytesMut::new();
+            msg.encode(&mut buf).expect("encode should succeed");
+            let decoded =
+                Message::decode(msg_type, &mut buf.freeze()).expect("decode should succeed");
+            assert_eq!(decoded, msg, "roundtrip mismatch for {msg_type:?}");
+        }
+        // V2 codes are distinct from each other and from the single-key Apply.
+        assert_ne!(
+            MsgType::AccordPreAcceptV2 as u8,
+            MsgType::AccordApplyV2 as u8
+        );
+        assert_ne!(MsgType::AccordApplyV2 as u8, MsgType::AccordApply as u8);
+    }
+
+    #[test]
     fn accord_message_type_codes_unique() {
         let accord_codes: Vec<u8> = vec![
             MsgType::AccordPreAccept as u8,
