@@ -128,8 +128,10 @@ SQL-front-end FMEA risk.
 ~945 in-crate test functions (heaviest: `router.rs` 253, `parser.rs` 158,
 `bridge.rs` 121, `connection.rs` 43) plus integration tests under `tests/`
 (`handshake`, `auth_integration`, `auth_warn_mode`, `bolt_transaction_state`,
-`cassandra_cql_examples`). In-code TODO/FIXME density is very low (1 marker);
-the real gaps are tracked structurally — see the FMEA.
+`cassandra_cql_examples`). The ignored live-cluster test `fts_live_cluster`
+runs in the CI cluster-integration job and asserts native `fts_match` returns a
+stable flushed row from every 3-node coordinator. In-code TODO/FIXME density is
+very low (1 marker); the real gaps are tracked structurally — see the FMEA.
 
 ## Specs
 
