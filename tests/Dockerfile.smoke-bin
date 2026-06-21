@@ -20,7 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ferrosa /usr/local/bin/ferrosa
-RUN chmod +x /usr/local/bin/ferrosa && ferrosa --version
+RUN chmod +x /usr/local/bin/ferrosa \
+    && which ferrosa \
+    && file /usr/local/bin/ferrosa
 
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa
