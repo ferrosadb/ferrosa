@@ -40,8 +40,12 @@ RUN for d in ferrosa ferrosa-common ferrosa-sstable ferrosa-storage ferrosa-sche
     echo 'fn main() {}' > ferrosa-index-builder/src/main.rs && \
     echo 'fn main() {}' > ferrosa-worker/src/main.rs
 
-# Limit parallelism to avoid OOM in the 8GB podman VM
-ENV CARGO_BUILD_JOBS=4
+# Limit parallelism aggressively: release rustc/LLVM builds are memory-heavy, and
+# the local cluster image is commonly built inside an 8GB Podman VM. Exit 137
+# during image build is a P0 because it blocks cluster validation; reliability
+# matters more than build speed here.
+ENV CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0
 
 RUN cargo build --release -p ferrosa 2>&1 || true
 
