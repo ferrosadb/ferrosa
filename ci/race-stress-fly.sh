@@ -65,11 +65,20 @@ SECONDS=0
 echo "$M rc=${PIPESTATUS[0]} elapsed=${SECONDS}s"'
 
 echo ":: launching $VM in $REGION (starved baseline is the fuzzer)"
-fly machine run ubuntu:24.04 \
+# Run detached so we can poll for completion instead of blocking on the VM.
+# Capture machine id and provisioning output for diagnostics.
+machine_info=$(fly machine run ubuntu:24.04 \
   --app "$APP" --vm-size "$VM" --vm-memory "$VM_MEMORY" --region "$REGION" --restart no \
   --file-local "/usr/local/bin/ferrosa-race-stress=$BINARY" \
   --env GH_TOKEN="$GH_TOKEN" \
-  -- bash -c "$REMOTE" >/dev/null
+  --detach \
+  -- bash -c "$REMOTE" 2>&1)
+echo "$machine_info"
+machine_id=$(printf '%s' "$machine_info" | awk '/^id/{print $2; exit}' | tr -d '\r')
+if [ -z "$machine_id" ]; then
+  echo "::error::could not extract fly machine id from provisioning output"
+  exit 1
+fi
 
 echo ":: waiting for completion (RS_RESULT marker)…"
 LOG="$(mktemp)"
@@ -77,11 +86,15 @@ LOG="$(mktemp)"
 deadline=$(( $(date +%s) + RACE_SECS + 1800 ))
 rc=""
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  fly logs -a "$APP" --no-tail >"$LOG" 2>/dev/null || true
+  # `fly logs` streams by default; cap each poll so a stuck CLI can't hang the loop.
+  timeout 25s fly logs -a "$APP" --no-tail >"$LOG" 2>/dev/null || true
   if grep -qaE 'RS_RESULT rc=[0-9]+' "$LOG"; then
     rc="$(grep -aoE 'RS_RESULT rc=[0-9]+ ?(elapsed=[0-9]+s)?' "$LOG" | tail -1)"
     break
   fi
+  # Also check machine state so we don't wait forever if the VM exited uncleanly.
+  machine_state=$(fly machine status -a "$APP" "$machine_id" --json 2>/dev/null | grep -aoE '"state":"[^"]+"' | head -1 || true)
+  printf '%s' "$machine_state" | grep -qE 'stopped|destroyed|failed' && break
   sleep 20
 done
 
