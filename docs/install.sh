@@ -15,7 +15,7 @@
 # Usage:
 #   curl -fsSL https://ferrosadb.com/install.sh | bash
 #   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --channel nightly
-#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --version v0.12.0 --no-service
+#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa"
