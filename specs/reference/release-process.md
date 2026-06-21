@@ -29,6 +29,9 @@ consumes them.
 - **Releases are tag-only.** The version-bump commit lives on the tag, never on
   `main`. `main`'s `Cargo.toml` version is therefore decorative between
   releases; the released artifact always carries the correct version.
+- **Current promoted stable releases:** Ferrosa Database `v0.16.0`; Ferrosa
+  Memory `v0.22.0`. Use GitHub's latest-release endpoint as the source of truth
+  for installers and docs that need the current stable tag.
 
 ## Why tag-only (the bug this fixed)
 
