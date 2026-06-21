@@ -5785,6 +5785,7 @@ impl StorageEngine {
             }
         }
 
+        let mut fti_sidecars_consulted = 0usize;
         for fti_path in fti_files {
             let bytes = match std::fs::read(&fti_path) {
                 Ok(b) => b,
@@ -5808,10 +5809,25 @@ impl StorageEngine {
                     )));
                 }
             };
+            fti_sidecars_consulted += 1;
             for hit in hits {
                 let entry = score_map.entry(hit.partition_key).or_insert(0.0);
                 if hit.score > *entry {
                     *entry = hit.score;
+                }
+            }
+        }
+
+        if score_map.is_empty() && fti_sidecars_consulted == 0 {
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(table_id) {
+                for (partition_key, score) in
+                    state.store.fulltext_table_scan_search(index_name, query)?
+                {
+                    let entry = score_map.entry(partition_key).or_insert(0.0);
+                    if score > *entry {
+                        *entry = score;
+                    }
                 }
             }
         }
@@ -18203,6 +18219,51 @@ mod tests {
             result_keys,
             vec!["fresh".to_string()],
             "fts_match must include rows that are still only in the active memtable"
+        );
+    }
+
+    #[test]
+    fn fts_query_sees_flushed_rows_while_sidecar_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        engine
+            .write(
+                &tid,
+                &make_key("durable"),
+                make_row(b"ferrosaftsdurable native fts probe body", 1000),
+                1000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let fti_files: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("FTI-idx_body"))
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(fti_files.len(), 1, "test setup expects one FTI sidecar");
+        std::fs::remove_file(&fti_files[0]).unwrap();
+
+        let results = engine
+            .fulltext_search(&tid, "idx_body", "ferrosaftsdurable")
+            .unwrap();
+        let result_keys: Vec<String> = results
+            .iter()
+            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .collect();
+
+        assert_eq!(
+            result_keys,
+            vec!["durable".to_string()],
+            "fts_match must not make flushed rows invisible while an FTI sidecar is missing or being rebuilt"
         );
     }
 
