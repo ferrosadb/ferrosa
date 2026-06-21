@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-06-21
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -39,6 +39,8 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 
 - ~945 in-crate tests (router 253, parser 158, bridge 121).
 - Integration tests: `tests/{handshake, auth_integration, auth_warn_mode,
-  bolt_transaction_state, cassandra_cql_examples}.rs`.
+  bolt_transaction_state, cassandra_cql_examples}.rs` plus the ignored
+  live-cluster `tests/fts_live_cluster.rs` guard for coordinator-independent
+  native `fts_match` results on a 3-node cluster.
 - Postgres differential oracle (in `ferrosa-postgres`) guards the shared codec.
 - Per-opcode CQL metrics + Prometheus endpoint surface error/overload rates.
