@@ -283,3 +283,62 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v --remove-orphans 2>/dev/null || true
+
+  race-stress-fly:
+    name: Read-vs-compaction stress (shared-cpu Fly)
+    runs-on: ubuntu-latest
+    # The stress binary is cross-compiled on the fast GitHub runner, then copied
+    # into a throwaway shared-cpu Fly machine. The starved baseline is what we
+    # want to test; compiling on that same starved VM was consuming the entire
+    # 75-minute job budget and the test never completed (no RS_RESULT marker).
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Install Cap'n Proto compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build race-stress test binary
+        id: build
+        run: |
+          set -euo pipefail
+          cargo test -p ferrosa-storage --features race-stress --release --lib --no-run
+          # Find the libtest binary that contains the race-stress test.
+          binary=$(find target/release/deps -maxdepth 1 -type f -executable -name 'ferrosa_storage-*' | head -n 1)
+          if [ -z "$binary" ]; then
+            echo "::error::Could not locate ferrosa-storage race-stress test binary"
+            exit 1
+          fi
+          ls -lh "$binary"
+          file "$binary"
+          echo "binary=$PWD/$binary" >> "$GITHUB_OUTPUT"
+
+      - name: Read-vs-compaction stress on a starved shared-cpu Fly machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
+          # shared-cpu on purpose: the throttled baseline starves the compaction
+          # executor — that starvation is what surfaces the read-vs-compaction
+          # race. A performance VM would NOT reproduce it. Use the 2x size (4 GB)
+          # so the in-VM test doesn't OOM (shared-cpu-1x caps at 2 GB).
+          VM: shared-cpu-2x
+          VM_MEMORY: '4096'
+          RACE_KEYS: '2000'
+          RACE_READERS: '8'
+          RACE_SECS: '600'
+          RACE_FLUSH_EVERY: '50'
+        run: |
+          set -euo pipefail
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "::notice::FLY_API_TOKEN not set — skipping nightly Fly race-stress (provision it; see board task t_dfbc14f3)"
+            exit 0
+          fi
+          curl -fsSL https://fly.io/install.sh | sh
+          export FLYCTL_INSTALL="$HOME/.fly"
+          export PATH="$FLYCTL_INSTALL/bin:$PATH"
+          bash ci/race-stress-fly.sh "${{ steps.build.outputs.binary }}"
