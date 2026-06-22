@@ -40,12 +40,19 @@ VERSION=""
 CHANNEL="stable"   # stable|nightly
 FORCE="no"
 WANT_SERVICE=""    # ask|yes|no
+# Install from a local release tarball instead of downloading from GitHub.
+# Used by the install smoke test (and devs) to exercise THIS script against a
+# just-built binary before it is published. Honors the
+# `FERROSA_MEMORY_INSTALL_TARBALL` env var or the `--tarball <path>` flag;
+# requires `--version <label>`.
+LOCAL_TARBALL="${FERROSA_MEMORY_INSTALL_TARBALL:-}"
 
 # ---------- arg parsing ----------
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)      VERSION="$2"; shift 2 ;;
     --channel)      CHANNEL="$2"; shift 2 ;;
+    --tarball)      LOCAL_TARBALL="$2"; shift 2 ;;
     --force)        FORCE="yes"; shift ;;
     --no-service)   WANT_SERVICE="no"; shift ;;
     --service)      WANT_SERVICE="yes"; shift ;;
@@ -100,6 +107,7 @@ resolve_channel_tag() {
 }
 
 if [ -z "$VERSION" ]; then
+  [ -z "$LOCAL_TARBALL" ] || die "--tarball requires an explicit --version <label>"
   VERSION=$(resolve_channel_tag) || true
   [ -n "$VERSION" ] || die "no ${CHANNEL} release found at ${RELEASE_HOST}"
   say "resolved ${CHANNEL} channel to ${VERSION}"
@@ -129,16 +137,22 @@ TARBALL="ferrosa-memory-${VERSION}-${TARGET}.tar.gz"
 URL="${RELEASE_HOST}/download/${VERSION}/${TARBALL}"
 SUMS_URL="${RELEASE_HOST}/download/${VERSION}/SHA256SUMS"
 
-# ---------- download + verify ----------
+# ---------- obtain the tarball (download, or use a local build) + verify ----------
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-say "downloading $TARBALL"
-curl -fsSL --output "$TMP/$TARBALL" "$URL"
-curl -fsSL --output "$TMP/SHA256SUMS" "$SUMS_URL"
+if [ -n "$LOCAL_TARBALL" ]; then
+  [ -f "$LOCAL_TARBALL" ] || die "local tarball not found: $LOCAL_TARBALL"
+  say "installing from local tarball $LOCAL_TARBALL (skipping download + checksum)"
+  cp "$LOCAL_TARBALL" "$TMP/$TARBALL"
+else
+  say "downloading $TARBALL"
+  curl -fsSL --output "$TMP/$TARBALL" "$URL"
+  curl -fsSL --output "$TMP/SHA256SUMS" "$SUMS_URL"
 
-say "verifying SHA256"
-( cd "$TMP" && grep "$TARBALL" SHA256SUMS | shasum -a 256 -c - ) \
-  || die "checksum verification FAILED"
+  say "verifying SHA256"
+  ( cd "$TMP" && grep "$TARBALL" SHA256SUMS | shasum -a 256 -c - ) \
+    || die "checksum verification FAILED"
+fi
 
 # ---------- install layout ----------
 say "installing to $INSTALL_ROOT"
