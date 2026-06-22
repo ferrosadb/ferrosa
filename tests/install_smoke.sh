@@ -31,11 +31,15 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 KEEP=no
 DEBUG_BUILD=no
 FERROSA_TARBALL=""
+WITH_MEMORY=no
+MEMORY_REPO="$(cd "$REPO/../ferrosa-memory" 2>/dev/null && pwd || true)"
 while [ $# -gt 0 ]; do
   case "$1" in
     --ferrosa-tarball) FERROSA_TARBALL="$2"; shift 2 ;;
     --keep)            KEEP=yes; shift ;;
     --debug-build)     DEBUG_BUILD=yes; shift ;;
+    --with-memory)     WITH_MEMORY=yes; shift ;;
+    --memory-repo)     MEMORY_REPO="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -46,12 +50,15 @@ INSTALL="$HOME_DIR/.ferrosa"
 LOGDIR="$WORK/logs"
 mkdir -p "$HOME_DIR" "$LOGDIR"
 FERROSA_PID=""
+MEMORY_PID=""
 
 log()  { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 fail() { printf '\n\033[31mSMOKE FAIL:\033[0m %s\n' "$*" >&2; [ -f "$LOGDIR/ferrosa.log" ] && { echo '--- last ferrosa log ---' >&2; tail -40 "$LOGDIR/ferrosa.log" >&2; }; exit 1; }
 
 cleanup() {
+  [ -n "$MEMORY_PID" ] && kill "$MEMORY_PID" 2>/dev/null || true
+  [ -n "$MEMORY_PID" ] && wait "$MEMORY_PID" 2>/dev/null || true
   [ -n "$FERROSA_PID" ] && kill "$FERROSA_PID" 2>/dev/null || true
   [ -n "$FERROSA_PID" ] && wait "$FERROSA_PID" 2>/dev/null || true
   if [ "$KEEP" = yes ]; then echo "kept work dir: $WORK"; else rm -rf "$WORK"; fi
@@ -184,6 +191,158 @@ assert_data_under_install() {
   ok "data dir is under the configured install root ($INSTALL/data)"
 }
 
+# ---------------------------------------------------------------------------
+# ferrosa-memory integration (optional, --with-memory). Installs ferrosa-memory
+# via the documented install-memory.sh against a local build, points it at the
+# freshly-installed ferrosa, and exercises ingest + search. Uses the "synthetic"
+# embeddings provider (deterministic, no GPU / no cloud) so it runs on plain CI;
+# the ollama.com-cloud + LMStudio providers are deferred (tracked separately).
+# ---------------------------------------------------------------------------
+build_memory_tarball() {
+  [ -n "$MEMORY_REPO" ] && [ -d "$MEMORY_REPO" ] \
+    || fail "ferrosa-memory repo not found (pass --memory-repo PATH); looked at '$MEMORY_REPO'"
+  local profile_flag="--release" bindir="$MEMORY_REPO/target/release"
+  if [ "$DEBUG_BUILD" = yes ]; then profile_flag=""; bindir="$MEMORY_REPO/target/debug"; fi
+  log "building ferrosa-memory-mcp from $MEMORY_REPO"
+  ( cd "$MEMORY_REPO" && cargo build $profile_flag -p ferrosa-memory-mcp --bin ferrosa-memory-mcp >/dev/null )
+  [ -x "$bindir/ferrosa-memory-mcp" ] || fail "ferrosa-memory-mcp not built at $bindir"
+  # Stage a tarball in the layout install-memory.sh expects: top-level binary +
+  # config/ferrosa-memory.example.toml.
+  local stage; stage="$(mktemp -d)"
+  cp "$bindir/ferrosa-memory-mcp" "$stage/"
+  mkdir -p "$stage/config"
+  cp "$MEMORY_REPO/config/ferrosa-memory.example.toml" "$stage/config/"
+  MEMORY_TARBALL="$WORK/ferrosa-memory-v0.0.0-smoke.tar.gz"
+  ( cd "$stage" && tar czf "$MEMORY_TARBALL" . )
+  rm -rf "$stage"
+  ok "staged ferrosa-memory tarball"
+}
+
+# Write a test config: HTTP transport (no TLS) for a curl-able exercise,
+# synthetic embeddings (no GPU/cloud), judge off, pointed at the ferrosa CQL port
+# this smoke chose. /healthz is unauthenticated; /mcp needs basic auth, so we
+# also generate the auth file (plain sha256 of the password).
+write_memory_config() {
+  MEM_PORT="$(free_port)"
+  MEM_TENANT="00000000-0000-0000-0000-000000000001"
+  MEM_USER="ferrosa_user"; MEM_PASS="ferrosa_user"
+  local hash; hash="$(printf '%s' "$MEM_PASS" | shasum -a 256 | awk '{print $1}')"
+  cat > "$INSTALL/config/http-auth.toml" <<EOF
+[[principal]]
+username = "$MEM_USER"
+password_sha256 = "$hash"
+tenant_id = "$MEM_TENANT"
+EOF
+  cat > "$INSTALL/config/ferrosa-memory.toml" <<EOF
+[server]
+transport = "http"
+bind_addr = "127.0.0.1"
+http_port = $MEM_PORT
+require_tls = false
+auth_file = "$INSTALL/config/http-auth.toml"
+
+[ferrosa]
+contact_points = ["127.0.0.1:$CQL_PORT"]
+keyspace = "agent_memory"
+username = "ferrosa_admin"
+password = "ferrosa_admin"
+admin_username = "ferrosa_admin"
+admin_password = "ferrosa_admin"
+
+[embeddings]
+provider = "synthetic"
+dimensions = 768
+
+[judge]
+enabled = false
+
+# Viz (memory graph visualizer) stays ON. Under HTTP transport it needs an
+# explicit tenant_id (the server tenant_id fallback is rejected in http mode).
+[viz]
+enabled = true
+tenant_id = "$MEM_TENANT"
+EOF
+}
+
+start_memory() {
+  : > "$LOGDIR/memory.log"
+  HOME="$HOME_DIR" FERROSA_MEMORY_CONFIG="$INSTALL/config/ferrosa-memory.toml" \
+    "$INSTALL/bin/ferrosa-memory-mcp" >> "$LOGDIR/memory.log" 2>&1 &
+  MEMORY_PID=$!
+  # Readiness = connected to ferrosa (CQL) AND agent_memory keyspace migrated.
+  local i=0
+  while [ "$i" -lt 90 ]; do
+    if [ "$(curl -fsS "http://127.0.0.1:$MEM_PORT/healthz/ready" 2>/dev/null)" = "ready" ]; then
+      ok "ferrosa-memory /healthz/ready=ready (connected to ferrosa, agent_memory keyspace ready)"
+      return 0
+    fi
+    kill -0 "$MEMORY_PID" 2>/dev/null \
+      || { cat "$LOGDIR/memory.log" >&2; fail "ferrosa-memory-mcp exited during startup"; }
+    sleep 1; i=$((i+1))
+  done
+  cat "$LOGDIR/memory.log" >&2
+  fail "ferrosa-memory never became ready on :$MEM_PORT (could not connect to ferrosa?)"
+}
+
+stop_memory() {
+  [ -n "$MEMORY_PID" ] && kill "$MEMORY_PID" 2>/dev/null || true
+  [ -n "$MEMORY_PID" ] && wait "$MEMORY_PID" 2>/dev/null || true
+  MEMORY_PID=""
+}
+
+# Ingest a memory and read it back through the MCP HTTP endpoint. Synthetic
+# embeddings make the semantic component deterministic (no GPU/cloud needed).
+exercise_memory() {
+  python3 - "$MEM_PORT" "$MEM_USER" "$MEM_PASS" <<'PY' || fail "ferrosa-memory ingest/search round-trip failed"
+import base64, json, sys, urllib.request
+port, user, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+url = f"http://127.0.0.1:{port}/mcp"
+auth = base64.b64encode(f"{user}:{pw}".encode()).decode()
+session = "550e8400-e29b-41d4-a716-446655440000"
+marker = "install-smoke-marker-fact"
+def call(i, name, args):
+    body = json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                       "params": {"name": name, "arguments": args}}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+        headers={"content-type": "application/json", "authorization": f"Basic {auth}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+up = call(1, "upsert_entity", {"session_id": session, "entity_name": marker,
+    "entity_type": "concept",
+    "context_snippet": "the install smoke verified ferrosa-memory end to end",
+    "confidence": 1.0})
+if "error" in up:
+    print("upsert error:", up["error"], file=sys.stderr); sys.exit(1)
+print("upsert ok")
+res = call(2, "search", {"session_id": session, "query": "install smoke verified", "limit": 10})
+if "error" in res:
+    print("search error:", res["error"], file=sys.stderr); sys.exit(1)
+# MCP tool result: result.content[0].text is a JSON string with the search payload.
+content = res.get("result", {}).get("content", [])
+payload = json.loads(content[0]["text"]) if content and "text" in content[0] else {}
+count = int(payload.get("count", 0))
+# The agent_memory keyspace was just created (empty) and we ingested exactly one
+# entity, so a non-empty result IS the round-trip: ingest -> searchable.
+if count < 1:
+    print("search returned no results; payload:", json.dumps(payload)[:800], file=sys.stderr); sys.exit(1)
+print(f"search returned {count} result(s) for the ingested memory")
+PY
+  ok "ingest + search round-trip through ferrosa-memory (synthetic embeddings)"
+}
+
+run_memory_smoke() {
+  build_memory_tarball
+  HOME="$HOME_DIR" FERROSA_MEMORY_INSTALL_TARBALL="$MEMORY_TARBALL" \
+    bash "$REPO/docs/install-memory.sh" --version v0.0.0-smoke --no-service \
+    > "$LOGDIR/install-memory.log" 2>&1 \
+    || { cat "$LOGDIR/install-memory.log" >&2; fail "install-memory.sh failed"; }
+  [ -x "$INSTALL/bin/ferrosa-memory-mcp" ] || fail "ferrosa-memory-mcp not installed"
+  ok "ferrosa-memory installed via docs/install-memory.sh to $INSTALL/bin"
+  write_memory_config
+  start_memory
+  exercise_memory
+}
+
 # ============================================================================
 # Scenario 1 — FRESH install
 # ============================================================================
@@ -245,6 +404,21 @@ serves_check
 [ "$(cat "$INSTALL/data/host_id")" = "$HOST_ID_AFTER" ] \
   || fail "data dir not preserved through partial-install recovery"
 ok "recovered from a partial install; data preserved"
-
 stop_ferrosa
-log "ALL SCENARIOS PASSED — fresh / idempotent / upgrade-preserves-data / partial-recovery"
+
+# ============================================================================
+# Scenario 5 — ferrosa-memory integration (optional, --with-memory)
+# ============================================================================
+if [ "$WITH_MEMORY" = yes ]; then
+  log "Scenario 5: ferrosa-memory integration via docs/install-memory.sh (synthetic embeddings)"
+  start_ferrosa          # bring the freshly-installed ferrosa back up for memory to connect to
+  serves_check
+  graph_check
+  run_memory_smoke
+  stop_memory
+  stop_ferrosa
+  log "ALL SCENARIOS PASSED — ferrosa install (x4) + ferrosa-memory integration (ingest/search)"
+else
+  log "ALL SCENARIOS PASSED — fresh / idempotent / upgrade-preserves-data / partial-recovery"
+  printf '  (re-run with --with-memory to also exercise the ferrosa-memory integration)\n' >&2
+fi
