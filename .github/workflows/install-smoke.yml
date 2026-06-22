@@ -53,3 +53,36 @@ jobs:
         # daemon starts / serves / keeps its data across upgrade — failing loud on
         # a panic, a non-bound port, or a dropped data dir.
         run: bash tests/install_smoke.sh
+
+  # Cross-repo: install ferrosa AND ferrosa-memory via the documented scripts,
+  # point ferrosa-memory at the fresh ferrosa, and exercise ingest + search
+  # (synthetic embeddings — no GPU/cloud). Separate from the ferrosa-only `smoke`
+  # job so the critical install gate stays fast/robust even if this heavier
+  # cross-repo build hiccups.
+  memory-smoke:
+    name: Install smoke + ferrosa-memory (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout ferrosa-memory
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ferrosadb/ferrosa-memory
+          path: ferrosa-memory
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install capnproto (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install capnproto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: false
+      - name: Run install smoke with the ferrosa-memory integration
+        run: bash tests/install_smoke.sh --with-memory --memory-repo "$GITHUB_WORKSPACE/ferrosa-memory"
