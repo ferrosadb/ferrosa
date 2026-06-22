@@ -178,6 +178,20 @@ where
         .and_then(|v| v.as_bool())
 }
 
+/// Human label for where the effective `auth_enabled` value came from, for the
+/// startup log. Env wins, then `[cql].auth_enabled` in the config file, then the
+/// built-in default. (Issue #172: the log used to always say `"default"` even
+/// when the config file set it.)
+fn auth_source_label(env_set: bool, toml_has_auth_key: bool) -> &'static str {
+    if env_set {
+        "FERROSA_AUTH_ENABLED env"
+    } else if toml_has_auth_key {
+        "config file ([cql].auth_enabled)"
+    } else {
+        "default"
+    }
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -676,6 +690,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // var is unset; see Sprint A of
     // specs/decisions/design-cql-role-auth-rollout.md.
     let storage_auth_enabled = storage_config.auth_enabled;
+
+    // Emit the auth-state startup logs now that the authoritative value is
+    // resolved (env → `[cql].auth_enabled` TOML → default). `from_env` no longer
+    // logs these: it only saw the env default and mislabeled a TOML
+    // `auth_enabled = true` as `source="default"`, making operators think the
+    // config was ignored (issue #172). Report the value actually in force, and
+    // where it came from.
+    let auth_source = auth_source_label(
+        std::env::var_os("FERROSA_AUTH_ENABLED").is_some(),
+        file_config
+            .get("cql")
+            .and_then(|c| c.get("auth_enabled"))
+            .is_some(),
+    );
+    ferrosa_storage::engine::log_cql_auth_state(storage_auth_enabled, auth_source);
+    ferrosa_storage::engine::log_auth_warn_state(storage_auth_enabled, storage_auth_warn);
+
     let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -2396,6 +2427,25 @@ mod tests {
     fn resolve_auth_enabled_toml_returns_none_when_unspecified() {
         let toml = empty_config();
         assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), None);
+    }
+
+    /// Regression (issue #172): the startup auth log used to always report
+    /// `source="default"`, hiding the fact that `[cql].auth_enabled` in the
+    /// config file was in force. `auth_source_label` must attribute a config-file
+    /// value to the config file (not "default"), env to env, and only fall back
+    /// to "default" when neither is set.
+    #[test]
+    fn auth_source_label_attributes_config_file_not_default() {
+        // env unset, [cql].auth_enabled present in TOML -> config file
+        assert_eq!(
+            auth_source_label(false, true),
+            "config file ([cql].auth_enabled)"
+        );
+        // env set -> env wins regardless of TOML
+        assert_eq!(auth_source_label(true, true), "FERROSA_AUTH_ENABLED env");
+        assert_eq!(auth_source_label(true, false), "FERROSA_AUTH_ENABLED env");
+        // neither set -> default
+        assert_eq!(auth_source_label(false, false), "default");
     }
 
     #[test]
