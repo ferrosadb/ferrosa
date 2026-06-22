@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Shared compilation cache (GitHub Actions backend). Every job that compiles
+  # runs a sccache-action step (the smoke-test job's is gated on the rare musl
+  # fallback). CARGO_INCREMENTAL=0 because incremental bypasses sccache.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
 
 permissions:
   contents: write
@@ -33,6 +39,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build AssemblyScript UDF toolchain bundle
         # --all-features enables `asc-udf` + `live-infra-tests`, which run the
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
@@ -222,6 +229,9 @@ jobs:
           docker build -f tests/Dockerfile.nightly-deb -t ferrosa-smoke:latest tests/
           rm -f tests/ferrosa.deb
 
+      - name: Set up sccache (only when the musl fallback compiles)
+        if: steps.nightly_deb.outputs.deb_path == ''
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build x86_64 musl static ferrosa binary (fallback)
         # The smoke test needs a runtime image. We prefer the nightly .deb above.
         # This fallback is compiled only if the reusable download step somehow
@@ -305,6 +315,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build race-stress test binary
         id: build
         run: |
