@@ -17,6 +17,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Shared compilation cache across all jobs AND runs, via the GitHub Actions
+  # cache backend. Each COMPILE job runs the sccache-action step (installs +
+  # starts the server); clippy/test/jepsen/musl/node-image otherwise cold-compile
+  # ~the same workspace independently. The fmt job inherits these too but never
+  # compiles, so RUSTC_WRAPPER is unused there. CARGO_INCREMENTAL=0 because
+  # incremental compilation bypasses sccache.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # ── Stage 1: Format + Lint (fast feedback) ──────────────────────────
@@ -41,6 +50,7 @@ jobs:
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - run: cargo clippy --all-targets -- -D warnings
       - name: Guard against unbounded materializing reads
         run: python3 scripts/check-unbounded-reads.py
@@ -66,6 +76,7 @@ jobs:
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
         # (pinned asc version) so those tests run and pass rather than being skipped.
         run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run tests
         env:
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
@@ -111,6 +122,7 @@ jobs:
         run: docker --version
       - name: Pre-pull postgres:16
         run: docker pull postgres:16
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run differential oracle (corpus + restricted-query + DML)
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -132,6 +144,7 @@ jobs:
           key: musl
       - name: Install musl tools and capnproto
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build static binary
         run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
       - name: Verify statically linked
@@ -175,6 +188,7 @@ jobs:
           key: node-image
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build glibc release binary (once)
         run: cargo build --release -p ferrosa -p ferrosa-ctl
       - name: Package into a thin runtime image
@@ -239,6 +253,7 @@ jobs:
         run: |
           docker pull rustfs/rustfs:latest
           docker pull minio/mc
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"
