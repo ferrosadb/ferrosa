@@ -109,17 +109,21 @@ run_installer() { # version-label  [extra-args...]
 
 # Rewrite the installed (bundled) config's listen ports to free ones so the
 # smoke never collides with a real daemon. Keeps everything else as shipped.
+# Only [cql].bind and [internode].bind are actually honored by the daemon today;
+# [web]/[graph] bind + bolt_port are read from defaults (a known config-plumbing
+# gap, tracked separately). So we patch the two that work to free ports, and the
+# graph/web/postgres listeners use their documented defaults (7474/7687/9090/5432
+# — free on a clean runner).
 patch_ports() {
-  CQL_PORT="$(free_port)"; WEB_PORT="$(free_port)"; INODE_PORT="$(free_port)"
+  CQL_PORT="$(free_port)"; INODE_PORT="$(free_port)"
+  GRAPH_PORT=7474   # daemon ignores [graph].bind; binds the default
   local cfg="$INSTALL/config/ferrosa.toml"
-  python3 - "$cfg" "$CQL_PORT" "$WEB_PORT" "$INODE_PORT" <<'PY'
+  python3 - "$cfg" "$CQL_PORT" "$INODE_PORT" <<'PY'
 import re, sys
-cfg, cql, web, inode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+cfg, cql, inode = sys.argv[1:4]
 t = open(cfg).read()
+# [cql].bind is the first bind line in the shipped config.
 t = re.sub(r'(?m)^(\s*bind\s*=\s*")[^"]*:\d+(")', lambda m: m.group(1)+"127.0.0.1:"+cql+m.group(2), t, count=1)
-# web + internode binds: replace remaining bind lines by section order is brittle,
-# so just force any 0.0.0.0/127.0.0.1 :PORT we recognise.
-t = t.replace("0.0.0.0:9090", "127.0.0.1:"+web).replace("127.0.0.1:9090", "127.0.0.1:"+web)
 t = t.replace("0.0.0.0:17000", "127.0.0.1:"+inode).replace("127.0.0.1:17000", "127.0.0.1:"+inode)
 open(cfg, "w").write(t)
 PY
@@ -153,6 +157,17 @@ serves_check() {
   ok "CQL server reached listening state and process is alive (serving)"
 }
 
+# Graph engine must be ON by default (bundled config ships [graph] enabled = true
+# so the Cypher/Bolt endpoints + viz work out of the box and ferrosa-memory can
+# use them). Assert the HTTP graph port binds and the daemon did NOT log the
+# disabled path.
+graph_check() {
+  grep -qi "graph engine disabled" "$LOGDIR/ferrosa.log" \
+    && fail "graph engine is DISABLED — bundled config should default it ON"
+  wait_tcp 127.0.0.1 "$GRAPH_PORT" 30 || fail "graph HTTP port $GRAPH_PORT never bound (graph not enabled by default?)"
+  ok "graph engine enabled by default (HTTP $GRAPH_PORT serving)"
+}
+
 # Fingerprint the data dir for the upgrade-preserves-data assertion.
 data_fingerprint() {
   local d="$INSTALL/data"
@@ -181,6 +196,7 @@ ok "installed to $INSTALL"
 patch_ports
 start_ferrosa
 serves_check
+graph_check
 assert_data_under_install
 FP_FRESH="$(data_fingerprint)"; ok "data fingerprint: $FP_FRESH"
 
