@@ -453,6 +453,9 @@ mod tests {
                 .unwrap();
             assert!(matches!(resp, Message::Pong { nonce: 1, .. }));
         }
+
+        pool.shutdown().await;
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     /// Connect to a test server, send Ping on each lane, verify Pong response.
@@ -515,6 +518,9 @@ mod tests {
 
         // All lanes should be connected.
         assert_eq!(pool.all_lanes_resolved().await, LaneOutcome::AllConnected);
+
+        pool.shutdown().await;
+        server.shutdown(Duration::from_millis(50)).await;
     }
 
     #[test]

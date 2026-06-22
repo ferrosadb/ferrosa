@@ -707,6 +707,7 @@ mod tests {
             "successful send/response traffic should refresh peer liveness"
         );
 
+        pm.remove_peer(server_id).await;
         server.shutdown(Duration::from_millis(50)).await;
     }
 
@@ -837,6 +838,7 @@ mod tests {
             .unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 99, .. }));
 
+        pm.remove_peer(server_id).await;
         server.shutdown(Duration::from_millis(50)).await;
     }
 
@@ -897,6 +899,7 @@ mod tests {
             "ensure_peer should upgrade placeholder peers into a live outbound pool"
         );
 
+        pm.remove_peer(server_id).await;
         server.shutdown(Duration::from_millis(50)).await;
     }
 
@@ -944,7 +947,9 @@ mod tests {
             Some(addr2_str.as_str())
         );
         assert_eq!(
-            old_pool.all_lanes_resolved().await,
+            tokio::time::timeout(Duration::from_secs(1), old_pool.all_lanes_resolved())
+                .await
+                .expect("old pool lane status query should not hang after replacement"),
             LaneOutcome::AnyFailed,
             "replacing a peer address must shut down old lane actors so they stop reconnecting to stale IPs"
         );
@@ -961,6 +966,7 @@ mod tests {
             .unwrap();
         assert!(matches!(resp, Message::Pong { nonce: 11, .. }));
 
+        pm.remove_peer(server_id).await;
         server1.shutdown(Duration::from_millis(50)).await;
         server2.shutdown(Duration::from_millis(50)).await;
     }
