@@ -8442,6 +8442,36 @@ mod tests {
     use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
 
+    /// Regression (issue #172): a fresh install passes its data dir via
+    /// `[storage].data_dir` in the TOML, which `main` resolves and exports as
+    /// `FERROSA_DATA_DIR` before building the engine config. `from_env` must
+    /// honor that env for the data dir AND every path derived from it (the
+    /// commit log, here) — otherwise the engine writes under the unwritable
+    /// `/var/lib/ferrosa` default and a non-root install (e.g. macOS
+    /// `~/.ferrosa/data`) fails to create its data dir.
+    #[test]
+    #[serial_test::serial(ferrosa_data_dir_env)]
+    fn from_env_routes_paths_through_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("FERROSA_DATA_DIR").ok();
+        std::env::set_var("FERROSA_DATA_DIR", dir.path());
+        let cfg = StorageEngineConfig::from_env().expect("from_env");
+        match prev {
+            Some(v) => std::env::set_var("FERROSA_DATA_DIR", v),
+            None => std::env::remove_var("FERROSA_DATA_DIR"),
+        }
+        assert_eq!(
+            cfg.data_dir,
+            dir.path(),
+            "data_dir must honor FERROSA_DATA_DIR"
+        );
+        assert!(
+            cfg.commit_log.log_dir.starts_with(dir.path()),
+            "commit-log dir must be derived from the configured data_dir, got {:?}",
+            cfg.commit_log.log_dir
+        );
+    }
+
     /// Return "docker" or "podman" — whichever container runtime is in PATH.
     /// Panics if neither is found.
     #[cfg(feature = "live-infra-tests")]
