@@ -1,16 +1,16 @@
 name: Install Smoke
 
-# User-grade install smoke: builds the release artifact and runs the REAL
-# docs/install.sh exactly as a documented user would — NON-ROOT, isolated $HOME,
-# the bundled config, the documented launch — on macOS (arm64) AND Linux. Covers
-# fresh install, idempotent re-run, in-place upgrade that PRESERVES the data dir,
-# and partial-install recovery.
+# User-grade install smoke: builds the release artifact ONCE per OS, then runs
+# the REAL docs/install.sh exactly as a documented user would — NON-ROOT,
+# isolated $HOME, the bundled config, the documented launch — on macOS (arm64)
+# AND Linux. Covers fresh install, idempotent re-run, in-place upgrade that
+# PRESERVES the data dir, and partial-install recovery; the memory job also
+# installs ferrosa-memory and exercises ingest + search.
 #
-# This is the gate that was missing when issue #172 shipped (the daemon panicked
-# on first start; [storage].data_dir was ignored). Nothing in CI previously ran
-# the published binary the way a user installs it (the daemon smokes ran in ROOT
-# Docker, which masks the unwritable-/var/lib + non-root failure modes, and never
-# ran on macOS at all).
+# Build/release/run split (12-factor): the `build` job compiles ferrosa + stages
+# the tarball ONCE per OS and uploads it; `smoke` and `memory-smoke` DOWNLOAD that
+# tarball and test it (the smoke job needs no Rust toolchain at all). This is the
+# gate that was missing when issue #172 shipped.
 
 on:
   pull_request:
@@ -25,9 +25,13 @@ concurrency:
   group: install-smoke-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SMOKE_VERSION: v0.0.0-smoke
+
 jobs:
-  smoke:
-    name: Install smoke (${{ matrix.os }})
+  # ── Compile ferrosa + stage the release tarball ONCE per OS ──────────────
+  build:
+    name: Build ferrosa tarball (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -46,21 +50,57 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false
-      - name: Run the user-grade install smoke
-        # The script builds a release tarball with the SAME
-        # .github/scripts/stage-release-tarball.sh the release uses, installs it
-        # via the real docs/install.sh (FERROSA_INSTALL_TARBALL), and asserts the
-        # daemon starts / serves / keeps its data across upgrade — failing loud on
-        # a panic, a non-bound port, or a dropped data dir.
-        run: bash tests/install_smoke.sh
+      - name: Build ferrosa + ferrosa-ctl (release) and stage the tarball
+        # Uses the SAME .github/scripts/stage-release-tarball.sh the real release
+        # uses, so the smoke exercises the real artifact layout.
+        run: |
+          case "$(uname -s)/$(uname -m)" in
+            Darwin/arm64) TARGET=aarch64-apple-darwin ;;
+            Linux/x86_64) TARGET=x86_64-unknown-linux-gnu ;;
+            *) echo "unsupported $(uname -s)/$(uname -m)"; exit 1 ;;
+          esac
+          cargo build --release --bin ferrosa --bin ferrosa-ctl
+          GITHUB_REF_NAME="$SMOKE_VERSION" bash .github/scripts/stage-release-tarball.sh "$TARGET" target/release
+      - name: Upload ferrosa tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-tarball-${{ matrix.os }}
+          path: dist/ferrosa-${{ env.SMOKE_VERSION }}-*.tar.gz
+          retention-days: 7
 
-  # Cross-repo: install ferrosa AND ferrosa-memory via the documented scripts,
-  # point ferrosa-memory at the fresh ferrosa, and exercise ingest + search
-  # (synthetic embeddings — no GPU/cloud). Separate from the ferrosa-only `smoke`
-  # job so the critical install gate stays fast/robust even if this heavier
-  # cross-repo build hiccups.
+  # ── Test the prebuilt artifact: ferrosa-only install (NO compile here) ───
+  smoke:
+    name: Install smoke (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download the prebuilt ferrosa tarball
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-tarball-${{ matrix.os }}
+          path: prebuilt
+      - name: Run the user-grade install smoke against the prebuilt tarball
+        # Installs the tarball via the real docs/install.sh (FERROSA_INSTALL_TARBALL)
+        # and asserts the daemon starts / serves / keeps its data across upgrade —
+        # failing loud on a panic, an unbound port, or a dropped data dir. No
+        # toolchain needed: --ferrosa-tarball skips the in-script build.
+        run: |
+          TB="$(ls prebuilt/ferrosa-"$SMOKE_VERSION"-*.tar.gz)"
+          bash tests/install_smoke.sh --ferrosa-tarball "$TB"
+
+  # ── Test the prebuilt artifact: ferrosa + ferrosa-memory integration ─────
+  # Reuses the SAME prebuilt ferrosa tarball; only ferrosa-memory is compiled
+  # here. Separate from `smoke` so the critical install gate stays robust even if
+  # the cross-repo build hiccups.
   memory-smoke:
     name: Install smoke + ferrosa-memory (${{ matrix.os }})
+    needs: build
     strategy:
       fail-fast: false
       matrix:
@@ -84,5 +124,15 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false
+      - name: Download the prebuilt ferrosa tarball
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-tarball-${{ matrix.os }}
+          path: prebuilt
       - name: Run install smoke with the ferrosa-memory integration
-        run: bash tests/install_smoke.sh --with-memory --memory-repo "$GITHUB_WORKSPACE/ferrosa-memory"
+        # Reuses the prebuilt ferrosa tarball (--ferrosa-tarball); only
+        # ferrosa-memory-mcp is compiled in this job.
+        run: |
+          TB="$(ls prebuilt/ferrosa-"$SMOKE_VERSION"-*.tar.gz)"
+          bash tests/install_smoke.sh --with-memory --ferrosa-tarball "$TB" \
+            --memory-repo "$GITHUB_WORKSPACE/ferrosa-memory"
