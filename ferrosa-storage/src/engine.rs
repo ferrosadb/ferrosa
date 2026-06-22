@@ -486,29 +486,17 @@ impl StorageEngineConfig {
         // itself out. When true, the CQL server requires SASL PLAIN
         // authentication and the router consults
         // `ferrosa_schema::check_permission`.
+        // `from_env` only sees the env var; the authoritative `auth_enabled`
+        // also honors `[cql].auth_enabled` in the TOML, which the binary applies
+        // to this config AFTER `from_env` returns. So the auth-state startup logs
+        // are emitted by the binary once the final value is known (via
+        // `log_cql_auth_state` + `log_auth_warn_state`) — NOT here, where they
+        // would report the pre-TOML env default and mislead operators into
+        // thinking `auth_enabled = true` in the config was ignored (issue #172).
         let auth_enabled = matches!(
             std::env::var("FERROSA_AUTH_ENABLED").ok().as_deref(),
             Some("true" | "1" | "on" | "yes")
         );
-        tracing::info!(
-            auth_enabled,
-            source = if std::env::var_os("FERROSA_AUTH_ENABLED").is_some() {
-                "FERROSA_AUTH_ENABLED env"
-            } else {
-                "default"
-            },
-            "storage-engine: CQL role auth is {} — {}",
-            if auth_enabled { "ENABLED" } else { "DISABLED" },
-            if auth_enabled {
-                "CQL STARTUP requires SASL PLAIN, router enforces permission \
-                 checks, web :9090 requires tokens on writes/admin"
-            } else {
-                "CQL accepts every STARTUP without credentials, router permits \
-                 everything — matches legacy behavior; set \
-                 FERROSA_AUTH_ENABLED=true to enforce"
-            }
-        );
-        log_auth_warn_state(auth_enabled, auth_warn);
 
         let write_verify = !matches!(
             std::env::var("FERROSA_WRITE_VERIFY").ok().as_deref(),
@@ -578,6 +566,30 @@ impl StorageEngineConfig {
             memtable_num_shards: 64,
         }
     }
+}
+
+/// Emit the startup log describing whether CQL role auth is enforced, and where
+/// the decision came from. Emitted by the binary AFTER it has resolved
+/// `auth_enabled` from env → `[cql].auth_enabled` TOML → default, so the line
+/// reflects the value actually in force (not the pre-TOML env default that
+/// `from_env` alone would see — issue #172). `source` is a human label like
+/// `"FERROSA_AUTH_ENABLED env"`, `"config file ([cql].auth_enabled)"`, or
+/// `"default"`.
+pub fn log_cql_auth_state(auth_enabled: bool, source: &str) {
+    tracing::info!(
+        auth_enabled,
+        source,
+        "storage-engine: CQL role auth is {} — {}",
+        if auth_enabled { "ENABLED" } else { "DISABLED" },
+        if auth_enabled {
+            "CQL STARTUP requires SASL PLAIN, router enforces permission \
+             checks, web :9090 requires tokens on writes/admin"
+        } else {
+            "CQL accepts every STARTUP without credentials, router permits \
+             everything — matches legacy behavior; set auth_enabled = true in \
+             [cql] (or FERROSA_AUTH_ENABLED=true) to enforce"
+        }
+    );
 }
 
 /// Emit the startup log line describing the current `(auth_enabled,
