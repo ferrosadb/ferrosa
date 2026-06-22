@@ -255,9 +255,18 @@ do_password() {
     say "run later: $BIN_DIR/ferrosa-ctl auth set-password"
     return
   fi
+  # Under `curl … | bash` this script's stdin is the pipe, not a terminal, so
+  # ferrosa-ctl's masked prompt (rpassword reads stdin) can't disable echo —
+  # the password echoes in cleartext and the read never completes (hang). Bind
+  # the controlling terminal explicitly so the prompt + confirmation work.
+  if [ ! -r /dev/tty ]; then
+    say "no controlling terminal — skipping interactive password setup"
+    say "run later from a terminal: $BIN_DIR/ferrosa-ctl auth set-password --user ferrosa_admin"
+    return
+  fi
   say "set ferrosa_admin password (current default: ferrosa_admin)"
   # Exact flag shape pinned to the auth set-password CLI from PR (Task #8 re-brief)
-  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin
+  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin < /dev/tty
 }
 
 # Password is a first-install concern. On upgrade we never re-prompt (the
