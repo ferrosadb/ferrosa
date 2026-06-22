@@ -58,6 +58,22 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+/// Expand a leading `~` / `~/` in a path to `$HOME`. Config files commonly write
+/// `data_dir = "~/.ferrosa/data"`; without this the engine creates a directory
+/// literally named `~` in the process CWD. Leaves the value unchanged if it does
+/// not start with `~` or if `$HOME` is unset (fail-soft for that edge).
+fn expand_tilde(p: String) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if p == "~" {
+            return home;
+        }
+        if let Some(rest) = p.strip_prefix("~/") {
+            return format!("{home}/{rest}");
+        }
+    }
+    p
+}
+
 /// Read a config value: env var takes precedence, then config file, then default.
 fn config_val(
     env_key: &str,
@@ -632,13 +648,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Load/generate host_id
-    let data_dir = config_val(
+    //
+    // Expand a leading `~`: the bundled config ships `data_dir = "~/.ferrosa/data"`,
+    // and without expansion the engine creates a directory literally named `~` in
+    // the process CWD instead of under $HOME (issue #172 follow-up — caught by the
+    // install smoke). Every derived path (commit log, compaction) flows from this
+    // via `FERROSA_DATA_DIR` below, so expanding here fixes them all.
+    let data_dir = expand_tilde(config_val(
         "FERROSA_DATA_DIR",
         &file_config,
         "storage",
         "data_dir",
         "/var/lib/ferrosa",
-    );
+    ));
     std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
@@ -2446,6 +2468,30 @@ mod tests {
         assert_eq!(auth_source_label(true, false), "FERROSA_AUTH_ENABLED env");
         // neither set -> default
         assert_eq!(auth_source_label(false, false), "default");
+    }
+
+    /// Regression (caught by the install smoke): the bundled config ships
+    /// `data_dir = "~/.ferrosa/data"`; a leading `~` must expand to $HOME, or the
+    /// engine creates a directory literally named `~` in the process CWD.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn expand_tilde_expands_leading_home() {
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/home/smoke");
+        assert_eq!(
+            expand_tilde("~/.ferrosa/data".into()),
+            "/home/smoke/.ferrosa/data"
+        );
+        assert_eq!(expand_tilde("~".into()), "/home/smoke");
+        // No leading ~: unchanged.
+        assert_eq!(expand_tilde("/var/lib/ferrosa".into()), "/var/lib/ferrosa");
+        // A `~` not at the start (or `~user`) is left alone — we only handle $HOME.
+        assert_eq!(expand_tilde("/x/~/y".into()), "/x/~/y");
+        assert_eq!(expand_tilde("~bob/data".into()), "~bob/data");
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
