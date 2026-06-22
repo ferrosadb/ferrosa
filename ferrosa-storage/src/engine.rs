@@ -486,29 +486,17 @@ impl StorageEngineConfig {
         // itself out. When true, the CQL server requires SASL PLAIN
         // authentication and the router consults
         // `ferrosa_schema::check_permission`.
+        // `from_env` only sees the env var; the authoritative `auth_enabled`
+        // also honors `[cql].auth_enabled` in the TOML, which the binary applies
+        // to this config AFTER `from_env` returns. So the auth-state startup logs
+        // are emitted by the binary once the final value is known (via
+        // `log_cql_auth_state` + `log_auth_warn_state`) — NOT here, where they
+        // would report the pre-TOML env default and mislead operators into
+        // thinking `auth_enabled = true` in the config was ignored (issue #172).
         let auth_enabled = matches!(
             std::env::var("FERROSA_AUTH_ENABLED").ok().as_deref(),
             Some("true" | "1" | "on" | "yes")
         );
-        tracing::info!(
-            auth_enabled,
-            source = if std::env::var_os("FERROSA_AUTH_ENABLED").is_some() {
-                "FERROSA_AUTH_ENABLED env"
-            } else {
-                "default"
-            },
-            "storage-engine: CQL role auth is {} — {}",
-            if auth_enabled { "ENABLED" } else { "DISABLED" },
-            if auth_enabled {
-                "CQL STARTUP requires SASL PLAIN, router enforces permission \
-                 checks, web :9090 requires tokens on writes/admin"
-            } else {
-                "CQL accepts every STARTUP without credentials, router permits \
-                 everything — matches legacy behavior; set \
-                 FERROSA_AUTH_ENABLED=true to enforce"
-            }
-        );
-        log_auth_warn_state(auth_enabled, auth_warn);
 
         let write_verify = !matches!(
             std::env::var("FERROSA_WRITE_VERIFY").ok().as_deref(),
@@ -578,6 +566,30 @@ impl StorageEngineConfig {
             memtable_num_shards: 64,
         }
     }
+}
+
+/// Emit the startup log describing whether CQL role auth is enforced, and where
+/// the decision came from. Emitted by the binary AFTER it has resolved
+/// `auth_enabled` from env → `[cql].auth_enabled` TOML → default, so the line
+/// reflects the value actually in force (not the pre-TOML env default that
+/// `from_env` alone would see — issue #172). `source` is a human label like
+/// `"FERROSA_AUTH_ENABLED env"`, `"config file ([cql].auth_enabled)"`, or
+/// `"default"`.
+pub fn log_cql_auth_state(auth_enabled: bool, source: &str) {
+    tracing::info!(
+        auth_enabled,
+        source,
+        "storage-engine: CQL role auth is {} — {}",
+        if auth_enabled { "ENABLED" } else { "DISABLED" },
+        if auth_enabled {
+            "CQL STARTUP requires SASL PLAIN, router enforces permission \
+             checks, web :9090 requires tokens on writes/admin"
+        } else {
+            "CQL accepts every STARTUP without credentials, router permits \
+             everything — matches legacy behavior; set auth_enabled = true in \
+             [cql] (or FERROSA_AUTH_ENABLED=true) to enforce"
+        }
+    );
 }
 
 /// Emit the startup log line describing the current `(auth_enabled,
@@ -8441,6 +8453,36 @@ mod tests {
     #[cfg(feature = "live-infra-tests")]
     use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    /// Regression (issue #172): a fresh install passes its data dir via
+    /// `[storage].data_dir` in the TOML, which `main` resolves and exports as
+    /// `FERROSA_DATA_DIR` before building the engine config. `from_env` must
+    /// honor that env for the data dir AND every path derived from it (the
+    /// commit log, here) — otherwise the engine writes under the unwritable
+    /// `/var/lib/ferrosa` default and a non-root install (e.g. macOS
+    /// `~/.ferrosa/data`) fails to create its data dir.
+    #[test]
+    #[serial_test::serial(ferrosa_data_dir_env)]
+    fn from_env_routes_paths_through_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("FERROSA_DATA_DIR").ok();
+        std::env::set_var("FERROSA_DATA_DIR", dir.path());
+        let cfg = StorageEngineConfig::from_env().expect("from_env");
+        match prev {
+            Some(v) => std::env::set_var("FERROSA_DATA_DIR", v),
+            None => std::env::remove_var("FERROSA_DATA_DIR"),
+        }
+        assert_eq!(
+            cfg.data_dir,
+            dir.path(),
+            "data_dir must honor FERROSA_DATA_DIR"
+        );
+        assert!(
+            cfg.commit_log.log_dir.starts_with(dir.path()),
+            "commit-log dir must be derived from the configured data_dir, got {:?}",
+            cfg.commit_log.log_dir
+        );
+    }
 
     /// Return "docker" or "podman" — whichever container runtime is in PATH.
     /// Panics if neither is found.

@@ -178,6 +178,20 @@ where
         .and_then(|v| v.as_bool())
 }
 
+/// Human label for where the effective `auth_enabled` value came from, for the
+/// startup log. Env wins, then `[cql].auth_enabled` in the config file, then the
+/// built-in default. (Issue #172: the log used to always say `"default"` even
+/// when the config file set it.)
+fn auth_source_label(env_set: bool, toml_has_auth_key: bool) -> &'static str {
+    if env_set {
+        "FERROSA_AUTH_ENABLED env"
+    } else if toml_has_auth_key {
+        "config file ([cql].auth_enabled)"
+    } else {
+        "default"
+    }
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -628,6 +642,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
+    // Pin the data dir the storage engine will use to the one we just resolved
+    // from env / `[storage].data_dir` TOML / default (issue #172). Without this,
+    // `StorageEngineConfig::from_env()` below independently re-defaults `data_dir`
+    // to `/var/lib/ferrosa` and derives the commit-log + compaction paths from
+    // it, IGNORING `[storage].data_dir` in the config file. On a non-root install
+    // (e.g. macOS `~/.ferrosa/data`) that default is not writable, so the engine
+    // failed to create it — and before the upload-runtime fix that error unwound
+    // through `main` and surfaced as the tokio "drop a runtime" panic instead of
+    // a clear message. Setting the env the builder reads keeps every derived path
+    // consistent with the host_id/data dir created just above. (Edition 2021:
+    // `set_var` is safe; this runs at the very start of `main`, before anything
+    // else reads `FERROSA_DATA_DIR`.)
+    std::env::set_var("FERROSA_DATA_DIR", &data_dir);
+
     // 3. Create StorageEngine — use open() on restart to replay commit log
     let mut storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     // Allow TOML to override the memtable shard count. `from_env`
@@ -662,20 +690,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // var is unset; see Sprint A of
     // specs/decisions/design-cql-role-auth-rollout.md.
     let storage_auth_enabled = storage_config.auth_enabled;
+
+    // Emit the auth-state startup logs now that the authoritative value is
+    // resolved (env → `[cql].auth_enabled` TOML → default). `from_env` no longer
+    // logs these: it only saw the env default and mislabeled a TOML
+    // `auth_enabled = true` as `source="default"`, making operators think the
+    // config was ignored (issue #172). Report the value actually in force, and
+    // where it came from.
+    let auth_source = auth_source_label(
+        std::env::var_os("FERROSA_AUTH_ENABLED").is_some(),
+        file_config
+            .get("cql")
+            .and_then(|c| c.get("auth_enabled"))
+            .is_some(),
+    );
+    ferrosa_storage::engine::log_cql_auth_state(storage_auth_enabled, auth_source);
+    ferrosa_storage::engine::log_auth_warn_state(storage_auth_enabled, storage_auth_warn);
+
     let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|threads| *threads > 0)
         .unwrap_or(4);
-    let _storage_upload_runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(storage_upload_threads)
-            .thread_name("storage-upload-rt")
-            .enable_all()
-            .build()
-            .expect("storage upload runtime"),
-    );
-    let storage_upload_handle = _storage_upload_runtime.handle().clone();
+    // Dedicated multi-thread runtime for S3 uploads, isolated from the main
+    // serving runtime. It must outlive the whole process. Critically, it must
+    // NEVER be dropped from within this `#[tokio::main]` async context: dropping
+    // a tokio `Runtime` inside an async context panics ("Cannot drop a runtime
+    // in a context where blocking is not allowed"). Held as a plain local (as it
+    // was, via `Arc`), it dropped at the end of `main` — and on any early
+    // error-unwind path — firing that panic *before any listener bound* and
+    // masking the real error (issue #172). We instead leak it for the process
+    // lifetime; the OS reclaims it at exit. Only a `Handle` is handed out, which
+    // does not keep the runtime alive on its own, so the leak is what guarantees
+    // the upload runtime stays up for as long as the engine needs it.
+    let storage_upload_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(storage_upload_threads)
+        .thread_name("storage-upload-rt")
+        .enable_all()
+        .build()
+        .expect("storage upload runtime");
+    let storage_upload_handle = storage_upload_runtime.handle().clone();
+    std::mem::forget(storage_upload_runtime);
     let has_commitlog_segments = storage_config.commit_log.log_dir.exists()
         && std::fs::read_dir(&storage_config.commit_log.log_dir)
             .map(|entries| {
@@ -2372,6 +2427,25 @@ mod tests {
     fn resolve_auth_enabled_toml_returns_none_when_unspecified() {
         let toml = empty_config();
         assert_eq!(resolve_auth_enabled_toml(&toml, |_| None), None);
+    }
+
+    /// Regression (issue #172): the startup auth log used to always report
+    /// `source="default"`, hiding the fact that `[cql].auth_enabled` in the
+    /// config file was in force. `auth_source_label` must attribute a config-file
+    /// value to the config file (not "default"), env to env, and only fall back
+    /// to "default" when neither is set.
+    #[test]
+    fn auth_source_label_attributes_config_file_not_default() {
+        // env unset, [cql].auth_enabled present in TOML -> config file
+        assert_eq!(
+            auth_source_label(false, true),
+            "config file ([cql].auth_enabled)"
+        );
+        // env set -> env wins regardless of TOML
+        assert_eq!(auth_source_label(true, true), "FERROSA_AUTH_ENABLED env");
+        assert_eq!(auth_source_label(true, false), "FERROSA_AUTH_ENABLED env");
+        // neither set -> default
+        assert_eq!(auth_source_label(false, false), "default");
     }
 
     #[test]
