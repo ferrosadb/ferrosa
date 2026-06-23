@@ -58,7 +58,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
 - **Accord** (`accord/`) — per-shard conflict index + protocol log for
-  strict-serializable transactions.
+  strict-serializable transactions. Also defines `TransactionCommitter` (ADR-021):
+  the front-end-facing seam CQL/Postgres `BEGIN`/`COMMIT` call to commit a
+  buffered multi-key write-set; the ferrosa-cluster Accord impl resolves replicas
+  and drives the multi-key transaction. `MockTransactionCommitter` backs
+  front-end unit tests without a cluster.
 - **Time-series** (`timeseries/`) — ring-buffer aggregation, late-data handling,
   WASM aggregate execution, materialization queues.
 - **Virtual tables / observability** (`virtual_tables.rs`, `metrics.rs`) —
