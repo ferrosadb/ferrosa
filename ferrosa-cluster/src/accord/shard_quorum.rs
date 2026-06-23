@@ -131,24 +131,45 @@ impl ParticipantSet {
     /// key must have a replica set).
     pub fn build(keys: &[Vec<u8>], replicas_of: impl Fn(&[u8]) -> Vec<Uuid>) -> Self {
         assert!(!keys.is_empty(), "write-set must have at least one key");
-
-        // Each key's canonical (sorted, deduped) replica set.
         let per_key: Vec<Vec<Uuid>> = keys
             .iter()
-            .map(|k| {
-                let mut r = replicas_of(k);
-                r.sort_unstable();
-                r.dedup();
-                assert!(!r.is_empty(), "key resolved to zero replicas");
-                r
-            })
+            .map(|k| Self::canonical(replicas_of(k)))
             .collect();
+        Self::from_canonical(per_key)
+    }
 
-        // Distinct replica sets, sorted → stable ShardId = position.
+    /// Build directly from each key's replica set (parallel to the write-set
+    /// order), e.g. wired from `TokenRing::replica_host_ids_for_strategy` per
+    /// key. Same grouping semantics as [`Self::build`].
+    ///
+    /// # Panics
+    /// Panics if `replica_sets` is empty or any entry is empty.
+    pub fn from_per_key(replica_sets: &[Vec<Uuid>]) -> Self {
+        assert!(
+            !replica_sets.is_empty(),
+            "write-set must have at least one key"
+        );
+        let per_key: Vec<Vec<Uuid>> = replica_sets
+            .iter()
+            .map(|r| Self::canonical(r.clone()))
+            .collect();
+        Self::from_canonical(per_key)
+    }
+
+    /// Sort + dedup a replica set into canonical form.
+    fn canonical(mut r: Vec<Uuid>) -> Vec<Uuid> {
+        r.sort_unstable();
+        r.dedup();
+        assert!(!r.is_empty(), "key resolved to zero replicas");
+        r
+    }
+
+    /// Group canonical per-key replica sets into shards: each distinct set is a
+    /// shard (stable `ShardId` = its position in the sorted distinct list).
+    fn from_canonical(per_key: Vec<Vec<Uuid>>) -> Self {
         let mut distinct: Vec<Vec<Uuid>> = per_key.clone();
         distinct.sort();
         distinct.dedup();
-
         let shards: HashMap<ShardId, Vec<Uuid>> = distinct
             .iter()
             .enumerate()
@@ -164,7 +185,6 @@ impl ParticipantSet {
                     as ShardId
             })
             .collect();
-
         Self { shards, key_shard }
     }
 
@@ -312,6 +332,25 @@ mod tests {
     fn participant_set_dedups_replicas_within_a_key() {
         let ps = ParticipantSet::build(&[b"a".to_vec()], |_k| vec![node(1), node(1), node(2)]);
         assert_eq!(ps.shards[&0].len(), 2, "duplicate replica deduped → rf=2");
+    }
+
+    #[test]
+    fn from_per_key_matches_build() {
+        let a = vec![node(1), node(2), node(3)];
+        let b = vec![node(4), node(5), node(6)];
+        let via_build = ParticipantSet::build(&[b"ka".to_vec(), b"kb".to_vec()], |k| {
+            if k == b"ka" {
+                a.clone()
+            } else {
+                b.clone()
+            }
+        });
+        let via_per_key = ParticipantSet::from_per_key(&[a.clone(), b.clone()]);
+        assert_eq!(
+            via_build, via_per_key,
+            "from_per_key must group identically to build"
+        );
+        assert_eq!(via_per_key.shards.len(), 2);
     }
 
     use proptest::prelude::*;
