@@ -1028,33 +1028,22 @@ impl AccordCoordinatorDriver {
             .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
         let commit_msg = Message::AccordCommit(Bytes::from(commit_bytes));
 
-        // Start with 1 ack for the coordinator itself (implicit local commit).
+        // The coordinator drove the protocol, so it is an implicit ack for both
+        // Commit and Apply; `self_is_replica` is also consumed by the local-apply
+        // below.
         let self_is_replica = self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil();
-        let mut commit_acks = if self_is_replica { 1usize } else { 0usize };
 
-        let remote_commit_futs: Vec<_> = self
-            .replica_ids
-            .iter()
-            .filter(|&&id| id != self_id)
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = commit_msg.clone();
-                async move { peers.send(peer_id, msg, Lane::Data).await }
-            })
-            .collect();
-        let commit_responses = futures::future::join_all(remote_commit_futs).await;
-
-        for result in &commit_responses {
-            match result {
-                Ok(_) => commit_acks += 1,
-                Err(e) => tracing::warn!(
-                    txn_id = ?txn_id,
-                    error = %e,
-                    "accord: Commit RPC failed"
-                ),
-            }
-        }
-        if commit_acks < sq {
+        // Per-shard quorum: every shard the write-set touches must independently
+        // reach its slow quorum. A single global counter would let one shard
+        // commit while another is a minority — the cross-shard non-atomicity
+        // Accord exists to prevent. (`single_shard_participant` is the
+        // behavior-preserving default for single-key / one replica set; per-key
+        // `ring.replicas` fan-out is a follow-up.)
+        let participant = self.single_shard_participant();
+        if !self
+            .quorum_broadcast(commit_msg, &participant, |r| r.is_ok())
+            .await
+        {
             return Err(AccordDriverError::QuorumUnavailable);
         }
 
@@ -1322,48 +1311,23 @@ impl AccordCoordinatorDriver {
             }
         }
 
-        // Coordinator itself counts as 1 implicit apply ack.
-        let mut apply_acks = if self_is_replica { 1usize } else { 0usize };
-
-        let remote_apply_futs: Vec<_> = self
-            .replica_ids
-            .iter()
-            .filter(|&&id| id != self_id)
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = apply_msg.clone();
-                async move { peers.send(peer_id, msg, Lane::Data).await }
+        // Apply quorum: the SAME per-shard rule as Commit (reusing the
+        // `participant` built above). An Apply ack is an `AccordApplyOK` for this
+        // txn — an empty body, or a payload whose `txn_id` matches.
+        let apply_txn = txn_id;
+        let apply_ok = self
+            .quorum_broadcast(apply_msg, &participant, move |r| {
+                matches!(r, Ok(Message::AccordApplyOK(b))
+                    if b.is_empty()
+                        || bincode::deserialize::<ApplyOkPayload>(b)
+                            .map(|ok| ok.txn_id == apply_txn)
+                            .unwrap_or(false))
             })
-            .collect();
-        let apply_responses = futures::future::join_all(remote_apply_futs).await;
-
-        for result in &apply_responses {
-            match result {
-                Ok(Message::AccordApplyOK(b)) => {
-                    if b.is_empty() {
-                        apply_acks += 1;
-                    } else if let Ok(ok) = bincode::deserialize::<ApplyOkPayload>(b) {
-                        if ok.txn_id == txn_id {
-                            apply_acks += 1;
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        txn_id = ?txn_id,
-                        error = %e,
-                        "accord: Apply RPC failed"
-                    );
-                }
-            }
-        }
-
-        if apply_acks < sq {
+            .await;
+        if !apply_ok {
             tracing::error!(
                 txn_id = ?txn_id,
-                apply_acks,
-                sq,
+                unmet = ?participant.shards.len(),
                 "accord: Apply quorum not reached — LWT result may not be durable"
             );
             return Err(AccordDriverError::ApplyQuorumUnavailable);
@@ -1371,11 +1335,60 @@ impl AccordCoordinatorDriver {
 
         tracing::info!(
             txn_id = ?txn_id,
-            apply_acks,
             "accord: Apply phase complete — [applied]=true"
         );
 
         Ok((commit_t, commit_deps))
+    }
+
+    /// Build the single-shard participant set for the current write-set: every
+    /// key maps to the full `replica_ids`, i.e. one shard. This is the
+    /// behavior-preserving default (per-shard quorum over one shard ==
+    /// `slow_quorum_size(rf)`); the per-key `ring.replicas(token, rf)` fan-out
+    /// that produces multiple shards is a follow-up increment.
+    fn single_shard_participant(&self) -> crate::accord::shard_quorum::ParticipantSet {
+        let keys: Vec<Vec<u8>> = self.write_set.iter().map(|e| e.key.clone()).collect();
+        let replica_ids = self.replica_ids.clone();
+        crate::accord::shard_quorum::ParticipantSet::build(&keys, |_| replica_ids.clone())
+    }
+
+    /// Fan `msg` out to the replica set and decide success by **per-shard** slow
+    /// quorum: every shard in `participant` must independently reach
+    /// `slow_quorum_size(shard_rf)`. The coordinator's own replica is an implicit
+    /// ack (it drove the protocol and its self-send is unreachable). `is_ack`
+    /// decides whether a peer's response counts. Returns true iff every shard
+    /// reached quorum.
+    pub(crate) async fn quorum_broadcast(
+        &self,
+        msg: Message,
+        participant: &crate::accord::shard_quorum::ParticipantSet,
+        is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+    ) -> bool {
+        let self_id = self.self_id;
+        let mut quorum = participant.quorum();
+        if self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil() {
+            quorum.record_node_ack(self_id);
+        }
+
+        let futs: Vec<_> = self
+            .replica_ids
+            .iter()
+            .filter(|&&id| id != self_id)
+            .map(|&peer_id| {
+                let peers = Arc::clone(&self.peers);
+                let msg = msg.clone();
+                async move { (peer_id, peers.send(peer_id, msg, Lane::Data).await) }
+            })
+            .collect();
+
+        for (peer_id, result) in futures::future::join_all(futs).await {
+            if is_ack(&result) {
+                quorum.record_node_ack(peer_id);
+            } else if let Err(e) = &result {
+                tracing::warn!(error = %e, peer = %peer_id, "accord: quorum broadcast RPC failed");
+            }
+        }
+        quorum.all_reached()
     }
 
     /// The transaction ID assigned to this coordinator's transaction.
@@ -2317,5 +2330,130 @@ mod tests {
             0,
             "fail-loud must precede any write — no partial multi-key apply"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: per-shard quorum, exercised through the real `quorum_broadcast`
+    // + the transport seam with a mock that returns controllable per-node acks.
+    // -----------------------------------------------------------------------
+
+    use crate::accord::shard_quorum::ParticipantSet;
+    use crate::accord::transport::AccordTransport;
+
+    /// A mock transport: each peer either acks (canned `Ok` response) or fails
+    /// (`Err`), per a configured map. Routes nothing — it only decides ack/fail.
+    struct MockTransport {
+        behavior: std::collections::HashMap<uuid::Uuid, bool>,
+        ok: Message,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for MockTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            _msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            if *self.behavior.get(&host_id).unwrap_or(&false) {
+                Ok(self.ok.clone())
+            } else {
+                Err(ferrosa_net::error::NetError::Timeout(
+                    "mock node down".into(),
+                ))
+            }
+        }
+    }
+
+    /// Driver whose coordinator is NOT one of the replicas (node_id 999 matches
+    /// no `from_u128(small)` replica), so the quorum is decided purely by the
+    /// mock's per-node responses — no implicit self-ack to muddy the assertion.
+    fn driver_with(
+        transport: Arc<dyn AccordTransport>,
+        replica_ids: Vec<uuid::Uuid>,
+    ) -> AccordCoordinatorDriver {
+        let clock = HybridLogicalClock::new(999, 0);
+        AccordCoordinatorDriver::new_multi_with_transport(
+            999,
+            replica_ids,
+            transport,
+            false,
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+    }
+
+    /// Two RF=3 shards: A = n[0..3], B = n[3..6].
+    fn two_shards(n: &[uuid::Uuid]) -> ParticipantSet {
+        ParticipantSet::build(&[b"ka".to_vec(), b"kb".to_vec()], |k| {
+            if k == b"ka" {
+                vec![n[0], n[1], n[2]]
+            } else {
+                vec![n[3], n[4], n[5]]
+            }
+        })
+    }
+
+    fn six_nodes() -> Vec<uuid::Uuid> {
+        (1u128..=6).map(uuid::Uuid::from_u128).collect()
+    }
+
+    #[tokio::test]
+    async fn quorum_broadcast_blocks_when_one_shard_is_a_minority() {
+        let n = six_nodes();
+        // Shard A all ack; shard B: only n[3] acks (1/3 < quorum 2).
+        let behavior = [
+            (n[0], true),
+            (n[1], true),
+            (n[2], true),
+            (n[3], true),
+            (n[4], false),
+            (n[5], false),
+        ]
+        .into_iter()
+        .collect();
+        let mock = Arc::new(MockTransport {
+            behavior,
+            ok: Message::AccordApplyOK(Bytes::new()),
+        });
+        let driver = driver_with(mock, n.clone());
+
+        let reached = driver
+            .quorum_broadcast(Message::AccordCommit(Bytes::new()), &two_shards(&n), |r| {
+                r.is_ok()
+            })
+            .await;
+        assert!(
+            !reached,
+            "shard B is a minority (1/3) — a global counter (4/6 acks) would wrongly pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_broadcast_succeeds_when_every_shard_has_quorum() {
+        let n = six_nodes();
+        // Each shard at 2/3 → quorum in both.
+        let behavior = [
+            (n[0], true),
+            (n[1], true),
+            (n[2], false),
+            (n[3], true),
+            (n[4], true),
+            (n[5], false),
+        ]
+        .into_iter()
+        .collect();
+        let mock = Arc::new(MockTransport {
+            behavior,
+            ok: Message::AccordApplyOK(Bytes::new()),
+        });
+        let driver = driver_with(mock, n.clone());
+
+        let reached = driver
+            .quorum_broadcast(Message::AccordCommit(Bytes::new()), &two_shards(&n), |r| {
+                r.is_ok()
+            })
+            .await;
+        assert!(reached, "both shards at 2/3 → quorum in each");
     }
 }
