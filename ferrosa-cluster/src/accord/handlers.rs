@@ -19,7 +19,8 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use super::state_machine::{AccordStateMachine, SmResponse};
 use super::wire::{
     AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitPayload,
-    PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload, RecoverPayload,
+    PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
+    RecoverPayload,
 };
 
 /// Shared mutable access to the Accord state machine.
@@ -144,6 +145,39 @@ impl RpcHandler for AccordHandler {
                         // Return empty PreAcceptOK to signal rejection.
                         Some(Message::AccordPreAcceptOK(Bytes::new()))
                     }
+                    _ => Some(Message::AccordPreAcceptOK(Bytes::new())),
+                }
+            }
+
+            Message::AccordPreAcceptV2(b) => {
+                // Multi-key PreAccept: register the txn under EVERY key it writes
+                // and return the UNION of dependencies across all keys, so a txn
+                // overlapping on a non-first key is serialized (t_276e12). The
+                // single-key AccordPreAccept arm above is the degenerate case.
+                let payload: PreAcceptV2Payload = bincode::deserialize(&b)
+                    .map_err(|e| tracing::error!("AccordPreAcceptV2: deserialize failed: {e}"))
+                    .ok()?;
+                let key_refs: Vec<&[u8]> = payload.keys.iter().map(|k| k.as_slice()).collect();
+                let mut sm = self.state.lock();
+                let resp = sm.handle_preaccept_multi(
+                    payload.txn_id,
+                    payload.t0,
+                    &key_refs,
+                    payload.ballot,
+                    payload.epoch,
+                );
+                drop(sm);
+                match resp {
+                    SmResponse::PreAcceptOK { t, deps, .. } => {
+                        let ok = PreAcceptOkPayload {
+                            from: self.local_node_id,
+                            t,
+                            deps,
+                        };
+                        let bytes = bincode::serialize(&ok).ok()?;
+                        Some(Message::AccordPreAcceptOK(Bytes::from(bytes)))
+                    }
+                    SmResponse::Nack { .. } => Some(Message::AccordPreAcceptOK(Bytes::new())),
                     _ => Some(Message::AccordPreAcceptOK(Bytes::new())),
                 }
             }
@@ -406,5 +440,53 @@ mod tests {
             TxnPhase::Applied,
             "the multi-key txn must reach Applied after AccordApplyV2"
         );
+    }
+
+    /// AccordPreAcceptV2 must union dependencies across ALL the transaction's
+    /// keys — a conflict registered on a non-first key must appear in the deps
+    /// the replica returns (t_276e12).
+    #[tokio::test]
+    async fn accord_preaccept_v2_unions_deps_across_keys_over_the_wire() {
+        let writer = std::sync::Arc::new(MockSyncWriter::new());
+        let sm = AccordStateMachine::new(1, writer);
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state.clone(), 1);
+
+        // A pre-existing txn registered (via normal PreAccept) only on key k2.
+        let conflict = TxnId::new(2, ts(500));
+        {
+            let mut sm = state.lock();
+            sm.handle_preaccept(conflict, ts(500), b"k2", BallotNumber(0), 0);
+        }
+
+        // New multi-key txn preaccepts {k1, k2} at t0=1000 over AccordPreAcceptV2.
+        let txn_id = TxnId::new(1, ts(1000));
+        let payload = PreAcceptV2Payload {
+            txn_id,
+            t0: ts(1000),
+            keys: vec![b"k1".to_vec(), b"k2".to_vec()],
+            ballot: BallotNumber(0),
+            epoch: 0,
+        };
+        let bytes = bincode::serialize(&payload).unwrap();
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(3),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let resp = handler
+            .handle(peer, Message::AccordPreAcceptV2(Bytes::from(bytes)))
+            .await;
+
+        match resp {
+            Some(Message::AccordPreAcceptOK(b)) => {
+                let ok: PreAcceptOkPayload = bincode::deserialize(&b).expect("PreAcceptOk decodes");
+                assert!(
+                    ok.deps.contains(&conflict),
+                    "V2 PreAccept must union deps across all keys — the conflict on the \
+                     non-first key k2 must appear in the returned deps"
+                );
+            }
+            other => panic!("expected AccordPreAcceptOK, got {:?}", other),
+        }
     }
 }

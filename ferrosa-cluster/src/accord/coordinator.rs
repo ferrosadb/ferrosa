@@ -560,9 +560,10 @@ impl AccordCoordinatorDriver {
     /// Build a driver for a multi-key (multi-partition) transaction.
     ///
     /// `write_set` is one `(partition_key, encoded_mutation)` per key the
-    /// transaction writes; it must be non-empty. The first key drives Accord
-    /// conflict ordering for now (representative-key); the full per-key
-    /// `PreAcceptV2` dependency union is a follow-up. The Apply phase builds a
+    /// transaction writes; it must be non-empty. Conflict ordering unions
+    /// dependencies across ALL keys via `AccordPreAcceptV2` (t_276e12); the first
+    /// key is kept only as the representative for the single-key ReadVote and the
+    /// v1 wire path. The Apply phase builds a
     /// per-shard participant ([`Self::with_per_key_replicas`]) and fans a
     /// per-replica `AccordApplyV2` (scoped to each replica's owned keys) out under
     /// per-shard quorum; the coordinator applies the keys it owns locally as one
@@ -923,15 +924,15 @@ impl AccordCoordinatorDriver {
     ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
             AcceptOkPayload, AcceptPayload, ApplyOkPayload, CommitPayload, PreAcceptOkPayload,
-            PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
+            PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
         };
 
-        // Multi-key execution is wired: the Apply phase fans a per-replica
-        // `AccordApplyV2` (scoped to each replica's owned keys) out under a
-        // per-shard participant, and each replica applies its whole write-set
-        // atomically. Conflict ordering (PreAccept/Accept) still uses the
-        // representative first key — full per-key `PreAcceptV2` dep union is a
-        // documented follow-up (see specs/in-process/multikey-accord-apply-rekeying.md).
+        // Multi-key execution is wired end to end: PreAccept fans `AccordPreAcceptV2`
+        // (all keys) so each replica unions dependencies across the whole write-set
+        // (t_276e12), and the Apply phase fans a per-replica `AccordApplyV2` (scoped
+        // to each replica's owned keys) under a per-shard participant, each replica
+        // applying its whole write-set atomically. The representative `key` below is
+        // used only for the single-key ReadVote (LWT IF-read) and v1 wire paths.
         let txn_id = self.coordinator.txn_id;
         let t0 = self.coordinator.t0;
         let key = self.coordinator.key.clone();
@@ -941,16 +942,34 @@ impl AccordCoordinatorDriver {
         // Phase 1: PreAccept fanout
         // ------------------------------------------------------------------
 
-        let pa_payload = PreAcceptPayload {
-            txn_id,
-            t0,
-            key: key.clone(),
-            ballot: BallotNumber(0),
-            epoch: 0,
+        // Single-key keeps the v1 `AccordPreAccept` wire (byte-identical). Multi-key
+        // sends `AccordPreAcceptV2` carrying every key, so each replica registers
+        // the txn under all of them and returns the UNION of dependencies across
+        // keys — serializing transactions that overlap on a non-first key (t_276e12).
+        let pa_msg = if self.write_set.len() == 1 {
+            let pa_payload = PreAcceptPayload {
+                txn_id,
+                t0,
+                key: key.clone(),
+                ballot: BallotNumber(0),
+                epoch: 0,
+            };
+            let pa_bytes = bincode::serialize(&pa_payload)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+            Message::AccordPreAccept(Bytes::from(pa_bytes))
+        } else {
+            let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+            let pa_payload = PreAcceptV2Payload {
+                txn_id,
+                t0,
+                keys,
+                ballot: BallotNumber(0),
+                epoch: 0,
+            };
+            let pa_bytes = bincode::serialize(&pa_payload)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+            Message::AccordPreAcceptV2(Bytes::from(pa_bytes))
         };
-        let pa_bytes =
-            bincode::serialize(&pa_payload).map_err(|e| AccordDriverError::Codec(e.to_string()))?;
-        let pa_msg = Message::AccordPreAccept(Bytes::from(pa_bytes));
 
         // Fanout to all replicas in parallel.
         let futs: Vec<_> = self

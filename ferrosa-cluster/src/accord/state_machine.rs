@@ -341,6 +341,24 @@ impl AccordStateMachine {
         t0: Timestamp,
         key: &[u8],
         ballot: BallotNumber,
+        epoch: u64,
+    ) -> SmResponse {
+        // Single-key PreAccept is the degenerate one-entry write-set; the wire
+        // path for a single-partition LWT stays byte-identical.
+        self.handle_preaccept_multi(txn_id, t0, &[key], ballot, epoch)
+    }
+
+    /// PreAccept for a multi-key write-set: register the txn under EVERY key it
+    /// writes and return the UNION of dependencies across all keys, bumping `t`
+    /// past the max conflicting timestamp on any key. This serializes two
+    /// transactions that overlap on a non-representative key (t_276e12) — the
+    /// representative-first-key PreAccept would miss the conflict.
+    pub fn handle_preaccept_multi(
+        &mut self,
+        txn_id: TxnId,
+        t0: Timestamp,
+        keys: &[&[u8]],
+        ballot: BallotNumber,
         _epoch: u64,
     ) -> SmResponse {
         // Check if we've already promised a higher ballot for this txn.
@@ -370,27 +388,37 @@ impl AccordStateMachine {
             }
         }
 
-        // Query ConflictIndex for deps using t0 (not t).
-        let deps = self.conflict_index.deps_before_t0(key, &t0);
+        // Query ConflictIndex for deps using t0 (not t), UNIONED across every
+        // key the transaction writes — a conflict on any key is a dependency.
+        let mut deps = HashSet::new();
+        for key in keys {
+            deps.extend(self.conflict_index.deps_before_t0(key, &t0));
+        }
 
-        // Check for timestamp conflict: if any conflicting t0 >= our t0,
-        // we need to bump our timestamp past it.
-        let max_conflict = self.conflict_index.max_conflicting_timestamp(key);
+        // Bump our timestamp past the max conflicting t0 on ANY key, not just
+        // the representative first key.
+        let max_conflict = keys
+            .iter()
+            .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
+            .max();
         let t = match max_conflict {
             Some(ct) if ct >= t0 => t0.bump_past(&ct, self.node_id),
             _ => t0,
         };
 
-        // Register in ConflictIndex.
-        let entry = InFlightWrite {
-            txn_id,
-            t0,
-            accord_ts: None,
-            status: TxnStatus::PreAccepted,
-        };
-        // Don't fail the protocol message on capacity errors, but log them.
-        if let Err(e) = self.conflict_index.register(key, entry) {
-            tracing::error!(%e, "accord: conflict_index register failed");
+        // Register the txn under EVERY key it writes, so a later conflicting
+        // txn on any of them sees it as a dependency.
+        for key in keys {
+            let entry = InFlightWrite {
+                txn_id,
+                t0,
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            };
+            // Don't fail the protocol message on capacity errors, but log them.
+            if let Err(e) = self.conflict_index.register(key, entry) {
+                tracing::error!(%e, "accord: conflict_index register failed");
+            }
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can
@@ -1472,6 +1500,113 @@ mod tests {
                     "should NOT include t0=1200 > t0=1000"
                 );
             }
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
+    /// Multi-key PreAccept registers the txn under EVERY key it writes, so a
+    /// later txn conflicting on any one of those keys sees it as a dependency —
+    /// not just on the representative first key (t_276e12).
+    #[test]
+    fn sm_preaccept_multi_key_registers_all_keys_for_conflict() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"key_one";
+        let k2: &[u8] = b"key_two";
+
+        // Txn A preaccepts BOTH keys at t0=500.
+        let a = txn(2, 500);
+        sm.handle_preaccept_multi(a, ts(500), &[k1, k2], BallotNumber(0), 0);
+
+        // Txn B preaccepts ONLY k2 at t0=1000 (> 500). It must depend on A
+        // because A registered itself under k2, not just its first key k1.
+        let b = txn(1, 1000);
+        let resp = sm.handle_preaccept(b, ts(1000), k2, BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { deps, .. } => assert!(
+                deps.contains(&a),
+                "B on k2 must depend on A — A must register under all its keys"
+            ),
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
+    /// Multi-key PreAccept returns the UNION of dependencies across all of the
+    /// transaction's keys, not just the first.
+    #[test]
+    fn sm_preaccept_multi_key_unions_deps_across_keys() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"k1";
+        let k2: &[u8] = b"k2";
+
+        // A pre-existing conflicting txn on each key, both with t0 < 1000.
+        let on_k1 = txn(2, 400);
+        let on_k2 = txn(3, 600);
+        let _ = sm.conflict_index_mut().register(
+            k1,
+            InFlightWrite {
+                txn_id: on_k1,
+                t0: ts(400),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+        let _ = sm.conflict_index_mut().register(
+            k2,
+            InFlightWrite {
+                txn_id: on_k2,
+                t0: ts(600),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+
+        // Txn C preaccepts {k1, k2} at t0=1000 → deps = union {on_k1, on_k2}.
+        let c = txn(1, 1000);
+        let resp = sm.handle_preaccept_multi(c, ts(1000), &[k1, k2], BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { deps, .. } => {
+                assert!(
+                    deps.contains(&on_k1),
+                    "deps must include the conflict on k1"
+                );
+                assert!(
+                    deps.contains(&on_k2),
+                    "deps must include the conflict on k2"
+                );
+            }
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
+    /// Multi-key PreAccept bumps `t` past the max conflicting timestamp across
+    /// ALL keys — a conflict on a non-first key must still push the timestamp.
+    #[test]
+    fn sm_preaccept_multi_key_t_bumps_past_conflict_on_any_key() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"quiet_key";
+        let k2: &[u8] = b"busy_key";
+
+        // A conflict on k2 (not k1) with t0=1500 >= our t0=1000.
+        let hot = txn(2, 1500);
+        let _ = sm.conflict_index_mut().register(
+            k2,
+            InFlightWrite {
+                txn_id: hot,
+                t0: ts(1500),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+
+        // Txn C preaccepts {k1, k2} at t0=1000. Because k2 has a conflict at
+        // 1500 >= 1000, C's final `t` must be bumped past 1500.
+        let c = txn(1, 1000);
+        let resp = sm.handle_preaccept_multi(c, ts(1000), &[k1, k2], BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { t, .. } => assert!(
+                t > ts(1500),
+                "t must bump past the conflict on k2 (got {t:?}), not stay at t0"
+            ),
             other => panic!("expected PreAcceptOK, got {:?}", other),
         }
     }
