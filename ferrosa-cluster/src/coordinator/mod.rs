@@ -159,6 +159,21 @@ impl ClusterCoordinator {
             .map(|info| info.data_center.clone())
     }
 
+    /// Resolve the replica **host ids** that own `token` under the keyspace
+    /// `strategy` from the current ring snapshot. This is the cluster-mode source
+    /// for an Accord transaction's participant set (ADR-021): the coordinator
+    /// owns the ring, so replica placement stays here instead of leaking into the
+    /// CQL/Postgres front-ends.
+    pub fn replica_host_ids_for(
+        &self,
+        token: crate::raft::Token,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> Vec<uuid::Uuid> {
+        self.ring
+            .load()
+            .replica_host_ids_for_strategy(token, strategy)
+    }
+
     /// Attach a Raft state snapshot for index-aware replica selection.
     pub fn with_raft_state(mut self, state: Arc<ArcSwap<RaftState>>) -> Self {
         self.raft_state = Some(state);
