@@ -23,9 +23,13 @@ pub mod protocol_log;
 pub mod read_2i;
 pub mod sidecar;
 pub mod sync_writer;
+pub mod transaction_committer;
 pub mod write_gate;
 
 pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
+pub use transaction_committer::{
+    CommitError, CommitOutcome, MockTransactionCommitter, TransactionCommitter, TransactionWrite,
+};
 pub use crash_recovery::{
     CrashRecoveryReplay, ReplayedConflictEntry, ReplayedPhase, ReplayedTxnState,
 };
