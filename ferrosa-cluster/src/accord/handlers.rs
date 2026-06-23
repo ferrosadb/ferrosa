@@ -18,7 +18,7 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use super::state_machine::{AccordStateMachine, SmResponse};
 use super::wire::{
-    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, CommitPayload,
+    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitPayload,
     PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload, RecoverPayload,
 };
 
@@ -198,6 +198,30 @@ impl RpcHandler for AccordHandler {
                 Some(Message::AccordApplyOK(Bytes::from(bytes)))
             }
 
+            Message::AccordApplyV2(b) => {
+                // Multi-key Apply: the coordinator already scoped this payload to
+                // exactly the keys this replica is a participant for (per-replica
+                // filtered fan-out), so the replica applies every write it was
+                // sent — the same "coordinator scopes, replica trusts" invariant
+                // as the v1 AccordApply arm, generalized to N partitions. The
+                // writes are routed as ONE write-set so they park/apply atomically
+                // (DATA-LOSS-CRITICAL: writes 2..N must never be dropped).
+                let payload: ApplyV2Payload = bincode::deserialize(&b)
+                    .map_err(|e| tracing::error!("AccordApplyV2: deserialize failed: {e}"))
+                    .ok()?;
+                let txn_id = payload.txn_id;
+                let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
+                let mut sm = self.state.lock();
+                sm.handle_apply_writeset(txn_id, writes);
+                drop(sm);
+                let ok = ApplyOkPayload {
+                    txn_id,
+                    from: self.local_node_id,
+                };
+                let bytes = bincode::serialize(&ok).ok()?;
+                Some(Message::AccordApplyOK(Bytes::from(bytes)))
+            }
+
             Message::AccordRecover(b) => {
                 let payload: RecoverPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordRecover: deserialize failed: {e}"))
@@ -315,5 +339,72 @@ impl RpcHandler for AccordHandler {
 
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accord::state_machine::AccordStateMachine;
+    use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
+    use ferrosa_common::accord::{BallotNumber, TxnId, TxnPhase};
+    use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+    fn ts(micros: u64) -> Timestamp {
+        Timestamp::synthetic(micros)
+    }
+
+    /// AccordApplyV2 must apply EVERY write it was sent (the coordinator already
+    /// scoped the payload to this replica's keys) as one atomic write-set,
+    /// advance the txn to Applied, and ack with AccordApplyOK.
+    #[tokio::test]
+    async fn accord_apply_v2_applies_full_writeset_and_acks() {
+        let writer = std::sync::Arc::new(MockSyncWriter::new());
+        let sm = AccordStateMachine::new(1, writer);
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state.clone(), 1);
+
+        let txn_id = TxnId::new(1, ts(1000));
+        // Commit a multi-key txn so the apply has agreed (t, deps) to read.
+        {
+            let mut sm = state.lock();
+            sm.handle_preaccept(txn_id, ts(1000), b"ka", BallotNumber(0), 0);
+            sm.handle_commit(txn_id, ts(1000), ts(1001), vec![]);
+        }
+
+        let payload = ApplyV2Payload {
+            txn_id,
+            writes: vec![
+                WriteSetEntry {
+                    key: b"ka".to_vec(),
+                    mutation: b"mut-a".to_vec(),
+                },
+                WriteSetEntry {
+                    key: b"kb".to_vec(),
+                    mutation: b"mut-b".to_vec(),
+                },
+            ],
+        };
+        let bytes = bincode::serialize(&payload).unwrap();
+
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(2),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let resp = handler
+            .handle(peer, Message::AccordApplyV2(Bytes::from(bytes)))
+            .await;
+
+        // Acked.
+        assert!(
+            matches!(resp, Some(Message::AccordApplyOK(_))),
+            "replica must ack the multi-key apply with AccordApplyOK"
+        );
+        // Both writes applied → txn advanced to Applied exactly once.
+        assert_eq!(
+            state.lock().get_state(&txn_id).unwrap().phase,
+            TxnPhase::Applied,
+            "the multi-key txn must reach Applied after AccordApplyV2"
+        );
     }
 }

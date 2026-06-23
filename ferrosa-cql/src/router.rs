@@ -1388,14 +1388,6 @@ async fn finish_lwt_via_accord(
         Err(AccordDriverError::Codec(msg)) => {
             Err(CqlError::ServerError(format!("Accord codec error: {msg}")))
         }
-        Err(AccordDriverError::MultiKeyNotYetExecutable { keys, replicas }) => {
-            // The single-key LWT path never builds a multi-key write-set, so this
-            // is unreachable here today; surface it loudly rather than silently if
-            // a future caller routes a multi-key transaction through this path.
-            Err(CqlError::ServerError(format!(
-                "Accord multi-key execution not yet wired ({keys} keys, {replicas} replicas)"
-            )))
-        }
     }
 }
 
