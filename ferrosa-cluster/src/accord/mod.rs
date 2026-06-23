@@ -29,6 +29,7 @@ pub mod proptests;
 pub mod recovery;
 pub mod recovery_scenarios;
 pub mod reorder_buffer;
+pub mod shard_quorum;
 pub mod state_machine;
 pub mod test_cluster;
 pub mod two_phase_ddl;
