@@ -101,6 +101,79 @@ impl ShardQuorum {
     }
 }
 
+/// The per-shard participant set for a multi-key transaction.
+///
+/// Built by grouping the write-set's keys by their token-range replica set
+/// (`ring.replicas(token, rf)`): keys whose replica sets are identical share a
+/// shard, and each distinct replica set is one shard. The driver uses `shards`
+/// to seed a [`ShardQuorum`] and to fan out each shard's keys to its replicas,
+/// and `key_shard` to route each write-set entry to the shard that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantSet {
+    /// `shard_id -> the shard's replica host ids` (sorted, deduplicated).
+    pub shards: HashMap<ShardId, Vec<Uuid>>,
+    /// For each input key (by position): the `ShardId` that owns it.
+    pub key_shard: Vec<ShardId>,
+}
+
+impl ParticipantSet {
+    /// Build the participant set from a write-set's keys. `replicas_of(key)`
+    /// returns the replica host ids for that key's token range (the driver wires
+    /// this to `ring.replicas(partitioner.token(key), rf)` mapped to host ids).
+    ///
+    /// Keys with identical replica sets collapse to one shard. `ShardId`s are
+    /// assigned deterministically (by the sorted distinct replica sets), so the
+    /// same write-set always yields the same shard layout.
+    ///
+    /// # Panics
+    /// Panics if `keys` is empty or any key resolves to zero replicas — both
+    /// signal a caller bug (a transaction must write at least one key, and every
+    /// key must have a replica set).
+    pub fn build(keys: &[Vec<u8>], replicas_of: impl Fn(&[u8]) -> Vec<Uuid>) -> Self {
+        assert!(!keys.is_empty(), "write-set must have at least one key");
+
+        // Each key's canonical (sorted, deduped) replica set.
+        let per_key: Vec<Vec<Uuid>> = keys
+            .iter()
+            .map(|k| {
+                let mut r = replicas_of(k);
+                r.sort_unstable();
+                r.dedup();
+                assert!(!r.is_empty(), "key resolved to zero replicas");
+                r
+            })
+            .collect();
+
+        // Distinct replica sets, sorted → stable ShardId = position.
+        let mut distinct: Vec<Vec<Uuid>> = per_key.clone();
+        distinct.sort();
+        distinct.dedup();
+
+        let shards: HashMap<ShardId, Vec<Uuid>> = distinct
+            .iter()
+            .enumerate()
+            .map(|(i, set)| (i as ShardId, set.clone()))
+            .collect();
+        let key_shard: Vec<ShardId> = per_key
+            .iter()
+            .map(|set| {
+                distinct
+                    .iter()
+                    .position(|s| s == set)
+                    .expect("every key's replica set is in the distinct list")
+                    as ShardId
+            })
+            .collect();
+
+        Self { shards, key_shard }
+    }
+
+    /// Seed a [`ShardQuorum`] from this participant set.
+    pub fn quorum(&self) -> ShardQuorum {
+        ShardQuorum::new(&self.shards)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +262,56 @@ mod tests {
             q.all_reached(),
             "the shared node satisfied both shards' quorums"
         );
+    }
+
+    #[test]
+    fn participant_set_collapses_keys_with_identical_replicas_to_one_shard() {
+        let ps = ParticipantSet::build(&[b"a".to_vec(), b"b".to_vec()], |_k| {
+            vec![node(1), node(2), node(3)]
+        });
+        assert_eq!(ps.shards.len(), 1, "shared replica set → one shard");
+        assert_eq!(ps.key_shard, vec![0, 0]);
+    }
+
+    #[test]
+    fn participant_set_distinct_replica_sets_become_distinct_shards() {
+        let ps = ParticipantSet::build(&[b"a".to_vec(), b"b".to_vec()], |k| {
+            if k == b"a" {
+                vec![node(1), node(2), node(3)]
+            } else {
+                vec![node(4), node(5), node(6)]
+            }
+        });
+        assert_eq!(ps.shards.len(), 2);
+        assert_ne!(
+            ps.key_shard[0], ps.key_shard[1],
+            "a and b in different shards"
+        );
+
+        // Quorum in only ONE shard must not satisfy the whole txn.
+        let mut q = ps.quorum();
+        for r in &ps.shards[&ps.key_shard[0]] {
+            q.record_node_ack(*r);
+        }
+        assert!(!q.all_reached(), "the other shard is still unmet");
+    }
+
+    #[test]
+    fn participant_set_overlapping_but_unequal_sets_are_distinct_shards() {
+        let ps = ParticipantSet::build(&[b"a".to_vec(), b"b".to_vec()], |k| {
+            if k == b"a" {
+                vec![node(1), node(2), node(3)]
+            } else {
+                vec![node(3), node(4), node(5)] // shares node 3, not identical
+            }
+        });
+        assert_eq!(ps.shards.len(), 2, "overlap ≠ identical → 2 shards");
+    }
+
+    #[test]
+    fn participant_set_dedups_replicas_within_a_key() {
+        let ps = ParticipantSet::build(&[b"a".to_vec()], |_k| vec![node(1), node(1), node(2)]);
+        assert_eq!(ps.shards[&0].len(), 2, "duplicate replica deduped → rf=2");
     }
 
     use proptest::prelude::*;
