@@ -4,10 +4,14 @@ name: Nightly Multi-DC Jepsen Tier
 # the bank workload at QUORUM under `dc-partition + dc-slow` for
 # 1 hour. Failure files a GitHub issue tagged sprint-7.
 #
-# The Ferrosa server image is NOT built from source here. We consume the
-# nightly .deb produced by the 00:17 UTC nightly-release workflow to avoid
-# compiling the workspace 6 times on a single hosted runner, which was causing
-# exit-143 runner terminations (OOM/eviction) before the workload started.
+# 12-factor build/release/run separation: NOTHING is compiled in the job that
+# runs Docker.
+#   - the SERVER nodes run the nightly `.deb` (pre-built artifact);
+#   - the `ferrosa-jepsen` DRIVER is compiled ONCE in the `build-driver` job and
+#     passed to the run job as an artifact.
+# The run job only downloads binaries and exercises them — no cargo, no
+# `compose --build`. Compiling the workspace alongside 6 node containers on one
+# hosted runner is what caused the chronic exit-143 (OOM) runner terminations.
 
 on:
   schedule:
@@ -26,20 +30,16 @@ permissions:
   issues: write
 
 jobs:
-  tier-multi-dc:
-    name: tier-multi-dc 1h bank workload (T3)
+  # ── Build phase: compile the jepsen driver ONCE (no Docker here) ─────────
+  build-driver:
+    name: Build ferrosa-jepsen driver (once)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-
       - name: Validate tier-multi-dc wiring (config-only)
         run: |
           set -o pipefail
@@ -48,15 +48,39 @@ jobs:
             -- tier_multi_dc_resolves_to_t3 \
                dc_partition_plus_dc_slow_nemesis_registered \
             2>&1 | tee tier-config.log
-
-      # Build the workload binary up front, BEFORE bring-up, so the workload
-      # step does not compile under load alongside the 6 node containers.
-      # The previous runs died ~30s into the workload step with exit 143
-      # (hosted-runner SIGTERM) — a `cargo run` that still had to link the
-      # release binary while 6 containers churned CPU/RAM is a prime OOM/eviction
-      # trigger. Pre-building keeps the heavy compile isolated and cached.
-      - name: Pre-build workload binary (before bring-up, avoids rebuild under load)
+      - name: Build the jepsen driver binary
         run: cargo build --release -p ferrosa-jepsen
+      - name: Stage the driver artifact (flat layout)
+        # Stage into one dir so the artifact has the binary + log at its ROOT
+        # (uploading the two source paths directly would preserve
+        # target/release/... relative to the repo root).
+        run: |
+          mkdir -p dist-driver
+          cp target/release/ferrosa-jepsen dist-driver/
+          cp tier-config.log dist-driver/
+      - name: Upload the driver binary (+ config log) as an artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-jepsen-driver
+          path: dist-driver
+          retention-days: 7
+
+  # ── Run phase: Docker only. Download the .deb image + the driver, run. ───
+  tier-multi-dc:
+    name: tier-multi-dc 1h bank workload (T3)
+    needs: build-driver
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download the prebuilt jepsen driver
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-jepsen-driver
+          path: driver
+      - name: Make the driver executable
+        run: chmod +x driver/ferrosa-jepsen
 
       - name: Download nightly Ferrosa .deb
         id: nightly_deb
@@ -64,7 +88,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Ferrosa nightly runtime image
+      - name: Build Ferrosa nightly runtime image (from the .deb, no source build)
         run: |
           set -euo pipefail
           cp "${{ steps.nightly_deb.outputs.deb_path }}" tests/ferrosa.deb
@@ -76,15 +100,15 @@ jobs:
           FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
         run: |
           set -euo pipefail
+          # --no-build (fail loud, never compile): the node services carry a
+          # `build:` block (root Dockerfile, from source), so `up --build` would
+          # RECOMPILE the whole ferrosa workspace and overwrite the .deb image.
+          # Plain `up -d --no-build` runs the pre-built FERROSA_NIGHTLY_IMAGE.
           docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
-            up -d --build
+            up -d --no-build
           # Wait for the first node in each DC to report ready on /health
-          # (leader-aware: in Forming/Cluster mode this is 503 until a Raft
-          # leader is elected, so a green probe means the DC actually formed).
-          # Fail-loud: if 60 tries (~120s) elapse without both DCs ready, dump
-          # node logs and `exit 1` so a genuine non-formation is caught instead
-          # of silently sailing into the workload step (the old loop's trailing
-          # `sleep` always succeeded, so the step could never fail).
+          # (leader-aware: 503 until a Raft leader is elected, so a green probe
+          # means the DC actually formed). Fail loud after ~120s.
           ready=0
           for i in $(seq 1 60); do
             if curl -sf http://localhost:29090/health >/dev/null \
@@ -101,20 +125,33 @@ jobs:
             exit 1
           fi
 
-      - name: Run tier-multi-dc 1h bank workload
+      - name: Run tier-multi-dc 1h bank workload (prebuilt driver, no compile)
         env:
           FERROSA_TEST_CONTAINERS: '1'
         run: |
           set -o pipefail
-          cargo run --release -p ferrosa-jepsen -- \
+          # Live resource monitor streamed to the Actions log (captured
+          # server-side, so it survives an exit-143 runner termination — the
+          # on-runner "Diagnostics on failure" step does NOT run when the host
+          # kills the runner). Prints host mem/disk + per-container mem every 5s.
+          ( while true; do
+              printf '[mon %s] ' "$(date +%T)"
+              free -m | awk '/Mem:/{printf "host_mem=%d/%dMB ", $3, $2}'
+              df -m / | awk 'NR==2{printf "disk_free=%dMB ", $4}'
+              docker stats --no-stream --format '{{.Name}}:{{.MemUsage}}' 2>/dev/null | tr '\n' ' '
+              echo
+              sleep 5
+            done ) &
+          MON=$!
+          trap 'kill "$MON" 2>/dev/null || true' EXIT
+          ./driver/ferrosa-jepsen \
             run \
             --tier multi-dc \
             --output-dir ./jepsen-out \
             2>&1 | tee tier-multi-dc.log
 
-      # Capture runner + container resource state on ANY failure so the next
-      # red run proves OOM-vs-other (the exit-143 evidence aged out before this
-      # could be confirmed). Best-effort: never fails the job itself.
+      # Capture runner + container resource state on ANY failure so a red run
+      # proves OOM-vs-other. Best-effort: never fails the job itself.
       - name: Diagnostics on failure (resource + container state)
         if: failure()
         run: |
@@ -135,7 +172,7 @@ jobs:
         with:
           name: tier-multi-dc-logs
           path: |
-            tier-config.log
+            driver/tier-config.log
             tier-multi-dc.log
             compose-logs.txt
             jepsen-out/
@@ -156,7 +193,7 @@ jobs:
           script: |
             const fs = require('fs');
             let body = '## Nightly tier-multi-dc Jepsen run failed\n\n';
-            for (const f of ['tier-config.log', 'tier-multi-dc.log']) {
+            for (const f of ['driver/tier-config.log', 'tier-multi-dc.log']) {
               if (fs.existsSync(f)) {
                 const txt = fs.readFileSync(f, 'utf8').slice(-3000);
                 body += '### ' + f + '\n```\n' + txt + '\n```\n';
