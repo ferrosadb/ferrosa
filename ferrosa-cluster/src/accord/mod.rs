@@ -12,6 +12,8 @@ pub mod cross_dc_adapter;
 pub mod cross_shard;
 pub mod ddl_drain;
 pub mod dep_wait;
+#[cfg(test)]
+mod driver_cross_shard_e2e;
 pub mod durability;
 pub mod electorate;
 pub mod epoch;
