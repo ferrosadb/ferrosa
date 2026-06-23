@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::accord::transport::AccordTransport;
 use bytes::Bytes;
 use ferrosa_common::accord::{BallotNumber, HybridLogicalClock, Timestamp, TxnId};
 use ferrosa_net::codec::Lane;
@@ -433,7 +434,8 @@ pub type ConditionGate = Box<dyn Fn(Option<&[u8]>) -> bool + Send + Sync>;
 /// The driver is single-use: one instance per transaction.
 pub struct AccordCoordinatorDriver {
     coordinator: AccordCoordinator,
-    peers: Arc<PeerManager>,
+    /// Network seam: `PeerManager` in production, a mock in tests.
+    peers: Arc<dyn AccordTransport>,
     /// IDs of the replicas for this transaction's token range.
     replica_ids: Vec<uuid::Uuid>,
     /// UUID of this coordinator node (used to identify self-sends).
@@ -576,6 +578,30 @@ impl AccordCoordinatorDriver {
         node_id: u64,
         replica_ids: Vec<uuid::Uuid>,
         peers: Arc<PeerManager>,
+        is_leaseholder: bool,
+        clock: &HybridLogicalClock,
+        write_set: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
+        // Coerce the concrete PeerManager into the transport seam; all driver
+        // logic is shared with the test-injectable `new_multi_with_transport`.
+        let transport: Arc<dyn AccordTransport> = peers;
+        Self::new_multi_with_transport(
+            node_id,
+            replica_ids,
+            transport,
+            is_leaseholder,
+            clock,
+            write_set,
+        )
+    }
+
+    /// Like [`Self::new_multi`] but takes the [`AccordTransport`] seam directly,
+    /// so tests can inject a mock that returns controllable per-node responses
+    /// (exercising the multi-node Commit/Apply quorum logic without a network).
+    pub(crate) fn new_multi_with_transport(
+        node_id: u64,
+        replica_ids: Vec<uuid::Uuid>,
+        peers: Arc<dyn AccordTransport>,
         is_leaseholder: bool,
         clock: &HybridLogicalClock,
         write_set: Vec<(Vec<u8>, Vec<u8>)>,

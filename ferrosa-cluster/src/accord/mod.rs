@@ -32,6 +32,7 @@ pub mod reorder_buffer;
 pub mod shard_quorum;
 pub mod state_machine;
 pub mod test_cluster;
+pub mod transport;
 pub mod two_phase_ddl;
 pub mod uda_integration;
 pub(crate) mod wire;
