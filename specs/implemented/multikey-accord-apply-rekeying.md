@@ -1,5 +1,6 @@
-# TODO · P1 · Multi-key Accord apply re-keying by `(txn_id, key)`
+# IMPLEMENTED · P1 · Multi-key Accord apply re-keying by `(txn_id, key)`
 
+**Updated:** 2026-06-23 (steps 1–4 implemented in-process; awaiting CI cross-shard e2e verification)
 **Branch:** `feat/accord-multikey-execution` (off main; foundations already committed)
 **Phase:** Accord multi-key transactions — Phase 2-execution + Phase 3 (fused)
 **Risk:** DATA-LOSS-CRITICAL. The failure mode is *silently dropped writes* in the
@@ -84,3 +85,50 @@ is already done + proven (PR #182); this is the remaining execution path.
 Steps 1–4 landed, in-process tests green, **and** the CI cross-shard e2e
 (`t_afa3ee86`) green. That last gate is what makes multi-key Accord genuinely
 done — not the in-process tests alone.
+
+## Implementation notes (2026-06-23)
+
+Implemented via TDD (RED→GREEN per step) with added BDD scenarios + property tests.
+
+**Deliberate strengthening of Step 2 — atomic write-set apply.** The spec's literal
+Step 1/2 describes a per-key apply *loop* with per-`(txn,key,t)` idempotency. As
+written, if key A persists and key B then fails, the loop returns A's entry →
+`handle_apply` marks the txn `Applied` → **B is silently lost** with no retry signal.
+Per the requester's explicit choice ("all-or-nothing batch"), `apply_writeset` instead
+decodes + preflights every partition and commits them in ONE atomic `apply_batch`
+(`write_atomic_batch` preflights all target tables before appending any commit-log
+record), so a failure on any key persists none. Idempotency still keyed by
+`(txn_id, partition_key, t)`; already-applied keys are filtered before the batch.
+
+**Fan-out shape — per-replica filtered payload.** The coordinator builds a distinct
+`AccordApplyV2` per replica scoped to only that replica's owned keys
+(`apply_v2_messages` + `quorum_broadcast_per_peer`), and the replica applies what it
+was sent — matching the existing "coordinator scopes, replica trusts" invariant
+(the v1 `AccordApply` handler does no ownership filtering). This avoids plumbing a
+ring/strategy into `AccordHandler`. Per-key replica resolution is an injected seam
+(`with_per_key_replicas`); `None` = single shard (every replica owns every key). The
+driver is not yet constructed in the live CQL path, so production wiring of the ring
+resolver into the driver is the broader Phase-2 follow-up the CI e2e covers.
+
+**Conflict-ordering limitation (unchanged from spec).** PreAccept/Accept still order
+on the representative first key; full per-key `PreAcceptV2` dep union is a follow-up.
+
+**Removed:** `AccordDriverError::MultiKeyNotYetExecutable` (the fail-loud guard) and
+its references in `accord_nemesis.rs`.
+
+**Public API added:** `StorageApplier::apply_writeset`,
+`DepWaitApplier::try_apply_writeset`, `AccordStateMachine::handle_apply_writeset`,
+`AccordCoordinatorDriver::with_per_key_replicas`, the `Message::AccordApplyV2`
+inbound handler (registered in `controller/cluster.rs`). `ApplyMutation` now derives
+`Clone`.
+
+**Tests:** unit (apply/state_machine/handlers/coordinator), 2 BDD scenarios, 3
+property tests (`prop_multikey_dag_applies_every_write_exactly_once_in_dep_order`,
+`prop_idempotent_replay_converges_to_highest_agreed_t`,
+`prop_writeset_apply_is_atomic_all_or_nothing`). `cargo test -p ferrosa-cluster`,
+`clippy --all-targets`, `fmt` green. Cross-shard e2e (`t_afa3ee86`) remains the
+final CI gate.
+
+**Follow-ups (deferred):** (1) wire `AccordCoordinatorDriver` + ring resolver into
+the live CQL execution path; (2) full per-key `PreAcceptV2` dependency union for
+multi-shard conflict ordering.

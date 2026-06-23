@@ -122,16 +122,24 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   dependencies have applied locally (otherwise it parks and the cascade applies
   it in order).
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
-- `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam, idempotent on
-  `(txn_id, t)`) + `EngineStorageApplier`/`EngineStorageReader` (real persistence
-  and linearizable read-at-`t`).
-- `wire.rs` — bincode payloads for each protocol message. **Multi-key (Phase 1):**
+- `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
+  `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
+  read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`
+  parks a transaction's WHOLE write-set and applies every key on resolve;
+  `StorageApplier::apply_writeset` commits all of a txn's partitions in ONE atomic
+  `apply_batch` (all-or-nothing — a failure on any key persists none); idempotency
+  is keyed by `(txn_id, partition_key, t)` so writes 2..N of one transaction are
+  never deduped/dropped.
+- `wire.rs` — bincode payloads for each protocol message. **Multi-key:**
   `WriteSetEntry` + `ApplyV2Payload` back the additive `AccordPreAcceptV2`/
   `AccordApplyV2` wire codes; `AccordCoordinatorDriver::new_multi(write_set)` is
   the multi-key constructor (`new` is the one-entry degenerate case). Multi-key
-  *execution* fails loud (`AccordDriverError::MultiKeyNotYetExecutable`) until the
-  participant set/per-shard quorum (Phase 2) and `(txn_id, key)` apply keying
-  (Phase 3) land — never a silently-dropped write.
+  *execution is wired*: `run_transaction` drops the old fail-loud guard, builds a
+  per-shard participant (`ParticipantSet::from_per_key` via the
+  `with_per_key_replicas` resolver) and fans a per-replica `AccordApplyV2`
+  (scoped to each replica's owned keys) out under per-shard quorum. Conflict
+  ordering still uses the representative first key (full per-key `PreAcceptV2` dep
+  union is a documented follow-up).
 - `dep_wait.rs` — waits-for graph with deterministic cycle-breaking.
 - `cross_shard.rs` / `cross_dc_adapter.rs` — multi-shard atomicity, cross-DC glue.
 - `electorate.rs` / `epoch.rs` — JoinElectorate membership gates, epoch tracking.

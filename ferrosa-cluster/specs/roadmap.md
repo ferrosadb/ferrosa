@@ -19,12 +19,32 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   codes (round-trip tested in `ferrosa-net`), and
   `AccordCoordinatorDriver::new_multi(write_set)` (with `new` delegating as the
   one-entry degenerate case) so the CQL/Postgres front-ends can be built against
-  the API in parallel. Multi-key *execution* is **deliberately fail-loud for now**
-  (`AccordDriverError::MultiKeyNotYetExecutable`): a `(txn_id, t)`-idempotent
-  applier would no-op writes 2..N of one transaction, so correct multi-key apply
-  needs the participant-set/per-shard quorum (Phase 2) and the `(txn_id, key)`
-  apply keying (Phase 3) before it can run — fail loud rather than silently drop
-  writes. Single-key LWT is unchanged.
+  the API in parallel. Single-key LWT is unchanged.
+- **Multi-key Accord — execution wired (Phase 2/3, re-keyed apply).** The
+  fail-loud `MultiKeyNotYetExecutable` guard is **removed**; multi-key
+  transactions now execute end-to-end in-process:
+  - `DepWaitApplier::try_apply_writeset` parks a transaction's WHOLE write-set
+    (`pending: HashMap<TxnId, Vec<ApplyMutation>>`) and applies every key on
+    resolve — no write 2..N is dropped while parked.
+  - `StorageApplier::apply_writeset` commits all of a txn's partitions through ONE
+    atomic `apply_batch` (all-or-nothing: a failure on any key persists none —
+    chosen over the spec's per-key loop to guarantee no torn multi-key apply).
+  - `EngineStorageApplier` idempotency is keyed by `(txn_id, partition_key, t)`
+    (was `(txn_id, t)`), so same-`t` writes to different keys of one txn each
+    persist instead of being deduped.
+  - `AccordStateMachine::handle_apply_writeset` dedups the per-write applied list
+    by `TxnId`, so the protocol-log marker is fsynced / the txn advanced to
+    `Applied` exactly once (not once per key).
+  - `run_transaction` builds a per-shard participant
+    (`ParticipantSet::from_per_key` via the `with_per_key_replicas` resolver) and
+    fans a per-replica `AccordApplyV2` (scoped to each replica's owned keys) out
+    under per-shard quorum; the `AccordApplyV2` inbound handler applies the
+    write-set it was sent. Conflict ordering still uses the representative first
+    key — full per-key `PreAcceptV2` dep union is the remaining follow-up.
+  - In-process verified (DepWait/engine/state-machine/handler/coordinator unit +
+    BDD + property tests for no-lost-write/exactly-once, dep-order, idempotent
+    replay, atomic visibility). The live cross-shard bank-transfer e2e is the
+    CI gate (`t_afa3ee86`).
 - **Replica apply path is now dep-ordered (Phase 0, t_59629c9b).** `handle_apply`
   used to call the storage applier **directly**, ignoring the transaction's
   dependency set — so an `Apply(B)` delivered before its dependency `A` applied
