@@ -138,8 +138,9 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   per-shard participant (`ParticipantSet::from_per_key` via the
   `with_per_key_replicas` resolver) and fans a per-replica `AccordApplyV2`
   (scoped to each replica's owned keys) out under per-shard quorum. Conflict
-  ordering still uses the representative first key (full per-key `PreAcceptV2` dep
-  union is a documented follow-up).
+  ordering unions dependencies across ALL keys: PreAccept fans `AccordPreAcceptV2`
+  (every key) so each replica registers the txn under all its keys and returns the
+  dep union, serializing transactions that overlap on a non-first key (t_276e12).
 - `dep_wait.rs` — waits-for graph with deterministic cycle-breaking.
 - `cross_shard.rs` / `cross_dc_adapter.rs` — multi-shard atomicity, cross-DC glue.
 - `electorate.rs` / `epoch.rs` — JoinElectorate membership gates, epoch tracking.

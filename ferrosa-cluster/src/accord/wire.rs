@@ -97,6 +97,22 @@ pub(crate) struct ApplyV2Payload {
     pub(crate) writes: Vec<WriteSetEntry>,
 }
 
+/// PreAccept request for a multi-key transaction.
+///
+/// Carries every partition key the transaction writes so the replica registers
+/// the txn under all of them and returns the UNION of dependencies across keys
+/// (t_276e12). The single-key [`PreAcceptPayload`] is the degenerate one-key
+/// case, kept byte-identical for single-partition LWT.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PreAcceptV2Payload {
+    pub(crate) txn_id: TxnId,
+    pub(crate) t0: Timestamp,
+    /// All partition keys the transaction writes (conflict-ordering keys).
+    pub(crate) keys: Vec<Vec<u8>>,
+    pub(crate) ballot: BallotNumber,
+    pub(crate) epoch: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Replica → Coordinator
 // ---------------------------------------------------------------------------

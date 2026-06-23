@@ -1150,6 +1150,8 @@ impl ModeController {
             self.registry
                 .register(MsgType::AccordPreAccept, accord_handler.clone());
             self.registry
+                .register(MsgType::AccordPreAcceptV2, accord_handler.clone());
+            self.registry
                 .register(MsgType::AccordAccept, accord_handler.clone());
             self.registry
                 .register(MsgType::AccordCommit, accord_handler.clone());

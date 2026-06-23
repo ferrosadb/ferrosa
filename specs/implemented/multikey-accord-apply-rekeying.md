@@ -110,8 +110,13 @@ ring/strategy into `AccordHandler`. Per-key replica resolution is an injected se
 driver is not yet constructed in the live CQL path, so production wiring of the ring
 resolver into the driver is the broader Phase-2 follow-up the CI e2e covers.
 
-**Conflict-ordering limitation (unchanged from spec).** PreAccept/Accept still order
-on the representative first key; full per-key `PreAcceptV2` dep union is a follow-up.
+**Conflict ordering — per-key dependency union (RESOLVED, t_276e12).** PreAccept now
+fans `AccordPreAcceptV2` carrying every key; each replica registers the txn under all
+its keys and returns the UNION of dependencies across them (`handle_preaccept_multi`),
+bumping `t` past the max conflict on any key. This serializes transactions that overlap
+on a non-representative key. Single-key LWT keeps the v1 `AccordPreAccept` wire path
+byte-identical. The representative first key is retained only for the single-key
+ReadVote (LWT IF-read).
 
 **Removed:** `AccordDriverError::MultiKeyNotYetExecutable` (the fail-loud guard) and
 its references in `accord_nemesis.rs`.
