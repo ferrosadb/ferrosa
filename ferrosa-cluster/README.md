@@ -60,6 +60,14 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 ### Coordination (`coordinator/`, `consistency.rs`, `write_path.rs`)
 - `ConsistencyLevel` — full CQL CL set incl. `Serial`/`LocalSerial`; `block_for` /
   `block_for_dc` quorum math, wire + string codecs.
+- `write_path.rs` — the front-end-facing replica-placement boundary (ADR-021):
+  `replicas_for_key(token, strategy)` and `accord_replicas_for_key(key,
+  replication)` resolve a key's RF replica host ids from the ring in cluster
+  mode (`None` outside it, so the caller keeps its local/all-peers fallback;
+  `Err` on an unparseable strategy). The CQL/Postgres LWT/Accord paths pass raw
+  key bytes + keyspace replication and never touch the partitioner or ring — the
+  CQL LWT path (`route_lwt_via_accord`) uses this for token-aware, RF-correct
+  participant sets instead of replicating every key to every connected peer.
 - `coordinator/write.rs` — replica fan-out with `cl.block_for(rf)` ack threshold,
   NTS / `LOCAL_QUORUM` / `EACH_QUORUM` per-DC variants, hinted handoff for failed
   replicas, post-quorum hint drain, lazy mutation encoding.

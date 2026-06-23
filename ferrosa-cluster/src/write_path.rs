@@ -815,6 +815,28 @@ impl WritePath {
         }
     }
 
+    /// Resolve the Accord participant replica **host ids** that own a partition
+    /// `key` under the keyspace `replication`, computing the key's token and
+    /// parsing the strategy here so the CQL/Postgres front-ends pass raw key
+    /// bytes + keyspace metadata and never touch the partitioner or ring
+    /// (ADR-021).
+    ///
+    /// - `Ok(Some(replicas))` in **cluster** mode — the RF replicas owning the
+    ///   key's token (a proper subset of the cluster when RF < node count).
+    /// - `Ok(None)` outside cluster mode (no ring) — the caller falls back to
+    ///   its local/all-live-peers participant set.
+    /// - `Err(_)` if `replication` cannot be parsed into a strategy — fail loud
+    ///   rather than silently resolving to an empty/default set.
+    pub fn accord_replicas_for_key(
+        &self,
+        key: &[u8],
+        replication: &ferrosa_schema::metadata::keyspace::ReplicationParams,
+    ) -> Result<Option<Vec<uuid::Uuid>>, crate::ring::strategy::StrategyParseError> {
+        let strategy = crate::ring::strategy::ReplicationStrategy::try_from(replication)?;
+        let token = ferrosa_common::Token::from_key(key).0;
+        Ok(self.replicas_for_key(token, &strategy))
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
@@ -1167,6 +1189,120 @@ mod tests {
             projected_body.contains("local_projected_range_stream")
                 && projected_body.contains("coordinate_range_read_projected_stream_all_with"),
             "projected scans must expose a stream and fail clearly when cluster semantics would under-read"
+        );
+    }
+
+    // ── Accord per-key replica resolution (ADR-021) ───────────────────────────
+    // The write path owns replica placement; the CQL/PG front-ends ask it for a
+    // key's Accord participant set rather than resolving the ring themselves.
+
+    fn simple_replication(rf: usize) -> ferrosa_schema::metadata::keyspace::ReplicationParams {
+        ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                rf.to_string(),
+            )]),
+        }
+    }
+
+    fn ring_node(addr: &str) -> crate::raft::NodeInfo {
+        crate::raft::NodeInfo {
+            host_id: uuid::Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: crate::raft::NodeState::Normal,
+            cql_broadcast: None,
+        }
+    }
+
+    #[test]
+    fn accord_replicas_for_key_is_none_outside_cluster_mode() {
+        // Standalone/pair/degraded modes have no ring, so the resolver yields
+        // None and the caller falls back to its local/all-live-peers set rather
+        // than guessing a placement.
+        let params = simple_replication(3);
+        assert_eq!(
+            WritePath::unavailable()
+                .accord_replicas_for_key(b"some-partition-key", &params)
+                .expect("a valid strategy parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn accord_replicas_for_key_fails_loud_on_bad_strategy() {
+        // An unparseable replication strategy must surface an error, never
+        // silently resolve to an empty/default replica set (fail loud).
+        let params = ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "NoSuchStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        assert!(
+            WritePath::unavailable()
+                .accord_replicas_for_key(b"k", &params)
+                .is_err(),
+            "unknown replication strategy must fail loud"
+        );
+    }
+
+    #[test]
+    fn accord_replicas_for_key_resolves_rf_subset_in_cluster_mode() {
+        // Token-aware: over a 3-node ring with RF=2, a key resolves to exactly
+        // its two owning replicas — a proper subset of the cluster, not "all
+        // live peers". This is what makes the live Accord path RF-correct.
+        use ferrosa_net::peer::{PeerEventListener, PeerManager};
+        use ferrosa_net::rpc::handler::PeerId;
+
+        struct NoopListener;
+        impl PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: PeerId) {}
+            fn on_peer_disconnected(&self, _: PeerId) {}
+            fn on_peer_suspected(&self, _: PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let mut ring = crate::ring::TokenRing::new();
+        let n1 = ring_node("10.0.0.1:7000");
+        let n2 = ring_node("10.0.0.2:7000");
+        let n3 = ring_node("10.0.0.3:7000");
+        let members = [n1.host_id, n2.host_id, n3.host_id];
+        ring.add_node(1, n1);
+        ring.add_node(2, n2);
+        ring.add_node(3, n3);
+        ring.assign_tokens(1, &[-3_000_000_000_000_000_000]);
+        ring.assign_tokens(2, &[0]);
+        ring.assign_tokens(3, &[3_000_000_000_000_000_000]);
+
+        let coordinator = ClusterCoordinator::new(
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            std::sync::Arc::new(PeerManager::new(
+                std::sync::Arc::new(ferrosa_net::config::NetConfig::default()),
+                uuid::Uuid::new_v4(),
+                std::sync::Arc::new(NoopListener),
+            )),
+            1,
+            storage,
+            2,
+            ConsistencyLevel::One,
+        );
+        let write_path = WritePath::cluster(std::sync::Arc::new(coordinator));
+
+        let params = simple_replication(2);
+        let replicas = write_path
+            .accord_replicas_for_key(b"some-partition-key", &params)
+            .expect("a valid strategy parses")
+            .expect("cluster mode resolves a concrete replica set");
+
+        assert_eq!(replicas.len(), 2, "RF=2 → exactly two owning replicas");
+        assert!(
+            replicas.iter().all(|r| members.contains(r)),
+            "every resolved replica must be a ring member"
         );
     }
 }
