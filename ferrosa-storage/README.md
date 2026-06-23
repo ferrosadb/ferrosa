@@ -46,6 +46,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
+- **Full-text search** (`fulltext_search`) — searches the memtable FTI + each
+  per-SSTable `-FTI-{index}.db` sidecar, and **falls back to scanning any live
+  SSTable whose sidecar is transiently missing** (the async index-rebuild window
+  after compaction), so a stable row is never dropped from `fts_match`
+  (BUG-F-007 / t_0455c0a1).
 - **Snapshot / PITR** (`snapshot/`, `restore/`, `commitlog/archiver.rs`) —
   S3 snapshot manager, commit-log archiving, restore manager with validation.
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows

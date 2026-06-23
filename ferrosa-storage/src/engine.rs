@@ -5760,7 +5760,7 @@ impl StorageEngine {
         query: &str,
     ) -> ferrosa_common::Result<Vec<Vec<u8>>> {
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let table_dir = self
             .config
@@ -5769,19 +5769,23 @@ impl StorageEngine {
             .join(table_id.to_string());
         let fti_suffix = format!("-FTI-{index_name}.db");
 
-        let fti_files: Vec<std::path::PathBuf> = std::fs::read_dir(&table_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                if name.ends_with(&fti_suffix) {
-                    Some(e.path())
-                } else {
-                    None
+        // Collect the on-disk FTI sidecar files AND the set of SSTable
+        // generations they cover, so we can fall back to scanning any LIVE
+        // SSTable that is (transiently) missing its sidecar — e.g. during the
+        // async index rebuild window after compaction (BUG-F-007 / t_0455c0a1).
+        let mut fti_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut covered_gens: HashSet<String> = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&table_dir) {
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some(gen) = name.strip_suffix(&fti_suffix) {
+                    covered_gens.insert(gen.to_string());
+                    fti_files.push(e.path());
                 }
-            })
-            .collect();
+            }
+        }
 
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
         {
@@ -5824,6 +5828,25 @@ impl StorageEngine {
                 let entry = score_map.entry(hit.partition_key).or_insert(0.0);
                 if hit.score > *entry {
                     *entry = hit.score;
+                }
+            }
+        }
+
+        // Fallback: scan any LIVE SSTable whose on-disk FTI sidecar is missing
+        // (the transient compaction / async-rebuild window) so a stable row is
+        // never dropped from full-text search (BUG-F-007 / t_0455c0a1).
+        {
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(table_id) {
+                for (partition_key, score) in state.store.fulltext_sstable_scan_missing_sidecar(
+                    index_name,
+                    query,
+                    &covered_gens,
+                )? {
+                    let entry = score_map.entry(partition_key).or_insert(0.0);
+                    if score > *entry {
+                        *entry = score;
+                    }
                 }
             }
         }
@@ -18366,6 +18389,79 @@ mod tests {
             keys,
             vec!["doc_0000".to_string()],
             "fts_match must still find the probe row after compaction (compaction must rebuild the FTI sidecar)"
+        );
+    }
+
+    /// Regression for t_0455c0a1 (BUG-F-007, read-side robustness): a live
+    /// SSTable whose on-disk `-FTI-{index}.db` sidecar is MISSING — e.g. during
+    /// the window after compaction swaps in the merged SSTable but before its
+    /// FTI sidecar is (re)built (the eager index build is async in production),
+    /// or after a transient sidecar build/write failure — must NOT make the
+    /// SSTable's rows invisible to `fts_match`. The row's text lives in the
+    /// SSTable data; `fulltext_search` must fall back to scanning a sidecar-less
+    /// SSTable so a stable row is never transiently dropped from full-text
+    /// search. (On a multi-node cluster, every replica hitting this window at
+    /// once made the scatter-gather union empty → non-deterministic 0 rows.)
+    #[tokio::test]
+    async fn fts_match_finds_row_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        const PROBE: &str = "ferrosaftssidecarmissing";
+        let key = make_key("doc_0000");
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(format!("{PROBE} distributed database").as_bytes(), 1),
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Sanity: found via the freshly written FTI sidecar.
+        assert_eq!(
+            engine
+                .fulltext_search(&tid, "idx_body", PROBE)
+                .unwrap()
+                .len(),
+            1,
+            "probe must be found via the FTI sidecar right after flush"
+        );
+
+        // Simulate the missing-sidecar window: delete every on-disk FTI sidecar
+        // for this index. The SSTable data files are left untouched.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&table_dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .contains("-FTI-idx_body")
+            {
+                std::fs::remove_file(entry.path()).unwrap();
+                removed += 1;
+            }
+        }
+        assert!(
+            removed > 0,
+            "test must have deleted at least one FTI sidecar"
+        );
+
+        // The row MUST still be found — a missing sidecar cannot hide a live row.
+        let hits = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let keys: Vec<String> = hits
+            .iter()
+            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["doc_0000".to_string()],
+            "fts_match must find the row even when its SSTable has no FTI sidecar"
         );
     }
 
