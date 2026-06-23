@@ -379,21 +379,6 @@ pub enum AccordDriverError {
     },
     /// F+1 apply acknowledgements were not received within the timeout.
     ApplyQuorumUnavailable,
-    /// A multi-key (multi-partition) transaction was driven, but multi-key
-    /// *execution* is not yet wired: the multi-shard participant set + per-shard
-    /// quorum (Phase 2) and the multi-key replica apply with `(txn_id, key)`
-    /// idempotency keying (Phase 3) are still to come. Until then a multi-key
-    /// write-set fails loud here rather than silently dropping writes — both over
-    /// the single-key wire (remote) and at the `(txn_id, t)`-idempotent applier
-    /// (which would no-op writes 2..N of one transaction at the same agreed `t`).
-    /// The additive V2 wire + `new_multi` API exist now so the front-ends can be
-    /// built against them in parallel.
-    MultiKeyNotYetExecutable {
-        /// Number of keys in the write-set.
-        keys: usize,
-        /// Number of replicas in the participant list.
-        replicas: usize,
-    },
 }
 
 impl std::fmt::Display for AccordDriverError {
@@ -404,11 +389,6 @@ impl std::fmt::Display for AccordDriverError {
             Self::Codec(e) => write!(f, "Accord codec error: {e}"),
             Self::ConditionNotMet { .. } => write!(f, "Accord LWT condition not met"),
             Self::ApplyQuorumUnavailable => write!(f, "Accord apply quorum unavailable"),
-            Self::MultiKeyNotYetExecutable { keys, replicas } => write!(
-                f,
-                "multi-key Accord execution not yet wired: {keys} keys across {replicas} replicas \
-                 (additive V2 wire + new_multi exist; fan-out is Phase 2, multi-key apply is Phase 3)"
-            ),
         }
     }
 }
@@ -457,10 +437,10 @@ pub struct AccordCoordinatorDriver {
     /// The transaction's full write-set: one `(key, mutation)` entry per
     /// partition written. A single-key transaction (the [`Self::new`] path) has
     /// exactly one entry whose `mutation` equals [`Self::mutation`] above; a
-    /// multi-key transaction ([`Self::new_multi`]) has several. The coordinator's
-    /// own-replica Apply iterates this set so every key it owns is persisted.
-    /// Multi-shard fan-out over this set is Phase 2/3 (see
-    /// [`AccordDriverError::MultiKeyNotYetExecutable`]).
+    /// multi-key transaction ([`Self::new_multi`]) has several. The Apply phase
+    /// fans a per-replica [`Message::AccordApplyV2`](ferrosa_net::Message) (scoped
+    /// to each replica's owned keys via [`Self::with_per_key_replicas`]) over this
+    /// set, and the coordinator's own-replica Apply persists the keys it owns.
     write_set: Vec<crate::accord::wire::WriteSetEntry>,
     /// How replicas should answer the Gap-4 read-vote: existence semantics for
     /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
@@ -510,6 +490,20 @@ pub struct AccordCoordinatorDriver {
     /// callers that have no generic predicate. Set via
     /// [`Self::with_condition_gate`].
     condition_gate: Option<ConditionGate>,
+    /// Per-key replica resolver for multi-shard fan-out (ADR-021). Given a
+    /// partition key's raw bytes, returns the replica host-ids that own it.
+    ///
+    /// When set, the apply phase builds the participant set via
+    /// [`ParticipantSet::from_per_key`](crate::accord::shard_quorum::ParticipantSet::from_per_key)
+    /// and sends each replica a per-replica `AccordApplyV2` scoped to ONLY the
+    /// keys it owns — so a replica never persists a key it is not a replica for.
+    /// `None` keeps the single-shard default (every replica owns every key →
+    /// each gets the full write-set), preserving the pre-multi-shard behavior
+    /// exactly. Production wires the ring resolver
+    /// (`WritePath::replicas_for_key`) here; set via
+    /// [`Self::with_per_key_replicas`].
+    #[allow(clippy::type_complexity)]
+    per_key_replicas: Option<Arc<dyn Fn(&[u8]) -> Vec<uuid::Uuid> + Send + Sync>>,
 }
 
 /// Return the row bytes that at least `quorum` of `reads` agree on, if any.
@@ -567,13 +561,14 @@ impl AccordCoordinatorDriver {
     ///
     /// `write_set` is one `(partition_key, encoded_mutation)` per key the
     /// transaction writes; it must be non-empty. The first key drives Accord
-    /// conflict ordering for now (single-shard); the full multi-shard participant
-    /// set + per-shard quorum is Phase 2. The coordinator applies every entry it
-    /// owns locally during the Apply phase, so an RF=1 / coordinator-is-sole-
-    /// replica multi-key transaction commits all keys atomically today. A
-    /// multi-key transaction with remote replicas fails loud
-    /// ([`AccordDriverError::MultiKeyNotYetExecutable`]) rather than silently
-    /// dropping the other keys' writes over the single-key wire.
+    /// conflict ordering for now (representative-key); the full per-key
+    /// `PreAcceptV2` dependency union is a follow-up. The Apply phase builds a
+    /// per-shard participant ([`Self::with_per_key_replicas`]) and fans a
+    /// per-replica `AccordApplyV2` (scoped to each replica's owned keys) out under
+    /// per-shard quorum; the coordinator applies the keys it owns locally as one
+    /// atomic write-set. Without a resolver this collapses to the single-shard
+    /// case (every replica owns every key), so an RF=1 / coordinator-is-sole-
+    /// replica multi-key transaction commits all keys atomically.
     pub fn new_multi(
         node_id: u64,
         replica_ids: Vec<uuid::Uuid>,
@@ -652,6 +647,7 @@ impl AccordCoordinatorDriver {
             local_applier: None,
             local_accord_state: None,
             condition_gate: None,
+            per_key_replicas: None,
         }
     }
 
@@ -739,6 +735,73 @@ impl AccordCoordinatorDriver {
         self
     }
 
+    /// Supply the per-key replica resolver for multi-shard fan-out (ADR-021).
+    ///
+    /// `resolve(key)` returns the replica host-ids that own `key`. With it set,
+    /// the apply phase builds a multi-shard participant
+    /// ([`ParticipantSet::from_per_key`](crate::accord::shard_quorum::ParticipantSet::from_per_key))
+    /// and scopes each replica's `AccordApplyV2` to only the keys it owns.
+    /// Production wires `WritePath::replicas_for_key`; `None` keeps the
+    /// single-shard default. See the field docs on `per_key_replicas`.
+    #[allow(clippy::type_complexity)]
+    pub fn with_per_key_replicas(
+        mut self,
+        resolve: Arc<dyn Fn(&[u8]) -> Vec<uuid::Uuid> + Send + Sync>,
+    ) -> Self {
+        self.per_key_replicas = Some(resolve);
+        self
+    }
+
+    /// Whether `replica` owns `key` under the current resolver.
+    ///
+    /// With no resolver this is the single-shard default — every replica owns
+    /// every key (returns `true`). With a resolver, `replica` owns `key` iff it
+    /// is in the key's resolved replica set.
+    fn replica_owns_key(&self, replica: uuid::Uuid, key: &[u8]) -> bool {
+        match &self.per_key_replicas {
+            Some(resolve) => resolve(key).contains(&replica),
+            None => true,
+        }
+    }
+
+    /// Build the participant set for this transaction's write-set: per-key
+    /// replica sets via the resolver (genuine multi-shard) when present, else the
+    /// single-shard default (every key → the full replica list).
+    fn participant_set(&self) -> crate::accord::shard_quorum::ParticipantSet {
+        match &self.per_key_replicas {
+            Some(resolve) => {
+                let sets: Vec<Vec<uuid::Uuid>> =
+                    self.write_set.iter().map(|e| resolve(&e.key)).collect();
+                crate::accord::shard_quorum::ParticipantSet::from_per_key(&sets)
+            }
+            None => self.single_shard_participant(),
+        }
+    }
+
+    /// Build the per-replica `AccordApplyV2` messages for the Apply fan-out: each
+    /// replica's payload carries ONLY the write-set entries for keys it owns
+    /// (the coordinator scopes; the replica trusts and applies what it received).
+    /// Keyed by replica host-id, covering every id in `replica_ids`.
+    fn apply_v2_messages(
+        &self,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Message>, AccordDriverError> {
+        let txn_id = self.coordinator.txn_id;
+        let mut out = std::collections::HashMap::with_capacity(self.replica_ids.len());
+        for &peer in &self.replica_ids {
+            let writes: Vec<crate::accord::wire::WriteSetEntry> = self
+                .write_set
+                .iter()
+                .filter(|e| self.replica_owns_key(peer, &e.key))
+                .cloned()
+                .collect();
+            let payload = crate::accord::wire::ApplyV2Payload { txn_id, writes };
+            let bytes = bincode::serialize(&payload)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+            out.insert(peer, Message::AccordApplyV2(Bytes::from(bytes)));
+        }
+        Ok(out)
+    }
+
     /// Build the Apply-phase payload bytes for this transaction.
     ///
     /// The payload carries the encoded **mutation** as `result_data` — NOT the
@@ -760,6 +823,11 @@ impl AccordCoordinatorDriver {
     /// coordinator's own-replica Apply iterates `writes`; the single-key path is
     /// the degenerate one-entry case. This is the canonical in-memory form that
     /// Phase 2 will serialize onto [`Message::AccordApplyV2`](ferrosa_net::Message).
+    ///
+    /// The production fan-out now builds per-replica payloads via
+    /// [`Self::apply_v2_messages`]; this whole-write-set form is retained for
+    /// tests asserting the degenerate single-key shape.
+    #[cfg(test)]
     fn apply_v2_payload(&self) -> crate::accord::wire::ApplyV2Payload {
         crate::accord::wire::ApplyV2Payload {
             txn_id: self.coordinator.txn_id,
@@ -858,16 +926,12 @@ impl AccordCoordinatorDriver {
             PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
         };
 
-        // Multi-key execution is not yet wired (Phase 2 fan-out + Phase 3 apply
-        // keying). Fail loud before any side effect rather than silently dropping
-        // writes 2..N. Single-key (the `new` path, one write-set entry) proceeds.
-        if self.write_set.len() > 1 {
-            return Err(AccordDriverError::MultiKeyNotYetExecutable {
-                keys: self.write_set.len(),
-                replicas: self.replica_ids.len(),
-            });
-        }
-
+        // Multi-key execution is wired: the Apply phase fans a per-replica
+        // `AccordApplyV2` (scoped to each replica's owned keys) out under a
+        // per-shard participant, and each replica applies its whole write-set
+        // atomically. Conflict ordering (PreAccept/Accept) still uses the
+        // representative first key — full per-key `PreAcceptV2` dep union is a
+        // documented follow-up (see specs/in-process/multikey-accord-apply-rekeying.md).
         let txn_id = self.coordinator.txn_id;
         let t0 = self.coordinator.t0;
         let key = self.coordinator.key.clone();
@@ -1036,10 +1100,10 @@ impl AccordCoordinatorDriver {
         // Per-shard quorum: every shard the write-set touches must independently
         // reach its slow quorum. A single global counter would let one shard
         // commit while another is a minority — the cross-shard non-atomicity
-        // Accord exists to prevent. (`single_shard_participant` is the
-        // behavior-preserving default for single-key / one replica set; per-key
-        // `ring.replicas` fan-out is a follow-up.)
-        let participant = self.single_shard_participant();
+        // Accord exists to prevent. `participant_set` resolves per-key replica
+        // sets when a multi-shard resolver is wired, else collapses to one shard
+        // (the behavior-preserving single-key / single-replica-set default).
+        let participant = self.participant_set();
         if !self
             .quorum_broadcast(commit_msg, &participant, |r| r.is_ok())
             .await
@@ -1273,9 +1337,6 @@ impl AccordCoordinatorDriver {
         // to reach F+1 total before returning the LWT result.
         // ------------------------------------------------------------------
 
-        let apply_bytes = self.apply_payload_bytes()?;
-        let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
-
         // Coordinator's OWN replica apply. Its self-send is unreachable, so apply
         // the committed mutation locally here (mirroring a remote replica's
         // handle_apply) before counting the implicit ack. Without this the
@@ -1283,30 +1344,26 @@ impl AccordCoordinatorDriver {
         // apply error must abort, never fake the implicit ack.
         if self_is_replica {
             if let Some(applier) = &self.local_applier {
-                // Apply every write in the transaction's write-set that this
-                // node owns. For a single-key txn this is exactly one entry
-                // (== `self.mutation`); the write-set form is what the multi-key
-                // path (guarded above until Phase 2/3) will iterate.
-                let apply = self.apply_v2_payload();
+                // Apply every write in the write-set that THIS node owns, as one
+                // atomic write-set (all-or-nothing). For a single-key / single-
+                // shard txn this is the whole set; with a multi-shard resolver it
+                // is only the coordinator's owned keys.
                 let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
-                for write in &apply.writes {
-                    if write.mutation.is_empty() {
-                        continue; // no-write entry (read-only / protocol-only)
-                    }
-                    applier
-                        .apply(
-                            txn_id,
-                            crate::accord::apply::ApplyMutation {
-                                data: write.mutation.clone(),
-                                t: commit_t,
-                                deps: deps.clone(),
-                            },
-                        )
-                        .map_err(|e| {
-                            AccordDriverError::Network(format!(
-                                "coordinator local apply failed: {e}"
-                            ))
-                        })?;
+                let owned: Vec<crate::accord::apply::ApplyMutation> = self
+                    .write_set
+                    .iter()
+                    .filter(|e| !e.mutation.is_empty())
+                    .filter(|e| self.replica_owns_key(self_id, &e.key))
+                    .map(|e| crate::accord::apply::ApplyMutation {
+                        data: e.mutation.clone(),
+                        t: commit_t,
+                        deps: deps.clone(),
+                    })
+                    .collect();
+                if !owned.is_empty() {
+                    applier.apply_writeset(txn_id, owned).map_err(|e| {
+                        AccordDriverError::Network(format!("coordinator local apply failed: {e}"))
+                    })?;
                 }
             }
         }
@@ -1315,15 +1372,36 @@ impl AccordCoordinatorDriver {
         // `participant` built above). An Apply ack is an `AccordApplyOK` for this
         // txn — an empty body, or a payload whose `txn_id` matches.
         let apply_txn = txn_id;
-        let apply_ok = self
-            .quorum_broadcast(apply_msg, &participant, move |r| {
-                matches!(r, Ok(Message::AccordApplyOK(b))
-                    if b.is_empty()
-                        || bincode::deserialize::<ApplyOkPayload>(b)
-                            .map(|ok| ok.txn_id == apply_txn)
-                            .unwrap_or(false))
-            })
-            .await;
+        let is_apply_ok = move |r: &ferrosa_net::error::Result<Message>| {
+            matches!(r, Ok(Message::AccordApplyOK(b))
+                if b.is_empty()
+                    || bincode::deserialize::<ApplyOkPayload>(b)
+                        .map(|ok| ok.txn_id == apply_txn)
+                        .unwrap_or(false))
+        };
+
+        // Single-key keeps the v1 `AccordApply` wire (byte-identical). Multi-key
+        // sends each replica a per-replica `AccordApplyV2` scoped to the keys it
+        // owns, so a replica never persists a key it is not a replica for.
+        let apply_ok = if self.write_set.len() == 1 {
+            let apply_bytes = self.apply_payload_bytes()?;
+            let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
+            self.quorum_broadcast(apply_msg, &participant, is_apply_ok)
+                .await
+        } else {
+            let per_peer = self.apply_v2_messages()?;
+            self.quorum_broadcast_per_peer(
+                &participant,
+                |peer_id| {
+                    per_peer
+                        .get(&peer_id)
+                        .cloned()
+                        .expect("every replica_id has a per-peer AccordApplyV2 message")
+                },
+                is_apply_ok,
+            )
+            .await
+        };
         if !apply_ok {
             tracing::error!(
                 txn_id = ?txn_id,
@@ -1364,6 +1442,23 @@ impl AccordCoordinatorDriver {
         participant: &crate::accord::shard_quorum::ParticipantSet,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
     ) -> bool {
+        // Same message to every peer — the degenerate case of the per-peer
+        // fan-out (used by PreAccept/Commit/Read and single-key Apply, whose
+        // payload is key-independent or the same for all replicas).
+        self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack)
+            .await
+    }
+
+    /// Like [`quorum_broadcast`](Self::quorum_broadcast) but builds a **distinct
+    /// message per peer** via `build_msg(peer_id)`. This is what lets the
+    /// multi-key Apply send each replica an `AccordApplyV2` scoped to only the
+    /// keys it owns, while still deciding success by the same per-shard quorum.
+    pub(crate) async fn quorum_broadcast_per_peer(
+        &self,
+        participant: &crate::accord::shard_quorum::ParticipantSet,
+        build_msg: impl Fn(uuid::Uuid) -> Message,
+        is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+    ) -> bool {
         let self_id = self.self_id;
         let mut quorum = participant.quorum();
         if self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil() {
@@ -1376,7 +1471,7 @@ impl AccordCoordinatorDriver {
             .filter(|&&id| id != self_id)
             .map(|&peer_id| {
                 let peers = Arc::clone(&self.peers);
-                let msg = msg.clone();
+                let msg = build_msg(peer_id);
                 async move { (peer_id, peers.send(peer_id, msg, Lane::Data).await) }
             })
             .collect();
@@ -2291,20 +2386,20 @@ mod tests {
         }
     }
 
-    /// A genuine multi-key transaction must FAIL LOUD until multi-key execution
-    /// is wired (Phase 2 fan-out + Phase 3 apply keying) — never silently drop
-    /// writes. No write reaches the local applier before the error.
-    #[tokio::test]
-    async fn multi_key_run_transaction_fails_loud_before_any_apply() {
-        use crate::accord::apply::NoopStorageApplier;
+    /// A genuine multi-key transaction is now WIRED for execution (the
+    /// `MultiKeyNotYetExecutable` guard is gone): its driver builds a per-replica
+    /// Apply fan-out covering EVERY key, and (on a single-node RF=1 cluster) the
+    /// coordinator owns and would apply both. The full multi-node commit→apply
+    /// round-trip is the CI-gated cross-shard e2e; here we assert the wiring is
+    /// in place and no key is dropped from the fan-out.
+    #[test]
+    fn multi_key_driver_fans_out_every_key_no_guard() {
         use ferrosa_common::accord::HybridLogicalClock;
-        use std::sync::Arc;
 
         let (node_id, self_uuid, peers) = single_node_peers();
         let clock = HybridLogicalClock::new(node_id, 0);
-        let applier = Arc::new(NoopStorageApplier::new());
 
-        let mut driver = AccordCoordinatorDriver::new_multi(
+        let driver = AccordCoordinatorDriver::new_multi(
             node_id,
             vec![self_uuid],
             peers,
@@ -2314,22 +2409,19 @@ mod tests {
                 (b"key-1".to_vec(), b"mutation-1".to_vec()),
                 (b"key-2".to_vec(), b"mutation-2".to_vec()),
             ],
-        )
-        .with_local_applier(applier.clone());
-
-        let result = driver.run_transaction().await;
-        match result {
-            Err(AccordDriverError::MultiKeyNotYetExecutable { keys, replicas }) => {
-                assert_eq!(keys, 2, "error reports the write-set key count");
-                assert_eq!(replicas, 1, "error reports the participant count");
-            }
-            other => panic!("multi-key txn must fail loud, got {other:?}"),
-        }
-        assert_eq!(
-            applier.apply_count(),
-            0,
-            "fail-loud must precede any write — no partial multi-key apply"
         );
+
+        // Single shard (no resolver) → the coordinator's own replica owns BOTH
+        // keys, so its Apply payload carries the full write-set — nothing dropped.
+        let msgs = driver.apply_v2_messages().expect("per-peer apply messages");
+        let mine = decode_v2(msgs.get(&self_uuid).expect("coordinator has a payload"));
+        assert_eq!(
+            mine.writes.len(),
+            2,
+            "the multi-key write-set fans out every key (no MultiKeyNotYetExecutable guard)"
+        );
+        let keys: Vec<&[u8]> = mine.writes.iter().map(|w| w.key.as_slice()).collect();
+        assert!(keys.contains(&b"key-1".as_slice()) && keys.contains(&b"key-2".as_slice()));
     }
 
     // -----------------------------------------------------------------------
@@ -2396,6 +2488,146 @@ mod tests {
 
     fn six_nodes() -> Vec<uuid::Uuid> {
         (1u128..=6).map(uuid::Uuid::from_u128).collect()
+    }
+
+    /// A capturing transport: records the exact `Message` sent to each peer, and
+    /// acks every send. Lets a test assert the per-replica `AccordApplyV2`
+    /// fan-out scoped each replica to only the keys it owns.
+    struct CapturingTransport {
+        sent: parking_lot::Mutex<std::collections::HashMap<uuid::Uuid, Message>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for CapturingTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            self.sent.lock().insert(host_id, msg);
+            Ok(Message::AccordApplyOK(Bytes::new()))
+        }
+    }
+
+    type KeyResolver = Arc<dyn Fn(&[u8]) -> Vec<uuid::Uuid> + Send + Sync>;
+
+    fn per_key_resolver(n: Vec<uuid::Uuid>) -> KeyResolver {
+        Arc::new(move |key: &[u8]| {
+            if key == b"ka" {
+                vec![n[0], n[1], n[2]]
+            } else {
+                vec![n[3], n[4], n[5]]
+            }
+        })
+    }
+
+    fn decode_v2(m: &Message) -> crate::accord::wire::ApplyV2Payload {
+        match m {
+            Message::AccordApplyV2(b) => bincode::deserialize(b).expect("v2 decodes"),
+            other => panic!("expected AccordApplyV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_v2_messages_scope_each_replica_to_its_owned_keys() {
+        let n = six_nodes();
+        let clock = HybridLogicalClock::new(999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999,
+            n.clone(),
+            Arc::new(CapturingTransport {
+                sent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            }),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mut-a".to_vec()),
+                (b"kb".to_vec(), b"mut-b".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(per_key_resolver(n.clone()));
+
+        let msgs = driver.apply_v2_messages().expect("build per-peer messages");
+
+        // Shard-A replicas get only ka; shard-B replicas get only kb.
+        for id in &n[0..3] {
+            let p = decode_v2(msgs.get(id).expect("shard-A replica has a message"));
+            assert_eq!(p.writes.len(), 1, "shard-A replica gets only its owned key");
+            assert_eq!(p.writes[0].key, b"ka");
+            assert_eq!(p.writes[0].mutation, b"mut-a");
+        }
+        for id in &n[3..6] {
+            let p = decode_v2(msgs.get(id).expect("shard-B replica has a message"));
+            assert_eq!(p.writes.len(), 1, "shard-B replica gets only its owned key");
+            assert_eq!(p.writes[0].key, b"kb");
+            assert_eq!(p.writes[0].mutation, b"mut-b");
+        }
+    }
+
+    #[test]
+    fn apply_v2_messages_without_resolver_send_full_writeset_to_every_replica() {
+        // No resolver → single shard → every replica owns every key.
+        let n = six_nodes();
+        let clock = HybridLogicalClock::new(999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999,
+            n.clone(),
+            Arc::new(CapturingTransport {
+                sent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            }),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mut-a".to_vec()),
+                (b"kb".to_vec(), b"mut-b".to_vec()),
+            ],
+        );
+
+        let msgs = driver.apply_v2_messages().expect("build per-peer messages");
+        for id in &n {
+            assert_eq!(
+                decode_v2(msgs.get(id).unwrap()).writes.len(),
+                2,
+                "single-shard: every replica receives the full write-set"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quorum_broadcast_per_peer_delivers_scoped_message_to_each_replica() {
+        let n = six_nodes();
+        let clock = HybridLogicalClock::new(999, 0);
+        let transport = Arc::new(CapturingTransport {
+            sent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        });
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999,
+            n.clone(),
+            transport.clone(),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mut-a".to_vec()),
+                (b"kb".to_vec(), b"mut-b".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(per_key_resolver(n.clone()));
+
+        let per_peer = driver.apply_v2_messages().unwrap();
+        let reached = driver
+            .quorum_broadcast_per_peer(
+                &driver.participant_set(),
+                |peer| per_peer.get(&peer).cloned().unwrap(),
+                |r| r.is_ok(),
+            )
+            .await;
+        assert!(reached, "every shard acked → quorum reached");
+
+        // Each replica actually received ITS scoped payload over the wire.
+        let sent = transport.sent.lock();
+        assert_eq!(decode_v2(sent.get(&n[0]).unwrap()).writes[0].key, b"ka");
+        assert_eq!(decode_v2(sent.get(&n[4]).unwrap()).writes[0].key, b"kb");
     }
 
     #[tokio::test]
