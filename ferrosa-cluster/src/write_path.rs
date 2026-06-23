@@ -796,6 +796,25 @@ impl WritePath {
         }
     }
 
+    /// Resolve a partition `token`'s replica **host ids** under the keyspace
+    /// `strategy`, for an Accord transaction's participant set (ADR-021).
+    ///
+    /// `Some(..)` only in **cluster** mode — replica placement is the ring's
+    /// concern and lives behind this boundary so the CQL/Postgres front-ends
+    /// never touch the ring/partitioner. Returns `None` in standalone/pair/
+    /// degraded modes, where the caller uses the local node (Accord transactions
+    /// are a cluster feature; a single-node deployment is one trivial replica).
+    pub fn replicas_for_key(
+        &self,
+        token: crate::raft::Token,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> Option<Vec<uuid::Uuid>> {
+        match self {
+            Self::Cluster(coordinator) => Some(coordinator.replica_host_ids_for(token, strategy)),
+            Self::Direct(_) | Self::Pair(_) | Self::Unavailable => None,
+        }
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
@@ -991,6 +1010,20 @@ mod tests {
         // Verify data was written
         let result = storage.read(&table_id, &key).unwrap();
         assert!(result.is_some(), "DirectWritePath should write to storage");
+    }
+
+    #[test]
+    fn replicas_for_key_is_none_outside_cluster_mode() {
+        // Standalone/pair/degraded modes have no ring, so the caller falls back
+        // to the local node. Cluster-mode resolution is covered by the ring's
+        // `replica_host_ids_for_strategy` test.
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+        assert_eq!(
+            WritePath::unavailable().replicas_for_key(0, &strategy),
+            None
+        );
     }
 
     #[test]
