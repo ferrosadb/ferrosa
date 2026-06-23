@@ -39,27 +39,76 @@ are currently reaching *around* it.
 
 ## Decision
 
-Make `WritePath` the **single boundary** for Accord transaction execution and
-replica resolution. Add an entry point (shape, not final name):
+Make `WritePath` the boundary for **replica resolution** (the topology concern),
+while keeping `AccordCoordinatorDriver` construction in the CQL layer for the
+single-key LWT path — because the LWT **condition gate** is irreducibly
+CQL-specific: it decodes CQL schema (`decode_agreed_row_to_map`) and evaluates
+the `IF` predicate (`eval_lwt_for_statement`) inside a closure the driver runs
+during the read-vote phase. The cluster layer cannot build that closure, so
+relocating the whole driver there would just push a CQL closure back across the
+boundary — no real decoupling.
+
+Two-part decision:
+
+1. **Replica resolution moves behind `WritePath`** (the only topology leak today):
+   ```text
+   WritePath::replicas_for_key(table_id, key) -> Vec<Uuid>   // host ids
+   ```
+   - `Cluster(coordinator)` — `ring.replicas(token(key), rf)` mapped `node_id` →
+     `host_id`, with `rf` from the keyspace replication.
+   - `Direct`/`Pair` — the local node(s) (standalone / two-node degenerate case).
+
+   `route_lwt_via_accord` sources `replica_ids` from this instead of
+   `peers.live_peer_ids()`. CQL stops touching `Ring`/`Token`/the partitioner;
+   the "all live peers" bug is fixed at the root. CQL still constructs the driver
+   and injects the applier/reader/gate (its own + engine concerns).
+
+2. **The gateless multi-key path (Phase 5 `BEGIN/COMMIT`) gets the fuller
+   `WritePath::accord_commit(write_set, ...)`** — no condition gate there, so the
+   cluster layer can own the whole drive + per-key `ParticipantSet` build. This
+   is added with Phase 5, not now.
+
+Both mirror the codebase's dependency-inversion idiom — `Arc<dyn DataStore>`,
+`Arc<dyn StorageApplier>`, the new `AccordTransport`, the planned
+`TransactionCommitter` (Phase 6) — so they are consistent, not novel.
+
+## Relation to exposing Accord transactions over SQL (Postgres + CQL)
+
+The goal these increments serve is **multi-key Accord transactions exposed over
+SQL** — `BEGIN/COMMIT` on both the Postgres and CQL front-ends. That makes the
+*front-end-facing* seam, not the cluster-internal one, the load-bearing
+boundary, and it must be **front-end-agnostic** because `ferrosa-postgres` does
+**not** (and should not) depend on `ferrosa-cluster`.
+
+Layering:
 
 ```text
-WritePath::accord_commit(write_set, read_predicate, options) -> AccordResult
+ferrosa-postgres ─┐
+                  ├─→  Arc<dyn TransactionCommitter>      (trait in ferrosa-storage — the shared dep)
+ferrosa-cql ──────┘              │   commit_write_set(writes, predicate) -> result
+                                 ▼
+        ferrosa-cluster: the Accord commit impl
+          1. resolve replicas per key  ← THIS ADR (ring.replicas, write.rs:278)
+          2. per-shard quorum          ← ShardQuorum / ParticipantSet (PR #182)
+          3. drive AccordCoordinatorDriver
 ```
 
-- `Cluster(coordinator)` — resolves `ring.replicas(token(key), rf)` per key
-  (mapping `node_id` → `host_id`), builds the `ParticipantSet`, constructs and
-  drives the `AccordCoordinatorDriver`, and returns the result.
-- `Direct`/`Pair` — the standalone / two-node degenerate case (one shard = the
-  local node(s)), preserving today's single-node behavior.
+So:
 
-`ferrosa-cql` submits **intent only** — the write-set plus the IF-predicate — and
-never touches `Ring`, `Token`, `replica_ids`, or the driver. `route_lwt_via_accord`
-collapses to: build the write-set + predicate, call `write_path.accord_commit`,
-map the result to a `RouteResult`.
+- **`TransactionCommitter`** (defined in `ferrosa-storage`, the crate both
+  front-ends already share — Phase 6) is the SQL-exposure boundary. Postgres and
+  CQL `BEGIN/COMMIT` both buffer DML into a write-set and call it on COMMIT;
+  ROLLBACK drops the buffer.
+- This ADR's `WritePath` replica resolution + PR #182's per-shard quorum are the
+  **implementation** behind that trait, in `ferrosa-cluster`, wired into the impl
+  in the binary (mirroring how `Arc<dyn StorageApplier>` is injected).
+- The single-key LWT path keeps its CQL-specific condition gate (above) and uses
+  the same `WritePath` replica resolution; it does not go through
+  `TransactionCommitter` (no buffered write-set).
 
-This mirrors the codebase's established dependency-inversion idiom — `Arc<dyn
-DataStore>`, `Arc<dyn StorageApplier>`, the new `AccordTransport`, and the planned
-`TransactionCommitter` (Phase 6 / ADR pending) — so it is consistent, not novel.
+Net: replica resolution moves behind `WritePath` now (this ADR, unblocks the LWT
+bug fix); the `TransactionCommitter` front-end seam lands with the multi-key
+`BEGIN/COMMIT` work (Phase 5 CQL + Phase 6 Postgres) and reuses both.
 
 ## Consequences
 
