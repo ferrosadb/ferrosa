@@ -25,18 +25,29 @@ COMPOSE_CMD=""
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
+        --quint) PROFILE="quint" ;;
         --help|-h)
-            echo "Usage: $0 [--keep]"
+            echo "Usage: $0 [--keep] [--quint]"
             echo ""
-            echo "  --keep   Do not tear down the cluster on exit."
+            echo "  --keep    Do not tear down the cluster on exit."
+            echo "  --quint   5-node cluster (ports 30042-30046) instead of the"
+            echo "            default 3-node trio. Needed to exercise RF<node-count"
+            echo "            replica placement (e.g. multi-shard Accord transactions)."
             echo ""
-            echo "Bring up a 3-node Ferrosa cluster via Podman on ports 30042-30044."
+            echo "Bring up a Ferrosa test cluster via Podman."
             echo "Source this script to inherit FERROSA_TEST_CLUSTER_NODES."
             exit 0
             ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
     esac
 done
+
+# Node count + host CQL ports are derived from the profile.
+if [[ "${PROFILE}" == "quint" ]]; then
+    NODE_COUNT=5
+else
+    NODE_COUNT=3
+fi
 
 # ── Detect compose binary ─────────────────────────────────────────────────────
 if podman compose version >/dev/null 2>&1; then
@@ -71,7 +82,7 @@ fi
 
 # ── Bring up cluster ──────────────────────────────────────────────────────────
 echo "Starting Ferrosa test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..."
-echo "Ports: CQL 30042/30043/30044, RustFS 30000/30001"
+echo "Profile: ${PROFILE} (${NODE_COUNT} nodes), CQL 30042.., RustFS 30000/30001"
 echo ""
 
 ${COMPOSE_CMD} \
@@ -83,12 +94,15 @@ ${COMPOSE_CMD} \
 
 # ── Wait for health ───────────────────────────────────────────────────────────
 echo ""
-echo "Waiting for all 3 nodes to become healthy (timeout: 120s)..."
+echo "Waiting for all ${NODE_COUNT} nodes to become healthy (timeout: 120s)..."
 
 TIMEOUT=120
 ELAPSED=0
 INTERVAL=5
-NODES=("${PROJECT_NAME}-node1-1" "${PROJECT_NAME}-node2-1" "${PROJECT_NAME}-node3-1")
+NODES=()
+for i in $(seq 1 "${NODE_COUNT}"); do
+    NODES+=("${PROJECT_NAME}-node${i}-1")
+done
 
 while true; do
     ALL_HEALTHY=1
@@ -102,7 +116,7 @@ while true; do
 
     if [[ $ALL_HEALTHY -eq 1 ]]; then
         echo ""
-        echo "All 3 nodes are healthy."
+        echo "All ${NODE_COUNT} nodes are healthy."
         break
     fi
 
@@ -120,7 +134,11 @@ while true; do
 done
 
 # ── Emit env vars ─────────────────────────────────────────────────────────────
-CLUSTER_NODES="127.0.0.1:30042,127.0.0.1:30043,127.0.0.1:30044"
+CLUSTER_NODES=""
+for i in $(seq 1 "${NODE_COUNT}"); do
+    port=$((30041 + i))
+    CLUSTER_NODES="${CLUSTER_NODES:+${CLUSTER_NODES},}127.0.0.1:${port}"
+done
 echo ""
 echo "# Source these environment variables to run ignored cluster tests:"
 echo "export FERROSA_TEST_CLUSTER_NODES=\"${CLUSTER_NODES}\""
