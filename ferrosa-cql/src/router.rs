@@ -1190,17 +1190,20 @@ async fn route_lwt_via_accord(
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_cluster::accord::AccordCoordinatorDriver;
 
-    // Build the replica set from the live peer map plus this node itself.
-    // Ordering is deterministic: local node first, then peers sorted by UUID.
+    // Fallback replica set: the live peer map plus this node itself. Used when
+    // the write path has no ring (standalone/pair/degraded) and as the basis for
+    // the "no peers at all" guard below. Cluster mode replaces this with the
+    // key's token-aware RF replicas (see `select_accord_replicas` after the
+    // keyspace is resolved). Ordering is deterministic: sorted by UUID.
     let host_id = state.node_config.host_id;
-    let mut replica_ids: Vec<uuid::Uuid> = peers.live_peer_ids();
+    let mut fallback_replicas: Vec<uuid::Uuid> = peers.live_peer_ids();
     // Include local node if not already in the list.
-    if !replica_ids.contains(&host_id) {
-        replica_ids.push(host_id);
+    if !fallback_replicas.contains(&host_id) {
+        fallback_replicas.push(host_id);
     }
-    replica_ids.sort_unstable();
+    fallback_replicas.sort_unstable();
 
-    if replica_ids.is_empty() {
+    if fallback_replicas.is_empty() {
         return Err(CqlError::ServerError(
             "Accord replica set is empty — no peers connected for LWT consensus".into(),
         ));
@@ -1220,6 +1223,25 @@ async fn route_lwt_via_accord(
     // Resolve the target keyspace/table for the generic-IF read-vote so replicas
     // (and the coordinator's own local reader) can target the read-at-`t`.
     let (ks, table) = lwt_keyspace_table(ctx, stmt)?;
+
+    // Token-aware participant resolution (ADR-021): in cluster mode the write
+    // path maps the key to its RF replicas from the ring (a proper subset of the
+    // cluster); otherwise we keep the live-peer fallback. This makes the live
+    // Accord LWT path RF-correct rather than replicating every key to every
+    // connected peer. Placement stays behind `WritePath` — the CQL front-end
+    // only passes raw key bytes + keyspace replication.
+    let replication = state
+        .schema
+        .snapshot()
+        .keyspaces
+        .get(&ks)
+        .map(|k| k.replication.clone());
+    let replica_ids = select_accord_replicas(
+        &state.write_path.load(),
+        replication.as_ref(),
+        &key,
+        fallback_replicas,
+    )?;
 
     // Classify the IF predicate. `NotExists` uses the replica existence path;
     // `Generic` reads the row at `t` so the coordinator evaluates `IF col=val`.
@@ -1310,6 +1332,35 @@ async fn route_lwt_via_accord(
     }
 
     finish_lwt_via_accord(state, &ks, &table, driver, None).await
+}
+
+/// Select the Accord participant replicas for a single-key LWT.
+///
+/// In cluster mode the write path resolves the key's owning replicas from the
+/// ring (token-aware, RF-correct — a proper subset of the cluster). Outside
+/// cluster mode (or when the keyspace replication is unknown) we keep the
+/// caller's `fallback` set (the live peer map), since Accord placement is a
+/// cluster concern. An unparseable strategy or an empty cluster-mode resolution
+/// fails loud rather than silently writing to the wrong/empty replica set.
+fn select_accord_replicas(
+    write_path: &ferrosa_cluster::WritePath,
+    replication: Option<&ReplicationParams>,
+    key: &[u8],
+    fallback: Vec<uuid::Uuid>,
+) -> Result<Vec<uuid::Uuid>, CqlError> {
+    let Some(replication) = replication else {
+        return Ok(fallback);
+    };
+    match write_path.accord_replicas_for_key(key, replication) {
+        Ok(Some(resolved)) if !resolved.is_empty() => Ok(resolved),
+        Ok(Some(_)) => Err(CqlError::ServerError(
+            "Accord cluster-mode replica resolution returned no replicas for the LWT key".into(),
+        )),
+        Ok(None) => Ok(fallback),
+        Err(e) => Err(CqlError::ServerError(format!(
+            "LWT replica resolution: {e}"
+        ))),
+    }
 }
 
 /// Drive the Accord transaction to completion and map its result to a CQL LWT
@@ -11357,6 +11408,60 @@ mod tests {
     use arc_swap::ArcSwap;
     use ferrosa_cluster::WritePath;
     use ferrosa_schema::NodeConfig;
+
+    // ── select_accord_replicas: live-path replica selection ───────────────────
+
+    fn simple_replication_params(rf: usize) -> ReplicationParams {
+        ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                rf.to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_outside_cluster_mode() {
+        // No ring (standalone/degraded WritePath) → keep the caller's all-live-
+        // peers fallback rather than failing the LWT.
+        let fallback = vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)];
+        let params = simple_replication_params(3);
+        let got = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&params),
+            b"pk",
+            fallback.clone(),
+        )
+        .expect("fallback path must not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_when_replication_absent() {
+        // No keyspace replication metadata → fall back rather than guess.
+        let fallback = vec![uuid::Uuid::from_u128(7)];
+        let got = select_accord_replicas(&WritePath::unavailable(), None, b"pk", fallback.clone())
+            .expect("absent replication must fall back, not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_fails_loud_on_bad_strategy() {
+        // An unparseable strategy must surface an error, never silently fall back
+        // to a placement the operator did not configure.
+        let bad = ReplicationParams {
+            strategy: "NoSuchStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        let err = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&bad),
+            b"pk",
+            vec![uuid::Uuid::from_u128(1)],
+        );
+        assert!(err.is_err(), "unparseable strategy must fail loud");
+    }
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
