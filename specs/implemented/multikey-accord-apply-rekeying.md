@@ -75,10 +75,20 @@ is already done + proven (PR #182); this is the remaining execution path.
   - `EngineStorageApplier` engine test: one txn, two keys, same `t` → **both**
     persist (today the 2nd dedups).
   - `cargo test -p ferrosa-cluster`, `clippy --all-targets`, `fmt` — all green.
-- **Live cross-shard e2e — DEFERRED to CI** (`t_afa3ee86`): cross-shard bank
-  transfer on the 5-node `quint` profile (RF=3 < 5 → real multiple shards) —
-  both legs or neither; a minority failure in one shard aborts. Local podman
-  cluster is blocked (`t_88f278c3`); CI's `FERROSA_TEST_CONTAINERS` path works.
+- **Driver-level cross-shard atomicity e2e — DONE** (`t_afa3ee86`):
+  `accord/driver_cross_shard_e2e.rs` drives the REAL `AccordCoordinatorDriver::
+  new_multi` over a routing transport to real per-node `AccordStateMachine`s/
+  handlers — exercising the `AccordPreAcceptV2` dep union + per-shard quorum +
+  per-replica `AccordApplyV2` atomic apply across two genuinely distinct shards.
+  Two tests: commit-all → both shards apply; one shard down → whole txn aborts,
+  **neither** shard applies (no partial cross-shard write). Matches the
+  `CrossShardCoordinator` oracle's all-or-nothing (`cross_shard.rs`).
+  *Atomicity is enforced at commit (Accord, not 2PC): a shard that cannot reach
+  commit quorum aborts the whole txn; post-commit every shard applies.*
+- **Live CQL-client cross-shard e2e — BLOCKED** on the multi-key client surface
+  (`BEGIN/COMMIT`-over-Accord, `t_bd3684`/`t_b98434`): there is no CQL path to
+  inject a multi-key txn from outside a node, so a Docker client-driven transfer
+  cannot be written yet. The 5-node `quint` bring-up itself is fixed (`#184`).
 
 ## Definition of done
 
