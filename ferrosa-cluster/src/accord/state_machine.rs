@@ -575,8 +575,32 @@ impl AccordStateMachine {
     ///    idempotent on `(txn_id, t)`, so a crash between them is recovered by the
     ///    per-txn Apply retry (never a falsely-`Applied` txn).
     pub fn handle_apply(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> SmResponse {
+        // A single-key Apply is the degenerate one-entry write-set. An empty
+        // payload is the no-write finalize, represented as an empty write-set.
+        let writes = if result_data.is_empty() {
+            Vec::new()
+        } else {
+            vec![result_data]
+        };
+        self.handle_apply_writeset(txn_id, writes)
+    }
+
+    /// Apply a **multi-key** transaction: its full write-set, one encoded
+    /// mutation per partition this replica owns. Every write is routed through
+    /// the dep-ordered apply engine as one unit (parked together, applied
+    /// atomically), so writes 2..N are never dropped.
+    ///
+    /// An empty `writes` (or all-empty entries) is the no-write finalize: the txn
+    /// committed but writes no row (a failed-`IF` LWT), so it is advanced to
+    /// `Applied` without touching storage and its dep-waiters are woken.
+    ///
+    /// Whatever the engine actually persists — the primary's N writes plus any
+    /// cascade-woken waiters — is **deduplicated by `TxnId`** so each transaction
+    /// is advanced to `Applied` and fsyncs its protocol-log marker exactly once
+    /// (N markers per txn would corrupt the log).
+    pub fn handle_apply_writeset(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> SmResponse {
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
-        // so the mutation we hand to storage carries the real `(t, deps)`.
+        // so each mutation we hand to storage carries the real `(t, deps)`.
         let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
             Some(state) => {
                 // Already applied: idempotent — do not re-persist or re-apply.
@@ -589,32 +613,34 @@ impl AccordStateMachine {
             None => return SmResponse::None,
         };
 
-        // No-write finalize (empty payload): nothing to persist and no dependency
-        // ordering to respect. Advance it to Applied, then advance any waiters it
-        // unblocks in the dep-wait graph.
-        if result_data.is_empty() {
+        // Drop no-write entries (empty payloads): a key the replica owns but for
+        // which this txn writes no row.
+        let writes: Vec<Vec<u8>> = writes.into_iter().filter(|d| !d.is_empty()).collect();
+
+        // No-write finalize: nothing to persist and no dependency ordering to
+        // respect. Advance to Applied, then advance any waiters it unblocks.
+        if writes.is_empty() {
             if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
                 // Marker fsync failed — fail loud, leave Committed; Apply retries.
                 return SmResponse::None;
             }
-            for (woken_id, woken_data) in self.apply_engine.notify_applied(txn_id) {
-                // Best-effort: a fsync failure here leaves that waiter Committed,
-                // and its own Apply retry re-drives it (storage apply is
-                // idempotent). Never a falsely-Applied txn.
-                let _ = self.bookkeep_applied(woken_id, woken_data);
-            }
+            let woken = self.apply_engine.notify_applied(txn_id);
+            self.bookkeep_applied_dedup(woken);
             return SmResponse::None;
         }
 
-        // Real write: route through the dep-ordered apply engine. The engine
-        // persists the row (idempotent on `(txn_id, t)`) only once every
-        // dependency has applied on this replica; otherwise it parks the mutation.
-        let mutation = ApplyMutation {
-            data: result_data,
-            t,
-            deps,
-        };
-        let applied = match self.apply_engine.try_apply(txn_id, mutation) {
+        // Real write-set: route through the dep-ordered apply engine. It persists
+        // every key atomically (idempotent on `(txn_id, key, t)`) once every
+        // dependency has applied on this replica; otherwise it parks the set.
+        let mutations: Vec<ApplyMutation> = writes
+            .into_iter()
+            .map(|data| ApplyMutation {
+                data,
+                t,
+                deps: deps.clone(),
+            })
+            .collect();
+        let applied = match self.apply_engine.try_apply_writeset(txn_id, mutations) {
             Ok(applied) => applied,
             Err(e) => {
                 // Storage apply failed: do NOT advance to Applied — fail loud,
@@ -627,18 +653,32 @@ impl AccordStateMachine {
 
         if applied.is_empty() {
             // Parked behind an unapplied dependency. This txn advances to Applied
-            // later, when its last dependency's `handle_apply` cascades to it.
+            // later, when its last dependency's apply cascades to it.
             return SmResponse::None;
         }
 
-        // Persisted: the primary plus any cascade-woken waiters, in apply order.
-        for (applied_id, applied_data) in applied {
-            // Best-effort bookkeep (see the no-write branch): a per-txn Apply
-            // retry re-drives any whose marker fsync failed.
-            let _ = self.bookkeep_applied(applied_id, applied_data);
-        }
-
+        // Persisted: the primary's writes plus any cascade-woken waiters. Dedup
+        // by TxnId so each txn is marked Applied / fsynced exactly once.
+        self.bookkeep_applied_dedup(applied);
         SmResponse::None
+    }
+
+    /// Run [`bookkeep_applied`] **once per distinct `TxnId`** in `applied`.
+    ///
+    /// A multi-key txn appears as N entries with the same `TxnId` (one per
+    /// applied key); the post-apply bookkeeping — protocol-log marker fsync,
+    /// `Applied` advance, conflict-index GC, dep-wait wake — is a per-transaction
+    /// action and must fire exactly once. The first entry's data is used; later
+    /// same-txn entries are skipped (their write is already durable). Each is
+    /// best-effort: a fsync failure leaves that txn `Committed` for its Apply
+    /// retry to re-drive (storage apply is idempotent), never falsely `Applied`.
+    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>) {
+        let mut bookkept: HashSet<TxnId> = HashSet::new();
+        for (applied_id, applied_data) in applied {
+            if bookkept.insert(applied_id) {
+                let _ = self.bookkeep_applied(applied_id, applied_data);
+            }
+        }
     }
 
     /// Post-apply bookkeeping for a transaction the apply engine has **already
@@ -1007,6 +1047,90 @@ mod tests {
 
         let state = sm.get_state(&txn_id).unwrap();
         assert_eq!(state.phase, TxnPhase::Applied);
+    }
+
+    /// Number of `write_and_sync` calls (one per protocol-log marker fsync).
+    fn marker_fsyncs(writer: &MockSyncWriter) -> usize {
+        writer
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, SyncWriteCall::Write))
+            .count()
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3 — multi-key apply bookkeeping. A multi-key txn yields N applied
+    // entries with the SAME TxnId; the state machine must advance it to Applied
+    // and fsync its marker EXACTLY ONCE (not N times — N markers corrupt the
+    // protocol log), and EVERY write must reach the storage applier.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_key_apply_fsyncs_applied_marker_once_per_txn() {
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        let before = marker_fsyncs(&writer);
+
+        // Two-key write-set for one txn.
+        let resp = sm.handle_apply_writeset(txn_id, vec![b"w1".to_vec(), b"w2".to_vec()]);
+        assert!(matches!(resp, SmResponse::None));
+
+        assert_eq!(
+            marker_fsyncs(&writer) - before,
+            1,
+            "the Applied marker must be fsynced ONCE per txn, not once per key"
+        );
+        assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Applied);
+    }
+
+    #[test]
+    fn multi_key_apply_routes_every_write_to_the_applier() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, capturing.clone());
+
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+
+        sm.handle_apply_writeset(txn_id, vec![b"w1".to_vec(), b"w2".to_vec()]);
+
+        let captured = capturing.captured();
+        assert_eq!(
+            captured.len(),
+            2,
+            "BOTH keys' writes must reach the storage applier — none dropped"
+        );
+        let datas: Vec<Vec<u8>> = captured.iter().map(|(_, d, _)| d.clone()).collect();
+        assert!(datas.contains(&b"w1".to_vec()) && datas.contains(&b"w2".to_vec()));
+        assert!(
+            captured
+                .iter()
+                .all(|(id, _, t)| *id == txn_id && *t == ts(1001)),
+            "every write carries the txn id and the agreed execution timestamp"
+        );
+    }
+
+    #[test]
+    fn single_key_handle_apply_still_fsyncs_exactly_one_marker() {
+        // Regression guard: the single-key path must stay byte-identical — one
+        // marker, Applied phase, just like before the writeset refactor.
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        let before = marker_fsyncs(&writer);
+
+        sm.handle_apply(txn_id, vec![42]);
+
+        assert_eq!(marker_fsyncs(&writer) - before, 1);
+        assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Applied);
     }
 
     /// Duplicate PreAccept returns same response.
