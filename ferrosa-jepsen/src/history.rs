@@ -1,5 +1,6 @@
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -179,22 +180,35 @@ fn op_matches_key(op: &Op, key: &str) -> bool {
 
 /// Per-client history recorder.
 ///
-/// Records invocation and completion timestamps for each operation, producing
-/// a `History` when finished.
+/// Each completed operation is STREAMED to a JSONL file on disk (one line per
+/// op), so the full history never materializes in RAM during the run. A 1-hour
+/// run — or a fast-failing workload spinning against an unreachable cluster —
+/// would otherwise grow an unbounded `Vec<Operation>` and OOM the host (this
+/// killed the nightly multi-DC runner ~30s into every run: the driver RSS
+/// climbed ~700 MB/s to 16 GB). RAM now stays O(1) regardless of op count.
 pub struct HistoryRecorder {
     client_id: String,
     pending: Option<(u64, Op)>,
-    operations: Vec<Operation>,
+    writer: BufWriter<File>,
+    path: PathBuf,
 }
 
 impl HistoryRecorder {
-    /// Create a new recorder for the given client.
+    /// Create a new recorder for the given client, backed by a temp JSONL file.
     pub fn new(client_id: &str) -> Self {
         assert!(!client_id.is_empty(), "client_id must not be empty");
+        let path = std::env::temp_dir().join(format!(
+            "ferrosa-jepsen-history-{client_id}-{}-{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+        ));
+        let file = File::create(&path)
+            .unwrap_or_else(|e| panic!("create history file {}: {e}", path.display()));
         Self {
             client_id: client_id.to_string(),
             pending: None,
-            operations: Vec::new(),
+            writer: BufWriter::new(file),
+            path,
         }
     }
 
@@ -213,8 +227,8 @@ impl HistoryRecorder {
         self.pending = Some((now_us, op));
     }
 
-    /// Record the completion of the pending operation. Captures the current
-    /// UTC timestamp and pushes the finished `Operation` to the internal list.
+    /// Record the completion of the pending operation, STREAMING the finished
+    /// `Operation` straight to the backing JSONL file (it is never kept in RAM).
     ///
     /// # Panics
     ///
@@ -225,24 +239,27 @@ impl HistoryRecorder {
             .take()
             .expect("complete called with no pending operation");
         let complete_us = chrono::Utc::now().timestamp_micros() as u64;
-        self.operations.push(Operation {
+        let operation = Operation {
             client_id: self.client_id.clone(),
             invoke_us,
             complete_us,
             op,
             result,
-        });
+        };
+        let json = serde_json::to_string(&operation).expect("serialize operation");
+        writeln!(self.writer, "{json}").expect("stream operation to history file");
     }
 
-    /// Consume the recorder and return the collected history.
-    pub fn finish(self) -> History {
+    /// Flush the stream and read the recorded history back from disk. RAM stays
+    /// flat during the run; the history is only re-read once at the end (when
+    /// the checker needs it).
+    pub fn finish(mut self) -> History {
         assert!(
             self.pending.is_none(),
             "cannot finish with a pending operation"
         );
-        History {
-            operations: self.operations,
-        }
+        self.writer.flush().expect("flush history file");
+        History::from_jsonl(&self.path).expect("read back streamed history")
     }
 }
 

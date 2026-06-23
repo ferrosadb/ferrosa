@@ -78,14 +78,20 @@ fn multi_dc_nightly_workload_invokes_current_run_subcommand() {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let step = step_body(&yaml, "Run tier-multi-dc 1h bank workload");
 
+    // 12-factor: the run job executes the PREBUILT driver binary (downloaded as
+    // an artifact from the build-driver job), via the `run` subcommand. It must
+    // NOT compile (`cargo run`) — nothing is built in the Docker/run job.
     assert!(
-        step.contains("cargo run --release -p ferrosa-jepsen -- \\\n            run \\\n            --tier multi-dc"),
-        "nightly multi-DC workload must call the current ferrosa-jepsen CLI via \
+        step.contains(
+            "./driver/ferrosa-jepsen \\\n            run \\\n            --tier multi-dc"
+        ),
+        "nightly multi-DC workload must run the prebuilt ./driver/ferrosa-jepsen via \
          the `run` subcommand; step was:\n{step}"
     );
     assert!(
-        !step.contains("cargo run --release -p ferrosa-jepsen -- \\\n            --tier multi-dc"),
-        "nightly multi-DC workload must not use the obsolete top-level --tier form"
+        !step.contains("cargo run"),
+        "nightly multi-DC run job must NOT compile (no `cargo run`); it runs the \
+         prebuilt driver artifact. step was:\n{step}"
     );
     assert!(
         !step.contains("--run-id"),
