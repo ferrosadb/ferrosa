@@ -58,7 +58,18 @@ impl Workload for BankWorkload {
     ) -> Result<()> {
         let start = Instant::now();
 
+        // Pace each iteration. Real ops take milliseconds, but under a
+        // partition / dc-slow nemesis a CQL call can fail INSTANTLY — without a
+        // floor the loop spins at CPU speed and appends millions of failed ops
+        // to the in-memory HistoryRecorder, ballooning RSS ~700 MB/s and OOM-ing
+        // the host (this killed the nightly tier-multi-dc runner ~30s into every
+        // run for 2+ weeks). 1 ms is far below the natural latency-bound rate, so
+        // healthy throughput is unaffected; it only caps the error-spin, keeping
+        // the history bounded. Unconditional (not end-of-body) because the error
+        // paths `continue`.
+        const MIN_ITER: Duration = Duration::from_millis(1);
         while start.elapsed() < duration {
+            tokio::time::sleep(MIN_ITER).await;
             let r: f64 = rand::random();
             if r < 0.7 {
                 // Transfer between two random accounts.
