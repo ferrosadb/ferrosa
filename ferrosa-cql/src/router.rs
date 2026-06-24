@@ -1046,6 +1046,116 @@ fn build_lwt_mutation(
     Ok((key_bytes, mutation_bytes))
 }
 
+/// Encode a DML statement as a buffered [`TransactionWrite`] for a CQL
+/// `BEGIN`/`COMMIT` transaction — the same key + commit-log mutation encoding as
+/// [`build_lwt_mutation`], plus the keyspace so the committer can resolve the
+/// key's replicas from that keyspace's replication.
+fn build_transaction_write(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<ferrosa_storage::accord::TransactionWrite, CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let now_micros = || -> Result<i64, CqlError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64)
+    };
+
+    let (table_id, key, row, ts) = match stmt {
+        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+        Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        _ => {
+            return Err(CqlError::Invalid(
+                "only INSERT/UPDATE/DELETE may be buffered in a transaction".into(),
+            ));
+        }
+    };
+
+    let keyspace = table_id.keyspace.clone();
+    let key_bytes = key.key.as_bytes().to_vec();
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key,
+        vec![row],
+        ts,
+    );
+    let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
+    mutation.serialize_into(&mut mutation_bytes);
+
+    Ok(ferrosa_storage::accord::TransactionWrite {
+        keyspace,
+        key: key_bytes,
+        mutation: mutation_bytes,
+    })
+}
+
+/// Intercept transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) and in-transaction
+/// DML for a CQL session. Returns `Some(result)` if the statement was handled as
+/// a transaction operation; `None` if it should be routed normally.
+///
+/// In an open transaction, `INSERT`/`UPDATE`/`DELETE` are **buffered** (not
+/// executed); `COMMIT` commits the whole buffered write-set as one multi-key
+/// Accord transaction via the [`SessionCore`](ferrosa_session::SessionCore)
+/// committer; `ROLLBACK` drops the buffer.
+pub async fn route_transactional(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+    txn: &mut crate::session::CqlTransaction,
+) -> Option<Result<RouteResult, CqlError>> {
+    match stmt {
+        Statement::BeginTransaction => Some(
+            txn.begin()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Rollback => Some(
+            txn.rollback()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Commit => Some(commit_cql_transaction(state, txn).await),
+        // Buffer DML only while a transaction is open; otherwise route normally.
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if txn.is_open() => {
+            Some(
+                build_transaction_write(state, ctx, stmt)
+                    .and_then(|w| txn.stage(w))
+                    .map(|()| RouteResult::Result(crate::result::encode_void())),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Commit the buffered write-set through the Accord committer. Fails loud (and
+/// closes the transaction) when not in cluster mode or when the commit cannot be
+/// driven — the client never gets a success it did not earn.
+async fn commit_cql_transaction(
+    state: &SharedState,
+    txn: &mut crate::session::CqlTransaction,
+) -> Result<RouteResult, CqlError> {
+    use ferrosa_storage::accord::CommitOutcome;
+    let committer = match state.accord_transaction_committer() {
+        Some(c) => c,
+        None => {
+            let _ = txn.rollback();
+            return Err(CqlError::Invalid(
+                "multi-statement transactions require cluster mode (Accord)".into(),
+            ));
+        }
+    };
+    match txn.commit(committer.as_ref()).await {
+        Ok(CommitOutcome::Committed) => Ok(RouteResult::Result(crate::result::encode_void())),
+        Ok(CommitOutcome::Aborted { reason }) => {
+            Err(CqlError::Invalid(format!("transaction aborted: {reason}")))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Decode the agreed row-at-`t` bytes (a serialized single-partition
 /// [`Mutation`](ferrosa_storage::Mutation)) into a `column -> value` map for IF
 /// evaluation, using the SAME positional decode the local read path uses
@@ -11821,6 +11931,49 @@ mod tests {
     fn keyspace_rf_returns_1_when_keyspace_not_found() {
         let (state, _dir) = setup();
         assert_eq!(keyspace_rf(&state.schema, "nonexistent"), 1);
+    }
+
+    #[tokio::test]
+    async fn route_transactional_handles_begin_rollback_and_fails_commit_in_standalone() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let mut txn = crate::session::CqlTransaction::new();
+
+        // A non-transactional statement is NOT intercepted (routes normally).
+        let select = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        assert!(
+            route_transactional(&state, &ctx, &select, &mut txn)
+                .await
+                .is_none(),
+            "SELECT must fall through to normal routing"
+        );
+
+        // BEGIN opens the transaction; ROLLBACK closes it.
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::BeginTransaction, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(txn.is_open());
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::Rollback, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(!txn.is_open());
+
+        // COMMIT in standalone mode (no Accord committer) must fail loud.
+        txn.begin().unwrap();
+        let committed = route_transactional(&state, &ctx, &Statement::Commit, &mut txn).await;
+        assert!(
+            matches!(committed, Some(Err(_))),
+            "COMMIT without a cluster committer must fail loud, not fake success"
+        );
     }
 
     #[tokio::test]
