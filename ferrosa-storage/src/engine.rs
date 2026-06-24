@@ -3154,19 +3154,19 @@ impl StorageEngine {
             return Ok(false);
         };
 
-        // Generic add_index covers BTree/Hash/Composite/Phonetic/Filtered.
-        // FullText and Vector use dedicated sidecar build paths and are
-        // reconstructed elsewhere; skip them loudly here so the gap is visible.
-        if matches!(
-            index_type,
-            ferrosa_index::IndexType::FullText | ferrosa_index::IndexType::Vector
-        ) {
+        // Vector indexes need their dimension + HNSW params to rebuild and use
+        // a dedicated path; skip them here. FullText is re-registered after
+        // column resolution below (and its sidecars rebuilt) — leaving it
+        // skipped made fts_match return EMPTY after a restart even though the
+        // on-disk FTI sidecars were intact, because the engine's
+        // fulltext_indexes map (column position) was never repopulated.
+        if matches!(index_type, ferrosa_index::IndexType::Vector) {
             tracing::warn!(
                 keyspace,
                 table,
                 index_name,
                 kind,
-                "skipping reload of fulltext/vector index — needs dedicated rebuild path"
+                "skipping reload of vector index — needs dedicated rebuild path"
             );
             return Ok(false);
         }
@@ -3209,6 +3209,46 @@ impl StorageEngine {
         } else {
             None
         };
+
+        // FullText: repopulate the engine's fulltext_indexes map (so fts_match
+        // can resolve the column and read the on-disk FTI sidecars / scan
+        // sidecar-less SSTables), then submit rebuild jobs so any SSTable that
+        // predates the index gets its FTI sidecar reindexed. This is the
+        // restart reindex path whose absence silently broke lexical search.
+        if matches!(index_type, ferrosa_index::IndexType::FullText) {
+            self.add_fulltext_index(&table_id, &index_name, column_position)?;
+            if let Some(ref scheduler) = self.index_scheduler {
+                let tables = self.tables.read();
+                if let Some(state) = tables.get(&table_id) {
+                    for sstable_id in state.store.sstable_generation_ids() {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id,
+                            index_name: index_name.clone(),
+                            index_type,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Initial,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position,
+                            filter_predicate: None,
+                        };
+                        if let Err(e) = scheduler.submit(job) {
+                            tracing::error!(%e, index_name, "reload: failed to submit fulltext reindex");
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                keyspace,
+                table,
+                index_name,
+                kind,
+                "re-registered + reindexed full-text index after restart"
+            );
+            return Ok(true);
+        }
 
         self.add_index_with_predicate(
             &table_id,
