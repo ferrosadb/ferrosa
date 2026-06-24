@@ -1,7 +1,12 @@
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::client::PoolSize;
+use scylla::policies::host_filter::AllowListHostFilter;
 use scylla::value::{CqlValue, Row};
 
 use crate::workload::CqlSession;
@@ -16,13 +21,33 @@ pub struct ScyllaCqlSession {
 
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
+    ///
+    /// The session is **pinned to a single node + a single connection**. A
+    /// `BEGIN…COMMIT` transaction buffers on one server connection, so every
+    /// statement in it must share one TCP connection — the pinned node forwards
+    /// writes as the Accord coordinator (cross-shard fan-out still happens).
+    /// Without pinning, the driver routes each statement by token to a different
+    /// node, and the transaction's buffered DML never reaches the `BEGIN`'s
+    /// connection.
+    ///
+    /// Caveat: the pinned node is a single point of failure for this client, so
+    /// a nemesis that kills it fails the client's ops (never *partial* writes —
+    /// the atomicity invariant still holds). Per-transaction reconnect / failover
+    /// to another node is a follow-up.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         assert!(
             !contact_points.is_empty(),
             "contact_points must not be empty"
         );
+        let pinned = contact_points[0].clone();
+        let filter = AllowListHostFilter::new([pinned.clone()])
+            .context("building single-node host filter")?;
         let session = SessionBuilder::new()
-            .known_nodes(contact_points)
+            .known_node(&pinned)
+            .host_filter(Arc::new(filter))
+            .pool_size(PoolSize::PerHost(
+                NonZeroUsize::new(1).expect("1 is nonzero"),
+            ))
             .build()
             .await
             .context("failed to connect to CQL cluster")?;
