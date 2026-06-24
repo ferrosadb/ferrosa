@@ -1,12 +1,7 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-use scylla::client::PoolSize;
-use scylla::policies::host_filter::AllowListHostFilter;
 use scylla::value::{CqlValue, Row};
 
 use crate::workload::CqlSession;
@@ -22,32 +17,27 @@ pub struct ScyllaCqlSession {
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
     ///
-    /// The session is **pinned to a single node + a single connection**. A
-    /// `BEGIN…COMMIT` transaction buffers on one server connection, so every
-    /// statement in it must share one TCP connection — the pinned node forwards
-    /// writes as the Accord coordinator (cross-shard fan-out still happens).
-    /// Without pinning, the driver routes each statement by token to a different
-    /// node, and the transaction's buffered DML never reaches the `BEGIN`'s
-    /// connection.
+    /// Uses the standard multi-node `known_nodes` session (the proven path the
+    /// nightly multi-DC runner relies on). The driver discovers the full topology
+    /// and routes each query token-aware.
     ///
-    /// Caveat: the pinned node is a single point of failure for this client, so
-    /// a nemesis that kills it fails the client's ops (never *partial* writes —
-    /// the atomicity invariant still holds). Per-transaction reconnect / failover
-    /// to another node is a follow-up.
+    /// NOTE on transactions: a `BEGIN…COMMIT` block buffers on one *server
+    /// connection*, so to be atomic its statements must all reach the same
+    /// connection. The token-aware pool can scatter them across coordinators, so
+    /// the atomic-transaction bank workload needs connection affinity — a
+    /// **single-node load-balancing policy** that pins every query to one
+    /// coordinator while keeping the full topology connected (so the cluster
+    /// stays reachable). An earlier attempt to pin via `AllowListHostFilter`
+    /// broke connectivity: the filter matches a node's *advertised* address,
+    /// which differs from the port-mapped contact point in Docker, so it filtered
+    /// out the only node and every query failed. See t_ec740b8f.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         assert!(
             !contact_points.is_empty(),
             "contact_points must not be empty"
         );
-        let pinned = contact_points[0].clone();
-        let filter = AllowListHostFilter::new([pinned.clone()])
-            .context("building single-node host filter")?;
         let session = SessionBuilder::new()
-            .known_node(&pinned)
-            .host_filter(Arc::new(filter))
-            .pool_size(PoolSize::PerHost(
-                NonZeroUsize::new(1).expect("1 is nonzero"),
-            ))
+            .known_nodes(contact_points)
             .build()
             .await
             .context("failed to connect to CQL cluster")?;
@@ -90,11 +80,15 @@ fn hex_encode(bytes: &[u8]) -> String {
 impl CqlSession for ScyllaCqlSession {
     async fn execute(&self, query: &str) -> Result<Vec<Vec<(String, String)>>> {
         assert!(!query.is_empty(), "query must not be empty");
+        // Flatten the driver error into the message (not just an anyhow context)
+        // so the workload's `e.to_string()` surfaces the ROOT cause — a bare
+        // "executing query: …" with the real failure hidden is a fail-loud gap
+        // that masked a connectivity regression once already.
         let result = self
             .session
             .query_unpaged(query, &[])
             .await
-            .with_context(|| format!("executing query: {query}"))?;
+            .map_err(|e| anyhow::anyhow!("executing query `{query}`: {e}"))?;
 
         // Non-SELECT statements (CREATE, INSERT, UPDATE, DELETE) produce no rows.
         let rows_result = match result.into_rows_result() {
