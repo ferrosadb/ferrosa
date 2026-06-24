@@ -66,19 +66,32 @@ echo "$M rc=${PIPESTATUS[0]} elapsed=${SECONDS}s"'
 
 echo ":: launching $VM in $REGION (starved baseline is the fuzzer)"
 # Run detached so we can poll for completion instead of blocking on the VM.
-# Capture machine id and provisioning output for diagnostics.
-machine_info=$(fly machine run ubuntu:24.04 \
+# In CI the fly CLI occasionally stalls even with --detach; cap provisioning
+# and discover the machine from the app if the CLI doesn't return its id.
+provision_log=$(mktemp)
+if timeout 180s fly machine run ubuntu:24.04 \
   --app "$APP" --vm-size "$VM" --vm-memory "$VM_MEMORY" --region "$REGION" --restart no \
   --file-local "/usr/local/bin/ferrosa-race-stress=$BINARY" \
-  --env GH_TOKEN="$GH_TOKEN" \
   --detach \
-  -- bash -c "$REMOTE" 2>&1)
-echo "$machine_info"
-machine_id=$(printf '%s' "$machine_info" | awk '/^id/{print $2; exit}' | tr -d '\r')
-if [ -z "$machine_id" ]; then
-  echo "::error::could not extract fly machine id from provisioning output"
+  -- bash -c "$REMOTE" >"$provision_log" 2>&1; then
+  echo ":: machine provisioning returned"
+  cat "$provision_log"
+  machine_id=$(awk '/^id/{print $2; exit}' "$provision_log" | tr -d '\r')
+else
+  echo "::warning::fly machine run --detach timed out or failed; discovering machine via list"
+  cat "$provision_log" || true
+fi
+
+if [ -z "${machine_id:-}" ]; then
+  # fly machine list output is JSON; extract the first machine id for this app.
+  machine_id=$(fly machine list -a "$APP" --json 2>/dev/null | grep -aoE '"id":"[^"]+"' | head -1 | cut -d'"' -f4 || true)
+fi
+
+if [ -z "${machine_id:-}" ]; then
+  echo "::error::could not create or discover a fly machine for app $APP"
   exit 1
 fi
+echo ":: machine id $machine_id"
 
 echo ":: waiting for completion (RS_RESULT marker)…"
 LOG="$(mktemp)"
