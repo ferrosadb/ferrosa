@@ -124,12 +124,23 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
-  Commit → Apply, fast/slow quorum math, HLC timestamps + `TxnId`. The replica
-  apply path is **dep-ordered**: `handle_apply` routes every real write through
-  `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of its
-  dependencies have applied locally (otherwise it parks and the cascade applies
-  it in order).
+  Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
+  The read-vote phase is the LWT `IF`-condition gate (`ReadPredicate::NotExists`
+  for `INSERT IF NOT EXISTS`, `ReadRow` for generic `IF`); a general multi-key
+  SQL transaction uses `ReadPredicate::Always`, which **skips the read-vote
+  entirely** and always applies after commit (there is no `IF` to evaluate). The
+  replica apply path is **dep-ordered**: `handle_apply` routes every real write
+  through `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of
+  its dependencies have applied locally (otherwise it parks and the cascade
+  applies it in order).
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
+- `transaction_commit.rs` — `AccordTransactionCommitter`: the cluster-side
+  implementation of `ferrosa_storage`'s `TransactionCommitter` seam (ADR-021). CQL/
+  Postgres `BEGIN`/`COMMIT` buffer DML and call it; it resolves replicas per key
+  (injected resolver wrapping `WritePath::accord_replicas_for_key` + schema in prod),
+  then drives ONE unconditional (`ReadPredicate::Always`) multi-key Accord
+  transaction via `new_multi`, mapping the outcome to `Committed`/`Aborted`/`Err`
+  (fail-loud — never acks an uncommitted txn).
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
   `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`

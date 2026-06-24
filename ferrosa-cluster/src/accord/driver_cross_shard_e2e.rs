@@ -17,10 +17,13 @@
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use uuid::Uuid;
+
+    use crate::accord::wire::ReadPredicate;
 
     use ferrosa_common::accord::{HybridLogicalClock, TxnId};
     use ferrosa_net::codec::Lane;
@@ -94,6 +97,9 @@ mod tests {
     struct RoutingTransport {
         nodes: HashMap<Uuid, Arc<AccordHandler>>,
         down: HashSet<Uuid>,
+        /// Number of `AccordRead` (read-vote) messages routed — lets a test prove
+        /// the read-vote phase ran (or, for an unconditional txn, was skipped).
+        read_votes: Arc<AtomicUsize>,
     }
     #[async_trait]
     impl AccordTransport for RoutingTransport {
@@ -103,6 +109,9 @@ mod tests {
             msg: Message,
             _lane: Lane,
         ) -> ferrosa_net::error::Result<Message> {
+            if matches!(msg, Message::AccordRead(_)) {
+                self.read_votes.fetch_add(1, Ordering::Relaxed);
+            }
             if self.down.contains(&host_id) {
                 return Err(NetError::Timeout("node down".into()));
             }
@@ -121,16 +130,19 @@ mod tests {
     /// Build a 2-shard cluster (one RF=1 node per shard) + an external coordinator
     /// driver for a 2-key cross-shard transaction. `down` names host ids whose
     /// node drops all messages. Returns (driver, nodeA, nodeB).
+    #[allow(clippy::too_many_arguments)]
     fn cross_shard_transfer(
         key_a: &[u8],
         mut_a: &[u8],
         key_b: &[u8],
         mut_b: &[u8],
         down: HashSet<Uuid>,
+        predicate: ReadPredicate,
     ) -> (
         AccordCoordinatorDriver,
         Arc<RecordingApplier>,
         Arc<RecordingApplier>,
+        Arc<AtomicUsize>,
     ) {
         let node_a = make_node(0xA);
         let node_b = make_node(0xB);
@@ -139,7 +151,12 @@ mod tests {
         let mut nodes = HashMap::new();
         nodes.insert(node_a.host_id, node_a.handler.clone());
         nodes.insert(node_b.host_id, node_b.handler.clone());
-        let transport: Arc<dyn AccordTransport> = Arc::new(RoutingTransport { nodes, down });
+        let read_votes = Arc::new(AtomicUsize::new(0));
+        let transport: Arc<dyn AccordTransport> = Arc::new(RoutingTransport {
+            nodes,
+            down,
+            read_votes: read_votes.clone(),
+        });
 
         // External coordinator (its id matches no replica → no self-loopback; every
         // message goes over the routing transport to a real handler).
@@ -169,9 +186,10 @@ mod tests {
             &clock,
             write_set,
         )
-        .with_per_key_replicas(Arc::new(resolver));
+        .with_per_key_replicas(Arc::new(resolver))
+        .with_read_predicate(predicate);
 
-        (driver, node_a.applier, node_b.applier)
+        (driver, node_a.applier, node_b.applier, read_votes)
     }
 
     /// Happy path: a 2-key transaction across two shards commits, and BOTH shards
@@ -180,8 +198,14 @@ mod tests {
     /// across genuinely distinct shards.
     #[tokio::test]
     async fn cross_shard_txn_commits_and_applies_on_both_shards() {
-        let (mut driver, applier_a, applier_b) =
-            cross_shard_transfer(b"acct_a", b"row_a", b"acct_b", b"row_b", HashSet::new());
+        let (mut driver, applier_a, applier_b, _reads) = cross_shard_transfer(
+            b"acct_a",
+            b"row_a",
+            b"acct_b",
+            b"row_b",
+            HashSet::new(),
+            ReadPredicate::NotExists,
+        );
 
         let result = driver.run_transaction().await;
         assert!(
@@ -201,6 +225,36 @@ mod tests {
         );
     }
 
+    /// Unconditional transaction (`ReadPredicate::Always`): a plain `BEGIN/COMMIT`
+    /// has no `IF` to evaluate, so the driver must SKIP the read-vote phase
+    /// entirely and apply on every shard. This is the unlock for general
+    /// multi-key SQL transactions (2a), which `NotExists`/`ReadRow` cannot serve.
+    #[tokio::test]
+    async fn unconditional_txn_skips_read_vote_and_applies_on_both_shards() {
+        let (mut driver, applier_a, applier_b, read_votes) = cross_shard_transfer(
+            b"acct_a",
+            b"row_a",
+            b"acct_b",
+            b"row_b",
+            HashSet::new(),
+            ReadPredicate::Always,
+        );
+
+        let result = driver.run_transaction().await;
+        assert!(
+            result.is_ok(),
+            "unconditional cross-shard txn must commit: {result:?}"
+        );
+        assert_eq!(
+            read_votes.load(Ordering::Relaxed),
+            0,
+            "an unconditional (Always) txn must send NO AccordRead — the read-vote \
+             phase is skipped"
+        );
+        assert_eq!(applier_a.applied_data(), vec![b"row_a".to_vec()]);
+        assert_eq!(applier_b.applied_data(), vec![b"row_b".to_vec()]);
+    }
+
     /// Abort-all: when one shard's only replica is down, the transaction cannot
     /// reach that shard's quorum and aborts — NEITHER shard applies (no partial
     /// cross-shard write).
@@ -208,8 +262,14 @@ mod tests {
     async fn cross_shard_txn_with_one_shard_down_applies_nothing() {
         let node_b_host = Uuid::from_u128(0xB);
         let down = HashSet::from([node_b_host]);
-        let (mut driver, applier_a, applier_b) =
-            cross_shard_transfer(b"acct_a", b"row_a", b"acct_b", b"row_b", down);
+        let (mut driver, applier_a, applier_b, _reads) = cross_shard_transfer(
+            b"acct_a",
+            b"row_a",
+            b"acct_b",
+            b"row_b",
+            down,
+            ReadPredicate::NotExists,
+        );
 
         let result = driver.run_transaction().await;
         assert!(
