@@ -1100,8 +1100,8 @@ fn build_transaction_write(
 ///
 /// In an open transaction, `INSERT`/`UPDATE`/`DELETE` are **buffered** (not
 /// executed); `COMMIT` commits the whole buffered write-set as one multi-key
-/// Accord transaction via the [`SessionCore`](ferrosa_session::SessionCore)
-/// committer; `ROLLBACK` drops the buffer.
+/// Accord transaction via the `SessionCore` committer
+/// (`accord_transaction_committer`); `ROLLBACK` drops the buffer.
 pub async fn route_transactional(
     state: &SharedState,
     ctx: &RequestContext<'_>,
