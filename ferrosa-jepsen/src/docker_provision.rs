@@ -49,8 +49,10 @@ pub fn container_runtime() -> &'static str {
 /// Information about a single provisioned node.
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
-    /// Hostname used to reach this node from the test runner.
-    pub host: &'static str,
+    /// Hostname or IP used to reach this node from the test runner. Owned so it
+    /// can hold a dynamic address (e.g. a Fly machine's private IP), not just a
+    /// static `"localhost"`.
+    pub host: String,
     /// CQL port on the test runner host.
     pub cql_port: u16,
 }
@@ -256,7 +258,7 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
     let nodes: Vec<NodeInfo> = NODE_CQL_PORTS[..node_count]
         .iter()
         .map(|&port| NodeInfo {
-            host: "localhost",
+            host: "localhost".to_string(),
             cql_port: port,
         })
         .collect();
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     fn node_info_cql_address() {
         let node = NodeInfo {
-            host: "localhost",
+            host: "localhost".to_string(),
             cql_port: 49042,
         };
         assert_eq!(node.cql_address(), "localhost:49042");
@@ -346,15 +348,15 @@ mod tests {
         let cluster = ClusterInfo {
             nodes: vec![
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49042,
                 },
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49043,
                 },
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49044,
                 },
             ],
