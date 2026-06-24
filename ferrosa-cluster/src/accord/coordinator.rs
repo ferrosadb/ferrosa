@@ -1152,200 +1152,209 @@ impl AccordCoordinatorDriver {
         // a fresh INSERT IF NOT EXISTS).
         // ------------------------------------------------------------------
 
-        let read_payload = ReadVotePayload {
-            txn_id,
-            t: commit_t,
-            key: key.clone(),
-            predicate: self.read_predicate.clone(),
-        };
-        let read_bytes = bincode::serialize(&read_payload)
-            .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
-        let read_msg = Message::AccordRead(Bytes::from(read_bytes));
-
-        let mut votes_false = 0usize;
-        let mut dissenting_row: Vec<u8> = Vec::new();
-        // For the generic ReadRow predicate: collect each replica's row-at-`t`
-        // bytes so we can require F+1 *agreement* on the row state before the
-        // coordinator evaluates the IF predicate. Disagreement is a correctness
-        // failure (non-linearizable read) and must abort, never silently pick one.
-        let mut read_rows: Vec<Vec<u8>> = Vec::new();
-        let is_generic = matches!(
+        // The read-vote phase is the LWT IF-condition gate. An unconditional
+        // transaction (`ReadPredicate::Always`) has no IF, so skip the whole
+        // phase and apply directly — otherwise the existence/row read-vote would
+        // wrongly gate an UPDATE to an existing row.
+        if !matches!(
             self.read_predicate,
-            crate::accord::wire::ReadPredicate::ReadRow { .. }
-        );
+            crate::accord::wire::ReadPredicate::Always
+        ) {
+            let read_payload = ReadVotePayload {
+                txn_id,
+                t: commit_t,
+                key: key.clone(),
+                predicate: self.read_predicate.clone(),
+            };
+            let read_bytes = bincode::serialize(&read_payload)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+            let read_msg = Message::AccordRead(Bytes::from(read_bytes));
 
-        // The coordinator's own replica is not reachable over the network
-        // (self-send fails). For the generic path it must contribute its local
-        // read-at-`t` so that, with RF=2 (sq=2), F+1 agreement is achievable and
-        // the result is deterministic across all replicas. The applier already
-        // persisted earlier conflicting txns locally before this read (dep-wait).
-        if is_generic {
-            if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
-                &self.read_predicate
-            {
-                // Prefer the local state machine when wired: it performs the SAME
-                // dep-wait the remote handler does (block until every conflicting
-                // `t0 < t` has Applied locally) before reading at `t`. This is what
-                // serializes a genuinely concurrent contender's write ahead of this
-                // read — without it the coordinator's own replica could read the key
-                // as absent while a smaller-`t` contender is mid-apply (the
-                // concurrent INSERT IF NOT EXISTS double-apply). On dep-wait timeout
-                // we ABSTAIN (push no row) so F+1 agreement fails loud rather than
-                // reading stale.
-                if let Some(local_sm) = &self.local_accord_state {
-                    if crate::accord::handlers::await_conflicting_deps_applied(
-                        local_sm, &key, commit_t,
-                    )
-                    .await
-                    {
-                        let row = local_sm
-                            .lock()
-                            .read_row_bytes_at(keyspace, table, &key, commit_t);
-                        read_rows.push(row.unwrap_or_default());
-                    } else {
-                        tracing::error!(
-                            txn_id = ?txn_id,
-                            "accord: coordinator local read-vote dep-wait timed out — abstaining"
-                        );
-                        // Abstain: contribute no local read. F+1 agreement then
-                        // fails loud below rather than treating a stale read as truth.
-                    }
-                } else if let Some(reader) = &self.local_reader {
-                    match reader.read_row_at(keyspace, table, &key, commit_t) {
-                        Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
-                        Err(e) => {
-                            return Err(AccordDriverError::Network(format!(
-                                "coordinator local read-at-t failed: {e}"
-                            )));
+            let mut votes_false = 0usize;
+            let mut dissenting_row: Vec<u8> = Vec::new();
+            // For the generic ReadRow predicate: collect each replica's row-at-`t`
+            // bytes so we can require F+1 *agreement* on the row state before the
+            // coordinator evaluates the IF predicate. Disagreement is a correctness
+            // failure (non-linearizable read) and must abort, never silently pick one.
+            let mut read_rows: Vec<Vec<u8>> = Vec::new();
+            let is_generic = matches!(
+                self.read_predicate,
+                crate::accord::wire::ReadPredicate::ReadRow { .. }
+            );
+
+            // The coordinator's own replica is not reachable over the network
+            // (self-send fails). For the generic path it must contribute its local
+            // read-at-`t` so that, with RF=2 (sq=2), F+1 agreement is achievable and
+            // the result is deterministic across all replicas. The applier already
+            // persisted earlier conflicting txns locally before this read (dep-wait).
+            if is_generic {
+                if let crate::accord::wire::ReadPredicate::ReadRow { keyspace, table } =
+                    &self.read_predicate
+                {
+                    // Prefer the local state machine when wired: it performs the SAME
+                    // dep-wait the remote handler does (block until every conflicting
+                    // `t0 < t` has Applied locally) before reading at `t`. This is what
+                    // serializes a genuinely concurrent contender's write ahead of this
+                    // read — without it the coordinator's own replica could read the key
+                    // as absent while a smaller-`t` contender is mid-apply (the
+                    // concurrent INSERT IF NOT EXISTS double-apply). On dep-wait timeout
+                    // we ABSTAIN (push no row) so F+1 agreement fails loud rather than
+                    // reading stale.
+                    if let Some(local_sm) = &self.local_accord_state {
+                        if crate::accord::handlers::await_conflicting_deps_applied(
+                            local_sm, &key, commit_t,
+                        )
+                        .await
+                        {
+                            let row = local_sm
+                                .lock()
+                                .read_row_bytes_at(keyspace, table, &key, commit_t);
+                            read_rows.push(row.unwrap_or_default());
+                        } else {
+                            tracing::error!(
+                                txn_id = ?txn_id,
+                                "accord: coordinator local read-vote dep-wait timed out — abstaining"
+                            );
+                            // Abstain: contribute no local read. F+1 agreement then
+                            // fails loud below rather than treating a stale read as truth.
                         }
-                    }
-                }
-            }
-        }
-
-        let remote_read_futs: Vec<_> = self
-            .replica_ids
-            .iter()
-            .filter(|&&id| id != self_id)
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = read_msg.clone();
-                async move { peers.send(peer_id, msg, Lane::Data).await }
-            })
-            .collect();
-        let read_responses = futures::future::join_all(remote_read_futs).await;
-
-        for result in &read_responses {
-            match result {
-                Ok(Message::AccordReadOK(b)) if !b.is_empty() => {
-                    match bincode::deserialize::<ReadVoteOkPayload>(b) {
-                        Ok(vote) => {
-                            if is_generic {
-                                // Generic IF: replica returns the row bytes at `t`
-                                // (condition_holds is a neutral true). Collect for
-                                // F+1 agreement; the coordinator evaluates the
-                                // predicate authoritatively below.
-                                read_rows.push(vote.current_row.clone());
-                            } else if !vote.condition_holds {
-                                // INSERT IF NOT EXISTS existence path.
-                                votes_false += 1;
-                                if dissenting_row.is_empty() {
-                                    dissenting_row = vote.current_row.clone();
-                                }
+                    } else if let Some(reader) = &self.local_reader {
+                        match reader.read_row_at(keyspace, table, &key, commit_t) {
+                            Ok(bytes) => read_rows.push(bytes.unwrap_or_default()),
+                            Err(e) => {
+                                return Err(AccordDriverError::Network(format!(
+                                    "coordinator local read-at-t failed: {e}"
+                                )));
                             }
                         }
-                        Err(_) => {
-                            // pre-Gap-4 replica or parse error: treat as
-                            // condition_holds=true (forward-compatible default).
-                        }
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    // No response or network error — skip (don't count as false vote).
-                    // Log network errors at warn level.
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            txn_id = ?txn_id,
-                            error = %e,
-                            "accord: ReadVote RPC failed (non-fatal)"
-                        );
                     }
                 }
             }
-        }
 
-        if is_generic {
-            // Require F+1 replicas to agree on the SAME row bytes at `t`. This is
-            // the linearizable read: a divergent read is non-linearizable and must
-            // abort (fail loud) rather than have the coordinator guess.
-            let agreed = agreed_row(&read_rows, sq);
-            let agreed_row_bytes = match agreed {
-                Some(row) => {
-                    self.last_read_row = if row.is_empty() {
+            let remote_read_futs: Vec<_> = self
+                .replica_ids
+                .iter()
+                .filter(|&&id| id != self_id)
+                .map(|&peer_id| {
+                    let peers = Arc::clone(&self.peers);
+                    let msg = read_msg.clone();
+                    async move { peers.send(peer_id, msg, Lane::Data).await }
+                })
+                .collect();
+            let read_responses = futures::future::join_all(remote_read_futs).await;
+
+            for result in &read_responses {
+                match result {
+                    Ok(Message::AccordReadOK(b)) if !b.is_empty() => {
+                        match bincode::deserialize::<ReadVoteOkPayload>(b) {
+                            Ok(vote) => {
+                                if is_generic {
+                                    // Generic IF: replica returns the row bytes at `t`
+                                    // (condition_holds is a neutral true). Collect for
+                                    // F+1 agreement; the coordinator evaluates the
+                                    // predicate authoritatively below.
+                                    read_rows.push(vote.current_row.clone());
+                                } else if !vote.condition_holds {
+                                    // INSERT IF NOT EXISTS existence path.
+                                    votes_false += 1;
+                                    if dissenting_row.is_empty() {
+                                        dissenting_row = vote.current_row.clone();
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // pre-Gap-4 replica or parse error: treat as
+                                // condition_holds=true (forward-compatible default).
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        // No response or network error — skip (don't count as false vote).
+                        // Log network errors at warn level.
+                        if let Err(e) = result {
+                            tracing::warn!(
+                                txn_id = ?txn_id,
+                                error = %e,
+                                "accord: ReadVote RPC failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
+            }
+
+            if is_generic {
+                // Require F+1 replicas to agree on the SAME row bytes at `t`. This is
+                // the linearizable read: a divergent read is non-linearizable and must
+                // abort (fail loud) rather than have the coordinator guess.
+                let agreed = agreed_row(&read_rows, sq);
+                let agreed_row_bytes = match agreed {
+                    Some(row) => {
+                        self.last_read_row = if row.is_empty() {
+                            None
+                        } else {
+                            Some(row.clone())
+                        };
+                        row
+                    }
+                    None => {
+                        return Err(AccordDriverError::Network(format!(
+                            "generic IF read-vote lacked F+1 ({sq}) agreement on the row at t \
+                         (got {} reads) — refusing a non-linearizable LWT",
+                            read_rows.len()
+                        )));
+                    }
+                };
+
+                // GATE THE WRITE on the IF condition. The coordinator owns the table
+                // schema (via the injected gate, which wraps the canonical
+                // eval_if_conditions); it evaluates the predicate against the
+                // F+1-agreed, linearizable row-at-`t` and ABORTS before the Apply
+                // phase when the condition does not hold. Without this the generic
+                // path would persist its mutation unconditionally and still report
+                // [applied]=false — a lost-update / wrong-[applied] data-loss bug.
+                //
+                // Determinism: every replica sees the same `t` and the same agreed
+                // row bytes, so the gate's verdict is identical everywhere.
+                if let Some(gate) = &self.condition_gate {
+                    let row_arg: Option<&[u8]> = if agreed_row_bytes.is_empty() {
                         None
                     } else {
-                        Some(row.clone())
+                        Some(agreed_row_bytes.as_slice())
                     };
-                    row
+                    if !gate(row_arg) {
+                        tracing::info!(
+                            txn_id = ?txn_id,
+                            "accord: generic IF condition not met — [applied]=false, no Apply"
+                        );
+                        // Finalize this committed-but-not-applied txn as a no-write
+                        // across replicas so it does not linger as a phantom dep that
+                        // would stall later reads' dep-wait on this key.
+                        self.finalize_no_write().await;
+                        return Err(AccordDriverError::ConditionNotMet {
+                            current_row: agreed_row_bytes,
+                        });
+                    }
                 }
-                None => {
-                    return Err(AccordDriverError::Network(format!(
-                        "generic IF read-vote lacked F+1 ({sq}) agreement on the row at t \
-                         (got {} reads) — refusing a non-linearizable LWT",
-                        read_rows.len()
-                    )));
-                }
-            };
-
-            // GATE THE WRITE on the IF condition. The coordinator owns the table
-            // schema (via the injected gate, which wraps the canonical
-            // eval_if_conditions); it evaluates the predicate against the
-            // F+1-agreed, linearizable row-at-`t` and ABORTS before the Apply
-            // phase when the condition does not hold. Without this the generic
-            // path would persist its mutation unconditionally and still report
-            // [applied]=false — a lost-update / wrong-[applied] data-loss bug.
-            //
-            // Determinism: every replica sees the same `t` and the same agreed
-            // row bytes, so the gate's verdict is identical everywhere.
-            if let Some(gate) = &self.condition_gate {
-                let row_arg: Option<&[u8]> = if agreed_row_bytes.is_empty() {
-                    None
-                } else {
-                    Some(agreed_row_bytes.as_slice())
-                };
-                if !gate(row_arg) {
+            } else {
+                // F+1 matching votes decide the outcome.
+                // Only return ConditionNotMet if F+1 replicas explicitly voted false.
+                if votes_false >= sq {
                     tracing::info!(
                         txn_id = ?txn_id,
-                        "accord: generic IF condition not met — [applied]=false, no Apply"
+                        votes_false,
+                        sq,
+                        "accord: IF condition not met — [applied]=false"
                     );
                     // Finalize this committed-but-not-applied txn as a no-write
                     // across replicas so it does not linger as a phantom dep that
                     // would stall later reads' dep-wait on this key.
                     self.finalize_no_write().await;
                     return Err(AccordDriverError::ConditionNotMet {
-                        current_row: agreed_row_bytes,
+                        current_row: dissenting_row,
                     });
                 }
             }
-        } else {
-            // F+1 matching votes decide the outcome.
-            // Only return ConditionNotMet if F+1 replicas explicitly voted false.
-            if votes_false >= sq {
-                tracing::info!(
-                    txn_id = ?txn_id,
-                    votes_false,
-                    sq,
-                    "accord: IF condition not met — [applied]=false"
-                );
-                // Finalize this committed-but-not-applied txn as a no-write
-                // across replicas so it does not linger as a phantom dep that
-                // would stall later reads' dep-wait on this key.
-                self.finalize_no_write().await;
-                return Err(AccordDriverError::ConditionNotMet {
-                    current_row: dissenting_row,
-                });
-            }
-        }
+        } // end read-vote phase (skipped for ReadPredicate::Always)
 
         // ------------------------------------------------------------------
         // Phase 5: Apply broadcast (Gap 5 — dep-wait + storage write)

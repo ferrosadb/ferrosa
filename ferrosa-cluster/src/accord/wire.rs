@@ -184,6 +184,11 @@ pub enum ReadPredicate {
         /// Target table name.
         table: String,
     },
+    /// Unconditional commit: there is no `IF` to evaluate, so the transaction
+    /// always applies after commit. The coordinator SKIPS the read-vote phase
+    /// entirely (no `AccordRead` fan-out). This is the path for a general
+    /// multi-key SQL transaction (`BEGIN`/`COMMIT`), which has no LWT condition.
+    Always,
 }
 
 /// Read-vote response from a replica.

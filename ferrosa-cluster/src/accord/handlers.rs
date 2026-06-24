@@ -332,6 +332,10 @@ impl RpcHandler for AccordHandler {
                             sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
                             vec![],
                         ),
+                        // Unconditional transaction: no IF to evaluate, always
+                        // holds. Defensive — the coordinator skips the read-vote
+                        // for `Always`, so this arm is not normally reached.
+                        ReadPredicate::Always => (true, vec![]),
                         // Generic IF col=val: the replica does the read-at-`t`
                         // and returns the row bytes; the coordinator (which owns
                         // the table schema) evaluates the predicate via the
