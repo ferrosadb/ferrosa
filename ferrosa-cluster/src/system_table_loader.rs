@@ -566,6 +566,59 @@ mod tests {
     }
 
     #[test]
+    fn replay_indexes_restores_fulltext_index_for_router_resolution() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::metadata::index::IndexMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Persist a CREATE INDEX (FullText) through the dogfooded writer.
+        let idx = IndexMetadata {
+            keyspace: "app".to_string(),
+            table: "docs".to_string(),
+            name: "idx_body_fts".to_string(),
+            index_type: IndexType::FullText,
+            target_columns: vec!["body".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(idx.clone()),
+            )
+            .unwrap();
+
+        // Cold restart: a fresh registry has NO indexes (the bug — the router's
+        // fts_match resolution would fall back to the bare column name).
+        let schema = test_schema();
+        assert!(
+            schema.snapshot().indexes.is_empty(),
+            "fresh schema must start with no indexes"
+        );
+
+        let count = SystemTableLoader::new(engine)
+            .replay_indexes_into_schema(&schema)
+            .unwrap();
+        assert_eq!(count, 1, "exactly one persisted index should be replayed");
+
+        // After replay the FullText index is resolvable, so the router maps
+        // fts_match(body) -> idx_body_fts instead of the bare column.
+        let snap = schema.snapshot();
+        let meta = snap
+            .indexes
+            .get(&(
+                "app".to_string(),
+                "docs".to_string(),
+                "idx_body_fts".to_string(),
+            ))
+            .expect("FullText index must be live in the registry after replay");
+        assert_eq!(meta.index_type, IndexType::FullText);
+        assert_eq!(meta.target_columns, vec!["body".to_string()]);
+    }
+
+    #[test]
     fn replay_role_permissions_restores_write_permission() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
