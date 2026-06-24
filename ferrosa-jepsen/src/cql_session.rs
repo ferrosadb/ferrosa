@@ -1,7 +1,12 @@
+use std::num::NonZeroUsize;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::client::PoolSize;
+use scylla::policies::load_balancing::{NodeIdentifier, SingleTargetLoadBalancingPolicy};
 use scylla::value::{CqlValue, Row};
 
 use crate::workload::CqlSession;
@@ -17,30 +22,55 @@ pub struct ScyllaCqlSession {
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
     ///
-    /// Uses the standard multi-node `known_nodes` session (the proven path the
-    /// nightly multi-DC runner relies on). The driver discovers the full topology
-    /// and routes each query token-aware.
+    /// The session **pins every query to a single coordinator node** so a
+    /// `BEGIN…COMMIT` block's statements share one connection — the server buffers
+    /// a transaction per connection, so without affinity the token-aware pool
+    /// would scatter the statements across coordinators and the buffered DML would
+    /// never reach the `BEGIN`'s connection (silently non-atomic).
     ///
-    /// NOTE on transactions: a `BEGIN…COMMIT` block buffers on one *server
-    /// connection*, so to be atomic its statements must all reach the same
-    /// connection. The token-aware pool can scatter them across coordinators, so
-    /// the atomic-transaction bank workload needs connection affinity — a
-    /// **single-node load-balancing policy** that pins every query to one
-    /// coordinator while keeping the full topology connected (so the cluster
-    /// stays reachable). An earlier attempt to pin via `AllowListHostFilter`
-    /// broke connectivity: the filter matches a node's *advertised* address,
-    /// which differs from the port-mapped contact point in Docker, so it filtered
-    /// out the only node and every query failed. See t_ec740b8f.
+    /// Pinning is by **`host_id`** (a stable cluster identity), discovered via a
+    /// short-lived probe session — NOT by address. A node's advertised address
+    /// differs from the port-mapped contact point in Docker/Fly, which is exactly
+    /// why the earlier `AllowListHostFilter` attempt filtered out the only node
+    /// and broke all connectivity (t_ec740b8f). The full topology stays connected
+    /// (`known_nodes` + `PoolSize(1)`); the pinned node forwards writes as the
+    /// Accord coordinator, so cross-shard fan-out still happens.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         assert!(
             !contact_points.is_empty(),
             "contact_points must not be empty"
         );
-        let session = SessionBuilder::new()
+
+        // Phase 1 — probe with a normal session to learn a live node's host_id.
+        let probe = SessionBuilder::new()
             .known_nodes(contact_points)
             .build()
             .await
-            .context("failed to connect to CQL cluster")?;
+            .context("failed to connect to CQL cluster (probe)")?;
+        let target = probe
+            .get_cluster_state()
+            .get_nodes_info()
+            .iter()
+            .min_by_key(|n| n.host_id) // deterministic across topology refreshes
+            .map(|n| n.host_id)
+            .context("cluster reports no known nodes to pin to")?;
+        drop(probe);
+
+        // Phase 2 — pin all queries to that node (one connection ⇒ transaction
+        // affinity), keeping the full topology connected for reachability.
+        let policy = SingleTargetLoadBalancingPolicy::new(NodeIdentifier::HostId(target), None);
+        let profile = ExecutionProfile::builder()
+            .load_balancing_policy(policy)
+            .build();
+        let session = SessionBuilder::new()
+            .known_nodes(contact_points)
+            .default_execution_profile_handle(profile.into_handle())
+            .pool_size(PoolSize::PerHost(
+                NonZeroUsize::new(1).expect("1 is nonzero"),
+            ))
+            .build()
+            .await
+            .context("failed to connect to CQL cluster (pinned)")?;
         Ok(Self { session })
     }
 }
