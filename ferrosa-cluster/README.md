@@ -134,6 +134,13 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   its dependencies have applied locally (otherwise it parks and the cascade
   applies it in order).
 - `recovery.rs` — Paxos-style recovery selecting by highest `accepted_ballot`.
+- `transaction_commit.rs` — `AccordTransactionCommitter`: the cluster-side
+  implementation of `ferrosa_storage`'s `TransactionCommitter` seam (ADR-021). CQL/
+  Postgres `BEGIN`/`COMMIT` buffer DML and call it; it resolves replicas per key
+  (injected resolver wrapping `WritePath::accord_replicas_for_key` + schema in prod),
+  then drives ONE unconditional (`ReadPredicate::Always`) multi-key Accord
+  transaction via `new_multi`, mapping the outcome to `Committed`/`Aborted`/`Err`
+  (fail-loud — never acks an uncommitted txn).
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
   `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`
