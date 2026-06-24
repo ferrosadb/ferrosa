@@ -199,6 +199,62 @@ impl SystemTableLoader {
         }
         Ok(restored)
     }
+
+    /// Replay persisted `system_schema.indexes` rows into the live schema
+    /// Registry's index set.
+    ///
+    /// `load_local_schema` (schema.json) restores table schemas with NO
+    /// indexes, and the storage-side `reload_indexes_from_system_schema` only
+    /// repopulates the *engine*. The CQL router resolves an `fts_match` column
+    /// to its index via `SchemaSnapshot.indexes` (`resolve_fulltext_index_name`),
+    /// so without this replay that lookup falls back to the bare column name
+    /// after a restart and full-text search silently returns nothing. Returns
+    /// the number of indexes (re-)registered.
+    ///
+    /// Filtered (partial) indexes are skipped here: their predicate lives in
+    /// the persisted options and would need faithful decoding to register
+    /// soundly; they already route via the engine, and only full-text routing
+    /// depends on the schema registry.
+    pub fn replay_indexes_into_schema(&self, schema: &Schema) -> ferrosa_common::Result<usize> {
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        let rows = self.engine.read_persisted_indexes()?;
+        let mut restored = 0usize;
+        for row in rows {
+            let Some(index_type) =
+                ferrosa_schema::system::persistence::index_type_from_kind(&row.kind)
+            else {
+                tracing::warn!(
+                    keyspace = %row.keyspace_name,
+                    index = %row.index_name,
+                    kind = %row.kind,
+                    "skipping system_schema.indexes replay: unknown index kind"
+                );
+                continue;
+            };
+            if matches!(index_type, ferrosa_index::IndexType::Filtered) {
+                continue;
+            }
+            let meta = IndexMetadata {
+                keyspace: row.keyspace_name.clone(),
+                table: row.table_name.clone(),
+                name: row.index_name.clone(),
+                index_type,
+                target_columns: row.target.split(", ").map(|s| s.to_string()).collect(),
+                filter_predicate: None,
+                options: serde_json::from_str(&row.options).unwrap_or_default(),
+            };
+            match schema.create_index_internal(meta) {
+                Ok(()) => restored += 1,
+                Err(e) => tracing::warn!(
+                    keyspace = %row.keyspace_name,
+                    index = %row.index_name,
+                    %e,
+                    "skipping system_schema.indexes replay row"
+                ),
+            }
+        }
+        Ok(restored)
+    }
 }
 
 fn decode_permission(name: &str) -> ferrosa_common::Result<Permission> {
