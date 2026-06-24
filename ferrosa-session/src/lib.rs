@@ -66,4 +66,45 @@ impl SessionCore {
     pub fn accord_enabled(&self) -> bool {
         self.peer_manager.is_some() && self.accord_clock.is_some()
     }
+
+    /// Build the Accord transaction committer for cluster-wide `BEGIN`/`COMMIT`
+    /// (ADR-021 / D11), or `None` in standalone mode. Built on demand from the
+    /// current write path + schema — cheap (Arc clones + a closure) — so no
+    /// committer is stored in or threaded through `SharedState`, and every
+    /// front-end (CQL and Postgres) gets it the same way.
+    ///
+    /// The per-key replica resolver wraps `WritePath::accord_replicas_for_key`
+    /// keyed by each write's keyspace replication; replica placement stays in the
+    /// cluster layer, never the front-ends.
+    pub fn accord_transaction_committer(
+        &self,
+    ) -> Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>> {
+        let peers = self.peer_manager.clone()?;
+        let clock = self.accord_clock.clone()?;
+        let node_id = u64::from_be_bytes(
+            self.node_config.host_id.as_bytes()[..8]
+                .try_into()
+                .expect("uuid is 16 bytes"),
+        );
+        let write_path = self.write_path.clone();
+        let schema = self.schema.clone();
+        let resolve: ferrosa_cluster::accord::ReplicaResolver =
+            Arc::new(move |ks: &str, key: &[u8]| {
+                let snap = schema.snapshot();
+                let replication = &snap.keyspaces.get(ks)?.replication;
+                write_path
+                    .load()
+                    .accord_replicas_for_key(key, replication)
+                    .ok()
+                    .flatten()
+            });
+        let applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+            self.engine.clone(),
+        ));
+        Some(Arc::new(
+            ferrosa_cluster::accord::AccordTransactionCommitter::new(
+                node_id, clock, peers, applier, resolve,
+            ),
+        ))
+    }
 }

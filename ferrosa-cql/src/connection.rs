@@ -260,6 +260,11 @@ pub(crate) async fn handle_connection<S>(
     let mut auth_context: Option<AuthContext> = None;
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
+    // Per-connection BEGIN/COMMIT transaction buffer (shared across this
+    // connection's concurrent in-flight requests; transactions are serialized).
+    let conn_txn = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::session::CqlTransaction::new(),
+    ));
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
     let mut client_use_beta: bool = false; // USE_BETA flag (0x10) in STARTUP
@@ -443,6 +448,7 @@ pub(crate) async fn handle_connection<S>(
                     let mut ks_for_handler = ks_at_spawn.clone();
                     let peer_addr = peer;
                     let request_task_pool = task_pool.clone();
+                    let conn_txn_for_handler = conn_txn.clone();
                     request_task_pool.spawn(async move {
                         let request_span = cql_request_span(opcode, peer_addr);
                         let result = (async {
@@ -455,6 +461,7 @@ pub(crate) async fn handle_connection<S>(
                                         &body,
                                         peer_addr,
                                         proto_version,
+                                        &conn_txn_for_handler,
                                     )
                                     .await
                                 }
@@ -538,6 +545,7 @@ pub(crate) async fn handle_connection<S>(
                         &mut pending_compression,
                         peer,
                         task_pool.clone(),
+                        &conn_txn,
                     )
                     .await
                 })
@@ -1047,6 +1055,7 @@ async fn handle_frame(
     pending_compression: &mut Option<Compression>,
     peer: SocketAddr,
     task_pool: TaskPool,
+    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -1087,6 +1096,7 @@ async fn handle_frame(
                     &frame.body,
                     peer,
                     frame.header.version,
+                    conn_txn,
                 )
                 .await
             }
@@ -1374,6 +1384,7 @@ async fn handle_query(
     body: &Bytes,
     peer: SocketAddr,
     protocol_version: u8,
+    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1442,6 +1453,22 @@ async fn handle_query(
 
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+
+    // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
+    // Accord). The per-connection buffer is locked only for the duration of the
+    // check/commit (transactions on a connection are inherently serial), then
+    // released before normal routing; `None` falls through.
+    let txn_result = {
+        let mut txn = conn_txn.lock().await;
+        crate::router::route_transactional(state, &ctx, &stmt, &mut txn).await
+    };
+    if let Some(result) = txn_result {
+        return match result {
+            Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
+            Ok(_) => HandleResult::Reply(Opcode::Result, crate::result::encode_void()),
+            Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+        };
+    }
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
