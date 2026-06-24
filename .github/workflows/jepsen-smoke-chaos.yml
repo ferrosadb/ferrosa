@@ -1,0 +1,49 @@
+name: Jepsen Smoke Chaos (manual)
+
+# Live verification of the jepsen harness against a real, **from-source** 3-node
+# cluster on a Linux runner: runs the smoke tier (register / lwt / bank workloads
+# x nemeses) with FERROSA_TEST_CONTAINERS=1. The compose file builds the node
+# image from the current checkout, so this exercises the branch's server code
+# (BEGIN/COMMIT) and driver code (transaction connection affinity + the CQL
+# handshake readiness gate) end to end.
+#
+# `workflow_dispatch` is the permanent entry point (works once this file is on
+# the default branch). The scoped `push` trigger lets the verification run from
+# the feature branch before it merges; remove it before merging.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/jepsen-fly-chaos
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-chaos:
+    name: smoke tier (3-node from-source cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run jepsen smoke chaos (from-source cluster)
+        env:
+          FERROSA_TEST_CONTAINERS: '1'
+          RUST_LOG: info
+        run: |
+          set -o pipefail
+          cargo run -p ferrosa-jepsen -- \
+            run \
+            --tier smoke \
+            --output-dir ./jepsen-out \
+            2>&1 | tee smoke-chaos.log
+      - name: Upload logs + history
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smoke-chaos-logs
+          path: |
+            smoke-chaos.log
+            jepsen-out
