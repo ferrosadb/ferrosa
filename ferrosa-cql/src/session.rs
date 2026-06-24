@@ -284,12 +284,23 @@ impl ConnTxn {
 /// the injected [`TransactionCommitter`] (ADR-021). `ROLLBACK` drops the buffer.
 ///
 /// FAIL-LOUD (URS-QEC-X01): a failed commit returns `Err` and the transaction is
-/// closed — the server never acks a transaction it did not commit.
+/// closed — the server never acks a transaction it did not commit. A statement
+/// that fails *inside* a transaction poisons it: the next `COMMIT` fails loud
+/// rather than committing a partial write-set.
 #[derive(Default)]
 pub struct CqlTransaction {
     open: bool,
+    /// Set when a buffered statement failed (or the write-set cap was hit): the
+    /// transaction can no longer commit, so a partial write-set is never
+    /// committed. The client must `ROLLBACK` and retry.
+    poisoned: bool,
     buffer: Vec<TransactionWrite>,
 }
+
+/// Max DML writes buffered in one transaction before it is poisoned. A client
+/// must not be able to OOM the server with an unbounded open `BEGIN` (Power-of-10
+/// Rule 3: every server-side dynamic collection has a hard cap).
+const MAX_TXN_WRITES: usize = 10_000;
 
 impl CqlTransaction {
     /// A fresh connection with no open transaction.
@@ -315,26 +326,44 @@ impl CqlTransaction {
             ));
         }
         self.open = true;
+        self.poisoned = false;
         self.buffer.clear();
         Ok(())
     }
 
-    /// Buffer one DML write. FAILS LOUD if no transaction is open.
+    /// Buffer one DML write. FAILS LOUD (and POISONS the transaction) if no
+    /// transaction is open or the write-set cap is exceeded.
     pub fn stage(&mut self, write: TransactionWrite) -> Result<(), CqlError> {
         if !self.open {
             return Err(CqlError::Invalid(
                 "DML staged outside of a transaction".to_string(),
             ));
         }
+        if self.buffer.len() >= MAX_TXN_WRITES {
+            self.poisoned = true;
+            return Err(CqlError::Invalid(format!(
+                "transaction write-set exceeds the {MAX_TXN_WRITES}-write limit; ROLLBACK required"
+            )));
+        }
         self.buffer.push(write);
         Ok(())
     }
 
+    /// Mark the open transaction un-committable after a statement failed inside
+    /// it (e.g. a DML that could not be encoded). The next `COMMIT` fails loud
+    /// rather than committing an incomplete write-set. No-op outside a txn.
+    pub fn poison(&mut self) {
+        if self.open {
+            self.poisoned = true;
+        }
+    }
+
     /// `COMMIT`: commit the buffered write-set via `committer`, then close the
-    /// transaction. FAILS LOUD if no transaction is open. The buffer is drained
-    /// and the transaction closed regardless of outcome — a failed commit is
-    /// surfaced as `Err` (never silently retried or acked), a clean abort as the
-    /// returned [`CommitOutcome`].
+    /// transaction. FAILS LOUD if no transaction is open, or if the transaction
+    /// was poisoned by an earlier failed statement (never commit a partial
+    /// write-set). The buffer is drained and the transaction closed regardless of
+    /// outcome — a failed commit is surfaced as `Err` (never silently retried or
+    /// acked), a clean abort as the returned [`CommitOutcome`].
     pub async fn commit(
         &mut self,
         committer: &dyn TransactionCommitter,
@@ -342,6 +371,14 @@ impl CqlTransaction {
         if !self.open {
             return Err(CqlError::Invalid(
                 "COMMIT outside of a transaction".to_string(),
+            ));
+        }
+        if self.poisoned {
+            self.buffer.clear();
+            self.open = false;
+            self.poisoned = false;
+            return Err(CqlError::Invalid(
+                "transaction aborted by an earlier failed statement; ROLLBACK required".to_string(),
             ));
         }
         let writes = std::mem::take(&mut self.buffer);
@@ -361,6 +398,7 @@ impl CqlTransaction {
         }
         self.buffer.clear();
         self.open = false;
+        self.poisoned = false;
         Ok(())
     }
 }
@@ -449,6 +487,47 @@ mod tests {
             !tx.is_open(),
             "the transaction closes even when commit fails"
         );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_poison_blocks_commit() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        tx.stage(tw("ks", b"a")).unwrap();
+        tx.poison(); // a statement failed inside the transaction
+
+        let result = tx.commit(&committer).await;
+
+        assert!(result.is_err(), "a poisoned transaction must NOT commit");
+        assert!(
+            !tx.is_open(),
+            "a poisoned COMMIT still closes the transaction"
+        );
+        assert!(
+            committer.committed().is_empty(),
+            "the committer must never be called for a poisoned txn (no partial write-set)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_write_set_cap_poisons_and_blocks_commit() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        for i in 0..MAX_TXN_WRITES {
+            tx.stage(tw("ks", format!("k{i}").as_bytes())).unwrap();
+        }
+        // The write past the cap fails loud and poisons the transaction.
+        assert!(
+            tx.stage(tw("ks", b"over")).is_err(),
+            "staging past the write-set cap must fail loud"
+        );
+        // COMMIT now fails (poisoned) and applies nothing — never a partial commit.
+        assert!(tx.commit(&committer).await.is_err());
+        assert!(committer.committed().is_empty());
     }
 
     #[test]
