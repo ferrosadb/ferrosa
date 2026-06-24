@@ -227,7 +227,10 @@ jobs:
           set -euo pipefail
           cp "${{ steps.nightly_deb.outputs.deb_path }}" tests/ferrosa.deb
           docker build -f tests/Dockerfile.nightly-deb -t ferrosa-smoke:latest tests/
-          rm -f tests/ferrosa.deb
+          # Keep ferrosa.deb in place: docker-smoke.sh runs `docker compose up --build`
+          # against docker-compose.yml, which uses tests/Dockerfile.smoke and needs
+          # the .deb file as a build context. Deleting it here causes a cache miss and
+          # "ferrosa.deb: not found" during the compose build.
 
       - name: Set up sccache (only when the musl fallback compiles)
         if: steps.nightly_deb.outputs.deb_path == ''
@@ -243,7 +246,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
           strip tests/ferrosa
           docker build -f tests/Dockerfile.nightly-bin -t ferrosa-smoke:latest tests/
-          rm -f tests/ferrosa
+          # Keep the static binary in place for the same reason we keep the .deb.
 
       - name: Run Docker smoke test
         env:
