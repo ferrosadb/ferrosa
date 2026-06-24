@@ -1,6 +1,7 @@
 //! `AccordTransactionCommitter` — the cluster-side implementation of the
-//! [`TransactionCommitter`](ferrosa_storage::accord::TransactionCommitter) seam
-//! (ADR-021, increment 2b).
+//! [`TransactionCommitter`] seam (ADR-021, increment 2b).
+//!
+//! [`TransactionCommitter`]: ferrosa_storage::accord::TransactionCommitter
 //!
 //! CQL/Postgres `BEGIN`/`COMMIT` buffer DML into a write-set and call
 //! [`commit`](TransactionCommitter::commit); this routes the whole write-set
