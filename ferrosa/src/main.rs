@@ -936,6 +936,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => tracing::warn!(%e, "failed to reload secondary indexes from system_schema"),
     }
 
+    // 4b'½. Replay persisted indexes into the SCHEMA REGISTRY too (the reload
+    // above only repopulates the storage engine). schema.json carries no
+    // indexes, so the CQL router's `resolve_fulltext_index_name` — which reads
+    // SchemaSnapshot.indexes — would fall back to the bare column name after a
+    // restart, silently breaking full-text search even though the FTI sidecars
+    // are intact on disk. This restores the index set the router resolves
+    // against.
+    {
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
+        match loader.replay_indexes_into_schema(&schema) {
+            Ok(count) if count > 0 => {
+                tracing::info!(
+                    count,
+                    "replayed persisted indexes into schema registry after restart"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%e, "failed to replay indexes into schema registry from system_schema")
+            }
+        }
+    }
+
     // 4b''. Reconstruct user-defined types from the persisted
     // `system_schema.types` table. `schema.json` does not carry UDTs, so without
     // this every CREATE TYPE is silently lost on restart. Runs after system
