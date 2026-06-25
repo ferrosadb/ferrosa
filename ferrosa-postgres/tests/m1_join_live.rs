@@ -311,6 +311,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -395,6 +396,7 @@ async fn extended_query_error_recovers_after_sync() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -436,6 +438,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -485,6 +488,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -544,6 +548,7 @@ async fn where_having_distinct_over_a_real_driver() {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
