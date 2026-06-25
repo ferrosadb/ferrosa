@@ -17612,6 +17612,68 @@ mod tests {
         }
     }
 
+    /// TDD repro for the live memory FTS failure: every ferrosa-memory query is
+    /// `... WHERE <pk preds> AND <col> = fts_match('...') ... ALLOW FILTERING`.
+    /// The end-to-end test above uses fts_match with NO partition-key predicate;
+    /// this exercises the PK-predicate + fts_match combination (entity_store
+    /// shape: partition key + clustering key + fts on a regular column).
+    // KNOWN BUG (unfixed): with PK predicates present, fts_match is matched at
+    // PARTITION granularity and the post-filter skips re-applying it per-row
+    // (evaluate_where_predicates_skips_fts_match_clauses), so a matched
+    // partition leaks rows that don't contain the term. Reproduced here;
+    // ignored until the per-row fts re-evaluation / row-granular FTI lands.
+    #[ignore = "known bug: fts_match dropped to partition granularity when PK predicates present"]
+    #[tokio::test]
+    async fn fts_match_with_pk_predicates_returns_matches() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE fpk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fpk.docs (tenant int, sid int, id int, body text, PRIMARY KEY (tenant, sid, id))",
+            "CREATE INDEX docs_body_fts ON fpk.docs (body) USING 'fulltext'",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 1, 'rust distributed database')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 2, 'cassandra storage engine')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (2, 9, 3, 'rust other tenant')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fpk", "docs"))
+            .unwrap();
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM fpk.docs WHERE tenant = 1 AND sid = 1 AND body = fts_match('rust') ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fts_match+pk query errored: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "only (tenant=1,sid=1,id=1) matches 'rust' AND the PK filter; got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     #[tokio::test]
     async fn fulltext_index_fts_match_reads_unflushed_memtable_row() {
         let (state, _dir) = setup();
