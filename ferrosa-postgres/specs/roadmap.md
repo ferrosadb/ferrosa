@@ -13,10 +13,14 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Now (highest value)
 
-- **Accord-backed transaction atomicity** (FMEA PG-1). Accumulate a `T`-block's
-  writes and commit them through Accord at `COMMIT` (the seam in
-  `execute_simple` / blueprint D11), with real `ROLLBACK`. Until then, document
-  the preview limitation prominently so no client relies on isolation/rollback.
+- ~~**Accord-backed transaction atomicity** (FMEA PG-1)~~ **DONE.** DML in a
+  `T` block buffers as a `TransactionWrite` (`apply_or_buffer`) and `COMMIT`
+  drives the write-set through the injected `TransactionCommitter` atomically
+  (`commit_txn`); `ROLLBACK` discards the buffer (never applied). No committer
+  (standalone) ⇒ COMMIT of a non-empty buffer fails loud; empty buffer commits
+  cleanly. Mirrors the CQL `CqlTransaction` path. *Residual (future):* true
+  snapshot isolation / read-your-writes inside the open block — buffered writes
+  are not visible to reads in the same transaction yet.
 - **`$N` parameters in DML** (FMEA PG-2). Extend the extended-protocol path so
   `INSERT`/`UPDATE`/`DELETE` accept bound parameters (today literal-only,
   `0A000`). Reuse `decode_param` + the existing `$N` inference.

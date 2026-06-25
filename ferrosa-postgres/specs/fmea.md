@@ -45,7 +45,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
-| PG-1 | **Transaction atomicity is not real** — `BEGIN`/`COMMIT` move the `I`/`T`/`E` status but the commit seam has an empty write-set; DML inside a block applies immediately and is not rolled back by `ROLLBACK` | A driver in a transaction sees PG-shaped status bytes but writes are NOT atomic/isolated — partial visibility / no rollback (silent correctness gap if a client relies on it) | 9 | 5 | 7 | 315 | **Open, top gap.** Accord commit seam is wired (`execute_simple`, blueprint D11) but writes are not yet accumulated/committed through Accord. Simple `SELECT 1` txn path is exercised; DML-in-txn atomicity is NOT. Document loudly as preview. |
+| PG-1 | **Transaction atomicity is not real** — `BEGIN`/`COMMIT` move the `I`/`T`/`E` status but the commit seam has an empty write-set; DML inside a block applies immediately and is not rolled back by `ROLLBACK` | A driver in a transaction sees PG-shaped status bytes but writes are NOT atomic/isolated — partial visibility / no rollback (silent correctness gap if a client relies on it) | 9 | 2 | 2 | 36 | **Implemented.** DML inside an open `T` block now BUFFERS as a `ferrosa_storage::accord::TransactionWrite` (`apply_or_buffer` in `query.rs`); `COMMIT` drives the whole write-set through the injected `TransactionCommitter` atomically (`commit_txn` in `server.rs`), `ROLLBACK`/`end_txn` discards the buffer (never applied). No committer (standalone) ⇒ COMMIT of a non-empty buffer fails loud (`0A000`); empty buffer commits cleanly. Write-set capped at `MAX_TXN_WRITES`. Autocommit unchanged. Mirrors the CQL `CqlTransaction` path. Tests: `server::txn_atomicity_tests`, `query::txn_buffer_tests`. |
 | PG-2 | **`$N` params unsupported in DML** — `INSERT`/`UPDATE`/`DELETE` with a `ScalarValue::Param` fail loud `0A000` | Every parameterized write from a real driver (the common path) is rejected; only literal DML works | 7 | 8 | 2 | 112 | Fail-loud `0A000` (no silent wrong write). `SELECT` params DO work via the extended path; extending inference to DML is roadmap Now. |
 | PG-3 | **No `RETURNING` / `ON CONFLICT`** — parser/executor do not accept them | ORMs/`INSERT ... RETURNING id` patterns fail | 6 | 7 | 2 | 84 | Fail-loud at parse (`42601`) — never a wrong row. Roadmap Next. |
 | PG-4 | **Lossy CQL→Value: `Duration`/collections read as NULL** | A `SELECT` over a table with a duration/list/map column silently shows NULL for that column | 6 | 4 | 6 | 144 | Documented in `storage_provider::cql_to_value` (code comment, never a panic). Detectable only by inspection — no error is raised. Widen `Value` (roadmap Later). |
@@ -58,10 +58,11 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 ## Top risks to act on
 
-1. **PG-1 (RPN 315)** — transaction atomicity is the single most consequential
-   gap: the protocol *looks* transactional but writes are not yet Accord-backed.
-   Either wire the Accord commit seam or document the preview limitation
-   prominently so no client relies on rollback/isolation.
+1. ~~**PG-1 (RPN 315)** — transaction atomicity~~ **RESOLVED.** DML in a `T`
+   block now buffers and commits atomically through Accord (`commit_txn`);
+   `ROLLBACK` discards the buffer; no-committer COMMIT of a non-empty buffer
+   fails loud. Re-scored to RPN 36 (residual: real isolation/MVCC semantics
+   beyond atomic multi-key apply are still future work).
 2. **PG-4 (RPN 144)** — lossy-NULL for `Duration`/collections is undetectable at
    runtime (no error). Make these fail loud where queried, or widen `Value`.
 3. **PG-2 (RPN 112)** — `$N` params in DML block the most common write path from

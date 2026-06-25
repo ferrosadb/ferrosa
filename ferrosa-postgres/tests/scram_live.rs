@@ -90,6 +90,7 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
+        accord_committer: None,
     });
     (ctx, dir)
 }

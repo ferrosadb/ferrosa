@@ -91,7 +91,10 @@ Notes:
   `WHERE` identifies the row; `UPDATE` writes regular/static cells (blind
   upsert), `DELETE` writes a row-level tombstone (`build_delete_row`). Both
   report `1` because the Cassandra-style write has no match count.
-- Inside a `BEGIN`/`COMMIT` block the write currently applies immediately — the
-  Accord commit seam exists but is not yet wired (see [fmea.md](fmea.md) PG-1).
+- Autocommit (no open transaction) applies immediately via `write_atomic_batch`,
+  as drawn above. Inside a `BEGIN`/`COMMIT` block the write is instead BUFFERED
+  as a `TransactionWrite` (`apply_or_buffer`) and the whole write-set is applied
+  atomically through the Accord `TransactionCommitter` on `COMMIT` (`commit_txn`);
+  `ROLLBACK` discards the buffer (never applied). See [fmea.md](fmea.md) PG-1.
 - The encoder is the single canonical `ferrosa-row-bridge` codec, so the row is
   byte-identical whether written via Postgres or CQL (no second encoder, D10).

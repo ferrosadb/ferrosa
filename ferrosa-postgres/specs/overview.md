@@ -8,9 +8,11 @@ executive_summary: >
   and lowers SQL onto the bespoke ferrosa-sql relational engine over live
   ferrosa storage. SELECT (incl. one JOIN) and single-row INSERT/UPDATE/DELETE
   are supported; it shares the storage row codec with CQL via ferrosa-row-bridge
-  (D10) and is differential-tested against real PostgreSQL 16. Developer preview:
-  $N params in DML, RETURNING, ON CONFLICT, and Accord-backed transaction
-  atomicity are still in progress.
+  (D10) and is differential-tested against real PostgreSQL 16. DML in a
+  BEGIN/COMMIT block buffers and commits atomically through Accord (FMEA PG-1);
+  ROLLBACK discards the buffer. Developer preview: $N params in DML, RETURNING,
+  and ON CONFLICT are still in progress, as is read-your-writes inside an open
+  transaction.
 ---
 
 # ferrosa-postgres — Architecture Overview

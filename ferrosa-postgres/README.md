@@ -19,8 +19,9 @@ byte-identically over CQL — without `ferrosa-postgres` ever depending on the
 ~54k-LOC `ferrosa-cql` crate.
 
 This is a **developer preview**. See [specs/fmea.md](specs/fmea.md) for the exact
-supported-vs-not surface (key gaps: `$N` params in DML, `RETURNING`, `ON
-CONFLICT`, and real transaction atomicity via Accord are all still in progress).
+supported-vs-not surface (key gaps: `$N` params in DML, `RETURNING`, and `ON
+CONFLICT` are still in progress; transaction atomicity via Accord is now wired —
+see below).
 
 ## What's implemented
 
@@ -40,15 +41,25 @@ CONFLICT`, and real transaction atomicity via Accord are all still in progress).
   parameter type inference (`ParameterDescription`), text + binary parameter and
   result encodings, and Postgres error-skip-until-`Sync` semantics. **Only
   `SELECT`** (and no-`FROM` expression selects) can be prepared.
-- **Transaction protocol state** — `BEGIN`/`COMMIT`/`ROLLBACK` drive the
-  `ReadyForQuery` status byte `I`/`T`/`E`; an error inside a block aborts it
-  (`T → E`) and only `COMMIT`/`ROLLBACK` are then accepted (`25P02`). **Atomicity
-  is not yet real** — the front-end commit seam is wired but writes are not yet
-  routed through Accord (blueprint D11).
+- **Transaction atomicity via Accord** (FMEA PG-1) — `BEGIN`/`COMMIT`/`ROLLBACK`
+  drive the `ReadyForQuery` status byte `I`/`T`/`E`, and DML inside an open `T`
+  block is **buffered** as a `ferrosa_storage::accord::TransactionWrite` instead
+  of applied (`apply_or_buffer` in `query.rs`). `COMMIT` drives the whole
+  write-set through the injected `TransactionCommitter` as one atomic multi-key
+  Accord transaction (`commit_txn` in `server.rs`); `ROLLBACK` discards the
+  buffer so the writes are **never applied**. Fail-loud: a statement that errors
+  inside a block poisons it (`T → E`, only `COMMIT`/`ROLLBACK` accepted, `25P02`);
+  in standalone mode (no committer) a `COMMIT` carrying buffered DML fails loud
+  (`0A000`, cluster mode required) rather than faking atomicity; an empty
+  write-set commits cleanly. The buffer is capped at `MAX_TXN_WRITES` (10 000).
+  This mirrors the CQL `CqlTransaction` path. *Not yet:* read-your-writes inside
+  the open block (buffered writes are not visible to in-transaction reads).
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
-  `ferrosa-row-bridge` encoder and `engine.write_atomic_batch`. UPDATE/DELETE are
-  Cassandra-style blind upserts/tombstones keyed by a full-primary-key equality
-  `WHERE` (reported as `UPDATE 1` / `DELETE 1`).
+  `ferrosa-row-bridge` encoder. **Autocommit** (no open transaction) applies
+  immediately via `engine.write_atomic_batch`; **inside a transaction** the write
+  is buffered (see above). UPDATE/DELETE are Cassandra-style blind
+  upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
+  `UPDATE 1` / `DELETE 1`).
 - **`pg_catalog` projection** — `catalog` projects `pg_namespace`/`pg_class`/
   `pg_attribute`/`pg_type` from live schema metadata with deterministic OIDs.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
@@ -66,7 +77,10 @@ shared `ferrosa_row_bridge::partition_to_rows_with_storage_mapping`) into an
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder CQL uses) →
-`engine.write_atomic_batch` → `CommandComplete`.
+build a `Mutation` → `apply_or_buffer`: **autocommit** →
+`engine.write_atomic_batch` and `CommandComplete`; **in a transaction** →
+serialize the `Mutation` into a buffered `TransactionWrite` (applied later by the
+committer on `COMMIT`) and `CommandComplete`.
 
 See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
