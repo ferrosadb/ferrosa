@@ -729,6 +729,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ferrosa_storage::engine::log_cql_auth_state(storage_auth_enabled, auth_source);
     ferrosa_storage::engine::log_auth_warn_state(storage_auth_enabled, storage_auth_warn);
 
+    // SEC (t_87a50318, FMEA FE-3): refuse to start a PRODUCTION node with auth
+    // disabled. A default node has auth_enabled=false, which leaves both the CQL
+    // listener and the web /admin/* cluster-control API (snapshot/restore/promote)
+    // unauthenticated — an open admin surface. Development mode stays permissive
+    // (auth-off is an explicit dev choice); production must opt IN to security.
+    if ferrosa_schema::startup::DeploymentMode::from_env()
+        == ferrosa_schema::startup::DeploymentMode::Production
+        && !storage_auth_enabled
+    {
+        eprintln!(
+            "FATAL: refusing to start — {}. Production requires authentication: set \
+             [cql] auth_enabled = true (or FERROSA_AUTH_ENABLED=true), or run in \
+             development mode (unset FERROSA_MODE=production).",
+            ferrosa_schema::startup::ProductionViolation::AuthDisabled
+        );
+        std::process::exit(1);
+    }
+
     let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
