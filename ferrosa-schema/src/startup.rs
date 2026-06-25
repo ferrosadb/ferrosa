@@ -49,6 +49,9 @@ pub enum ProductionViolation {
     EnvSecretsInProduction,
     /// The password policy does not meet minimum requirements.
     PasswordPolicyBelowMinimum,
+    /// Authentication is disabled, leaving the CQL listener and the web
+    /// `/admin/*` cluster-control API unauthenticated (FMEA FE-3).
+    AuthDisabled,
 }
 
 impl std::fmt::Display for ProductionViolation {
@@ -84,6 +87,13 @@ impl std::fmt::Display for ProductionViolation {
                     "password policy does not meet minimum production requirements"
                 )
             }
+            Self::AuthDisabled => {
+                write!(
+                    f,
+                    "authentication is disabled — the CQL listener and web /admin/* \
+                     cluster-control API are unauthenticated; set [cql] auth_enabled = true"
+                )
+            }
         }
     }
 }
@@ -103,6 +113,8 @@ pub struct ProductionCheckConfig {
     pub secrets_provider_type: String, // pragma: allowlist secret
     /// Whether the S3 endpoint allows HTTP (non-TLS) connections.
     pub s3_allow_http: bool,
+    /// Whether client/admin authentication is enabled.
+    pub auth_enabled: bool,
 }
 
 /// Validate that the configuration meets production requirements.
@@ -119,6 +131,9 @@ pub fn validate_production_requirements(
         return violations;
     }
 
+    if !config.auth_enabled {
+        violations.push(ProductionViolation::AuthDisabled);
+    }
     if !config.has_superuser_password {
         violations.push(ProductionViolation::DefaultSuperuserPassword);
     }
@@ -152,7 +167,32 @@ mod tests {
             has_superuser_password: true,
             secrets_provider_type: "aws-secrets-manager".into(), // pragma: allowlist secret
             s3_allow_http: false,
+            auth_enabled: true,
         }
+    }
+
+    #[test]
+    fn production_with_auth_disabled_is_a_violation() {
+        let mut config = passing_production_config();
+        config.auth_enabled = false;
+        let violations = validate_production_requirements(&config);
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, ProductionViolation::AuthDisabled)),
+            "production mode with auth disabled must report AuthDisabled; got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn development_with_auth_disabled_is_allowed() {
+        let mut config = passing_production_config();
+        config.mode = DeploymentMode::Development;
+        config.auth_enabled = false;
+        assert!(
+            validate_production_requirements(&config).is_empty(),
+            "development mode must not enforce auth"
+        );
     }
 
     #[test]
@@ -185,6 +225,7 @@ mod tests {
             has_superuser_password: false,
             secrets_provider_type: "env".into(), // pragma: allowlist secret
             s3_allow_http: true,
+            auth_enabled: true,
         };
         let violations = validate_production_requirements(&config);
         assert!(
