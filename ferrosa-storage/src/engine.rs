@@ -18232,6 +18232,68 @@ mod tests {
         assert!(!hits.is_empty(), "search for 'rust' must return results");
     }
 
+    /// TDD repro for the post-restart fts_match-empty bug: flush an FTI sidecar,
+    /// persist the index, CLOSE the engine, reopen + reload, and require
+    /// fulltext_search to still return the row.
+    #[test]
+    fn fts_match_works_after_engine_reopen() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let idx_meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: tid.keyspace().to_string(),
+            table: tid.table().to_string(),
+            name: "idx_body".to_string(),
+            index_type: IndexType::FullText,
+            target_columns: vec!["val".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+            engine
+                .write(
+                    &tid,
+                    &make_key("r1"),
+                    make_row(b"rust distributed database", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+
+            let row = persistence::index_to_rows(&idx_meta);
+            engine
+                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+            engine.flush(&indexes_tid).unwrap();
+
+            // Sanity: fts_match works before the restart.
+            let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+            assert!(!hits.is_empty(), "fts_match must work before reopen");
+        }
+
+        // Reopen, replicating the boot sequence's index reload.
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.reload_indexes_from_system_schema().unwrap();
+
+        // The bug: fts_match must still return the row after restart.
+        let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+        assert!(
+            !hits.is_empty(),
+            "fts_match must return the indexed row after an engine reopen"
+        );
+    }
+
     // ── FT-019: FTS end-to-end insert → flush → query ──────────────────────
 
     #[test]
