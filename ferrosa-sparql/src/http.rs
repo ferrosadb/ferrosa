@@ -15,6 +15,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use base64::Engine as _;
+use ferrosa_schema::auth::permission::{Permission, Resource};
+use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 
 use crate::engine::SparqlEngine;
@@ -69,11 +72,82 @@ fn build_router(state: AppState) -> Router {
 ///
 /// Accepts `application/sparql-query` (raw SPARQL text) or
 /// `application/x-www-form-urlencoded` (query=... parameter).
+/// Authenticate a SPARQL request via HTTP Basic auth, mirroring the graph/CQL
+/// path (t_e2bf1e62, FMEA SP-1). Honors the `auth_disabled` kill-switch by
+/// returning a superuser context (same as the CQL/graph behaviour). Returns a
+/// 401 `Response` on any failure.
+// The Err is an axum `Response` (the ready-to-return 401) — large by nature for
+// an HTTP handler helper; boxing it would only complicate the call sites.
+#[allow(clippy::result_large_err)]
+fn authenticate_sparql(
+    auth_disabled: bool,
+    schema: &Schema,
+    headers: &axum::http::HeaderMap,
+) -> Result<AuthContext, Response> {
+    if auth_disabled {
+        return Ok(AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        });
+    }
+    let auth_value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "missing Authorization header"))?;
+    let encoded = auth_value.strip_prefix("Basic ").ok_or_else(|| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "unsupported auth scheme (expected Basic)",
+        )
+    })?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid base64 in Authorization header",
+            )
+        })?;
+    let decoded_str = String::from_utf8(decoded)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "invalid UTF-8 in credentials"))?;
+    let (username, password) = decoded_str
+        .split_once(':')
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "invalid credentials format"))?;
+    schema
+        .authenticate(username, password)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "authentication failed"))
+}
+
+/// Authorize the authenticated role for `perm` on the target keyspace, so the
+/// attacker-controllable `X-Keyspace` header is no longer the only tenancy
+/// boundary. Returns a 403 `Response` on denial.
+#[allow(clippy::result_large_err)] // Err is the ready-to-return 403 Response.
+fn authorize_keyspace(
+    schema: &Schema,
+    auth: &AuthContext,
+    keyspace: &str,
+    perm: Permission,
+) -> Result<(), Response> {
+    schema
+        .check_permission(auth, perm, &Resource::Keyspace(keyspace.to_string()))
+        .map_err(|_| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                &format!("permission denied: {perm} on keyspace {keyspace}"),
+            )
+        })
+}
+
 async fn handle_sparql_post(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let auth = match authenticate_sparql(state.auth_disabled, &state.schema, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let query_str = match extract_query_from_post(&headers, &body) {
         Ok(q) => q,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
@@ -83,6 +157,10 @@ async fn handle_sparql_post(
         .get("X-Keyspace")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("rdf");
+
+    if let Err(resp) = authorize_keyspace(&state.schema, &auth, keyspace, Permission::Select) {
+        return resp;
+    }
 
     let accept = headers
         .get(header::ACCEPT)
@@ -109,6 +187,16 @@ async fn handle_sparql_get(
     headers: axum::http::HeaderMap,
     AxumQuery(params): AxumQuery<SparqlGetParams>,
 ) -> Response {
+    let auth = match authenticate_sparql(state.auth_disabled, &state.schema, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) =
+        authorize_keyspace(&state.schema, &auth, &params.keyspace, Permission::Select)
+    {
+        return resp;
+    }
+
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -123,6 +211,10 @@ async fn handle_sparql_update(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let auth = match authenticate_sparql(state.auth_disabled, &state.schema, &headers) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let update_str = match extract_query_from_post(&headers, &body) {
         Ok(q) => q,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
@@ -132,6 +224,11 @@ async fn handle_sparql_update(
         .get("X-Keyspace")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("rdf");
+
+    // SPARQL UPDATE is a write — require MODIFY on the keyspace.
+    if let Err(resp) = authorize_keyspace(&state.schema, &auth, keyspace, Permission::Modify) {
+        return resp;
+    }
 
     match state.engine.execute_update(&update_str, keyspace).await {
         Ok(result) => (
@@ -230,4 +327,71 @@ fn extract_query_from_post(headers: &axum::http::HeaderMap, body: &[u8]) -> Resu
 
 fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use ferrosa_schema::{
+        AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+        RateLimitConfig, SchemaConfig, TestAuditSink,
+    };
+
+    fn test_schema() -> Schema {
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap()
+    }
+
+    /// The kill-switch: when auth is disabled, requests are served as superuser
+    /// (same as the CQL/graph behaviour).
+    #[test]
+    fn auth_disabled_kill_switch_allows() {
+        let res = authenticate_sparql(true, &test_schema(), &axum::http::HeaderMap::new());
+        assert!(res.is_ok(), "auth_disabled must allow (kill-switch)");
+        assert!(res.unwrap().is_superuser);
+    }
+
+    /// t_e2bf1e62 (FMEA SP-1): an unauthenticated SPARQL request must be REJECTED,
+    /// not served. Previously no handler checked credentials at all.
+    #[test]
+    fn missing_authorization_header_rejected_when_auth_on() {
+        let res = authenticate_sparql(false, &test_schema(), &axum::http::HeaderMap::new());
+        assert!(
+            res.is_err(),
+            "with auth enabled and no Authorization header, the request must be rejected"
+        );
+    }
+
+    /// Per-keyspace authorization: a superuser passes; an unprivileged role with
+    /// no grant is denied — so the X-Keyspace header is no longer the only boundary.
+    #[test]
+    fn keyspace_authorization_enforced() {
+        let schema = test_schema();
+        let superuser = AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        assert!(
+            authorize_keyspace(&schema, &superuser, "rdf", Permission::Modify).is_ok(),
+            "superuser must be authorized"
+        );
+        let unprivileged = AuthContext {
+            role: "nobody".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        };
+        assert!(
+            authorize_keyspace(&schema, &unprivileged, "rdf", Permission::Select).is_err(),
+            "an unprivileged role with no grant must be denied"
+        );
+    }
 }
