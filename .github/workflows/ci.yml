@@ -445,7 +445,11 @@ jobs:
     name: Cluster integration tests
     runs-on: ubuntu-latest
     needs: build-node-image
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Run on PRs, on main, AND in the merge queue (`merge_group`). Without the
+    # merge_group arm this job is skipped in the queue, so a red integration run
+    # could never gate the merge — which is exactly how a red PR slipped through.
+    # It must also be added to the ruleset's required status checks.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
