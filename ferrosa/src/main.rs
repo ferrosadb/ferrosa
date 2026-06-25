@@ -181,6 +181,58 @@ where
 /// `Some(true|false)` when the operator made an explicit choice in
 /// either place, `None` when they did not (so downstream resolution can
 /// fall back to the storage default).
+/// Production deployment gate (FMEA epic). In production mode (`FERROSA_MODE=
+/// production`), refuses startup when an operator-fixable security requirement
+/// is unmet — authentication disabled (`t_87a50318`), CQL TLS not required
+/// (`t_27bf4674`), or the default superuser password. Weaknesses whose config is
+/// not operator-configurable yet (the hardcoded permissive password policy and
+/// env secrets provider) only WARN — see `ProductionViolation::blocks_startup`.
+/// No-op in development mode. Calls `exit(1)` rather than returning so the gate
+/// cannot be accidentally bypassed by a `?` further up.
+fn enforce_production_requirements(
+    auth_enabled: bool,
+    cql_require_tls: bool,
+    has_superuser_password: bool,
+) {
+    use ferrosa_schema::startup::{
+        validate_production_requirements, DeploymentMode, ProductionCheckConfig,
+    };
+    let violations = validate_production_requirements(&ProductionCheckConfig {
+        mode: DeploymentMode::from_env(),
+        auth_enabled,
+        cql_require_tls,
+        has_superuser_password,
+        // The schema is hardcoded to a permissive policy + env secrets (see the
+        // SchemaConfig in main); report them truthfully so the WARN fires, but
+        // they don't block startup until that config is operator-configurable.
+        password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+        secrets_provider_type: "env".to_string(),
+        s3_allow_http: false, // S3 endpoint scheme isn't surfaced here yet.
+    });
+    let (blocking, warnings): (Vec<_>, Vec<_>) =
+        violations.iter().partition(|v| v.blocks_startup());
+    for w in &warnings {
+        tracing::warn!("production config weakness (not yet enforceable): {w}");
+    }
+    if !blocking.is_empty() {
+        eprintln!("FATAL: refusing to start — production deployment requirements not met:");
+        for b in &blocking {
+            eprintln!("  - {b}");
+        }
+        eprintln!(
+            "Remediate the above (e.g. [cql] auth_enabled = true, [cql] require_tls = true, \
+             change the default superuser password), or run a development node (unset \
+             FERROSA_MODE=production)."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// BUG-006: `[cql] auth_enabled = true` in TOML was silently ignored;
+/// only `FERROSA_AUTH_ENABLED=true` activated the authenticator. Returns
+/// `Some(true|false)` when the operator made an explicit choice in
+/// either place, `None` when they did not (so downstream resolution can
+/// fall back to the storage default).
 fn resolve_auth_enabled_toml<F>(file_config: &toml::Value, env: F) -> Option<bool>
 where
     F: Fn(&str) -> Option<String>,
@@ -729,23 +781,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ferrosa_storage::engine::log_cql_auth_state(storage_auth_enabled, auth_source);
     ferrosa_storage::engine::log_auth_warn_state(storage_auth_enabled, storage_auth_warn);
 
-    // SEC (t_87a50318, FMEA FE-3): refuse to start a PRODUCTION node with auth
-    // disabled. A default node has auth_enabled=false, which leaves both the CQL
-    // listener and the web /admin/* cluster-control API (snapshot/restore/promote)
-    // unauthenticated — an open admin surface. Development mode stays permissive
-    // (auth-off is an explicit dev choice); production must opt IN to security.
-    if ferrosa_schema::startup::DeploymentMode::from_env()
-        == ferrosa_schema::startup::DeploymentMode::Production
-        && !storage_auth_enabled
-    {
-        eprintln!(
-            "FATAL: refusing to start — {}. Production requires authentication: set \
-             [cql] auth_enabled = true (or FERROSA_AUTH_ENABLED=true), or run in \
-             development mode (unset FERROSA_MODE=production).",
-            ferrosa_schema::startup::ProductionViolation::AuthDisabled
-        );
-        std::process::exit(1);
-    }
+    // SEC (FMEA epic): the production deployment gate (auth, CQL TLS, default
+    // superuser password, …) runs as `enforce_production_requirements` once the
+    // CQL TLS config is resolved below — it needs `cql_require_tls` and `schema`.
 
     let storage_upload_threads = std::env::var("FERROSA_STORAGE_UPLOAD_THREADS")
         .ok()
@@ -1212,6 +1250,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cql",
         "require_tls",
         "false",
+    );
+
+    // SEC (FMEA epic: t_87a50318 auth + t_27bf4674 TLS): refuse to start a
+    // production node that fails an operator-fixable security requirement. Runs
+    // before any listener binds. No-op in development mode.
+    enforce_production_requirements(
+        storage_auth_enabled,
+        cql_require_tls == "true" || cql_require_tls == "1",
+        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
     );
     let cql_max_connections: usize = config_val(
         "FERROSA_CQL_MAX_CONNECTIONS",
