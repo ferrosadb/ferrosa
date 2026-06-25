@@ -308,8 +308,14 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
 /// that surfaced under slow podman + from-source image builds).
 ///
 /// Polls every 500 ms for up to `CLUSTER_READY_TIMEOUT`.
+///
+/// A **from-source** image build + cold node bootstrap on a CI runner can take
+/// well over two minutes: an observed run had all three nodes join the cluster at
+/// ~118s, just missing a 120s deadline (0 combos ran, false-green). 300s gives
+/// comfortable margin; the smoke workload itself is only seconds, so a longer
+/// one-time readiness wait costs nothing.
 async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
-    const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+    const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(300);
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     let deadline = tokio::time::Instant::now() + CLUSTER_READY_TIMEOUT;
