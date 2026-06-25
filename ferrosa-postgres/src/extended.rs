@@ -26,20 +26,26 @@
 use std::collections::HashMap;
 
 use ferrosa_sql::{
-    parse_statement, ScalarItem, ScalarValue, SelectStmt, Statement, Value as SqlValue,
+    parse_statement, DeleteStmt, InsertStmt, ScalarItem, ScalarValue, SelectStmt, Statement,
+    UpdateStmt, Value as SqlValue,
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
 use crate::query::{decode_param, error_response, exec_error_response, row_description_fields};
 
-/// What a prepared statement parses to: a table query, or a no-`FROM`
-/// expression query (`SELECT version()`, `SELECT 1`). Transaction-control and
-/// session statements are handled on the simple-query path, not prepared here.
-/// `Select` is boxed — `SelectStmt` is far larger than the other variant.
+/// What a prepared statement parses to: a table query, a no-`FROM` expression
+/// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
+/// `UPDATE` / `DELETE`). Transaction-control and session statements are handled
+/// on the simple-query path, not prepared here. The statement variants are boxed
+/// — `SelectStmt` (and, for size parity, the DML statements) are far larger than
+/// the `Exprs` variant.
 #[derive(Debug, Clone)]
 pub enum PreparedKind {
     Select(Box<SelectStmt>),
     Exprs(Vec<ScalarItem>),
+    Insert(Box<InsertStmt>),
+    Update(Box<UpdateStmt>),
+    Delete(Box<DeleteStmt>),
 }
 
 /// A prepared statement: the parsed query plus the client-declared parameter
@@ -207,12 +213,21 @@ impl Session {
                 }
                 PreparedKind::Exprs(items)
             }
+            // Parameterized DML: prepare the statement as-is. Bound `$N` values
+            // are substituted at Execute (the declared `param_types` OIDs drive
+            // the Bind-time decode; an unspecified OID decodes leniently). No
+            // column-from-comparison inference like SELECT — Ecto declares the
+            // param OIDs in Parse, which we honor.
+            Ok(Statement::Insert(ins)) => PreparedKind::Insert(ins),
+            Ok(Statement::Update(upd)) => PreparedKind::Update(upd),
+            Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
                 self.error_pending = true;
                 return error_response(
                     "0A000",
-                    "only SELECT statements can be prepared via the extended-query protocol",
+                    "only SELECT and INSERT/UPDATE/DELETE statements can be prepared via the \
+                     extended-query protocol",
                 );
             }
             Err(e) => {
