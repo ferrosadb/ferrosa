@@ -31,6 +31,11 @@ pub struct QueryContext {
     pub engine: Arc<StorageEngine>,
     pub schema: Arc<Schema>,
     pub default_schema: String,
+    /// The Accord committer that drives a buffered `BEGIN`/`COMMIT` write-set to
+    /// an atomic multi-key transaction. `None` in standalone mode — a `COMMIT`
+    /// with buffered DML then fails loud (cluster mode required) rather than
+    /// faking atomicity (FMEA PG-1).
+    pub accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>>,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -279,33 +284,110 @@ async fn execute_simple(
                 tag: "BEGIN".to_string(),
             }]
         }
-        ferrosa_sql::Statement::Commit => {
-            // Accord commit seam: read-only front-end ⇒ empty write-set today.
-            session.end_txn();
-            vec![BackendMessage::CommandComplete {
-                tag: "COMMIT".to_string(),
-            }]
-        }
+        ferrosa_sql::Statement::Commit => commit_txn(ctx, session).await,
         ferrosa_sql::Statement::Rollback => {
+            // ROLLBACK discards the buffered write-set — those writes were never
+            // applied — and leaves the transaction block.
             session.end_txn();
             vec![BackendMessage::CommandComplete {
                 tag: "ROLLBACK".to_string(),
             }]
         }
         // Data + session statements: delegate to the stateless executor. (It
-        // re-parses; cheap, and keeps the executor self-contained.)
+        // re-parses; cheap, and keeps the executor self-contained.) In an open
+        // transaction, DML is BUFFERED into the session write-set instead of
+        // applied; autocommit (no open txn) applies immediately.
         _ => {
-            let msgs =
-                query::execute_query(&ctx.engine, &ctx.schema, sql, &ctx.default_schema).await;
+            let msgs = if session.in_txn() {
+                query::execute_query(
+                    &ctx.engine,
+                    &ctx.schema,
+                    sql,
+                    &ctx.default_schema,
+                    Some(session.txn_writes_mut()),
+                )
+                .await
+            } else {
+                query::execute_query(&ctx.engine, &ctx.schema, sql, &ctx.default_schema, None).await
+            };
             if session.in_txn()
                 && msgs
                     .iter()
                     .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
             {
+                // A statement that fails inside a transaction POISONS it (`T` →
+                // `E`): the next COMMIT is rejected (PG `25P02`) rather than
+                // committing a partial buffered write-set.
                 session.mark_txn_failed();
             }
             msgs
         }
+    }
+}
+
+/// Drive the buffered `BEGIN`/`COMMIT` write-set through the Accord committer,
+/// then leave the transaction block. FAILS LOUD and never applies a buffered
+/// write outside the committer:
+///
+/// * standalone mode (no committer) → ErrorResponse (cluster mode required);
+/// * a clean Accord abort → ErrorResponse (`40001`/`25000`);
+/// * a commit that cannot reach a decision → ErrorResponse (`58000`).
+///
+/// In every case the transaction is ended and the buffer dropped, so the server
+/// never acks a transaction it did not commit.
+async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMessage> {
+    use ferrosa_storage::accord::CommitOutcome;
+
+    // A COMMIT on an aborted (poisoned) transaction never commits the partial
+    // buffer — Postgres treats it as a ROLLBACK. Drop the buffer and report
+    // ROLLBACK rather than committing an incomplete write-set.
+    if session.in_failed_txn() {
+        session.end_txn();
+        return vec![BackendMessage::CommandComplete {
+            tag: "ROLLBACK".to_string(),
+        }];
+    }
+
+    let writes = session.take_txn_writes();
+
+    // An empty write-set (`BEGIN; COMMIT;` with no DML, or only reads) is a
+    // no-op that commits cleanly — there is nothing to apply, so no atomicity to
+    // honor and no committer required (matches the `TransactionCommitter`
+    // contract). This is NOT a fake success: zero writes means zero state change.
+    if writes.is_empty() {
+        session.end_txn();
+        return vec![BackendMessage::CommandComplete {
+            tag: "COMMIT".to_string(),
+        }];
+    }
+
+    let committer = match &ctx.accord_committer {
+        Some(c) => c.clone(),
+        None => {
+            session.end_txn();
+            // Buffered writes were never applied; fail loud rather than fake a
+            // COMMIT we cannot honor atomically.
+            return vec![query::error_response(
+                "0A000",
+                "multi-statement transactions require cluster mode (Accord)",
+            )];
+        }
+    };
+
+    let outcome = committer.commit(writes).await;
+    session.end_txn();
+    match outcome {
+        Ok(CommitOutcome::Committed) => vec![BackendMessage::CommandComplete {
+            tag: "COMMIT".to_string(),
+        }],
+        Ok(CommitOutcome::Aborted { reason }) => vec![query::error_response(
+            "40001",
+            &format!("transaction aborted: {reason}"),
+        )],
+        Err(e) => vec![query::error_response(
+            "58000",
+            &format!("transaction commit failed: {}", e.reason),
+        )],
     }
 }
 
@@ -536,5 +618,371 @@ where
         tokio::spawn(async move {
             let _ = handle_connection(stream, store, ctx).await;
         });
+    }
+}
+
+/// Transaction atomicity (FMEA PG-1): a `BEGIN`/`COMMIT` block buffers its DML
+/// and only the Accord committer applies it. ROLLBACK discards the buffer (the
+/// writes were never applied); COMMIT with no committer fails loud instead of
+/// faking atomicity. Runs a real local `StorageEngine` (temp dir, no S3/Docker).
+#[cfg(test)]
+mod txn_atomicity_tests {
+    use super::*;
+    use crate::extended::Session;
+    use ferrosa_schema::{
+        AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
+        EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
+        ReplicationParams, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
+    };
+    use ferrosa_storage::accord::MockTransactionCommitter;
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use indexmap::IndexMap;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn schema_config() -> SchemaConfig {
+        SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        }
+    }
+
+    fn superuser() -> AuthContext {
+        AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    fn column(name: &str, kind: ColumnKind, ty: &str) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position: 0,
+            column_type: ty.to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        }
+    }
+
+    fn schema_with_kv() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            "k".to_string(),
+            column("k", ColumnKind::PartitionKey, "text"),
+        );
+        cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "kv".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec!["k".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table kv");
+        schema
+    }
+
+    fn engine_config(dir: &Path) -> StorageEngineConfig {
+        StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256 * 1024,
+                max_segment_age: Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
+                log_dir: dir.join("commitlog"),
+                checkpoint_dir: dir.join("commitlog"),
+                archive: None,
+            },
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            write_verify: false,
+        }
+    }
+
+    fn kv_storage_schema() -> ferrosa_common::schema::TableSchema {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: "kv".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>, committer: bool) -> QueryContext {
+        QueryContext {
+            engine,
+            schema,
+            default_schema: "public".to_string(),
+            accord_committer: if committer {
+                Some(Arc::new(MockTransactionCommitter::new()))
+            } else {
+                None
+            },
+        }
+    }
+
+    async fn make_ctx(committer: bool) -> (tempfile::TempDir, QueryContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(kv_storage_schema()).unwrap();
+        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()), committer);
+        (dir, ctx)
+    }
+
+    /// Rows visible for key `k`, read back through the `execute_query` SELECT
+    /// path with no transaction buffer.
+    async fn row_count(ctx: &QueryContext, key: &str) -> usize {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            &format!("SELECT k FROM kv WHERE k = '{key}'"),
+            &ctx.default_schema,
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT failed: {msgs:?}"
+        );
+        msgs.iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count()
+    }
+
+    fn is_error(msgs: &[BackendMessage], code: &str) -> bool {
+        msgs.iter().any(|m| {
+            matches!(m, BackendMessage::ErrorResponse { fields }
+                if fields.iter().any(|f| *f == (b'C', code.to_string())))
+        })
+    }
+
+    #[tokio::test]
+    async fn rollback_discards_buffered_writes() {
+        // BEGIN; INSERT (buffered); ROLLBACK ⇒ the row was never applied.
+        // Contrast: an autocommit INSERT IS applied.
+        let (_dir, ctx) = make_ctx(true).await;
+        let mut session = Session::new();
+
+        let m = execute_simple(&ctx, &mut session, "BEGIN").await;
+        assert!(matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "BEGIN"));
+        assert!(session.in_txn());
+
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('r', 'rolledback')",
+        )
+        .await;
+        assert!(
+            matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "buffered INSERT still acks: {m:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "r").await,
+            0,
+            "a write buffered inside a txn is NOT yet in storage"
+        );
+
+        let m = execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        assert!(matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "ROLLBACK"));
+        assert!(!session.in_txn());
+        assert_eq!(
+            row_count(&ctx, "r").await,
+            0,
+            "ROLLBACK discards the buffer — the write is NEVER applied (FMEA PG-1)"
+        );
+
+        // Autocommit contrast: this DML applies immediately.
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('a', 'auto')",
+        )
+        .await;
+        assert!(matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"));
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "an autocommit INSERT IS applied immediately"
+        );
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_without_committer_fails_loud() {
+        // No committer (standalone mode): BEGIN; INSERT; COMMIT must FAIL LOUD
+        // (cluster mode required) and the buffered row must NOT be in storage.
+        let (_dir, ctx) = make_ctx(false).await;
+        let mut session = Session::new();
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('x', 'never')",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "x").await, 0, "still buffered, not applied");
+
+        let m = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            is_error(&m, "0A000"),
+            "COMMIT with no committer must fail loud (0A000), got {m:?}"
+        );
+        assert!(
+            m.iter()
+                .any(|msg| matches!(msg, BackendMessage::ErrorResponse { fields }
+                if fields.iter().any(|f| f.0 == b'M' && f.1.contains("cluster mode")))),
+            "the error must mention cluster mode: {m:?}"
+        );
+        assert!(
+            !session.in_txn(),
+            "the transaction is ended even on failure"
+        );
+        assert_eq!(
+            row_count(&ctx, "x").await,
+            0,
+            "a COMMIT that cannot be honored NEVER applies the buffered write"
+        );
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_with_committer_acks_and_records_write_set() {
+        // With a committer, COMMIT drives the buffered write-set through it and
+        // acks COMMIT. (The mock records the set; it does not itself apply.)
+        let (_dir, ctx) = make_ctx(true).await;
+        let mut session = Session::new();
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('y', 'committed')",
+        )
+        .await;
+        let m = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "COMMIT acks via the committer: {m:?}"
+        );
+        assert!(!session.in_txn());
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_txn_commit_does_not_apply() {
+        // A statement that errors inside a txn poisons it; subsequent DML hits
+        // 25P02; COMMIT is treated as ROLLBACK and nothing is applied.
+        let (_dir, ctx) = make_ctx(true).await;
+        let mut session = Session::new();
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        // A bad INSERT (missing PK column) errors and poisons the txn.
+        let m = execute_simple(&ctx, &mut session, "INSERT INTO kv (v) VALUES ('no-pk')").await;
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, BackendMessage::ErrorResponse { .. })),
+            "the bad INSERT fails loud: {m:?}"
+        );
+        assert!(session.in_failed_txn(), "the txn is now poisoned (T → E)");
+
+        // Further DML is rejected with 25P02 until the block ends.
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('z', 'x')",
+        )
+        .await;
+        assert!(is_error(&m, "25P02"), "aborted txn rejects DML: {m:?}");
+
+        // COMMIT on a poisoned txn behaves like ROLLBACK; nothing applied.
+        let m = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            matches!(&m[..], [BackendMessage::CommandComplete { tag }] if tag == "ROLLBACK"),
+            "COMMIT on an aborted txn reports ROLLBACK: {m:?}"
+        );
+        assert!(!session.in_txn() && !session.in_failed_txn());
+        assert_eq!(row_count(&ctx, "z").await, 0);
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn select_inside_txn_still_works() {
+        // A read inside a transaction is served normally (it does not buffer).
+        let (_dir, ctx) = make_ctx(true).await;
+        let mut session = Session::new();
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let m = execute_simple(&ctx, &mut session, "SELECT 1").await;
+        assert!(
+            m.iter()
+                .any(|x| matches!(x, BackendMessage::DataRow { .. })),
+            "SELECT 1 inside a txn returns a row: {m:?}"
+        );
+        assert!(!is_error(&m, "0A000"));
+        ctx.engine.shutdown().unwrap();
     }
 }

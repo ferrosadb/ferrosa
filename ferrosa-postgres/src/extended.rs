@@ -71,6 +71,11 @@ pub struct Session {
     /// (`I`/`T`/`E`). Entering a `T` block is the trigger to route the
     /// transaction's writes through Accord once DML lands (blueprint D11).
     txn: TransactionStatus,
+    /// Buffered DML write-set for the open `BEGIN`/`COMMIT` block. DML inside a
+    /// transaction is BUFFERED here instead of applied; `COMMIT` drives the whole
+    /// set through the Accord committer atomically; `ROLLBACK`/`end_txn` clears it
+    /// so a discarded transaction never touches storage (FMEA PG-1).
+    txn_writes: Vec<ferrosa_storage::accord::TransactionWrite>,
 }
 
 /// The format code (0 text / 1 binary) for parameter `i` under the Bind fan-out
@@ -136,17 +141,34 @@ impl Session {
         matches!(self.txn, TransactionStatus::Failed)
     }
 
-    /// `BEGIN`: enter a transaction block. A `BEGIN` while already in one keeps
-    /// the session in-transaction (PG warns but stays `T`).
+    /// `BEGIN`: enter a transaction block and start a fresh empty write-set. A
+    /// `BEGIN` while already in one keeps the session in-transaction (PG warns
+    /// but stays `T`) and clears any buffered writes.
     pub fn begin_txn(&mut self) {
+        self.txn_writes.clear();
         if matches!(self.txn, TransactionStatus::Idle) {
             self.txn = TransactionStatus::InTransaction;
         }
     }
 
-    /// `COMMIT`/`ROLLBACK`: leave the transaction block, back to idle.
+    /// `COMMIT`/`ROLLBACK`: leave the transaction block, back to idle, and drop
+    /// the buffered write-set. After `end_txn` no buffered write survives, so a
+    /// rolled-back (or committed) transaction never re-applies on the next one.
     pub fn end_txn(&mut self) {
         self.txn = TransactionStatus::Idle;
+        self.txn_writes.clear();
+    }
+
+    /// Mutable handle to the open transaction's buffered write-set, for the DML
+    /// path to push a `TransactionWrite` into while in a `T` block.
+    pub fn txn_writes_mut(&mut self) -> &mut Vec<ferrosa_storage::accord::TransactionWrite> {
+        &mut self.txn_writes
+    }
+
+    /// Drain the buffered write-set, leaving it empty. Used by `COMMIT` to hand
+    /// the whole set to the Accord committer.
+    pub fn take_txn_writes(&mut self) -> Vec<ferrosa_storage::accord::TransactionWrite> {
+        std::mem::take(&mut self.txn_writes)
     }
 
     /// An error while executing a statement inside a transaction aborts it

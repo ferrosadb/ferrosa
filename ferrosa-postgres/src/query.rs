@@ -685,6 +685,7 @@ pub async fn execute_query(
     schema: &Schema,
     sql: &str,
     default_schema: &str,
+    txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     // 1. Parse the top-level statement.
     let stmt = match parse_statement(sql) {
@@ -722,10 +723,65 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DML: single-row INSERT / UPDATE / DELETE write through the engine.
-        Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema),
-        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema),
-        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema),
+        // DML: single-row INSERT / UPDATE / DELETE. With `txn = Some(buffer)`
+        // (an open transaction) the write is BUFFERED as a `TransactionWrite`
+        // and committed atomically via Accord on COMMIT; with `txn = None`
+        // (autocommit) it applies immediately via `write_atomic_batch`.
+        Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema, txn),
+        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema, txn),
+        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema, txn),
+    }
+}
+
+/// Max DML writes buffered in one Postgres transaction before it is rejected.
+/// A client must not be able to OOM the server with an unbounded open `BEGIN`
+/// (Power-of-10 Rule 3: every server-side dynamic collection has a hard cap).
+/// Mirrors `ferrosa_cql::session::MAX_TXN_WRITES`.
+const MAX_TXN_WRITES: usize = 10_000;
+
+/// Buffer a built `Mutation` as a [`TransactionWrite`] into the open
+/// transaction's write-set, or apply it immediately via `write_atomic_batch`
+/// when there is no open transaction (autocommit).
+///
+/// FAIL LOUD: when buffering, exceeding [`MAX_TXN_WRITES`] returns an error
+/// response (and the server poisons the transaction) rather than growing the
+/// buffer without bound; a buffered write is NEVER applied to storage here —
+/// only the Accord committer applies it on COMMIT.
+fn apply_or_buffer(
+    engine: &StorageEngine,
+    txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
+    key: &ferrosa_common::DecoratedKey,
+    mutation: Mutation,
+    ok_tag: &str,
+) -> Vec<BackendMessage> {
+    match txn {
+        Some(buffer) => {
+            if buffer.len() >= MAX_TXN_WRITES {
+                return vec![error_response(
+                    "53400",
+                    &format!(
+                        "transaction write-set exceeds the {MAX_TXN_WRITES}-write limit; \
+                         ROLLBACK required"
+                    ),
+                )];
+            }
+            let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
+            mutation.serialize_into(&mut mutation_bytes);
+            buffer.push(ferrosa_storage::accord::TransactionWrite {
+                keyspace: mutation.keyspace.clone(),
+                key: key.key.as_bytes().to_vec(),
+                mutation: mutation_bytes,
+            });
+            vec![BackendMessage::CommandComplete {
+                tag: ok_tag.to_string(),
+            }]
+        }
+        None => match engine.write_atomic_batch(vec![mutation]) {
+            Ok(()) => vec![BackendMessage::CommandComplete {
+                tag: ok_tag.to_string(),
+            }],
+            Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
+        },
     }
 }
 
@@ -791,6 +847,7 @@ fn execute_insert(
     schema: &Schema,
     ins: &InsertStmt,
     default_schema: &str,
+    txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
 
@@ -893,16 +950,11 @@ fn execute_insert(
     let mutation = Mutation::new(
         ks.to_string(),
         ins.table.table.clone(),
-        key,
+        key.clone(),
         vec![row],
         timestamp,
     );
-    match engine.write_atomic_batch(vec![mutation]) {
-        Ok(()) => vec![BackendMessage::CommandComplete {
-            tag: "INSERT 0 1".to_string(),
-        }],
-        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
-    }
+    apply_or_buffer(engine, txn, &key, mutation, "INSERT 0 1")
 }
 
 /// Resolve a `(column, value)` pair from a DML statement to its `CqlValue`,
@@ -954,6 +1006,7 @@ fn execute_update(
     schema: &Schema,
     upd: &UpdateStmt,
     default_schema: &str,
+    txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
 
@@ -1047,13 +1100,14 @@ fn execute_update(
         Err(e) => return vec![error_response("22000", &e.to_string())],
     };
     let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
-    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
-    match engine.write_atomic_batch(vec![mutation]) {
-        Ok(()) => vec![BackendMessage::CommandComplete {
-            tag: "UPDATE 1".to_string(),
-        }],
-        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
-    }
+    let mutation = Mutation::new(
+        ks.to_string(),
+        table.to_string(),
+        key.clone(),
+        vec![row],
+        timestamp,
+    );
+    apply_or_buffer(engine, txn, &key, mutation, "UPDATE 1")
 }
 
 /// Execute a single-row `DELETE`: a row-level tombstone. The equality `WHERE`
@@ -1065,6 +1119,7 @@ fn execute_delete(
     schema: &Schema,
     del: &DeleteStmt,
     default_schema: &str,
+    txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
 
@@ -1134,13 +1189,14 @@ fn execute_delete(
     };
     // Empty delete-columns => row-level tombstone.
     let row = ferrosa_row_bridge::build_delete_row(&[], &ck_values, timestamp);
-    let mutation = Mutation::new(ks.to_string(), table.to_string(), key, vec![row], timestamp);
-    match engine.write_atomic_batch(vec![mutation]) {
-        Ok(()) => vec![BackendMessage::CommandComplete {
-            tag: "DELETE 1".to_string(),
-        }],
-        Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
-    }
+    let mutation = Mutation::new(
+        ks.to_string(),
+        table.to_string(),
+        key.clone(),
+        vec![row],
+        timestamp,
+    );
+    apply_or_buffer(engine, txn, &key, mutation, "DELETE 1")
 }
 
 /// Evaluate a no-`FROM` expression SELECT (`SELECT 1`, `SELECT version()`,
@@ -1923,5 +1979,316 @@ mod tests {
             alias: None,
         }];
         assert!(execute_scalar_select(&items, "ks").is_err());
+    }
+}
+
+/// Transaction-buffer correctness (FMEA PG-1): DML in a `BEGIN`/`COMMIT` block
+/// must BUFFER as an Accord `TransactionWrite` instead of applying to storage;
+/// only the committer applies it. These run a real local `StorageEngine` (temp
+/// dir, no S3/Docker/cluster) and read back via the same `execute_query` path.
+#[cfg(test)]
+mod txn_buffer_tests {
+    use super::*;
+    use ferrosa_schema::{
+        AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
+        EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
+        ReplicationParams, Schema, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
+    };
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use indexmap::IndexMap;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn schema_config() -> SchemaConfig {
+        SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        }
+    }
+
+    fn superuser() -> AuthContext {
+        AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    fn column(name: &str, kind: ColumnKind, ty: &str) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position: 0,
+            column_type: ty.to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        }
+    }
+
+    /// Schema with keyspace `public` and table `kv(k text PK, v text)`.
+    fn schema_with_kv() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            "k".to_string(),
+            column("k", ColumnKind::PartitionKey, "text"),
+        );
+        cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "kv".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec!["k".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table kv");
+        schema
+    }
+
+    fn engine_config(dir: &Path) -> StorageEngineConfig {
+        StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256 * 1024,
+                max_segment_age: Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
+                log_dir: dir.join("commitlog"),
+                checkpoint_dir: dir.join("commitlog"),
+                archive: None,
+            },
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            write_verify: false,
+        }
+    }
+
+    fn kv_storage_schema() -> ferrosa_common::schema::TableSchema {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: "kv".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// How many `kv` rows whose `k` equals `key` are visible in storage, read
+    /// back through the SAME `execute_query` SELECT path the front-end serves.
+    async fn row_count(engine: &StorageEngine, schema: &Schema, key: &str) -> usize {
+        let msgs = execute_query(
+            engine,
+            schema,
+            &format!("SELECT k FROM kv WHERE k = '{key}'"),
+            "public",
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT failed: {msgs:?}"
+        );
+        msgs.iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count()
+    }
+
+    async fn new_engine_and_schema() -> (tempfile::TempDir, StorageEngine, Schema) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(kv_storage_schema()).unwrap();
+        let schema = schema_with_kv();
+        (dir, engine, schema)
+    }
+
+    #[tokio::test]
+    async fn buffered_insert_is_not_applied_until_committer() {
+        // An INSERT with `txn = Some(buffer)` is BUFFERED, never written to
+        // storage. Contrast: an autocommit INSERT (`txn = None`) IS written.
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        // Buffered: must NOT touch storage.
+        let mut buffer: Vec<ferrosa_storage::accord::TransactionWrite> = Vec::new();
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('a', 'buffered')",
+            "public",
+            Some(&mut buffer),
+        )
+        .await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "buffered INSERT still acks INSERT 0 1: {msgs:?}"
+        );
+        assert_eq!(
+            buffer.len(),
+            1,
+            "the write was buffered as a TransactionWrite"
+        );
+        assert_eq!(buffer[0].keyspace, "public");
+        assert!(
+            !buffer[0].mutation.is_empty() && !buffer[0].key.is_empty(),
+            "the buffered write carries encoded key + mutation bytes"
+        );
+        assert_eq!(
+            row_count(&engine, &schema, "a").await,
+            0,
+            "a BUFFERED write must NOT be visible in storage (FMEA PG-1)"
+        );
+
+        // Autocommit: IS applied immediately.
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('b', 'autocommit')",
+            "public",
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "autocommit INSERT acks: {msgs:?}"
+        );
+        assert_eq!(
+            row_count(&engine, &schema, "b").await,
+            1,
+            "an autocommit write IS applied immediately"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn applying_a_buffered_write_set_makes_it_visible() {
+        // The committer's job: apply the buffered mutation. Here we apply the
+        // buffered TransactionWrite's mutation bytes through the engine exactly
+        // as the cluster committer's apply path does, proving the buffered bytes
+        // are a faithful, applyable mutation (not a fake ack).
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        let mut buffer: Vec<ferrosa_storage::accord::TransactionWrite> = Vec::new();
+        execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('c', 'committed')",
+            "public",
+            Some(&mut buffer),
+        )
+        .await;
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(
+            row_count(&engine, &schema, "c").await,
+            0,
+            "buffered, not yet applied"
+        );
+
+        // Apply the buffered mutation (what the committer does on COMMIT).
+        let mutation = Mutation::deserialize_from(&buffer[0].mutation).expect("decode mutation");
+        engine.write_atomic_batch(vec![mutation]).expect("apply");
+        assert_eq!(
+            row_count(&engine, &schema, "c").await,
+            1,
+            "after the committer applies the buffered write-set the row is visible"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffer_respects_write_cap() {
+        // Staging past MAX_TXN_WRITES fails loud (53400) rather than growing the
+        // buffer without bound; nothing is applied to storage.
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+        let mut buffer: Vec<ferrosa_storage::accord::TransactionWrite> =
+            Vec::with_capacity(MAX_TXN_WRITES);
+        // Pre-fill to the cap with dummy writes so the next stage trips it.
+        for _ in 0..MAX_TXN_WRITES {
+            buffer.push(ferrosa_storage::accord::TransactionWrite {
+                keyspace: "public".to_string(),
+                key: b"x".to_vec(),
+                mutation: b"x".to_vec(),
+            });
+        }
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('over', 'cap')",
+            "public",
+            Some(&mut buffer),
+        )
+        .await;
+        match &msgs[..] {
+            [BackendMessage::ErrorResponse { fields }] => {
+                assert_eq!(fields[1], (b'C', "53400".to_string()));
+            }
+            other => panic!("expected a fail-loud cap ErrorResponse, got {other:?}"),
+        }
+        assert_eq!(
+            buffer.len(),
+            MAX_TXN_WRITES,
+            "the over-cap write was NOT buffered"
+        );
+        assert_eq!(
+            row_count(&engine, &schema, "over").await,
+            0,
+            "an over-cap write is never applied to storage"
+        );
+
+        engine.shutdown().unwrap();
     }
 }
