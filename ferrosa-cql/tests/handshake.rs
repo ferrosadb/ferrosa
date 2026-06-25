@@ -963,7 +963,7 @@ async fn cqlsh_introspection_queries_all_succeed() {
     }
 }
 
-/// Verifies system.local returns the `tokens` column (set<varchar>).
+/// Verifies system.local returns the `tokens` column (set<text>).
 /// Regression: cqlsh prints "'local' not found in keyspace 'system'" when
 /// the tokens column is missing from system_schema.columns metadata.
 #[tokio::test]
