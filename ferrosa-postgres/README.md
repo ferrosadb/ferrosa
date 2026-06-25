@@ -19,9 +19,10 @@ byte-identically over CQL — without `ferrosa-postgres` ever depending on the
 ~54k-LOC `ferrosa-cql` crate.
 
 This is a **developer preview**. See [specs/fmea.md](specs/fmea.md) for the exact
-supported-vs-not surface (key gaps: `$N` params in DML, `RETURNING`, and `ON
-CONFLICT` are still in progress; transaction atomicity via Accord is now wired —
-see below).
+supported-vs-not surface. Now wired: transaction atomicity via Accord,
+parameterized DML, and `INSERT … RETURNING`. Key remaining gaps: `ON CONFLICT`,
+`UPDATE`/`DELETE … RETURNING`, `= ANY($N)` / IN-lists, and read-your-writes
+inside an open transaction block.
 
 ## What's implemented
 
@@ -39,21 +40,35 @@ see below).
 - **Extended query protocol** — `Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`
   with a per-connection [`Session`] (prepared statements + portals), `$N`
   parameter type inference (`ParameterDescription`), text + binary parameter and
-  result encodings, and Postgres error-skip-until-`Sync` semantics. **Only
-  `SELECT`** (and no-`FROM` expression selects) can be prepared.
+  result encodings, and Postgres error-skip-until-`Sync` semantics. `SELECT`,
+  no-`FROM` expression selects, AND parameterized `INSERT` / `UPDATE` / `DELETE`
+  can be prepared. This is the path `Ecto.Repo.insert/update/delete/all` drives.
+- **Parameterized DML + `INSERT … RETURNING`** — `$N` placeholders in `INSERT`
+  VALUES, `UPDATE` SET/WHERE, and `DELETE` WHERE are bound at `Bind` and
+  substituted at `Execute` (fail-loud `08P01` if a `$N` has no bound value).
+  Param OIDs in `Describe` are inferred from each placeholder's target column
+  (so a driver that does not pre-declare OIDs gets a concrete type). `INSERT …
+  RETURNING col,…` / `RETURNING *` echoes the just-written values as a `DataRow`
+  (built in-memory — no storage read-back), exactly what Ecto needs to recover a
+  generated/echoed key. RETURNING rows honor the portal's result formats (binary
+  works). `UPDATE`/`DELETE … RETURNING`, `ON CONFLICT`, and `= ANY($N)` are
+  **not yet supported** and fail loud (`0A000`/parse error), never silently.
 - **Transaction atomicity via Accord** (FMEA PG-1) — `BEGIN`/`COMMIT`/`ROLLBACK`
   drive the `ReadyForQuery` status byte `I`/`T`/`E`, and DML inside an open `T`
   block is **buffered** as a `ferrosa_storage::accord::TransactionWrite` instead
-  of applied (`apply_or_buffer` in `query.rs`). `COMMIT` drives the whole
-  write-set through the injected `TransactionCommitter` as one atomic multi-key
-  Accord transaction (`commit_txn` in `server.rs`); `ROLLBACK` discards the
-  buffer so the writes are **never applied**. Fail-loud: a statement that errors
-  inside a block poisons it (`T → E`, only `COMMIT`/`ROLLBACK` accepted, `25P02`);
-  in standalone mode (no committer) a `COMMIT` carrying buffered DML fails loud
-  (`0A000`, cluster mode required) rather than faking atomicity; an empty
-  write-set commits cleanly. The buffer is capped at `MAX_TXN_WRITES` (10 000).
-  This mirrors the CQL `CqlTransaction` path. *Not yet:* read-your-writes inside
-  the open block (buffered writes are not visible to in-transaction reads).
+  of applied (`apply_or_buffer` in `query.rs`) — over BOTH the simple and the
+  extended (parameterized) protocols. `COMMIT` drives the whole write-set through
+  the injected `TransactionCommitter` as one atomic multi-key Accord transaction
+  (`commit_txn` in `server.rs`); `ROLLBACK` discards the buffer so the writes are
+  **never applied**. `INSERT … RETURNING` inside a `T` block returns its rows now
+  (built from the in-memory values) while the write commits at COMMIT. Fail-loud:
+  a statement that errors inside a block poisons it (`T → E`, only
+  `COMMIT`/`ROLLBACK` accepted, `25P02`); in standalone mode (no committer) a
+  `COMMIT` carrying buffered DML fails loud (`0A000`, cluster mode required)
+  rather than faking atomicity; an empty write-set commits cleanly. The buffer is
+  capped at `MAX_TXN_WRITES` (10 000). This mirrors the CQL `CqlTransaction` path.
+  *Not yet:* read-your-writes inside the open block (buffered writes are not
+  visible to in-transaction reads).
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
   `ferrosa-row-bridge` encoder. **Autocommit** (no open transaction) applies
   immediately via `engine.write_atomic_batch`; **inside a transaction** the write
@@ -124,13 +139,18 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 ## Tests
 
-~111 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
-query/storage_provider/catalog/store) run with no infrastructure, plus
-integration tests:
+~119 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
+query/storage_provider/catalog/store + `txn_atomicity_tests`) run with no
+infrastructure, plus integration tests:
 
-- `tests/m1_join_live.rs` (5) — full stack over a real `tokio-postgres` driver
+- `tests/m1_join_live.rs` (15) — full stack over a real `tokio-postgres` driver
   in-process: SCRAM → JOIN, parameterized extended query, GROUP BY/ORDER
-  BY/LIMIT, error-recovery-after-`Sync`. Local temp engine, no Docker.
+  BY/LIMIT, error-recovery-after-`Sync`, AND the parameterized DML path
+  (`INSERT`/`UPDATE`/`DELETE` via `$N`, `INSERT … RETURNING id`/`*`,
+  `UPDATE`/`DELETE … RETURNING` fail-loud, and extended-protocol DML inside a
+  transaction: BEGIN/INSERT RETURNING/ROLLBACK discards, BEGIN/INSERT/COMMIT
+  via a mock committer, and standalone-COMMIT fail-loud). Local temp engine, no
+  Docker.
 - `tests/scram_live.rs` (3) — real-driver SCRAM + `SELECT 1`, extended
   expression select, wrong-password rejection. In-process loopback.
 - `tests/differential_oracle.rs` (3, `#[cfg(feature = "live-infra-tests")]`) —
