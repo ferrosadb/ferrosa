@@ -2237,10 +2237,13 @@ impl<F: FlushTarget> TableStore<F> {
         for (index_name, col_pos) in &self.fulltext_indexes {
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
-                let pk_bytes = partition.key.key.as_bytes().to_vec();
-                // Extract the text value from the target column.
-                let mut text = String::new();
+                let pk_bytes = partition.key.key.as_bytes();
+                // Index ONE document PER ROW, keyed by the full primary key
+                // (partition + clustering). Indexing per-partition with the text
+                // of all rows concatenated made a hit identify only the partition,
+                // leaking non-matching clustering rows (t_da51e20c).
                 for row in &partition.rows {
+                    let mut text = String::new();
                     for (col_idx, cell) in &row.cells {
                         if *col_idx as usize == *col_pos {
                             if let Some(ref val) = cell.value {
@@ -2251,9 +2254,13 @@ impl<F: FlushTarget> TableStore<F> {
                             }
                         }
                     }
-                }
-                if !text.is_empty() {
-                    fti_builder.add_document(pk_bytes, text.trim());
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        fti_builder.add_document(doc_key, text.trim());
+                    }
                 }
             }
             match fti_builder.finish() {
@@ -4433,9 +4440,10 @@ impl<F: FlushTarget> TableStore<F> {
         let mut builder = FullTextIndexBuilder::new();
         let mut add_partitions = |partitions: Vec<Partition>| {
             for partition in partitions {
-                let pk_bytes = partition.key.key.as_bytes().to_vec();
-                let mut text = String::new();
+                let pk_bytes = partition.key.key.as_bytes();
+                // Per-row document keyed by the full primary key (t_da51e20c).
                 for row in &partition.rows {
+                    let mut text = String::new();
                     for (col_idx, cell) in &row.cells {
                         if *col_idx as usize == *col_pos {
                             if let Some(ref val) = cell.value {
@@ -4446,9 +4454,13 @@ impl<F: FlushTarget> TableStore<F> {
                             }
                         }
                     }
-                }
-                if !text.is_empty() {
-                    builder.add_document(pk_bytes, text.trim());
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        builder.add_document(doc_key, text.trim());
+                    }
                 }
             }
         };
@@ -4542,9 +4554,10 @@ impl<F: FlushTarget> TableStore<F> {
                 match iter.next_partition() {
                     Ok(Some(mut p)) => {
                         mapping.remap_partition(&mut p);
-                        let pk_bytes = p.key.key.as_bytes().to_vec();
-                        let mut text = String::new();
+                        let pk_bytes = p.key.key.as_bytes();
+                        // Per-row document keyed by the full primary key (t_da51e20c).
                         for row in &p.rows {
+                            let mut text = String::new();
                             for (col_idx, cell) in &row.cells {
                                 if *col_idx as usize == col_pos {
                                     if let Some(ref val) = cell.value {
@@ -4555,10 +4568,14 @@ impl<F: FlushTarget> TableStore<F> {
                                     }
                                 }
                             }
-                        }
-                        if !text.is_empty() {
-                            builder.add_document(pk_bytes, text.trim());
-                            any_docs = true;
+                            if !text.is_empty() {
+                                let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                                    pk_bytes,
+                                    &row.clustering,
+                                );
+                                builder.add_document(doc_key, text.trim());
+                                any_docs = true;
+                            }
                         }
                     }
                     Ok(None) => break,

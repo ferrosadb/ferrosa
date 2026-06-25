@@ -3568,20 +3568,38 @@ async fn route_select_user_table(
             .await
             .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
 
-        // Fetch each matching partition and apply post-filter.
-        // The raw_pk bytes are the PartitionKey bytes as stored in the FTI.
-        // Reconstruct a DecoratedKey by wrapping them in PartitionKey directly.
+        // `matching_pks` are full-key document ids (partition + clustering), one
+        // per matching ROW. Read each distinct partition once, keep ONLY the rows
+        // whose full key actually matched — so non-matching clustering rows in a
+        // matched partition don't leak (t_da51e20c) — then post-filter.
+        let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+        let mut seen_partitions = std::collections::HashSet::new();
         let mut fts_rows = Vec::new();
-        for raw_pk in matching_pks {
+        for doc_key in &matched {
+            let Some(pk) = ferrosa_index::fulltext::keys::doc_key_partition(doc_key) else {
+                // Legacy/malformed id (e.g. a sidecar built before row-granular
+                // keys, pending rebuild) — skip rather than misread.
+                continue;
+            };
+            if !seen_partitions.insert(pk.to_vec()) {
+                continue; // partition already read
+            }
             let decorated =
-                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
-            if let Some(partition) = state
+                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
+            if let Some(mut partition) = state
                 .write_path
                 .load()
                 .read(&table_id, &decorated)
                 .await
                 .map_err(|e| CqlError::ServerError(format!("{e}")))?
             {
+                // Keep only the rows whose full key is in the FTS match set.
+                partition.rows.retain(|row| {
+                    matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
+                        pk,
+                        &row.clustering,
+                    ))
+                });
                 let mut prows = bridge::partition_to_rows_with_storage_mapping(
                     &partition,
                     &all_col_names,

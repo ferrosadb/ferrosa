@@ -18328,7 +18328,12 @@ mod tests {
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
 
         assert!(result_keys.contains(&"r1".to_string()), "r1 has both terms");
@@ -18363,7 +18368,12 @@ mod tests {
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
 
         assert_eq!(
@@ -18485,7 +18495,12 @@ mod tests {
         let after = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
         let keys: Vec<String> = after
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
         assert_eq!(
             keys,
@@ -18558,7 +18573,12 @@ mod tests {
         let hits = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
         let keys: Vec<String> = hits
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
         assert_eq!(
             keys,
