@@ -64,10 +64,36 @@ impl NodeInfo {
     }
 
     /// Return `true` if the CQL port accepts a TCP connection.
+    ///
+    /// NOTE: TCP-open is NOT the same as CQL-ready — a node's listener can accept
+    /// a socket before it can complete the protocol handshake (which then fails
+    /// with `early eof` on `OPTIONS`). Use [`cql_handshake_ok`](Self::cql_handshake_ok)
+    /// as the readiness gate; this bare check is kept only for cheap liveness.
     pub async fn cql_reachable(&self) -> bool {
         tokio::net::TcpStream::connect(self.cql_address())
             .await
             .is_ok()
+    }
+
+    /// Return `true` only if a full CQL **handshake + trivial query** succeeds —
+    /// the real readiness signal. Building a session drives the `OPTIONS`/`STARTUP`
+    /// negotiation and a `SELECT` proves the node is actually serving CQL, not
+    /// merely holding an open socket. Any error (handshake `early eof`, control
+    /// connection broken, query failure) returns `false` so the caller keeps
+    /// polling.
+    pub async fn cql_handshake_ok(&self) -> bool {
+        use scylla::client::session_builder::SessionBuilder;
+        match SessionBuilder::new()
+            .known_node(self.cql_address())
+            .build()
+            .await
+        {
+            Ok(session) => session
+                .query_unpaged("SELECT key FROM system.local", &[])
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -275,7 +301,11 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
     Ok(cluster)
 }
 
-/// Wait for all nodes in the cluster to accept TCP connections on their CQL port.
+/// Wait for all nodes in the cluster to be **CQL-ready** — i.e. to complete a
+/// real CQL handshake + query, not merely accept a TCP socket. Gating on
+/// TCP-open let the orchestrator connect before the listener could handshake,
+/// failing every workload with `early eof` on `OPTIONS` (a node-readiness race
+/// that surfaced under slow podman + from-source image builds).
 ///
 /// Polls every 500 ms for up to `CLUSTER_READY_TIMEOUT`.
 async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
@@ -291,8 +321,8 @@ async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
         );
 
         loop {
-            if node.cql_reachable().await {
-                info!(cql_address = node.cql_address(), "CQL port ready");
+            if node.cql_handshake_ok().await {
+                info!(cql_address = node.cql_address(), "CQL handshake ready");
                 break;
             }
             if tokio::time::Instant::now() > deadline {

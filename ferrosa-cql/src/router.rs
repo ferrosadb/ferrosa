@@ -1121,9 +1121,16 @@ pub async fn route_transactional(
         // Buffer DML only while a transaction is open; otherwise route normally.
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if txn.is_open() => {
             Some(
-                build_transaction_write(state, ctx, stmt)
-                    .and_then(|w| txn.stage(w))
-                    .map(|()| RouteResult::Result(crate::result::encode_void())),
+                match build_transaction_write(state, ctx, stmt).and_then(|w| txn.stage(w)) {
+                    Ok(()) => Ok(RouteResult::Result(crate::result::encode_void())),
+                    Err(e) => {
+                        // A statement that fails inside a transaction POISONS it,
+                        // so the next COMMIT fails loud rather than committing an
+                        // incomplete write-set (never a silently partial txn).
+                        txn.poison();
+                        Err(e)
+                    }
+                },
             )
         }
         _ => None,
