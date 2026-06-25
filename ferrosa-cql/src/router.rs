@@ -8473,7 +8473,21 @@ async fn route_grant(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (also emits the audit event). Then run the same
+            // persisted DDL path the Pair/Cluster arms use so the grant is
+            // written to system_auth.role_permissions and survives a restart —
+            // standalone mode otherwise only updated memory, silently losing
+            // grants on restart (t_fb280b30). grant_internal is idempotent.
+            state
+                .schema
+                .grant(&s.role, &resource, perms.clone(), ctx.auth)?;
+            ddl.execute(DdlOperation::Grant(GrantEntry {
+                role: s.role.clone(),
+                resource,
+                permissions: perms,
+            }))
+            .await
+            .map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -8520,7 +8534,21 @@ async fn route_revoke(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (+ audit), then persist each revoke to
+            // system_auth.role_permissions so it survives a restart — else the
+            // revoked permission silently reappears after restart (t_fb280b30).
+            state
+                .schema
+                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
+            for perm in perms {
+                ddl.execute(DdlOperation::Revoke {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                })
+                .await
+                .map_err(CqlError::from)?;
+            }
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -8602,11 +8630,11 @@ async fn route_grant_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            if grant {
-                state.schema.grant_role_internal(&member, &role)?;
-            } else {
-                state.schema.revoke_role_internal(&member, &role)?;
-            }
+            // Route through the persisted DDL path (apply_direct) so the
+            // membership change is written to system_auth.role_members and
+            // survives a restart — Direct mode previously only updated memory,
+            // silently losing role grants on restart (t_fb280b30).
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             coordinator.coordinate_ddl(op).await?;
@@ -11637,6 +11665,10 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        // Real startup registers the system tables unconditionally (main.rs:802);
+        // mirror that so the harness reflects standalone mode (system_auth.* must
+        // exist for grant persistence — t_fb280b30).
+        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
@@ -20908,6 +20940,49 @@ mod tests {
             result.is_ok(),
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
+        );
+    }
+
+    /// t_fb280b30: in standalone (Direct) mode a GRANT must be written to
+    /// `system_auth.role_permissions` so it survives a restart — the startup
+    /// replay (`SystemTableLoader::replay_role_permissions_into_schema`) reads
+    /// that table. Previously Direct mode only updated in-memory state, so grants
+    /// silently vanished on restart.
+    #[tokio::test]
+    async fn grant_persists_to_storage_to_survive_restart() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE pgks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE pgks.t (k int PRIMARY KEY, v text)",
+            "CREATE ROLE pg_user WITH PASSWORD = 'pass' AND LOGIN = true",
+            "GRANT SELECT ON pgks.t TO pg_user",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Simulate a restart: flush the auth table, then read grants straight
+        // from storage via the same loader startup uses.
+        let _ = state.engine.flush(&ferrosa_storage::TableId::new(
+            "system_auth",
+            "role_permissions",
+        ));
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone());
+        let grants = loader.load_role_permissions().unwrap();
+        assert!(
+            grants.iter().any(|g| g.role == "pg_user"),
+            "GRANT must persist to system_auth.role_permissions to survive restart; got {grants:?}"
         );
     }
 
