@@ -2182,12 +2182,23 @@ mod tests {
             .write(&table_id, &test_key(), test_row(1000), 1000)
             .unwrap();
 
+        // The local FTI now returns a full ROW-GRANULAR doc key (partition +
+        // clustering), not a bare partition key. Capture the actual local key so
+        // the remote returns the SAME bytes — exercising real dedup — instead of a
+        // hand-rolled partition key that would no longer match.
+        let local_keys = storage
+            .fulltext_search(&table_id, "val_fti", "hello")
+            .unwrap();
+        assert_eq!(local_keys.len(), 1, "local node should have one FTI hit");
+        let shared_key = local_keys[0].clone();
+        let remote_only = vec![9u8, 9, 9];
+
         // Remote node: returns the SAME local key (must dedup) plus a
-        // remote-only key [9,9,9].
+        // remote-only key.
         let (server, addr, remote_host_id) = start_rpc_server(
             MsgType::FulltextSearchRequest,
             Arc::new(StaticFulltextSearchHandler {
-                keys: vec![vec![1, 2, 3], vec![9, 9, 9]],
+                keys: vec![shared_key.clone(), remote_only.clone()],
             }),
         )
         .await;
@@ -2224,9 +2235,10 @@ mod tests {
             .unwrap();
         keys.sort();
 
+        let mut expected = vec![shared_key, remote_only];
+        expected.sort();
         assert_eq!(
-            keys,
-            vec![vec![1u8, 2, 3], vec![9, 9, 9]],
+            keys, expected,
             "fan-out must union local + remote FTI hits and de-duplicate the shared key"
         );
 
