@@ -11,7 +11,7 @@
 //! portion back out (the router reads partitions by partition key, then keeps
 //! only the rows whose full key actually matched).
 //!
-//! The leading [`ROW_KEY_TAG`] byte distinguishes a row-granular key from a
+//! The leading `ROW_KEY_TAG` byte distinguishes a row-granular key from a
 //! legacy bare-partition-key id, so a stale sidecar (pre-rebuild) is detected
 //! rather than silently misparsed.
 
