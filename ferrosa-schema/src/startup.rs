@@ -115,6 +115,8 @@ pub struct ProductionCheckConfig {
     pub s3_allow_http: bool,
     /// Whether client/admin authentication is enabled.
     pub auth_enabled: bool,
+    /// Whether CQL client connections require TLS (`[cql].require_tls`).
+    pub cql_require_tls: bool,
 }
 
 /// Validate that the configuration meets production requirements.
@@ -150,9 +152,26 @@ pub fn validate_production_requirements(
     {
         violations.push(ProductionViolation::PasswordPolicyBelowMinimum);
     }
-    // CQL TLS and internode TLS checks are stubs (added when those crates land)
+    if !config.cql_require_tls {
+        violations.push(ProductionViolation::CqlTlsNotConfigured);
+    }
+    // Internode TLS check remains a stub (added when that config is plumbed).
 
     violations
+}
+
+impl ProductionViolation {
+    /// Whether this violation must BLOCK startup (it is operator-fixable today)
+    /// versus only warn. Some violations describe weaknesses whose underlying
+    /// config is not operator-configurable yet (the schema's password policy and
+    /// secrets provider are currently hardcoded) — blocking on those would leave
+    /// no recourse, so they only warn until that config is plumbed.
+    pub fn blocks_startup(&self) -> bool {
+        !matches!(
+            self,
+            Self::EnvSecretsInProduction | Self::PasswordPolicyBelowMinimum
+        )
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +187,7 @@ mod tests {
             secrets_provider_type: "aws-secrets-manager".into(), // pragma: allowlist secret
             s3_allow_http: false,
             auth_enabled: true,
+            cql_require_tls: true,
         }
     }
 
@@ -193,6 +213,36 @@ mod tests {
             validate_production_requirements(&config).is_empty(),
             "development mode must not enforce auth"
         );
+    }
+
+    #[test]
+    fn production_without_cql_tls_is_a_blocking_violation() {
+        let mut config = passing_production_config();
+        config.cql_require_tls = false;
+        let violations = validate_production_requirements(&config);
+        let tls = violations
+            .iter()
+            .find(|v| matches!(v, ProductionViolation::CqlTlsNotConfigured));
+        assert!(
+            tls.is_some(),
+            "production without require_tls must report CqlTlsNotConfigured; got {violations:?}"
+        );
+        assert!(
+            tls.unwrap().blocks_startup(),
+            "missing CQL TLS must block startup"
+        );
+    }
+
+    #[test]
+    fn hardcoded_weaknesses_warn_but_do_not_block() {
+        // Secrets provider + password policy are not operator-configurable yet,
+        // so they must WARN (not block) until that config is plumbed.
+        assert!(!ProductionViolation::EnvSecretsInProduction.blocks_startup());
+        assert!(!ProductionViolation::PasswordPolicyBelowMinimum.blocks_startup());
+        // The operator-fixable security requirements block startup.
+        assert!(ProductionViolation::AuthDisabled.blocks_startup());
+        assert!(ProductionViolation::CqlTlsNotConfigured.blocks_startup());
+        assert!(ProductionViolation::DefaultSuperuserPassword.blocks_startup());
     }
 
     #[test]
@@ -226,6 +276,7 @@ mod tests {
             secrets_provider_type: "env".into(), // pragma: allowlist secret
             s3_allow_http: true,
             auth_enabled: true,
+            cql_require_tls: true,
         };
         let violations = validate_production_requirements(&config);
         assert!(
