@@ -12581,7 +12581,7 @@ mod tests {
         }
     }
 
-    /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
+    /// Regression test: cqlsh expects `tokens` column (set<text>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
     #[tokio::test]
