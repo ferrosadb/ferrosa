@@ -605,3 +605,284 @@ async fn where_having_distinct_over_a_real_driver() {
     assert_eq!(distinct[0].get(0), Some("1"));
     assert_eq!(distinct[1].get(0), Some("2"));
 }
+
+// ── Extended-protocol DML (parameterized INSERT/UPDATE/DELETE + RETURNING) ──────
+//
+// These exercise the Parse → Bind($N) → Execute path that `Ecto.Repo`'s
+// insert/update/delete/all calls drive: tokio-postgres `execute`/`query` with
+// bound parameters, over the same in-memory engine + `users(id int PK, name
+// text)` fixture. They are the end-to-end evidence for `feat/pg-extended-crud`.
+
+/// Spin up a fresh server over the seeded engine and return a connected driver
+/// client (+ the tempdir to keep storage alive for the test's lifetime). No
+/// Accord committer — autocommit DML applies immediately; a COMMIT carrying
+/// buffered DML would fail loud (cluster mode required).
+async fn dml_client() -> (tokio_postgres::Client, tempfile::TempDir) {
+    dml_client_with_committer(false).await
+}
+
+/// As [`dml_client`], but `with_committer` installs a
+/// [`MockTransactionCommitter`] in the `QueryContext` so a `BEGIN`/`COMMIT`
+/// block commits its buffered write-set (the mock records it and reports
+/// `Committed`) instead of failing loud for missing cluster mode.
+async fn dml_client_with_committer(
+    with_committer: bool,
+) -> (tokio_postgres::Client, tempfile::TempDir) {
+    use ferrosa_storage::accord::MockTransactionCommitter;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seed_engine(dir.path());
+    let schema = create_schema();
+    let accord_committer: Option<Arc<dyn ferrosa_storage::accord::TransactionCommitter>> =
+        if with_committer {
+            Some(Arc::new(MockTransactionCommitter::new()))
+        } else {
+            None
+        };
+    let ctx = Arc::new(QueryContext {
+        engine: Arc::new(engine),
+        schema: Arc::new(schema),
+        default_schema: "public".into(),
+        accord_committer,
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(server::serve(listener, dev_store(), ctx));
+    (connect(port).await, dir)
+}
+
+#[tokio::test]
+async fn extended_parameterized_insert_writes_row() {
+    let (client, _dir) = dml_client().await;
+
+    // Parse → Bind($1=42, $2='carol') → Execute. tokio-postgres `execute`
+    // returns the affected-row count parsed from the CommandComplete tag.
+    let n = client
+        .execute(
+            "INSERT INTO users (id, name) VALUES ($1, $2)",
+            &[&42i32, &"carol"],
+        )
+        .await
+        .expect("parameterized INSERT should apply");
+    assert_eq!(n, 1, "INSERT 0 1 ⇒ one affected row");
+
+    // The row is now readable back over the same connection.
+    let rows = client
+        .query("SELECT name FROM users WHERE id = $1", &[&42i32])
+        .await
+        .expect("the inserted row should be readable");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>(0), "carol");
+}
+
+#[tokio::test]
+async fn extended_insert_returning_id_yields_a_data_row() {
+    let (client, _dir) = dml_client().await;
+
+    // INSERT ... RETURNING id: the row Ecto reads back to recover a key. The
+    // returned value is the value just written (no storage read-back).
+    let rows = client
+        .query(
+            "INSERT INTO users (id, name) VALUES ($1, $2) RETURNING id",
+            &[&7i32, &"dave"],
+        )
+        .await
+        .expect("INSERT RETURNING should return the new row");
+    assert_eq!(rows.len(), 1, "RETURNING yields exactly the inserted row");
+    assert_eq!(rows[0].get::<_, i32>(0), 7, "RETURNING id echoes the key");
+}
+
+#[tokio::test]
+async fn extended_insert_returning_star_yields_all_columns() {
+    let (client, _dir) = dml_client().await;
+    let rows = client
+        .query(
+            "INSERT INTO users (id, name) VALUES ($1, $2) RETURNING *",
+            &[&9i32, &"erin"],
+        )
+        .await
+        .expect("INSERT RETURNING * should return all columns");
+    assert_eq!(rows.len(), 1);
+    // Column order follows the table schema: id (PK) then name.
+    assert_eq!(rows[0].get::<_, i32>("id"), 9);
+    assert_eq!(rows[0].get::<_, &str>("name"), "erin");
+}
+
+#[tokio::test]
+async fn extended_parameterized_update_applies() {
+    let (client, _dir) = dml_client().await;
+
+    // alice (id=1) starts as "alice"; UPDATE her name via bound params.
+    let n = client
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"alice2", &1i32],
+        )
+        .await
+        .expect("parameterized UPDATE should apply");
+    assert_eq!(n, 1, "UPDATE 1 ⇒ one affected row");
+
+    let rows = client
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("the updated row should be readable");
+    assert_eq!(rows[0].get::<_, &str>(0), "alice2");
+}
+
+#[tokio::test]
+async fn extended_parameterized_delete_applies() {
+    let (client, _dir) = dml_client().await;
+
+    // bob (id=2) exists in the fixture; DELETE him via a bound param.
+    let n = client
+        .execute("DELETE FROM users WHERE id = $1", &[&2i32])
+        .await
+        .expect("parameterized DELETE should apply");
+    assert_eq!(n, 1, "DELETE 1 ⇒ one affected row");
+
+    let rows = client
+        .query("SELECT name FROM users WHERE id = $1", &[&2i32])
+        .await
+        .expect("query after delete should succeed");
+    assert!(rows.is_empty(), "the deleted row is gone");
+}
+
+#[tokio::test]
+async fn extended_update_returning_is_unsupported_fail_loud() {
+    let (client, _dir) = dml_client().await;
+    // UPDATE ... RETURNING is out of scope this PR: a clear 0A000, not a silent
+    // drop of the RETURNING clause.
+    let err = client
+        .query(
+            "UPDATE users SET name = $1 WHERE id = $2 RETURNING id",
+            &[&"x", &1i32],
+        )
+        .await
+        .expect_err("UPDATE RETURNING must fail loud");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("0A000"),
+        "UPDATE RETURNING should be feature_not_supported, got: {err}"
+    );
+    // The connection survives (its own Sync/ReadyForQuery): a plain read works.
+    let ok = client
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("session usable after the fail-loud error");
+    assert_eq!(ok.len(), 1);
+}
+
+#[tokio::test]
+async fn extended_delete_returning_is_unsupported_fail_loud() {
+    let (client, _dir) = dml_client().await;
+    let err = client
+        .query("DELETE FROM users WHERE id = $1 RETURNING id", &[&1i32])
+        .await
+        .expect_err("DELETE RETURNING must fail loud");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("0A000"),
+        "DELETE RETURNING should be feature_not_supported, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn extended_dml_in_transaction_rollback_discards_buffered_write() {
+    // Extended-protocol DML inside a BEGIN block is BUFFERED (not applied), and
+    // ROLLBACK discards the buffer — the write is never applied. The INSERT
+    // RETURNING still returns its row (built from the in-memory values) while
+    // the write would only commit at COMMIT. A committer is installed so the
+    // write buffers cleanly rather than tripping the standalone fail-loud path.
+    let (client, _dir) = dml_client_with_committer(true).await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+
+    // INSERT ... RETURNING inside the txn returns its row now (buffered write).
+    let rows = client
+        .query(
+            "INSERT INTO users (id, name) VALUES ($1, $2) RETURNING id",
+            &[&100i32, &"frank"],
+        )
+        .await
+        .expect("buffered INSERT RETURNING returns its row");
+    assert_eq!(rows.len(), 1, "RETURNING yields the buffered row");
+    assert_eq!(rows[0].get::<_, i32>(0), 100);
+
+    // ROLLBACK discards the buffer — the write was never applied.
+    client.batch_execute("ROLLBACK").await.expect("ROLLBACK");
+
+    // Nothing was applied: the targeted row never appeared in storage.
+    let after = client
+        .query("SELECT name FROM users WHERE id = $1", &[&100i32])
+        .await
+        .expect("read after rollback should succeed");
+    assert!(
+        after.is_empty(),
+        "the buffered in-txn INSERT was discarded by ROLLBACK, not applied"
+    );
+}
+
+#[tokio::test]
+async fn extended_dml_in_transaction_commit_drives_the_committer() {
+    // Extended-protocol DML inside a BEGIN block buffers; COMMIT drives the
+    // buffered write-set through the Accord committer. With a committer wired,
+    // COMMIT succeeds cleanly (not the standalone `0A000`). The atomic-apply
+    // semantics themselves are unit-tested in `server::txn_atomicity_tests`
+    // against a real engine; here we prove the extended path reaches COMMIT.
+    let (client, _dir) = dml_client_with_committer(true).await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    let n = client
+        .execute(
+            "INSERT INTO users (id, name) VALUES ($1, $2)",
+            &[&101i32, &"grace"],
+        )
+        .await
+        .expect("buffered INSERT acks inside the txn");
+    assert_eq!(n, 1, "INSERT 0 1 ⇒ one buffered row");
+
+    // COMMIT drives the write-set through the committer and succeeds.
+    client
+        .batch_execute("COMMIT")
+        .await
+        .expect("COMMIT of a buffered write-set should succeed with a committer");
+}
+
+#[tokio::test]
+async fn extended_dml_in_transaction_without_committer_fails_loud_at_commit() {
+    // Standalone mode (no committer): an extended-protocol DML buffers, but
+    // COMMIT of a non-empty buffer fails loud (`0A000`, cluster mode required)
+    // rather than faking atomicity or applying outside the committer. The buffer
+    // is discarded, so nothing is applied.
+    let (client, _dir) = dml_client().await; // no committer
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    let n = client
+        .execute(
+            "INSERT INTO users (id, name) VALUES ($1, $2)",
+            &[&102i32, &"heidi"],
+        )
+        .await
+        .expect("buffered INSERT acks inside the txn");
+    assert_eq!(n, 1, "the write buffers (acks) inside the txn");
+
+    // COMMIT fails loud: no committer to apply the buffered write-set.
+    let err = client
+        .batch_execute("COMMIT")
+        .await
+        .expect_err("COMMIT without a committer must fail loud");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("0A000"),
+        "standalone COMMIT of buffered DML is feature_not_supported, got: {err}"
+    );
+
+    // Nothing was applied: the buffered write was dropped, not written.
+    let after = client
+        .query("SELECT name FROM users WHERE id = $1", &[&102i32])
+        .await
+        .expect("read after failed commit should succeed");
+    assert!(
+        after.is_empty(),
+        "the buffered write was never applied outside the committer"
+    );
+}

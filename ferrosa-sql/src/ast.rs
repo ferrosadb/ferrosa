@@ -39,31 +39,47 @@ pub enum Statement {
     Delete(Box<DeleteStmt>),
 }
 
-/// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Single-row, with
-/// literal or `$N` values (one per named column).
+/// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...) [RETURNING ...]`.
+/// Single-row, with literal or `$N` values (one per named column). The optional
+/// `returning` clause names the columns to echo back (see [`Returning`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertStmt {
     pub table: TableRef,
     pub columns: Vec<String>,
     pub values: Vec<ScalarValue>,
+    pub returning: Option<Returning>,
 }
 
-/// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`. The
-/// `WHERE` is restricted to equality on key columns (Cassandra-style upsert: the
-/// full primary key identifies the row); `assignments` are the SET cells.
+/// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]
+/// [RETURNING ...]`. The `WHERE` is restricted to equality on key columns
+/// (Cassandra-style upsert: the full primary key identifies the row);
+/// `assignments` are the SET cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateStmt {
     pub table: TableRef,
     pub assignments: Vec<(String, ScalarValue)>,
     pub where_eq: Vec<(String, ScalarValue)>,
+    pub returning: Option<Returning>,
 }
 
-/// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Row-level delete; the
-/// equality `WHERE` supplies the full primary key identifying the row.
+/// `DELETE FROM [schema.]table WHERE col = val [AND ...] [RETURNING ...]`.
+/// Row-level delete; the equality `WHERE` supplies the full primary key
+/// identifying the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteStmt {
     pub table: TableRef,
     pub where_eq: Vec<(String, ScalarValue)>,
+    pub returning: Option<Returning>,
+}
+
+/// A `RETURNING` clause: either `RETURNING *` (all of the table's columns, in
+/// schema order — resolved at execute time) or an explicit list of column names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Returning {
+    /// `RETURNING *` — every column of the target table.
+    Star,
+    /// `RETURNING col, col, ...` — the named columns, in the order written.
+    Columns(Vec<String>),
 }
 
 /// One projected scalar in a no-`FROM` SELECT, with an optional `AS` alias.

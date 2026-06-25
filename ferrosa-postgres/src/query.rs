@@ -36,7 +36,7 @@ use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
     execute, parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
-    QueryResult, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
+    QueryResult, Returning, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -723,13 +723,24 @@ pub async fn execute_query(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
-        // DML: single-row INSERT / UPDATE / DELETE. With `txn = Some(buffer)`
-        // (an open transaction) the write is BUFFERED as a `TransactionWrite`
-        // and committed atomically via Accord on COMMIT; with `txn = None`
-        // (autocommit) it applies immediately via `write_atomic_batch`.
-        Statement::Insert(ins) => execute_insert(engine, schema, &ins, default_schema, txn),
-        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema, txn),
-        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema, txn),
+        // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
+        // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
+        // error (no value to bind). With `txn = Some(buffer)` (an open
+        // transaction) the write is BUFFERED as a `TransactionWrite` and
+        // committed atomically via Accord on COMMIT; with `txn = None`
+        // (autocommit) it applies immediately via `write_atomic_batch`. An INSERT
+        // RETURNING leads with a RowDescription on this (simple) path.
+        Statement::Insert(ins) => execute_insert(
+            engine,
+            schema,
+            &ins,
+            default_schema,
+            &[],
+            ReturningOpts::simple(),
+            txn,
+        ),
+        Statement::Update(upd) => execute_update(engine, schema, &upd, default_schema, &[], txn),
+        Statement::Delete(del) => execute_delete(engine, schema, &del, default_schema, &[], txn),
     }
 }
 
@@ -782,6 +793,31 @@ fn apply_or_buffer(
             }],
             Err(e) => vec![error_response("58000", &format!("write failed: {e}"))],
         },
+    }
+}
+
+/// Resolve a DML scalar to a concrete [`SqlValue`], substituting bound
+/// parameters from `params` (1-based, the Postgres `$N` numbering). A literal
+/// passes through; a `$N` indexes `params`. FAILS LOUD (`08P01`,
+/// protocol_violation) when `$N` has no bound value — never a silent default, so
+/// a parameter the client failed to bind can never become NULL. Function calls
+/// in DML values are unsupported (`0A000`).
+fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, BackendMessage> {
+    match sv {
+        ScalarValue::Literal(v) => Ok(v.clone()),
+        ScalarValue::Param(n) => {
+            // `$N` is 1-based; `params` is 0-based.
+            params.get(n.wrapping_sub(1)).cloned().ok_or_else(|| {
+                error_response(
+                    "08P01",
+                    &format!("bind parameter ${n} has no value (out of range)"),
+                )
+            })
+        }
+        ScalarValue::Func(_) => Err(error_response(
+            "0A000",
+            "function calls in DML values are not supported",
+        )),
     }
 }
 
@@ -838,18 +874,56 @@ fn value_to_cql(value: &SqlValue, ty: &CqlType) -> Result<CqlValue, BackendMessa
     Ok(out)
 }
 
+/// How an `INSERT ... RETURNING` result is rendered, bundled so `execute_insert`
+/// stays within the argument limit. `with_row_description` controls whether the
+/// result leads with a `RowDescription` (simple path: `true`; extended Execute:
+/// `false`, the client already learned columns from `Describe`); `result_formats`
+/// are the portal's per-column format codes (empty ⇒ all text).
+#[derive(Clone, Copy)]
+pub(crate) struct ReturningOpts<'a> {
+    pub with_row_description: bool,
+    pub result_formats: &'a [i16],
+}
+
+impl ReturningOpts<'_> {
+    /// The simple-query default: lead with a `RowDescription`, all text format.
+    pub(crate) fn simple() -> Self {
+        Self {
+            with_row_description: true,
+            result_formats: &[],
+        }
+    }
+}
+
 /// Execute a single-row `INSERT`: materialize the row from the table schema and
 /// write it through the engine. Returns `CommandComplete "INSERT 0 1"` (Postgres
 /// reports oid 0 + a 1-row count). The row encoder is the shared
 /// `ferrosa-row-bridge` one — the SAME bytes the engine + CQL reads decode.
-fn execute_insert(
+///
+/// `params` supplies bound `$N` values (the extended-query path); the simple
+/// path passes `&[]`. `returning_opts` controls RETURNING rendering (see
+/// [`ReturningOpts`]). `txn = Some(buffer)` BUFFERS the write as a
+/// `TransactionWrite` (committed atomically on COMMIT); `None` is autocommit.
+///
+/// `RETURNING` echoes the values just written (built in-memory from the supplied
+/// column values — storage is NOT read back): exactly what Ecto needs to recover
+/// a generated/echoed key after an insert. A buffered write still returns its
+/// RETURNING rows now; the write commits at COMMIT.
+pub(crate) fn execute_insert(
     engine: &StorageEngine,
     schema: &Schema,
     ins: &InsertStmt,
     default_schema: &str,
+    params: &[SqlValue],
+    returning_opts: ReturningOpts<'_>,
     txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
+
+    let ReturningOpts {
+        with_row_description,
+        result_formats,
+    } = returning_opts;
 
     let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
     let snap = schema.snapshot();
@@ -863,46 +937,24 @@ fn execute_insert(
         }
     };
 
-    // Convert each named column's value (per its CQL type); collect regular/
-    // static cells by storage index, and all values by name for key ordering.
+    // Resolve each named column's value (per its CQL type), substituting bound
+    // params; collect regular/static cells by storage index, the CQL values by
+    // name for key ordering, and the SQL values by name for RETURNING.
     let mut col_values: HashMap<String, CqlValue> = HashMap::new();
+    let mut sql_values: HashMap<String, SqlValue> = HashMap::new();
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for (i, col_name) in ins.columns.iter().enumerate() {
-        let col_meta = match meta.columns.get(col_name) {
-            Some(c) => c,
-            None => {
-                return vec![error_response(
-                    "42703",
-                    &format!(
-                        "column \"{col_name}\" of relation \"{}\" does not exist",
-                        ins.table.table
-                    ),
-                )]
-            }
-        };
-        let cql_type =
-            match ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
-            {
-                Ok(t) => t,
-                Err(e) => return vec![error_response("42704", &e.to_string())],
-            };
-        let value = match &ins.values[i] {
-            ScalarValue::Literal(v) => match value_to_cql(v, &cql_type) {
-                Ok(cv) => cv,
-                Err(msg) => return vec![msg],
-            },
-            ScalarValue::Param(_) => {
-                return vec![error_response(
-                "0A000",
-                "$N parameters in INSERT require the extended-query protocol (not yet supported)",
-            )]
-            }
-            ScalarValue::Func(_) => {
-                return vec![error_response(
-                    "0A000",
-                    "function calls in INSERT VALUES are not supported",
-                )]
-            }
+        let (col_meta, sql_value, value) = match resolve_dml_value(
+            meta,
+            schema,
+            ks,
+            &ins.table.table,
+            col_name,
+            &ins.values[i],
+            params,
+        ) {
+            Ok(r) => r,
+            Err(msg) => return vec![msg],
         };
         if matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             if let Some(idx) = meta.storage_column_index(col_name) {
@@ -910,6 +962,7 @@ fn execute_insert(
             }
         }
         col_values.insert(col_name.clone(), value);
+        sql_values.insert(col_name.clone(), sql_value);
     }
 
     // Partition-key and clustering values in key order — all required for INSERT.
@@ -938,6 +991,17 @@ fn execute_insert(
         }
     }
 
+    // Build the RETURNING result BEFORE the write, from the in-memory values, so
+    // a missing RETURNING column fails loud without a half-applied side effect.
+    let returning = match ins.returning.as_ref() {
+        Some(r) => match build_insert_returning(meta, schema, ks, &ins.table.table, r, &sql_values)
+        {
+            Ok(rows) => Some(rows),
+            Err(msg) => return vec![msg],
+        },
+        None => None,
+    };
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -954,13 +1018,365 @@ fn execute_insert(
         vec![row],
         timestamp,
     );
-    apply_or_buffer(engine, txn, &key, mutation, "INSERT 0 1")
+    // Write (or buffer into the open transaction) via the shared seam. On any
+    // error — including the write-set cap — `apply_or_buffer` returns an
+    // `ErrorResponse`; propagate it untouched (the RETURNING rows are never
+    // emitted for a failed write). On success it returns `CommandComplete
+    // "INSERT 0 1"`; when RETURNING is present we replace that with the
+    // RETURNING DataRow(s) + the same CommandComplete tag, built from the
+    // in-memory values resolved above (no storage read-back). A buffered write
+    // still returns its RETURNING rows now and commits at COMMIT.
+    let write_result = apply_or_buffer(engine, txn, &key, mutation, "INSERT 0 1");
+    let errored = write_result
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }));
+    match returning {
+        Some(result) if !errored => render_dml_returning(
+            result,
+            with_row_description,
+            result_formats,
+            "INSERT 0 1".to_string(),
+        ),
+        _ => write_result,
+    }
+}
+
+/// Resolve a `RETURNING` clause for an `INSERT` into the output column set + the
+/// single returned row, from the values just written (no storage read-back).
+/// `RETURNING *` expands to every table column in schema order; a named column
+/// not present in the statement's value list is reported as NULL (it was not
+/// supplied — Cassandra has no row to read a default from). A `RETURNING` of a
+/// column that does not exist in the table fails loud (`42703`).
+fn build_insert_returning(
+    meta: &ferrosa_schema::TableMetadata,
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    returning: &Returning,
+    sql_values: &std::collections::HashMap<String, SqlValue>,
+) -> Result<QueryResult, BackendMessage> {
+    let names: Vec<String> = match returning {
+        Returning::Star => meta.columns.keys().cloned().collect(),
+        Returning::Columns(cols) => cols.clone(),
+    };
+    let mut columns = Vec::with_capacity(names.len());
+    let mut row = Vec::with_capacity(names.len());
+    for name in &names {
+        let col_meta = meta.columns.get(name).ok_or_else(|| {
+            error_response(
+                "42703",
+                &format!("column \"{name}\" of relation \"{table}\" does not exist in RETURNING"),
+            )
+        })?;
+        let cql_type =
+            ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+                .map_err(|e| error_response("42704", &e.to_string()))?;
+        columns.push(Column::new(
+            name.clone(),
+            cql_type_to_column_type(&cql_type),
+        ));
+        row.push(sql_values.get(name).cloned().unwrap_or(SqlValue::Null));
+    }
+    Ok(QueryResult {
+        columns,
+        rows: vec![Row(row)],
+    })
+}
+
+/// The parameter type OIDs to advertise for a parameterized DML statement in
+/// `ParameterDescription`. The COUNT is the number of distinct `$N` placeholders
+/// (driven by the highest index `N` referenced), so a driver like tokio-postgres
+/// — which does NOT pre-declare OIDs in `Parse` and learns the count from this
+/// reply — binds the right number of parameters. Each OID is the client-declared
+/// type where given (non-zero), else `0` (unspecified ⇒ decode leniently at
+/// Bind). No column-from-comparison inference is attempted for DML.
+///
+/// Fails loud (`08P01`) on a non-contiguous placeholder set (e.g. `$1, $3` with
+/// no `$2`): Postgres requires `$1..$N` dense, and a gap would silently bind the
+/// wrong value.
+pub(crate) fn dml_param_oids(
+    placeholders: &[usize],
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let max = placeholders.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    // Every index 1..=max must be present (Postgres requires dense $1..$N).
+    for n in 1..=max {
+        if !placeholders.contains(&n) {
+            return Err(error_response(
+                "08P01",
+                &format!("parameter ${n} is referenced out of order or missing in $1..${max}"),
+            ));
+        }
+    }
+    Ok((1..=max)
+        .map(|n| match declared.get(n - 1).copied() {
+            Some(oid) if oid != 0 => oid,
+            _ => 0,
+        })
+        .collect())
+}
+
+/// Collect the `$N` placeholder indices referenced by an `INSERT`'s VALUES.
+pub(crate) fn insert_placeholders(ins: &InsertStmt) -> Vec<usize> {
+    ins.values.iter().filter_map(scalar_param_index).collect()
+}
+
+/// Collect the `$N` placeholder indices referenced by an `UPDATE` (SET + WHERE).
+pub(crate) fn update_placeholders(upd: &UpdateStmt) -> Vec<usize> {
+    upd.assignments
+        .iter()
+        .chain(upd.where_eq.iter())
+        .filter_map(|(_, sv)| scalar_param_index(sv))
+        .collect()
+}
+
+/// Collect the `$N` placeholder indices referenced by a `DELETE`'s WHERE.
+pub(crate) fn delete_placeholders(del: &DeleteStmt) -> Vec<usize> {
+    del.where_eq
+        .iter()
+        .filter_map(|(_, sv)| scalar_param_index(sv))
+        .collect()
+}
+
+/// The 1-based `$N` index of a scalar, if it is a parameter placeholder.
+fn scalar_param_index(sv: &ScalarValue) -> Option<usize> {
+    match sv {
+        ScalarValue::Param(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `(placeholder index, target column name)` pairs for an `INSERT`: each `$N` in
+/// VALUES is bound to the column at the same position in the column list.
+fn insert_param_targets(ins: &InsertStmt) -> Vec<(usize, &str)> {
+    ins.columns
+        .iter()
+        .zip(ins.values.iter())
+        .filter_map(|(col, sv)| scalar_param_index(sv).map(|n| (n, col.as_str())))
+        .collect()
+}
+
+/// `(placeholder index, target column name)` pairs for an `UPDATE`: SET and
+/// WHERE `$N`s are bound to the column on the left of each `=`.
+fn update_param_targets(upd: &UpdateStmt) -> Vec<(usize, &str)> {
+    upd.assignments
+        .iter()
+        .chain(upd.where_eq.iter())
+        .filter_map(|(col, sv)| scalar_param_index(sv).map(|n| (n, col.as_str())))
+        .collect()
+}
+
+/// `(placeholder index, target column name)` pairs for a `DELETE` WHERE.
+fn delete_param_targets(del: &DeleteStmt) -> Vec<(usize, &str)> {
+    del.where_eq
+        .iter()
+        .filter_map(|(col, sv)| scalar_param_index(sv).map(|n| (n, col.as_str())))
+        .collect()
+}
+
+/// Infer the parameter type OIDs for a parameterized DML statement by resolving
+/// each `$N` against its TARGET COLUMN's type in the table schema. This lets a
+/// driver (tokio-postgres) serialize bound values with a concrete type instead
+/// of probing the catalog for an unspecified (`0`) OID. The client-declared OID
+/// wins where it is non-zero; otherwise the column's type drives it; a target we
+/// cannot resolve falls back to `0` (lenient). FAILS LOUD on a non-dense `$1..$N`
+/// placeholder set (via [`dml_param_oids`]).
+///
+/// `targets` maps each present placeholder to its column name; `meta` is the
+/// table metadata; `declared` the client-declared OIDs from Parse.
+fn infer_dml_param_oids(
+    targets: &[(usize, &str)],
+    meta: &ferrosa_schema::TableMetadata,
+    schema: &Schema,
+    ks: &str,
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let placeholders: Vec<usize> = targets.iter().map(|(n, _)| *n).collect();
+    // Validate density + length and seed with declared/0 first.
+    let mut oids = dml_param_oids(&placeholders, declared)?;
+    // Then refine each `0` (unspecified) slot from its target column's type.
+    for (n, col_name) in targets {
+        let idx = n - 1;
+        if oids.get(idx).copied() != Some(0) {
+            continue; // a non-zero client-declared OID already won
+        }
+        if let Some(col_meta) = meta.columns.get(*col_name) {
+            if let Ok(cql_type) =
+                ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            {
+                oids[idx] = column_type_oid(cql_type_to_column_type(&cql_type));
+            }
+        }
+    }
+    Ok(oids)
+}
+
+/// Resolve a DML statement's table metadata for parameter inference, or a
+/// fail-loud `42P01` if the table does not exist. Returns the OIDs inferred from
+/// each `$N`'s target column.
+pub(crate) fn infer_insert_param_oids(
+    schema: &Schema,
+    ins: &InsertStmt,
+    default_schema: &str,
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let Some(meta) = snap.tables.get(&(ks.to_string(), ins.table.table.clone())) else {
+        // Defer the table-existence error to Describe/Execute; here just fall
+        // back to declared/0 OIDs so the count is still correct.
+        return dml_param_oids(&insert_placeholders(ins), declared);
+    };
+    infer_dml_param_oids(&insert_param_targets(ins), meta, schema, ks, declared)
+}
+
+/// As [`infer_insert_param_oids`] for an `UPDATE`.
+pub(crate) fn infer_update_param_oids(
+    schema: &Schema,
+    upd: &UpdateStmt,
+    default_schema: &str,
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let ks = upd.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let Some(meta) = snap.tables.get(&(ks.to_string(), upd.table.table.clone())) else {
+        return dml_param_oids(&update_placeholders(upd), declared);
+    };
+    infer_dml_param_oids(&update_param_targets(upd), meta, schema, ks, declared)
+}
+
+/// As [`infer_insert_param_oids`] for a `DELETE`.
+pub(crate) fn infer_delete_param_oids(
+    schema: &Schema,
+    del: &DeleteStmt,
+    default_schema: &str,
+    declared: &[i32],
+) -> Result<Vec<i32>, BackendMessage> {
+    let ks = del.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let Some(meta) = snap.tables.get(&(ks.to_string(), del.table.table.clone())) else {
+        return dml_param_oids(&delete_placeholders(del), declared);
+    };
+    infer_dml_param_oids(&delete_param_targets(del), meta, schema, ks, declared)
+}
+
+/// Resolve the output columns of an `INSERT ... RETURNING` for the extended
+/// `Describe('S')` reply (a `RowDescription`). Returns `Ok(None)` when the
+/// statement has no `RETURNING` (the caller emits `NoData`), or the resolved
+/// column descriptors. Fails loud on an unknown table (`42P01`) or an unknown
+/// RETURNING column (`42703`) — the same errors Execute would raise, surfaced at
+/// Describe time so the driver learns the shape before binding.
+pub(crate) fn describe_insert_returning(
+    schema: &Schema,
+    ins: &InsertStmt,
+    default_schema: &str,
+) -> Result<Option<Vec<Column>>, BackendMessage> {
+    let Some(returning) = ins.returning.as_ref() else {
+        return Ok(None);
+    };
+    let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
+    let snap = schema.snapshot();
+    let meta = snap
+        .tables
+        .get(&(ks.to_string(), ins.table.table.clone()))
+        .ok_or_else(|| {
+            error_response(
+                "42P01",
+                &format!("relation \"{ks}.{}\" does not exist", ins.table.table),
+            )
+        })?;
+    let names: Vec<String> = match returning {
+        Returning::Star => meta.columns.keys().cloned().collect(),
+        Returning::Columns(cols) => cols.clone(),
+    };
+    let mut columns = Vec::with_capacity(names.len());
+    for name in &names {
+        let col_meta = meta.columns.get(name).ok_or_else(|| {
+            error_response(
+                "42703",
+                &format!(
+                    "column \"{name}\" of relation \"{}\" does not exist in RETURNING",
+                    ins.table.table
+                ),
+            )
+        })?;
+        let cql_type =
+            ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+                .map_err(|e| error_response("42704", &e.to_string()))?;
+        columns.push(Column::new(
+            name.clone(),
+            cql_type_to_column_type(&cql_type),
+        ));
+    }
+    Ok(Some(columns))
+}
+
+/// Map a [`CqlType`] to the relational [`ColumnType`] used for the Postgres
+/// RowDescription OID/size. Mirrors `storage_provider`'s column typing; unmapped
+/// CQL types default to `Text` (their text rendering is always valid).
+fn cql_type_to_column_type(ty: &CqlType) -> ColumnType {
+    match ty {
+        CqlType::Int
+        | CqlType::Smallint
+        | CqlType::Tinyint
+        | CqlType::Bigint
+        | CqlType::Counter => ColumnType::Int,
+        CqlType::Boolean => ColumnType::Bool,
+        CqlType::Float | CqlType::Double => ColumnType::Float,
+        CqlType::Uuid | CqlType::Timeuuid => ColumnType::Uuid,
+        CqlType::Blob => ColumnType::Bytea,
+        CqlType::Timestamp => ColumnType::Timestamp,
+        CqlType::Date => ColumnType::Date,
+        CqlType::Time => ColumnType::Time,
+        CqlType::Inet => ColumnType::Inet,
+        CqlType::Decimal | CqlType::Varint => ColumnType::Numeric,
+        _ => ColumnType::Text,
+    }
+}
+
+/// Render a DML `RETURNING` result into backend messages: an optional leading
+/// `RowDescription` (simple path), the `DataRow`(s) encoded per `result_formats`
+/// (the Postgres fan-out rule — empty ⇒ all text), then `CommandComplete` with
+/// the supplied `tag`. The extended Execute path passes `with_row_description =
+/// false` (the client learned the columns from `Describe`) AND the portal's
+/// chosen result formats, so a driver requesting binary results (tokio-postgres)
+/// decodes the RETURNING row correctly.
+fn render_dml_returning(
+    result: QueryResult,
+    with_row_description: bool,
+    result_formats: &[i16],
+    tag: String,
+) -> Vec<BackendMessage> {
+    let mut out = Vec::with_capacity(result.rows.len() + 2);
+    if with_row_description {
+        out.push(BackendMessage::RowDescription {
+            fields: row_description_fields(&result.columns, result_formats),
+        });
+    }
+    let col_types: Vec<ColumnType> = result.columns.iter().map(|c| c.ty).collect();
+    for row in &result.rows {
+        let columns = row
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, v)| encode_value(result_format_for(result_formats, i), col_types[i], v))
+            .collect();
+        out.push(BackendMessage::DataRow { columns });
+    }
+    out.push(BackendMessage::CommandComplete { tag });
+    out
 }
 
 /// Resolve a `(column, value)` pair from a DML statement to its `CqlValue`,
-/// looking up the column's CQL type from `meta`. Returns the column metadata
-/// alongside so the caller can classify it (key vs regular). `$N`/function
-/// values fail loud (extended-protocol / unsupported).
+/// substituting any bound `$N` parameter from `params` first (see
+/// [`substitute_param`]), then looking up the column's CQL type from `meta`.
+/// Returns the column metadata alongside so the caller can classify it (key vs
+/// regular), and the resolved [`SqlValue`] so the caller can build a `RETURNING`
+/// row without re-reading storage. A simple-protocol caller passes `&[]`, so a
+/// `$N` there fails loud (no value bound).
 fn resolve_dml_value<'a>(
     meta: &'a ferrosa_schema::TableMetadata,
     schema: &Schema,
@@ -968,7 +1384,8 @@ fn resolve_dml_value<'a>(
     table: &str,
     col_name: &str,
     sv: &ScalarValue,
-) -> Result<(&'a ferrosa_schema::ColumnMetadata, CqlValue), BackendMessage> {
+    params: &[SqlValue],
+) -> Result<(&'a ferrosa_schema::ColumnMetadata, SqlValue, CqlValue), BackendMessage> {
     let col_meta = meta.columns.get(col_name).ok_or_else(|| {
         error_response(
             "42703",
@@ -978,22 +1395,9 @@ fn resolve_dml_value<'a>(
     let cql_type =
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
-    let value = match sv {
-        ScalarValue::Literal(v) => value_to_cql(v, &cql_type)?,
-        ScalarValue::Param(_) => {
-            return Err(error_response(
-                "0A000",
-                "$N parameters require the extended-query protocol (not yet supported)",
-            ))
-        }
-        ScalarValue::Func(_) => {
-            return Err(error_response(
-                "0A000",
-                "function calls in DML values are not supported",
-            ))
-        }
-    };
-    Ok((col_meta, value))
+    let sql_value = substitute_param(sv, params)?;
+    let value = value_to_cql(&sql_value, &cql_type)?;
+    Ok((col_meta, sql_value, value))
 }
 
 /// Execute a single-row `UPDATE`: a Cassandra-style upsert. The equality `WHERE`
@@ -1001,14 +1405,24 @@ fn resolve_dml_value<'a>(
 /// regular/static cells. Returns `CommandComplete "UPDATE 1"` — the engine write
 /// is a blind upsert, so the affected-row count is reported as 1 when the write
 /// lands (Cassandra has no match count; this is the documented semantic).
-fn execute_update(
+pub(crate) fn execute_update(
     engine: &StorageEngine,
     schema: &Schema,
     upd: &UpdateStmt,
     default_schema: &str,
+    params: &[SqlValue],
     txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
+
+    // UPDATE ... RETURNING is out of scope for this PR (only INSERT RETURNING is
+    // wired). Fail loud rather than silently dropping the clause.
+    if upd.returning.is_some() {
+        return vec![error_response(
+            "0A000",
+            "UPDATE ... RETURNING is not yet supported",
+        )];
+    }
 
     let ks = upd.table.schema.as_deref().unwrap_or(default_schema);
     let table = upd.table.table.as_str();
@@ -1026,10 +1440,11 @@ fn execute_update(
     // SET assignments -> regular/static cells (by storage index).
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
     for (col_name, sv) in &upd.assignments {
-        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
-            Ok(r) => r,
-            Err(msg) => return vec![msg],
-        };
+        let (col_meta, _sql_value, value) =
+            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
+                Ok(r) => r,
+                Err(msg) => return vec![msg],
+            };
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return vec![error_response(
                 "0A000",
@@ -1050,10 +1465,11 @@ fn execute_update(
     // WHERE equality -> key values (must be key columns).
     let mut key_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &upd.where_eq {
-        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
-            Ok(r) => r,
-            Err(msg) => return vec![msg],
-        };
+        let (col_meta, _sql_value, value) =
+            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
+                Ok(r) => r,
+                Err(msg) => return vec![msg],
+            };
         if !matches!(
             col_meta.kind,
             ColumnKind::PartitionKey | ColumnKind::Clustering
@@ -1114,14 +1530,23 @@ fn execute_update(
 /// supplies the full primary key identifying the row. Returns `CommandComplete
 /// "DELETE 1"` — the engine writes a tombstone unconditionally, so the count is
 /// reported as 1 when the write lands (Cassandra has no match count).
-fn execute_delete(
+pub(crate) fn execute_delete(
     engine: &StorageEngine,
     schema: &Schema,
     del: &DeleteStmt,
     default_schema: &str,
+    params: &[SqlValue],
     txn: Option<&mut Vec<ferrosa_storage::accord::TransactionWrite>>,
 ) -> Vec<BackendMessage> {
     use std::collections::HashMap;
+
+    // DELETE ... RETURNING is out of scope for this PR. Fail loud.
+    if del.returning.is_some() {
+        return vec![error_response(
+            "0A000",
+            "DELETE ... RETURNING is not yet supported",
+        )];
+    }
 
     let ks = del.table.schema.as_deref().unwrap_or(default_schema);
     let table = del.table.table.as_str();
@@ -1138,10 +1563,11 @@ fn execute_delete(
 
     let mut key_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &del.where_eq {
-        let (col_meta, value) = match resolve_dml_value(meta, schema, ks, table, col_name, sv) {
-            Ok(r) => r,
-            Err(msg) => return vec![msg],
-        };
+        let (col_meta, _sql_value, value) =
+            match resolve_dml_value(meta, schema, ks, table, col_name, sv, params) {
+                Ok(r) => r,
+                Err(msg) => return vec![msg],
+            };
         if !matches!(
             col_meta.kind,
             ColumnKind::PartitionKey | ColumnKind::Clustering

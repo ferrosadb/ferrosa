@@ -4,7 +4,8 @@ use std::fmt;
 
 use crate::ast::{
     AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, Join, Operand, OrderItem, Projection,
-    ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term, UpdateStmt,
+    Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term,
+    UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -598,6 +599,11 @@ impl Parser {
             values.push(self.parse_scalar_value()?);
         }
         self.expect(&Tok::RParen, ")")?;
+
+        // ON CONFLICT is recognized to fail loud (out of scope), never silently
+        // ignored — a client that relies on upsert semantics must learn it.
+        self.reject_on_conflict()?;
+        let returning = self.parse_returning()?;
         self.expect_end()?;
 
         if columns.len() != values.len() {
@@ -610,6 +616,7 @@ impl Parser {
             table,
             columns,
             values,
+            returning,
         })))
     }
 
@@ -633,12 +640,14 @@ impl Parser {
             self.next();
             where_eq.push(self.parse_assignment()?);
         }
+        let returning = self.parse_returning()?;
         self.expect_end()?;
 
         Ok(Statement::Update(Box::new(UpdateStmt {
             table,
             assignments,
             where_eq,
+            returning,
         })))
     }
 
@@ -655,9 +664,52 @@ impl Parser {
             self.next();
             where_eq.push(self.parse_assignment()?);
         }
+        let returning = self.parse_returning()?;
         self.expect_end()?;
 
-        Ok(Statement::Delete(Box::new(DeleteStmt { table, where_eq })))
+        Ok(Statement::Delete(Box::new(DeleteStmt {
+            table,
+            where_eq,
+            returning,
+        })))
+    }
+
+    /// Parse an optional `RETURNING * | col, col, ...` clause. Returns `None`
+    /// when the next token is not the `RETURNING` keyword (it is lexed as a bare
+    /// identifier). `RETURNING *` yields [`Returning::Star`].
+    fn parse_returning(&mut self) -> Result<Option<Returning>, ParseError> {
+        match self.peek() {
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("RETURNING") => {
+                self.next(); // RETURNING
+            }
+            _ => return Ok(None),
+        }
+        if matches!(self.peek(), Some(Tok::Star)) {
+            self.next();
+            return Ok(Some(Returning::Star));
+        }
+        let mut cols = vec![self.ident()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            cols.push(self.ident()?);
+        }
+        Ok(Some(Returning::Columns(cols)))
+    }
+
+    /// Fail loud on an `ON CONFLICT` clause: upsert/`DO` semantics are out of
+    /// scope, and silently dropping the clause would change the statement's
+    /// meaning. A bare `ON` not followed by `CONFLICT` is left for the caller's
+    /// `expect_end`/`parse_returning` to reject in context.
+    fn reject_on_conflict(&mut self) -> Result<(), ParseError> {
+        if matches!(self.peek(), Some(Tok::On))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CONFLICT"))
+        {
+            return Err(ParseError::Unexpected {
+                expected: "no ON CONFLICT (not yet supported)",
+                found: "ON CONFLICT".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Parse `[schema.]table` with NO trailing alias — for DML targets, where a
@@ -1726,6 +1778,81 @@ mod tests {
             }
             other => panic!("expected Delete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_statement_insert_returning_columns() {
+        let stmt =
+            parse_statement("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, v").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(
+                    ins.values,
+                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                );
+                assert_eq!(
+                    ins.returning,
+                    Some(Returning::Columns(vec!["id".to_string(), "v".to_string()]))
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_returning_star() {
+        let stmt = parse_statement("INSERT INTO t (id) VALUES (1) RETURNING *").unwrap();
+        match stmt {
+            Statement::Insert(ins) => assert_eq!(ins.returning, Some(Returning::Star)),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_no_returning_is_none() {
+        let stmt = parse_statement("INSERT INTO t (id) VALUES (1)").unwrap();
+        match stmt {
+            Statement::Insert(ins) => assert_eq!(ins.returning, None),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_update_delete_returning() {
+        let upd = parse_statement("UPDATE t SET v = $1 WHERE id = $2 RETURNING id").unwrap();
+        match upd {
+            Statement::Update(u) => {
+                assert_eq!(
+                    u.assignments,
+                    vec![("v".to_string(), ScalarValue::Param(1))]
+                );
+                assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
+                assert_eq!(
+                    u.returning,
+                    Some(Returning::Columns(vec!["id".to_string()]))
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+        let del = parse_statement("DELETE FROM t WHERE id = $1 RETURNING *").unwrap();
+        match del {
+            Statement::Delete(d) => {
+                assert_eq!(d.where_eq, vec![("id".to_string(), ScalarValue::Param(1))]);
+                assert_eq!(d.returning, Some(Returning::Star));
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_on_conflict_is_clear_error() {
+        let err = parse_statement("INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING")
+            .expect_err("ON CONFLICT must be rejected, not silently ignored");
+        // The error message names ON CONFLICT so the boundary is explicit.
+        assert!(
+            err.to_string().contains("ON CONFLICT"),
+            "error should mention ON CONFLICT, got: {err}"
+        );
     }
 
     #[test]

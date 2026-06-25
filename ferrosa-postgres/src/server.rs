@@ -443,6 +443,68 @@ async fn describe(
                         Err(err) => vec![session.fail(err)],
                     }
                 }
+                // Parameterized DML: advertise one OID per `$N` placeholder so a
+                // driver that does NOT pre-declare OIDs (tokio-postgres) learns
+                // the count. Each OID is the client-declared type where given,
+                // else `0` (unspecified ⇒ lenient Bind decode). We persist these
+                // so the subsequent Bind decodes against the same OIDs. The
+                // result shape is a RowDescription for INSERT RETURNING, else
+                // NoData (UPDATE/DELETE never return rows here).
+                PreparedKind::Insert(ins) => {
+                    let param_oids = match query::infer_insert_param_oids(
+                        &ctx.schema,
+                        &ins,
+                        &ctx.default_schema,
+                        &declared,
+                    ) {
+                        Ok(oids) => oids,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    session.set_param_oids(name, param_oids.clone());
+                    match query::describe_insert_returning(&ctx.schema, &ins, &ctx.default_schema) {
+                        Ok(Some(columns)) => vec![
+                            extended::parameter_description(&param_oids),
+                            extended::describe_statement_rows(&columns),
+                        ],
+                        Ok(None) => vec![
+                            extended::parameter_description(&param_oids),
+                            BackendMessage::NoData,
+                        ],
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
+                PreparedKind::Update(upd) => {
+                    let param_oids = match query::infer_update_param_oids(
+                        &ctx.schema,
+                        &upd,
+                        &ctx.default_schema,
+                        &declared,
+                    ) {
+                        Ok(oids) => oids,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    session.set_param_oids(name, param_oids.clone());
+                    vec![
+                        extended::parameter_description(&param_oids),
+                        BackendMessage::NoData,
+                    ]
+                }
+                PreparedKind::Delete(del) => {
+                    let param_oids = match query::infer_delete_param_oids(
+                        &ctx.schema,
+                        &del,
+                        &ctx.default_schema,
+                        &declared,
+                    ) {
+                        Ok(oids) => oids,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    session.set_param_oids(name, param_oids.clone());
+                    vec![
+                        extended::parameter_description(&param_oids),
+                        BackendMessage::NoData,
+                    ]
+                }
             }
         }
         b'P' => {
@@ -480,6 +542,20 @@ async fn describe(
                         }
                         Err(err) => vec![session.fail(err)],
                     }
+                }
+                // DML portal: a RowDescription for INSERT RETURNING (under the
+                // portal's result formats), else NoData. UPDATE/DELETE: NoData.
+                PreparedKind::Insert(ins) => {
+                    match query::describe_insert_returning(&ctx.schema, &ins, &ctx.default_schema) {
+                        Ok(Some(columns)) => {
+                            vec![extended::describe_portal_rows(&columns, &result_formats)]
+                        }
+                        Ok(None) => vec![BackendMessage::NoData],
+                        Err(err) => vec![session.fail(err)],
+                    }
+                }
+                PreparedKind::Update(_) | PreparedKind::Delete(_) => {
+                    vec![BackendMessage::NoData]
                 }
             }
         }
@@ -592,7 +668,107 @@ async fn execute_portal(
                 Err(msg) => vec![session.fail(msg)],
             }
         }
+        // Parameterized DML over the extended protocol. The bound params drive
+        // `$N` substitution; the Execute path omits the leading RowDescription
+        // for INSERT RETURNING (the client learned columns from Describe). In an
+        // open transaction the write is BUFFERED into the session write-set
+        // (`Some(txn_writes_mut())`) and committed atomically via Accord at
+        // COMMIT; autocommit (no open txn) applies immediately. A failed DML
+        // poisons the transaction (`execute_dml`).
+        PreparedKind::Insert(ins) => {
+            // Extended Execute: no leading RowDescription for RETURNING (sent at
+            // Describe time); rows honor the portal's result formats.
+            let returning_opts = query::ReturningOpts {
+                with_row_description: false,
+                result_formats: &result_formats,
+            };
+            let in_txn = session.in_txn();
+            let msgs = if in_txn {
+                query::execute_insert(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &ins,
+                    &ctx.default_schema,
+                    &params,
+                    returning_opts,
+                    Some(session.txn_writes_mut()),
+                )
+            } else {
+                query::execute_insert(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &ins,
+                    &ctx.default_schema,
+                    &params,
+                    returning_opts,
+                    None,
+                )
+            };
+            execute_dml(session, msgs)
+        }
+        PreparedKind::Update(upd) => {
+            let in_txn = session.in_txn();
+            let msgs = if in_txn {
+                query::execute_update(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &upd,
+                    &ctx.default_schema,
+                    &params,
+                    Some(session.txn_writes_mut()),
+                )
+            } else {
+                query::execute_update(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &upd,
+                    &ctx.default_schema,
+                    &params,
+                    None,
+                )
+            };
+            execute_dml(session, msgs)
+        }
+        PreparedKind::Delete(del) => {
+            let in_txn = session.in_txn();
+            let msgs = if in_txn {
+                query::execute_delete(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &del,
+                    &ctx.default_schema,
+                    &params,
+                    Some(session.txn_writes_mut()),
+                )
+            } else {
+                query::execute_delete(
+                    &ctx.engine,
+                    &ctx.schema,
+                    &del,
+                    &ctx.default_schema,
+                    &params,
+                    None,
+                )
+            };
+            execute_dml(session, msgs)
+        }
     }
+}
+
+/// Post-process a DML executor's messages for the extended Execute path: if it
+/// produced an `ErrorResponse`, set the skip-until-Sync flag AND poison the
+/// transaction (so a failed statement inside a `BEGIN` block can never be
+/// committed — the same fail-loud rule the simple-query path applies). Returns
+/// the messages unchanged.
+fn execute_dml(session: &mut Session, msgs: Vec<BackendMessage>) -> Vec<BackendMessage> {
+    if msgs
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        session.mark_error();
+        session.mark_txn_failed();
+    }
+    msgs
 }
 
 /// SQLSTATE for a codec-level framing error (always a protocol violation).

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-06-25
 ---
 
 # ferrosa-postgres — Roadmap
@@ -11,23 +11,37 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 `FIXME` markers in the source — the open work is encoded as fail-loud
 `feature_not_supported` paths and documented lossy fallbacks instead.
 
+## Done (recent)
+
+- **Accord-backed transaction atomicity** (FMEA PG-1, #206). DML in a `T` block
+  buffers as a `TransactionWrite` (`apply_or_buffer`) — over BOTH the simple and
+  extended protocols — and `COMMIT` drives the write-set through the injected
+  `TransactionCommitter` atomically (`commit_txn`); `ROLLBACK` discards the buffer
+  (never applied). No committer (standalone) ⇒ COMMIT of a non-empty buffer fails
+  loud; empty buffer commits cleanly. Mirrors the CQL `CqlTransaction` path.
+- **Parameterized DML** (was FMEA PG-2, `feat/pg-extended-crud`).
+  `INSERT`/`UPDATE`/`DELETE` accept bound `$N` parameters over the extended
+  protocol: prepared as `PreparedKind::{Insert,Update,Delete}`, substituted at
+  `Execute` via `substitute_param` (fail-loud `08P01` on an unbound `$N`), with
+  param OIDs inferred from each placeholder's target column. Transactional
+  parameterized DML buffers into the same session write-set.
+- **`INSERT … RETURNING col,…`/`*`** (part of FMEA PG-3, `feat/pg-extended-crud`).
+  Echoes the just-written values as a `DataRow` (built in-memory, no storage
+  read-back) — the `Ecto.Repo.insert` generated-key path; works inside a
+  transaction (rows returned now, write commits at COMMIT).
+
 ## Now (highest value)
 
-- ~~**Accord-backed transaction atomicity** (FMEA PG-1)~~ **DONE.** DML in a
-  `T` block buffers as a `TransactionWrite` (`apply_or_buffer`) and `COMMIT`
-  drives the write-set through the injected `TransactionCommitter` atomically
-  (`commit_txn`); `ROLLBACK` discards the buffer (never applied). No committer
-  (standalone) ⇒ COMMIT of a non-empty buffer fails loud; empty buffer commits
-  cleanly. Mirrors the CQL `CqlTransaction` path. *Residual (future):* true
-  snapshot isolation / read-your-writes inside the open block — buffered writes
-  are not visible to reads in the same transaction yet.
-- **`$N` parameters in DML** (FMEA PG-2). Extend the extended-protocol path so
-  `INSERT`/`UPDATE`/`DELETE` accept bound parameters (today literal-only,
-  `0A000`). Reuse `decode_param` + the existing `$N` inference.
+- **Read-your-writes inside an open transaction** (FMEA PG-1 residual). Buffered
+  writes are not yet visible to reads in the same transaction; wire the buffer
+  into the in-transaction read path (or document the snapshot-isolation gap).
 
 ## Next
 
-- **`RETURNING` and `ON CONFLICT`** (FMEA PG-3) — the common ORM insert idioms.
+- **`UPDATE`/`DELETE … RETURNING`** (FMEA PG-3) — today fail loud `0A000`; only
+  `INSERT … RETURNING` is wired.
+- **`ON CONFLICT` (upsert)** — today a parse error; the common ORM upsert idiom.
+- **`= ANY($N)` / IN-list parameter expansion** — Ecto `where: x in ^ids`.
 - **Multi-row `INSERT ... VALUES`** and richer `UPDATE`/`DELETE` `WHERE`
   (range/non-key predicates), which today are restricted to single-row, full-PK
   equality.
