@@ -684,9 +684,92 @@ pub async fn start_graph_http(
     Ok(())
 }
 
+/// The body returned by the disabled-engine stub for every request.
+fn graph_disabled_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "graph engine disabled",
+            "remediation": "the graph engine is not enabled on this node; set [graph] enabled = true \
+                            (or FERROSA_GRAPH_ENABLED=true) and restart to enable graph queries",
+        })),
+    )
+        .into_response()
+}
+
+/// Fallback handler: every path on the disabled stub returns the clear error.
+async fn graph_disabled_handler() -> Response {
+    graph_disabled_response()
+}
+
+/// Build the disabled-engine router — a clear `503 graph engine disabled` for
+/// every route (t_2dd438d2). Without this the graph ports simply don't listen
+/// when the engine is disabled, so clients (e.g. ferrosa-memory) get an opaque
+/// connection-refused instead of an actionable error.
+pub fn build_disabled_router() -> Router {
+    Router::new().fallback(graph_disabled_handler)
+}
+
+/// Start a thin HTTP listener that responds to every request with a clear
+/// "graph engine disabled" error + remediation, used when the graph engine is
+/// not enabled. Mirrors [`start_graph_http`]'s plain-HTTP bind.
+pub async fn start_graph_disabled_http(config: &GraphHttpConfig) -> crate::error::Result<()> {
+    let app =
+        build_disabled_router().layer(RequestBodyLimitLayer::new(config.max_request_body_bytes));
+    let listener = tokio::net::TcpListener::bind(config.bind_addr)
+        .await
+        .map_err(|e| GraphError::Internal(format!("bind error: {e}")))?;
+    tracing::info!(
+        addr = %config.bind_addr,
+        "graph engine disabled — serving disabled-engine responses on the graph HTTP port"
+    );
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| GraphError::Internal(format!("HTTP server error: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disabled_router_returns_clear_error_for_all_routes() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // t_2dd438d2: every path on the disabled stub must return a clear,
+        // actionable error — not connection-refused, and not a misleading
+        // missing-table error.
+        let app = build_disabled_router();
+        for path in [
+            "/graph/query",
+            "/graph/schema",
+            "/graph/health",
+            "/anything",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} should report the engine disabled"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let s = String::from_utf8_lossy(&body);
+            assert!(s.contains("graph engine disabled"), "{path}: {s}");
+            assert!(
+                s.contains("enabled = true"),
+                "{path} must include remediation: {s}"
+            );
+        }
+    }
 
     #[test]
     fn default_config() {
