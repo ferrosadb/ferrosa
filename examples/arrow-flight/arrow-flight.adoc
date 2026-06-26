@@ -63,12 +63,12 @@ For *streaming* changes rather than point-in-time reads, use CQL `SUBSCRIBE` via
 include::flight_demo.py[lines=39..72]
 ----
 
-Running it against the seeded `schema.cql` prints the two sensor rows read back over Arrow:
+Running it against the seeded `schema.cql` prints the three sensor rows read back over Arrow:
 
 ----
 [flight] authenticated, token 109 bytes
 [flight] GetFlightInfo: 1 endpoint(s), columns ['sensor_id', 'ts', 'temperature', 'humidity']
-[flight] read 2 rows over Arrow Flight
+[flight] read 3 rows over Arrow Flight
 ----
 
 NOTE: Wiring `flight_demo.py` into CI (a job that boots a `flight`-enabled server and runs it, alongside the existing "Example CQL Scripts" job which already runs `schema.cql`) is tracked in forge `t_0c1f92ee`.

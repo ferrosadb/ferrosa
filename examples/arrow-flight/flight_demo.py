@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Runnable Arrow Flight client for ferrosa — handshake, GetFlightInfo, DoGet, DoPut.
+"""Runnable Arrow Flight client for ferrosa — handshake, GetFlightInfo, DoGet.
 
-Verified live against a `flight`-enabled ferrosa (gRPC on 127.0.0.1:18815, CQL on
-19142, auth cassandra/cassandra). Run `schema.cql` over CQL first to create
-flight_demo.sensor_readings.
+Run `schema.cql` over CQL first to create flight_demo.sensor_readings.
 
     pip install pyarrow
     python flight_demo.py            # defaults below
+    python flight_demo.py --flight grpc://127.0.0.1:18815  # mapped test port
 
 ferrosa's Flight handshake is intentionally simple and NOT pyarrow's basic-token
 flow: the client sends one HandshakeRequest whose payload is `username\\0password`
@@ -37,7 +36,7 @@ class _Handshake(flight.ClientAuthHandler):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--flight", default="grpc://127.0.0.1:18815")
+    ap.add_argument("--flight", default="grpc://127.0.0.1:8815")
     ap.add_argument("--user", default="cassandra")
     ap.add_argument("--password", default="cassandra")
     ap.add_argument("--keyspace", default="flight_demo")
