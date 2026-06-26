@@ -1,0 +1,125 @@
+# ferrosa-graph
+
+> The property-graph query engine for ferrosa: a Cypher endpoint over data
+> stored in ordinary CQL tables, kept traversable by a system-managed
+> adjacency index.
+
+## What this crate is
+
+`ferrosa-graph` lets a ferrosa keyspace be queried as a property graph without
+a separate graph store. Vertices and edges live in **regular CQL tables** tagged
+with `extensions["graph.type"] = "vertex" | "edge"` (plus `graph.label`,
+`graph.source`, `graph.target`). Topology is made traversable by a
+**per-keyspace adjacency index** — a system table `system_graph_<ks>.adjacency`
+that the engine creates lazily and keeps consistent with the edge tables.
+
+The crate parses Cypher, validates + authorizes it against the schema, plans it
+into a physical traversal plan, and executes that plan against the storage
+engine through the cluster write path. It exposes the same query surface over
+three transports: an **HTTP/JSON** endpoint (port 7474), the **Bolt v5** wire
+protocol (port 7687, Neo4j-driver compatible), and direct in-process calls from
+the `ferrosa` binary.
+
+## What's implemented
+
+- **Cypher parser** — lexer + recursive-descent parser (`parser/`) covering
+  `MATCH` / `OPTIONAL MATCH`, `WHERE`, `WITH` pipelines, `RETURN` (DISTINCT,
+  `ORDER BY`, `LIMIT`), `CREATE` / `SET` / `REMOVE` / `DELETE` / `DETACH DELETE`,
+  `MERGE`, `UNWIND`, `UNION [ALL]`, `FOREACH`, correlated `CALL {}` subqueries,
+  `SUBSCRIBE` / `UNSUBSCRIBE`, variable-length paths `[*min..max]`, pattern
+  predicates/comprehensions, list comprehensions, and map projections.
+- **Logical planner** (`planner/logical.rs`) — resolves Cypher labels to tables
+  via `graph.label` extensions (case-insensitive), validates property refs, and
+  performs **per-statement authorization** (`check_permission`: `Select` for
+  reads, `Modify` for writes) against the `AuthContext` (threat T3).
+- **Physical planner** (`planner/physical.rs`) — anchor selection + `Expand` /
+  `ExpandVarLength` / `Create` / `Merge` / `Subscribe` / `Union` plans.
+- **Expand executor** (`executor/expand.rs`) — anchor lookup, per-hop adjacency
+  reads, property evaluation, aggregation, write clauses; honors DoS limits
+  (`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`).
+- **Variable-length paths** (`executor/varpath.rs`, `leapfrog.rs`) — BFS over
+  `min..=max` hops with a visited set for cycle detection and a
+  `max_var_path_visited` vertex budget (threat T13).
+- **Aggregations** (`executor/aggregate.rs`) — `count`, `sum`, `avg`, `min`,
+  `max`, `collect`, with `max_groups` / `max_collect_size` caps.
+- **Adjacency index** (`adjacency/`) — `schema` (table layout + naming),
+  `observer` (synchronous index maintenance), `reconcile` (background safety net).
+- **SUBSCRIBE** (`executor/subscribe.rs`) — per-connection subscription registry
+  with a tunable per-connection cap (`FERROSA_GRAPH_MAX_SUBSCRIPTIONS`, default 8).
+- **Transports** — `http.rs` (axum, Basic auth, TLS, body-size limit, SSE for
+  SUBSCRIBE) and `bolt/` (Bolt v5 handshake, PackStream codec, message dispatch).
+- **Cluster-aware DDL** — adjacency keyspace/table creation routes through the
+  same `DdlPath` regular CQL `CREATE TABLE` uses, so every replica registers the
+  system table (`ClusterGraphSchemaCoordinator`); a local coordinator is the
+  single-node default.
+
+## How it works
+
+A query flows: **parse → bind params → validate + authorize → logical plan →
+physical plan → execute**. On the first query in a keyspace that touches edges,
+`ensure_adjacency_storage_for_keyspace` lazily creates
+`system_graph_<ks>.adjacency`, registers the `AdjacencyIndexObserver`, runs one
+synchronous reconcile pass, and (if configured) starts the background
+reconciliation loop.
+
+The **adjacency-consistency invariant** is the heart of the crate: every edge
+write must produce the matching OUT and IN adjacency entries. This is enforced
+**synchronously** — `AdjacencyIndexObserver` is a `WriteObserver` running in
+`ObserverMode::Sync`, so its derived adjacency mutations are applied in the same
+write as the edge row, not asynchronously. The background **reconciler** is the
+explicit, observable fallback: it scans edge tables to repair missing entries
+and scans the adjacency index to tombstone orphans, covering dropped-mutation
+and crash-recovery gaps. See [specs/data-flow.md](specs/data-flow.md).
+
+## Public API (key entry points)
+
+| Area | Item |
+|------|------|
+| Engine | `GraphEngine::new` / `new_with_coordinator`, `execute[_with_params]`, `explain`, `execute_subscribe`, `graph_schema`, `shutdown` |
+| Config | `GraphConfig`, `GraphEngineConfig` (DoS limits), `GraphHttpConfig`, `BoltConfig` |
+| DDL routing | `GraphSchemaCoordinator` (+ `Local` / `Cluster` impls) |
+| Adjacency | `adjacency_keyspace_name`, `adjacency_table_metadata`, `AdjacencyIndexObserver`, `reconcile_once`, `spawn_reconciliation` |
+| HTTP | `http::router`, `GraphHttpConfig` |
+| Bolt | `bolt::server::start_bolt_server`, `BoltConfig` |
+| Errors | `GraphError`, `Result` |
+
+## Dependencies
+
+**Calls** (ferrosa crates this depends on):
+
+- **`ferrosa-cluster`** — `WritePath` (read/range_read/write), `DdlPath` +
+  `DdlOperation` for replicated adjacency DDL, `ConsistencyLevel`,
+  `ReplicationStrategy`, `ClusterError`.
+- **`ferrosa-common`** — `DecoratedKey`, `PartitionKey`, `CellValue`, `Error`.
+- **`ferrosa-net`** — internode protocol types (`PeerManager`, `RpcServer`,
+  `Message`). **Used only by the integration test harness**
+  (`tests/graph_http_integration.rs`); it is a `[dev-dependencies]` entry, not a
+  production code path of this crate.
+- **`ferrosa-schema`** — `Schema`, `SchemaSnapshot`, `TableMetadata`,
+  `AuthContext`, `check_permission`, `VirtualTableRegistry`.
+- **`ferrosa-sstable`** — `Partition`, `Row`, `CellValue`, `LivenessInfo`,
+  `DeletionTime` (the storage row shapes it reads and builds).
+- **`ferrosa-storage`** — `StorageEngine`, `Mutation`, `TableId`,
+  `WriteObserver` / `ObserverMode` (the observer hook).
+
+External: `axum`/`axum-server`, `tokio`, `serde`/`serde_json`, `arc-swap`,
+`parking_lot`, `indexmap`, `phf`, `blake3`, `uuid`, `base64`, `hex`, `chrono`.
+
+**Called by** (crates that depend on this):
+
+- **`ferrosa`** — the main binary wires the `GraphEngine`, HTTP endpoint, and
+  Bolt server alongside the CQL listener.
+
+## Tests
+
+353 in-crate unit/`tokio` tests plus three integration suites under `tests/`
+(`adjacency_replication.rs`, `graph_http_integration.rs`, `parser_proptest.rs`).
+No `#[ignore]`, no `TODO`/`FIXME` markers in source. Highest coverage:
+`parser/parse_impl.rs` (81), `executor/eval.rs` (47), `executor/expand.rs` (44).
+
+## Specs
+
+- [Architecture overview](specs/overview.md) — module map, invariants, position
+- [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
+- [Roadmap](specs/roadmap.md) — Now / Next / Later
+- [Data flow](specs/data-flow.md) — MATCH expand + adjacency-consistent write

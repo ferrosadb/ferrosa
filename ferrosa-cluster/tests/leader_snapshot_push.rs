@@ -553,8 +553,15 @@ async fn find_non_node3_leader(
 // window.  Without the pusher, the counter stays 0 and convergence depends
 // entirely on the natural Raft heartbeat cycle — which in production (3 s
 // election timeout) may not fire in time before the suppression window expires.
+// Bound multi-node harness oversubscription across all test binaries so the
+// short raft election timers stay serviceable (deterministic election). See the
+// shared module for the full rationale.
+#[path = "common/harness_slot.rs"]
+mod harness_slot;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_pushes_snapshot_to_wiped_node() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
     INSTALLSNAPSHOT_PUSHES_TOTAL.store(0, Ordering::Relaxed);
 

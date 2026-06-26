@@ -2181,6 +2181,7 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-sstable",
  "ferrosa-storage",
+ "fs2",
  "futures",
  "indexmap 2.14.0",
  "openraft",
@@ -2653,6 +2654,18 @@ dependencies = [
  "wat",
  "wit-component",
  "wit-parser 0.244.0",
+]
+
+[[package]]
+name = "ferrosa-view"
+version = "0.13.0"
+dependencies = [
+ "ferrosa-schema",
+ "indexmap 2.14.0",
+ "proptest",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

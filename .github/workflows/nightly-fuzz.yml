@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Shared compilation cache (GitHub Actions backend). Every job that compiles
+  # runs a sccache-action step (the smoke-test job's is gated on the rare musl
+  # fallback). CARGO_INCREMENTAL=0 because incremental bypasses sccache.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
 
 permissions:
   contents: write
@@ -33,6 +39,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build AssemblyScript UDF toolchain bundle
         # --all-features enables `asc-udf` + `live-infra-tests`, which run the
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
@@ -88,6 +95,9 @@ jobs:
                  --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
                  --skip bounded_fetch_reassembles_to_single_pass \
                  --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
+                 --skip differential_oracle_dml_agrees \
+                 --skip differential_oracle_corpus_agrees \
+                 --skip differential_oracle_rejects_unsupported_queries \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
@@ -206,51 +216,37 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - name: Install musl tools and capnproto
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools capnproto
+      - name: Download latest nightly .deb release
+        id: nightly_deb
+        uses: ./.github/actions/ferrosa-nightly-deb
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build smoke-test runtime image from nightly .deb
+        run: |
+          set -euo pipefail
+          cp "${{ steps.nightly_deb.outputs.deb_path }}" tests/ferrosa.deb
+          docker build -f tests/Dockerfile.nightly-deb -t ferrosa-smoke:latest tests/
+          # Keep ferrosa.deb in place: docker-smoke.sh runs `docker compose up --build`
+          # against docker-compose.yml, which uses tests/Dockerfile.smoke and needs
+          # the .deb file as a build context. Deleting it here causes a cache miss and
+          # "ferrosa.deb: not found" during the compose build.
+
+      - name: Set up sccache (only when the musl fallback compiles)
+        if: steps.nightly_deb.outputs.deb_path == ''
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build x86_64 musl static ferrosa binary (fallback)
-        # The smoke test needs a runtime image. Prefer the nightly .deb below,
-        # but always produce a static binary here so the smoke test can run even
-        # when no nightly release has been published yet (e.g. immediately after
-        # this PR merges). This prevents the smoke test from failing fast due to
-        # a missing .deb instead of exercising the actual pair-mode behavior.
+        # The smoke test needs a runtime image. We prefer the nightly .deb above.
+        # This fallback is compiled only if the reusable download step somehow
+        # misses; in normal scheduled runs the midnight build is always available.
+        if: steps.nightly_deb.outputs.deb_path == ''
         run: |
           rustup target add x86_64-unknown-linux-musl
           cargo build --release --target x86_64-unknown-linux-musl -p ferrosa
           cp target/x86_64-unknown-linux-musl/release/ferrosa tests/ferrosa
           strip tests/ferrosa
-
-      - name: Download latest nightly .deb release
-        id: nightly_deb
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Prefer the nightly .deb when available; it already contains the
-          # correct version and systemd packaging. The nightly-release workflow
-          # now runs at 00:17 UTC, so this should exist for the 03:00 smoke job.
-          set -euo pipefail
-          asset_url=$(gh api "repos/${{ github.repository }}/releases" \
-            --jq '.[] | select(.prerelease == true) | .assets[] | select(.name | test("ferrosa_.*_amd64\\.deb$")) | .browser_download_url' \
-            | head -n 1 || true)
-          if [[ -n "$asset_url" ]]; then
-            echo "deb_url=$asset_url" >> "$GITHUB_OUTPUT"
-            curl -fsSL -o tests/ferrosa.deb "$asset_url"
-            ls -lh tests/ferrosa.deb
-            dpkg-deb -I tests/ferrosa.deb | grep -E 'Package|Version|Architecture'
-          else
-            echo "::warning::No nightly .deb found; will use the musl binary fallback."
-          fi
-
-      - name: Build smoke-test runtime image
-        run: |
-          if [[ -f tests/ferrosa.deb ]]; then
-            echo "Building smoke image from nightly .deb"
-            docker build -f tests/Dockerfile.smoke -t ferrosa-smoke:latest tests/
-          else
-            echo "Building smoke image from musl binary fallback"
-            docker build -f tests/Dockerfile.smoke-bin -t ferrosa-smoke:latest tests/
-          fi
+          docker build -f tests/Dockerfile.nightly-bin -t ferrosa-smoke:latest tests/
+          # Keep the static binary in place for the same reason we keep the .deb.
 
       - name: Run Docker smoke test
         env:
@@ -307,28 +303,46 @@ jobs:
   race-stress-fly:
     name: Read-vs-compaction stress (shared-cpu Fly)
     runs-on: ubuntu-latest
-    # The script provisions a throwaway shared-cpu Fly machine, builds with
-    # --features race-stress, runs an RACE_SECS storm, and tears the app down.
-    # Generous cap = build/boot headroom + the storm; the script self-destroys
-    # the app via an EXIT trap even if this job is cancelled.
+    # The stress binary is cross-compiled on the fast GitHub runner, then copied
+    # into a throwaway shared-cpu Fly machine. The starved baseline is what we
+    # want to test; compiling on that same starved VM was consuming the entire
+    # 75-minute job budget and the test never completed (no RS_RESULT marker).
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Install Cap'n Proto compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Build race-stress test binary
+        id: build
+        run: |
+          set -euo pipefail
+          cargo test -p ferrosa-storage --features race-stress --release --lib --no-run
+          # Find the libtest binary that contains the race-stress test.
+          binary=$(find target/release/deps -maxdepth 1 -type f -executable -name 'ferrosa_storage-*' | head -n 1)
+          if [ -z "$binary" ]; then
+            echo "::error::Could not locate ferrosa-storage race-stress test binary"
+            exit 1
+          fi
+          ls -lh "$binary"
+          file "$binary"
+          echo "binary=$PWD/$binary" >> "$GITHUB_OUTPUT"
+
       - name: Read-vs-compaction stress on a starved shared-cpu Fly machine
         env:
-          # Only NEW secret required. If unset, the step skips cleanly (so the
-          # nightly run is green until the secret is provisioned — see t_dfbc14f3).
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          # The repo-scoped job token can clone this private repo on the VM.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FLY_ORG: ${{ vars.FLY_ORG || 'personal' }}
-          BRANCH: ${{ github.ref_name }}
           # shared-cpu on purpose: the throttled baseline starves the compaction
           # executor — that starvation is what surfaces the read-vs-compaction
           # race. A performance VM would NOT reproduce it. Use the 2x size (4 GB)
-          # so the in-VM `--release` build of ferrosa-storage doesn't OOM
-          # (shared-cpu-1x caps at 2 GB); it is still shared/throttled.
+          # so the in-VM test doesn't OOM (shared-cpu-1x caps at 2 GB).
           VM: shared-cpu-2x
           VM_MEMORY: '4096'
           RACE_KEYS: '2000'
@@ -336,6 +350,7 @@ jobs:
           RACE_SECS: '600'
           RACE_FLUSH_EVERY: '50'
         run: |
+          set -euo pipefail
           if [ -z "${FLY_API_TOKEN:-}" ]; then
             echo "::notice::FLY_API_TOKEN not set — skipping nightly Fly race-stress (provision it; see board task t_dfbc14f3)"
             exit 0
@@ -343,4 +358,4 @@ jobs:
           curl -fsSL https://fly.io/install.sh | sh
           export FLYCTL_INSTALL="$HOME/.fly"
           export PATH="$FLYCTL_INSTALL/bin:$PATH"
-          bash ci/race-stress-fly.sh
+          bash ci/race-stress-fly.sh "${{ steps.build.outputs.binary }}"

@@ -144,6 +144,9 @@ pub enum MsgType {
     // Secondary index scatter-gather
     IndexReadRequest = 0x62,
     IndexReadResponse = 0x63,
+    // Full-text index scatter-gather (fts_match across every node's local FTI)
+    FulltextSearchRequest = 0x64,
+    FulltextSearchResponse = 0x65,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -156,6 +159,9 @@ pub enum MsgType {
     AccordApplyOK = 0x78,
     AccordRecover = 0x79,
     AccordRecoverOK = 0x7A,
+    // Multi-key Accord (additive V2 — see message.rs)
+    AccordPreAcceptV2 = 0x7B,
+    AccordApplyV2 = 0x7C,
     // Bootstrap coordination
     BootstrapComplete = 0x80,
     BootstrapCompleteAck = 0x81,
@@ -264,6 +270,8 @@ impl TryFrom<u8> for MsgType {
             0x61 => Ok(Self::IndexBuildComplete),
             0x62 => Ok(Self::IndexReadRequest),
             0x63 => Ok(Self::IndexReadResponse),
+            0x64 => Ok(Self::FulltextSearchRequest),
+            0x65 => Ok(Self::FulltextSearchResponse),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),
@@ -275,6 +283,8 @@ impl TryFrom<u8> for MsgType {
             0x78 => Ok(Self::AccordApplyOK),
             0x79 => Ok(Self::AccordRecover),
             0x7A => Ok(Self::AccordRecoverOK),
+            0x7B => Ok(Self::AccordPreAcceptV2),
+            0x7C => Ok(Self::AccordApplyV2),
             0x80 => Ok(Self::BootstrapComplete),
             0x81 => Ok(Self::BootstrapCompleteAck),
             0x82 => Ok(Self::ClusterMembershipForward),

@@ -54,6 +54,10 @@ otel = [
     "opentelemetry-otlp",
     "opentelemetry_sdk",
 ]
+# All shippable optional features. Curated, NOT --all-features: excludes
+# `live-infra-tests` (test-only) and `ferrosa-cluster/sprint-03-engine-transfer`
+# (in-progress). Used by release artifacts and the published Docker image.
+full = ["otel", "flight", "ferrosa-cql/asc-udf"]
 
 # Optional OTel dependencies, gated behind the `otel` feature.
 [dependencies.tracing-opentelemetry]

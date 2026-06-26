@@ -584,8 +584,15 @@ async fn write_entries(leader: &Arc<TestRaft>, count: u64) {
 /// Pre-fix: fails because `node3_final_term > leader_final_term + 5`
 ///          (without the guard node3 would be thousands of terms ahead).
 /// Post-fix: passes — guard suppresses elections, node3 converges.
+// Bound multi-node harness oversubscription across all test binaries so the
+// short raft election timers stay serviceable (deterministic election). See the
+// shared module for the full rationale.
+#[path = "common/harness_slot.rs"]
+mod harness_slot;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn election_storm_does_not_occur_on_log_divergence() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
 
     let router = InProcessRouter::new();
@@ -739,6 +746,7 @@ async fn election_storm_does_not_occur_on_log_divergence() {
 /// Post-fix: counter is >= 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn election_storm_recovery_metric_increments() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
 
     let router = InProcessRouter::new();
@@ -891,6 +899,7 @@ async fn election_storm_recovery_metric_increments() {
 /// 60 s of storm onset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn election_storm_guard_fires_at_production_cadence() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
 
     let router = InProcessRouter::new();
@@ -1076,6 +1085,7 @@ fn prevote_checkquorum_raft_config() -> Arc<Config> {
 /// The gate is removed; this runs in the default suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ferrosa_partitioned_node_does_not_advance_term() {
+    let _slot = harness_slot::acquire_harness_slot().await;
     ELECTION_STORM_TERM_JUMPS_TOTAL.store(0, Ordering::Relaxed);
 
     let router = InProcessRouter::new();

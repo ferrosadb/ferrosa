@@ -251,6 +251,10 @@ pub enum Message {
     IndexReadRequest(Bytes),
     IndexReadResponse(Bytes),
 
+    // Full-text index scatter-gather (fts_match across every node's local FTI)
+    FulltextSearchRequest(Bytes),
+    FulltextSearchResponse(Bytes),
+
     // Accord consensus — opaque payloads, ferrosa-cluster interprets
     AccordPreAccept(Bytes),
     AccordPreAcceptOK(Bytes),
@@ -263,6 +267,12 @@ pub enum Message {
     AccordApplyOK(Bytes),
     AccordRecover(Bytes),
     AccordRecoverOK(Bytes),
+    // Multi-key (multi-partition) Accord — additive V2 variants carrying the
+    // multi-key PreAccept (key union) and Apply (write-set) payloads. The
+    // single-key variants above keep their exact bytes; the intermediate
+    // Accept/Commit/Read phases are key-agnostic and reuse the v1 variants.
+    AccordPreAcceptV2(Bytes),
+    AccordApplyV2(Bytes),
 
     // Bootstrap coordination
     /// Sent by a non-leader node to the leader after bootstrap streaming completes.
@@ -356,6 +366,8 @@ impl Message {
             Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
             Self::IndexReadRequest(_) => MsgType::IndexReadRequest,
             Self::IndexReadResponse(_) => MsgType::IndexReadResponse,
+            Self::FulltextSearchRequest(_) => MsgType::FulltextSearchRequest,
+            Self::FulltextSearchResponse(_) => MsgType::FulltextSearchResponse,
             Self::AccordPreAccept(_) => MsgType::AccordPreAccept,
             Self::AccordPreAcceptOK(_) => MsgType::AccordPreAcceptOK,
             Self::AccordAccept(_) => MsgType::AccordAccept,
@@ -367,6 +379,8 @@ impl Message {
             Self::AccordApplyOK(_) => MsgType::AccordApplyOK,
             Self::AccordRecover(_) => MsgType::AccordRecover,
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
+            Self::AccordPreAcceptV2(_) => MsgType::AccordPreAcceptV2,
+            Self::AccordApplyV2(_) => MsgType::AccordApplyV2,
             Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
             Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
             Self::ClusterMembershipForward(_) => MsgType::ClusterMembershipForward,
@@ -507,6 +521,8 @@ impl Message {
             | Self::IndexBuildComplete(b)
             | Self::IndexReadRequest(b)
             | Self::IndexReadResponse(b)
+            | Self::FulltextSearchRequest(b)
+            | Self::FulltextSearchResponse(b)
             | Self::AccordPreAccept(b)
             | Self::AccordPreAcceptOK(b)
             | Self::AccordAccept(b)
@@ -518,6 +534,8 @@ impl Message {
             | Self::AccordApplyOK(b)
             | Self::AccordRecover(b)
             | Self::AccordRecoverOK(b)
+            | Self::AccordPreAcceptV2(b)
+            | Self::AccordApplyV2(b)
             | Self::ClusterMembershipForward(b)
             | Self::ClusterMembershipForwardAck(b) => buf.put_slice(b),
             Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
@@ -727,6 +745,12 @@ impl Message {
             }
             MsgType::IndexReadRequest => Self::IndexReadRequest(body.split_to(body.remaining())),
             MsgType::IndexReadResponse => Self::IndexReadResponse(body.split_to(body.remaining())),
+            MsgType::FulltextSearchRequest => {
+                Self::FulltextSearchRequest(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchResponse => {
+                Self::FulltextSearchResponse(body.split_to(body.remaining()))
+            }
             MsgType::AccordPreAccept => Self::AccordPreAccept(body.split_to(body.remaining())),
             MsgType::AccordPreAcceptOK => Self::AccordPreAcceptOK(body.split_to(body.remaining())),
             MsgType::AccordAccept => Self::AccordAccept(body.split_to(body.remaining())),
@@ -738,6 +762,8 @@ impl Message {
             MsgType::AccordApplyOK => Self::AccordApplyOK(body.split_to(body.remaining())),
             MsgType::AccordRecover => Self::AccordRecover(body.split_to(body.remaining())),
             MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
+            MsgType::AccordPreAcceptV2 => Self::AccordPreAcceptV2(body.split_to(body.remaining())),
+            MsgType::AccordApplyV2 => Self::AccordApplyV2(body.split_to(body.remaining())),
             MsgType::BootstrapComplete => {
                 let mut id_bytes = [0u8; 16];
                 if body.remaining() >= 16 {

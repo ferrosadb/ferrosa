@@ -347,7 +347,7 @@ impl BatchAtomicityResult {
 
     /// Whether this result is valid under nemesis (no partial visibility).
     fn is_atomically_valid(&self) -> bool {
-        // Codec errors indicate a bug, not nemesis-induced failure.
+        // Codec errors indicate a bug, not a nemesis-induced failure.
         !matches!(self, Self::CodecError)
     }
 }

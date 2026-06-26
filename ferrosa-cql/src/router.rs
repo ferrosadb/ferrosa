@@ -1046,6 +1046,123 @@ fn build_lwt_mutation(
     Ok((key_bytes, mutation_bytes))
 }
 
+/// Encode a DML statement as a buffered [`TransactionWrite`] for a CQL
+/// `BEGIN`/`COMMIT` transaction — the same key + commit-log mutation encoding as
+/// [`build_lwt_mutation`], plus the keyspace so the committer can resolve the
+/// key's replicas from that keyspace's replication.
+fn build_transaction_write(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<ferrosa_storage::accord::TransactionWrite, CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let now_micros = || -> Result<i64, CqlError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64)
+    };
+
+    let (table_id, key, row, ts) = match stmt {
+        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+        Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        _ => {
+            return Err(CqlError::Invalid(
+                "only INSERT/UPDATE/DELETE may be buffered in a transaction".into(),
+            ));
+        }
+    };
+
+    let keyspace = table_id.keyspace.clone();
+    let key_bytes = key.key.as_bytes().to_vec();
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key,
+        vec![row],
+        ts,
+    );
+    let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
+    mutation.serialize_into(&mut mutation_bytes);
+
+    Ok(ferrosa_storage::accord::TransactionWrite {
+        keyspace,
+        key: key_bytes,
+        mutation: mutation_bytes,
+    })
+}
+
+/// Intercept transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) and in-transaction
+/// DML for a CQL session. Returns `Some(result)` if the statement was handled as
+/// a transaction operation; `None` if it should be routed normally.
+///
+/// In an open transaction, `INSERT`/`UPDATE`/`DELETE` are **buffered** (not
+/// executed); `COMMIT` commits the whole buffered write-set as one multi-key
+/// Accord transaction via the `SessionCore` committer
+/// (`accord_transaction_committer`); `ROLLBACK` drops the buffer.
+pub async fn route_transactional(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+    txn: &mut crate::session::CqlTransaction,
+) -> Option<Result<RouteResult, CqlError>> {
+    match stmt {
+        Statement::BeginTransaction => Some(
+            txn.begin()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Rollback => Some(
+            txn.rollback()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Commit => Some(commit_cql_transaction(state, txn).await),
+        // Buffer DML only while a transaction is open; otherwise route normally.
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if txn.is_open() => {
+            Some(
+                match build_transaction_write(state, ctx, stmt).and_then(|w| txn.stage(w)) {
+                    Ok(()) => Ok(RouteResult::Result(crate::result::encode_void())),
+                    Err(e) => {
+                        // A statement that fails inside a transaction POISONS it,
+                        // so the next COMMIT fails loud rather than committing an
+                        // incomplete write-set (never a silently partial txn).
+                        txn.poison();
+                        Err(e)
+                    }
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Commit the buffered write-set through the Accord committer. Fails loud (and
+/// closes the transaction) when not in cluster mode or when the commit cannot be
+/// driven — the client never gets a success it did not earn.
+async fn commit_cql_transaction(
+    state: &SharedState,
+    txn: &mut crate::session::CqlTransaction,
+) -> Result<RouteResult, CqlError> {
+    use ferrosa_storage::accord::CommitOutcome;
+    let committer = match state.accord_transaction_committer() {
+        Some(c) => c,
+        None => {
+            let _ = txn.rollback();
+            return Err(CqlError::Invalid(
+                "multi-statement transactions require cluster mode (Accord)".into(),
+            ));
+        }
+    };
+    match txn.commit(committer.as_ref()).await {
+        Ok(CommitOutcome::Committed) => Ok(RouteResult::Result(crate::result::encode_void())),
+        Ok(CommitOutcome::Aborted { reason }) => {
+            Err(CqlError::Invalid(format!("transaction aborted: {reason}")))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Decode the agreed row-at-`t` bytes (a serialized single-partition
 /// [`Mutation`](ferrosa_storage::Mutation)) into a `column -> value` map for IF
 /// evaluation, using the SAME positional decode the local read path uses
@@ -1190,17 +1307,20 @@ async fn route_lwt_via_accord(
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_cluster::accord::AccordCoordinatorDriver;
 
-    // Build the replica set from the live peer map plus this node itself.
-    // Ordering is deterministic: local node first, then peers sorted by UUID.
+    // Fallback replica set: the live peer map plus this node itself. Used when
+    // the write path has no ring (standalone/pair/degraded) and as the basis for
+    // the "no peers at all" guard below. Cluster mode replaces this with the
+    // key's token-aware RF replicas (see `select_accord_replicas` after the
+    // keyspace is resolved). Ordering is deterministic: sorted by UUID.
     let host_id = state.node_config.host_id;
-    let mut replica_ids: Vec<uuid::Uuid> = peers.live_peer_ids();
+    let mut fallback_replicas: Vec<uuid::Uuid> = peers.live_peer_ids();
     // Include local node if not already in the list.
-    if !replica_ids.contains(&host_id) {
-        replica_ids.push(host_id);
+    if !fallback_replicas.contains(&host_id) {
+        fallback_replicas.push(host_id);
     }
-    replica_ids.sort_unstable();
+    fallback_replicas.sort_unstable();
 
-    if replica_ids.is_empty() {
+    if fallback_replicas.is_empty() {
         return Err(CqlError::ServerError(
             "Accord replica set is empty — no peers connected for LWT consensus".into(),
         ));
@@ -1220,6 +1340,25 @@ async fn route_lwt_via_accord(
     // Resolve the target keyspace/table for the generic-IF read-vote so replicas
     // (and the coordinator's own local reader) can target the read-at-`t`.
     let (ks, table) = lwt_keyspace_table(ctx, stmt)?;
+
+    // Token-aware participant resolution (ADR-021): in cluster mode the write
+    // path maps the key to its RF replicas from the ring (a proper subset of the
+    // cluster); otherwise we keep the live-peer fallback. This makes the live
+    // Accord LWT path RF-correct rather than replicating every key to every
+    // connected peer. Placement stays behind `WritePath` — the CQL front-end
+    // only passes raw key bytes + keyspace replication.
+    let replication = state
+        .schema
+        .snapshot()
+        .keyspaces
+        .get(&ks)
+        .map(|k| k.replication.clone());
+    let replica_ids = select_accord_replicas(
+        &state.write_path.load(),
+        replication.as_ref(),
+        &key,
+        fallback_replicas,
+    )?;
 
     // Classify the IF predicate. `NotExists` uses the replica existence path;
     // `Generic` reads the row at `t` so the coordinator evaluates `IF col=val`.
@@ -1310,6 +1449,35 @@ async fn route_lwt_via_accord(
     }
 
     finish_lwt_via_accord(state, &ks, &table, driver, None).await
+}
+
+/// Select the Accord participant replicas for a single-key LWT.
+///
+/// In cluster mode the write path resolves the key's owning replicas from the
+/// ring (token-aware, RF-correct — a proper subset of the cluster). Outside
+/// cluster mode (or when the keyspace replication is unknown) we keep the
+/// caller's `fallback` set (the live peer map), since Accord placement is a
+/// cluster concern. An unparseable strategy or an empty cluster-mode resolution
+/// fails loud rather than silently writing to the wrong/empty replica set.
+fn select_accord_replicas(
+    write_path: &ferrosa_cluster::WritePath,
+    replication: Option<&ReplicationParams>,
+    key: &[u8],
+    fallback: Vec<uuid::Uuid>,
+) -> Result<Vec<uuid::Uuid>, CqlError> {
+    let Some(replication) = replication else {
+        return Ok(fallback);
+    };
+    match write_path.accord_replicas_for_key(key, replication) {
+        Ok(Some(resolved)) if !resolved.is_empty() => Ok(resolved),
+        Ok(Some(_)) => Err(CqlError::ServerError(
+            "Accord cluster-mode replica resolution returned no replicas for the LWT key".into(),
+        )),
+        Ok(None) => Ok(fallback),
+        Err(e) => Err(CqlError::ServerError(format!(
+            "LWT replica resolution: {e}"
+        ))),
+    }
 }
 
 /// Drive the Accord transaction to completion and map its result to a CQL LWT
@@ -3388,25 +3556,50 @@ async fn route_select_user_table(
             .index_usage_tracker
             .record(ks, &s.table, index_name, "FullText");
 
+        // Route the FTI lookup through the write path so it scatter-gathers
+        // across the cluster. `fts_match` carries no partition key, so its hits
+        // span all token ranges; a coordinator-local lookup returned 0/1
+        // depending on which node served the query (BUG-F-007 / t_0d08aa43).
+        // Standalone/pair still resolves locally via the same call.
         let matching_pks = state
-            .engine
+            .write_path
+            .load()
             .fulltext_search(&table_id, index_name, fts_query)
+            .await
             .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
 
-        // Fetch each matching partition and apply post-filter.
-        // The raw_pk bytes are the PartitionKey bytes as stored in the FTI.
-        // Reconstruct a DecoratedKey by wrapping them in PartitionKey directly.
+        // `matching_pks` are full-key document ids (partition + clustering), one
+        // per matching ROW. Read each distinct partition once, keep ONLY the rows
+        // whose full key actually matched — so non-matching clustering rows in a
+        // matched partition don't leak (t_da51e20c) — then post-filter.
+        let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+        let mut seen_partitions = std::collections::HashSet::new();
         let mut fts_rows = Vec::new();
-        for raw_pk in matching_pks {
+        for doc_key in &matched {
+            let Some(pk) = ferrosa_index::fulltext::keys::doc_key_partition(doc_key) else {
+                // Legacy/malformed id (e.g. a sidecar built before row-granular
+                // keys, pending rebuild) — skip rather than misread.
+                continue;
+            };
+            if !seen_partitions.insert(pk.to_vec()) {
+                continue; // partition already read
+            }
             let decorated =
-                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
-            if let Some(partition) = state
+                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
+            if let Some(mut partition) = state
                 .write_path
                 .load()
                 .read(&table_id, &decorated)
                 .await
                 .map_err(|e| CqlError::ServerError(format!("{e}")))?
             {
+                // Keep only the rows whose full key is in the FTS match set.
+                partition.rows.retain(|row| {
+                    matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
+                        pk,
+                        &row.clustering,
+                    ))
+                });
                 let mut prows = bridge::partition_to_rows_with_storage_mapping(
                     &partition,
                     &all_col_names,
@@ -8280,7 +8473,21 @@ async fn route_grant(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (also emits the audit event). Then run the same
+            // persisted DDL path the Pair/Cluster arms use so the grant is
+            // written to system_auth.role_permissions and survives a restart —
+            // standalone mode otherwise only updated memory, silently losing
+            // grants on restart (t_fb280b30). grant_internal is idempotent.
+            state
+                .schema
+                .grant(&s.role, &resource, perms.clone(), ctx.auth)?;
+            ddl.execute(DdlOperation::Grant(GrantEntry {
+                role: s.role.clone(),
+                resource,
+                permissions: perms,
+            }))
+            .await
+            .map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -8327,7 +8534,21 @@ async fn route_revoke(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (+ audit), then persist each revoke to
+            // system_auth.role_permissions so it survives a restart — else the
+            // revoked permission silently reappears after restart (t_fb280b30).
+            state
+                .schema
+                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
+            for perm in perms {
+                ddl.execute(DdlOperation::Revoke {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                })
+                .await
+                .map_err(CqlError::from)?;
+            }
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -8409,11 +8630,11 @@ async fn route_grant_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            if grant {
-                state.schema.grant_role_internal(&member, &role)?;
-            } else {
-                state.schema.revoke_role_internal(&member, &role)?;
-            }
+            // Route through the persisted DDL path (apply_direct) so the
+            // membership change is written to system_auth.role_members and
+            // survives a restart — Direct mode previously only updated memory,
+            // silently losing role grants on restart (t_fb280b30).
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             coordinator.coordinate_ddl(op).await?;
@@ -11350,6 +11571,60 @@ mod tests {
     use arc_swap::ArcSwap;
     use ferrosa_cluster::WritePath;
     use ferrosa_schema::NodeConfig;
+
+    // ── select_accord_replicas: live-path replica selection ───────────────────
+
+    fn simple_replication_params(rf: usize) -> ReplicationParams {
+        ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                rf.to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_outside_cluster_mode() {
+        // No ring (standalone/degraded WritePath) → keep the caller's all-live-
+        // peers fallback rather than failing the LWT.
+        let fallback = vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)];
+        let params = simple_replication_params(3);
+        let got = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&params),
+            b"pk",
+            fallback.clone(),
+        )
+        .expect("fallback path must not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_when_replication_absent() {
+        // No keyspace replication metadata → fall back rather than guess.
+        let fallback = vec![uuid::Uuid::from_u128(7)];
+        let got = select_accord_replicas(&WritePath::unavailable(), None, b"pk", fallback.clone())
+            .expect("absent replication must fall back, not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_fails_loud_on_bad_strategy() {
+        // An unparseable strategy must surface an error, never silently fall back
+        // to a placement the operator did not configure.
+        let bad = ReplicationParams {
+            strategy: "NoSuchStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        let err = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&bad),
+            b"pk",
+            vec![uuid::Uuid::from_u128(1)],
+        );
+        assert!(err.is_err(), "unparseable strategy must fail loud");
+    }
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
@@ -11390,6 +11665,10 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        // Real startup registers the system tables unconditionally (main.rs:802);
+        // mirror that so the harness reflects standalone mode (system_auth.* must
+        // exist for grant persistence — t_fb280b30).
+        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
@@ -11709,6 +11988,49 @@ mod tests {
     fn keyspace_rf_returns_1_when_keyspace_not_found() {
         let (state, _dir) = setup();
         assert_eq!(keyspace_rf(&state.schema, "nonexistent"), 1);
+    }
+
+    #[tokio::test]
+    async fn route_transactional_handles_begin_rollback_and_fails_commit_in_standalone() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let mut txn = crate::session::CqlTransaction::new();
+
+        // A non-transactional statement is NOT intercepted (routes normally).
+        let select = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        assert!(
+            route_transactional(&state, &ctx, &select, &mut txn)
+                .await
+                .is_none(),
+            "SELECT must fall through to normal routing"
+        );
+
+        // BEGIN opens the transaction; ROLLBACK closes it.
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::BeginTransaction, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(txn.is_open());
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::Rollback, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(!txn.is_open());
+
+        // COMMIT in standalone mode (no Accord committer) must fail loud.
+        txn.begin().unwrap();
+        let committed = route_transactional(&state, &ctx, &Statement::Commit, &mut txn).await;
+        assert!(
+            matches!(committed, Some(Err(_))),
+            "COMMIT without a cluster committer must fail loud, not fake success"
+        );
     }
 
     #[tokio::test]
@@ -12316,7 +12638,7 @@ mod tests {
         }
     }
 
-    /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
+    /// Regression test: cqlsh expects `tokens` column (set<text>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
     #[tokio::test]
@@ -17340,6 +17662,68 @@ mod tests {
         }
     }
 
+    /// TDD repro for the live memory FTS failure: every ferrosa-memory query is
+    /// `... WHERE <pk preds> AND <col> = fts_match('...') ... ALLOW FILTERING`.
+    /// The end-to-end test above uses fts_match with NO partition-key predicate;
+    /// this exercises the PK-predicate + fts_match combination (entity_store
+    /// shape: partition key + clustering key + fts on a regular column).
+    // KNOWN BUG (unfixed): with PK predicates present, fts_match is matched at
+    // PARTITION granularity and the post-filter skips re-applying it per-row
+    // (evaluate_where_predicates_skips_fts_match_clauses), so a matched
+    // partition leaks rows that don't contain the term. Reproduced here;
+    // ignored until the per-row fts re-evaluation / row-granular FTI lands.
+    #[ignore = "known bug: fts_match dropped to partition granularity when PK predicates present"]
+    #[tokio::test]
+    async fn fts_match_with_pk_predicates_returns_matches() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE fpk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fpk.docs (tenant int, sid int, id int, body text, PRIMARY KEY (tenant, sid, id))",
+            "CREATE INDEX docs_body_fts ON fpk.docs (body) USING 'fulltext'",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 1, 'rust distributed database')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 2, 'cassandra storage engine')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (2, 9, 3, 'rust other tenant')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fpk", "docs"))
+            .unwrap();
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM fpk.docs WHERE tenant = 1 AND sid = 1 AND body = fts_match('rust') ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fts_match+pk query errored: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "only (tenant=1,sid=1,id=1) matches 'rust' AND the PK filter; got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     #[tokio::test]
     async fn fulltext_index_fts_match_reads_unflushed_memtable_row() {
         let (state, _dir) = setup();
@@ -19511,6 +19895,82 @@ mod tests {
         assert_eq!(count_value, 7);
     }
 
+    /// Regression for the COUNT(*) undercount bug (forge t_8c4e44e8): a bare
+    /// `SELECT COUNT(*)` over N distinct single-row partitions returned a
+    /// nondeterministic undercount (observed 12/15/23 for N=50) even though a
+    /// full `SELECT id` scan saw all N. The undercount only manifests when the
+    /// rows are spread across MANY token-overlapping SSTables plus the active
+    /// memtable — exactly the LSM state a fresh load produces once the active
+    /// memtable crosses `flush_threshold_bytes` several times. The earlier
+    /// store-level regression only ever produced a single SSTable, so it never
+    /// exercised the multi-run metadata merge that drops partitions.
+    ///
+    /// COUNT(*) goes through the ADR-020 metadata fast path
+    /// (`WritePath::count_range`); the full scan streams partitions. Both must
+    /// equal N regardless of how many SSTable runs the partitions land in.
+    #[tokio::test]
+    async fn count_star_counts_every_partition_across_many_sstable_runs() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_runs WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("CREATE TABLE cnt_runs.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        const N: i32 = 50;
+        let table_id = ferrosa_storage::TableId::new("cnt_runs", "t");
+        // Insert N distinct partitions, flushing every 10 rows so the rows end
+        // up spread across several SSTables (each holding a token-interleaved
+        // subset of the murmur3-hashed keys) plus the trailing active memtable.
+        for i in 0..N {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_runs.t (id, v) VALUES ({i}, 'v{i}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+            if i % 10 == 9 {
+                state.engine.flush(&table_id).unwrap();
+            }
+        }
+
+        // Bare COUNT(*) — ADR-020 metadata fast path.
+        let count_stmt = crate::parser::parse("SELECT COUNT(*) FROM cnt_runs.t").unwrap();
+        let count_value = match &route(&state, &ctx, count_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected count result"),
+        };
+
+        // Full scan — must see every partition.
+        let scan_stmt = crate::parser::parse("SELECT id FROM cnt_runs.t").unwrap();
+        let scanned_rows = match &route(&state, &ctx, scan_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected scan result"),
+        };
+
+        assert_eq!(
+            scanned_rows, N,
+            "full SELECT must see every partition (got {scanned_rows})"
+        );
+        assert_eq!(
+            count_value, N as i64,
+            "COUNT(*) must equal the {N} inserted partitions across all SSTable \
+             runs + memtable, got {count_value}"
+        );
+    }
+
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────
 
     /// With a phonetic index on a text column, WHERE col = 'Jon Smyth'
@@ -20480,6 +20940,49 @@ mod tests {
             result.is_ok(),
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
+        );
+    }
+
+    /// t_fb280b30: in standalone (Direct) mode a GRANT must be written to
+    /// `system_auth.role_permissions` so it survives a restart — the startup
+    /// replay (`SystemTableLoader::replay_role_permissions_into_schema`) reads
+    /// that table. Previously Direct mode only updated in-memory state, so grants
+    /// silently vanished on restart.
+    #[tokio::test]
+    async fn grant_persists_to_storage_to_survive_restart() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE pgks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE pgks.t (k int PRIMARY KEY, v text)",
+            "CREATE ROLE pg_user WITH PASSWORD = 'pass' AND LOGIN = true",
+            "GRANT SELECT ON pgks.t TO pg_user",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Simulate a restart: flush the auth table, then read grants straight
+        // from storage via the same loader startup uses.
+        let _ = state.engine.flush(&ferrosa_storage::TableId::new(
+            "system_auth",
+            "role_permissions",
+        ));
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone());
+        let grants = loader.load_role_permissions().unwrap();
+        assert!(
+            grants.iter().any(|g| g.role == "pg_user"),
+            "GRANT must persist to system_auth.role_permissions to survive restart; got {grants:?}"
         );
     }
 

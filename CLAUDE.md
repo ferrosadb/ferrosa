@@ -86,6 +86,23 @@ Always apply Rust idioms and best practices. Use the language's type system to p
 3. `cargo test -p <crate>` — affected crate tests pass
 4. `cargo build --all-targets` — full workspace compiles clean
 5. Feature branch — never commit to main directly
+6. **Update the modified crate's docs** — see the rule below.
+
+### Per-crate docs are part of "done"
+
+Every crate carries its own `README.md` (what's implemented, how it works, its
+dependencies/dependents) and a `specs/` directory (`overview.md`, `fmea.md`,
+`roadmap.md`). **Changing a crate's behavior, public API, dependency set, or
+known-issue/roadmap status is not done until that crate's `README.md` + `specs/`
+are updated to match.** A crate's docs must reflect its *current* implementation
+and dependency set — stale crate docs are treated like a failing check. The
+crate-centric index lives at [`specs/crates.md`](specs/crates.md).
+
+The `crate-docs-reminder` pre-commit hook (in `.pre-commit-config.yaml`, script
+`scripts/crate-docs-reminder.sh`) enforces this at commit time: it lists every
+crate with a staged `src/**.rs` change but no staged `README.md`/`specs/*.md`
+update. It warns by default (some changes are genuinely doc-neutral); set
+`FERROSA_CRATE_DOCS_STRICT=1` to make it block.
 
 ### CI must pass before pushing
 
@@ -93,7 +110,7 @@ Agents MUST verify that all CI checks will pass locally before pushing to a remo
 
 ## Releases
 
-See [specs/release-process.md](specs/release-process.md). Key rules:
+See [specs/reference/release-process.md](specs/reference/release-process.md). Key rules:
 
 - **Never hand-edit `[workspace.package] version` in `Cargo.toml` in a PR.** The nightly release automation owns it and derives the next SemVer from Conventional Commit history; a manual bump is ignored and overwritten.
 - Use **Conventional Commit** subjects (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`) — the auto-bump level is computed from them, and sloppy subjects silently degrade a release to a `patch`.

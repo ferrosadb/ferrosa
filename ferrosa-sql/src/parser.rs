@@ -3,8 +3,9 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Join, Operand, OrderItem, Projection, SelectItem, SelectStmt,
-    TableRef, Term,
+    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, Join, Operand, OrderItem, Projection,
+    Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef, Term,
+    UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -117,6 +118,51 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
         limit,
         offset,
     })
+}
+
+/// Parse a top-level statement off the Postgres wire: a table `SELECT`, a
+/// no-`FROM` expression `SELECT` (`SELECT 1`, `SELECT version()`), transaction
+/// control (`BEGIN`/`COMMIT`/`ROLLBACK`), or a session statement (`SET`/`RESET`).
+///
+/// Transaction-control and session statements are recognized here so the
+/// front-end can give them real semantics — they are not silently accepted.
+pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let toks = lex(trimmed)?;
+    let mut p = Parser { toks, pos: 0 };
+    match p.peek() {
+        Some(Tok::Select) => {
+            if p.is_expr_select() {
+                let items = p.parse_scalar_select()?;
+                p.expect_end()?;
+                Ok(Statement::SelectExprs(items))
+            } else {
+                // Table query: reuse the full SELECT grammar on the same SQL.
+                Ok(Statement::Select(Box::new(parse(trimmed)?)))
+            }
+        }
+        Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
+            // Transaction control: `BEGIN [TRANSACTION|WORK]`, `START TRANSACTION`,
+            // `COMMIT|END`, `ROLLBACK|ABORT`. Trailing modifier words are ignored.
+            "BEGIN" | "START" => Ok(Statement::Begin),
+            "COMMIT" | "END" => Ok(Statement::Commit),
+            "ROLLBACK" | "ABORT" => Ok(Statement::Rollback),
+            "SET" => p.parse_set(),
+            "RESET" => p.parse_reset(),
+            "INSERT" => p.parse_insert(),
+            "UPDATE" => p.parse_update(),
+            "DELETE" => p.parse_delete(),
+            other => Err(ParseError::Unexpected {
+                expected: "a statement",
+                found: other.to_string(),
+            }),
+        },
+        Some(t) => Err(ParseError::Unexpected {
+            expected: "a statement",
+            found: format!("{t:?}"),
+        }),
+        None => Err(ParseError::UnexpectedEnd),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -394,6 +440,301 @@ impl Parser {
             items.push(self.parse_select_item()?);
         }
         Ok(Projection::Items(items))
+    }
+
+    /// After a leading `SELECT`, decide whether this is a no-`FROM` expression
+    /// select (`SELECT 1`, `SELECT version()`, `SELECT $1`, `SELECT TRUE`) vs a
+    /// table select. `self.pos` is at the `SELECT` token.
+    fn is_expr_select(&self) -> bool {
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_)) => true,
+            Some(Tok::Ident(w)) => {
+                let up = w.to_ascii_uppercase();
+                matches!(up.as_str(), "TRUE" | "FALSE" | "NULL")
+                    || (!is_aggregate_name(w)
+                        && matches!(self.toks.get(self.pos + 2), Some(Tok::LParen)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Parse `SELECT <scalar> [, <scalar>]*` with no `FROM`. Assumes `self.pos`
+    /// is at the `SELECT` token.
+    fn parse_scalar_select(&mut self) -> Result<Vec<ScalarItem>, ParseError> {
+        self.expect(&Tok::Select, "SELECT")?;
+        let mut items = vec![self.parse_scalar_item()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            items.push(self.parse_scalar_item()?);
+        }
+        Ok(items)
+    }
+
+    /// One scalar select item: a `$N` param, a zero-arg function call, or a
+    /// literal — with an optional `AS`/bare alias.
+    fn parse_scalar_item(&mut self) -> Result<ScalarItem, ParseError> {
+        let value = if let Some(Tok::Param(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            ScalarValue::Param(n)
+        } else if matches!(self.peek(), Some(Tok::Ident(_)))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+        {
+            let Some(Tok::Ident(w)) = self.next() else {
+                unreachable!("peeked an Ident above");
+            };
+            self.expect(&Tok::LParen, "(")?;
+            self.expect(&Tok::RParen, ")")?;
+            ScalarValue::Func(w.to_ascii_uppercase())
+        } else {
+            ScalarValue::Literal(self.parse_value()?)
+        };
+        let alias = self.parse_optional_alias()?;
+        Ok(ScalarItem { value, alias })
+    }
+
+    /// An optional output alias: `AS name` or a bare `name`.
+    fn parse_optional_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if matches!(self.peek(), Some(Tok::As | Tok::Ident(_))) {
+            if matches!(self.peek(), Some(Tok::As)) {
+                self.next();
+            }
+            Ok(Some(self.ident()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `SET <name> [=|TO] <value>`. Assumes `self.pos` is at the `SET` ident.
+    fn parse_set(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // SET
+        let name = self.ident()?;
+        match self.peek() {
+            Some(Tok::Eq) => {
+                self.next();
+            }
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("TO") => {
+                self.next();
+            }
+            _ => {}
+        }
+        let value = match self.next() {
+            Some(Tok::Str(s)) => s,
+            Some(Tok::Int(n)) => n.to_string(),
+            Some(Tok::Ident(w)) => w,
+            Some(t) => {
+                return Err(ParseError::Unexpected {
+                    expected: "SET value",
+                    found: format!("{t:?}"),
+                })
+            }
+            None => return Err(ParseError::UnexpectedEnd),
+        };
+        Ok(Statement::Set { name, value })
+    }
+
+    /// `RESET <name>` (`RESET ALL` → name `ALL`). Assumes `self.pos` is at `RESET`.
+    fn parse_reset(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // RESET
+        let name = self.ident()?;
+        Ok(Statement::Reset { name })
+    }
+
+    /// Error unless all tokens are consumed (statement fully parsed).
+    fn expect_end(&self) -> Result<(), ParseError> {
+        match self.peek() {
+            None => Ok(()),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: "end of statement",
+                found: format!("{t:?}"),
+            }),
+        }
+    }
+
+    /// Consume an identifier that case-insensitively equals `kw` (for the
+    /// keyword-like idents the lexer leaves as `Ident`: `INTO`, `VALUES`).
+    fn expect_ident_kw(&mut self, kw: &'static str) -> Result<(), ParseError> {
+        match self.next() {
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case(kw) => Ok(()),
+            Some(t) => Err(ParseError::Unexpected {
+                expected: kw,
+                found: format!("{t:?}"),
+            }),
+            None => Err(ParseError::UnexpectedEnd),
+        }
+    }
+
+    /// A scalar value in a `VALUES` list: a `$N` parameter or a literal.
+    fn parse_scalar_value(&mut self) -> Result<ScalarValue, ParseError> {
+        if let Some(Tok::Param(n)) = self.peek() {
+            let n = *n;
+            self.next();
+            Ok(ScalarValue::Param(n))
+        } else {
+            Ok(ScalarValue::Literal(self.parse_value()?))
+        }
+    }
+
+    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Assumes
+    /// `self.pos` is at the `INSERT` ident. Single-row; values are literals or
+    /// `$N` parameters, one per named column.
+    fn parse_insert(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // INSERT
+        self.expect_ident_kw("INTO")?;
+        let table = self.parse_table_ref()?;
+
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns = vec![self.ident()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            columns.push(self.ident()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+
+        self.expect_ident_kw("VALUES")?;
+        self.expect(&Tok::LParen, "(")?;
+        let mut values = vec![self.parse_scalar_value()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            values.push(self.parse_scalar_value()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+
+        // ON CONFLICT is recognized to fail loud (out of scope), never silently
+        // ignored — a client that relies on upsert semantics must learn it.
+        self.reject_on_conflict()?;
+        let returning = self.parse_returning()?;
+        self.expect_end()?;
+
+        if columns.len() != values.len() {
+            return Err(ParseError::Unexpected {
+                expected: "matching column and value counts",
+                found: format!("{} columns, {} values", columns.len(), values.len()),
+            });
+        }
+        Ok(Statement::Insert(Box::new(InsertStmt {
+            table,
+            columns,
+            values,
+            returning,
+        })))
+    }
+
+    /// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`.
+    /// Assumes `self.pos` is at the `UPDATE` ident. `WHERE` is equality-only
+    /// (the key columns identify the row, Cassandra-style upsert).
+    fn parse_update(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // UPDATE
+        let table = self.parse_qualified_table()?;
+
+        self.expect_ident_kw("SET")?;
+        let mut assignments = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            assignments.push(self.parse_assignment()?);
+        }
+
+        self.expect(&Tok::Where, "WHERE")?;
+        let mut where_eq = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.next();
+            where_eq.push(self.parse_assignment()?);
+        }
+        let returning = self.parse_returning()?;
+        self.expect_end()?;
+
+        Ok(Statement::Update(Box::new(UpdateStmt {
+            table,
+            assignments,
+            where_eq,
+            returning,
+        })))
+    }
+
+    /// `DELETE FROM [schema.]table WHERE col = val [AND ...]`. Assumes `self.pos`
+    /// is at the `DELETE` ident. `WHERE` is equality-only on key columns.
+    fn parse_delete(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // DELETE
+        self.expect(&Tok::From, "FROM")?;
+        let table = self.parse_qualified_table()?;
+
+        self.expect(&Tok::Where, "WHERE")?;
+        let mut where_eq = vec![self.parse_assignment()?];
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.next();
+            where_eq.push(self.parse_assignment()?);
+        }
+        let returning = self.parse_returning()?;
+        self.expect_end()?;
+
+        Ok(Statement::Delete(Box::new(DeleteStmt {
+            table,
+            where_eq,
+            returning,
+        })))
+    }
+
+    /// Parse an optional `RETURNING * | col, col, ...` clause. Returns `None`
+    /// when the next token is not the `RETURNING` keyword (it is lexed as a bare
+    /// identifier). `RETURNING *` yields [`Returning::Star`].
+    fn parse_returning(&mut self) -> Result<Option<Returning>, ParseError> {
+        match self.peek() {
+            Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("RETURNING") => {
+                self.next(); // RETURNING
+            }
+            _ => return Ok(None),
+        }
+        if matches!(self.peek(), Some(Tok::Star)) {
+            self.next();
+            return Ok(Some(Returning::Star));
+        }
+        let mut cols = vec![self.ident()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            cols.push(self.ident()?);
+        }
+        Ok(Some(Returning::Columns(cols)))
+    }
+
+    /// Fail loud on an `ON CONFLICT` clause: upsert/`DO` semantics are out of
+    /// scope, and silently dropping the clause would change the statement's
+    /// meaning. A bare `ON` not followed by `CONFLICT` is left for the caller's
+    /// `expect_end`/`parse_returning` to reject in context.
+    fn reject_on_conflict(&mut self) -> Result<(), ParseError> {
+        if matches!(self.peek(), Some(Tok::On))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CONFLICT"))
+        {
+            return Err(ParseError::Unexpected {
+                expected: "no ON CONFLICT (not yet supported)",
+                found: "ON CONFLICT".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Parse `[schema.]table` with NO trailing alias — for DML targets, where a
+    /// following ident (`SET`, `WHERE`) is a keyword, not an alias.
+    fn parse_qualified_table(&mut self) -> Result<TableRef, ParseError> {
+        let first = self.ident()?;
+        let (schema, table) = if matches!(self.peek(), Some(Tok::Dot)) {
+            self.next();
+            (Some(first), self.ident()?)
+        } else {
+            (None, first)
+        };
+        Ok(TableRef {
+            schema,
+            table,
+            alias: None,
+        })
+    }
+
+    /// A `col = value` pair (used by `UPDATE`'s SET list and equality WHERE).
+    fn parse_assignment(&mut self) -> Result<(String, ScalarValue), ParseError> {
+        let col = self.ident()?;
+        self.expect(&Tok::Eq, "=")?;
+        let value = self.parse_scalar_value()?;
+        Ok((col, value))
     }
 
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
@@ -1244,5 +1585,295 @@ mod tests {
         assert!(parse("DELETE FROM users").is_err());
         assert!(parse("SELECT").is_err());
         assert!(parse("SELECT * FROM").is_err());
+    }
+
+    // ---- parse_statement: the Postgres-wire entry point ----
+
+    #[test]
+    fn parse_statement_routes_table_select() {
+        assert!(matches!(
+            parse_statement("SELECT id FROM users"),
+            Ok(Statement::Select(_))
+        ));
+        assert!(matches!(
+            parse_statement("SELECT * FROM users WHERE id = 1"),
+            Ok(Statement::Select(_))
+        ));
+        assert!(matches!(
+            parse_statement("SELECT COUNT(*) FROM users"),
+            Ok(Statement::Select(_))
+        ));
+    }
+
+    #[test]
+    fn parse_statement_transaction_control() {
+        assert_eq!(parse_statement("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(
+            parse_statement("begin transaction").unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(
+            parse_statement("START TRANSACTION").unwrap(),
+            Statement::Begin
+        );
+        assert_eq!(parse_statement("COMMIT").unwrap(), Statement::Commit);
+        assert_eq!(parse_statement("END").unwrap(), Statement::Commit);
+        assert_eq!(parse_statement("ROLLBACK").unwrap(), Statement::Rollback);
+        assert_eq!(parse_statement("ABORT").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parse_statement_literal_select() {
+        assert_eq!(
+            parse_statement("SELECT 1").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Literal(Value::Int(1)),
+                alias: None,
+            }])
+        );
+        assert_eq!(
+            parse_statement("SELECT 'hello'").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Literal(Value::Text("hello".into())),
+                alias: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn parse_statement_function_and_alias_select() {
+        assert_eq!(
+            parse_statement("SELECT version()").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Func("VERSION".into()),
+                alias: None,
+            }])
+        );
+        assert_eq!(
+            parse_statement("SELECT current_database() AS db, 1 AS one").unwrap(),
+            Statement::SelectExprs(vec![
+                ScalarItem {
+                    value: ScalarValue::Func("CURRENT_DATABASE".into()),
+                    alias: Some("db".into()),
+                },
+                ScalarItem {
+                    value: ScalarValue::Literal(Value::Int(1)),
+                    alias: Some("one".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_statement_param_select() {
+        assert_eq!(
+            parse_statement("SELECT $1").unwrap(),
+            Statement::SelectExprs(vec![ScalarItem {
+                value: ScalarValue::Param(1),
+                alias: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn parse_statement_insert() {
+        let stmt = parse_statement("INSERT INTO demo.t (id, v) VALUES (1, 'x')").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table.schema.as_deref(), Some("demo"));
+                assert_eq!(ins.table.table, "t");
+                assert_eq!(ins.columns, vec!["id".to_string(), "v".to_string()]);
+                assert_eq!(
+                    ins.values,
+                    vec![
+                        ScalarValue::Literal(Value::Int(1)),
+                        ScalarValue::Literal(Value::Text("x".into())),
+                    ]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_with_params_and_unqualified_table() {
+        let stmt = parse_statement("INSERT INTO t (a, b) VALUES ($1, $2)").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table.schema, None);
+                assert_eq!(ins.table.table, "t");
+                assert_eq!(
+                    ins.values,
+                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_rejects_arity_mismatch() {
+        assert!(parse_statement("INSERT INTO t (a, b) VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn parse_statement_update() {
+        let stmt =
+            parse_statement("UPDATE demo.t SET v = 'x', n = 3 WHERE id = 1 AND ck = 2").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(u.table.schema.as_deref(), Some("demo"));
+                assert_eq!(u.table.table, "t");
+                assert_eq!(
+                    u.assignments,
+                    vec![
+                        (
+                            "v".to_string(),
+                            ScalarValue::Literal(Value::Text("x".into()))
+                        ),
+                        ("n".to_string(), ScalarValue::Literal(Value::Int(3))),
+                    ]
+                );
+                assert_eq!(
+                    u.where_eq,
+                    vec![
+                        ("id".to_string(), ScalarValue::Literal(Value::Int(1))),
+                        ("ck".to_string(), ScalarValue::Literal(Value::Int(2))),
+                    ]
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_update_with_params() {
+        let stmt = parse_statement("UPDATE t SET v = $1 WHERE id = $2").unwrap();
+        match stmt {
+            Statement::Update(u) => {
+                assert_eq!(
+                    u.assignments,
+                    vec![("v".to_string(), ScalarValue::Param(1))]
+                );
+                assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_delete() {
+        let stmt = parse_statement("DELETE FROM demo.t WHERE id = 1 AND ck = 2").unwrap();
+        match stmt {
+            Statement::Delete(d) => {
+                assert_eq!(d.table.schema.as_deref(), Some("demo"));
+                assert_eq!(d.table.table, "t");
+                assert_eq!(
+                    d.where_eq,
+                    vec![
+                        ("id".to_string(), ScalarValue::Literal(Value::Int(1))),
+                        ("ck".to_string(), ScalarValue::Literal(Value::Int(2))),
+                    ]
+                );
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_returning_columns() {
+        let stmt =
+            parse_statement("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, v").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(
+                    ins.values,
+                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                );
+                assert_eq!(
+                    ins.returning,
+                    Some(Returning::Columns(vec!["id".to_string(), "v".to_string()]))
+                );
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_returning_star() {
+        let stmt = parse_statement("INSERT INTO t (id) VALUES (1) RETURNING *").unwrap();
+        match stmt {
+            Statement::Insert(ins) => assert_eq!(ins.returning, Some(Returning::Star)),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_no_returning_is_none() {
+        let stmt = parse_statement("INSERT INTO t (id) VALUES (1)").unwrap();
+        match stmt {
+            Statement::Insert(ins) => assert_eq!(ins.returning, None),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_update_delete_returning() {
+        let upd = parse_statement("UPDATE t SET v = $1 WHERE id = $2 RETURNING id").unwrap();
+        match upd {
+            Statement::Update(u) => {
+                assert_eq!(
+                    u.assignments,
+                    vec![("v".to_string(), ScalarValue::Param(1))]
+                );
+                assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
+                assert_eq!(
+                    u.returning,
+                    Some(Returning::Columns(vec!["id".to_string()]))
+                );
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+        let del = parse_statement("DELETE FROM t WHERE id = $1 RETURNING *").unwrap();
+        match del {
+            Statement::Delete(d) => {
+                assert_eq!(d.where_eq, vec![("id".to_string(), ScalarValue::Param(1))]);
+                assert_eq!(d.returning, Some(Returning::Star));
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_statement_insert_on_conflict_is_clear_error() {
+        let err = parse_statement("INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING")
+            .expect_err("ON CONFLICT must be rejected, not silently ignored");
+        // The error message names ON CONFLICT so the boundary is explicit.
+        assert!(
+            err.to_string().contains("ON CONFLICT"),
+            "error should mention ON CONFLICT, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_statement_set_and_reset() {
+        assert_eq!(
+            parse_statement("SET client_encoding = 'UTF8'").unwrap(),
+            Statement::Set {
+                name: "client_encoding".into(),
+                value: "UTF8".into(),
+            }
+        );
+        assert_eq!(
+            parse_statement("SET search_path TO public").unwrap(),
+            Statement::Set {
+                name: "search_path".into(),
+                value: "public".into(),
+            }
+        );
+        assert_eq!(
+            parse_statement("RESET ALL").unwrap(),
+            Statement::Reset { name: "ALL".into() }
+        );
     }
 }

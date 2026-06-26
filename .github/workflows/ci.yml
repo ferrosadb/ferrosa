@@ -8,10 +8,24 @@ on:
   # With `branches: [main]` these were skipped entirely — only the
   # path-filtered Driver Smoke ran — so stacked PRs went unexercised.
   pull_request:
+  # Run in the merge queue too: when a PR is queued, GitHub builds a temporary
+  # `merge_group` ref (the PR rebased on the latest main + entries ahead of it)
+  # and these checks must report on it for the queue to merge. Without this
+  # trigger the queue's required checks never run and entries would stall.
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Shared compilation cache across all jobs AND runs, via the GitHub Actions
+  # cache backend. Each COMPILE job runs the sccache-action step (installs +
+  # starts the server); clippy/test/jepsen/musl/node-image otherwise cold-compile
+  # ~the same workspace independently. The fmt job inherits these too but never
+  # compiles, so RUSTC_WRAPPER is unused there. CARGO_INCREMENTAL=0 because
+  # incremental compilation bypasses sccache.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # ── Stage 1: Format + Lint (fast feedback) ──────────────────────────
@@ -36,7 +50,10 @@ jobs:
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Guard against unbounded materializing reads
+        run: python3 scripts/check-unbounded-reads.py
 
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
@@ -59,6 +76,7 @@ jobs:
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
         # (pinned asc version) so those tests run and pass rather than being skipped.
         run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run tests
         env:
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
@@ -84,6 +102,34 @@ jobs:
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
 
+  # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
+  # The `test` job above skips `differential_oracle` because it has no
+  # container runtime; this dedicated job runs it against a real postgres:16
+  # (started by the test harness via the runner's docker), comparing the
+  # ferrosa Postgres front-end's SELECT/DML semantics to PostgreSQL.
+  postgres-oracle:
+    name: Differential Oracle (vs PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: false
+      - name: Verify docker is available
+        run: docker --version
+      - name: Pre-pull postgres:16
+        run: docker pull postgres:16
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Run differential oracle (corpus + restricted-query + DML)
+        env:
+          FERROSA_TEST_CONTAINERS: "1"
+        run: |
+          cargo test -p ferrosa-postgres --features live-infra-tests \
+            --test differential_oracle -- --test-threads=1 --nocapture
+
   # ── Stage 2b: Musl static build ───────────────────────────────────
   musl:
     name: Static Build (musl)
@@ -98,8 +144,9 @@ jobs:
           key: musl
       - name: Install musl tools and capnproto
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
       - name: Verify statically linked
         run: |
           file target/x86_64-unknown-linux-musl/release/ferrosa
@@ -141,6 +188,7 @@ jobs:
           key: node-image
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build glibc release binary (once)
         run: cargo build --release -p ferrosa -p ferrosa-ctl
       - name: Package into a thin runtime image
@@ -205,6 +253,7 @@ jobs:
         run: |
           docker pull rustfs/rustfs:latest
           docker pull minio/mc
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -311,6 +360,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           targets: wasm32-unknown-unknown
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Wait for CQL port
         run: |
@@ -395,7 +445,11 @@ jobs:
     name: Cluster integration tests
     runs-on: ubuntu-latest
     needs: build-node-image
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    # Run on PRs, on main, AND in the merge queue (`merge_group`). Without the
+    # merge_group arm this job is skipped in the queue, so a red integration run
+    # could never gate the merge — which is exactly how a red PR slipped through.
+    # It must also be added to the ruleset's required status checks.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -412,6 +466,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
@@ -448,6 +503,7 @@ jobs:
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Generate docs
         run: cargo doc --no-deps --workspace
         env:

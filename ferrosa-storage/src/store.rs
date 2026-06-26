@@ -2237,10 +2237,13 @@ impl<F: FlushTarget> TableStore<F> {
         for (index_name, col_pos) in &self.fulltext_indexes {
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
-                let pk_bytes = partition.key.key.as_bytes().to_vec();
-                // Extract the text value from the target column.
-                let mut text = String::new();
+                let pk_bytes = partition.key.key.as_bytes();
+                // Index ONE document PER ROW, keyed by the full primary key
+                // (partition + clustering). Indexing per-partition with the text
+                // of all rows concatenated made a hit identify only the partition,
+                // leaking non-matching clustering rows (t_da51e20c).
                 for row in &partition.rows {
+                    let mut text = String::new();
                     for (col_idx, cell) in &row.cells {
                         if *col_idx as usize == *col_pos {
                             if let Some(ref val) = cell.value {
@@ -2251,9 +2254,13 @@ impl<F: FlushTarget> TableStore<F> {
                             }
                         }
                     }
-                }
-                if !text.is_empty() {
-                    fti_builder.add_document(pk_bytes, text.trim());
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        fti_builder.add_document(doc_key, text.trim());
+                    }
                 }
             }
             match fti_builder.finish() {
@@ -4433,9 +4440,10 @@ impl<F: FlushTarget> TableStore<F> {
         let mut builder = FullTextIndexBuilder::new();
         let mut add_partitions = |partitions: Vec<Partition>| {
             for partition in partitions {
-                let pk_bytes = partition.key.key.as_bytes().to_vec();
-                let mut text = String::new();
+                let pk_bytes = partition.key.key.as_bytes();
+                // Per-row document keyed by the full primary key (t_da51e20c).
                 for row in &partition.rows {
+                    let mut text = String::new();
                     for (col_idx, cell) in &row.cells {
                         if *col_idx as usize == *col_pos {
                             if let Some(ref val) = cell.value {
@@ -4446,9 +4454,13 @@ impl<F: FlushTarget> TableStore<F> {
                             }
                         }
                     }
-                }
-                if !text.is_empty() {
-                    builder.add_document(pk_bytes, text.trim());
+                    if !text.is_empty() {
+                        let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk_bytes,
+                            &row.clustering,
+                        );
+                        builder.add_document(doc_key, text.trim());
+                    }
                 }
             }
         };
@@ -4470,6 +4482,125 @@ impl<F: FlushTarget> TableStore<F> {
             ferrosa_common::Error::InvalidFormat(format!("fts_match memtable index error: {e}"))
         })?;
 
+        Ok(reader
+            .search(&parsed_query)
+            .into_iter()
+            .map(|hit| (hit.partition_key, hit.score))
+            .collect())
+    }
+
+    /// Full-text search over LIVE SSTables that have NO on-disk FTI sidecar.
+    ///
+    /// `covered_gens` are the SSTable generations that already have a
+    /// `{gen}-FTI-{index}.db` sidecar on disk (searched directly by the engine).
+    /// For every other live SSTable the sidecar may be missing transiently — e.g.
+    /// after compaction swaps in the merged SSTable but before its sidecar is
+    /// (re)built (the eager index build is async in production), or after a
+    /// sidecar write failure. Without this fallback those rows are invisible to
+    /// `fts_match`, which on a multi-node cluster made every replica's
+    /// scatter-gather union empty at once → non-deterministic 0 rows
+    /// (BUG-F-007 / t_0455c0a1). We build a transient FTI over each such
+    /// SSTable's indexed column and run the same query, so a stable row is never
+    /// transiently dropped from full-text search.
+    pub fn fulltext_sstable_scan_missing_sidecar(
+        &self,
+        index_name: &str,
+        query: &str,
+        covered_gens: &std::collections::HashSet<String>,
+    ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
+        use ferrosa_index::fulltext::builder::{serialize_fti, FullTextIndexBuilder};
+        use ferrosa_index::fulltext::query::parse_fts_query;
+        use ferrosa_index::fulltext::reader::FullTextIndexReader;
+
+        let Some((_, col_pos)) = self
+            .fulltext_indexes
+            .iter()
+            .find(|(name, _)| name == index_name)
+        else {
+            return Ok(vec![]);
+        };
+        let col_pos = *col_pos;
+
+        let parsed_query = parse_fts_query(query).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
+        })?;
+
+        let schema = self.schema.load();
+        let guard = self.view.load();
+        let mut builder = FullTextIndexBuilder::new();
+        let mut any_docs = false;
+        for desc in guard.sstables.iter() {
+            // SSTables with a sidecar are already covered by the engine's direct
+            // sidecar search; only scan the ones that are (transiently) missing.
+            if covered_gens.contains(&desc.gen) || self.is_sstable_quarantined(&desc.gen) {
+                continue;
+            }
+            let sstable = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: open reader failed");
+                    continue;
+                }
+            };
+            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
+            let mut iter = match sstable.partitions_iter() {
+                Ok(it) => it,
+                Err(e) => {
+                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: broken iterator");
+                    continue;
+                }
+            };
+            loop {
+                match iter.next_partition() {
+                    Ok(Some(mut p)) => {
+                        mapping.remap_partition(&mut p);
+                        let pk_bytes = p.key.key.as_bytes();
+                        // Per-row document keyed by the full primary key (t_da51e20c).
+                        for row in &p.rows {
+                            let mut text = String::new();
+                            for (col_idx, cell) in &row.cells {
+                                if *col_idx as usize == col_pos {
+                                    if let Some(ref val) = cell.value {
+                                        if let Ok(s) = std::str::from_utf8(val) {
+                                            text.push_str(s);
+                                            text.push(' ');
+                                        }
+                                    }
+                                }
+                            }
+                            if !text.is_empty() {
+                                let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
+                                    pk_bytes,
+                                    &row.clustering,
+                                );
+                                builder.add_document(doc_key, text.trim());
+                                any_docs = true;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: decode error");
+                        break;
+                    }
+                }
+            }
+        }
+        drop(guard);
+
+        if !any_docs {
+            return Ok(vec![]);
+        }
+        let fti = builder.build();
+        if fti.doc_count == 0 {
+            return Ok(vec![]);
+        }
+        let bytes = serialize_fti(&fti).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match sstable index error: {e}"))
+        })?;
+        let reader = FullTextIndexReader::open(bytes).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match sstable index error: {e}"))
+        })?;
         Ok(reader
             .search(&parsed_query)
             .into_iter()

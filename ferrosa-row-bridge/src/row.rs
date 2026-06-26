@@ -7,9 +7,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferrosa_common::{CellValue, CqlType, CqlValue, DecoratedKey};
+use ferrosa_common::{CellValue, CqlType, CqlValue, DecoratedKey, PartitionKey};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
-use crate::codec::decode_value;
+use crate::codec::{decode_value, encode_value};
+use crate::RowBridgeError;
 
 /// Convert a storage `Partition` back to result rows for CQL RESULT encoding.
 ///
@@ -320,4 +322,168 @@ pub fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
         pos = end;
     }
     components
+}
+
+// ---------------------------------------------------------------------------
+// Write-direction row assembly — the single canonical encoder shared by the
+// CQL front-end (ferrosa-cql re-exports these) and the Postgres front-end.
+// ---------------------------------------------------------------------------
+
+/// Build a partition's [`DecoratedKey`] from its partition-key column values: a
+/// single component encoded bare, a composite as `[2-byte len][bytes][0x00]`
+/// per component (the engine's key format). `pk_types` is accepted for
+/// signature stability; encoding is value-driven.
+pub fn build_decorated_key(
+    pk_values: &[CqlValue],
+    _pk_types: &[CqlType],
+) -> Result<DecoratedKey, RowBridgeError> {
+    if pk_values.is_empty() {
+        return Err(RowBridgeError(
+            "partition key must have at least one column".to_string(),
+        ));
+    }
+    let bytes = if pk_values.len() == 1 {
+        encode_value(&pk_values[0])
+    } else {
+        let mut buf = Vec::new();
+        for val in pk_values {
+            let encoded = encode_value(val);
+            let len = u16::try_from(encoded.len())
+                .map_err(|_| RowBridgeError("partition key component too large".to_string()))?;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(&encoded);
+            buf.push(0x00);
+        }
+        buf
+    };
+    Ok(DecoratedKey::new(PartitionKey::new(bytes)))
+}
+
+/// Encode clustering-column values into the engine's clustering-key bytes: a
+/// single value bare, multiple length-prefixed and concatenated.
+pub fn encode_clustering(values: &[CqlValue]) -> Vec<u8> {
+    if values.is_empty() {
+        return vec![];
+    }
+    if values.len() == 1 {
+        return encode_value(&values[0]);
+    }
+    let mut buf = Vec::new();
+    for val in values {
+        let encoded = encode_value(val);
+        let len = (encoded.len() as u16).to_be_bytes();
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(&encoded);
+    }
+    buf
+}
+
+/// Build a storage [`Row`] from non-key column values + clustering values.
+///
+/// - `column_values`: `(storage_column_index, value)` for non-key columns.
+/// - `clustering_values`: clustering-column values.
+/// - `timestamp`: write timestamp (microseconds); `ttl`: optional seconds.
+///
+/// An explicit `Null` emits a cell tombstone (Cassandra delete semantics), not a
+/// live empty cell. Cells are sorted by column index — the SSTable reader reads
+/// them in index order, so out-of-order cells corrupt reads.
+pub fn build_row(
+    column_values: &[(u16, CqlValue)],
+    clustering_values: &[CqlValue],
+    timestamp: i64,
+    ttl: Option<i32>,
+) -> Row {
+    let clustering = encode_clustering(clustering_values);
+    let mut cells: Vec<(u16, CellValue)> = column_values
+        .iter()
+        .map(|(idx, val)| {
+            if matches!(val, CqlValue::Null) {
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let local_deletion_time = i32::try_from(now_secs).unwrap_or(i32::MAX);
+                return (*idx, CellValue::tombstone(timestamp, local_deletion_time));
+            }
+            let encoded = encode_value(val);
+            let cell = match ttl {
+                Some(ttl_secs) => {
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let local_deletion_time =
+                        i32::try_from(now_secs.saturating_add(ttl_secs as u64)).unwrap_or(i32::MAX);
+                    CellValue::expiring(encoded, timestamp, ttl_secs, local_deletion_time)
+                }
+                None => CellValue::live(encoded, timestamp),
+            };
+            (*idx, cell)
+        })
+        .collect();
+    cells.sort_by_key(|(idx, _)| *idx);
+
+    let primary_key_liveness = match ttl {
+        Some(ttl_secs) => {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let local_deletion_time =
+                i32::try_from(now_secs.saturating_add(ttl_secs as u64)).unwrap_or(i32::MAX);
+            LivenessInfo::with_ttl(timestamp, ttl_secs, local_deletion_time)
+        }
+        None => LivenessInfo::with_timestamp(timestamp),
+    };
+
+    Row {
+        clustering,
+        cells,
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness,
+    }
+}
+
+/// Build a storage [`Row`] representing a deletion. Empty `delete_columns` is a
+/// row-level deletion (a partition/row tombstone); a non-empty list tombstones
+/// each named column. `clustering_values` locate the row; `timestamp` is micros.
+pub fn build_delete_row(
+    delete_columns: &[u16],
+    clustering_values: &[CqlValue],
+    timestamp: i64,
+) -> Row {
+    let clustering = encode_clustering(clustering_values);
+
+    // System clock: the one allowed unwrap.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    if delete_columns.is_empty() {
+        Row {
+            clustering,
+            cells: vec![],
+            deletion: DeletionTime::new(timestamp, now_secs),
+            primary_key_liveness: LivenessInfo::NONE,
+        }
+    } else {
+        // Column-level deletion: tombstone each specified column. Cells MUST be
+        // sorted by column index — same requirement as build_row.
+        let mut cells: Vec<(u16, CellValue)> = delete_columns
+            .iter()
+            .map(|&idx| {
+                let ldt = i32::try_from(now_secs).unwrap_or(i32::MAX);
+                (idx, CellValue::tombstone(timestamp, ldt))
+            })
+            .collect();
+        cells.sort_by_key(|(idx, _)| *idx);
+
+        Row {
+            clustering,
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        }
+    }
 }

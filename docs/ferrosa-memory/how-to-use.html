@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<!-- ferrosadb.com marketing site -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How to Use Ferrosa Memory — The Day-to-Day Agent Workflow</title>
+  <meta name="description" content="How to actually use Ferrosa Memory in an agent workflow: the ingest → retrieve → link → record → forget loop, ingesting your whole codebase so the agent retrieves instead of grepping, progressive two-tier tool disclosure, and common multi-session workflows.">
+  <link rel="icon" type="image/svg+xml" href="assets/brand/fm-logo.svg">
+  <style>
+    :root {
+      --bg-primary: #05070c;
+      --bg-secondary: #09111f;
+      --bg-card: #0e1828;
+      --bg-card-hover: #142337;
+      --text-primary: #e8eef7;
+      --text-secondary: #9fb0c6;
+      --text-muted: #647794;
+      --accent: #348cff;
+      --accent-glow: rgba(52, 140, 255, 0.18);
+      --accent-secondary: #7ee7ff;
+      --accent-cool: #7ee7ff;
+      --accent-steel: #516d92;
+      --accent-green: #6bc9a0;
+      --border: #17273d;
+      --border-hover: #25395a;
+      --code-bg: #060b14;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Navigation ── */
+    nav {
+      position: fixed;
+      top: 0;
+      width: 100%;
+      z-index: 100;
+      background: rgba(5, 7, 12, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+    }
+
+    nav .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    nav .logo {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    nav .logo span { color: var(--accent); }
+
+    nav .nav-links {
+      display: flex;
+      gap: 2rem;
+      list-style: none;
+    }
+
+    nav .nav-links a {
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    nav .nav-links a:hover { color: var(--text-primary); }
+
+    nav .nav-cta {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.5rem 1.25rem;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      transition: opacity 0.2s;
+    }
+
+    nav .nav-cta:hover { opacity: 0.9; }
+
+    nav .nav-toggle {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 2.5rem;
+      height: 2.5rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-card);
+      color: var(--text-primary);
+      cursor: pointer;
+    }
+
+    nav .nav-toggle span,
+    nav .nav-toggle span::before,
+    nav .nav-toggle span::after {
+      display: block;
+      width: 1.1rem;
+      height: 2px;
+      border-radius: 2px;
+      background: currentColor;
+      content: '';
+      transition: transform 0.2s, opacity 0.2s;
+    }
+
+    nav .nav-toggle span { position: relative; }
+    nav .nav-toggle span::before { position: absolute; transform: translateY(-6px); }
+    nav .nav-toggle span::after { position: absolute; transform: translateY(6px); }
+
+    nav.nav-open .nav-toggle span { background: transparent; }
+    nav.nav-open .nav-toggle span::before { background: var(--text-primary); transform: rotate(45deg); }
+    nav.nav-open .nav-toggle span::after { background: var(--text-primary); transform: rotate(-45deg); }
+
+    /* ── Sections ── */
+    section {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 6rem 2rem;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      padding-top: 11rem;
+      padding-bottom: 6rem;
+      text-align: center;
+      position: relative;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -60%);
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-logo {
+      width: 88px;
+      height: 88px;
+      border-radius: 22px;
+      margin: 0 auto 1.75rem;
+      display: block;
+      box-shadow: 0 10px 40px rgba(52, 140, 255, 0.25);
+      position: relative;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      padding: 0.375rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2rem;
+    }
+
+    .hero-badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.5rem;
+      position: relative;
+    }
+
+    .hero h1 .gradient {
+      background: linear-gradient(135deg, var(--accent), var(--accent-secondary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-secondary);
+      max-width: 680px;
+      margin: 0 auto 2.5rem;
+      line-height: 1.7;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 30px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--text-primary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1rem;
+      border: 1px solid var(--border);
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--border-hover);
+      background: var(--bg-card-hover);
+    }
+
+    /* ── Section headers ── */
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }
+
+    .section-title {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+      line-height: 1.15;
+    }
+
+    .section-subtitle {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      max-width: 680px;
+      line-height: 1.7;
+    }
+
+    .section-subtitle.centered {
+      margin: 0 auto;
+      text-align: center;
+    }
+
+    .section-title.centered { text-align: center; }
+    .section-label.centered { text-align: center; }
+
+    /* ── Problem section ── */
+    .problem {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .problem section { padding: 5rem 2rem; }
+
+    /* ── Feature grid ── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-top: 3rem;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2.25rem;
+      transition: border-color 0.2s, transform 0.15s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--border-hover);
+      transform: translateY(-2px);
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.25rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .feature-icon.steel { background: rgba(52, 140, 255, 0.14); }
+    .feature-icon.cyan { background: rgba(126, 231, 255, 0.14); }
+    .feature-icon.cql { background: rgba(124, 156, 245, 0.12); }
+    .feature-icon.graph { background: rgba(107, 201, 160, 0.12); }
+    .feature-icon.lock { background: rgba(200, 130, 240, 0.12); }
+    .feature-icon.index { background: rgba(100, 200, 220, 0.12); }
+    .feature-icon.observe { background: rgba(240, 200, 100, 0.12); }
+
+    .feature-card h3 {
+      font-size: 1.1875rem;
+      font-weight: 700;
+      margin-bottom: 0.625rem;
+    }
+
+    .feature-card p {
+      font-size: 0.9375rem;
+      color: var(--text-secondary);
+      line-height: 1.65;
+    }
+
+    /* ── Comparison-style alt section ── */
+    .comparison {
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── CTA section ── */
+    .cta-section {
+      text-align: center;
+      padding: 6rem 2rem;
+    }
+
+    .cta-section h2 {
+      font-size: clamp(2rem, 4vw, 3rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 1rem;
+    }
+
+    .cta-section p {
+      font-size: 1.125rem;
+      color: var(--text-secondary);
+      margin-bottom: 2.5rem;
+      max-width: 520px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* ── Beta Banner ── */
+    .beta-banner {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      position: fixed;
+      top: 64px;
+      width: 100%;
+      z-index: 99;
+    }
+
+    .beta-tag {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 0.125rem 0.5rem;
+      border-radius: 4px;
+      margin-right: 0.375rem;
+      vertical-align: middle;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 768px) {
+      .features-grid { grid-template-columns: 1fr; }
+      nav { padding: 0 1rem; }
+      nav .nav-inner {
+        height: 64px;
+        min-height: 64px;
+        gap: 0.75rem;
+        padding: 0;
+        position: relative;
+      }
+      body { overflow-x: hidden; }
+      nav .logo { margin-right: auto; }
+      nav .nav-cta {
+        display: inline-flex;
+        flex-shrink: 0;
+        padding: 0.5rem 0.75rem;
+      }
+      nav .nav-toggle { display: inline-flex; }
+      nav .nav-links {
+        position: fixed;
+        top: 64px;
+        left: 0;
+        right: 0;
+        display: none;
+        flex-direction: column;
+        gap: 0;
+        padding: 0.5rem 1rem 1rem;
+        background: rgba(5, 7, 12, 0.98);
+        border-bottom: 1px solid var(--border);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+      }
+      nav.nav-open .nav-links { display: flex; }
+      nav .nav-links li { list-style: none; }
+      nav .nav-links a {
+        display: block;
+        padding: 0.75rem 0;
+        white-space: nowrap;
+      }
+      section {
+        width: 100%;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        overflow-wrap: anywhere;
+      }
+      .hero { padding-top: 11rem; }
+      .hero h1 { font-size: clamp(2rem, 11vw, 3rem); }
+      .hero p { font-size: 1rem; }
+      .hero-actions { flex-direction: column; align-items: stretch; }
+      .btn-primary,
+      .btn-secondary { width: 100%; text-align: center; }
+      .beta-banner { top: 148px; font-size: 0.75rem; }
+    }
+  </style>
+
+<style>
+  .suite-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap:1.5rem; margin-top:2.5rem; }
+  .kicker { color:var(--accent); font-size:.75rem; letter-spacing:.12em; font-weight:800; text-transform:uppercase; margin-bottom:.75rem; }
+  .cool { color:var(--accent-cool); }
+  .pill-row { display:flex; flex-wrap:wrap; gap:.5rem; margin:1.25rem 0; }
+  .pill { border:1px solid var(--border); background:var(--bg-secondary); color:var(--text-secondary); border-radius:999px; padding:.35rem .75rem; font-size:.8125rem; }
+  .doc-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:1rem; margin-top:1.5rem; }
+  .doc-card { background:var(--bg-card); border:1px solid var(--border); border-radius:14px; padding:1.4rem; transition:border-color .2s; }
+  .doc-card:hover { border-color:var(--border-hover); }
+  .doc-card h3 { margin-bottom:.5rem; }
+  .doc-card p, .suite-card p { color:var(--text-secondary); }
+  .doc-card .tag { display:inline-block; font-family:var(--font-mono); font-size:.72rem; color:var(--accent-cool); margin-bottom:.5rem; letter-spacing:.04em; }
+  .code-block { background:var(--code-bg); border:1px solid var(--border); border-radius:14px; padding:1.25rem; overflow:auto; margin:1rem 0; }
+  .code-block code, pre { font-family:var(--font-mono); font-size:.875rem; color:#cfe0f5; }
+  .note { border-left:3px solid var(--accent-cool); background:rgba(126,231,255,.08); padding:1rem 1.25rem; border-radius:0 12px 12px 0; color:var(--text-secondary); margin:1.5rem 0; }
+  .two-col { display:grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap:2rem; align-items:start; }
+  @media (max-width: 800px) { .two-col { grid-template-columns:1fr; } }
+
+  /* Loop diagram — built from existing palette tokens. */
+  .loop-row { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:.75rem; margin:1.75rem 0 1rem; }
+  .loop-step { border:1px solid var(--border); border-radius:14px; padding:1rem 1.1rem; background:var(--bg-card); }
+  .loop-step .loop-verb { font-weight:800; color:var(--text-primary); letter-spacing:-.01em; }
+  .loop-step .loop-tool { font-family:var(--font-mono); font-size:.74rem; color:var(--accent-cool); display:block; margin-top:.35rem; }
+  .loop-step .loop-why { color:var(--text-secondary); font-size:.86rem; margin-top:.5rem; }
+  .loop-step.ingest { border-color:var(--accent); }
+  .loop-step.retrieve { border-color:var(--accent-cool); }
+  .loop-step.link { border-color:var(--accent-steel); }
+  .loop-step.record { border-color:var(--accent-green); }
+  .loop-step.forget { border-color:#c882f0; }
+
+  .before-after { display:grid; grid-template-columns: 1fr 1fr; gap:1.25rem; margin-top:1.75rem; }
+  @media (max-width: 700px) { .before-after { grid-template-columns:1fr; } }
+  .ba-card { border:1px solid var(--border); border-radius:14px; padding:1.4rem; background:var(--bg-card); }
+  .ba-card.before { border-color:var(--border-hover); }
+  .ba-card.after { border-color:var(--accent-green); }
+  .ba-card h4 { font-size:1rem; font-weight:700; margin-bottom:.6rem; }
+  .ba-card.before h4 { color:var(--text-secondary); }
+  .ba-card.after h4 { color:var(--accent-green); }
+  .ba-card ul { margin:0; padding-left:1.1rem; }
+  .ba-card li { color:var(--text-secondary); font-size:.9rem; margin-bottom:.4rem; }
+
+  .step-row { display:grid; grid-template-columns: auto 1fr; gap:1rem; align-items:start; margin-top:1.1rem; }
+  .step-num { width:2rem; height:2rem; flex:none; border-radius:8px; background:rgba(52,140,255,.14); color:var(--accent); font-weight:800; font-family:var(--font-mono); display:flex; align-items:center; justify-content:center; }
+  .step-row p { color:var(--text-secondary); }
+  .step-row h4 { font-size:1.0625rem; font-weight:700; margin-bottom:.25rem; }
+
+  .tier-strip { display:grid; grid-template-columns: 1fr 1fr; gap:1.25rem; margin-top:2rem; }
+  @media (max-width: 700px) { .tier-strip { grid-template-columns:1fr; } }
+  .tier-box { border:1px solid var(--border); border-radius:16px; padding:1.6rem; background:var(--bg-card); }
+  .tier-box .tier-count { font-family:var(--font-mono); font-weight:800; color:var(--accent-cool); font-size:1.6rem; }
+  .tier-box h3 { margin:.4rem 0 .5rem; }
+  .tier-box p { color:var(--text-secondary); font-size:.92rem; }
+  .habit-list { list-style:none; margin-top:1.5rem; display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:.75rem; }
+  .habit-list li { border:1px solid var(--border); border-radius:12px; padding:1rem 1.1rem; background:var(--bg-card); color:var(--text-secondary); font-size:.92rem; }
+  .habit-list li b { color:var(--text-primary); font-weight:700; display:block; margin-bottom:.25rem; }
+</style>
+
+</head>
+<body>
+<!-- ═══════════════════ Navigation ═══════════════════ -->
+<nav>
+  <div class="nav-inner">
+    <a href="/" class="logo" style="display:flex;align-items:center;gap:0.5rem;">
+      <img src="assets/brand/fm-logo.svg" alt="Fm" width="28" height="28" style="border-radius:7px;">
+      ferrosa <span>memory</span>
+    </a>
+    <ul class="nav-links" id="site-nav-links">
+      <li><a href="./">Overview</a></li>
+      <li><a href="how-it-works.html">How it works</a></li>
+      <li><a href="how-to-use.html">How to use</a></li>
+      <li><a href="tools.html">Tools</a></li>
+      <li><a href="compare.html">Compare</a></li>
+      <li><a href="getting-started.html">Setup</a></li>
+      <li><a href="../database/">Database</a></li>
+      <li><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+    </ul>
+    <a href="getting-started.html" class="nav-cta">Get started</a>
+    <button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button>
+  </div>
+</nav>
+
+<div class="beta-banner">
+  <span class="beta-tag">Developer Preview</span> Ferrosa Memory 0.16 — structured, linked, auditable memory for agentic systems.
+</div>
+
+<!-- ═══════════════════ Hero ═══════════════════ -->
+<section class="hero">
+  <img class="hero-logo" src="assets/brand/fm-logo.svg" alt="Ferrosa Memory logo">
+  <div class="hero-badge"><span class="dot"></span> Usage guide · 0.15 · Developer Preview</div>
+  <h1>How to <span class="gradient">use it.</span></h1>
+  <p>A hands-on guide to putting Ferrosa Memory to work in a real agent loop — ingest your codebase once, retrieve instead of grepping, link what relates, record decisions as they evolve, and forget on purpose.</p>
+  <div class="hero-actions">
+    <a href="#loop" class="btn-primary">Start with the loop</a>
+    <a href="#codebase" class="btn-secondary">Ingest your codebase</a>
+  </div>
+</section>
+
+<!-- ═══════════════════ The core loop ═══════════════════ -->
+<section id="loop">
+  <div class="section-label cool">The core loop</div>
+  <h2 class="section-title">Five verbs you'll use every session.</h2>
+  <p class="section-subtitle">Day-to-day, Ferrosa Memory comes down to a short loop. Ingest what you learn, retrieve before you do work, link facts that relate, record facts as they change, and forget deliberately when something is wrong or stale. The MCP tool names map straight onto these verbs.</p>
+
+  <div class="loop-row">
+    <div class="loop-step ingest">
+      <span class="loop-verb">Ingest</span>
+      <span class="loop-tool">smart_ingest</span>
+      <span class="loop-why">Store an insight, decision, or relationship. The server decides create / update / supersede / skip.</span>
+    </div>
+    <div class="loop-step retrieve">
+      <span class="loop-verb">Retrieve</span>
+      <span class="loop-tool">hybrid_search</span>
+      <span class="loop-why">Ask in natural language; get a fused, ranked answer before you grep or read files.</span>
+    </div>
+    <div class="loop-step link">
+      <span class="loop-verb">Link</span>
+      <span class="loop-tool">create_edge</span>
+      <span class="loop-why">Connect two related facts with a typed edge. Connected facts are knowledge.</span>
+    </div>
+    <div class="loop-step record">
+      <span class="loop-verb">Record</span>
+      <span class="loop-tool">write_temporal_fact</span>
+      <span class="loop-why">Note a value that changes over time. The old one is superseded, not erased.</span>
+    </div>
+    <div class="loop-step forget">
+      <span class="loop-verb">Forget</span>
+      <span class="loop-tool">forget</span>
+      <span class="loop-why">Propose candidates, review the blast radius, then confirm. Reversible by default.</span>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:2.5rem;">
+    <div>
+      <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:.5rem;">Ingest — store what you learned</h3>
+      <div class="code-block"><pre><code>{
+  "tool": "smart_ingest",
+  "arguments": {
+    "entity_name": "Auth token rotation",
+    "entity_type": "decision",
+    "content": "Access tokens rotate every 15 min; refresh tokens are single-use and stored hashed."
+  }
+}</code></pre></div>
+      <p style="color:var(--text-secondary); font-size:.92rem;">Store insights, decisions, relationships, and facts — not raw file contents. <code>smart_ingest</code> deduplicates against what's already there and supersedes when it recognizes an update.</p>
+
+      <h3 style="font-size:1.15rem; font-weight:700; margin:1.75rem 0 .5rem;">Link — connect what relates</h3>
+      <div class="code-block"><pre><code>{
+  "tool": "create_edge",
+  "arguments": {
+    "from": "Auth token rotation",
+    "to": "Session store schema",
+    "edge_type": "depends_on"
+  }
+}</code></pre></div>
+      <p style="color:var(--text-secondary); font-size:.92rem;">After learning two related facts, link them. Edge types include <code>depends_on</code>, <code>contains</code>, <code>part_of</code>, <code>related_to</code>, <code>calls</code>, <code>implements</code>, <code>uses</code>, and <code>references</code>.</p>
+    </div>
+    <div>
+      <h3 style="font-size:1.15rem; font-weight:700; margin-bottom:.5rem;">Retrieve — ask before you grep</h3>
+      <div class="code-block"><pre><code>{
+  "tool": "hybrid_search",
+  "arguments": {
+    "query": "how do we rotate auth tokens",
+    "limit": 5
+  }
+}</code></pre></div>
+      <p style="color:var(--text-secondary); font-size:.92rem;">If <code>hybrid_search</code> returns what you need, you're done — no grep, no find, no re-reading files. For document-chunk hits, call <code>get_chunk_context</code> to expand around a match and recover the surrounding lines.</p>
+
+      <h3 style="font-size:1.15rem; font-weight:700; margin:1.75rem 0 .5rem;">Record — facts that evolve</h3>
+      <div class="code-block"><pre><code>{
+  "tool": "write_temporal_fact",
+  "arguments": {
+    "entity_id": "&lt;entity UUID from smart_ingest&gt;",
+    "fact_text": "Rotation window changed from 15 min to 10 min."
+  }
+}</code></pre></div>
+      <p style="color:var(--text-secondary); font-size:.92rem;">Temporal facts are timestamped and superseded rather than overwritten. Retrieval returns the latest value by default; the full chain stays inspectable for audit.</p>
+    </div>
+  </div>
+
+  <div class="note">Forgetting is two-phase and safe to use day-to-day: call <code>forget</code> with a query to <em>propose</em> candidates and see each one's blast radius, then call it again with <code>confirm: true</code> and the IDs you approved. The default mode is a reversible retraction (restore with <code>restore_forgotten</code>); a hard delete is permanent. Never confirm on a user's behalf.</div>
+</section>
+
+<!-- ═══════════════════ Ingest your codebase ═══════════════════ -->
+<section id="codebase" class="problem">
+  <section>
+    <div class="section-label cool">The headline win</div>
+    <h2 class="section-title">Ingest your codebase. Stop grepping.</h2>
+    <p class="section-subtitle">The single most useful habit: ingest your whole codebase and docs into memory once, then let the agent <em>retrieve</em> the relevant functions and files semantically — instead of grepping, listing directories, and re-reading whole files at the start of every session.</p>
+
+    <div class="step-row">
+      <div class="step-num">1</div>
+      <div>
+        <h4>Ingest the repo and its docs — once</h4>
+        <p>Walk the source tree and feed files through <code>smart_ingest</code> (or <code>batch_ingest</code> for bulk). Documents are stored as a document → section → chunk hierarchy with semantic previous/next links, so a single hit can be expanded back into full surrounding context. Re-run only on the files that changed to keep memory fresh — you don't re-ingest the world every session.</p>
+      </div>
+    </div>
+    <div class="step-row">
+      <div class="step-num">2</div>
+      <div>
+        <h4>Retrieve functions and files semantically</h4>
+        <p>Next session, the agent asks <code>hybrid_search</code> "where do we validate refresh tokens?" and gets the exact function back — fused from vector, lexical (BM25), phonetic, and graph signals. No directory listing, no full-file re-read to locate one symbol. When a chunk hit needs its neighbors, <code>get_chunk_context</code> pulls the adjacent chunks.</p>
+      </div>
+    </div>
+    <div class="step-row">
+      <div class="step-num">3</div>
+      <div>
+        <h4>Reuse work the agent already did</h4>
+        <p>Memoization caches the results of completed, deterministic sub-calls by content hash. When the same sub-task recurs, the prior result comes back from cache instead of paying for a redundant LLM call. And session-restore hooks mean the agent opens each session already knowing what it was doing — it doesn't re-derive context it computed last time.</p>
+      </div>
+    </div>
+
+    <div class="before-after">
+      <div class="ba-card before">
+        <h4>Without memory — every session</h4>
+        <ul>
+          <li>Grep the tree to find where a function lives.</li>
+          <li>List directories to rebuild a mental map.</li>
+          <li>Re-read a 2,000-line file to locate one function.</li>
+          <li>Re-derive context and decisions computed last time.</li>
+          <li>Repeat the same LLM sub-calls on the same inputs.</li>
+        </ul>
+      </div>
+      <div class="ba-card after">
+        <h4>With memory — after one ingest</h4>
+        <ul>
+          <li>Ask in natural language; get the relevant function back.</li>
+          <li>Follow typed edges instead of re-reading to map structure.</li>
+          <li>Expand one chunk's neighbors instead of a whole file.</li>
+          <li>Open the session already knowing the prior plan.</li>
+          <li>Reuse cached sub-call results instead of recomputing.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="note">Why this saves tokens, honestly: every grep result, directory listing, and full-file re-read is text that lands in the model's context window and is paid for on every turn it stays there. Retrieving a ranked, scoped answer puts only the relevant lines in context. Memoization skips redundant LLM sub-calls entirely, and session-restore avoids re-deriving context that was already computed. The mechanism is "load less, recompute less" — the exact savings depend on your repo, your queries, and your harness.</div>
+  </section>
+</section>
+
+<!-- ═══════════════════ Progressive tool disclosure ═══════════════════ -->
+<section id="disclosure">
+  <div class="section-label cool">Progressive tool disclosure</div>
+  <h2 class="section-title">A focused toolbox first. The rest when you need it.</h2>
+  <p class="section-subtitle">Ferrosa Memory exposes around 80 MCP tools — but it doesn't hand them all to the model at once. They're organized into two tiers and disclosed progressively: a small, focused everyday set is exposed by default, and the fuller toolbox is revealed when the task reaches for it.</p>
+
+  <div class="tier-strip">
+    <div class="tier-box">
+      <span class="tier-count">21</span>
+      <h3>Tier 1 — default</h3>
+      <p>The everyday memory loop: <code>smart_ingest</code> and <code>hybrid_search</code>, typed edges, context expansion, triggered intentions, durable session tasks, feedback, stats, runtime config, and <code>forget</code>. This is what the agent sees first.</p>
+    </div>
+    <div class="tier-box">
+      <span class="tier-count">58</span>
+      <h3>Tier 2 — on demand</h3>
+      <p>Batch work, memo &amp; plan tracking, the full intention lifecycle, trajectory folds, bi-temporal facts, stored skills, consolidation and graph inference, and the governance plane — surfaced by passing <code>include_all: true</code> on <code>tools/list</code>.</p>
+    </div>
+  </div>
+
+  <p style="color:var(--text-secondary); margin-top:1.75rem;">To reveal Tier 2, your client sends <code>include_all: true</code> on the MCP <code>tools/list</code> request; the <code>all_tools</code> tool also enumerates the full catalog from inside a session. The agent effectively "graduates" to more tools as the work demands them.</p>
+
+  <div class="code-block" style="margin-top:1rem;"><pre><code>// default — focused everyday set
+{ "method": "tools/list", "params": {} }
+
+// reveal the full toolbox when the task needs it
+{ "method": "tools/list", "params": { "include_all": true } }</code></pre></div>
+
+  <div class="two-col" style="margin-top:2rem;">
+    <div class="feature-card">
+      <div class="feature-icon cyan">🪶</div>
+      <h3>Fewer tokens spent on tool schemas</h3>
+      <p>Every tool definition the model sees is text in its context window. Loading a focused default set instead of all ~80 schemas means fewer tokens spent on tool definitions before the agent has done any work.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon steel">🎯</div>
+      <h3>Less chance of the wrong tool</h3>
+      <p>A shorter, focused list is easier for the model to choose from correctly. The advanced and operator tools stay out of the way until a task actually calls for batch work, folds, or the governance plane — then they're one flag away.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ Common workflows ═══════════════════ -->
+<section id="workflows" class="comparison">
+  <section>
+    <div class="section-label cool">Common workflows</div>
+    <h2 class="section-title">A few shapes that show up again and again.</h2>
+    <p class="section-subtitle">The same loop supports very different jobs. Here are three concrete ones.</p>
+    <div class="doc-grid">
+      <div class="doc-card">
+        <span class="tag">coding agent</span>
+        <h3>A codebase that persists across sessions</h3>
+        <p>Ingest the repo and docs once, and record decisions as they're made. Next session, the agent runs <code>check_intentions</code> and a <code>hybrid_search</code> at startup, opening with what it already knows — the codebase map, the open decisions, and where it left off — before reading a single file.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">research · notes</span>
+        <h3>Notes that accumulate into knowledge</h3>
+        <p>Ingest papers, articles, and your own notes as you go; link findings with <code>create_edge</code> so related ideas connect instead of piling up. Background consolidation surfaces relationships between notes that arrived separately, and <code>hybrid_search</code> recalls them by meaning later — not just by the words you happened to use.</p>
+      </div>
+      <div class="doc-card">
+        <span class="tag">team · workgroup</span>
+        <h3>One shared memory for a team</h3>
+        <p>Point several agents or teammates at the same Ferrosa Memory instance and they share one graph: a decision recorded by one is retrievable by all. Durable session tasks — a focus stack, working set, and recovery hints — survive restarts and support handoff, so an interrupted agent (or a colleague's) can pick up where the last left off.</p>
+      </div>
+    </div>
+    <div class="note">For shared or team deployments, use unique credentials and proper TLS/auth boundaries — the default local credentials are only appropriate for single-user development on loopback. See <a href="getting-started.html">Setup</a> for connecting an MCP client.</div>
+  </section>
+</section>
+
+<!-- ═══════════════════ Good habits ═══════════════════ -->
+<section id="habits">
+  <div class="section-label cool">Good habits</div>
+  <h2 class="section-title">Five habits that make memory pull its weight.</h2>
+  <p class="section-subtitle">Memory is only as useful as the loop around it. These habits keep recall sharp and the graph trustworthy.</p>
+  <ul class="habit-list">
+    <li><b>Ingest once, keep it fresh</b>Load the codebase and docs up front, then re-ingest only what changed. <code>smart_ingest</code> deduplicates and supersedes, so refreshes don't bloat the graph.</li>
+    <li><b>Let it retrieve before it greps</b>Make <code>hybrid_search</code> the first move, not a fallback. If it answers, you're done; if the first page misses, send <code>+1</code>/<code>-1</code> feedback and page on before reaching for grep.</li>
+    <li><b>Record decisions as facts</b>When something is decided or changes, write it with <code>smart_ingest</code> or <code>write_temporal_fact</code> and link it. Tomorrow's agent reasons over decisions, not just files.</li>
+    <li><b>Connect, don't isolate</b>After learning two related facts, <code>create_edge</code> between them. Connected facts are knowledge an agent can traverse; isolated facts are just data.</li>
+    <li><b>Forget deliberately, auditably</b>Use the two-phase <code>forget</code> — propose, review blast radius, then confirm. Prefer reversible retraction; every removal is journaled, so it's a deliberate act, not a guess.</li>
+  </ul>
+
+  <div class="two-col" style="margin-top:2.5rem;">
+    <div class="feature-card">
+      <div class="feature-icon steel">🧭</div>
+      <h3>Set up once</h3>
+      <p>Install the server, connect your MCP client, and wire the session hooks so recall and capture happen automatically. The <a href="getting-started.html">Setup guide</a> covers ports, embeddings, credentials, and harness hooks end to end.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon cyan">🔬</div>
+      <h3>Understand the internals</h3>
+      <p>Want to know how the fused ranking, bi-temporal facts, dream-cycle consolidation, and auditable forgetting actually work? The <a href="how-it-works.html">How it works</a> page walks the architecture layer by layer.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ CTA ═══════════════════ -->
+<section id="get-started" class="cta-section">
+  <h2>Set it up, then put it to work.</h2>
+  <p>Start by ingesting one repo and asking it a question. Then add the session hooks so the loop runs itself.</p>
+  <div class="hero-actions">
+    <a href="getting-started.html" class="btn-primary">Get started</a>
+    <a href="tools.html" class="btn-secondary">Browse the tools</a>
+  </div>
+</section>
+
+<footer>
+  <div style="max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; border-top: 1px solid var(--border); display:flex; justify-content:space-between; gap:2rem; flex-wrap:wrap; color:var(--text-muted);">
+    <div>Ferrosa Memory <span style="color:var(--accent);">0.15</span> · Developer preview</div>
+    <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+      <a href="./" style="color:var(--text-secondary); text-decoration:none;">Overview</a>
+      <a href="how-it-works.html" style="color:var(--text-secondary); text-decoration:none;">How it works</a>
+      <a href="how-to-use.html" style="color:var(--text-secondary); text-decoration:none;">How to use</a>
+      <a href="tools.html" style="color:var(--text-secondary); text-decoration:none;">Tools</a>
+      <a href="compare.html" style="color:var(--text-secondary); text-decoration:none;">Compare</a>
+      <a href="getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Setup</a>
+      <a href="../database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('nav').forEach((nav) => {
+    const toggle = nav.querySelector('.nav-toggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      const open = nav.classList.toggle('nav-open');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+    });
+    nav.querySelectorAll('.nav-links a').forEach((link) => {
+      link.addEventListener('click', () => {
+        nav.classList.remove('nav-open');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-label', 'Open navigation');
+      });
+    });
+  });
+</script>
+</body>
+</html>

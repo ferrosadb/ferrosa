@@ -15,7 +15,7 @@
 # Usage:
 #   curl -fsSL https://ferrosadb.com/install.sh | bash
 #   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --channel nightly
-#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --version v0.12.0 --no-service
+#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa"
@@ -32,12 +32,18 @@ CHANNEL="stable"   # stable|nightly
 FORCE="no"
 WANT_SERVICE=""    # ask|yes|no
 WANT_PASSWORD=""   # ask|yes|no
+# Install from a local release tarball instead of downloading from GitHub.
+# Used by the install smoke test (and devs) to exercise THIS script against a
+# just-built binary before it is published. Honors the `FERROSA_INSTALL_TARBALL`
+# env var or the `--tarball <path>` flag; requires `--version <label>`.
+LOCAL_TARBALL="${FERROSA_INSTALL_TARBALL:-}"
 
 # ---------- arg parsing ----------
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)      VERSION="$2"; shift 2 ;;
     --channel)      CHANNEL="$2"; shift 2 ;;
+    --tarball)      LOCAL_TARBALL="$2"; shift 2 ;;
     --force)        FORCE="yes"; shift ;;
     --no-service)   WANT_SERVICE="no"; shift ;;
     --service)      WANT_SERVICE="yes"; shift ;;
@@ -95,6 +101,7 @@ resolve_channel_tag() {
 }
 
 if [ -z "$VERSION" ]; then
+  [ -z "$LOCAL_TARBALL" ] || die "--tarball requires an explicit --version <label>"
   VERSION=$(resolve_channel_tag) || true
   [ -n "$VERSION" ] || die "no ${CHANNEL} release found at ${RELEASE_HOST}"
   say "resolved ${CHANNEL} channel to ${VERSION}"
@@ -127,16 +134,22 @@ TARBALL="ferrosa-${VERSION}-${TARGET}.tar.gz"
 URL="${RELEASE_HOST}/download/${VERSION}/${TARBALL}"
 SUMS_URL="${RELEASE_HOST}/download/${VERSION}/SHA256SUMS"
 
-# ---------- download + verify ----------
+# ---------- obtain the tarball (download, or use a local build) + verify ----------
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-say "downloading $TARBALL"
-curl -fsSL --output "$TMP/$TARBALL" "$URL"
-curl -fsSL --output "$TMP/SHA256SUMS" "$SUMS_URL"
+if [ -n "$LOCAL_TARBALL" ]; then
+  [ -f "$LOCAL_TARBALL" ] || die "local tarball not found: $LOCAL_TARBALL"
+  say "installing from local tarball $LOCAL_TARBALL (skipping download + checksum)"
+  cp "$LOCAL_TARBALL" "$TMP/$TARBALL"
+else
+  say "downloading $TARBALL"
+  curl -fsSL --output "$TMP/$TARBALL" "$URL"
+  curl -fsSL --output "$TMP/SHA256SUMS" "$SUMS_URL"
 
-say "verifying SHA256"
-( cd "$TMP" && grep "$TARBALL" SHA256SUMS | shasum -a 256 -c - ) \
-  || die "checksum verification FAILED"
+  say "verifying SHA256"
+  ( cd "$TMP" && grep "$TARBALL" SHA256SUMS | shasum -a 256 -c - ) \
+    || die "checksum verification FAILED"
+fi
 
 # ---------- install layout ----------
 say "installing to $INSTALL_ROOT"
@@ -242,9 +255,18 @@ do_password() {
     say "run later: $BIN_DIR/ferrosa-ctl auth set-password"
     return
   fi
+  # Under `curl … | bash` this script's stdin is the pipe, not a terminal, so
+  # ferrosa-ctl's masked prompt (rpassword reads stdin) can't disable echo —
+  # the password echoes in cleartext and the read never completes (hang). Bind
+  # the controlling terminal explicitly so the prompt + confirmation work.
+  if [ ! -r /dev/tty ]; then
+    say "no controlling terminal — skipping interactive password setup"
+    say "run later from a terminal: $BIN_DIR/ferrosa-ctl auth set-password --user ferrosa_admin"
+    return
+  fi
   say "set ferrosa_admin password (current default: ferrosa_admin)"
   # Exact flag shape pinned to the auth set-password CLI from PR (Task #8 re-brief)
-  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin
+  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin < /dev/tty
 }
 
 # Password is a first-install concern. On upgrade we never re-prompt (the

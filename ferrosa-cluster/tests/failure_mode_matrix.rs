@@ -183,7 +183,7 @@ async fn s_01_late_join_via_membership_changer_lands_in_openraft_voter_set() {
     // node.  Pre-Sprint-1 the raw client_write path could leave the
     // openraft side out of sync; the changer closes that gap.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     let new_host = Uuid::new_v4();
     let new_addr: std::net::SocketAddr = "127.0.0.1:9201".parse().unwrap();
@@ -220,7 +220,7 @@ async fn s_02_concurrent_late_joins_serialize_via_inprogress_retry() {
     // succeed; the second hits `InProgress` and the changer's
     // backoff retries.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     let h1 = Uuid::new_v4();
     let h2 = Uuid::new_v4();
@@ -249,7 +249,7 @@ async fn s_03_joiner_reaches_partitioned_non_leader_returns_error_no_panic() {
     // or silently dropping the join.  We isolate the non-leader and
     // dial via that node; expect a NotLeader/RaftError, never panic.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     let leader_id = cluster.leader_node().node_id;
     // Pick any non-leader.
@@ -313,7 +313,7 @@ async fn s_05_approve_node_replicates_through_raft() {
     // here we re-run the smoke shape so the matrix has direct
     // attribution.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let pending = Uuid::new_v4();
     let changer = MembershipChanger::new(
         cluster.leader_node().raft.clone(),
@@ -349,7 +349,7 @@ async fn s_05_approve_node_replicates_through_raft() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s_06_decommission_follower_removes_from_openraft_voter_set() {
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9401".parse().unwrap();
     let n = uuid_to_node_id(h);
@@ -396,7 +396,7 @@ async fn s_07_decommission_leader_auto_transfers_first() {
     // Already covered by `decommission_leader_transfer.rs`; the matrix
     // attribution is here.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
     let leader_host = host_id_for(leader_id);
     let changer = MembershipChanger::new(
@@ -420,7 +420,7 @@ async fn s_07_decommission_leader_auto_transfers_first() {
 async fn s_08_decommission_concurrent_with_add_serializes() {
     // S-08: concurrent add+remove serialize through `InProgress` retry.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let h_add = Uuid::new_v4();
     let n_add = uuid_to_node_id(h_add);
     let a: std::net::SocketAddr = "127.0.0.1:9501".parse().unwrap();
@@ -455,7 +455,7 @@ async fn s_09_decommission_partitioned_node_succeeds_for_quorum() {
     // S-09: removing a partitioned node still succeeds because the
     // remaining {N1, N2} have quorum.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     // Add a 4th node we'll partition+remove (avoids touching the
     // bootstrap voters' identities).
@@ -494,7 +494,7 @@ async fn s_10_readd_previously_decommissioned_node() {
     // pre-flight checks treat the existing-but-removed entry as a
     // fresh add.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9701".parse().unwrap();
@@ -546,7 +546,7 @@ async fn s_11_single_follower_disappears_quorum_continues() {
     // closest in-process equivalent of "OOM kill".  Cluster must keep
     // committing with the remaining quorum.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
 
     // Isolate a non-leader.
     let leader_id = cluster.leader_node().node_id;
@@ -615,7 +615,7 @@ async fn s_15_runaway_term_repro_does_not_storm() {
     // `tests/raft_election_storm.rs::election_storm_does_not_occur_on_log_divergence`.
     // Here: smoke that the storm metric stays at zero on a clean run.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let storm = ferrosa_cluster::raft::election_guard::election_storm_term_jumps_total();
     // Pre-Sprint-3 builds occasionally produced one or two storms in
@@ -684,7 +684,7 @@ async fn s_18_seed_init_recoverable_smoke() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s_19_symmetric_partition_majority_still_commits() {
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
     // Partition a non-leader (one node from the rest).
     let target_idx = cluster
@@ -719,7 +719,7 @@ async fn s_21_flap_partition_storm_metric_stays_low() {
     // S-21: fast partition flap.  After Sprint 3 PreVote, the storm
     // metric must not run away.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
     let target_idx = cluster
         .nodes()
@@ -780,7 +780,7 @@ async fn s_25_lane_reconnect_returns_unreachable_not_panic() {
     // Verify a partitioned send surfaces as a clean error rather
     // than a panic.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     cluster.partition(0);
     tokio::time::sleep(Duration::from_millis(100)).await;
     cluster.heal();
@@ -810,7 +810,7 @@ async fn s_27_voluntary_leadership_transfer() {
     // W4.14's decommission path and the openraft fork's
     // `tests/elect/t12_pre_vote_basic`.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
     // Find a different voter.
     let target = {
@@ -864,7 +864,7 @@ async fn s_28_transfer_to_lagging_target_catches_up_first() {
     // target: in that state openraft fails loud with `matched=None`, which
     // proves the harness raced readiness rather than the catch-up path.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let leader_id = cluster.leader_node().node_id;
     let target = {
         let m = cluster.leader_node().metrics();
@@ -927,7 +927,7 @@ async fn s_29_transfer_concurrent_with_decommission_serializes() {
     // S-29: serialization handled by openraft + InProgress retry.
     // Smoke: transfer + add succeed in some order.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9801".parse().unwrap();
     let n = uuid_to_node_id(h);
@@ -948,7 +948,7 @@ async fn s_30_election_guard_does_not_fire_under_steady_state() {
     // also asserts this through the retirement-gate test; here we
     // pin it from the matrix's perspective.
     let cluster = TestCluster::with_voters(3).await;
-    let _ = cluster.wait_for_leader(Duration::from_secs(5)).await;
+    cluster.require_leader(Duration::from_secs(5)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let storm = ferrosa_cluster::raft::election_guard::election_storm_term_jumps_total();
     assert!(storm <= 2);

@@ -167,6 +167,26 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // FAIL LOUD (t_5fdf25f0): the process exit code must reflect the run.
+            // Previously this returned Ok(()) unconditionally, so a run that
+            // executed ZERO combinations (e.g. cluster provisioning failed and the
+            // only topology was skipped) — or even one with failing invariants —
+            // exited 0 and showed green in CI, masking a broken harness.
+            if report.total == 0 {
+                anyhow::bail!(
+                    "jepsen run executed 0 combinations — nothing was verified \
+                     (cluster provisioning likely failed / every topology skipped). \
+                     Refusing to report a false green."
+                );
+            }
+            if !report.all_passed() {
+                anyhow::bail!(
+                    "jepsen run failed: {} of {} combination(s) violated an invariant",
+                    report.failed,
+                    report.total
+                );
+            }
+
             Ok(())
         }
         Commands::Report { action } => {

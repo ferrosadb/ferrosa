@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::ast::Statement;
 use crate::error::CqlError;
+use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter, TransactionWrite};
 use ferrosa_storage::{BatchOp, StorageEngine};
 
 /// Transaction state for a CQL session.
@@ -275,10 +276,259 @@ impl ConnTxn {
     }
 }
 
+/// Per-connection buffer for a **cluster-wide** CQL `BEGIN`/`COMMIT` transaction.
+///
+/// Distinct from [`ConnTxn`] (which commits a *local* atomic batch on the single
+/// engine for Bolt): this buffers DML between `BEGIN` and `COMMIT` and, on
+/// `COMMIT`, commits the WHOLE write-set as one multi-key Accord transaction via
+/// the injected [`TransactionCommitter`] (ADR-021). `ROLLBACK` drops the buffer.
+///
+/// FAIL-LOUD (URS-QEC-X01): a failed commit returns `Err` and the transaction is
+/// closed — the server never acks a transaction it did not commit. A statement
+/// that fails *inside* a transaction poisons it: the next `COMMIT` fails loud
+/// rather than committing a partial write-set.
+#[derive(Default)]
+pub struct CqlTransaction {
+    open: bool,
+    /// Set when a buffered statement failed (or the write-set cap was hit): the
+    /// transaction can no longer commit, so a partial write-set is never
+    /// committed. The client must `ROLLBACK` and retry.
+    poisoned: bool,
+    buffer: Vec<TransactionWrite>,
+}
+
+/// Max DML writes buffered in one transaction before it is poisoned. A client
+/// must not be able to OOM the server with an unbounded open `BEGIN` (Power-of-10
+/// Rule 3: every server-side dynamic collection has a hard cap).
+const MAX_TXN_WRITES: usize = 10_000;
+
+impl CqlTransaction {
+    /// A fresh connection with no open transaction.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` while a transaction is open.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Number of DML writes buffered so far.
+    pub fn staged_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// `BEGIN`: open a transaction. FAILS LOUD on a nested `BEGIN`.
+    pub fn begin(&mut self) -> Result<(), CqlError> {
+        if self.open {
+            return Err(CqlError::Invalid(
+                "nested transactions are not supported".to_string(),
+            ));
+        }
+        self.open = true;
+        self.poisoned = false;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Buffer one DML write. FAILS LOUD (and POISONS the transaction) if no
+    /// transaction is open or the write-set cap is exceeded.
+    pub fn stage(&mut self, write: TransactionWrite) -> Result<(), CqlError> {
+        if !self.open {
+            return Err(CqlError::Invalid(
+                "DML staged outside of a transaction".to_string(),
+            ));
+        }
+        if self.buffer.len() >= MAX_TXN_WRITES {
+            self.poisoned = true;
+            return Err(CqlError::Invalid(format!(
+                "transaction write-set exceeds the {MAX_TXN_WRITES}-write limit; ROLLBACK required"
+            )));
+        }
+        self.buffer.push(write);
+        Ok(())
+    }
+
+    /// Mark the open transaction un-committable after a statement failed inside
+    /// it (e.g. a DML that could not be encoded). The next `COMMIT` fails loud
+    /// rather than committing an incomplete write-set. No-op outside a txn.
+    pub fn poison(&mut self) {
+        if self.open {
+            self.poisoned = true;
+        }
+    }
+
+    /// `COMMIT`: commit the buffered write-set via `committer`, then close the
+    /// transaction. FAILS LOUD if no transaction is open, or if the transaction
+    /// was poisoned by an earlier failed statement (never commit a partial
+    /// write-set). The buffer is drained and the transaction closed regardless of
+    /// outcome — a failed commit is surfaced as `Err` (never silently retried or
+    /// acked), a clean abort as the returned [`CommitOutcome`].
+    pub async fn commit(
+        &mut self,
+        committer: &dyn TransactionCommitter,
+    ) -> Result<CommitOutcome, CqlError> {
+        if !self.open {
+            return Err(CqlError::Invalid(
+                "COMMIT outside of a transaction".to_string(),
+            ));
+        }
+        if self.poisoned {
+            self.buffer.clear();
+            self.open = false;
+            self.poisoned = false;
+            return Err(CqlError::Invalid(
+                "transaction aborted by an earlier failed statement; ROLLBACK required".to_string(),
+            ));
+        }
+        let writes = std::mem::take(&mut self.buffer);
+        self.open = false;
+        committer
+            .commit(writes)
+            .await
+            .map_err(|e| CqlError::ServerError(format!("transaction commit failed: {}", e.reason)))
+    }
+
+    /// `ROLLBACK`: discard the buffer and close. FAILS LOUD if not open.
+    pub fn rollback(&mut self) -> Result<(), CqlError> {
+        if !self.open {
+            return Err(CqlError::Invalid(
+                "ROLLBACK outside of a transaction".to_string(),
+            ));
+        }
+        self.buffer.clear();
+        self.open = false;
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::*;
+
+    fn tw(ks: &str, key: &[u8]) -> TransactionWrite {
+        TransactionWrite {
+            keyspace: ks.to_string(),
+            key: key.to_vec(),
+            mutation: b"m".to_vec(),
+        }
+    }
+
+    #[test]
+    fn cql_txn_begin_stage_rollback() {
+        let mut tx = CqlTransaction::new();
+        assert!(!tx.is_open());
+        tx.begin().unwrap();
+        assert!(tx.is_open());
+        assert!(tx.begin().is_err(), "nested BEGIN must fail loud");
+        tx.stage(tw("ks", b"a")).unwrap();
+        tx.stage(tw("ks", b"b")).unwrap();
+        assert_eq!(tx.staged_len(), 2);
+        tx.rollback().unwrap();
+        assert!(!tx.is_open());
+        assert_eq!(tx.staged_len(), 0, "ROLLBACK drops the buffer");
+    }
+
+    #[test]
+    fn cql_txn_stage_and_rollback_outside_fail() {
+        let mut tx = CqlTransaction::new();
+        assert!(tx.stage(tw("ks", b"a")).is_err());
+        assert!(tx.rollback().is_err());
+    }
+
+    #[tokio::test]
+    async fn cql_txn_commit_sends_buffer_to_committer_and_closes() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        tx.stage(tw("ks", b"a")).unwrap();
+        tx.stage(tw("ks", b"b")).unwrap();
+
+        let outcome = tx.commit(&committer).await.unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert!(!tx.is_open(), "COMMIT closes the transaction");
+        assert_eq!(tx.staged_len(), 0, "buffer is drained on commit");
+        assert_eq!(
+            committer.committed(),
+            vec![vec![tw("ks", b"a"), tw("ks", b"b")]],
+            "the exact buffered write-set reaches the committer, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_commit_outside_fails() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        assert!(tx.commit(&committer).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cql_txn_commit_failure_surfaced_and_closes() {
+        use ferrosa_storage::accord::{CommitError, MockTransactionCommitter};
+        let committer = MockTransactionCommitter::with_result(Err(CommitError {
+            reason: "quorum unavailable".to_string(),
+        }));
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        tx.stage(tw("ks", b"a")).unwrap();
+
+        let result = tx.commit(&committer).await;
+
+        assert!(
+            result.is_err(),
+            "a failed commit must surface as Err — never ack an uncommitted transaction"
+        );
+        assert!(
+            !tx.is_open(),
+            "the transaction closes even when commit fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_poison_blocks_commit() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        tx.stage(tw("ks", b"a")).unwrap();
+        tx.poison(); // a statement failed inside the transaction
+
+        let result = tx.commit(&committer).await;
+
+        assert!(result.is_err(), "a poisoned transaction must NOT commit");
+        assert!(
+            !tx.is_open(),
+            "a poisoned COMMIT still closes the transaction"
+        );
+        assert!(
+            committer.committed().is_empty(),
+            "the committer must never be called for a poisoned txn (no partial write-set)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_write_set_cap_poisons_and_blocks_commit() {
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer = MockTransactionCommitter::new();
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        for i in 0..MAX_TXN_WRITES {
+            tx.stage(tw("ks", format!("k{i}").as_bytes())).unwrap();
+        }
+        // The write past the cap fails loud and poisons the transaction.
+        assert!(
+            tx.stage(tw("ks", b"over")).is_err(),
+            "staging past the write-set cap must fail loud"
+        );
+        // COMMIT now fails (poisoned) and applies nothing — never a partial commit.
+        assert!(tx.commit(&committer).await.is_err());
+        assert!(committer.committed().is_empty());
+    }
 
     #[test]
     fn transition_begin_commit() {

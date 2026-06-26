@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ferrosa fast setup — installs prebuilt binaries via the LATEST file.
 #
-# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.12.0"),
+# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.16.0"),
 # downloads the matching release tarball from
 # https://github.com/ferrosadb/ferrosa/releases, verifies SHA256, installs to
 # ~/.ferrosa/, and optionally registers as a user service. No source clone,
@@ -9,7 +9,7 @@
 #
 # Usage:
 #   curl -fsSL https://ferrosadb.com/setup.sh | bash
-#   curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --version v0.12.0 --no-service
+#   curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --version v0.16.0 --no-service
 #
 # Env overrides (mostly for testing):
 #   FERROSA_LATEST_URL   — where to fetch the version pointer (default https://ferrosadb.com/LATEST)
@@ -166,8 +166,17 @@ do_password() {
     say "run later: $BIN_DIR/ferrosa-ctl auth set-password"
     return
   fi
+  # Under `curl … | bash` this script's stdin is the pipe, not a terminal, so
+  # ferrosa-ctl's masked prompt (rpassword reads stdin) can't disable echo —
+  # the password echoes in cleartext and the read never completes (hang). Bind
+  # the controlling terminal explicitly so the prompt + confirmation work.
+  if [ ! -r /dev/tty ]; then
+    say "no controlling terminal — skipping interactive password setup"
+    say "run later from a terminal: $BIN_DIR/ferrosa-ctl auth set-password --user ferrosa_admin"
+    return
+  fi
   say "set ferrosa_admin password (current default: ferrosa_admin)"
-  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin
+  "$BIN_DIR/ferrosa-ctl" auth set-password --user ferrosa_admin < /dev/tty
 }
 
 case "$WANT_PASSWORD" in

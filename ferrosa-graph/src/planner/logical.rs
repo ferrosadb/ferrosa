@@ -87,8 +87,15 @@ pub fn resolve_label(snap: &SchemaSnapshot, keyspace: &str, label: &str) -> Resu
         }
     }
 
+    // Actionable remediation (t_2dd438d2): the bare "no table" message read like
+    // missing DDL and hid the two real causes — (a) the graph engine is disabled,
+    // or (b) the labelled table was never created.
     Err(GraphError::Validation(format!(
-        "no table with graph.label '{label}' found in keyspace '{keyspace}'"
+        "no table with graph.label '{label}' found in keyspace '{keyspace}' — \
+         create it with CREATE TABLE {keyspace}.<name> (...) WITH extensions = \
+         {{'graph.type': 'vertex' or 'edge', 'graph.label': '{label}'}}; if you \
+         intended to use graph features, also ensure the graph engine is enabled \
+         ([graph] enabled = true)"
     )))
 }
 
@@ -365,6 +372,15 @@ mod tests {
             GraphError::Validation(msg) => {
                 assert!(msg.contains("Person"));
                 assert!(msg.contains("social"));
+                // t_2dd438d2: the error must be actionable, not a bare "no table".
+                assert!(
+                    msg.contains("graph.label") && msg.contains("extensions"),
+                    "error should explain how to create the labelled table: {msg}"
+                );
+                assert!(
+                    msg.contains("enabled = true"),
+                    "error should point at the disabled-engine cause: {msg}"
+                );
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
