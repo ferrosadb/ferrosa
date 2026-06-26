@@ -1010,6 +1010,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2b$hash".to_string()),
             member_of: std::collections::HashSet::new(),
+            scram: None,
         };
         let mutation = SystemTableMutation::RoleCreated(role);
         match &mutation {
@@ -1141,6 +1142,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2b$hash".to_string()),
             member_of: std::collections::HashSet::new(),
+            scram: None,
         };
 
         let (key, row, _ts) = role_to_row(&role);
@@ -1171,6 +1173,7 @@ mod tests {
             can_login: false,
             salted_hash: None,
             member_of: std::collections::HashSet::new(),
+            scram: None,
         };
 
         let (_key, row, _ts) = role_to_row(&role);

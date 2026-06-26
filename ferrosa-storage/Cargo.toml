@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
@@ -89,6 +90,11 @@ fuzz-fileio = ["test-generators"]
 # run in the default `test-generators` set. Retained so existing invocations
 # (`--features test-generators,repair-fuzz-known-failures`) keep working.
 repair-fuzz-known-failures = ["test-generators"]
+# Nightly real-concurrency read-vs-compaction stress (engine.rs
+# read_compaction_race_stress). Off by default so the per-PR gate stays fast;
+# the nightly fuzz workflow runs it on a shared-cpu Fly machine, env-scaled via
+# RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
+race-stress = []
 
 [dev-dependencies]
 async-trait = "0.1"

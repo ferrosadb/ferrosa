@@ -34,7 +34,9 @@ use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnS
 use ferrosa_storage::accord::sync_writer::SyncWriter;
 use tokio::sync::Notify;
 
-use crate::accord::apply::{ApplyMutation, NoopStorageApplier, StorageApplier, StorageReader};
+use crate::accord::apply::{
+    ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier, StorageReader,
+};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -88,11 +90,15 @@ pub struct AccordStateMachine {
     committed_txns: HashSet<TxnId>,
     /// Notified waiters from the last commit (for test inspection).
     last_notified: Vec<TxnId>,
-    /// Storage integration seam: persists the committed mutation to the local
-    /// `StorageEngine` during `handle_apply`. Defaults to [`NoopStorageApplier`]
-    /// for protocol-only tests; production wires a real engine-backed applier
-    /// via [`AccordStateMachine::with_applier`].
-    applier: Arc<dyn StorageApplier>,
+    /// Dep-ordered apply engine: wraps the storage [`StorageApplier`] in a
+    /// [`DepWaitApplier`] so a committed transaction is persisted only after all
+    /// of its dependencies have applied on this replica. `handle_apply` routes
+    /// every real write through this (never the raw applier directly), which is
+    /// what enforces dependency order at the replica apply path — the prerequisite
+    /// for serializable multi-key transactions. The inner applier defaults to
+    /// [`NoopStorageApplier`] for protocol-only tests; production wires a real
+    /// engine-backed applier via [`AccordStateMachine::with_applier`].
+    apply_engine: Arc<DepWaitApplier>,
     /// Optional storage read seam for the generic-`IF` linearizable read-at-`t`
     /// (Gap 4). `None` keeps the conflict-index existence path used by
     /// `INSERT IF NOT EXISTS`. Production wires an engine-backed reader via
@@ -126,7 +132,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier: Arc::new(NoopStorageApplier::new()),
+            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -148,7 +154,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier: Arc::new(NoopStorageApplier::new()),
+            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -172,7 +178,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier,
+            apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
         }
@@ -199,7 +205,7 @@ impl AccordStateMachine {
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
-            applier,
+            apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
         }
@@ -335,6 +341,24 @@ impl AccordStateMachine {
         t0: Timestamp,
         key: &[u8],
         ballot: BallotNumber,
+        epoch: u64,
+    ) -> SmResponse {
+        // Single-key PreAccept is the degenerate one-entry write-set; the wire
+        // path for a single-partition LWT stays byte-identical.
+        self.handle_preaccept_multi(txn_id, t0, &[key], ballot, epoch)
+    }
+
+    /// PreAccept for a multi-key write-set: register the txn under EVERY key it
+    /// writes and return the UNION of dependencies across all keys, bumping `t`
+    /// past the max conflicting timestamp on any key. This serializes two
+    /// transactions that overlap on a non-representative key (t_276e12) — the
+    /// representative-first-key PreAccept would miss the conflict.
+    pub fn handle_preaccept_multi(
+        &mut self,
+        txn_id: TxnId,
+        t0: Timestamp,
+        keys: &[&[u8]],
+        ballot: BallotNumber,
         _epoch: u64,
     ) -> SmResponse {
         // Check if we've already promised a higher ballot for this txn.
@@ -364,27 +388,37 @@ impl AccordStateMachine {
             }
         }
 
-        // Query ConflictIndex for deps using t0 (not t).
-        let deps = self.conflict_index.deps_before_t0(key, &t0);
+        // Query ConflictIndex for deps using t0 (not t), UNIONED across every
+        // key the transaction writes — a conflict on any key is a dependency.
+        let mut deps = HashSet::new();
+        for key in keys {
+            deps.extend(self.conflict_index.deps_before_t0(key, &t0));
+        }
 
-        // Check for timestamp conflict: if any conflicting t0 >= our t0,
-        // we need to bump our timestamp past it.
-        let max_conflict = self.conflict_index.max_conflicting_timestamp(key);
+        // Bump our timestamp past the max conflicting t0 on ANY key, not just
+        // the representative first key.
+        let max_conflict = keys
+            .iter()
+            .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
+            .max();
         let t = match max_conflict {
             Some(ct) if ct >= t0 => t0.bump_past(&ct, self.node_id),
             _ => t0,
         };
 
-        // Register in ConflictIndex.
-        let entry = InFlightWrite {
-            txn_id,
-            t0,
-            accord_ts: None,
-            status: TxnStatus::PreAccepted,
-        };
-        // Don't fail the protocol message on capacity errors, but log them.
-        if let Err(e) = self.conflict_index.register(key, entry) {
-            tracing::error!(%e, "accord: conflict_index register failed");
+        // Register the txn under EVERY key it writes, so a later conflicting
+        // txn on any of them sees it as a dependency.
+        for key in keys {
+            let entry = InFlightWrite {
+                txn_id,
+                t0,
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            };
+            // Don't fail the protocol message on capacity errors, but log them.
+            if let Err(e) = self.conflict_index.register(key, entry) {
+                tracing::error!(%e, "accord: conflict_index register failed");
+            }
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can
@@ -547,19 +581,54 @@ impl AccordStateMachine {
     // Apply handler
     // -----------------------------------------------------------------------
 
-    /// Handle an Apply (fire-and-forget).
+    /// Handle an Apply (fire-and-forget) — **dep-ordered** at the replica.
     ///
-    /// 1. Idempotent no-op if already Applied.
-    /// 2. Persist the protocol-log marker BEFORE applying (recovery ordering).
-    /// 3. Persist the real mutation to local storage via the [`StorageApplier`]
-    ///    — closes the phantom-write gap (`bug-accord-lwt-acks-phantom-write.md`):
-    ///    the row must be durably written to the engine, not merely logged.
-    /// 4. Only after the mutation is durable do we set the Applied flag and mark
-    ///    the conflict index — so a crash before the storage write leaves the txn
-    ///    recoverable (re-Apply), never falsely Applied (persist-before-Applied).
+    /// 1. Idempotent no-op if already Applied; ignore an unknown txn.
+    /// 2. No-write finalize (empty payload): an LWT whose IF condition did NOT
+    ///    hold still *commits* but writes no row. It touches no storage, so there
+    ///    is no dependency order to respect — advance it to `Applied` directly,
+    ///    then ask the apply engine which parked waiters this unblocks and
+    ///    advance them too (so a later read at `t' > t` does not block on this
+    ///    phantom dependency until its dep-wait timeout).
+    /// 3. Real write: route the mutation through the [`DepWaitApplier`]. If every
+    ///    dependency has already applied on this replica, it persists the row
+    ///    immediately and cascades to any waiters this unblocks; otherwise it
+    ///    parks the mutation and returns an empty list — and we must NOT advance
+    ///    the txn to `Applied`. Routing through the engine (never the raw applier)
+    ///    is what enforces dependency order at the replica apply path.
+    /// 4. For every transaction the engine actually persisted (the primary plus
+    ///    any cascade-woken waiters), run the `bookkeep_applied` helper:
+    ///    the protocol-log marker, `Applied` flag, conflict-index GC, and the
+    ///    dep-wait wake. The storage write precedes the marker; the applier is
+    ///    idempotent on `(txn_id, t)`, so a crash between them is recovered by the
+    ///    per-txn Apply retry (never a falsely-`Applied` txn).
     pub fn handle_apply(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> SmResponse {
+        // A single-key Apply is the degenerate one-entry write-set. An empty
+        // payload is the no-write finalize, represented as an empty write-set.
+        let writes = if result_data.is_empty() {
+            Vec::new()
+        } else {
+            vec![result_data]
+        };
+        self.handle_apply_writeset(txn_id, writes)
+    }
+
+    /// Apply a **multi-key** transaction: its full write-set, one encoded
+    /// mutation per partition this replica owns. Every write is routed through
+    /// the dep-ordered apply engine as one unit (parked together, applied
+    /// atomically), so writes 2..N are never dropped.
+    ///
+    /// An empty `writes` (or all-empty entries) is the no-write finalize: the txn
+    /// committed but writes no row (a failed-`IF` LWT), so it is advanced to
+    /// `Applied` without touching storage and its dep-waiters are woken.
+    ///
+    /// Whatever the engine actually persists — the primary's N writes plus any
+    /// cascade-woken waiters — is **deduplicated by `TxnId`** so each transaction
+    /// is advanced to `Applied` and fsyncs its protocol-log marker exactly once
+    /// (N markers per txn would corrupt the log).
+    pub fn handle_apply_writeset(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> SmResponse {
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
-        // so the mutation we hand to storage carries the real `(t, deps)`.
+        // so each mutation we hand to storage carries the real `(t, deps)`.
         let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
             Some(state) => {
                 // Already applied: idempotent — do not re-persist or re-apply.
@@ -572,39 +641,91 @@ impl AccordStateMachine {
             None => return SmResponse::None,
         };
 
-        // Persist the protocol-log marker BEFORE applying the mutation.
-        let data = format!("Applied:{}", txn_id.0.time);
-        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
-            // Fsync failed: do NOT apply or set the applied flag.
+        // Drop no-write entries (empty payloads): a key the replica owns but for
+        // which this txn writes no row.
+        let writes: Vec<Vec<u8>> = writes.into_iter().filter(|d| !d.is_empty()).collect();
+
+        // No-write finalize: nothing to persist and no dependency ordering to
+        // respect. Advance to Applied, then advance any waiters it unblocks.
+        if writes.is_empty() {
+            if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
+                // Marker fsync failed — fail loud, leave Committed; Apply retries.
+                return SmResponse::None;
+            }
+            let woken = self.apply_engine.notify_applied(txn_id);
+            self.bookkeep_applied_dedup(woken);
             return SmResponse::None;
         }
 
-        // No-write finalize: an LWT whose IF condition did NOT hold still
-        // *commits* (it is ordered by Accord), but applies NO row write — the
-        // coordinator sends an Apply with an EMPTY payload to finalize it. We
-        // must still advance the txn to `Applied` (and wake dep-waiters / GC the
-        // conflict index) so it stops being a phantom dependency: a later read at
-        // `t' > t` that waited on this conflict would otherwise block until its
-        // dep-wait timeout. We deliberately skip the storage applier (there is no
-        // row to write), which also avoids decoding empty bytes as a Mutation.
-        if !result_data.is_empty() {
-            // Persist the real mutation to local storage. The applier is
-            // idempotent on (txn_id, t) and must durably write before returning
-            // Ok. If it fails we MUST NOT advance to Applied — fail loud, never
-            // fake success: the coordinator gets no implicit ack and the Apply
-            // can be retried.
-            let mutation = ApplyMutation {
-                data: result_data.clone(),
+        // Real write-set: route through the dep-ordered apply engine. It persists
+        // every key atomically (idempotent on `(txn_id, key, t)`) once every
+        // dependency has applied on this replica; otherwise it parks the set.
+        let mutations: Vec<ApplyMutation> = writes
+            .into_iter()
+            .map(|data| ApplyMutation {
+                data,
                 t,
-                deps,
-            };
-            if let Err(e) = self.applier.apply(txn_id, mutation) {
+                deps: deps.clone(),
+            })
+            .collect();
+        let applied = match self.apply_engine.try_apply_writeset(txn_id, mutations) {
+            Ok(applied) => applied,
+            Err(e) => {
+                // Storage apply failed: do NOT advance to Applied — fail loud,
+                // never fake success. The coordinator gets no implicit ack and
+                // the Apply can be retried.
                 tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
                 return SmResponse::None;
             }
+        };
+
+        if applied.is_empty() {
+            // Parked behind an unapplied dependency. This txn advances to Applied
+            // later, when its last dependency's apply cascades to it.
+            return SmResponse::None;
         }
 
-        // Durable in storage — now safe to mark Applied and GC the conflict index.
+        // Persisted: the primary's writes plus any cascade-woken waiters. Dedup
+        // by TxnId so each txn is marked Applied / fsynced exactly once.
+        self.bookkeep_applied_dedup(applied);
+        SmResponse::None
+    }
+
+    /// Run [`bookkeep_applied`] **once per distinct `TxnId`** in `applied`.
+    ///
+    /// A multi-key txn appears as N entries with the same `TxnId` (one per
+    /// applied key); the post-apply bookkeeping — protocol-log marker fsync,
+    /// `Applied` advance, conflict-index GC, dep-wait wake — is a per-transaction
+    /// action and must fire exactly once. The first entry's data is used; later
+    /// same-txn entries are skipped (their write is already durable). Each is
+    /// best-effort: a fsync failure leaves that txn `Committed` for its Apply
+    /// retry to re-drive (storage apply is idempotent), never falsely `Applied`.
+    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>) {
+        let mut bookkept: HashSet<TxnId> = HashSet::new();
+        for (applied_id, applied_data) in applied {
+            if bookkept.insert(applied_id) {
+                let _ = self.bookkeep_applied(applied_id, applied_data);
+            }
+        }
+    }
+
+    /// Post-apply bookkeeping for a transaction the apply engine has **already
+    /// persisted** (or a no-write finalize): persist the protocol-log marker,
+    /// advance the in-memory state to `Applied`, GC the conflict index, and wake
+    /// any `ReadVote` dep-wait parked on this transaction.
+    ///
+    /// Returns `Err(())` if the marker fsync fails — the caller must then leave
+    /// the txn `Committed` (never falsely `Applied`); the per-txn Apply retry
+    /// re-drives it, and because the storage applier is idempotent on
+    /// `(txn_id, t)` the re-driven apply is a no-op on storage.
+    fn bookkeep_applied(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> Result<(), ()> {
+        // Persist the protocol-log marker. Fail loud (return Err) on fsync
+        // failure so the caller does not advance a non-durable apply.
+        let data = format!("Applied:{}", txn_id.0.time);
+        if !self.sync_writer.write_and_sync(data.as_bytes()).is_ok() {
+            return Err(());
+        }
+
         if let Some(state) = self.txn_states.get_mut(&txn_id) {
             state.apply(result_data);
         }
@@ -615,7 +736,7 @@ impl AccordStateMachine {
         // the lock); see [`Self::applied_notify`].
         self.applied_notify.notify_waiters();
 
-        SmResponse::None
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -790,9 +911,19 @@ pub fn build_accord_state_machine(
     sync_writer: Arc<dyn SyncWriter>,
     storage: Arc<ferrosa_storage::engine::StorageEngine>,
 ) -> AccordStateMachine {
-    let applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
+    let engine_applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
         storage.clone(),
     ));
+    // When a CDC bus is attached, publish CommittedToCluster on apply so live
+    // CQL SUBSCRIBE ... ON COMMITTED (and Arrow Flight) see Accord-committed
+    // writes; otherwise use the engine applier directly.
+    let applier: Arc<dyn crate::accord::apply::StorageApplier> = match storage.cdc_bus() {
+        Some(bus) => Arc::new(crate::accord::apply::CdcPublishingApplier::new(
+            engine_applier,
+            bus,
+        )),
+        None => engine_applier,
+    };
     let reader = Arc::new(crate::accord::apply::EngineStorageReader::new(storage));
     AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader)
 }
@@ -944,6 +1075,90 @@ mod tests {
 
         let state = sm.get_state(&txn_id).unwrap();
         assert_eq!(state.phase, TxnPhase::Applied);
+    }
+
+    /// Number of `write_and_sync` calls (one per protocol-log marker fsync).
+    fn marker_fsyncs(writer: &MockSyncWriter) -> usize {
+        writer
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, SyncWriteCall::Write))
+            .count()
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3 — multi-key apply bookkeeping. A multi-key txn yields N applied
+    // entries with the SAME TxnId; the state machine must advance it to Applied
+    // and fsync its marker EXACTLY ONCE (not N times — N markers corrupt the
+    // protocol log), and EVERY write must reach the storage applier.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_key_apply_fsyncs_applied_marker_once_per_txn() {
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        let before = marker_fsyncs(&writer);
+
+        // Two-key write-set for one txn.
+        let resp = sm.handle_apply_writeset(txn_id, vec![b"w1".to_vec(), b"w2".to_vec()]);
+        assert!(matches!(resp, SmResponse::None));
+
+        assert_eq!(
+            marker_fsyncs(&writer) - before,
+            1,
+            "the Applied marker must be fsynced ONCE per txn, not once per key"
+        );
+        assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Applied);
+    }
+
+    #[test]
+    fn multi_key_apply_routes_every_write_to_the_applier() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, capturing.clone());
+
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+
+        sm.handle_apply_writeset(txn_id, vec![b"w1".to_vec(), b"w2".to_vec()]);
+
+        let captured = capturing.captured();
+        assert_eq!(
+            captured.len(),
+            2,
+            "BOTH keys' writes must reach the storage applier — none dropped"
+        );
+        let datas: Vec<Vec<u8>> = captured.iter().map(|(_, d, _)| d.clone()).collect();
+        assert!(datas.contains(&b"w1".to_vec()) && datas.contains(&b"w2".to_vec()));
+        assert!(
+            captured
+                .iter()
+                .all(|(id, _, t)| *id == txn_id && *t == ts(1001)),
+            "every write carries the txn id and the agreed execution timestamp"
+        );
+    }
+
+    #[test]
+    fn single_key_handle_apply_still_fsyncs_exactly_one_marker() {
+        // Regression guard: the single-key path must stay byte-identical — one
+        // marker, Applied phase, just like before the writeset refactor.
+        let (mut sm, writer) = make_sm(1);
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        let before = marker_fsyncs(&writer);
+
+        sm.handle_apply(txn_id, vec![42]);
+
+        assert_eq!(marker_fsyncs(&writer) - before, 1);
+        assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Applied);
     }
 
     /// Duplicate PreAccept returns same response.
@@ -1289,6 +1504,113 @@ mod tests {
         }
     }
 
+    /// Multi-key PreAccept registers the txn under EVERY key it writes, so a
+    /// later txn conflicting on any one of those keys sees it as a dependency —
+    /// not just on the representative first key (t_276e12).
+    #[test]
+    fn sm_preaccept_multi_key_registers_all_keys_for_conflict() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"key_one";
+        let k2: &[u8] = b"key_two";
+
+        // Txn A preaccepts BOTH keys at t0=500.
+        let a = txn(2, 500);
+        sm.handle_preaccept_multi(a, ts(500), &[k1, k2], BallotNumber(0), 0);
+
+        // Txn B preaccepts ONLY k2 at t0=1000 (> 500). It must depend on A
+        // because A registered itself under k2, not just its first key k1.
+        let b = txn(1, 1000);
+        let resp = sm.handle_preaccept(b, ts(1000), k2, BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { deps, .. } => assert!(
+                deps.contains(&a),
+                "B on k2 must depend on A — A must register under all its keys"
+            ),
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
+    /// Multi-key PreAccept returns the UNION of dependencies across all of the
+    /// transaction's keys, not just the first.
+    #[test]
+    fn sm_preaccept_multi_key_unions_deps_across_keys() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"k1";
+        let k2: &[u8] = b"k2";
+
+        // A pre-existing conflicting txn on each key, both with t0 < 1000.
+        let on_k1 = txn(2, 400);
+        let on_k2 = txn(3, 600);
+        let _ = sm.conflict_index_mut().register(
+            k1,
+            InFlightWrite {
+                txn_id: on_k1,
+                t0: ts(400),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+        let _ = sm.conflict_index_mut().register(
+            k2,
+            InFlightWrite {
+                txn_id: on_k2,
+                t0: ts(600),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+
+        // Txn C preaccepts {k1, k2} at t0=1000 → deps = union {on_k1, on_k2}.
+        let c = txn(1, 1000);
+        let resp = sm.handle_preaccept_multi(c, ts(1000), &[k1, k2], BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { deps, .. } => {
+                assert!(
+                    deps.contains(&on_k1),
+                    "deps must include the conflict on k1"
+                );
+                assert!(
+                    deps.contains(&on_k2),
+                    "deps must include the conflict on k2"
+                );
+            }
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
+    /// Multi-key PreAccept bumps `t` past the max conflicting timestamp across
+    /// ALL keys — a conflict on a non-first key must still push the timestamp.
+    #[test]
+    fn sm_preaccept_multi_key_t_bumps_past_conflict_on_any_key() {
+        let (mut sm, _writer) = make_sm(1);
+        let k1: &[u8] = b"quiet_key";
+        let k2: &[u8] = b"busy_key";
+
+        // A conflict on k2 (not k1) with t0=1500 >= our t0=1000.
+        let hot = txn(2, 1500);
+        let _ = sm.conflict_index_mut().register(
+            k2,
+            InFlightWrite {
+                txn_id: hot,
+                t0: ts(1500),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+
+        // Txn C preaccepts {k1, k2} at t0=1000. Because k2 has a conflict at
+        // 1500 >= 1000, C's final `t` must be bumped past 1500.
+        let c = txn(1, 1000);
+        let resp = sm.handle_preaccept_multi(c, ts(1000), &[k1, k2], BallotNumber(0), 0);
+        match resp {
+            SmResponse::PreAcceptOK { t, .. } => assert!(
+                t > ts(1500),
+                "t must bump past the conflict on k2 (got {t:?}), not stay at t0"
+            ),
+            other => panic!("expected PreAcceptOK, got {:?}", other),
+        }
+    }
+
     /// Accept uses t (final timestamp) for dep filter, not t0.
     #[test]
     fn sm_accept_deps_use_t_not_t0() {
@@ -1533,6 +1855,52 @@ mod tests {
         assert_eq!(
             *got_t, t,
             "applier must receive the agreed execution timestamp"
+        );
+    }
+
+    /// RED (Phase 0, t_59629c9b): the replica apply path must be DEP-ORDERED.
+    /// Two committed txns on the same key, B depends on A. If Apply(B) is
+    /// delivered before Apply(A), B's mutation must NOT hit storage until A has
+    /// applied — then both apply in dependency order. Today `handle_apply` calls
+    /// the applier DIRECTLY (no dep-wait at the state-machine apply path), so B
+    /// applies immediately and out of order — this test fails until the apply
+    /// path routes through dep-ordered application.
+    #[test]
+    fn sm_apply_is_dep_ordered_parks_until_dependency_applies() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer.clone(), applier.clone());
+
+        let a = txn(1, 1000);
+        let b = txn(2, 2000);
+        let ta = ts(1001);
+        let tb = ts(2001);
+        let key = b"shared-key";
+
+        // Commit A (no deps) and B (deps = [A]) on the same key.
+        sm.handle_preaccept(a, ts(1000), key, BallotNumber(0), 0);
+        sm.handle_accept(a, ts(1000), ta, vec![], BallotNumber(1));
+        sm.handle_commit(a, ts(1000), ta, vec![]);
+
+        sm.handle_preaccept(b, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(b, ts(2000), tb, vec![a], BallotNumber(1));
+        sm.handle_commit(b, ts(2000), tb, vec![a]);
+
+        // Deliver Apply(B) BEFORE Apply(A). B depends on A (not yet applied), so
+        // B must PARK — its write must not reach storage out of dependency order.
+        sm.handle_apply(b, b"write-b".to_vec());
+        assert!(
+            applier.captured().is_empty(),
+            "B must not apply before its dependency A (dep-ordered apply)"
+        );
+
+        // Now apply A → the cascade must then apply B, in dependency order.
+        sm.handle_apply(a, b"write-a".to_vec());
+        let ids: Vec<_> = applier.captured().iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![a, b],
+            "after A applies, A then B must apply in dependency order"
         );
     }
 

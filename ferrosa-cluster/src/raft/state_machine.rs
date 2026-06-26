@@ -848,20 +848,31 @@ impl FerrosStateMachine {
                     true
                 };
                 schema_changed = inserted;
-                if inserted {
-                    let ks_clone = ks.clone();
-                    if let Some(schema) = &self.schema {
-                        if let Err(e) = schema.create_keyspace_internal(ks) {
-                            tracing::error!(%e, "Raft apply: create_keyspace_internal failed — schema diverged from Raft state");
-                        }
+                // Always reconcile the externally shared `Schema` with the
+                // committed Raft state — even when `self.state` already had the
+                // keyspace. Fresh CQL connections read the keyspace exclusively
+                // from this shared `Schema` (system_schema.keyspaces, USE,
+                // keyspace validation). Gating this behind `inserted` left the
+                // keyspace permanently invisible to new connections whenever
+                // `self.state` and the shared `Schema` had drifted (duplicate
+                // proposal replay, or recovery that repopulated `self.state`
+                // from a persisted snapshot against a fresh `Schema`). See
+                // forge t_86f9259d. `create_keyspace_internal` is idempotent.
+                if let Some(schema) = &self.schema {
+                    if let Err(e) = schema.create_keyspace_internal(ks.clone()) {
+                        tracing::error!(%e, keyspace = %ks.name, "Raft apply: create_keyspace_internal failed — shared schema diverged from Raft state");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "create_keyspace_internal({}) failed: {e}",
+                            ks.name
+                        )));
                     }
-                    if self.system_writer.is_some() {
-                        pending_system_writes.push(PendingSystemWrite {
-                            mutation: SystemTableMutation::KeyspaceCreated(ks_clone),
-                            level: SystemWriteLogLevel::WarnReplay,
-                            context: "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)",
-                        });
-                    }
+                }
+                if inserted && self.system_writer.is_some() {
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::KeyspaceCreated(ks),
+                        level: SystemWriteLogLevel::WarnReplay,
+                        context: "Raft apply: system table write skipped for CreateKeyspace (expected during log replay)",
+                    });
                 }
             }
             RaftOp::DropKeyspace(name) => {
@@ -948,32 +959,42 @@ impl FerrosStateMachine {
                     false
                 };
                 schema_changed = inserted;
-                if inserted {
-                    if let Some(schema) = &self.schema {
-                        if let Err(e) = schema.create_table_internal(*table.clone()) {
-                            tracing::error!(%e, "Raft apply: create_table_internal failed — schema diverged");
-                        }
+                // Always reconcile the shared `Schema` and the storage engine
+                // with committed Raft state — same rationale as CreateKeyspace
+                // (forge t_86f9259d). Fresh CQL connections resolve the table
+                // from the shared `Schema`, and reads/writes need the engine
+                // registration; gating these behind `inserted` made the table
+                // permanently unreadable to new connections after any state /
+                // schema drift. Both `create_table_internal` and
+                // `register_table` are idempotent.
+                if let Some(schema) = &self.schema {
+                    if let Err(e) = schema.create_table_internal(*table.clone()) {
+                        tracing::error!(%e, keyspace = %table.keyspace, table = %table.name, "Raft apply: create_table_internal failed — shared schema diverged");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "create_table_internal({}.{}) failed: {e}",
+                            table.keyspace, table.name
+                        )));
                     }
-                    if let Some(engine) = &self.engine {
-                        if let Err(e) = engine.register_table(table.to_storage_schema()) {
-                            tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
-                            apply_errors.push(ApplyError::EngineRegisterTable {
-                                keyspace: table.keyspace.clone(),
-                                table: table.name.clone(),
-                                reason: e.to_string(),
-                            });
-                        }
-                    }
-                    if self.system_writer.is_some() {
-                        // Warn, not error: during Raft log replay on startup,
-                        // system_schema tables may not be registered yet.  The
-                        // schema bootstrap populates them once loading completes.
-                        pending_system_writes.push(PendingSystemWrite {
-                            mutation: SystemTableMutation::TableCreated(table),
-                            level: SystemWriteLogLevel::WarnReplay,
-                            context: "Raft apply: system table write skipped for CreateTable (expected during log replay)",
+                }
+                if let Some(engine) = &self.engine {
+                    if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                        tracing::error!(%e, "Raft apply: register_table failed — writes to this table will silently fail");
+                        apply_errors.push(ApplyError::EngineRegisterTable {
+                            keyspace: table.keyspace.clone(),
+                            table: table.name.clone(),
+                            reason: e.to_string(),
                         });
                     }
+                }
+                if inserted && self.system_writer.is_some() {
+                    // Warn, not error: during Raft log replay on startup,
+                    // system_schema tables may not be registered yet.  The
+                    // schema bootstrap populates them once loading completes.
+                    pending_system_writes.push(PendingSystemWrite {
+                        mutation: SystemTableMutation::TableCreated(table),
+                        level: SystemWriteLogLevel::WarnReplay,
+                        context: "Raft apply: system table write skipped for CreateTable (expected during log replay)",
+                    });
                 }
             }
             RaftOp::DropTable { keyspace, table } => {
@@ -3011,6 +3032,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
 
         let entries = vec![
@@ -3032,6 +3054,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: HashSet::new(),
+                scram: None,
             })
         };
         let grant = |member: &str, role: &str| RaftOp::GrantRole {
@@ -3098,6 +3121,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$2a$10$leader-side-hash".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
 
         sm.apply(vec![make_entry(1, 1, RaftOp::CreateRole(role))])
@@ -3631,6 +3655,135 @@ mod tests {
         }
     }
 
+    /// Repro for forge t_86f9259d: a keyspace created through the Raft
+    /// state-machine apply path must be visible in the **externally shared**
+    /// `Schema` that fresh CQL connections read (`state.schema.snapshot()` and
+    /// `system_schema.keyspaces`).
+    ///
+    /// In single-node Raft-metadata mode the CQL router and the Raft state
+    /// machine share the same `Arc<Schema>` (see
+    /// `ModeController::transition_to_cluster`, which passes
+    /// `self.schema.clone()` to `with_side_effects`). The creating connection
+    /// succeeds because it applied the DDL in-session; a *fresh* connection
+    /// reads the keyspace exclusively from this shared `Schema`. If the apply
+    /// path mutates only the state machine's private `self.state.keyspaces`
+    /// and skips the shared `Schema`, the keyspace is permanently invisible to
+    /// new connections.
+    #[tokio::test]
+    async fn create_keyspace_via_raft_apply_is_visible_in_shared_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // The router holds this Arc; the state machine gets a clone — exactly
+        // how `transition_to_cluster` wires `self.schema.clone()`.
+        let shared_schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&shared_schema), Arc::clone(&engine));
+
+        let ks = simple_keyspace("vis_test");
+        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+        sm.apply(vec![entry]).await.unwrap();
+
+        // A fresh connection reads from the shared Schema snapshot.
+        let snap = shared_schema.snapshot();
+        assert!(
+            snap.keyspaces.contains_key("vis_test"),
+            "keyspace created via Raft apply must be visible to fresh connections \
+             through the shared Schema (system_schema.keyspaces reads this snapshot)"
+        );
+    }
+
+    /// Repro for forge t_86f9259d (the persistent, fresh-connection-only
+    /// invisibility): when a `CreateKeyspace` is applied while the keyspace is
+    /// already present in the state machine's private `self.state.keyspaces`
+    /// but absent from the externally shared `Schema`, the apply path must
+    /// still reconcile the shared `Schema` — not silently skip it.
+    ///
+    /// The divergence arises whenever `self.state` and the shared `Schema`
+    /// fall out of step (e.g. a duplicate proposal replay, or a state-machine
+    /// recovery that repopulated `self.state` from a persisted Raft snapshot
+    /// while a fresh `Schema` was constructed at process start). The previous
+    /// implementation gated the shared-`Schema` write behind the
+    /// "newly inserted into `self.state`" guard, so the keyspace became
+    /// permanently invisible to every new CQL connection (which reads the
+    /// shared `Schema`), exactly matching the reported black-box symptom.
+    #[tokio::test]
+    async fn create_keyspace_reconciles_shared_schema_even_when_state_already_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let shared_schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&shared_schema), Arc::clone(&engine));
+
+        // Simulate the state-machine state already containing the keyspace
+        // (recovered Raft state / duplicate proposal) while the shared Schema
+        // — read by fresh CQL connections — does not yet know about it.
+        let ks = simple_keyspace("vis_test");
+        sm.state.keyspaces.insert(ks.name.clone(), ks.clone());
+        assert!(
+            !shared_schema.snapshot().keyspaces.contains_key("vis_test"),
+            "precondition: shared Schema must start without vis_test"
+        );
+
+        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(ks));
+        sm.apply(vec![entry]).await.unwrap();
+
+        assert!(
+            shared_schema.snapshot().keyspaces.contains_key("vis_test"),
+            "CreateKeyspace apply must reconcile the shared Schema so fresh \
+             connections see the keyspace, even when self.state already had it"
+        );
+    }
+
+    /// Companion to the keyspace reconciliation repro: a `CreateTable` apply
+    /// must reconcile the shared `Schema` even when `self.state.tables` already
+    /// holds the table, so fresh CQL connections can resolve `ks.t`. Same
+    /// `inserted`-guard divergence as CreateKeyspace (forge t_86f9259d).
+    #[tokio::test]
+    async fn create_table_reconciles_shared_schema_even_when_state_already_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let shared_schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&shared_schema), Arc::clone(&engine));
+
+        // Keyspace is present everywhere; the table exists in self.state but not
+        // yet in the shared Schema (drift).
+        let ks = simple_keyspace("vis_test");
+        sm.apply(vec![make_entry(1, 1, RaftOp::CreateKeyspace(ks))])
+            .await
+            .unwrap();
+        let table = simple_table("vis_test", "t");
+        sm.state
+            .tables
+            .insert(("vis_test".into(), "t".into()), table.clone());
+        assert!(
+            !shared_schema
+                .snapshot()
+                .tables
+                .contains_key(&("vis_test".to_string(), "t".to_string())),
+            "precondition: shared Schema must start without vis_test.t"
+        );
+
+        sm.apply(vec![make_entry(1, 2, RaftOp::CreateTable(Box::new(table)))])
+            .await
+            .unwrap();
+
+        assert!(
+            shared_schema
+                .snapshot()
+                .tables
+                .contains_key(&("vis_test".to_string(), "t".to_string())),
+            "CreateTable apply must reconcile the shared Schema so fresh \
+             connections can resolve the table, even when self.state already had it"
+        );
+    }
+
     #[tokio::test]
     async fn create_keyspace_emits_system_table_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -3818,6 +3971,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
 
         let entries = vec![make_entry(1, 1, RaftOp::CreateRole(role))];

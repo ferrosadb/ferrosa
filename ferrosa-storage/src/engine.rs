@@ -486,29 +486,17 @@ impl StorageEngineConfig {
         // itself out. When true, the CQL server requires SASL PLAIN
         // authentication and the router consults
         // `ferrosa_schema::check_permission`.
+        // `from_env` only sees the env var; the authoritative `auth_enabled`
+        // also honors `[cql].auth_enabled` in the TOML, which the binary applies
+        // to this config AFTER `from_env` returns. So the auth-state startup logs
+        // are emitted by the binary once the final value is known (via
+        // `log_cql_auth_state` + `log_auth_warn_state`) — NOT here, where they
+        // would report the pre-TOML env default and mislead operators into
+        // thinking `auth_enabled = true` in the config was ignored (issue #172).
         let auth_enabled = matches!(
             std::env::var("FERROSA_AUTH_ENABLED").ok().as_deref(),
             Some("true" | "1" | "on" | "yes")
         );
-        tracing::info!(
-            auth_enabled,
-            source = if std::env::var_os("FERROSA_AUTH_ENABLED").is_some() {
-                "FERROSA_AUTH_ENABLED env"
-            } else {
-                "default"
-            },
-            "storage-engine: CQL role auth is {} — {}",
-            if auth_enabled { "ENABLED" } else { "DISABLED" },
-            if auth_enabled {
-                "CQL STARTUP requires SASL PLAIN, router enforces permission \
-                 checks, web :9090 requires tokens on writes/admin"
-            } else {
-                "CQL accepts every STARTUP without credentials, router permits \
-                 everything — matches legacy behavior; set \
-                 FERROSA_AUTH_ENABLED=true to enforce"
-            }
-        );
-        log_auth_warn_state(auth_enabled, auth_warn);
 
         let write_verify = !matches!(
             std::env::var("FERROSA_WRITE_VERIFY").ok().as_deref(),
@@ -578,6 +566,30 @@ impl StorageEngineConfig {
             memtable_num_shards: 64,
         }
     }
+}
+
+/// Emit the startup log describing whether CQL role auth is enforced, and where
+/// the decision came from. Emitted by the binary AFTER it has resolved
+/// `auth_enabled` from env → `[cql].auth_enabled` TOML → default, so the line
+/// reflects the value actually in force (not the pre-TOML env default that
+/// `from_env` alone would see — issue #172). `source` is a human label like
+/// `"FERROSA_AUTH_ENABLED env"`, `"config file ([cql].auth_enabled)"`, or
+/// `"default"`.
+pub fn log_cql_auth_state(auth_enabled: bool, source: &str) {
+    tracing::info!(
+        auth_enabled,
+        source,
+        "storage-engine: CQL role auth is {} — {}",
+        if auth_enabled { "ENABLED" } else { "DISABLED" },
+        if auth_enabled {
+            "CQL STARTUP requires SASL PLAIN, router enforces permission \
+             checks, web :9090 requires tokens on writes/admin"
+        } else {
+            "CQL accepts every STARTUP without credentials, router permits \
+             everything — matches legacy behavior; set auth_enabled = true in \
+             [cql] (or FERROSA_AUTH_ENABLED=true) to enforce"
+        }
+    );
 }
 
 /// Emit the startup log line describing the current `(auth_enabled,
@@ -3142,19 +3154,19 @@ impl StorageEngine {
             return Ok(false);
         };
 
-        // Generic add_index covers BTree/Hash/Composite/Phonetic/Filtered.
-        // FullText and Vector use dedicated sidecar build paths and are
-        // reconstructed elsewhere; skip them loudly here so the gap is visible.
-        if matches!(
-            index_type,
-            ferrosa_index::IndexType::FullText | ferrosa_index::IndexType::Vector
-        ) {
+        // Vector indexes need their dimension + HNSW params to rebuild and use
+        // a dedicated path; skip them here. FullText is re-registered after
+        // column resolution below (and its sidecars rebuilt) — leaving it
+        // skipped made fts_match return EMPTY after a restart even though the
+        // on-disk FTI sidecars were intact, because the engine's
+        // fulltext_indexes map (column position) was never repopulated.
+        if matches!(index_type, ferrosa_index::IndexType::Vector) {
             tracing::warn!(
                 keyspace,
                 table,
                 index_name,
                 kind,
-                "skipping reload of fulltext/vector index — needs dedicated rebuild path"
+                "skipping reload of vector index — needs dedicated rebuild path"
             );
             return Ok(false);
         }
@@ -3197,6 +3209,46 @@ impl StorageEngine {
         } else {
             None
         };
+
+        // FullText: repopulate the engine's fulltext_indexes map (so fts_match
+        // can resolve the column and read the on-disk FTI sidecars / scan
+        // sidecar-less SSTables), then submit rebuild jobs so any SSTable that
+        // predates the index gets its FTI sidecar reindexed. This is the
+        // restart reindex path whose absence silently broke lexical search.
+        if matches!(index_type, ferrosa_index::IndexType::FullText) {
+            self.add_fulltext_index(&table_id, &index_name, column_position)?;
+            if let Some(ref scheduler) = self.index_scheduler {
+                let tables = self.tables.read();
+                if let Some(state) = tables.get(&table_id) {
+                    for sstable_id in state.store.sstable_generation_ids() {
+                        let job = crate::index::IndexBuildJob {
+                            sstable_id,
+                            index_name: index_name.clone(),
+                            index_type,
+                            table: (
+                                table_id.keyspace().to_string(),
+                                table_id.table().to_string(),
+                            ),
+                            priority: crate::index::BuildPriority::Initial,
+                            enqueued_at: std::time::Instant::now(),
+                            column_position,
+                            filter_predicate: None,
+                        };
+                        if let Err(e) = scheduler.submit(job) {
+                            tracing::error!(%e, index_name, "reload: failed to submit fulltext reindex");
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                keyspace,
+                table,
+                index_name,
+                kind,
+                "re-registered + reindexed full-text index after restart"
+            );
+            return Ok(true);
+        }
 
         self.add_index_with_predicate(
             &table_id,
@@ -5371,6 +5423,19 @@ impl StorageEngine {
         }
     }
 
+    /// Attach (or replace) the CDC bus used by the commit log to publish
+    /// `WrittenOnNode` change-data-capture events. Inject the shared bus here
+    /// after the engine is constructed; lock-free and safe under concurrent
+    /// writes.
+    pub fn set_cdc_bus(&self, bus: std::sync::Arc<ferrosa_cdc::CdcBus>) {
+        self.commit_log.set_cdc(bus);
+    }
+
+    /// The CDC bus attached to this engine's commit log, if any.
+    pub fn cdc_bus(&self) -> Option<std::sync::Arc<ferrosa_cdc::CdcBus>> {
+        self.commit_log.cdc()
+    }
+
     /// Reads a partition from a table, merging memtable and SSTable sources.
     pub fn read(
         &self,
@@ -5735,7 +5800,7 @@ impl StorageEngine {
         query: &str,
     ) -> ferrosa_common::Result<Vec<Vec<u8>>> {
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
 
         let table_dir = self
             .config
@@ -5744,19 +5809,23 @@ impl StorageEngine {
             .join(table_id.to_string());
         let fti_suffix = format!("-FTI-{index_name}.db");
 
-        let fti_files: Vec<std::path::PathBuf> = std::fs::read_dir(&table_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_str()?.to_string();
-                if name.ends_with(&fti_suffix) {
-                    Some(e.path())
-                } else {
-                    None
+        // Collect the on-disk FTI sidecar files AND the set of SSTable
+        // generations they cover, so we can fall back to scanning any LIVE
+        // SSTable that is (transiently) missing its sidecar — e.g. during the
+        // async index rebuild window after compaction (BUG-F-007 / t_0455c0a1).
+        let mut fti_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut covered_gens: HashSet<String> = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&table_dir) {
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some(gen) = name.strip_suffix(&fti_suffix) {
+                    covered_gens.insert(gen.to_string());
+                    fti_files.push(e.path());
                 }
-            })
-            .collect();
+            }
+        }
 
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
         {
@@ -5799,6 +5868,25 @@ impl StorageEngine {
                 let entry = score_map.entry(hit.partition_key).or_insert(0.0);
                 if hit.score > *entry {
                     *entry = hit.score;
+                }
+            }
+        }
+
+        // Fallback: scan any LIVE SSTable whose on-disk FTI sidecar is missing
+        // (the transient compaction / async-rebuild window) so a stable row is
+        // never dropped from full-text search (BUG-F-007 / t_0455c0a1).
+        {
+            let tables = self.tables.read();
+            if let Some(state) = tables.get(table_id) {
+                for (partition_key, score) in state.store.fulltext_sstable_scan_missing_sidecar(
+                    index_name,
+                    query,
+                    &covered_gens,
+                )? {
+                    let entry = score_map.entry(partition_key).or_insert(0.0);
+                    if score > *entry {
+                        *entry = score;
+                    }
                 }
             }
         }
@@ -8428,6 +8516,36 @@ mod tests {
     #[cfg(feature = "live-infra-tests")]
     use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    /// Regression (issue #172): a fresh install passes its data dir via
+    /// `[storage].data_dir` in the TOML, which `main` resolves and exports as
+    /// `FERROSA_DATA_DIR` before building the engine config. `from_env` must
+    /// honor that env for the data dir AND every path derived from it (the
+    /// commit log, here) — otherwise the engine writes under the unwritable
+    /// `/var/lib/ferrosa` default and a non-root install (e.g. macOS
+    /// `~/.ferrosa/data`) fails to create its data dir.
+    #[test]
+    #[serial_test::serial(ferrosa_data_dir_env)]
+    fn from_env_routes_paths_through_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("FERROSA_DATA_DIR").ok();
+        std::env::set_var("FERROSA_DATA_DIR", dir.path());
+        let cfg = StorageEngineConfig::from_env().expect("from_env");
+        match prev {
+            Some(v) => std::env::set_var("FERROSA_DATA_DIR", v),
+            None => std::env::remove_var("FERROSA_DATA_DIR"),
+        }
+        assert_eq!(
+            cfg.data_dir,
+            dir.path(),
+            "data_dir must honor FERROSA_DATA_DIR"
+        );
+        assert!(
+            cfg.commit_log.log_dir.starts_with(dir.path()),
+            "commit-log dir must be derived from the configured data_dir, got {:?}",
+            cfg.commit_log.log_dir
+        );
+    }
 
     /// Return "docker" or "podman" — whichever container runtime is in PATH.
     /// Panics if neither is found.
@@ -12768,6 +12886,126 @@ mod tests {
             "t2 must remain readable via read_clustering_row across a concurrent compaction \
              that deleted its SSTable (no spurious Ok(None) on the point-read hot path)"
         );
+    }
+
+    /// Real-concurrency stress harness for the read-vs-compaction data-loss
+    /// class (bug t_940cc015). Phase-separated availability invariant: write a
+    /// FROZEN set of committed keys (no deletes), then hammer reads from N
+    /// threads while a background storm of filler writes drives NATURAL
+    /// compaction. No manual `CompactionTask`, no barrier, no `count==1`
+    /// assumption — so it can't wedge on the in-flight-input claim the way an
+    /// injected task does. Every read of a committed key MUST return `Some`; a
+    /// spurious `Ok(None)`/`Err` is silent data loss and fails the test.
+    ///
+    /// Feature-gated (`race-stress`) so it stays out of the per-PR gate (the
+    /// fast hand-written barrier tests above are the per-PR deterministic tier).
+    /// The nightly fuzz workflow runs this on a shared-cpu Fly machine whose
+    /// ~6.5% baseline starves the compaction executor and widens the window.
+    /// Scale via env: RACE_KEYS, RACE_READERS, RACE_SECS, RACE_FLUSH_EVERY.
+    #[cfg(feature = "race-stress")]
+    mod read_compaction_race_stress {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn committed_keys_stay_readable_under_compaction_storm() {
+            let n_keys = env_u64("RACE_KEYS", 300) as usize;
+            let n_readers = env_u64("RACE_READERS", 4) as usize;
+            let secs = env_u64("RACE_SECS", 20);
+            let flush_every = env_u64("RACE_FLUSH_EVERY", 25).max(1) as usize;
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = StorageEngineConfig::test_config(dir.path());
+            config.compaction.min_threshold = 2;
+            let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            // Phase A: write + flush the frozen committed key set (no deletes).
+            let keys: Vec<_> = (0..n_keys).map(|i| make_key(&format!("k{i:08}"))).collect();
+            let mut ts = 1i64;
+            for (i, k) in keys.iter().enumerate() {
+                engine
+                    .write(&tid, k, make_row(format!("v{i}").as_bytes(), ts), ts)
+                    .unwrap();
+                ts += 1;
+                if (i + 1) % flush_every == 0 {
+                    engine.flush(&tid).unwrap();
+                }
+            }
+            engine.flush(&tid).unwrap();
+
+            // Phase B: readers assert availability while the storm churns compaction.
+            let stop = Arc::new(AtomicBool::new(false));
+            let misses = Arc::new(AtomicU64::new(0));
+            let reads = Arc::new(AtomicU64::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..n_readers {
+                let eng = Arc::clone(&engine);
+                let t = tid.clone();
+                let ks = keys.clone();
+                let stop = Arc::clone(&stop);
+                let misses = Arc::clone(&misses);
+                let reads = Arc::clone(&reads);
+                handles.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        for k in &ks {
+                            match eng.read(&t, k) {
+                                Ok(Some(_)) => {}
+                                Ok(None) | Err(_) => {
+                                    misses.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+
+            // Storm: filler writes (NOT in the committed set) create fresh SSTables;
+            // flush() triggers natural maybe_compact() and poll applies the merges,
+            // continuously moving committed rows between SSTables under the readers.
+            let start = Instant::now();
+            let mut j = 0u64;
+            while start.elapsed().as_secs() < secs {
+                for _ in 0..flush_every {
+                    engine
+                        .write(
+                            &tid,
+                            &make_key(&format!("junk{j:010}")),
+                            make_row(b"j", ts),
+                            ts,
+                        )
+                        .unwrap();
+                    ts += 1;
+                    j += 1;
+                }
+                engine.flush(&tid).unwrap();
+                engine.poll_compactions().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            stop.store(true, Ordering::Relaxed);
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let m = misses.load(Ordering::Relaxed);
+            let r = reads.load(Ordering::Relaxed);
+            assert_eq!(
+                m, 0,
+                "{m} of {r} reads of committed keys returned Ok(None)/Err during a \
+                 compaction storm — read-vs-compaction silent data loss"
+            );
+        }
     }
 
     /// Window (1), DELETED-`Filter.db` variant — fail-loud + retry path.
@@ -17994,6 +18232,68 @@ mod tests {
         assert!(!hits.is_empty(), "search for 'rust' must return results");
     }
 
+    /// TDD repro for the post-restart fts_match-empty bug: flush an FTI sidecar,
+    /// persist the index, CLOSE the engine, reopen + reload, and require
+    /// fulltext_search to still return the row.
+    #[test]
+    fn fts_match_works_after_engine_reopen() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let idx_meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: tid.keyspace().to_string(),
+            table: tid.table().to_string(),
+            name: "idx_body".to_string(),
+            index_type: IndexType::FullText,
+            target_columns: vec!["val".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+            engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+            engine
+                .write(
+                    &tid,
+                    &make_key("r1"),
+                    make_row(b"rust distributed database", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+
+            let row = persistence::index_to_rows(&idx_meta);
+            engine
+                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+            engine.flush(&indexes_tid).unwrap();
+
+            // Sanity: fts_match works before the restart.
+            let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+            assert!(!hits.is_empty(), "fts_match must work before reopen");
+        }
+
+        // Reopen, replicating the boot sequence's index reload.
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        engine.reload_indexes_from_system_schema().unwrap();
+
+        // The bug: fts_match must still return the row after restart.
+        let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+        assert!(
+            !hits.is_empty(),
+            "fts_match must return the indexed row after an engine reopen"
+        );
+    }
+
     // ── FT-019: FTS end-to-end insert → flush → query ──────────────────────
 
     #[test]
@@ -18028,7 +18328,12 @@ mod tests {
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
 
         assert!(result_keys.contains(&"r1".to_string()), "r1 has both terms");
@@ -18063,7 +18368,12 @@ mod tests {
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
-            .map(|pk| String::from_utf8_lossy(pk).to_string())
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
             .collect();
 
         assert_eq!(
@@ -18131,6 +18441,149 @@ mod tests {
             missing.len(),
             100,
             &missing[..missing.len().min(10)]
+        );
+    }
+
+    /// Regression for t_0d08aa43 (BUG-F-007): `fts_match` returned 0/1
+    /// non-deterministically on a cluster. Root cause (on-disk half): FTI
+    /// sidecars are built ONLY on flush — compaction merges SSTables and
+    /// removes the old per-gen FTI sidecars WITHOUT writing one for the merged
+    /// generation, so a compacted node silently loses the row from full-text
+    /// search. A row found via FTI before compaction must still be found after.
+    #[tokio::test]
+    async fn fts_match_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        // 5 flushed batches → ≥4 SSTables (each with its own FTI sidecar), so
+        // STCS will compact them. A unique probe term lives in the first row.
+        const PROBE: &str = "ferrosaftscompactprobe";
+        for batch in 0..5u64 {
+            for i in 0..25u64 {
+                let n = batch * 25 + i;
+                let key = make_key(&format!("doc_{n:04}"));
+                let text = if n == 0 {
+                    format!("{PROBE} distributed database")
+                } else {
+                    format!("filler distributed database row {n}")
+                };
+                let ts = (n as i64) + 1;
+                engine
+                    .write(&tid, &key, make_row(text.as_bytes(), ts), ts)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        // Before compaction: the probe is found via the per-gen FTI sidecars.
+        let before = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "probe must be found via FTI before compaction"
+        );
+
+        // Compact (STCS triggers at ≥4 SSTables): merges gens, removing the old
+        // per-gen FTI sidecars.
+        engine.poll_compactions().await;
+
+        // After compaction the probe MUST still be found.
+        let after = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let keys: Vec<String> = after
+            .iter()
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["doc_0000".to_string()],
+            "fts_match must still find the probe row after compaction (compaction must rebuild the FTI sidecar)"
+        );
+    }
+
+    /// Regression for t_0455c0a1 (BUG-F-007, read-side robustness): a live
+    /// SSTable whose on-disk `-FTI-{index}.db` sidecar is MISSING — e.g. during
+    /// the window after compaction swaps in the merged SSTable but before its
+    /// FTI sidecar is (re)built (the eager index build is async in production),
+    /// or after a transient sidecar build/write failure — must NOT make the
+    /// SSTable's rows invisible to `fts_match`. The row's text lives in the
+    /// SSTable data; `fulltext_search` must fall back to scanning a sidecar-less
+    /// SSTable so a stable row is never transiently dropped from full-text
+    /// search. (On a multi-node cluster, every replica hitting this window at
+    /// once made the scatter-gather union empty → non-deterministic 0 rows.)
+    #[tokio::test]
+    async fn fts_match_finds_row_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        const PROBE: &str = "ferrosaftssidecarmissing";
+        let key = make_key("doc_0000");
+        engine
+            .write(
+                &tid,
+                &key,
+                make_row(format!("{PROBE} distributed database").as_bytes(), 1),
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Sanity: found via the freshly written FTI sidecar.
+        assert_eq!(
+            engine
+                .fulltext_search(&tid, "idx_body", PROBE)
+                .unwrap()
+                .len(),
+            1,
+            "probe must be found via the FTI sidecar right after flush"
+        );
+
+        // Simulate the missing-sidecar window: delete every on-disk FTI sidecar
+        // for this index. The SSTable data files are left untouched.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&table_dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .contains("-FTI-idx_body")
+            {
+                std::fs::remove_file(entry.path()).unwrap();
+                removed += 1;
+            }
+        }
+        assert!(
+            removed > 0,
+            "test must have deleted at least one FTI sidecar"
+        );
+
+        // The row MUST still be found — a missing sidecar cannot hide a live row.
+        let hits = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let keys: Vec<String> = hits
+            .iter()
+            .filter_map(|dk| {
+                // fulltext_search returns full row-granular doc keys now; decode
+                // the partition-key portion for these partition-level assertions.
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["doc_0000".to_string()],
+            "fts_match must find the row even when its SSTable has no FTI sidecar"
         );
     }
 

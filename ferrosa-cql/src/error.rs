@@ -293,6 +293,16 @@ impl From<ferrosa_common::Error> for CqlError {
     }
 }
 
+/// The storage-row codec / type-name parser lives in `ferrosa-row-bridge`
+/// (decoupled so `ferrosa-postgres` can reuse it without depending on this
+/// crate). Every failure path in the moved closure used `CqlError::Invalid`, so
+/// `RowBridgeError` maps straight back to it — callers see the identical error.
+impl From<ferrosa_row_bridge::RowBridgeError> for CqlError {
+    fn from(err: ferrosa_row_bridge::RowBridgeError) -> Self {
+        Self::Invalid(err.0)
+    }
+}
+
 impl From<std::io::Error> for CqlError {
     fn from(err: std::io::Error) -> Self {
         Self::ServerError(format!("I/O error: {err}"))

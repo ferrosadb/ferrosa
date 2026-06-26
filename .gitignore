@@ -2,6 +2,8 @@
 .fastembed_cache/
 /target/
 **/target/
+/target-*/
+/dist/
 /releases/
 
 # .claude/skills/ contains symlinks to the research repo (~/.claude/skills/).
@@ -23,3 +25,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+
+# CI/local smoke build artifacts
+tests/ferrosa.deb
+tests/ferrosa
+target-linux/

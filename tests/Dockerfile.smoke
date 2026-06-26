@@ -27,7 +27,7 @@ COPY ferrosa.deb /tmp/ferrosa.deb
 RUN dpkg -i /tmp/ferrosa.deb || (apt-get update && apt-get install -f -y) \
     && rm /tmp/ferrosa.deb \
     && which ferrosa \
-    && ferrosa --version
+    && dpkg -l ferrosa
 
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa

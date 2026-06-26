@@ -4,8 +4,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Ferrosa — Suite for Database and Agent Memory</title>
-  <meta name="description" content="Ferrosa Suite covers Ferrosa Database for operational database problems and Ferrosa Memory for developer-preview long-context linked memory for agents.">
+  <title>Ferrosa Memory — typed, durable memory for AI agents</title>
+  <meta name="description" content="Ferrosa Memory is a self-hosted, MCP-native memory service for AI agents — typed primitives (plans, bi-temporal facts, an entity graph, trajectory folds, feedback-aware recall) on a durable, S3-backed distributed store. Developer preview; managed service coming. Built on Ferrosa Database.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
     :root {
@@ -838,10 +838,10 @@
       ferro<span>sa</span>
     </a>
     <ul class="nav-links" id="site-nav-links">
-      <li><a href="/database/">Database</a></li>
       <li><a href="/ferrosa-memory/">Memory</a></li>
       <li><a href="/ferrosa-memory/getting-started.html">Memory Setup</a></li>
-      <li><a href="/database/examples/">Examples</a></li>
+      <li><a href="/ferrosa-memory/compare.html">Compare</a></li>
+      <li><a href="/database/">Database</a></li>
       <li><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></li>
     </ul>
     <a href="#get-started" class="nav-cta">Get Started</a>
@@ -850,50 +850,52 @@
 </nav>
 
 <div class="beta-banner">
-  <span class="beta-tag">Developer Preview</span> Ferrosa Suite is version 0.15.0 and moving toward a public release.
+  <span class="beta-tag">Developer Preview</span> Ferrosa Suite is version 0.16.0 and moving toward a public release.
 </div>
 <section class="hero">
-  <div class="hero-badge"><span class="dot"></span> Ferrosa Suite 0.15.0</div>
-  <h1>Infrastructure for data systems <span class="gradient">and agent memory.</span></h1>
-  <p>Ferrosa is a developer-preview suite for two related problems: a Rust-native distributed database for operational workloads, and Ferrosa Memory for linked agent context that can be queried, updated, and inspected over time.</p>
+  <div class="hero-badge"><span class="dot"></span> Ferrosa Memory · Developer Preview</div>
+  <h1>Agent memory with <span class="gradient">structure, not just search.</span></h1>
+  <p>Most tools bolt a vector store onto your app and call it memory. <strong>Ferrosa Memory</strong> gives agents typed primitives — plans, bi-temporal facts, an entity graph, trajectory folds, and feedback-aware recall — over a durable, S3-backed distributed store you run yourself. MCP-native and self-hosted today, with a managed service on the way.</p>
   <div class="hero-actions">
-    <a href="/database/" class="btn-primary">Use the Database</a>
-    <a href="/ferrosa-memory/getting-started.html" class="btn-secondary">Set Up Ferrosa Memory</a>
+    <a href="/ferrosa-memory/getting-started.html" class="btn-primary">Set Up Ferrosa Memory</a>
+    <a href="/ferrosa-memory/" class="btn-secondary">See what it does →</a>
   </div>
 </section>
-<section id="products">
-  <div class="section-label">Two products, one storage philosophy</div>
-  <h2>Pick the layer that matches your problem.</h2>
-  <p style="color:var(--text-secondary); max-width:780px;">Use Ferrosa Database when you want to evaluate CQL-compatible storage, search, graph, SPARQL, and transactions in one system. Use Ferrosa Memory when you want agents to carry linked context across sessions with temporal facts, graph links, document/chunk retrieval, feedback-aware reranking, and inspectable memory operations.</p>
+<section id="why">
+  <div class="section-label cool">Why it's different</div>
+  <h2>Memory that's typed, linked, and inspectable — not a blob of embeddings.</h2>
+  <p style="color:var(--text-secondary); max-width:820px;">Generic memory layers store text and rank it by similarity. Ferrosa Memory models the things agents actually need to remember as first-class data you can query, update, and audit — nearly 80 MCP tools across two tiers, on durable Ferrosa storage.</p>
   <div class="suite-grid">
-    <a class="suite-card" href="/database/">
-      <div class="kicker">Ferrosa Database</div>
-      <h3>Database problems: explored at the storage layer.</h3>
-      <p>CQL-compatible operational storage with S3-backed durability, secondary indexes, vector search, Cypher + Bolt graph queries, SPARQL, transactions, CDC, and observability. Developer-preview behavior should be tested with your workload before production use.</p>
-      <div class="pill-row"><span class="pill">CQL</span><span class="pill">Graph</span><span class="pill">SPARQL</span><span class="pill">Vector search</span><span class="pill">S3-backed</span></div>
-    </a>
-    <a class="suite-card memory" href="/ferrosa-memory/">
-      <div class="kicker">Ferrosa Memory</div>
-      <h3>Agent memory: durable, linked, queryable context.</h3>
-      <p>An MCP-native memory server for agents: a typed entity graph, bi-temporal facts, hybrid retrieval, trajectory folds, document/chunk retrieval, dream-cycle consolidation, Datalog-derived facts, and auditable forgetting — nearly 80 tools across two tiers, on durable Ferrosa DB storage.</p>
-      <p style="margin-top:1rem;"><span class="pill">MCP on 18765</span> <span class="pill">Viz on 18766</span></p>
-      <div class="pill-row"><span class="pill">MCP</span><span class="pill">Typed graph</span><span class="pill">Bi-temporal</span><span class="pill">Hybrid retrieval</span><span class="pill">Forgetting</span><span class="pill">Datalog</span></div>
-    </a>
-  </div>
-</section>
-<section id="memory-preview">
-  <div class="section-label cool">Agentic memory preview</div>
-  <h2>Long-context agents need more than a bigger prompt.</h2>
-  <div class="two-col">
-    <div>
-      <p style="color:var(--text-secondary);">Ferrosa Memory treats memory as data you can inspect: raw context segments can become entities, temporal facts, graph edges, and queryable views. Agents can retrieve context, follow relationships, record evolving state, and use a workbench to inspect CQL, SPARQL, Datalog, and visualization surfaces.</p>
-      <p style="color:var(--text-secondary);">The implementation draws inspiration from research on virtual context management, generative agents, graph-augmented retrieval, memory evaluation, compression, Datalog-style inference, and hippocampal memory indexing.</p>
+    <div class="doc-card">
+      <h3>Typed memory primitives</h3>
+      <p>Plan trees, bi-temporal facts with supersession (most-recent-valid retrieval), a named entity graph with phonetic dedup and multi-hop Cypher, trajectory folds (branch-and-collapse with semantic recall over summaries), and memoization to skip redundant LLM calls.</p>
+      <div class="pill-row"><span class="pill">Plans</span><span class="pill">Bi-temporal</span><span class="pill">Entity graph</span><span class="pill">Folds</span></div>
     </div>
     <div class="doc-card">
-      <h3>Research-inspired, product-shaped</h3>
-      <p>Preview docs cite the papers and specs behind the design, including memory architectures, GraphRAG-style retrieval, Datalog materialization, MemoryArena-style evaluation, prompt/context compression, and privacy/security work for persistent agent memory.</p>
-      <a href="/ferrosa-memory/how-it-works.html" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">See how it works →</a><br>
-      <a href="/ferrosa-memory/compare.html" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Compare vs. other memory servers →</a>
+      <h3>Recall that improves with use</h3>
+      <p>Hybrid retrieval over vector (HNSW), full-text (BM25), and phonetic candidates, with task-aware query decomposition and feedback-aware reranking that adapts to your workspace. Forgetting is explicit and auditable, with Datalog-derived facts on top.</p>
+      <div class="pill-row"><span class="pill">Hybrid retrieval</span><span class="pill">Reranking</span><span class="pill">Auditable forgetting</span><span class="pill">Datalog</span></div>
+    </div>
+    <div class="doc-card">
+      <h3>Built on a real distributed store</h3>
+      <p>Not a wrapper around your vector DB. Memory lives in Ferrosa Database — durable, S3-backed storage with vector, BM25, and phonetic indexes plus a property graph in one engine, so a new node serves from object storage in seconds.</p>
+      <div class="pill-row"><span class="pill">S3-backed</span><span class="pill">Durable</span><span class="pill">One engine</span></div>
+    </div>
+  </div>
+</section>
+<section id="compare">
+  <div class="section-label">How it compares</div>
+  <h2>Most "agent memory" is a vector store with a wrapper.</h2>
+  <div class="two-col">
+    <div>
+      <p style="color:var(--text-secondary);">The common pattern bolts a memory SDK onto a vector database or Postgres: text in, similar text out. That covers semantic recall, but not the structure agents need — plans, evolving facts, relationships between entities, or why a memory was retrieved.</p>
+      <p style="color:var(--text-secondary);">Ferrosa Memory keeps those as typed data on a store designed for it: hybrid indexes, a property graph, bi-temporal facts, and inspectable operations — so memory is something you can query, correct, and audit, not a black box of embeddings.</p>
+      <a href="/ferrosa-memory/compare.html" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">See the full comparison →</a>
+    </div>
+    <div class="doc-card">
+      <h3>Memory layer vs. memory service</h3>
+      <p style="color:var(--text-secondary);"><strong>Typical memory layer:</strong> an SDK over your own vector DB; add and search; similarity only; you own durability and ops.</p>
+      <p style="color:var(--text-secondary); margin-top:0.75rem;"><strong>Ferrosa Memory:</strong> a self-hosted service with typed primitives, hybrid + graph retrieval, bi-temporal facts, and auditable forgetting on a durable distributed store.</p>
     </div>
   </div>
   <div class="screenshot-grid">
@@ -907,28 +909,64 @@
     </a>
   </div>
 </section>
+<section id="scale">
+  <div class="section-label cool">From workgroup to enterprise</div>
+  <h2>Start on one box. Grow into a cluster. Managed is coming.</h2>
+  <div class="suite-grid">
+    <div class="doc-card">
+      <h3>Small team, self-hosted</h3>
+      <p>Run the MCP server with native binaries and local filesystem storage on a single machine — your team's shared memory in minutes. Point Claude Code or any MCP client at it.</p>
+    </div>
+    <div class="doc-card">
+      <h3>Scale to a real cluster</h3>
+      <p>The same memory runs on a Compose cluster with S3/MinIO durability and replication. The distributed Ferrosa store underneath handles growth, with a new node serving from object storage in seconds.</p>
+    </div>
+    <div class="doc-card">
+      <h3>Managed service — coming</h3>
+      <p>A hosted, managed memory service is on the roadmap for teams that want the API without running infrastructure. Same primitives, same model.</p>
+      <a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer" style="color:var(--accent-cool); text-decoration:none; font-weight:700;">Follow the roadmap →</a>
+    </div>
+  </div>
+</section>
+<section id="database">
+  <div class="section-label">The store underneath</div>
+  <div class="two-col">
+    <div>
+      <h2 style="margin-top:0;">Built on Ferrosa Database.</h2>
+      <p style="color:var(--text-secondary);">Ferrosa Memory runs on Ferrosa Database — a Rust-native, CQL-compatible distributed store with S3-backed durability, secondary and vector search, Cypher graph queries, SPARQL, and transactions. It's also usable on its own for operational workloads.</p>
+      <div class="hero-actions">
+        <a href="/database/" class="btn-secondary">Explore the Database →</a>
+      </div>
+    </div>
+    <div class="doc-card">
+      <div class="kicker">Ferrosa Database</div>
+      <div class="pill-row" style="margin-top:0.75rem;"><span class="pill">CQL</span><span class="pill">Graph</span><span class="pill">SPARQL</span><span class="pill">Vector search</span><span class="pill">S3-backed</span></div>
+      <p style="color:var(--text-secondary); margin-top:1rem;">Developer-preview behavior should be tested with your workload before production use.</p>
+    </div>
+  </div>
+</section>
 <section id="get-started" class="cta-section">
-  <h2>Start with the problem you have.</h2>
-  <p>Install a local developer preview for macOS or Linux, then evaluate the database and memory surfaces against your own workflows.</p>
-  <div class="code-block"><pre><code># Database only
-curl -fsSL https://ferrosadb.com/install.sh | bash
+  <h2>Give your agents memory in a few minutes.</h2>
+  <p>Install a local developer preview for macOS or Linux, then point your MCP client at it.</p>
+  <div class="code-block"><pre><code># Ferrosa Memory + LLM onboarding
+curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
 
-# Ferrosa Memory + LLM onboarding
-curl -fsSL https://ferrosadb.com/setup-memory.sh | bash</code></pre></div>
-  <p style="color:var(--text-secondary); max-width:760px; margin:1rem auto 0;">Memory setup can run minimal native binaries with local filesystem storage, or a full Compose cluster with optional MinIO. Nomic embeddings are optional; without them semantic/vector search is degraded.</p>
+# Just the database
+curl -fsSL https://ferrosadb.com/install.sh | bash</code></pre></div>
+  <p style="color:var(--text-secondary); max-width:760px; margin:1rem auto 0;">Memory setup runs minimal native binaries with local filesystem storage, or a full Compose cluster with optional MinIO. Nomic embeddings are optional; without them semantic/vector search is degraded.</p>
   <div class="hero-actions">
-    <a href="/database/getting-started.html" class="btn-primary">Database Getting Started</a>
-    <a href="/ferrosa-memory/getting-started.html" class="btn-secondary">Memory Quickstart</a>
+    <a href="/ferrosa-memory/getting-started.html" class="btn-primary">Memory Quickstart</a>
+    <a href="/ferrosa-memory/how-it-works.html" class="btn-secondary">How it works</a>
   </div>
 </section>
 <footer>
   <div style="max-width: 1200px; margin: 0 auto; padding: 3rem 2rem; border-top: 1px solid var(--border); display:flex; justify-content:space-between; gap:2rem; flex-wrap:wrap; color:var(--text-muted);">
-    <div>Ferrosa Suite <span style="color:var(--accent);">0.15.0</span> · Developer preview</div>
+    <div>Ferrosa Suite <span style="color:var(--accent);">0.16.0</span> · Developer preview</div>
     <div style="display:flex; gap:1rem; flex-wrap:wrap;">
-      <a href="/database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
       <a href="/ferrosa-memory/" style="color:var(--text-secondary); text-decoration:none;">Memory</a>
-      <a href="/database/getting-started.html" style="color:var(--text-secondary); text-decoration:none;">DB Docs</a>
-      <a href="/ferrosa-memory/#examples" style="color:var(--text-secondary); text-decoration:none;">Memory Examples</a>
+      <a href="/ferrosa-memory/getting-started.html" style="color:var(--text-secondary); text-decoration:none;">Memory Setup</a>
+      <a href="/ferrosa-memory/compare.html" style="color:var(--text-secondary); text-decoration:none;">Compare</a>
+      <a href="/database/" style="color:var(--text-secondary); text-decoration:none;">Database</a>
     </div>
   </div>
 </footer>

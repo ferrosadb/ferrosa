@@ -178,6 +178,23 @@ impl TokenRing {
         }
     }
 
+    /// The replica **host ids** (not internal node ids) that own `token` under
+    /// `strategy`. Convenience over [`Self::replicas_for_strategy`] for callers
+    /// that address replicas by `host_id` — e.g. the Accord coordinator driver,
+    /// whose per-shard quorum (`ShardQuorum`/`ParticipantSet`) is keyed by host
+    /// id. A node missing a registry entry is skipped (it cannot be a usable
+    /// replica target). Order follows `replicas_for_strategy`.
+    pub fn replica_host_ids_for_strategy(
+        &self,
+        token: Token,
+        strategy: &strategy::ReplicationStrategy,
+    ) -> Vec<uuid::Uuid> {
+        self.replicas_for_strategy(token, strategy)
+            .into_iter()
+            .filter_map(|id| self.get_node(id).map(|n| n.host_id))
+            .collect()
+    }
+
     /// Find replicas for a token using NetworkTopologyStrategy.
     ///
     /// Walks clockwise from `token`, filling per-DC quotas from `dc_rf`
@@ -747,6 +764,38 @@ mod tests {
         };
         let replicas = ring.replicas_for_strategy(0, &strategy);
         assert_eq!(replicas.len(), 2);
+    }
+
+    #[test]
+    fn replica_host_ids_for_strategy_maps_node_ids_to_host_ids() {
+        let mut ring = TokenRing::new();
+        ring.add_node(1, make_node("10.0.0.1:7000"));
+        ring.add_node(2, make_node("10.0.0.2:7000"));
+        ring.assign_tokens(1, &[100]);
+        ring.assign_tokens(2, &[200]);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 2,
+        };
+
+        // The host-id variant must return exactly the host ids of the node-id
+        // replicas, in the same order (this is what the Accord participant set
+        // consumes — replicas addressed by host_id).
+        let node_ids = ring.replicas_for_strategy(0, &strategy);
+        let expected: Vec<uuid::Uuid> = node_ids
+            .iter()
+            .map(|&id| {
+                ring.get_node(id)
+                    .expect("replica must be in the ring")
+                    .host_id
+            })
+            .collect();
+        let host_ids = ring.replica_host_ids_for_strategy(0, &strategy);
+
+        assert_eq!(host_ids.len(), 2, "RF=2 → two replica host ids");
+        assert_eq!(
+            host_ids, expected,
+            "host-id variant must mirror the node-id replicas"
+        );
     }
 
     #[test]

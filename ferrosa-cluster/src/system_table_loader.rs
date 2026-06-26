@@ -199,6 +199,62 @@ impl SystemTableLoader {
         }
         Ok(restored)
     }
+
+    /// Replay persisted `system_schema.indexes` rows into the live schema
+    /// Registry's index set.
+    ///
+    /// `load_local_schema` (schema.json) restores table schemas with NO
+    /// indexes, and the storage-side `reload_indexes_from_system_schema` only
+    /// repopulates the *engine*. The CQL router resolves an `fts_match` column
+    /// to its index via `SchemaSnapshot.indexes` (`resolve_fulltext_index_name`),
+    /// so without this replay that lookup falls back to the bare column name
+    /// after a restart and full-text search silently returns nothing. Returns
+    /// the number of indexes (re-)registered.
+    ///
+    /// Filtered (partial) indexes are skipped here: their predicate lives in
+    /// the persisted options and would need faithful decoding to register
+    /// soundly; they already route via the engine, and only full-text routing
+    /// depends on the schema registry.
+    pub fn replay_indexes_into_schema(&self, schema: &Schema) -> ferrosa_common::Result<usize> {
+        use ferrosa_schema::metadata::index::IndexMetadata;
+        let rows = self.engine.read_persisted_indexes()?;
+        let mut restored = 0usize;
+        for row in rows {
+            let Some(index_type) =
+                ferrosa_schema::system::persistence::index_type_from_kind(&row.kind)
+            else {
+                tracing::warn!(
+                    keyspace = %row.keyspace_name,
+                    index = %row.index_name,
+                    kind = %row.kind,
+                    "skipping system_schema.indexes replay: unknown index kind"
+                );
+                continue;
+            };
+            if matches!(index_type, ferrosa_index::IndexType::Filtered) {
+                continue;
+            }
+            let meta = IndexMetadata {
+                keyspace: row.keyspace_name.clone(),
+                table: row.table_name.clone(),
+                name: row.index_name.clone(),
+                index_type,
+                target_columns: row.target.split(", ").map(|s| s.to_string()).collect(),
+                filter_predicate: None,
+                options: serde_json::from_str(&row.options).unwrap_or_default(),
+            };
+            match schema.create_index_internal(meta) {
+                Ok(()) => restored += 1,
+                Err(e) => tracing::warn!(
+                    keyspace = %row.keyspace_name,
+                    index = %row.index_name,
+                    %e,
+                    "skipping system_schema.indexes replay row"
+                ),
+            }
+        }
+        Ok(restored)
+    }
 }
 
 fn decode_permission(name: &str) -> ferrosa_common::Result<Permission> {
@@ -510,6 +566,59 @@ mod tests {
     }
 
     #[test]
+    fn replay_indexes_restores_fulltext_index_for_router_resolution() {
+        use ferrosa_index::IndexType;
+        use ferrosa_schema::metadata::index::IndexMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        // Persist a CREATE INDEX (FullText) through the dogfooded writer.
+        let idx = IndexMetadata {
+            keyspace: "app".to_string(),
+            table: "docs".to_string(),
+            name: "idx_body_fts".to_string(),
+            index_type: IndexType::FullText,
+            target_columns: vec!["body".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(idx.clone()),
+            )
+            .unwrap();
+
+        // Cold restart: a fresh registry has NO indexes (the bug — the router's
+        // fts_match resolution would fall back to the bare column name).
+        let schema = test_schema();
+        assert!(
+            schema.snapshot().indexes.is_empty(),
+            "fresh schema must start with no indexes"
+        );
+
+        let count = SystemTableLoader::new(engine)
+            .replay_indexes_into_schema(&schema)
+            .unwrap();
+        assert_eq!(count, 1, "exactly one persisted index should be replayed");
+
+        // After replay the FullText index is resolvable, so the router maps
+        // fts_match(body) -> idx_body_fts instead of the bare column.
+        let snap = schema.snapshot();
+        let meta = snap
+            .indexes
+            .get(&(
+                "app".to_string(),
+                "docs".to_string(),
+                "idx_body_fts".to_string(),
+            ))
+            .expect("FullText index must be live in the registry after replay");
+        assert_eq!(meta.index_type, IndexType::FullText);
+        assert_eq!(meta.target_columns, vec!["body".to_string()]);
+    }
+
+    #[test]
     fn replay_role_permissions_restores_write_permission() {
         let dir = tempfile::tempdir().unwrap();
         let engine = test_engine(dir.path());
@@ -535,6 +644,7 @@ mod tests {
                 can_login: true,
                 salted_hash: None,
                 member_of: Default::default(),
+                scram: None,
             })
             .unwrap();
 

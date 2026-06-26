@@ -93,6 +93,39 @@ fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
     }
 }
 
+/// Build a `CommittedToCluster` CDC event for a regular-CL write, if the
+/// engine's shared CDC bus has a committed-stream subscriber.
+///
+/// Coordinator-side: a regular-CL write reaches "committed to cluster" when the
+/// coordinator achieves its consistency level (the caller publishes only after
+/// the write returns `Ok`). Ordered by the write `timestamp` — there is no
+/// Accord timestamp for non-Accord writes (decision O-8). Returns the bus +
+/// event so the row is cloned only when a subscriber is actually listening; the
+/// caller publishes after success. `None` (no allocation) otherwise.
+fn committed_cdc_event(
+    storage: &StorageEngine,
+    table_id: &TableId,
+    key: &DecoratedKey,
+    rows: &[Row],
+    timestamp: i64,
+) -> Option<(Arc<ferrosa_cdc::CdcBus>, ferrosa_cdc::CdcEvent)> {
+    let bus = storage.cdc_bus()?;
+    if !bus.has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster) {
+        return None;
+    }
+    let event = ferrosa_cdc::CdcEvent {
+        stream: ferrosa_cdc::CdcStream::CommittedToCluster,
+        keyspace: table_id.keyspace.clone(),
+        table: table_id.table.clone(),
+        key: key.clone(),
+        rows: rows.to_vec(),
+        timestamp,
+        accord_ts: None,
+        mutation_id: uuid::Uuid::new_v4().into_bytes(),
+    };
+    Some((bus, event))
+}
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -153,13 +186,44 @@ impl WritePath {
                         .coordinate_write(&m)
                         .await
                         .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
+                    if let Some((bus, ev)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        &TableId::new(&m.keyspace, &m.table),
+                        &m.key,
+                        &m.rows,
+                        m.timestamp,
+                    ) {
+                        bus.publish(ev);
+                    }
                 }
                 Ok(())
             }
-            Self::Cluster(coordinator) => coordinator
-                .coordinate_logged_batch(mutations)
-                .await
-                .map_err(cluster_error_to_common),
+            Self::Cluster(coordinator) => {
+                // Capture committed-CDC events before `mutations` is moved into
+                // the batch (clones only when a committed subscriber exists).
+                let pending: Vec<_> = mutations
+                    .iter()
+                    .filter_map(|m| {
+                        committed_cdc_event(
+                            &coordinator.storage,
+                            &TableId::new(&m.keyspace, &m.table),
+                            &m.key,
+                            &m.rows,
+                            m.timestamp,
+                        )
+                    })
+                    .collect();
+                let res = coordinator
+                    .coordinate_logged_batch(mutations)
+                    .await
+                    .map_err(cluster_error_to_common);
+                if res.is_ok() {
+                    for (bus, ev) in pending {
+                        bus.publish(ev);
+                    }
+                }
+                res
+            }
         }
     }
 
@@ -525,7 +589,7 @@ impl WritePath {
                 .local_storage()
                 .count_range(table_id, None, None)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id),
+            Self::Cluster(coordinator) => coordinator.coordinate_range_count(table_id).await,
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "count_range unavailable: write path is in degraded mode".into(),
             )),
@@ -701,6 +765,78 @@ impl WritePath {
         }
     }
 
+    /// Full-text (`fts_match`) index lookup, returning matching partition keys.
+    ///
+    /// In standalone/pair mode this hits local storage. In cluster mode the
+    /// coordinator fans out to every node and unions the matching keys, because
+    /// `fts_match` carries no partition key and its hits span all token ranges —
+    /// a coordinator-local lookup made the result non-deterministic (BUG-F-007).
+    pub async fn fulltext_search(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &str,
+    ) -> crate::error::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Direct(engine) => engine
+                .fulltext_search(table_id, index_name, query)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) => coordinator
+                .local_storage()
+                .fulltext_search(table_id, index_name, query)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_fulltext_search(table_id, index_name, query)
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "fulltext search unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Resolve a partition `token`'s replica **host ids** under the keyspace
+    /// `strategy`, for an Accord transaction's participant set (ADR-021).
+    ///
+    /// `Some(..)` only in **cluster** mode — replica placement is the ring's
+    /// concern and lives behind this boundary so the CQL/Postgres front-ends
+    /// never touch the ring/partitioner. Returns `None` in standalone/pair/
+    /// degraded modes, where the caller uses the local node (Accord transactions
+    /// are a cluster feature; a single-node deployment is one trivial replica).
+    pub fn replicas_for_key(
+        &self,
+        token: crate::raft::Token,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> Option<Vec<uuid::Uuid>> {
+        match self {
+            Self::Cluster(coordinator) => Some(coordinator.replica_host_ids_for(token, strategy)),
+            Self::Direct(_) | Self::Pair(_) | Self::Unavailable => None,
+        }
+    }
+
+    /// Resolve the Accord participant replica **host ids** that own a partition
+    /// `key` under the keyspace `replication`, computing the key's token and
+    /// parsing the strategy here so the CQL/Postgres front-ends pass raw key
+    /// bytes + keyspace metadata and never touch the partitioner or ring
+    /// (ADR-021).
+    ///
+    /// - `Ok(Some(replicas))` in **cluster** mode — the RF replicas owning the
+    ///   key's token (a proper subset of the cluster when RF < node count).
+    /// - `Ok(None)` outside cluster mode (no ring) — the caller falls back to
+    ///   its local/all-live-peers participant set.
+    /// - `Err(_)` if `replication` cannot be parsed into a strategy — fail loud
+    ///   rather than silently resolving to an empty/default set.
+    pub fn accord_replicas_for_key(
+        &self,
+        key: &[u8],
+        replication: &ferrosa_schema::metadata::keyspace::ReplicationParams,
+    ) -> Result<Option<Vec<uuid::Uuid>>, crate::ring::strategy::StrategyParseError> {
+        let strategy = crate::ring::strategy::ReplicationStrategy::try_from(replication)?;
+        let token = ferrosa_common::Token::from_key(key).0;
+        Ok(self.replicas_for_key(token, &strategy))
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
@@ -744,21 +880,57 @@ impl WritePath {
                     vec![row],
                     timestamp,
                 );
-                coordinator
+                let res = coordinator
                     .coordinate_write(&mutation)
                     .await
-                    .map_err(cluster_error_to_common)
+                    .map_err(cluster_error_to_common);
+                if res.is_ok() {
+                    if let Some((bus, ev)) = committed_cdc_event(
+                        coordinator.local_storage(),
+                        table_id,
+                        &mutation.key,
+                        &mutation.rows,
+                        mutation.timestamp,
+                    ) {
+                        bus.publish(ev);
+                    }
+                }
+                res
             }
-            Self::Cluster(coordinator) => match strategy {
-                ReplicationStrategy::Simple { replication_factor } => coordinator
-                    .coordinate_write_with(table_id, key, row, timestamp, cl, *replication_factor)
-                    .await
-                    .map_err(cluster_error_to_common),
-                ReplicationStrategy::NetworkTopology { .. } => coordinator
-                    .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
-                    .await
-                    .map_err(cluster_error_to_common),
-            },
+            Self::Cluster(coordinator) => {
+                // Capture the committed-CDC payload before `row` is moved into
+                // the coordinate call; clones only if a subscriber is listening.
+                let pending = committed_cdc_event(
+                    &coordinator.storage,
+                    table_id,
+                    key,
+                    std::slice::from_ref(&row),
+                    timestamp,
+                );
+                let res = match strategy {
+                    ReplicationStrategy::Simple { replication_factor } => coordinator
+                        .coordinate_write_with(
+                            table_id,
+                            key,
+                            row,
+                            timestamp,
+                            cl,
+                            *replication_factor,
+                        )
+                        .await
+                        .map_err(cluster_error_to_common),
+                    ReplicationStrategy::NetworkTopology { .. } => coordinator
+                        .coordinate_write_nts(table_id, key, row, timestamp, cl, strategy)
+                        .await
+                        .map_err(cluster_error_to_common),
+                };
+                if res.is_ok() {
+                    if let Some((bus, ev)) = pending {
+                        bus.publish(ev);
+                    }
+                }
+                res
+            }
         }
     }
 }
@@ -860,6 +1032,57 @@ mod tests {
         // Verify data was written
         let result = storage.read(&table_id, &key).unwrap();
         assert!(result.is_some(), "DirectWritePath should write to storage");
+    }
+
+    #[test]
+    fn replicas_for_key_is_none_outside_cluster_mode() {
+        // Standalone/pair/degraded modes have no ring, so the caller falls back
+        // to the local node. Cluster-mode resolution is covered by the ring's
+        // `replica_host_ids_for_strategy` test.
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+        assert_eq!(
+            WritePath::unavailable().replicas_for_key(0, &strategy),
+            None
+        );
+    }
+
+    #[test]
+    fn committed_cdc_event_only_when_subscribed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let bus = ferrosa_cdc::CdcBus::new(16);
+        storage.set_cdc_bus(bus.clone());
+
+        let table_id = TableId::new("ks", "t");
+        let key = DecoratedKey {
+            token: Token(1),
+            key: PartitionKey::new(vec![1]),
+        };
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+
+        // No committed-stream subscriber → no event built (no allocation).
+        assert!(
+            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+                .is_none()
+        );
+
+        // With a subscriber → event built with the right fields, accord_ts None.
+        let _sub = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+        let (_bus, ev) =
+            committed_cdc_event(&storage, &table_id, &key, std::slice::from_ref(&row), 1000)
+                .expect("committed CDC event built when subscribed");
+        assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
+        assert_eq!(ev.keyspace, "ks");
+        assert_eq!(ev.table, "t");
+        assert_eq!(ev.rows, vec![row]);
+        assert!(ev.accord_ts.is_none());
     }
 
     #[tokio::test]
@@ -966,6 +1189,120 @@ mod tests {
             projected_body.contains("local_projected_range_stream")
                 && projected_body.contains("coordinate_range_read_projected_stream_all_with"),
             "projected scans must expose a stream and fail clearly when cluster semantics would under-read"
+        );
+    }
+
+    // ── Accord per-key replica resolution (ADR-021) ───────────────────────────
+    // The write path owns replica placement; the CQL/PG front-ends ask it for a
+    // key's Accord participant set rather than resolving the ring themselves.
+
+    fn simple_replication(rf: usize) -> ferrosa_schema::metadata::keyspace::ReplicationParams {
+        ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                rf.to_string(),
+            )]),
+        }
+    }
+
+    fn ring_node(addr: &str) -> crate::raft::NodeInfo {
+        crate::raft::NodeInfo {
+            host_id: uuid::Uuid::new_v4(),
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: crate::raft::NodeState::Normal,
+            cql_broadcast: None,
+        }
+    }
+
+    #[test]
+    fn accord_replicas_for_key_is_none_outside_cluster_mode() {
+        // Standalone/pair/degraded modes have no ring, so the resolver yields
+        // None and the caller falls back to its local/all-live-peers set rather
+        // than guessing a placement.
+        let params = simple_replication(3);
+        assert_eq!(
+            WritePath::unavailable()
+                .accord_replicas_for_key(b"some-partition-key", &params)
+                .expect("a valid strategy parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn accord_replicas_for_key_fails_loud_on_bad_strategy() {
+        // An unparseable replication strategy must surface an error, never
+        // silently resolve to an empty/default replica set (fail loud).
+        let params = ferrosa_schema::metadata::keyspace::ReplicationParams {
+            strategy: "NoSuchStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        assert!(
+            WritePath::unavailable()
+                .accord_replicas_for_key(b"k", &params)
+                .is_err(),
+            "unknown replication strategy must fail loud"
+        );
+    }
+
+    #[test]
+    fn accord_replicas_for_key_resolves_rf_subset_in_cluster_mode() {
+        // Token-aware: over a 3-node ring with RF=2, a key resolves to exactly
+        // its two owning replicas — a proper subset of the cluster, not "all
+        // live peers". This is what makes the live Accord path RF-correct.
+        use ferrosa_net::peer::{PeerEventListener, PeerManager};
+        use ferrosa_net::rpc::handler::PeerId;
+
+        struct NoopListener;
+        impl PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: PeerId) {}
+            fn on_peer_disconnected(&self, _: PeerId) {}
+            fn on_peer_suspected(&self, _: PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let mut ring = crate::ring::TokenRing::new();
+        let n1 = ring_node("10.0.0.1:7000");
+        let n2 = ring_node("10.0.0.2:7000");
+        let n3 = ring_node("10.0.0.3:7000");
+        let members = [n1.host_id, n2.host_id, n3.host_id];
+        ring.add_node(1, n1);
+        ring.add_node(2, n2);
+        ring.add_node(3, n3);
+        ring.assign_tokens(1, &[-3_000_000_000_000_000_000]);
+        ring.assign_tokens(2, &[0]);
+        ring.assign_tokens(3, &[3_000_000_000_000_000_000]);
+
+        let coordinator = ClusterCoordinator::new(
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            std::sync::Arc::new(PeerManager::new(
+                std::sync::Arc::new(ferrosa_net::config::NetConfig::default()),
+                uuid::Uuid::new_v4(),
+                std::sync::Arc::new(NoopListener),
+            )),
+            1,
+            storage,
+            2,
+            ConsistencyLevel::One,
+        );
+        let write_path = WritePath::cluster(std::sync::Arc::new(coordinator));
+
+        let params = simple_replication(2);
+        let replicas = write_path
+            .accord_replicas_for_key(b"some-partition-key", &params)
+            .expect("a valid strategy parses")
+            .expect("cluster mode resolves a concrete replica set");
+
+        assert_eq!(replicas.len(), 2, "RF=2 → exactly two owning replicas");
+        assert!(
+            replicas.iter().all(|r| members.contains(r)),
+            "every resolved replica must be a ring member"
         );
     }
 }

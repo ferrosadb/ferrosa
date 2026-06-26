@@ -22,7 +22,7 @@
 //! `DepWaitApplier` uses a `parking_lot::Mutex` for the dep-wait graph so it
 //! can be shared across the coordinator thread and the replica handler thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use ferrosa_common::accord::{Timestamp, TxnId};
@@ -58,6 +58,7 @@ impl std::error::Error for ApplyError {}
 ///
 /// For Gap 5, this is an opaque byte vector. The production implementation
 /// will decode it as a `(TableId, DecoratedKey, Row)` triple.
+#[derive(Clone)]
 pub struct ApplyMutation {
     /// Serialized mutation payload (table_id + key + row + etc).
     pub data: Vec<u8>,
@@ -79,6 +80,30 @@ pub trait StorageApplier: Send + Sync + 'static {
     /// Called after all dependency transactions have already been applied.
     /// The implementation must persist the write before returning `Ok(())`.
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError>;
+
+    /// Apply ALL of a multi-key transaction's writes as a single atomic unit.
+    ///
+    /// A multi-key Accord transaction has one `txn_id` but one
+    /// [`ApplyMutation`] per partition it writes. They must commit
+    /// **all-or-nothing**: a failure on any key must persist none, so the
+    /// transaction never tears at the replica storage seam (DATA-LOSS-CRITICAL —
+    /// a partial apply that still marked the txn `Applied` would silently drop
+    /// the failed key with no retry signal).
+    ///
+    /// The default implementation applies each mutation in turn via
+    /// [`apply`](Self::apply) — adequate for test/no-op appliers, but **not**
+    /// atomic. The production [`EngineStorageApplier`] overrides this to commit
+    /// every partition through a single preflighted `apply_batch`.
+    fn apply_writeset(
+        &self,
+        txn_id: TxnId,
+        mutations: Vec<ApplyMutation>,
+    ) -> Result<(), ApplyError> {
+        for mutation in mutations {
+            self.apply(txn_id, mutation)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,12 +268,17 @@ impl StorageReader for EngineStorageReader {
 pub struct NoopStorageApplier {
     /// Log of (txn_id, t) pairs that were applied.
     applied: Mutex<Vec<(TxnId, Timestamp)>>,
+    /// Log of (txn_id, mutation.data) — the actual payload each apply received.
+    /// Recorded so tests can assert the cascade replays the REAL queued data
+    /// (not an empty placeholder).
+    payloads: Mutex<Vec<(TxnId, Vec<u8>)>>,
 }
 
 impl NoopStorageApplier {
     pub fn new() -> Self {
         Self {
             applied: Mutex::new(Vec::new()),
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -266,6 +296,18 @@ impl NoopStorageApplier {
     pub fn apply_count(&self) -> usize {
         self.applied.lock().len()
     }
+
+    /// The mutation payload the given txn was applied with (most recent), or
+    /// `None` if it was never applied. Used to assert the dep-cascade replays
+    /// the queued transaction's real data.
+    pub fn applied_data(&self, txn_id: &TxnId) -> Option<Vec<u8>> {
+        self.payloads
+            .lock()
+            .iter()
+            .rev()
+            .find(|(id, _)| id == txn_id)
+            .map(|(_, d)| d.clone())
+    }
 }
 
 impl Default for NoopStorageApplier {
@@ -277,6 +319,7 @@ impl Default for NoopStorageApplier {
 impl StorageApplier for NoopStorageApplier {
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
         self.applied.lock().push((txn_id, mutation.t));
+        self.payloads.lock().push((txn_id, mutation.data));
         Ok(())
     }
 }
@@ -342,8 +385,13 @@ fn restamp_row(row: &mut ferrosa_sstable::types::Row, cell_ts: i64) {
 /// agreed order even under coordinator clock skew.
 pub struct EngineStorageApplier {
     engine: Arc<StorageEngine>,
-    /// `(txn_id, t.time)` pairs already persisted — for idempotent re-apply.
-    applied: Mutex<HashSet<(TxnId, u64)>>,
+    /// `(txn_id, partition-key, t.time)` triples already persisted — for
+    /// idempotent re-apply. The **partition key** is part of the key so that the
+    /// distinct writes of one multi-key transaction (same `txn_id` + same agreed
+    /// `t`, different partition) are each tracked independently. Keying by
+    /// `(txn_id, t)` alone would dedup writes 2..N of a transaction as spurious
+    /// re-applies and silently drop them (DATA-LOSS).
+    applied: Mutex<HashSet<(TxnId, Vec<u8>, u64)>>,
 }
 
 impl EngineStorageApplier {
@@ -363,61 +411,96 @@ impl EngineStorageApplier {
 
 impl StorageApplier for EngineStorageApplier {
     fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
-        let key = (txn_id, mutation.t.time);
+        // The single-key apply is the degenerate one-entry writeset, so it
+        // shares the exact persistence + idempotency path (atomic batch of one).
+        self.apply_writeset(txn_id, vec![mutation])
+    }
 
-        // Idempotency gate: an already-applied (txn_id, t) is a no-op. Checked
-        // before decode so a duplicate Apply never re-writes a stale value.
-        if self.applied.lock().contains(&key) {
+    fn apply_writeset(
+        &self,
+        txn_id: TxnId,
+        mutations: Vec<ApplyMutation>,
+    ) -> Result<(), ApplyError> {
+        // Decode + restamp every partition, filtering out any (txn,key,t) already
+        // durable, and accumulate the BatchOps for the rest. The whole set then
+        // commits through ONE `apply_batch`, which preflights every target table
+        // BEFORE appending any commit-log record — so either all surviving keys
+        // land durably or none do (all-or-nothing; no partial / torn apply).
+        let mut ops: Vec<BatchOp> = Vec::new();
+        // The (txn,key,t) triples this call will newly persist — recorded only
+        // AFTER the batch is durable, so a failed apply leaves them re-appliable.
+        let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
+
+        {
+            // Snapshot the idempotency set under the lock to decide what to skip.
+            let already = self.applied.lock();
+            for mutation in &mutations {
+                // Decode the self-describing commit-log mutation (one partition).
+                // Fail loud on garbage.
+                let mut decoded =
+                    Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
+                        txn_id,
+                        reason: format!("failed to decode apply mutation: {e}"),
+                    })?;
+
+                // Idempotency gate: an already-applied (txn,key,t) is a no-op.
+                // Checked AFTER decode so the partition key is available — this is
+                // what lets writes 2..N of one txn (same txn+t, different key)
+                // each apply instead of being deduped as a re-apply.
+                let part_key = decoded.key.key.as_bytes().to_vec();
+                let idem = (txn_id, part_key, mutation.t.time);
+                if already.contains(&idem) {
+                    continue;
+                }
+
+                // Re-stamp every cell to the Accord-agreed execution timestamp.
+                //
+                // The coordinator stamps cells at materialize time with its own
+                // wall clock, BEFORE consensus picks `t`. Honoring that wall clock
+                // for LWW would let coordinator clock skew invert the Accord total
+                // order (lost update / non-linearizable). The agreed `t` exists
+                // precisely to order conflicting writes, so it — not the wall
+                // clock — must drive the last-write-wins cell timestamp.
+                let cell_ts = accord_cell_timestamp(mutation.t);
+                let keyspace = decoded.keyspace.clone();
+                let table = decoded.table.clone();
+                let key = decoded.key.clone();
+                for row in &mut decoded.rows {
+                    restamp_row(row, cell_ts);
+                }
+                for row in decoded.rows {
+                    ops.push(BatchOp::Write {
+                        keyspace: keyspace.clone(),
+                        table: table.clone(),
+                        key: key.clone(),
+                        row,
+                        timestamp: cell_ts,
+                    });
+                }
+                newly_applied.push(idem);
+            }
+        }
+
+        // Every key was already durable — true no-op (the whole writeset was a
+        // re-apply). Avoid an empty batch.
+        if newly_applied.is_empty() {
             return Ok(());
         }
 
-        // Decode the self-describing commit-log mutation. Fail loud on garbage.
-        let mut decoded = Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
-            txn_id,
-            reason: format!("failed to decode apply mutation: {e}"),
-        })?;
-
-        // Re-stamp every cell to the Accord-agreed execution timestamp `t`.
-        //
-        // The coordinator stamps cells at materialize time with its own wall
-        // clock, BEFORE consensus picks `t`. Honoring that wall clock for LWW
-        // would let coordinator clock skew invert the Accord total order
-        // (lost update / non-linearizable). The agreed `t` exists precisely to
-        // order conflicting writes, so it — not the wall clock — must drive the
-        // last-write-wins cell timestamp.
-        let cell_ts = accord_cell_timestamp(mutation.t);
-        for row in &mut decoded.rows {
-            restamp_row(row, cell_ts);
-        }
-
-        // Persist all rows atomically via the batch primitive. `apply_batch`
-        // preflights every target table BEFORE appending any commit-log record,
-        // so either all rows land durably or none do — no partial apply.
-        // Returns an error if any table is unregistered or the append fails;
-        // propagated as `ApplyError` (never fake success).
-        let ops: Vec<BatchOp> = decoded
-            .rows
-            .into_iter()
-            .map(|row| BatchOp::Write {
-                keyspace: decoded.keyspace.clone(),
-                table: decoded.table.clone(),
-                key: decoded.key.clone(),
-                row,
-                timestamp: cell_ts,
-            })
-            .collect();
-
+        // Atomic commit of all surviving partitions. On any preflight/append
+        // failure NONE of the ops are applied; propagated as `ApplyError`
+        // (never fake success).
         self.engine.apply_batch(ops).map_err(|e| ApplyError {
             txn_id,
-            reason: format!(
-                "storage apply_batch failed for {}.{}: {e}",
-                decoded.keyspace, decoded.table
-            ),
+            reason: format!("storage apply_batch failed for writeset: {e}"),
         })?;
 
-        // Record only after all rows are durable, so a mid-apply failure leaves
+        // Record only after the batch is durable, so a mid-apply failure leaves
         // the txn re-appliable rather than falsely marked applied.
-        self.applied.lock().insert(key);
+        let mut applied = self.applied.lock();
+        for idem in newly_applied {
+            applied.insert(idem);
+        }
         Ok(())
     }
 }
@@ -435,6 +518,13 @@ impl StorageApplier for EngineStorageApplier {
 pub struct DepWaitApplier {
     graph: Mutex<DepWaitGraph>,
     applier: Arc<dyn StorageApplier>,
+    /// The FULL write-set (one [`ApplyMutation`] per partition) for each
+    /// transaction parked waiting on dependencies, keyed by txn id. When the last
+    /// dependency resolves, the cascade pulls the real write-set from here and
+    /// applies **every** entry atomically — fixing both the empty-placeholder bug
+    /// (queued txns re-applied with `data: vec![]`) and the multi-key drop
+    /// (writes 2..N of a parked txn silently lost because only one was stored).
+    pending: Mutex<HashMap<TxnId, Vec<ApplyMutation>>>,
 }
 
 impl DepWaitApplier {
@@ -442,93 +532,158 @@ impl DepWaitApplier {
         Self {
             graph: Mutex::new(DepWaitGraph::new()),
             applier,
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
     /// Attempt to apply a committed transaction.
     ///
     /// If all dependencies in `deps` are already applied, calls `applier.apply`
-    /// immediately and propagates the "applied" signal through the graph.
+    /// immediately and propagates the "applied" signal through the graph,
+    /// transitively waking any parked waiters this resolves.
     ///
     /// If any dependencies are not yet applied, registers this transaction as
-    /// a waiter and returns `Ok(false)`. The transaction will be applied
-    /// automatically when the last dependency calls `notify_applied`.
+    /// a waiter and returns an empty `Vec`. The transaction will be applied
+    /// automatically when the last dependency calls
+    /// [`notify_applied`](Self::notify_applied) or [`try_apply`](Self::try_apply).
     ///
-    /// Returns `Ok(true)` if the transaction was applied immediately, or
-    /// `Ok(false)` if it was queued to wait.
-    pub fn try_apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<bool, ApplyError> {
-        let deps: Vec<TxnId> = mutation.deps.clone();
+    /// Returns the `(txn_id, mutation_data)` of every transaction that was
+    /// **actually persisted** by this call, in apply order — the primary first,
+    /// then each cascade-woken waiter. The caller (the Accord state machine) uses
+    /// this list to advance exactly those transactions to `Applied` and fire
+    /// their post-apply bookkeeping (protocol-log marker, conflict-index GC,
+    /// dep-wait wake). An **empty** `Vec` means the transaction parked behind an
+    /// unapplied dependency and must NOT be marked applied.
+    pub fn try_apply(
+        &self,
+        txn_id: TxnId,
+        mutation: ApplyMutation,
+    ) -> Result<Vec<(TxnId, Vec<u8>)>, ApplyError> {
+        // The single-key path is the degenerate one-entry write-set; delegating
+        // keeps it byte-identical with the multi-key path.
+        self.try_apply_writeset(txn_id, vec![mutation])
+    }
 
-        // Fast path: check all deps without holding the lock.
-        // Then take the lock to register waits atomically.
+    /// Attempt to apply a committed **multi-key** transaction: its full
+    /// write-set (one [`ApplyMutation`] per partition), parked and applied as a
+    /// unit so writes 2..N are never dropped.
+    ///
+    /// Dependencies are **txn-level** (the dep-wait graph stays keyed by
+    /// `TxnId`), so the union of every entry's `deps` gates the whole write-set.
+    /// If all deps are already applied, the entire write-set is applied
+    /// atomically now (via [`StorageApplier::apply_writeset`]) and the cascade
+    /// runs; otherwise the whole write-set parks and an empty `Vec` is returned.
+    ///
+    /// Returns one `(txn_id, data)` entry **per applied write** — a multi-key
+    /// txn yields N entries with the same `txn_id` — in apply order (this txn's
+    /// writes first, then each cascade-woken waiter's). The state machine dedups
+    /// by `txn_id` for once-per-txn `Applied` bookkeeping.
+    pub fn try_apply_writeset(
+        &self,
+        txn_id: TxnId,
+        mutations: Vec<ApplyMutation>,
+    ) -> Result<Vec<(TxnId, Vec<u8>)>, ApplyError> {
+        // Txn-level deps: the union across every write in the set (the graph is
+        // TxnId-keyed; deps are a property of the transaction, not the key).
+        let deps: Vec<TxnId> = {
+            let mut seen: HashSet<TxnId> = HashSet::new();
+            let mut out: Vec<TxnId> = Vec::new();
+            for m in &mutations {
+                for dep in &m.deps {
+                    if seen.insert(*dep) {
+                        out.push(*dep);
+                    }
+                }
+            }
+            out
+        };
+
         let mut graph = self.graph.lock();
 
         // Register waits for any unresolved deps.
         let mut waiting = false;
         for dep in &deps {
             if !graph.is_applied(dep) {
-                // Dep not yet applied — register a wait.
-                // We don't use DepWaitGraph::register_wait here because we
-                // handle the "waiter" tracking ourselves per-transaction.
                 waiting = true;
-                // For now: mark that this txn needs this dep.
-                // The actual scheduling will be handled by notify_applied.
                 let _ = graph.register_wait(txn_id, *dep);
             }
         }
 
         if waiting {
-            // Store the mutation for later application.
-            // For simplicity in this implementation, we apply eagerly once
-            // notify_applied cascades — see notify_applied below.
+            // Park the WHOLE write-set so the cascade replays every key's REAL
+            // data when the last dependency resolves — not an empty placeholder,
+            // and not just the first key.
             drop(graph);
-            return Ok(false);
+            self.pending.lock().insert(txn_id, mutations);
+            return Ok(Vec::new());
         }
 
         drop(graph);
 
-        // All deps satisfied — apply now.
-        self.applier.apply(txn_id, mutation)?;
+        // All deps satisfied — apply the whole write-set atomically now, then
+        // cascade to any waiters this resolves. Capture the per-key payloads
+        // before the mutations are moved into the applier so we can report them.
+        let datas: Vec<Vec<u8>> = mutations.iter().map(|m| m.data.clone()).collect();
+        self.applier.apply_writeset(txn_id, mutations)?;
+        let mut applied: Vec<(TxnId, Vec<u8>)> =
+            datas.into_iter().map(|data| (txn_id, data)).collect();
+        applied.extend(self.cascade(txn_id));
+        Ok(applied)
+    }
 
-        // Mark applied in the graph and cascade to waiters.
-        let woken = self.graph.lock().mark_applied(txn_id);
-        for waiter_id in woken {
-            // Waiters were registered with empty mutations (data=vec![]).
-            // In production this would look up the queued mutation from a
-            // per-txn store. For Gap 5 happy path, we apply with empty data.
-            let _ = self.applier.apply(
-                waiter_id,
-                ApplyMutation {
-                    data: vec![],
-                    t: txn_id.0, // use dep's timestamp as placeholder
-                    deps: vec![],
-                },
-            );
-            let _ = self.graph.lock().mark_applied(waiter_id);
+    /// Mark `just_applied` as applied and apply — in dependency order — every
+    /// transaction whose *last* remaining dependency this resolves, using each
+    /// waiter's parked mutation (its real data). Cascades transitively, since a
+    /// woken waiter may itself unblock further waiters.
+    ///
+    /// Returns the `(txn_id, mutation_data)` of every waiter that was actually
+    /// persisted, in apply order — so the caller can advance exactly those to
+    /// `Applied`. A waiter whose apply *fails* is left un-applied and is NOT in
+    /// the returned list (fail loud; its dependents stay parked).
+    fn cascade(&self, just_applied: TxnId) -> Vec<(TxnId, Vec<u8>)> {
+        let mut applied: Vec<(TxnId, Vec<u8>)> = Vec::new();
+        let mut queue: VecDeque<TxnId> = self
+            .graph
+            .lock()
+            .mark_applied(just_applied)
+            .into_iter()
+            .collect();
+        while let Some(waiter) = queue.pop_front() {
+            // Pull the waiter's parked write-set (stored when it parked in
+            // `try_apply_writeset`). If absent — e.g. a no-write finalize that
+            // parked nothing — there is nothing to persist; still mark it applied
+            // so its own waiters proceed.
+            if let Some(mutations) = self.pending.lock().remove(&waiter) {
+                let datas: Vec<Vec<u8>> = mutations.iter().map(|m| m.data.clone()).collect();
+                if let Err(e) = self.applier.apply_writeset(waiter, mutations) {
+                    // Fail loud: the parked write-set did not persist (atomically,
+                    // so NO key landed). Do NOT mark applied or cascade past it —
+                    // its dependents stay parked rather than committing on a lost
+                    // write. The txn is re-driven by the coordinator's Apply retry.
+                    tracing::error!(%e, txn = waiter.0.time, "accord dep-cascade: applier failed for parked waiter — leaving it un-applied");
+                    continue;
+                }
+                // Report every key of the waiter's write-set, in order.
+                applied.extend(datas.into_iter().map(|data| (waiter, data)));
+            }
+            for woken in self.graph.lock().mark_applied(waiter) {
+                queue.push_back(woken);
+            }
         }
-
-        Ok(true)
+        applied
     }
 
     /// Notify the applier that `txn_id` has been applied externally.
     ///
-    /// Called when a dependency transaction's apply is acknowledged by the
-    /// remote coordinator (via `ApplyOK`). Unblocks any waiting transactions.
-    pub fn notify_applied(&self, txn_id: TxnId) {
-        let woken = self.graph.lock().mark_applied(txn_id);
-        for waiter_id in woken {
-            // Waiter is now unblocked — apply with empty mutation (will be
-            // superseded by real data in the production implementation).
-            let _ = self.applier.apply(
-                waiter_id,
-                ApplyMutation {
-                    data: vec![],
-                    t: txn_id.0,
-                    deps: vec![],
-                },
-            );
-            let _ = self.graph.lock().mark_applied(waiter_id);
-        }
+    /// Called when a dependency transaction reaches `Applied` without a local
+    /// row write (a no-write LWT finalize) or when a remote coordinator
+    /// acknowledges its apply (via `ApplyOK`). Unblocks any waiting transactions
+    /// and returns the `(txn_id, mutation_data)` of every waiter that was
+    /// actually persisted as a result, in apply order (see the `cascade` helper).
+    pub fn notify_applied(&self, txn_id: TxnId) -> Vec<(TxnId, Vec<u8>)> {
+        // Mark the externally-applied dependency and apply any waiters it
+        // unblocks, using their real parked mutations (see `cascade`).
+        self.cascade(txn_id)
     }
 
     /// Check if a transaction has been applied.
@@ -544,6 +699,85 @@ impl DepWaitApplier {
     /// Access to the storage applier (for test assertions).
     pub fn applier(&self) -> &Arc<dyn StorageApplier> {
         &self.applier
+    }
+}
+
+// ===========================================================================
+// CdcPublishingApplier — publish CommittedToCluster CDC on durable apply
+// ===========================================================================
+
+/// Decorates a [`StorageApplier`] to publish a `CommittedToCluster` CDC event
+/// after a successful durable apply, so live CQL `SUBSCRIBE ... ON COMMITTED`
+/// (and the Arrow Flight endpoint) receive Accord-committed writes. No-op when
+/// no committed-stream subscriber is attached. The inner applier's fail-loud
+/// contract is preserved — the event is published only after `inner.apply`
+/// returns `Ok`.
+pub struct CdcPublishingApplier {
+    inner: Arc<dyn StorageApplier>,
+    cdc: Arc<ferrosa_cdc::CdcBus>,
+}
+
+impl CdcPublishingApplier {
+    pub fn new(inner: Arc<dyn StorageApplier>, cdc: Arc<ferrosa_cdc::CdcBus>) -> Self {
+        Self { inner, cdc }
+    }
+}
+
+impl CdcPublishingApplier {
+    /// Build the `CommittedToCluster` CDC event for `mutation`, or `None` if no
+    /// subscriber is listening (or the payload fails to decode).
+    fn committed_event(&self, mutation: &ApplyMutation) -> Option<ferrosa_cdc::CdcEvent> {
+        if !self
+            .cdc
+            .has_subscribers(ferrosa_cdc::CdcStream::CommittedToCluster)
+        {
+            return None;
+        }
+        Mutation::deserialize_from(&mutation.data)
+            .ok()
+            .map(|m| ferrosa_cdc::CdcEvent {
+                stream: ferrosa_cdc::CdcStream::CommittedToCluster,
+                keyspace: m.keyspace.clone(),
+                table: m.table.clone(),
+                key: m.key.clone(),
+                rows: m.rows.clone(),
+                timestamp: m.timestamp,
+                accord_ts: Some(mutation.t),
+                mutation_id: m.mutation_id,
+            })
+    }
+}
+
+impl StorageApplier for CdcPublishingApplier {
+    fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
+        // Build the CDC event before `mutation` is consumed, and only if a
+        // committed-stream subscriber is actually listening.
+        let event = self.committed_event(&mutation);
+        self.inner.apply(txn_id, mutation)?;
+        if let Some(ev) = event {
+            self.cdc.publish(ev);
+        }
+        Ok(())
+    }
+
+    fn apply_writeset(
+        &self,
+        txn_id: TxnId,
+        mutations: Vec<ApplyMutation>,
+    ) -> Result<(), ApplyError> {
+        // Build every event up front, then route the writeset through the inner
+        // applier's ATOMIC `apply_writeset` (NOT the per-key default loop, which
+        // would forfeit cross-key atomicity). Publish only after the durable
+        // apply returns Ok, preserving the inner fail-loud contract.
+        let events: Vec<ferrosa_cdc::CdcEvent> = mutations
+            .iter()
+            .filter_map(|m| self.committed_event(m))
+            .collect();
+        self.inner.apply_writeset(txn_id, mutations)?;
+        for ev in events {
+            self.cdc.publish(ev);
+        }
+        Ok(())
     }
 }
 
@@ -584,7 +818,11 @@ mod tests {
         let txn = txn_id(1, 1000);
         let result = applier.try_apply(txn, mutation(vec![])).unwrap();
 
-        assert!(result, "transaction with no deps must apply immediately");
+        assert_eq!(
+            result.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![txn],
+            "transaction with no deps must apply immediately and be reported"
+        );
         assert!(
             noop.was_applied(&txn),
             "noop applier must record the application"
@@ -620,7 +858,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            result,
+            !result.is_empty(),
             "transaction with already-applied dep must apply immediately"
         );
         assert!(noop.was_applied(&txn));
@@ -650,18 +888,233 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!result, "transaction with pending dep must be queued");
+        assert!(
+            result.is_empty(),
+            "transaction with pending dep must be queued (empty applied list)"
+        );
         assert!(
             !noop.was_applied(&txn),
             "txn must not be applied while dep is pending"
         );
 
-        // Dep becomes available — notify the applier.
-        applier.notify_applied(dep);
+        // Dep becomes available — notify the applier. The woken waiter is
+        // returned so the caller can advance it to Applied.
+        let woken = applier.notify_applied(dep);
+        assert_eq!(
+            woken.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![txn],
+            "notify_applied must report the cascaded waiter"
+        );
 
         // Txn should now be applied (woken from the dep-wait graph).
         // The waiter should have been called via cascade in notify_applied.
         assert_eq!(noop.apply_count(), 1, "cascade must apply the waiter");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression (t_cb5180f9): the dep cascade must replay a queued waiter
+    // with its REAL parked mutation, not an empty `data: vec![]` placeholder
+    // (which silently dropped the waiter's write).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cascade_replays_queued_mutation_real_data() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let a = txn_id(1, 500);
+        let b = txn_id(2, 1000);
+
+        // B depends on A (not yet applied) → B parks.
+        let queued = applier
+            .try_apply(
+                b,
+                ApplyMutation {
+                    data: b"write-from-B".to_vec(),
+                    t: ts(1000),
+                    deps: vec![a],
+                },
+            )
+            .unwrap();
+        assert!(queued.is_empty(), "B must be queued behind A");
+        assert!(!noop.was_applied(&b));
+
+        // A applies (no deps) → cascade wakes B. The returned list reports A
+        // then B in dependency order.
+        let applied = applier
+            .try_apply(
+                a,
+                ApplyMutation {
+                    data: b"write-from-A".to_vec(),
+                    t: ts(500),
+                    deps: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            applied.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![a, b],
+            "A applies immediately then cascades to B, in dependency order"
+        );
+
+        assert!(
+            noop.was_applied(&b),
+            "cascade must apply the queued waiter B"
+        );
+        assert_eq!(
+            noop.applied_data(&b).as_deref(),
+            Some(b"write-from-B".as_slice()),
+            "B must be re-applied with its REAL parked mutation, not data: vec![]",
+        );
+        assert_eq!(
+            noop.applied_data(&a).as_deref(),
+            Some(b"write-from-A".as_slice())
+        );
+    }
+
+    #[test]
+    fn cascade_is_transitive_with_real_data() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+        let (a, b, c) = (txn_id(1, 100), txn_id(2, 200), txn_id(3, 300));
+
+        // Queue C (waits on B) and B (waits on A); both park.
+        assert!(applier
+            .try_apply(
+                c,
+                ApplyMutation {
+                    data: b"C".to_vec(),
+                    t: ts(300),
+                    deps: vec![b]
+                }
+            )
+            .unwrap()
+            .is_empty());
+        assert!(applier
+            .try_apply(
+                b,
+                ApplyMutation {
+                    data: b"B".to_vec(),
+                    t: ts(200),
+                    deps: vec![a]
+                }
+            )
+            .unwrap()
+            .is_empty());
+        // A applies → B unblocks → C unblocks, each with its own data, reported
+        // in transitive dependency order.
+        assert_eq!(
+            applier
+                .try_apply(
+                    a,
+                    ApplyMutation {
+                        data: b"A".to_vec(),
+                        t: ts(100),
+                        deps: vec![]
+                    }
+                )
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![a, b, c],
+        );
+
+        assert_eq!(noop.applied_data(&a).as_deref(), Some(b"A".as_slice()));
+        assert_eq!(noop.applied_data(&b).as_deref(), Some(b"B".as_slice()));
+        assert_eq!(noop.applied_data(&c).as_deref(), Some(b"C".as_slice()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-key (writeset) — DATA-LOSS-CRITICAL: a txn with N partition writes
+    // must park ALL N and apply ALL N on resolve. The bug being fixed dropped
+    // writes 2..N (the engine was keyed by txn only, so they collided/vanished).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn writeset_no_deps_applies_every_key_immediately() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let txn = txn_id(1, 1000);
+        let writes = vec![
+            ApplyMutation {
+                data: b"key1-write".to_vec(),
+                t: ts(1000),
+                deps: vec![],
+            },
+            ApplyMutation {
+                data: b"key2-write".to_vec(),
+                t: ts(1000),
+                deps: vec![],
+            },
+        ];
+
+        let applied = applier.try_apply_writeset(txn, writes).unwrap();
+        // Both writes of the SAME txn must be reported (same TxnId, distinct data).
+        assert_eq!(applied.len(), 2, "every key of the txn must apply");
+        assert!(applied.iter().all(|(id, _)| *id == txn));
+        assert_eq!(noop.apply_count(), 2, "BOTH writes must reach the applier");
+        let datas: Vec<Vec<u8>> = applied.into_iter().map(|(_, d)| d).collect();
+        assert!(datas.contains(&b"key1-write".to_vec()));
+        assert!(datas.contains(&b"key2-write".to_vec()));
+    }
+
+    #[test]
+    fn writeset_parked_behind_dep_applies_all_keys_on_resolve() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let dep = txn_id(1, 500);
+        let txn = txn_id(2, 1000);
+
+        // Two-key write-set for `txn`, both blocked behind the unapplied `dep`.
+        let writes = vec![
+            ApplyMutation {
+                data: b"key1-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+            ApplyMutation {
+                data: b"key2-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+        ];
+        let queued = applier.try_apply_writeset(txn, writes).unwrap();
+        assert!(
+            queued.is_empty(),
+            "the whole multi-key txn must park behind dep"
+        );
+        assert_eq!(noop.apply_count(), 0, "nothing applies while parked");
+
+        // dep resolves → the cascade must replay BOTH parked writes (today: 1).
+        let woken = applier.notify_applied(dep);
+        let woken_ids: Vec<_> = woken.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            woken_ids,
+            vec![txn, txn],
+            "BOTH writes of the multi-key txn must apply on resolve — not just the first"
+        );
+        assert_eq!(noop.apply_count(), 2);
+        let datas: Vec<Vec<u8>> = woken.into_iter().map(|(_, d)| d).collect();
+        assert!(
+            datas.contains(&b"key1-write".to_vec()) && datas.contains(&b"key2-write".to_vec()),
+            "the cascade must replay each key's REAL parked data"
+        );
+    }
+
+    #[test]
+    fn try_apply_is_single_key_writeset_delegation() {
+        // The single-key path must stay behaviorally identical: one entry in,
+        // one entry out, applied once.
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+        let txn = txn_id(1, 1000);
+        let applied = applier.try_apply(txn, mutation(vec![])).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, txn);
+        assert_eq!(noop.apply_count(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -709,7 +1162,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(result, "txn_b must apply immediately (dep already applied)");
+        assert!(
+            !result.is_empty(),
+            "txn_b must apply immediately (dep already applied)"
+        );
         assert!(noop.was_applied(&txn_b));
 
         // Verify apply log order.
@@ -721,6 +1177,176 @@ mod tests {
             log_a_pos < log_b_pos,
             "txn_a must be applied before txn_b in the log"
         );
+    }
+
+    // =======================================================================
+    // BDD scenarios — the multi-key data-loss narrative, Given/When/Then.
+    // =======================================================================
+
+    /// A `StorageApplier` recording every applied `(txn.time, data)` in global
+    /// apply order, so property tests can assert exactly-once + dependency order.
+    struct RecordingApplier {
+        seq: Mutex<Vec<(u64, Vec<u8>)>>,
+    }
+
+    impl RecordingApplier {
+        fn new() -> Self {
+            Self {
+                seq: Mutex::new(Vec::new()),
+            }
+        }
+        fn order(&self) -> Vec<(u64, Vec<u8>)> {
+            self.seq.lock().clone()
+        }
+    }
+
+    impl StorageApplier for RecordingApplier {
+        fn apply(&self, txn_id: TxnId, mutation: ApplyMutation) -> Result<(), ApplyError> {
+            self.seq.lock().push((txn_id.0.time, mutation.data));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bdd_multikey_txn_parked_behind_dependency_loses_no_write() {
+        // GIVEN a two-key transaction B that depends on a not-yet-applied A,
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+        let a = txn_id(1, 100);
+        let b = txn_id(2, 200);
+        let b_writes = vec![
+            ApplyMutation {
+                data: b"B/key1".to_vec(),
+                t: ts(200),
+                deps: vec![a],
+            },
+            ApplyMutation {
+                data: b"B/key2".to_vec(),
+                t: ts(200),
+                deps: vec![a],
+            },
+        ];
+
+        // WHEN B is driven before A (so B parks), then A applies,
+        let parked = applier.try_apply_writeset(b, b_writes).unwrap();
+        assert!(parked.is_empty(), "B parks behind A");
+        let woken = applier
+            .try_apply(
+                a,
+                ApplyMutation {
+                    data: b"A/key".to_vec(),
+                    t: ts(100),
+                    deps: vec![],
+                },
+            )
+            .unwrap();
+
+        // THEN A and BOTH of B's keys are applied — no write is lost.
+        let ids: Vec<TxnId> = woken.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![a, b, b],
+            "A applies, then both of B's writes cascade"
+        );
+        assert_eq!(noop.apply_count(), 3);
+    }
+
+    // =======================================================================
+    // Property tests — invariants over random multi-key dependency DAGs.
+    // =======================================================================
+
+    use proptest::prelude::*;
+
+    /// Cap on the number of transactions a generated DAG may contain.
+    const MAX_TXNS: usize = 7;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// For ANY random DAG of multi-key transactions applied in ANY order:
+        ///  (1) NO-LOST-WRITE / EXACTLY-ONCE — every (txn, key) write is applied
+        ///      exactly once: none dropped, none double-applied.
+        ///  (2) DEP-ORDER — for every dependency edge a→b, every one of a's writes
+        ///      is applied before any of b's (a reaches Applied before b cascades).
+        #[test]
+        #[allow(clippy::needless_range_loop)] // `i` indexes a flat matrix + parallel vecs
+        fn prop_multikey_dag_applies_every_write_exactly_once_in_dep_order(
+            // adjacency[i*MAX_TXNS + j] = "txn i depends on txn j" (only j<i used → DAG)
+            adjacency in prop::collection::vec(any::<bool>(), MAX_TXNS * MAX_TXNS),
+            keys_per in prop::collection::vec(1usize..4, MAX_TXNS),
+            prios in prop::collection::vec(any::<u64>(), MAX_TXNS),
+            n in 2usize..=MAX_TXNS,
+        ) {
+            let rec = Arc::new(RecordingApplier::new());
+            let applier = DepWaitApplier::new(rec.clone());
+
+            // txn i has a distinct, increasing time so TxnIds and ordering are stable.
+            let id_of = |i: usize| TxnId::new(1, ts((i as u64 + 1) * 100));
+
+            // Build each txn's deps (j<i per adjacency) and write-set. `i`
+            // indexes the flat adjacency matrix and several parallel vecs, so a
+            // range loop is the clearest form here.
+            let mut deps_of: Vec<Vec<TxnId>> = vec![Vec::new(); n];
+            let mut writes_of: Vec<Vec<ApplyMutation>> = Vec::with_capacity(n);
+            let mut expected: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for i in 0..n {
+                for j in 0..i {
+                    if adjacency[i * MAX_TXNS + j] {
+                        deps_of[i].push(id_of(j));
+                    }
+                }
+                let mut ws = Vec::new();
+                for k in 0..keys_per[i] {
+                    let data = format!("{i}:{k}").into_bytes();
+                    expected.insert(data.clone());
+                    ws.push(ApplyMutation {
+                        data,
+                        t: ts((i as u64 + 1) * 100),
+                        deps: deps_of[i].clone(),
+                    });
+                }
+                writes_of.push(ws);
+            }
+
+            // Attempt order: a pseudo-random permutation by (prio, index).
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by_key(|&i| (prios[i], i));
+
+            for &i in &order {
+                applier
+                    .try_apply_writeset(id_of(i), writes_of[i].clone())
+                    .expect("apply must not error (Noop/recording applier never fails)");
+            }
+
+            let log = rec.order();
+
+            // (1) Exactly-once: the recorded multiset equals the expected set, with
+            // no duplicates.
+            let recorded: Vec<Vec<u8>> = log.iter().map(|(_, d)| d.clone()).collect();
+            let recorded_set: std::collections::HashSet<Vec<u8>> = recorded.iter().cloned().collect();
+            prop_assert_eq!(recorded.len(), expected.len(), "no write dropped or double-applied");
+            prop_assert_eq!(recorded_set, expected, "exactly the expected writes were applied");
+
+            // First/last global apply position per txn time.
+            let mut first: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+            let mut last: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+            for (pos, (time, _)) in log.iter().enumerate() {
+                first.entry(*time).or_insert(pos);
+                last.insert(*time, pos);
+            }
+
+            // (2) Dep-order: along every edge a→b, all of a precedes all of b.
+            for i in 0..n {
+                let bt = (i as u64 + 1) * 100;
+                for dep in &deps_of[i] {
+                    let at = dep.0.time;
+                    prop_assert!(
+                        last[&at] < first[&bt],
+                        "dependency {at} must fully apply before dependent {bt}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1024,6 +1650,283 @@ mod engine_applier_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Multi-key idempotency — DATA-LOSS-CRITICAL. Two writes of the SAME txn at
+    // the SAME agreed `t` but DIFFERENT partition keys must BOTH persist. The
+    // pre-fix idempotency key was (txn_id, t.time), so the second key was
+    // silently deduped as a "re-apply" and its write vanished.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn two_keys_same_txn_and_t_both_persist() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+        let k1 = make_key("pk1");
+        let k2 = make_key("pk2");
+
+        applier
+            .apply(id, encoded_mutation(k1.clone(), b"v1", 1000, t, vec![]))
+            .unwrap();
+        // SAME txn_id + t, DIFFERENT key — must NOT be treated as a re-apply.
+        applier
+            .apply(id, encoded_mutation(k2.clone(), b"v2", 1000, t, vec![]))
+            .unwrap();
+
+        assert_eq!(read_cell0(&engine, &k1).as_deref(), Some(b"v1".as_slice()));
+        assert_eq!(
+            read_cell0(&engine, &k2).as_deref(),
+            Some(b"v2".as_slice()),
+            "second key of the same (txn,t) must persist — idempotency must include the key"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic writeset apply: every key of a multi-key txn commits in ONE atomic
+    // batch (all-or-nothing). A failure on ANY key persists NONE — the multi-key
+    // transaction never tears at the replica storage seam.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn apply_writeset_persists_all_keys() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+        let k1 = make_key("pk1");
+        let k2 = make_key("pk2");
+
+        applier
+            .apply_writeset(
+                id,
+                vec![
+                    encoded_mutation(k1.clone(), b"a", 1000, t, vec![]),
+                    encoded_mutation(k2.clone(), b"b", 1000, t, vec![]),
+                ],
+            )
+            .expect("a clean multi-key writeset must persist every key");
+
+        assert_eq!(read_cell0(&engine, &k1).as_deref(), Some(b"a".as_slice()));
+        assert_eq!(read_cell0(&engine, &k2).as_deref(), Some(b"b".as_slice()));
+        assert_eq!(applier.applied_count(), 2, "both (txn,key,t) recorded");
+    }
+
+    #[test]
+    fn apply_writeset_is_all_or_nothing_when_a_key_fails() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+        let k1 = make_key("pk1");
+        let good = encoded_mutation(k1.clone(), b"a", 1000, t, vec![]);
+
+        // Second write targets a table that was never registered → preflight
+        // fails for the batch, so NO key may persist.
+        let bad_m = Mutation::new(
+            KS.to_string(),
+            "no_such_table".to_string(),
+            make_key("pk2"),
+            vec![make_row(b"b", 1000)],
+            1000,
+        );
+        let mut buf = vec![0u8; bad_m.serialized_size()];
+        bad_m.serialize_into(&mut buf);
+        let bad = ApplyMutation {
+            data: buf,
+            t,
+            deps: vec![],
+        };
+
+        let err = applier
+            .apply_writeset(id, vec![good, bad])
+            .expect_err("a failing key must fail the whole writeset — fail loud");
+        assert!(!err.reason.is_empty(), "error must carry a reason");
+
+        assert!(
+            read_cell0(&engine, &k1).is_none(),
+            "all-or-nothing: the good key must NOT persist when another key in the writeset fails"
+        );
+        assert_eq!(
+            applier.applied_count(),
+            0,
+            "no (txn,key,t) may be recorded for a failed writeset"
+        );
+    }
+
+    #[test]
+    fn apply_writeset_skips_already_applied_keys_and_applies_the_rest() {
+        // A re-drive where key A already persisted (single-key apply) and the
+        // writeset {A,B} arrives: A is deduped, B applies. No torn state, no
+        // resurrection of A.
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+        let k1 = make_key("pk1");
+        let k2 = make_key("pk2");
+
+        applier
+            .apply(id, encoded_mutation(k1.clone(), b"a", 1000, t, vec![]))
+            .unwrap();
+        // Re-drive as a writeset: A already applied (skip), B new (apply).
+        applier
+            .apply_writeset(
+                id,
+                vec![
+                    encoded_mutation(k1.clone(), b"a", 1000, t, vec![]),
+                    encoded_mutation(k2.clone(), b"b", 1000, t, vec![]),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(read_cell0(&engine, &k1).as_deref(), Some(b"a".as_slice()));
+        assert_eq!(read_cell0(&engine, &k2).as_deref(), Some(b"b".as_slice()));
+        assert_eq!(applier.applied_count(), 2);
+    }
+
+    /// Build an `ApplyMutation` whose decoded `Mutation` targets `table` (use an
+    /// unregistered table name to force a preflight failure).
+    fn encoded_mutation_for_table(
+        table: &str,
+        key: DecoratedKey,
+        value: &[u8],
+        t: Timestamp,
+    ) -> ApplyMutation {
+        let m = Mutation::new(
+            KS.to_string(),
+            table.to_string(),
+            key,
+            vec![make_row(value, 1000)],
+            1000,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        ApplyMutation {
+            data: buf,
+            t,
+            deps: vec![],
+        }
+    }
+
+    // =======================================================================
+    // BDD scenario — atomic rollback of a partial multi-key write-set.
+    // =======================================================================
+    #[test]
+    fn bdd_failed_key_rolls_back_the_whole_multikey_writeset() {
+        // GIVEN a real engine and a two-key write-set whose second key targets an
+        // unregistered table,
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+        let good_key = make_key("ok");
+        let t = accord_ts(1000);
+        let good = encoded_mutation(good_key.clone(), b"v", 1000, t, vec![]);
+        let bad = encoded_mutation_for_table("missing_table", make_key("bad"), b"x", t);
+
+        // WHEN the write-set is applied,
+        let res = applier.apply_writeset(txn(1, 1000), vec![good, bad]);
+
+        // THEN it fails loud AND the good key did not persist (all-or-nothing).
+        assert!(res.is_err(), "a failing key fails the whole write-set");
+        assert!(
+            read_cell0(&engine, &good_key).is_none(),
+            "atomic rollback: no key persists when any key in the set fails"
+        );
+        assert_eq!(applier.applied_count(), 0);
+    }
+
+    // =======================================================================
+    // Property tests — idempotent replay / LWW-by-agreed-t, and atomicity.
+    // =======================================================================
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// IDEMPOTENT REPLAY + LWW-BY-AGREED-T. For a single key written by
+        /// several transactions at distinct agreed timestamps, applying those
+        /// writes in ANY order with ARBITRARY duplicates always converges to the
+        /// value of the highest agreed `t` — re-applying an already-applied
+        /// (txn,key,t) is a no-op and never resurrects a stale value.
+        #[test]
+        fn prop_idempotent_replay_converges_to_highest_agreed_t(
+            arrivals in prop::collection::vec(0usize..6, 1..24),
+        ) {
+            let (engine, _dir) = make_engine();
+            let applier = EngineStorageApplier::new(engine.clone());
+            let key = make_key("pk");
+
+            for &w in &arrivals {
+                let t = accord_ts((w as u64 + 1) * 100);
+                applier
+                    .apply(
+                        txn(1, (w as u64 + 1) * 100),
+                        encoded_mutation(key.clone(), format!("v{w}").as_bytes(), ((w + 1) * 100) as i64, t, vec![]),
+                    )
+                    .unwrap();
+            }
+
+            let winner = *arrivals.iter().max().unwrap();
+            let want = format!("v{winner}");
+            let got = read_cell0(&engine, &key);
+            prop_assert_eq!(
+                got.as_deref(),
+                Some(want.as_bytes()),
+                "the write with the highest agreed t wins regardless of arrival order/duplicates"
+            );
+        }
+
+        /// ATOMIC VISIBILITY. A multi-key write-set is all-or-nothing: if any key
+        /// fails (unregistered table), NONE of the keys persist; if all succeed,
+        /// ALL persist. A read can never observe a partial multi-key transaction.
+        #[test]
+        fn prop_writeset_apply_is_atomic_all_or_nothing(
+            n_keys in 1usize..5,
+            fail_at in prop::option::of(0usize..5),
+        ) {
+            let (engine, _dir) = make_engine();
+            let applier = EngineStorageApplier::new(engine.clone());
+            let t = accord_ts(1000);
+
+            let keys: Vec<DecoratedKey> = (0..n_keys).map(|k| make_key(&format!("pk{k}"))).collect();
+            let mut muts = Vec::with_capacity(n_keys);
+            for (k, key) in keys.iter().enumerate() {
+                if fail_at == Some(k) {
+                    muts.push(encoded_mutation_for_table("missing_table", key.clone(), b"x", t));
+                } else {
+                    muts.push(encoded_mutation(key.clone(), format!("v{k}").as_bytes(), 1000, t, vec![]));
+                }
+            }
+
+            let res = applier.apply_writeset(txn(1, 1000), muts);
+            let expect_fail = fail_at.map(|f| f < n_keys).unwrap_or(false);
+
+            if expect_fail {
+                prop_assert!(res.is_err(), "a failing key must fail the whole write-set");
+                for key in &keys {
+                    prop_assert!(
+                        read_cell0(&engine, key).is_none(),
+                        "all-or-nothing: no key may persist when the write-set fails"
+                    );
+                }
+                prop_assert_eq!(applier.applied_count(), 0);
+            } else {
+                prop_assert!(res.is_ok());
+                for (k, key) in keys.iter().enumerate() {
+                    let want = format!("v{k}");
+                    let got = read_cell0(&engine, key);
+                    prop_assert_eq!(
+                        got.as_deref(),
+                        Some(want.as_bytes()),
+                        "every key of a clean write-set persists"
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // StorageReader / EngineStorageReader: linearizable read-at-t.
     //
     // The reader is symmetric to the applier: a replica calls read_row_at
@@ -1099,6 +2002,215 @@ mod engine_applier_tests {
         assert!(
             got.is_none(),
             "a cell written at a later agreed t must not be visible to a read at an earlier t"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end streaming SUBSCRIBE latency with two simultaneous connections:
+    // one on the local-commit stream (WrittenOnNode, fired at commit-log append)
+    // and one on the full-Accord stream (CommittedToCluster, fired by the
+    // CdcPublishingApplier after a durable Accord apply). Measures write->deliver
+    // latency for each path and prints the distribution.
+    //
+    // NOTE: single-node, in-process push bus — both streams deliver in
+    // microseconds. The local-vs-committed *gap* (cluster consensus / quorum
+    // round-trip) only manifests in a multi-node deployment; here both paths are
+    // dominated by the same local commit-log append.
+    fn report(label: &str, samples: &mut [u64]) {
+        samples.sort_unstable();
+        let n = samples.len();
+        let avg = samples.iter().sum::<u64>() / n as u64;
+        let p50 = samples[n / 2];
+        let p99 = samples[(n * 99 / 100).min(n - 1)];
+        eprintln!(
+            "SUBSCRIBE latency [{label}] over {n} writes: avg={:.1}µs p50={:.1}µs p99={:.1}µs",
+            avg as f64 / 1000.0,
+            p50 as f64 / 1000.0,
+            p99 as f64 / 1000.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_latency_two_connections_local_and_full_accord() {
+        let (engine, _dir) = make_engine();
+        let bus = ferrosa_cdc::CdcBus::new(8192);
+        engine.set_cdc_bus(bus.clone());
+
+        // Two simultaneous subscriber connections.
+        let mut local = bus.subscribe(ferrosa_cdc::CdcStream::WrittenOnNode);
+        let mut committed = bus.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+
+        let applier =
+            CdcPublishingApplier::new(Arc::new(EngineStorageApplier::new(engine.clone())), bus);
+
+        const WARMUP: usize = 20;
+        const N: usize = 300;
+
+        // --- Local-commit path: plain engine writes fire WrittenOnNode only. ---
+        let mut local_ns = Vec::with_capacity(N);
+        for i in 0..(WARMUP + N) {
+            let key = make_key(&format!("local{i}"));
+            let m = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                key,
+                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                1_000 + i as i64,
+            );
+            let t0 = std::time::Instant::now();
+            engine.write_atomic_batch(vec![m]).expect("local write");
+            let ev = local.recv().await.expect("WrittenOnNode delivered");
+            let dt = t0.elapsed();
+            assert_eq!(ev.stream, ferrosa_cdc::CdcStream::WrittenOnNode);
+            if i >= WARMUP {
+                local_ns.push(dt.as_nanos() as u64);
+            }
+        }
+
+        // --- Full-Accord path: applier.apply does a durable apply, then the
+        //     decorator publishes CommittedToCluster (and the inner write fires
+        //     WrittenOnNode, which we drain). ---
+        let mut committed_ns = Vec::with_capacity(N);
+        for i in 0..(WARMUP + N) {
+            let key = make_key(&format!("accord{i}"));
+            let t = accord_ts(10_000 + i as u64);
+            let m = encoded_mutation(
+                key,
+                format!("v{i}").as_bytes(),
+                10_000 + i as i64,
+                t,
+                vec![],
+            );
+            let t0 = std::time::Instant::now();
+            applier
+                .apply(txn(1, 10_000 + i as u64), m)
+                .expect("accord apply");
+            let ev = committed
+                .recv()
+                .await
+                .expect("CommittedToCluster delivered");
+            let dt = t0.elapsed();
+            assert_eq!(ev.stream, ferrosa_cdc::CdcStream::CommittedToCluster);
+            assert_eq!(
+                ev.accord_ts,
+                Some(t),
+                "committed event carries the accord ts"
+            );
+            // Drain the WrittenOnNode the inner write produced, so the local
+            // subscriber does not lag.
+            local.recv().await.expect("inner WrittenOnNode");
+            if i >= WARMUP {
+                committed_ns.push(dt.as_nanos() as u64);
+            }
+        }
+
+        report("local commit (WrittenOnNode)", &mut local_ns);
+        report("full accord (CommittedToCluster)", &mut committed_ns);
+        assert_eq!(local_ns.len(), N);
+        assert_eq!(committed_ns.len(), N);
+    }
+
+    // -----------------------------------------------------------------------
+    // MULTI-NODE model: two nodes, each with its own StorageEngine + push CDC
+    // bus. Node A takes local writes (WrittenOnNode); node B is a replica that
+    // applies cluster-committed writes via the real Accord apply path
+    // (CdcPublishingApplier -> CommittedToCluster). Subscribers on each node
+    // measure write->deliver latency, PROVING delivery is event-driven push:
+    //   * delivery is dominated by the commit cost, with NO poll-interval floor;
+    //   * after a long idle gap a single committed write is delivered
+    //     immediately — a poll-based CDC would be bounded by its interval.
+    //
+    // (A fully network-formed cluster latency number additionally needs the
+    // live-infra cluster harness; this models the replica apply + CDC fan-out,
+    // which is where CommittedToCluster actually fires on a cluster commit.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multinode_subscribe_is_realtime_push_not_poll() {
+        // --- Two independent nodes. ---
+        let (engine_a, _da) = make_engine();
+        let bus_a = ferrosa_cdc::CdcBus::new(8192);
+        engine_a.set_cdc_bus(bus_a.clone());
+        let (engine_b, _db) = make_engine();
+        let bus_b = ferrosa_cdc::CdcBus::new(8192);
+        engine_b.set_cdc_bus(bus_b.clone());
+
+        // Two subscriber connections, one per node.
+        let mut sub_a_local = bus_a.subscribe(ferrosa_cdc::CdcStream::WrittenOnNode);
+        let mut sub_b_committed = bus_b.subscribe(ferrosa_cdc::CdcStream::CommittedToCluster);
+
+        // Node B applies cluster-committed writes (replica apply path).
+        let applier_b =
+            CdcPublishingApplier::new(Arc::new(EngineStorageApplier::new(engine_b.clone())), bus_b);
+
+        const N: usize = 200;
+        let mut a_local_ns = Vec::with_capacity(N);
+        let mut b_committed_ns = Vec::with_capacity(N);
+        for i in 0..N {
+            // Local commit on node A -> WrittenOnNode delivered to A's subscriber.
+            let m_a = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                make_key(&format!("a{i}")),
+                vec![make_row(format!("v{i}").as_bytes(), 1_000 + i as i64)],
+                1_000 + i as i64,
+            );
+            let t0 = std::time::Instant::now();
+            engine_a
+                .write_atomic_batch(vec![m_a])
+                .expect("node A write");
+            sub_a_local.recv().await.expect("A WrittenOnNode delivered");
+            a_local_ns.push(t0.elapsed().as_nanos() as u64);
+
+            // Cluster-committed apply on node B -> CommittedToCluster to B's sub.
+            let t = accord_ts(100_000 + i as u64);
+            let m_b = encoded_mutation(
+                make_key(&format!("b{i}")),
+                format!("v{i}").as_bytes(),
+                100_000 + i as i64,
+                t,
+                vec![],
+            );
+            let t1 = std::time::Instant::now();
+            applier_b
+                .apply(txn(2, 100_000 + i as u64), m_b)
+                .expect("node B apply");
+            sub_b_committed
+                .recv()
+                .await
+                .expect("B CommittedToCluster delivered");
+            b_committed_ns.push(t1.elapsed().as_nanos() as u64);
+        }
+        report("node A local-commit (WrittenOnNode)", &mut a_local_ns);
+        report(
+            "node B cluster-committed (CommittedToCluster)",
+            &mut b_committed_ns,
+        );
+
+        // --- Push-vs-poll discriminator: idle, then ONE committed write. A
+        //     poll-based CDC would deliver no sooner than its next tick; a push
+        //     bus delivers as soon as the apply commits. ---
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let t = accord_ts(900_000);
+        let m = encoded_mutation(make_key("idle"), b"x", 900_000, t, vec![]);
+        let t0 = std::time::Instant::now();
+        applier_b
+            .apply(txn(2, 900_000), m)
+            .expect("post-idle apply");
+        let ev = sub_b_committed
+            .recv()
+            .await
+            .expect("post-idle CommittedToCluster delivered");
+        let idle_deliver = t0.elapsed();
+        eprintln!("after 250ms idle, CommittedToCluster delivered in {idle_deliver:?}");
+        assert_eq!(ev.accord_ts, Some(t));
+        // Load-robust bound: the measured number (printed above) is the real
+        // proof — it is dominated by the commit fsync (~ms), NOT a poll interval.
+        // A poll-based CDC (e.g. a segment-reader on a multi-second checkpoint
+        // interval) could not deliver this fast regardless of CPU contention.
+        assert!(
+            idle_deliver < std::time::Duration::from_secs(1),
+            "real-time push CDC must deliver promptly after the commit \
+             (got {idle_deliver:?}); a poll-based stream would be bounded by its \
+             poll interval regardless of the idle gap"
         );
     }
 }

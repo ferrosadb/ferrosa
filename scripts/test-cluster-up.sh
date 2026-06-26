@@ -25,12 +25,16 @@ COMPOSE_CMD=""
 for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
+        --quint) PROFILE="quint" ;;
         --help|-h)
-            echo "Usage: $0 [--keep]"
+            echo "Usage: $0 [--keep] [--quint]"
             echo ""
-            echo "  --keep   Do not tear down the cluster on exit."
+            echo "  --keep    Do not tear down the cluster on exit."
+            echo "  --quint   5-node cluster (ports 30042-30046) instead of the"
+            echo "            default 3-node trio. Needed to exercise RF<node-count"
+            echo "            replica placement (e.g. multi-shard Accord transactions)."
             echo ""
-            echo "Bring up a 3-node Ferrosa cluster via Podman on ports 30042-30044."
+            echo "Bring up a Ferrosa test cluster via Podman."
             echo "Source this script to inherit FERROSA_TEST_CLUSTER_NODES."
             exit 0
             ;;
@@ -38,13 +42,29 @@ for arg in "$@"; do
     esac
 done
 
-# ── Detect compose binary ─────────────────────────────────────────────────────
-if podman compose version >/dev/null 2>&1; then
-    COMPOSE_CMD="podman compose"
-elif command -v podman-compose >/dev/null 2>&1; then
-    COMPOSE_CMD="podman-compose"
+# Node count + host CQL ports are derived from the profile.
+if [[ "${PROFILE}" == "quint" ]]; then
+    NODE_COUNT=5
 else
-    echo "ERROR: Neither 'podman compose' nor 'podman-compose' is available." >&2
+    NODE_COUNT=3
+fi
+
+# ── Detect compose binary ─────────────────────────────────────────────────────
+# Prefer the NATIVE python `podman-compose` over `podman compose`. The latter
+# shells out to the external `/usr/local/bin/docker-compose` provider, which on
+# macOS+podman has a create-time image-lookup bug: it namespaces a locally-built
+# image as `docker.io/library/ferrosa-test-node` and then fails with "no such
+# image ... image not known" even though `podman images` lists it (t_88f278).
+# The python provider talks to podman directly and does not hit that bug.
+if command -v podman-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="podman-compose"
+elif podman compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="podman compose"
+    echo "WARNING: using 'podman compose' (external docker-compose provider)." >&2
+    echo "         If bring-up fails with 'image not known', install the native" >&2
+    echo "         provider instead: pip install podman-compose" >&2
+else
+    echo "ERROR: Neither 'podman-compose' nor 'podman compose' is available." >&2
     echo "Install podman-compose: pip install podman-compose" >&2
     exit 1
 fi
@@ -69,9 +89,23 @@ if [[ $KEEP -eq 0 ]]; then
     trap teardown EXIT INT TERM
 fi
 
+# ── Build the node image ONCE ─────────────────────────────────────────────────
+# All N nodeN services share `image: ferrosa-test-node:latest` with identical
+# `build:` blocks. `compose up --build` would launch N CONCURRENT cargo-release
+# compiles of the SAME image — filling the podman VM disk ("no space left on
+# device"). Build it once here, then bring the cluster up with `--no-build`.
+# Mirrors scripts/test-cluster-up-ci.sh (p1-32). Set REBUILD=1 to force a rebuild
+# from the current tree (needed when validating local code changes).
+if [[ "${REBUILD:-0}" != "1" ]] && podman image inspect ferrosa-test-node:latest >/dev/null 2>&1; then
+    echo "Using existing ferrosa-test-node:latest image (set REBUILD=1 to rebuild)."
+else
+    echo "Building ferrosa-test-node:latest (single podman build, avoids per-service race)..."
+    podman build -t ferrosa-test-node:latest -f "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}"
+fi
+
 # ── Bring up cluster ──────────────────────────────────────────────────────────
 echo "Starting Ferrosa test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..."
-echo "Ports: CQL 30042/30043/30044, RustFS 30000/30001"
+echo "Profile: ${PROFILE} (${NODE_COUNT} nodes), CQL 30042.., RustFS 30000/30001"
 echo ""
 
 ${COMPOSE_CMD} \
@@ -79,16 +113,52 @@ ${COMPOSE_CMD} \
     -f "${COMPOSE_OVERRIDE}" \
     --project-name "${PROJECT_NAME}" \
     --profile "${PROFILE}" \
-    up -d --build
+    up -d --no-build || true
+
+# ── Resolve node container names ──────────────────────────────────────────────
+# The compose providers disagree on the separator: the python `podman-compose`
+# names containers `<project>_node<i>_1` (underscores) while `podman compose`
+# (docker-compose) uses `<project>-node<i>-1` (hyphens). Resolve the real name
+# per node so the retry + health loops work under either provider.
+resolve_node_name() {
+    local i="$1"
+    local underscore="${PROJECT_NAME}_node${i}_1"
+    local hyphen="${PROJECT_NAME}-node${i}-1"
+    if podman container exists "${underscore}" 2>/dev/null; then
+        echo "${underscore}"
+    else
+        echo "${hyphen}"
+    fi
+}
+
+# ── Retry flaky node starts ───────────────────────────────────────────────────
+# podman-compose starts the N node containers in parallel; some intermittently
+# fail with "starting some containers: internal libpod error" and are left in
+# `created` (never ran). The failure is transient — an idempotent `podman start`
+# with backoff brings them up. Without this, a >3-node bring-up routinely lands
+# 1-2 nodes short (t_88f278).
+for i in $(seq 1 "${NODE_COUNT}"); do
+    c="$(resolve_node_name "${i}")"
+    for attempt in 1 2 3 4 5; do
+        st=$(podman inspect --format '{{.State.Status}}' "${c}" 2>/dev/null || echo missing)
+        [[ "${st}" == "running" ]] && break
+        podman start "${c}" >/dev/null 2>&1 && break
+        echo "  ${c}: start attempt ${attempt} failed (transient libpod race), retrying..."
+        sleep 3
+    done
+done
 
 # ── Wait for health ───────────────────────────────────────────────────────────
 echo ""
-echo "Waiting for all 3 nodes to become healthy (timeout: 120s)..."
+echo "Waiting for all ${NODE_COUNT} nodes to become healthy (timeout: 120s)..."
 
 TIMEOUT=120
 ELAPSED=0
 INTERVAL=5
-NODES=("${PROJECT_NAME}-node1-1" "${PROJECT_NAME}-node2-1" "${PROJECT_NAME}-node3-1")
+NODES=()
+for i in $(seq 1 "${NODE_COUNT}"); do
+    NODES+=("$(resolve_node_name "${i}")")
+done
 
 while true; do
     ALL_HEALTHY=1
@@ -102,7 +172,7 @@ while true; do
 
     if [[ $ALL_HEALTHY -eq 1 ]]; then
         echo ""
-        echo "All 3 nodes are healthy."
+        echo "All ${NODE_COUNT} nodes are healthy."
         break
     fi
 
@@ -120,7 +190,11 @@ while true; do
 done
 
 # ── Emit env vars ─────────────────────────────────────────────────────────────
-CLUSTER_NODES="127.0.0.1:30042,127.0.0.1:30043,127.0.0.1:30044"
+CLUSTER_NODES=""
+for i in $(seq 1 "${NODE_COUNT}"); do
+    port=$((30041 + i))
+    CLUSTER_NODES="${CLUSTER_NODES:+${CLUSTER_NODES},}127.0.0.1:${port}"
+done
 echo ""
 echo "# Source these environment variables to run ignored cluster tests:"
 echo "export FERROSA_TEST_CLUSTER_NODES=\"${CLUSTER_NODES}\""

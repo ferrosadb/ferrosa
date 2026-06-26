@@ -295,6 +295,7 @@ pub(crate) async fn connect_with_retry_cancelable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Assert delay is within [base, base + 25%] range (accounting for jitter).
     fn assert_in_range(actual: Duration, base_ms: u64) {
@@ -341,7 +342,13 @@ mod tests {
         let _ = b.next_delay();
     }
 
+    // `DORMANT_PEER_COUNT` is a process-wide static metric. The two tests that
+    // mutate it must not run concurrently (libtest parallelises by default) or
+    // one test's absolute-value assertion races the other's mutation — a
+    // shared-global-state race, not a timing flake. `#[serial]` keys them so they
+    // run one at a time relative to each other.
     #[test]
+    #[serial(dormant_peer_counter)]
     fn dormant_peer_counter_increments_and_decrements() {
         // Use a fresh counter baseline by reading current value.
         let before = dormant_peer_count();
@@ -352,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(dormant_peer_counter)]
     fn dormant_peer_counter_saturates_at_zero() {
         // Drive to 0 if not already, then try to decrement below — must not wrap.
         let cur = dormant_peer_count();

@@ -260,6 +260,11 @@ pub(crate) async fn handle_connection<S>(
     let mut auth_context: Option<AuthContext> = None;
     let mut current_keyspace: Option<String> = None;
     let mut subscription_state = SubscriptionState::new(8);
+    // Per-connection BEGIN/COMMIT transaction buffer (shared across this
+    // connection's concurrent in-flight requests; transactions are serialized).
+    let conn_txn = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::session::CqlTransaction::new(),
+    ));
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
     let mut client_use_beta: bool = false; // USE_BETA flag (0x10) in STARTUP
@@ -443,6 +448,7 @@ pub(crate) async fn handle_connection<S>(
                     let mut ks_for_handler = ks_at_spawn.clone();
                     let peer_addr = peer;
                     let request_task_pool = task_pool.clone();
+                    let conn_txn_for_handler = conn_txn.clone();
                     request_task_pool.spawn(async move {
                         let request_span = cql_request_span(opcode, peer_addr);
                         let result = (async {
@@ -455,6 +461,7 @@ pub(crate) async fn handle_connection<S>(
                                         &body,
                                         peer_addr,
                                         proto_version,
+                                        &conn_txn_for_handler,
                                     )
                                     .await
                                 }
@@ -538,6 +545,7 @@ pub(crate) async fn handle_connection<S>(
                         &mut pending_compression,
                         peer,
                         task_pool.clone(),
+                        &conn_txn,
                     )
                     .await
                 })
@@ -629,32 +637,37 @@ pub(crate) async fn handle_connection<S>(
                         inner,
                         interval,
                         delta,
+                        streams,
                     } => {
-                        let interval = match interval {
-                            Some(d) => d,
-                            None => {
-                                // Change-driven mode not yet implemented
-                                let err = CqlError::Invalid(
-                                    "SUBSCRIBE without EVERY not yet supported; \
-                                     use SUBSCRIBE ... EVERY <interval>"
-                                        .into(),
-                                );
-                                let body = err.encode_body().freeze();
-                                let frame = CqlFrame {
-                                    header: FrameHeader {
-                                        version: VERSION_RESPONSE,
-                                        flags: 0,
-                                        stream_id,
-                                        opcode: Opcode::Error,
-                                        length: 0,
-                                    },
-                                    body,
-                                };
-                                if framed.send(frame).await.is_err() {
-                                    break;
+                        // Snapshot mode requires EVERY <interval>; event-driven CDC
+                        // mode (ON LOCAL|COMMITTED) needs no interval.
+                        let snapshot_interval = match streams {
+                            crate::ast::SubscribeStreams::Cdc { .. } => None,
+                            crate::ast::SubscribeStreams::Snapshot => match interval {
+                                Some(d) => Some(d),
+                                None => {
+                                    let err = CqlError::Invalid(
+                                        "SUBSCRIBE without EVERY not yet supported; \
+                                         use SUBSCRIBE ... EVERY <interval>"
+                                            .into(),
+                                    );
+                                    let body = err.encode_body().freeze();
+                                    let frame = CqlFrame {
+                                        header: FrameHeader {
+                                            version: VERSION_RESPONSE,
+                                            flags: 0,
+                                            stream_id,
+                                            opcode: Opcode::Error,
+                                            length: 0,
+                                        },
+                                        body,
+                                    };
+                                    if framed.send(frame).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
+                            },
                         };
 
                         // Create a cancellation token and register the subscription.
@@ -705,23 +718,39 @@ pub(crate) async fn handle_connection<S>(
                             must_change_password: false,
                         });
 
-                        crate::subscribe::spawn_subscription_poll(
-                            stream_id,
-                            interval,
-                            state.clone(),
-                            auth,
-                            current_keyspace.clone(),
-                            *inner,
-                            sub_tx.clone(),
-                            cancel,
-                            delta,
-                            task_pool.clone(),
-                        );
+                        match streams {
+                            crate::ast::SubscribeStreams::Cdc { local, committed } => {
+                                crate::subscribe::spawn_cdc_subscription(
+                                    stream_id,
+                                    state.clone(),
+                                    auth,
+                                    current_keyspace.clone(),
+                                    *inner,
+                                    sub_tx.clone(),
+                                    cancel,
+                                    local,
+                                    committed,
+                                    task_pool.clone(),
+                                );
+                            }
+                            crate::ast::SubscribeStreams::Snapshot => {
+                                crate::subscribe::spawn_subscription_poll(
+                                    stream_id,
+                                    snapshot_interval
+                                        .expect("snapshot mode resolves an interval above"),
+                                    state.clone(),
+                                    auth,
+                                    current_keyspace.clone(),
+                                    *inner,
+                                    sub_tx.clone(),
+                                    cancel,
+                                    delta,
+                                    task_pool.clone(),
+                                );
+                            }
+                        }
 
-                        debug!(
-                            "subscription started for {peer} stream={stream_id} interval={:?}",
-                            interval
-                        );
+                        debug!("subscription started for {peer} stream={stream_id}");
                     }
                     HandleResult::CancelSubscription { stream_id: sub_id } => {
                         subscription_state.cancel(sub_id);
@@ -829,26 +858,33 @@ where
             inner,
             interval,
             delta,
+            streams,
         } => {
-            let interval = match interval {
-                Some(d) => d,
-                None => {
-                    let err = CqlError::Invalid(
-                        "SUBSCRIBE without EVERY not yet supported; use SUBSCRIBE ... EVERY <interval>"
-                            .into(),
-                    );
-                    let frame = CqlFrame {
-                        header: FrameHeader {
-                            version: VERSION_RESPONSE,
-                            flags: 0,
-                            stream_id,
-                            opcode: Opcode::Error,
-                            length: 0,
-                        },
-                        body: err.encode_body().freeze(),
-                    };
-                    return framed.send(frame).await.is_ok();
-                }
+            use crate::ast::SubscribeStreams;
+            // Snapshot mode (no ON clause) requires EVERY <interval>; event-driven
+            // CDC mode (ON LOCAL|COMMITTED) needs no interval.
+            let snapshot_interval = match streams {
+                SubscribeStreams::Cdc { .. } => None,
+                SubscribeStreams::Snapshot => match interval {
+                    Some(d) => Some(d),
+                    None => {
+                        let err = CqlError::Invalid(
+                            "SUBSCRIBE without EVERY not yet supported; use SUBSCRIBE ... EVERY <interval>"
+                                .into(),
+                        );
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: VERSION_RESPONSE,
+                                flags: 0,
+                                stream_id,
+                                opcode: Opcode::Error,
+                                length: 0,
+                            },
+                            body: err.encode_body().freeze(),
+                        };
+                        return framed.send(frame).await.is_ok();
+                    }
+                },
             };
             let cancel = tokio_util::sync::CancellationToken::new();
             let handle = crate::subscribe::SubscriptionHandle {
@@ -888,18 +924,36 @@ where
                 is_superuser: true,
                 must_change_password: false,
             });
-            crate::subscribe::spawn_subscription_poll(
-                stream_id,
-                interval,
-                state.clone(),
-                auth,
-                current_keyspace.clone(),
-                *inner,
-                sub_tx.clone(),
-                cancel,
-                delta,
-                TaskPool::current("cql-subscription"),
-            );
+            match streams {
+                SubscribeStreams::Cdc { local, committed } => {
+                    crate::subscribe::spawn_cdc_subscription(
+                        stream_id,
+                        state.clone(),
+                        auth,
+                        current_keyspace.clone(),
+                        *inner,
+                        sub_tx.clone(),
+                        cancel,
+                        local,
+                        committed,
+                        TaskPool::current("cql-cdc-subscription"),
+                    );
+                }
+                SubscribeStreams::Snapshot => {
+                    crate::subscribe::spawn_subscription_poll(
+                        stream_id,
+                        snapshot_interval.expect("snapshot mode resolves an interval above"),
+                        state.clone(),
+                        auth,
+                        current_keyspace.clone(),
+                        *inner,
+                        sub_tx.clone(),
+                        cancel,
+                        delta,
+                        TaskPool::current("cql-subscription"),
+                    );
+                }
+            }
             true
         }
         HandleResult::CancelSubscription { stream_id: sub_id } => {
@@ -977,11 +1031,13 @@ pub(crate) enum HandleResult {
     /// Close immediately without sending anything (reserved for future use).
     #[allow(dead_code)]
     CloseNow,
-    /// Subscription accepted — send void ACK, then spawn polling task.
+    /// Subscription accepted — send void ACK, then spawn the delivery task
+    /// (snapshot poll, or an event-driven CDC subscriber per `streams`).
     StartSubscription {
         inner: Box<crate::ast::Statement>,
         interval: Option<Duration>,
         delta: bool,
+        streams: crate::ast::SubscribeStreams,
     },
     /// Unsubscribe — cancel one or all subscriptions.
     CancelSubscription { stream_id: Option<u16> },
@@ -999,6 +1055,7 @@ async fn handle_frame(
     pending_compression: &mut Option<Compression>,
     peer: SocketAddr,
     task_pool: TaskPool,
+    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -1039,6 +1096,7 @@ async fn handle_frame(
                     &frame.body,
                     peer,
                     frame.header.version,
+                    conn_txn,
                 )
                 .await
             }
@@ -1326,6 +1384,7 @@ async fn handle_query(
     body: &Bytes,
     peer: SocketAddr,
     protocol_version: u8,
+    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1395,6 +1454,22 @@ async fn handle_query(
     // Build an auth context for routing (use a default if auth was disabled).
     let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
 
+    // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
+    // Accord). The per-connection buffer is locked only for the duration of the
+    // check/commit (transactions on a connection are inherently serial), then
+    // released before normal routing; `None` falls through.
+    let txn_result = {
+        let mut txn = conn_txn.lock().await;
+        crate::router::route_transactional(state, &ctx, &stmt, &mut txn).await
+    };
+    if let Some(result) = txn_result {
+        return match result {
+            Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
+            Ok(_) => HandleResult::Reply(Opcode::Result, crate::result::encode_void()),
+            Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+        };
+    }
+
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
         Ok(RouteResult::SetKeyspace(ks, body)) => {
@@ -1405,10 +1480,12 @@ async fn handle_query(
             inner,
             interval,
             delta,
+            streams,
         }) => HandleResult::StartSubscription {
             inner,
             interval,
             delta,
+            streams,
         },
         Ok(RouteResult::Unsubscribe { stream_id }) => {
             HandleResult::CancelSubscription { stream_id }
@@ -2829,27 +2906,29 @@ mod tests {
 
         (
             SharedState {
-                engine: engine.clone(),
-                schema: schema.clone(),
-                node_config,
-                cluster_state: Arc::new(ArcSwap::from_pointee(
-                    ferrosa_cluster::ClusterStateHolder::Standalone,
-                )),
-                write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
-                ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                core: Arc::new(ferrosa_session::SessionCore {
+                    engine: engine.clone(),
+                    schema: schema.clone(),
+                    node_config,
+                    cluster_state: Arc::new(ArcSwap::from_pointee(
+                        ferrosa_cluster::ClusterStateHolder::Standalone,
+                    )),
+                    write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+                    ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                    udf_executor,
+                    mode_controller,
+                    auth_warn: false,
+                    peer_manager: None,
+                    accord_clock: None,
+                }),
                 prepared_cache: Arc::new(PreparedCache::new(1024 * 1024)),
                 connection_tracker: Arc::new(ConnectionTracker::new()),
                 query_tracker: Arc::new(crate::virtual_tables::QueryTracker::new()),
                 full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
                 index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
-                udf_executor,
                 event_sender: tokio::sync::broadcast::channel(64).0,
-                mode_controller,
                 cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
                 topology_policy: crate::topology::ClientTopologyPolicy::default(),
-                auth_warn: false,
-                peer_manager: None,
-                accord_clock: None,
             },
             dir,
         )

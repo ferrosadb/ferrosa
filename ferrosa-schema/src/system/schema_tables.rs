@@ -217,10 +217,21 @@ pub fn query_columns(snap: &SchemaSnapshot) -> Vec<ColumnRow> {
 }
 
 /// Rewrite types that drivers may not parse to a compatible alternative.
-/// Currently: `vector<...>` → `blob`. Other types pass through unchanged.
+///
+/// - `vector<...>` → `blob` (p1-37: scylla's CQL type parser rejects vectors).
+/// - `varchar` → `text` (t_1df55d24): `varchar` is a valid CQL alias for `text`,
+///   but the scylla driver's *metadata* parser doesn't recognize it and resolves
+///   it as a phantom UDT (`Missing UDT: <ks>, varchar`), rejecting the whole
+///   cluster-metadata fetch so no client can connect. Cassandra advertises `text`.
+///   The replace covers nested forms (`set<varchar>`, `frozen<set<varchar>>`).
+///
+/// Other types pass through unchanged.
 fn rewrite_unsupported_types(ty: &str) -> String {
     if ty.starts_with("vector<") {
         return "blob".to_string();
+    }
+    if ty.contains("varchar") {
+        return ty.replace("varchar", "text");
     }
     ty.to_string()
 }
@@ -289,7 +300,7 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("broadcast_address", "regular", "inet", -1),
         ("rpc_address", "regular", "inet", -1),
         ("bootstrapped", "regular", "text", -1),
-        ("tokens", "regular", "set<varchar>", -1),
+        ("tokens", "regular", "set<text>", -1),
     ];
     for (name, kind, cql_type, pos) in local_cols {
         rows.push(ColumnRow {
@@ -317,7 +328,7 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("native_port", "regular", "int", -1),
         ("schema_version", "regular", "uuid", -1),
         ("release_version", "regular", "text", -1),
-        ("tokens", "regular", "set<varchar>", -1),
+        ("tokens", "regular", "set<text>", -1),
     ];
     // p1-37: legacy `system.peers` is the union of peers_v2's columns
     // PLUS `rpc_address` (the original Cassandra 3.x column drivers
@@ -334,7 +345,7 @@ fn system_column_rows() -> Vec<ColumnRow> {
         ("rpc_address", "regular", "inet", -1),
         ("schema_version", "regular", "uuid", -1),
         ("release_version", "regular", "text", -1),
-        ("tokens", "regular", "set<varchar>", -1),
+        ("tokens", "regular", "set<text>", -1),
     ];
     for (table, cols) in [("peers", peers_v1_cols), ("peers_v2", peers_v2_cols)] {
         for (name, kind, cql_type, pos) in cols {
@@ -747,6 +758,40 @@ mod tests {
         assert_eq!(r_row.kind, "regular");
     }
 
+    /// Regression (t_1df55d24): no advertised column type may be `varchar`. The
+    /// scylla driver's metadata parser treats `varchar` as an unknown UDT
+    /// (`Missing UDT: system, varchar`) and rejects the whole cluster-metadata
+    /// fetch, so NO driver client (incl. the jepsen harness) can connect.
+    /// Cassandra advertises `text`.
+    #[test]
+    fn system_schema_columns_advertise_text_not_varchar() {
+        let snap = SchemaSnapshot::new();
+        for row in query_columns(&snap) {
+            assert!(
+                !row.column_type.contains("varchar"),
+                "system_schema column {}.{}.{} advertises `{}` — drivers reject `varchar` \
+                 as a phantom UDT; advertise `text`",
+                row.keyspace_name,
+                row.table_name,
+                row.column_name,
+                row.column_type,
+            );
+        }
+    }
+
+    /// `varchar` (incl. nested) normalizes to `text` for driver-metadata compat.
+    #[test]
+    fn rewrite_normalizes_varchar_to_text() {
+        assert_eq!(rewrite_unsupported_types("varchar"), "text");
+        assert_eq!(rewrite_unsupported_types("set<varchar>"), "set<text>");
+        assert_eq!(
+            rewrite_unsupported_types("frozen<set<varchar>>"),
+            "frozen<set<text>>"
+        );
+        assert_eq!(rewrite_unsupported_types("text"), "text");
+        assert_eq!(rewrite_unsupported_types("int"), "int");
+    }
+
     /// Regression test: cqlsh expects `tokens` in system_schema.columns for
     /// system.local. Without it, cqlsh fails to validate system.local queries
     /// and prints "'local' not found in keyspace 'system'".
@@ -762,7 +807,7 @@ mod tests {
             .iter()
             .find(|r| r.column_name == "tokens")
             .expect("system.local must have a 'tokens' column");
-        assert_eq!(tokens_col.column_type, "set<varchar>");
+        assert_eq!(tokens_col.column_type, "set<text>");
         assert_eq!(tokens_col.kind, "regular");
     }
 
@@ -837,7 +882,7 @@ mod tests {
                 .iter()
                 .find(|r| r.column_name == "tokens")
                 .unwrap_or_else(|| panic!("system.{table} must have a 'tokens' column"));
-            assert_eq!(tokens_col.column_type, "set<varchar>");
+            assert_eq!(tokens_col.column_type, "set<text>");
             assert_eq!(tokens_col.kind, "regular");
         }
     }

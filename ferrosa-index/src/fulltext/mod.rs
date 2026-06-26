@@ -11,6 +11,7 @@
 
 pub mod analyzer;
 pub mod builder;
+pub mod keys;
 pub mod merge;
 pub mod query;
 pub mod reader;

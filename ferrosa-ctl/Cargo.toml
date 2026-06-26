@@ -38,6 +38,7 @@ sled = "0.34"
 [dev-dependencies]
 arc-swap = "1.7"
 ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-session = { path = "../ferrosa-session" }
 # Reuse the engine's real-SSTable fixtures (table_dir_with_n_generations /
 # corrupt_one_generation) so `sstable` tests run against genuine BTI files.
 ferrosa-storage = { path = "../ferrosa-storage", features = ["test-support"] }

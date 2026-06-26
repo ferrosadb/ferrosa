@@ -89,6 +89,7 @@ services:
   # NotImplemented).
   # ---------------------------------------------------------------------------
   dc1-node1:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -117,6 +118,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node1-data:/var/lib/ferrosa
     healthcheck:
@@ -127,6 +135,9 @@ services:
       start_period: 15s
 
   dc1-node2:
+    # CI runs the pre-built nightly .deb image (set via FERROSA_NIGHTLY_IMAGE);
+    # the build: block is a local-dev fallback that `up --no-build` never uses.
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -155,6 +166,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node2-data:/var/lib/ferrosa
     healthcheck:
@@ -165,6 +183,7 @@ services:
       start_period: 15s
 
   dc1-node3:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -193,6 +212,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node3-data:/var/lib/ferrosa
     healthcheck:
@@ -206,6 +232,7 @@ services:
   # DC2 — 3 voters
   # ---------------------------------------------------------------------------
   dc2-node1:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -234,6 +261,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node1-data:/var/lib/ferrosa
     healthcheck:
@@ -244,6 +278,7 @@ services:
       start_period: 15s
 
   dc2-node2:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -272,6 +307,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node2-data:/var/lib/ferrosa
     healthcheck:
@@ -282,6 +324,7 @@ services:
       start_period: 15s
 
   dc2-node3:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
     build:
       context: ../../..
       dockerfile: Dockerfile
@@ -310,6 +353,13 @@ services:
       FERROSA_S3_ALLOW_HTTP: "true"
       FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
       FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      # Modest per-node footprint for this 6-node test cluster (the runner has
+      # 16 GB, so this is hygiene, not the fix — the real nightly killer was
+      # `compose --build` recompiling 5/6 server nodes from source). The cache
+      # default is 10 GB; a bank workload's dataset is tiny, so these are ample.
+      FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node3-data:/var/lib/ferrosa
     healthcheck:

@@ -23,6 +23,21 @@ use crate::resource_monitor::{self, LeakVerdict, ResourceMonitor, ResourceSnapsh
 use crate::stats::{FinalizeContext, LoadStats, StatsCollector};
 use crate::tui::{TuiDashboard, TuiFrame};
 
+/// Connect to a node, authenticating with the well-known development seed
+/// credentials (override via FERROSA_CQL_USER / FERROSA_CQL_PASSWORD).
+///
+/// A dev-mode Ferrosa server bootstraps seed roles and sends an AUTHENTICATE
+/// challenge even when enforcement is off, so a plain credential-less connect
+/// fails with `BadCredentials`. Supplying credentials works against BOTH
+/// auth-on and auth-off servers (the client only sends an AUTH_RESPONSE if the
+/// server actually challenges).
+async fn connect_authed(addr: SocketAddr) -> Result<CqlClient, ferrosa_cql::error::CqlError> {
+    let user = std::env::var("FERROSA_CQL_USER").unwrap_or_else(|_| "ferrosa_admin".to_string());
+    let pass =
+        std::env::var("FERROSA_CQL_PASSWORD").unwrap_or_else(|_| "ferrosa_admin".to_string());
+    CqlClient::connect_with_credentials(addr, &user, &pass).await
+}
+
 /// Parse a comma-separated list of node addresses.
 ///
 /// Each entry is `host:port` for CQL. The web API port is inferred as
@@ -147,7 +162,7 @@ async fn run_cluster_load_test_async(
     eprintln!("Setting up schema (waiting for Raft DDL readiness)...");
     let mut schema_ok = false;
     for attempt in 1..=30 {
-        match CqlClient::connect(nodes[0]).await {
+        match connect_authed(nodes[0]).await {
             Ok(mut client) => match setup_schema(&mut client, rf).await {
                 Ok(()) => {
                     eprintln!("  Schema ready on attempt {attempt}");
@@ -175,7 +190,7 @@ async fn run_cluster_load_test_async(
     // Verify schema propagated to all nodes.
     for node in nodes {
         for _ in 0..10 {
-            if let Ok(mut c) = CqlClient::connect(*node).await {
+            if let Ok(mut c) = connect_authed(*node).await {
                 if c.query("USE load_test").await.is_ok()
                     && c.query("SELECT pk FROM data LIMIT 1").await.is_ok()
                 {
@@ -225,7 +240,7 @@ async fn run_cluster_load_test_async(
         let gt = Arc::clone(&ground_truth);
 
         handles.push(tokio::spawn(async move {
-            let mut client = match CqlClient::connect(node).await {
+            let mut client = match connect_authed(node).await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("worker {worker_id} failed to connect to {node}: {e}");
@@ -467,7 +482,7 @@ async fn verify_via_cql(
     }
 
     // Connect to the first node for verification reads.
-    let mut client = match CqlClient::connect(nodes[0]).await {
+    let mut client = match connect_authed(nodes[0]).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("integrity: connect failed: {e}");

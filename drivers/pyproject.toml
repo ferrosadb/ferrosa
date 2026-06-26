@@ -1,0 +1,14 @@
+[project]
+name = "ferrosa-driver"
+version = "0.1.0"
+description = "Drop-in replacement for the DataStax cassandra-driver that adds ferrosa SUBSCRIBE (real-time change streaming)."
+requires-python = ">=3.8"
+dependencies = ["cassandra-driver>=3.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ferrosa_driver*"]

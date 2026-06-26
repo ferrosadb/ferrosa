@@ -338,6 +338,7 @@ fn seed_role_if_absent(
         can_login: true,
         salted_hash: Some(hashed),
         member_of: HashSet::new(),
+        scram: None,
     };
     schema.create_role_internal(role)?;
     warn!(

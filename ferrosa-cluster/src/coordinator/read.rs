@@ -34,8 +34,9 @@ use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
-    partition_from_wire, IndexReadRequestPayload, IndexReadResponsePayload,
-    RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
+    partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
+    IndexReadRequestPayload, IndexReadResponsePayload, RangeReadRequestPayload,
+    RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
 };
 use crate::raft::IndexNodeStatus;
 
@@ -1607,6 +1608,147 @@ impl ClusterCoordinator {
 
         Ok(deduped)
     }
+
+    /// Fan out a full-text (`fts_match`) lookup to every node and union the
+    /// matching partition keys.
+    ///
+    /// `fts_match` carries no partition key, so its hits span all token ranges;
+    /// consulting only the coordinator's local FTI returned 0/1
+    /// non-deterministically depending on which node coordinated the query
+    /// (BUG-F-007). Querying every node and de-duplicating the keys makes the
+    /// result coordinator-independent. Partial failures degrade to a partial
+    /// union (logged); only an all-nodes-failed-and-empty result errors.
+    pub async fn coordinate_fulltext_search(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &str,
+    ) -> crate::error::Result<Vec<Vec<u8>>> {
+        let ring = self.ring.load();
+        let node_ids = ring.node_ids();
+        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
+            .iter()
+            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
+            .collect();
+        drop(ring);
+
+        let req_payload = FulltextSearchRequestPayload {
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            index_name: index_name.to_string(),
+            query: query.to_string(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
+
+        let local_id = self.local_node_id;
+        let storage = self.storage.clone();
+        let table_id_clone = table_id.clone();
+        let index_name_owned = index_name.to_string();
+        let query_owned = query.to_string();
+        let total_nodes = nodes.len();
+
+        let mut futs: FuturesUnordered<_> = nodes
+            .into_iter()
+            .map(|(node_id, remote)| {
+                let storage = storage.clone();
+                let table_id = table_id_clone.clone();
+                let index_name = index_name_owned.clone();
+                let query = query_owned.clone();
+                let req_body = req_body.clone();
+                let coordinator = self;
+
+                async move {
+                    if node_id == local_id {
+                        storage
+                            .fulltext_search(&table_id, &index_name, &query)
+                            .map_err(ClusterError::Storage)
+                    } else {
+                        let (hid, addr) = remote.ok_or_else(|| {
+                            ClusterError::Internal(format!(
+                                "fulltext search: node {node_id} has no host_id"
+                            ))
+                        })?;
+
+                        let resp = coordinator
+                            .send_remote_with_reconnect_timeout(
+                                hid,
+                                &addr,
+                                Message::FulltextSearchRequest(req_body),
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ClusterError::Internal(format!(
+                                    "fulltext search from node {node_id} ({hid}) via {addr}: {e}"
+                                ))
+                            })?;
+
+                        match resp {
+                            Message::FulltextSearchResponse(b) => {
+                                let payload =
+                                    bincode::deserialize::<FulltextSearchResponsePayload>(&b)
+                                        .map_err(|e| {
+                                            ClusterError::Internal(format!(
+                                                "fulltext search: failed to decode response \
+                                                 from node {node_id} ({hid}): {e}"
+                                            ))
+                                        })?;
+                                Ok(payload.matching_keys)
+                            }
+                            other => Err(ClusterError::Internal(format!(
+                                "fulltext search: unexpected response {:?} from node {node_id} ({hid})",
+                                other.msg_type()
+                            ))),
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+        let mut first_error: Option<ClusterError> = None;
+        let mut failed_nodes = 0usize;
+
+        while let Some(result) = futs.next().await {
+            match result {
+                Ok(keys) => {
+                    for k in keys {
+                        if seen.insert(k.clone()) {
+                            all_keys.push(k);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("coordinate_fulltext_search: {e}");
+                    failed_nodes += 1;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            if failed_nodes == total_nodes {
+                tracing::error!(
+                    failed_nodes,
+                    "coordinate_fulltext_search: all nodes failed, returning error"
+                );
+                return Err(err);
+            }
+            tracing::warn!(
+                failed_nodes,
+                keys_received = all_keys.len(),
+                %err,
+                "coordinate_fulltext_search: {failed_nodes}/{total_nodes} node(s) failed, \
+                 returning partial union",
+            );
+        }
+
+        Ok(all_keys)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2001,6 +2143,158 @@ mod tests {
         let server = Arc::new(RpcServer::new(config, server_id, registry));
         let addr = server.start_and_get_addr().await.unwrap();
         (server, addr, server_id)
+    }
+
+    struct StaticFulltextSearchHandler {
+        keys: Vec<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticFulltextSearchHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::FulltextSearchRequest(_) = msg else {
+                return None;
+            };
+            let payload = crate::raft::handlers::FulltextSearchResponsePayload {
+                matching_keys: self.keys.clone(),
+            };
+            Some(Message::FulltextSearchResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    /// fts_match fan-out (BUG-F-007 / t_0d08aa43): the coordinator must query
+    /// every node's local FTI and union the matching partition keys, de-duping
+    /// a key returned by more than one replica. Reproduces the multi-node served
+    /// path in-process: local node has an FTI hit; a remote node returns the
+    /// same key plus a remote-only key.
+    #[tokio::test]
+    async fn coordinate_fulltext_search_unions_and_dedups_across_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let table_id = TableId::new("test_ks", "test_tbl");
+
+        // Local node: an FTI row whose text matches → local returns key [1,2,3].
+        storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        // The local FTI now returns a full ROW-GRANULAR doc key (partition +
+        // clustering), not a bare partition key. Capture the actual local key so
+        // the remote returns the SAME bytes — exercising real dedup — instead of a
+        // hand-rolled partition key that would no longer match.
+        let local_keys = storage
+            .fulltext_search(&table_id, "val_fti", "hello")
+            .unwrap();
+        assert_eq!(local_keys.len(), 1, "local node should have one FTI hit");
+        let shared_key = local_keys[0].clone();
+        let remote_only = vec![9u8, 9, 9];
+
+        // Remote node: returns the SAME local key (must dedup) plus a
+        // remote-only key.
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::FulltextSearchRequest,
+            Arc::new(StaticFulltextSearchHandler {
+                keys: vec![shared_key.clone(), remote_only.clone()],
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm.clone(),
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::Quorum,
+        );
+
+        let mut keys = coordinator
+            .coordinate_fulltext_search(&table_id, "val_fti", "hello")
+            .await
+            .unwrap();
+        keys.sort();
+
+        let mut expected = vec![shared_key, remote_only];
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "fan-out must union local + remote FTI hits and de-duplicate the shared key"
+        );
+
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A remote FTI failure must not turn a legitimate empty local result into
+    /// a user-visible query failure. The fmem hybrid_search path fans out
+    /// `fts_match` and can hit transient remote stream failures such as
+    /// `ChannelClosedBeforeDone`; if at least one node completed, the result is
+    /// a partial union, even when that union is empty. Only all nodes failing is
+    /// fatal.
+    #[tokio::test]
+    async fn coordinate_fulltext_search_degrades_to_empty_when_some_nodes_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let local_node_id = 1u64;
+        let mut local = make_node("127.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let remote_host_id = Uuid::new_v4();
+        let mut remote = make_node("127.0.0.1:1");
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2u64, remote);
+        ring.assign_tokens(local_node_id, &[42]);
+        ring.assign_tokens(2u64, &[142]);
+
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage,
+            2,
+            ConsistencyLevel::Quorum,
+        );
+
+        let keys = coordinator
+            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token")
+            .await
+            .expect("one successful empty FTI shard should degrade remote failure to empty union");
+
+        assert!(
+            keys.is_empty(),
+            "expected an empty partial union when local FTI succeeds and remote FTI fails"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3588,6 +3882,111 @@ mod tests {
             1,
             "should return the one written partition"
         );
+    }
+
+    /// Regression for the COUNT(*) undercount bug (forge t_8c4e44e8). When the
+    /// keyspace RF does not span the ring, the local replica holds only the
+    /// partitions in its owned token ranges. The OLD `coordinate_range_count`
+    /// called `storage.count_range` directly and silently returned that local
+    /// SUBSET as the answer — a nondeterministic undercount, while a full
+    /// `SELECT` (which fans out + dedups by token) saw every row.
+    ///
+    /// The fix routes COUNT(*) through the same CL-selected, token-deduped
+    /// fan-out the streaming read uses. So when the required remote owners are
+    /// unreachable, COUNT(*) must FAIL LOUD (exactly like
+    /// `coordinate_range_read`) rather than report local-only partial data as a
+    /// complete count.
+    #[tokio::test]
+    async fn coordinate_range_count_errors_when_required_remote_is_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        // Remote peer with no connection pool — sends will fail.
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[150]);
+
+        // RF=1 over a 2-node ring => the local node does NOT own every token
+        // range, so `range_read_remotes` is non-empty and COUNT(*) must fan out.
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        // Write a partition locally. The OLD code would have happily returned
+        // count=1 here — but that is only the LOCAL view; node2 may hold more.
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        let result = coordinator.coordinate_range_count(&table_id).await;
+        assert!(
+            result.is_err(),
+            "COUNT(*) must not report the local-only subset as a complete count \
+             when a required remote owner is unreachable"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("fire failed"),
+            "error should name the remote fanout failure, got: {message}"
+        );
+    }
+
+    /// Companion to the undercount regression: when the local node owns the
+    /// entire ring at the configured CL (`range_read_remotes` empty), COUNT(*)
+    /// keeps the exact local metadata fast path and returns the true count.
+    #[tokio::test]
+    async fn coordinate_range_count_single_node_returns_exact_local_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        let count = coordinator
+            .coordinate_range_count(&table_id)
+            .await
+            .expect("single-node COUNT(*) should succeed via the local fast path");
+        assert_eq!(count, 1, "COUNT(*) must equal the one written partition");
     }
 
     struct GeneratorRangeStorage {

@@ -57,8 +57,8 @@ use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
 use crate::raft::handlers::{
-    IndexReadHandler, RaftAppendHandler, RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler,
-    ReadRequestHandler,
+    FulltextSearchHandler, IndexReadHandler, RaftAppendHandler, RaftSnapshotHandler,
+    RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -1080,6 +1080,10 @@ impl ModeController {
         self.registry
             .register(MsgType::IndexReadRequest, index_read_handler);
 
+        let fulltext_search_handler = Arc::new(FulltextSearchHandler::new(self.storage.clone()));
+        self.registry
+            .register(MsgType::FulltextSearchRequest, fulltext_search_handler);
+
         let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
         self.registry.register(MsgType::ReadRequest, read_handler);
 
@@ -1146,6 +1150,8 @@ impl ModeController {
             self.registry
                 .register(MsgType::AccordPreAccept, accord_handler.clone());
             self.registry
+                .register(MsgType::AccordPreAcceptV2, accord_handler.clone());
+            self.registry
                 .register(MsgType::AccordAccept, accord_handler.clone());
             self.registry
                 .register(MsgType::AccordCommit, accord_handler.clone());
@@ -1153,6 +1159,8 @@ impl ModeController {
                 .register(MsgType::AccordRead, accord_handler.clone());
             self.registry
                 .register(MsgType::AccordApply, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordApplyV2, accord_handler.clone());
             self.registry
                 .register(MsgType::AccordRecover, accord_handler);
         }
@@ -1216,6 +1224,10 @@ impl ModeController {
         {
             let storage = self.storage.clone();
             let accord_state = accord_state_for_maintenance;
+            // Honor shutdown: without this the maintenance loop ignores the
+            // cancel token and shutdown() blocks the full 10s drain deadline
+            // before abort_all() force-kills it (×3 nodes = ~30s in tests).
+            let maint_cancel = self.cancel.clone();
             self.spawn_tracked(async move {
                 let urgent_flush_interval_millis =
                     std::env::var("FERROSA_URGENT_FLUSH_INTERVAL_MILLIS")
@@ -1228,7 +1240,11 @@ impl ModeController {
                 ));
                 let mut ticks = 0u64;
                 loop {
-                    interval.tick().await;
+                    // Stop promptly on shutdown instead of being force-aborted.
+                    tokio::select! {
+                        _ = maint_cancel.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     ticks = ticks.wrapping_add(1);
 
                     if storage.take_flush_request() {

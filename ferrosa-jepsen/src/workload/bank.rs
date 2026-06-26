@@ -14,11 +14,26 @@ const INITIAL_BALANCE: i64 = 1000;
 /// Expected total across all accounts.
 const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
 
+/// Read one account's balance, `None` if the row is absent/unparseable.
+async fn read_balance(session: &dyn CqlSession, id: i64) -> Result<Option<i64>> {
+    let rows = session
+        .execute(&format!(
+            "SELECT balance FROM jepsen.accounts WHERE id = {id}"
+        ))
+        .await?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|(_, v)| v.parse::<i64>().ok()))
+}
+
 /// Multi-account bank transfer workload.
 ///
 /// Setup: 10 accounts each with balance 1000.
-/// Operations: transfers between random pairs (via LWT), reads of all balances.
-/// Invariant: total balance is conserved (sum == 10000).
+/// Operations: **atomic** transfers between random pairs (one multi-key Accord
+/// `BEGIN…COMMIT` transaction — both writes or neither), reads of all balances.
+/// Invariant: total balance is conserved (sum == 10000); a partial transfer
+/// (e.g. from a node failure mid-commit) would break it.
 pub struct BankWorkload;
 
 #[async_trait]
@@ -58,7 +73,18 @@ impl Workload for BankWorkload {
     ) -> Result<()> {
         let start = Instant::now();
 
+        // Pace each iteration. Real ops take milliseconds, but under a
+        // partition / dc-slow nemesis a CQL call can fail INSTANTLY — without a
+        // floor the loop spins at CPU speed and appends millions of failed ops
+        // to the in-memory HistoryRecorder, ballooning RSS ~700 MB/s and OOM-ing
+        // the host (this killed the nightly tier-multi-dc runner ~30s into every
+        // run for 2+ weeks). 1 ms is far below the natural latency-bound rate, so
+        // healthy throughput is unaffected; it only caps the error-spin, keeping
+        // the history bounded. Unconditional (not end-of-body) because the error
+        // paths `continue`.
+        const MIN_ITER: Duration = Duration::from_millis(1);
         while start.elapsed() < duration {
+            tokio::time::sleep(MIN_ITER).await;
             let r: f64 = rand::random();
             if r < 0.7 {
                 // Transfer between two random accounts.
@@ -69,83 +95,69 @@ impl Workload for BankWorkload {
                 }
                 let amount = (rand::random::<u64>() % 100 + 1) as i64;
 
-                // Read source balance first.
+                // Read both balances (outside the transaction). This is an
+                // ATOMICITY test: the two writes commit together or not at all
+                // (one multi-key Accord transaction), so a PARTIAL transfer —
+                // debit without credit, e.g. a node failure mid-COMMIT — breaks
+                // total conservation and the checker flags it. Full lost-update
+                // serializability (conditional commit) is deferred (t_6edfea95).
                 recorder.invoke(Op::Read {
                     key: format!("account-{from}"),
                 });
-                let balance = match session
-                    .execute(&format!(
-                        "SELECT balance FROM jepsen.accounts WHERE id = {from}"
-                    ))
-                    .await
-                {
-                    Ok(rows) => {
-                        let val = rows
-                            .first()
-                            .and_then(|r| r.first())
-                            .and_then(|(_, v)| v.parse::<i64>().ok());
-                        recorder.complete(OpResult::Value(val));
-                        val
+                let from_balance = match read_balance(session, from).await {
+                    Ok(v) => {
+                        recorder.complete(OpResult::Value(v));
+                        v
                     }
                     Err(e) => {
                         recorder.complete(OpResult::Err(e.to_string()));
                         continue;
                     }
                 };
-
-                let Some(balance) = balance else {
+                let Some(from_balance) = from_balance else {
                     continue;
                 };
-
-                if balance < amount {
+                if from_balance < amount {
                     continue;
                 }
 
-                // CAS debit from source.
-                let new_balance = balance - amount;
-                recorder.invoke(Op::Cas {
-                    key: format!("account-{from}"),
-                    expected: balance,
-                    value: new_balance,
+                recorder.invoke(Op::Read {
+                    key: format!("account-{to}"),
                 });
-                let debit_ok = match session
-                    .execute(&format!(
-                        "UPDATE jepsen.accounts SET balance = {new_balance} \
-                         WHERE id = {from} IF balance = {balance}"
-                    ))
-                    .await
-                {
-                    Ok(rows) => {
-                        let applied = rows
-                            .first()
-                            .map(|r| r.iter().any(|(k, v)| k == "[applied]" && v == "true"))
-                            .unwrap_or(false);
-                        recorder.complete(OpResult::Applied(applied));
-                        applied
+                let to_balance = match read_balance(session, to).await {
+                    Ok(v) => {
+                        recorder.complete(OpResult::Value(v));
+                        v
                     }
                     Err(e) => {
                         recorder.complete(OpResult::Err(e.to_string()));
-                        false
+                        continue;
                     }
                 };
-
-                if !debit_ok {
+                let Some(to_balance) = to_balance else {
                     continue;
-                }
+                };
 
-                // Credit destination (unconditional, transfer is committed).
+                // Atomic cross-shard transfer: BEGIN; debit; credit; COMMIT — one
+                // multi-key Accord transaction. Both writes land, or neither.
+                let new_from = from_balance - amount;
+                let new_to = to_balance + amount;
                 recorder.invoke(Op::Write {
                     key: format!("account-{to}"),
                     value: amount,
                 });
                 match session
-                    .execute(&format!(
-                        "UPDATE jepsen.accounts SET balance = balance + {amount} \
-                         WHERE id = {to}"
-                    ))
+                    .transaction(&[
+                        "BEGIN TRANSACTION".to_string(),
+                        format!(
+                            "UPDATE jepsen.accounts SET balance = {new_from} WHERE id = {from}"
+                        ),
+                        format!("UPDATE jepsen.accounts SET balance = {new_to} WHERE id = {to}"),
+                        "COMMIT".to_string(),
+                    ])
                     .await
                 {
-                    Ok(_) => recorder.complete(OpResult::Ok),
+                    Ok(()) => recorder.complete(OpResult::Ok),
                     Err(e) => recorder.complete(OpResult::Err(e.to_string())),
                 }
             } else {

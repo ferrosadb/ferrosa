@@ -23,6 +23,7 @@ pub mod protocol_log;
 pub mod read_2i;
 pub mod sidecar;
 pub mod sync_writer;
+pub mod transaction_committer;
 pub mod write_gate;
 
 pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
@@ -36,4 +37,7 @@ pub use read_2i::{
 };
 pub use sidecar::{AccordSidecar, SidecarUploadManifest, SIDECAR_EXTENSION};
 pub use sync_writer::{FileSyncWriter, MockSyncWriter, SyncWriteResult, SyncWriter};
+pub use transaction_committer::{
+    CommitError, CommitOutcome, MockTransactionCommitter, TransactionCommitter, TransactionWrite,
+};
 pub use write_gate::{check_write_gate, check_write_gate_range, WriteGateDecision};

@@ -49,8 +49,10 @@ pub fn container_runtime() -> &'static str {
 /// Information about a single provisioned node.
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
-    /// Hostname used to reach this node from the test runner.
-    pub host: &'static str,
+    /// Hostname or IP used to reach this node from the test runner. Owned so it
+    /// can hold a dynamic address (e.g. a Fly machine's private IP), not just a
+    /// static `"localhost"`.
+    pub host: String,
     /// CQL port on the test runner host.
     pub cql_port: u16,
 }
@@ -62,10 +64,36 @@ impl NodeInfo {
     }
 
     /// Return `true` if the CQL port accepts a TCP connection.
+    ///
+    /// NOTE: TCP-open is NOT the same as CQL-ready — a node's listener can accept
+    /// a socket before it can complete the protocol handshake (which then fails
+    /// with `early eof` on `OPTIONS`). Use [`cql_handshake_ok`](Self::cql_handshake_ok)
+    /// as the readiness gate; this bare check is kept only for cheap liveness.
     pub async fn cql_reachable(&self) -> bool {
         tokio::net::TcpStream::connect(self.cql_address())
             .await
             .is_ok()
+    }
+
+    /// Return `true` only if a full CQL **handshake + trivial query** succeeds —
+    /// the real readiness signal. Building a session drives the `OPTIONS`/`STARTUP`
+    /// negotiation and a `SELECT` proves the node is actually serving CQL, not
+    /// merely holding an open socket. Any error (handshake `early eof`, control
+    /// connection broken, query failure) returns `false` so the caller keeps
+    /// polling.
+    pub async fn cql_handshake_ok(&self) -> bool {
+        use scylla::client::session_builder::SessionBuilder;
+        match SessionBuilder::new()
+            .known_node(self.cql_address())
+            .build()
+            .await
+        {
+            Ok(session) => session
+                .query_unpaged("SELECT key FROM system.local", &[])
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -256,7 +284,7 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
     let nodes: Vec<NodeInfo> = NODE_CQL_PORTS[..node_count]
         .iter()
         .map(|&port| NodeInfo {
-            host: "localhost",
+            host: "localhost".to_string(),
             cql_port: port,
         })
         .collect();
@@ -273,11 +301,21 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
     Ok(cluster)
 }
 
-/// Wait for all nodes in the cluster to accept TCP connections on their CQL port.
+/// Wait for all nodes in the cluster to be **CQL-ready** — i.e. to complete a
+/// real CQL handshake + query, not merely accept a TCP socket. Gating on
+/// TCP-open let the orchestrator connect before the listener could handshake,
+/// failing every workload with `early eof` on `OPTIONS` (a node-readiness race
+/// that surfaced under slow podman + from-source image builds).
 ///
 /// Polls every 500 ms for up to `CLUSTER_READY_TIMEOUT`.
+///
+/// A **from-source** image build + cold node bootstrap on a CI runner can take
+/// well over two minutes: an observed run had all three nodes join the cluster at
+/// ~118s, just missing a 120s deadline (0 combos ran, false-green). 300s gives
+/// comfortable margin; the smoke workload itself is only seconds, so a longer
+/// one-time readiness wait costs nothing.
 async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
-    const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+    const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(300);
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     let deadline = tokio::time::Instant::now() + CLUSTER_READY_TIMEOUT;
@@ -289,8 +327,8 @@ async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
         );
 
         loop {
-            if node.cql_reachable().await {
-                info!(cql_address = node.cql_address(), "CQL port ready");
+            if node.cql_handshake_ok().await {
+                info!(cql_address = node.cql_address(), "CQL handshake ready");
                 break;
             }
             if tokio::time::Instant::now() > deadline {
@@ -335,7 +373,7 @@ mod tests {
     #[test]
     fn node_info_cql_address() {
         let node = NodeInfo {
-            host: "localhost",
+            host: "localhost".to_string(),
             cql_port: 49042,
         };
         assert_eq!(node.cql_address(), "localhost:49042");
@@ -346,15 +384,15 @@ mod tests {
         let cluster = ClusterInfo {
             nodes: vec![
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49042,
                 },
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49043,
                 },
                 NodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49044,
                 },
             ],

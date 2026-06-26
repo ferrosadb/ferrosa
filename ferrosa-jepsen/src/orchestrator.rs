@@ -346,15 +346,15 @@ mod tests {
         let cluster = ClusterInfo {
             nodes: vec![
                 JepsenNodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49042,
                 },
                 JepsenNodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49043,
                 },
                 JepsenNodeInfo {
-                    host: "localhost",
+                    host: "localhost".to_string(),
                     cql_port: 49044,
                 },
             ],

@@ -1,0 +1,30 @@
+[package]
+name = "ferrosa-flight"
+description = "Apache Arrow Flight (gRPC) query endpoint for Ferrosa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { version = "53", features = ["ipc"] }
+arrow-flight = "53"
+tonic = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
+tracing = "0.1"
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-cluster = { path = "../ferrosa-cluster" }
+ferrosa-schema = { path = "../ferrosa-schema" }
+
+[dev-dependencies]
+num-bigint = "0.4"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tempfile = "3"
+ferrosa-cql = { path = "../ferrosa-cql", features = ["test-util"] }

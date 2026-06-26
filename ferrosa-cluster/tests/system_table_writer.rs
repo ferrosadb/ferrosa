@@ -86,6 +86,7 @@ fn writer_persists_role_creation() {
         can_login: true,
         salted_hash: Some("$2b$hash".to_string()),
         member_of: HashSet::new(),
+        scram: None,
     };
 
     writer

@@ -3,13 +3,13 @@
 # downloads ONBOARDING.md, optionally clones source repos, optionally pulls
 # the Nomic embedding model, and hands off to a selected LLM harness.
 #
-# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.12.0")
+# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.16.0")
 # and uses it for both ferrosa and ferrosa-memory release artifacts (the two
 # projects ship synchronized tags). No source compile.
 #
 # Usage:
 #   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
-#   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --version v0.12.0 --no-clone
+#   curl -fsSL https://ferrosadb.com/setup-memory.sh | bash -s -- --version v0.16.0 --no-clone
 #
 # Env overrides (mostly for testing):
 #   FERROSA_LATEST_URL    — version pointer (default https://ferrosadb.com/LATEST)
@@ -39,6 +39,9 @@ VERSION=""
 WANT_CLONE=""    # ask|yes|no
 WANT_NOMIC=""    # ask|yes|no
 WANT_HERMES=""   # ask|yes|no
+WANT_HOOKS=""    # ask|yes|no — install harness hooks (default yes)
+HARNESS="${FERROSA_HARNESS:-auto}"   # auto|all|codex|claude|hermes|generic
+MCP_URL="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,12 +52,19 @@ while [ $# -gt 0 ]; do
     --no-nomic)   WANT_NOMIC="no"; shift ;;
     --hermes)     WANT_HERMES="yes"; shift ;;
     --no-hermes)  WANT_HERMES="no"; shift ;;
+    --hooks)      WANT_HOOKS="yes"; shift ;;
+    --no-hooks)   WANT_HOOKS="no"; shift ;;
+    --harness)    HARNESS="$2"; shift 2 ;;
+    --mcp-url)    MCP_URL="$2"; shift 2 ;;
     -h|--help)
       cat <<EOF
 ferrosa-memory fast setup
   --version <tag>          install a specific tag (default: read $LATEST_URL)
   --clone / --no-clone     clone or update source repos under \$FERROSA_SUITE_DIR
   --nomic / --no-nomic     pull the Nomic embedding model via ollama
+  --hooks / --no-hooks     install LLM-harness hooks (session-start/recall/turn)
+  --harness <name>         which harness hooks to install: auto|all|codex|claude|hermes|generic
+  --mcp-url <url>          MCP endpoint baked into the hooks (default $MCP_URL)
   --hermes / --no-hermes   exec hermes "onboard me ..." when done
 EOF
       exit 0 ;;
@@ -171,6 +181,69 @@ if [ ! -f "$ONBOARDING_PATH" ]; then
     || say "failed to fetch ONBOARDING.md (continuing; you can re-download later)"
 fi
 
+# ── Stage 3b: install LLM-harness hooks ─────────────────────────────────────
+# The hooks (session-start / recall / turn-finalization) are what make the
+# memory server actually engage the LLM — without them onboarding is incomplete.
+# They are installed by ferrosa-memory's self-contained hook installer
+# (scripts/install-agent-hooks.py + scripts/hooks/ferrosa-memory-turn-hook.py,
+# both stdlib-only Python). With a source checkout we run it in-tree; with
+# --no-clone we fetch those two files PINNED to $VERSION into a stable location
+# (the generated wrappers bake in the hook path, so it must persist) and run
+# them against the installed MCP endpoint.
+HOOK_SRC_DIR="${INSTALL_ROOT}/share/ferrosa-memory"
+RAW_BASE="https://raw.githubusercontent.com/${MEMORY_REPO}/${VERSION}"
+
+fetch_hook_installer() {
+  # Pinned to the release tag so hooks match the installed binary; fails loud
+  # (no silent fallback to main) if the tag lacks the files.
+  mkdir -p "$HOOK_SRC_DIR/scripts/hooks"
+  curl -fsSL "$RAW_BASE/scripts/install-agent-hooks.py" \
+       -o "$HOOK_SRC_DIR/scripts/install-agent-hooks.py" || return 1
+  curl -fsSL "$RAW_BASE/scripts/hooks/ferrosa-memory-turn-hook.py" \
+       -o "$HOOK_SRC_DIR/scripts/hooks/ferrosa-memory-turn-hook.py" || return 1
+}
+
+install_hooks() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    say "python3 not found — cannot install harness hooks automatically."
+    say "Install python3, then run:"
+    say "  curl -fsSL $RAW_BASE/scripts/install-agent-hooks.py | \\"
+    say "    python3 - --harness $HARNESS --mcp-url $MCP_URL"
+    return 1
+  fi
+  local root
+  if [ -f "$FERROSA_SUITE_DIR/ferrosa-memory/scripts/install-agent-hooks.py" ]; then
+    root="$FERROSA_SUITE_DIR/ferrosa-memory"
+    say "installing harness hooks from source checkout (harness=$HARNESS)"
+  else
+    say "fetching harness hook installer @ $VERSION (no source checkout)"
+    if ! fetch_hook_installer; then
+      say "could not fetch the hook installer at $VERSION."
+      say "Fix: clone the repo and run ./setup.sh, or fetch manually from"
+      say "  $RAW_BASE/scripts/install-agent-hooks.py"
+      return 1
+    fi
+    root="$HOOK_SRC_DIR"
+  fi
+  # No --skip-auth-check: it post-dates older release installers, and the
+  # installer already warns-and-continues when the server is unreachable (and
+  # correctly refuses if the server is up but credentials are inconsistent).
+  if ( cd "$root" && python3 scripts/install-agent-hooks.py \
+         --harness "$HARNESS" --mcp-url "$MCP_URL" ); then
+    say "harness hooks installed (harness=$HARNESS, mcp=$MCP_URL)"
+  else
+    say "hook installer reported an error (see output above)"
+    return 1
+  fi
+}
+
+if [ "$WANT_HOOKS" = "no" ]; then
+  say "skipping harness hook installation (--no-hooks)"
+else
+  install_hooks || say "WARNING: harness hooks were NOT installed (see above). The memory \
+server will run, but your LLM will not auto-recall/ingest until hooks are installed."
+fi
+
 # ── Stage 4: optional Nomic embedding model ─────────────────────────────────
 pull_nomic() {
   if command -v ollama >/dev/null 2>&1; then
@@ -199,6 +272,7 @@ ferrosa-memory $VERSION installed.
 
   binaries: $BIN_DIR
   config:   $CONFIG_DIR/ferrosa-memory.toml
+  hooks:    ~/.config/ferrosa-memory/hooks (harness=$HARNESS; unless --no-hooks)
   onboard:  $ONBOARDING_PATH
 
 EOF

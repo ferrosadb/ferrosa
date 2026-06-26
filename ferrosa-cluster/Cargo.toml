@@ -10,6 +10,7 @@ bincode = "1"
 bytes = "1"
 crc32fast = "1"
 dashmap = "6"
+ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-net = { path = "../ferrosa-net" }
@@ -30,6 +31,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 ferrosa-storage = { path = "../ferrosa-storage", features = ["test-generators"] }
+fs2 = "0.4"
 indexmap = "2"
 proptest = "1"
 rand = "0.10"

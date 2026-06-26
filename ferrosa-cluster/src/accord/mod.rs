@@ -12,6 +12,8 @@ pub mod cross_dc_adapter;
 pub mod cross_shard;
 pub mod ddl_drain;
 pub mod dep_wait;
+#[cfg(test)]
+mod driver_cross_shard_e2e;
 pub mod durability;
 pub mod electorate;
 pub mod epoch;
@@ -29,8 +31,11 @@ pub mod proptests;
 pub mod recovery;
 pub mod recovery_scenarios;
 pub mod reorder_buffer;
+pub mod shard_quorum;
 pub mod state_machine;
 pub mod test_cluster;
+pub mod transaction_commit;
+pub mod transport;
 pub mod two_phase_ddl;
 pub mod uda_integration;
 pub(crate) mod wire;
@@ -67,5 +72,6 @@ pub use recovery::{
 pub use reorder_buffer::ReorderBuffer;
 pub use state_machine::{AccordStateMachine, SmResponse};
 pub use test_cluster::{TestCluster, TestMessage, TestMessagePayload, TestReplica};
+pub use transaction_commit::{AccordTransactionCommitter, ReplicaResolver};
 pub use two_phase_ddl::{DdlMarker, DdlOperation, DdlPhase, TwoPhaseDdlError, TwoPhaseDdlManager};
 pub use wire::ReadPredicate;

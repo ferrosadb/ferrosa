@@ -8,15 +8,12 @@
 //! in `build_delete_row`.
 
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use num_bigint::BigInt;
 
 use crate::ast::{CqlTypeName, Term};
 use crate::error::CqlError;
-use crate::types::{decode_value, encode_value, CqlType, CqlValue};
+use crate::types::{decode_value, CqlType, CqlValue};
 use ferrosa_schema::Schema;
 
 // ---------------------------------------------------------------------------
@@ -611,8 +608,15 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Function 2: parse_cql_type
+// Function 2: parse_cql_type  (moved to ferrosa-row-bridge — D10 decoupling)
 // ---------------------------------------------------------------------------
+//
+// The CQL type-name parser was extracted to the neutral `ferrosa-row-bridge`
+// crate so `ferrosa-postgres` can reuse it without depending on `ferrosa-cql`.
+// These thin wrappers preserve the original public paths
+// (`ferrosa_cql::bridge::parse_cql_type[_in_keyspace]`) and map the bridge's
+// `RowBridgeError` back to `CqlError::Invalid` — identical behaviour for the
+// in-crate callers and the existing test suite.
 
 /// Parse a CQL type name string (e.g. `"int"`, `"list<text>"`, `"frozen<map<text, int>>"`)
 /// into a [`CqlType`].
@@ -620,16 +624,7 @@ pub fn cql_type_display_name(t: &CqlType) -> String {
 /// `frozen<...>` is treated as transparent — the inner type is returned directly,
 /// since `CqlType` does not represent frozen as a distinct concept.
 pub fn parse_cql_type(s: &str) -> Result<CqlType, CqlError> {
-    let s = s.trim();
-    let mut parser = TypeParser::new(s);
-    let result = parser.parse_type()?;
-    let remaining = parser.remaining().trim();
-    if !remaining.is_empty() {
-        return Err(CqlError::Invalid(format!(
-            "unexpected trailing characters in type: '{remaining}'"
-        )));
-    }
-    Ok(result)
+    ferrosa_row_bridge::parse_cql_type(s).map_err(CqlError::from)
 }
 
 /// Parse a CQL type name string with schema context for UDT resolution.
@@ -641,219 +636,7 @@ pub fn parse_cql_type_in_keyspace(
     keyspace: &str,
     schema: &Schema,
 ) -> Result<CqlType, CqlError> {
-    let s = s.trim();
-    let mut parser = TypeParser::new_with_schema(s, keyspace, schema);
-    let result = parser.parse_type()?;
-    let remaining = parser.remaining().trim();
-    if !remaining.is_empty() {
-        return Err(CqlError::Invalid(format!(
-            "unexpected trailing characters in type: '{remaining}'"
-        )));
-    }
-    Ok(result)
-}
-
-/// Small recursive-descent parser for CQL type strings.
-struct TypeParser<'a> {
-    input: &'a str,
-    pos: usize,
-    /// Optional schema context for resolving UDT names.
-    schema_ctx: Option<(&'a str, &'a Schema)>,
-}
-
-impl<'a> TypeParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            input,
-            pos: 0,
-            schema_ctx: None,
-        }
-    }
-
-    fn new_with_schema(input: &'a str, keyspace: &'a str, schema: &'a Schema) -> Self {
-        Self {
-            input,
-            pos: 0,
-            schema_ctx: Some((keyspace, schema)),
-        }
-    }
-
-    fn remaining(&self) -> &'a str {
-        &self.input[self.pos..]
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.input.as_bytes().get(self.pos).copied()
-    }
-
-    fn consume(&mut self, ch: u8) -> Result<(), CqlError> {
-        self.skip_whitespace();
-        match self.peek() {
-            Some(c) if c == ch => {
-                self.pos += 1;
-                Ok(())
-            }
-            _ => Err(CqlError::Invalid(format!(
-                "expected '{}' in type at position {}",
-                ch as char, self.pos
-            ))),
-        }
-    }
-
-    /// Read an identifier (letters, digits, underscore).
-    fn read_ident(&mut self) -> Result<&'a str, CqlError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while self.pos < self.input.len() {
-            let b = self.input.as_bytes()[self.pos];
-            if b.is_ascii_alphanumeric() || b == b'_' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(CqlError::Invalid(format!(
-                "expected type name at position {}",
-                self.pos
-            )));
-        }
-        Ok(&self.input[start..self.pos])
-    }
-
-    fn parse_type(&mut self) -> Result<CqlType, CqlError> {
-        let ident = self.read_ident()?;
-        let lower = ident.to_ascii_lowercase();
-
-        match lower.as_str() {
-            "text" | "varchar" => Ok(CqlType::Varchar),
-            "int" => Ok(CqlType::Int),
-            "bigint" => Ok(CqlType::Bigint),
-            "smallint" => Ok(CqlType::Smallint),
-            "tinyint" => Ok(CqlType::Tinyint),
-            "float" => Ok(CqlType::Float),
-            "double" => Ok(CqlType::Double),
-            "boolean" => Ok(CqlType::Boolean),
-            "blob" => Ok(CqlType::Blob),
-            "uuid" => Ok(CqlType::Uuid),
-            "timeuuid" => Ok(CqlType::Timeuuid),
-            "timestamp" => Ok(CqlType::Timestamp),
-            "inet" => Ok(CqlType::Inet),
-            "ascii" => Ok(CqlType::Ascii),
-            "counter" => Ok(CqlType::Counter),
-            "varint" => Ok(CqlType::Varint),
-            "decimal" => Ok(CqlType::Decimal),
-            "date" => Ok(CqlType::Date),
-            "time" => Ok(CqlType::Time),
-            "duration" => Ok(CqlType::Duration),
-            "list" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let elem = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b'>')?;
-                Ok(CqlType::List(Box::new(elem)))
-            }
-            "set" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let elem = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b'>')?;
-                Ok(CqlType::Set(Box::new(elem)))
-            }
-            "map" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let key = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b',')?;
-                let val = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b'>')?;
-                Ok(CqlType::Map(Box::new(key), Box::new(val)))
-            }
-            "tuple" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let mut types = vec![self.parse_type()?];
-                loop {
-                    self.skip_whitespace();
-                    if self.peek() == Some(b',') {
-                        self.pos += 1;
-                        types.push(self.parse_type()?);
-                    } else {
-                        break;
-                    }
-                }
-                self.consume(b'>')?;
-                Ok(CqlType::Tuple(types))
-            }
-            "vector" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let elem = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b',')?;
-                self.skip_whitespace();
-                let dim_str = self.read_ident()?;
-                let dim: usize = dim_str.parse().map_err(|_| {
-                    CqlError::Invalid(format!(
-                        "expected integer dimension for vector, got '{dim_str}'"
-                    ))
-                })?;
-                self.skip_whitespace();
-                self.consume(b'>')?;
-                Ok(CqlType::Vector(Box::new(elem), dim))
-            }
-            "frozen" => {
-                self.skip_whitespace();
-                self.consume(b'<')?;
-                let inner = self.parse_type()?;
-                self.skip_whitespace();
-                self.consume(b'>')?;
-                Ok(inner)
-            }
-            _ => {
-                // Try UDT lookup if schema context is available.
-                // Copy context refs to avoid borrow conflict with `self.read_ident()`.
-                let ctx = self.schema_ctx;
-                if let Some((keyspace, schema)) = ctx {
-                    // Check for fully-qualified name (ks.typename) by reading a dot
-                    if self.peek() == Some(b'.') {
-                        self.pos += 1;
-                        let type_name = self.read_ident()?;
-                        let type_name_lower = type_name.to_ascii_lowercase();
-                        if let Some(udt) = schema.get_type(&lower, &type_name_lower) {
-                            return Ok(CqlType::Udt {
-                                keyspace: udt.keyspace,
-                                name: udt.name,
-                                fields: udt.fields,
-                            });
-                        }
-                        return Err(CqlError::Invalid(format!(
-                            "unknown CQL type: '{lower}.{type_name_lower}'"
-                        )));
-                    }
-                    // Try unqualified name in current keyspace
-                    if let Some(udt) = schema.get_type(keyspace, &lower) {
-                        return Ok(CqlType::Udt {
-                            keyspace: udt.keyspace,
-                            name: udt.name,
-                            fields: udt.fields,
-                        });
-                    }
-                }
-                Err(CqlError::Invalid(format!("unknown CQL type: '{lower}'")))
-            }
-        }
-    }
+    ferrosa_row_bridge::parse_cql_type_in_keyspace(s, keyspace, schema).map_err(CqlError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -956,423 +739,23 @@ fn resolve_builtin_type(name: &str) -> Option<CqlType> {
 }
 
 // ---------------------------------------------------------------------------
-// Function 3: build_decorated_key
+// Function 6: partition_to_rows  (moved to ferrosa-row-bridge — D10 decoupling)
 // ---------------------------------------------------------------------------
-
-/// Build a [`DecoratedKey`] from partition key column values.
-///
-/// - Single-column PK: raw `encode_value()` bytes.
-/// - Composite PK: `[2-byte len][value bytes][0x00]` per component.
-pub fn build_decorated_key(
-    pk_values: &[CqlValue],
-    _pk_types: &[CqlType],
-) -> Result<DecoratedKey, CqlError> {
-    if pk_values.is_empty() {
-        return Err(CqlError::Invalid(
-            "partition key must have at least one column".into(),
-        ));
-    }
-
-    let bytes = if pk_values.len() == 1 {
-        encode_value(&pk_values[0])
-    } else {
-        // Composite key: [2-byte len][value bytes][0x00] per component
-        let mut buf = Vec::new();
-        for val in pk_values {
-            let encoded = encode_value(val);
-            let len = u16::try_from(encoded.len())
-                .map_err(|_| CqlError::Invalid("partition key component too large".into()))?;
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(&encoded);
-            buf.push(0x00);
-        }
-        buf
-    };
-
-    Ok(DecoratedKey::new(PartitionKey::new(bytes)))
-}
-
-// ---------------------------------------------------------------------------
-// Function 4: build_row
-// ---------------------------------------------------------------------------
-
-/// Build a storage [`Row`] from column values.
-///
-/// - `column_values`: `(column_index, value)` pairs for non-key columns.
-/// - `clustering_values`: CQL values for clustering columns.
-/// - `timestamp`: write timestamp (microseconds).
-/// - `ttl`: optional TTL in seconds.
-pub fn build_row(
-    column_values: &[(u16, CqlValue)],
-    clustering_values: &[CqlValue],
-    timestamp: i64,
-    ttl: Option<i32>,
-) -> Row {
-    let clustering = encode_clustering(clustering_values);
-
-    // Cells MUST be sorted by column index. The SSTable writer serializes
-    // cells in Vec order, but the reader reads them in column-index order
-    // (from the bitmap). If cells are out of order, the reader misinterprets
-    // cell data → parse drift → SSTable corruption → 100% data loss.
-    let mut cells: Vec<(u16, CellValue)> = column_values
-        .iter()
-        .map(|(idx, val)| {
-            // An explicit NULL deletes the column (Cassandra semantics): emit
-            // a cell tombstone, not a live empty-bytes cell, so reads return
-            // null rather than "" / 0.
-            if matches!(val, CqlValue::Null) {
-                let now_secs = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let local_deletion_time = i32::try_from(now_secs).unwrap_or(i32::MAX);
-                return (*idx, CellValue::tombstone(timestamp, local_deletion_time));
-            }
-            let encoded = encode_value(val);
-            let cell = match ttl {
-                Some(ttl_secs) => {
-                    // System clock: the one allowed unwrap
-                    let now_secs = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let local_deletion_time =
-                        i32::try_from(now_secs.saturating_add(ttl_secs as u64)).unwrap_or(i32::MAX);
-                    CellValue::expiring(encoded, timestamp, ttl_secs, local_deletion_time)
-                }
-                None => CellValue::live(encoded, timestamp),
-            };
-            (*idx, cell)
-        })
-        .collect();
-    cells.sort_by_key(|(idx, _)| *idx);
-
-    let primary_key_liveness = match ttl {
-        Some(ttl_secs) => {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let local_deletion_time =
-                i32::try_from(now_secs.saturating_add(ttl_secs as u64)).unwrap_or(i32::MAX);
-            LivenessInfo::with_ttl(timestamp, ttl_secs, local_deletion_time)
-        }
-        None => LivenessInfo::with_timestamp(timestamp),
-    };
-
-    Row {
-        clustering,
-        cells,
-        deletion: DeletionTime::LIVE,
-        primary_key_liveness,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Function 5: build_delete_row
-// ---------------------------------------------------------------------------
-
-/// Build a storage [`Row`] representing a deletion.
-///
-/// - `delete_columns`: column indices to delete. If empty, this is a row-level
-///   deletion (range tombstone).
-/// - `clustering_values`: CQL values for clustering columns.
-/// - `timestamp`: deletion timestamp (microseconds).
-pub fn build_delete_row(
-    delete_columns: &[u16],
-    clustering_values: &[CqlValue],
-    timestamp: i64,
-) -> Row {
-    let clustering = encode_clustering(clustering_values);
-
-    // System clock: the one allowed unwrap
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as u32;
-
-    if delete_columns.is_empty() {
-        // Row-level deletion
-        Row {
-            clustering,
-            cells: vec![],
-            deletion: DeletionTime::new(timestamp, now_secs),
-            primary_key_liveness: LivenessInfo::NONE,
-        }
-    } else {
-        // Column-level deletion: tombstone each specified column.
-        // Must be sorted by column index — same requirement as build_row.
-        let mut cells: Vec<(u16, CellValue)> = delete_columns
-            .iter()
-            .map(|&idx| {
-                // CellValue.local_deletion_time is i32, DeletionTime.local_deletion_time is u32
-                let ldt = i32::try_from(now_secs).unwrap_or(i32::MAX);
-                (idx, CellValue::tombstone(timestamp, ldt))
-            })
-            .collect();
-        cells.sort_by_key(|(idx, _)| *idx);
-
-        Row {
-            clustering,
-            cells,
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::NONE,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Function 6: partition_to_rows
-// ---------------------------------------------------------------------------
-
-/// Convert a storage `Partition` back to result rows for CQL RESULT encoding.
-///
-/// Each returned row is a `Vec<Option<CqlValue>>` with one entry per column
-/// in `column_names`. Tombstone rows and cells are represented as `None`.
-pub fn partition_to_rows(
-    partition: &ferrosa_sstable::types::Partition,
-    column_names: &[String],
-    column_types: &[CqlType],
-    pk_columns: &[usize],
-    ck_columns: &[usize],
-) -> Vec<Vec<Option<CqlValue>>> {
-    let pk_set: std::collections::HashSet<usize> = pk_columns.iter().copied().collect();
-    let ck_set: std::collections::HashSet<usize> = ck_columns.iter().copied().collect();
-    let storage_to_table: Vec<usize> = (0..column_names.len())
-        .filter(|i| !pk_set.contains(i) && !ck_set.contains(i))
-        .collect();
-
-    partition_to_rows_with_storage_mapping(
-        partition,
-        column_names,
-        column_types,
-        pk_columns,
-        ck_columns,
-        &storage_to_table,
-    )
-}
-
-/// Convert a storage `Partition` using an explicit storage-index to table-index
-/// map. New schemas use Cassandra column-name order for storage cells, which can
-/// differ from original CQL declaration order.
-/// True if a `local_deletion_time` (seconds since epoch) has passed.
-/// `i32::MAX` is the "no expiry" sentinel and never expires.
-fn ldt_is_expired(local_deletion_time: i32, now_secs: i32) -> bool {
-    // i32::MAX is the "no expiry" sentinel (NO_DELETION_TIME).
-    local_deletion_time != i32::MAX && now_secs >= local_deletion_time
-}
-
-/// True if a cell still holds a live value at `now_secs` — neither a tombstone
-/// nor an expired TTL cell.
-fn cell_is_live(cell: &CellValue, now_secs: i32) -> bool {
-    !(cell.is_tombstone()
-        || cell.is_expiring() && ldt_is_expired(cell.local_deletion_time, now_secs))
-}
-
-pub fn partition_to_rows_with_storage_mapping(
-    partition: &ferrosa_sstable::types::Partition,
-    column_names: &[String],
-    column_types: &[CqlType],
-    pk_columns: &[usize],
-    ck_columns: &[usize],
-    storage_to_table: &[usize],
-) -> Vec<Vec<Option<CqlValue>>> {
-    partition_to_rows_with_clustering(
-        partition,
-        column_names,
-        column_types,
-        pk_columns,
-        ck_columns,
-        storage_to_table,
-    )
-    .into_iter()
-    .map(|(_clustering, row)| row)
-    .collect()
-}
-
-/// Like [`partition_to_rows_with_storage_mapping`] but pairs each produced
-/// output row with the raw clustering-key bytes of the source row.
-///
-/// The coordinator-side paging cursor needs the clustering bytes of the last
-/// row emitted on a page to resume mid-partition without skipping or
-/// duplicating rows. Tombstone/TTL skipping logic lives here once so the
-/// paired and unpaired variants stay byte-identical.
-pub fn partition_to_rows_with_clustering(
-    partition: &ferrosa_sstable::types::Partition,
-    column_names: &[String],
-    column_types: &[CqlType],
-    pk_columns: &[usize],
-    ck_columns: &[usize],
-    storage_to_table: &[usize],
-) -> Vec<(Vec<u8>, Vec<Option<CqlValue>>)> {
-    let mut result = Vec::new();
-
-    // Wall-clock seconds for TTL expiry, evaluated once per call. Expiry is
-    // applied at read time because compaction does not purge expired cells.
-    let now_secs = i32::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i32::MAX);
-
-    // Pre-decode PK values from the partition key
-    let pk_values = decode_pk(&partition.key, pk_columns.len());
-
-    for row in &partition.rows {
-        // TTL expiry: a row whose primary-key liveness was written with a TTL
-        // and has expired is gone — unless some cell is still live (a later
-        // non-TTL UPDATE can resurrect it). Mirrors Cassandra semantics.
-        let pkl = &row.primary_key_liveness;
-        let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
-        if liveness_expired {
-            let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
-            if !any_live_cell {
-                continue;
-            }
-        }
-
-        // Skip tombstone rows — but only if no newer mutation supersedes the
-        // tombstone. In Cassandra semantics, an UPDATE or INSERT after a
-        // DELETE resurrects the row: the primary_key_liveness timestamp or
-        // cell timestamps may be newer than the row-level deletion.
-        if !row.deletion.is_live() {
-            let del_ts = row.deletion.marked_for_delete_at;
-            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
-            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
-            if !liveness_supersedes && !any_cell_supersedes {
-                continue;
-            }
-        }
-
-        let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
-
-        // Fill PK columns
-        for (i, &col_idx) in pk_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = pk_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        // Fill CK columns
-        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
-        for (i, &col_idx) in ck_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = ck_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        // Fill regular/static columns from cells.
-        //
-        // Cell indices are in storage column space (0-based within
-        // static+regular columns).  Translate to full-table column index
-        // via the mapping built above.
-        for (col_index, cell) in &row.cells {
-            let storage_idx = *col_index as usize;
-            let table_idx = match storage_to_table.get(storage_idx) {
-                Some(&idx) => idx,
-                None => continue, // out-of-range storage index — skip
-            };
-            if table_idx < column_types.len() {
-                if !cell_is_live(cell, now_secs) {
-                    // Tombstone or expired TTL cell → reads as null.
-                    output_row[table_idx] = None;
-                } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
-                        output_row[table_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        result.push((row.clustering.clone(), output_row));
-    }
-
-    result
-}
-
-pub fn write_partition_raw_rows_with_storage_mapping<F>(
-    partition: &ferrosa_sstable::types::Partition,
-    column_count: usize,
-    pk_columns: &[usize],
-    ck_columns: &[usize],
-    storage_to_table: &[usize],
-    mut emit: F,
-) where
-    F: FnMut(&[Option<&[u8]>]),
-{
-    let now_secs = i32::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i32::MAX);
-
-    let pk_values = decode_pk(&partition.key, pk_columns.len());
-
-    for row in &partition.rows {
-        let pkl = &row.primary_key_liveness;
-        let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
-        if liveness_expired {
-            let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
-            if !any_live_cell {
-                continue;
-            }
-        }
-
-        if !row.deletion.is_live() {
-            let del_ts = row.deletion.marked_for_delete_at;
-            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
-            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
-            if !liveness_supersedes && !any_cell_supersedes {
-                continue;
-            }
-        }
-
-        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
-        let mut output_row: Vec<Option<&[u8]>> = vec![None; column_count];
-
-        for (i, &col_idx) in pk_columns.iter().enumerate() {
-            if col_idx < column_count {
-                output_row[col_idx] = pk_values.get(i).map(Vec::as_slice);
-            }
-        }
-
-        for (i, &col_idx) in ck_columns.iter().enumerate() {
-            if col_idx < column_count {
-                output_row[col_idx] = ck_values.get(i).map(Vec::as_slice);
-            }
-        }
-
-        for (col_index, cell) in &row.cells {
-            let storage_idx = *col_index as usize;
-            let table_idx = match storage_to_table.get(storage_idx) {
-                Some(&idx) => idx,
-                None => continue,
-            };
-            if table_idx >= column_count {
-                continue;
-            }
-            if !cell_is_live(cell, now_secs) {
-                output_row[table_idx] = None;
-            } else {
-                output_row[table_idx] = cell.value.as_deref();
-            }
-        }
-
-        emit(&output_row);
-    }
-}
+//
+// The `Partition` -> row decomposition (column ordering + tombstone/TTL
+// skipping) was extracted to the neutral `ferrosa-row-bridge` crate so the
+// Postgres front-end reuses the *exact same* path (no risk of divergent row
+// ordering). Re-exported here at the original public paths
+// (`ferrosa_cql::bridge::partition_to_rows[_with_storage_mapping|_with_clustering]`,
+// `write_partition_raw_rows_with_storage_mapping`) so in-crate callers,
+// `router.rs`, and the existing test suite need no changes. `decode_value`
+// (used internally below) maps RowBridgeError back to CqlError via the
+// `crate::types::decode_value` wrapper.
+pub use ferrosa_row_bridge::{
+    build_decorated_key, build_delete_row, build_row, decode_clustering, decode_pk,
+    encode_clustering, partition_to_rows, partition_to_rows_with_clustering,
+    partition_to_rows_with_storage_mapping, write_partition_raw_rows_with_storage_mapping,
+};
 
 // ---------------------------------------------------------------------------
 // Function 7: CellMeta and partition_to_rows_with_metadata
@@ -1504,93 +887,8 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Encode clustering key values to bytes.
-///
-/// Single clustering column: raw `encode_value()` bytes.
-/// Multiple: `[2-byte len][value bytes]` per component (no trailing 0x00).
-fn encode_clustering(values: &[CqlValue]) -> Vec<u8> {
-    if values.is_empty() {
-        return vec![];
-    }
-    if values.len() == 1 {
-        return encode_value(&values[0]);
-    }
-    // Multi-column clustering: length-prefixed concatenation
-    let mut buf = Vec::new();
-    for val in values {
-        let encoded = encode_value(val);
-        // Use saturating cast; clustering values should never be > 64K
-        let len = (encoded.len() as u16).to_be_bytes();
-        buf.extend_from_slice(&len);
-        buf.extend_from_slice(&encoded);
-    }
-    buf
-}
-
 pub(crate) fn build_clustering_key(values: &[CqlValue]) -> Vec<u8> {
     encode_clustering(values)
-}
-
-/// Decode partition key bytes into component byte slices.
-///
-/// Single PK: the whole byte slice is the single component.
-/// Composite PK: `[2-byte len][value bytes][0x00]` per component.
-///
-/// Public so offline tooling (e.g. ferrosa-ctl salvage re-ingest) can split a
-/// stored partition key back into the per-column values needed to bind a
-/// prepared INSERT.
-pub fn decode_pk(dk: &DecoratedKey, num_components: usize) -> Vec<Vec<u8>> {
-    let bytes = dk.key.as_bytes();
-    if num_components <= 1 {
-        return vec![bytes.to_vec()];
-    }
-    // Composite: [2-byte len][value bytes][0x00] per component
-    let mut components = Vec::with_capacity(num_components);
-    let mut pos = 0;
-    while pos + 2 <= bytes.len() && components.len() < num_components {
-        let len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let end = pos + len;
-        if end > bytes.len() {
-            break;
-        }
-        components.push(bytes[pos..end].to_vec());
-        pos = end;
-        // Skip the 0x00 separator
-        if pos < bytes.len() && bytes[pos] == 0x00 {
-            pos += 1;
-        }
-    }
-    components
-}
-
-/// Decode clustering key bytes into component byte slices.
-///
-/// Single CK: the whole byte slice is the single component.
-/// Multiple: `[2-byte len][value bytes]` per component.
-///
-/// Public so offline tooling (e.g. ferrosa-ctl salvage re-ingest) can split a
-/// stored clustering key back into the per-column values for a prepared INSERT.
-pub fn decode_clustering(bytes: &[u8], num_components: usize) -> Vec<Vec<u8>> {
-    if bytes.is_empty() || num_components == 0 {
-        return vec![];
-    }
-    if num_components == 1 {
-        return vec![bytes.to_vec()];
-    }
-    let mut components = Vec::with_capacity(num_components);
-    let mut pos = 0;
-    while pos + 2 <= bytes.len() && components.len() < num_components {
-        let len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let end = pos + len;
-        if end > bytes.len() {
-            break;
-        }
-        components.push(bytes[pos..end].to_vec());
-        pos = end;
-    }
-    components
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,6 +1137,11 @@ fn format_json_float_f64(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Encoders moved to ferrosa-row-bridge (re-exported above); the tests below
+    // still reference these directly.
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_row_bridge::encode_value;
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 
     #[test]
     fn term_int_to_cql_int() {

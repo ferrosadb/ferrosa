@@ -13,7 +13,6 @@ use std::fs;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -21,22 +20,22 @@ use sha2::{Digest, Sha256};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
-use ferrosa_cluster::{DdlPath, WritePath};
+use ferrosa_cluster::DdlPath;
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
     ClusteringOrder as SchemaClusteringOrder, ColumnKind, ColumnMetadata, GrantEntry,
-    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, NodeConfig, Permission, ReplicationParams,
-    Resource, RoleMetadata, RoleUpdates, RowPredicate, Schema, TableMetadata, TableParams,
-    TableUpdates, UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata,
-    VirtualColumnUpdate, VirtualTableUpdate,
+    IndexMetadata, KeyspaceMetadata, KeyspaceUpdates, Permission, ReplicationParams, Resource,
+    RoleMetadata, RoleUpdates, RowPredicate, Schema, TableMetadata, TableParams, TableUpdates,
+    UserAggregateMetadata, UserFunctionMetadata, UserTypeMetadata, VirtualColumnUpdate,
+    VirtualTableUpdate,
 };
+use ferrosa_session::SessionCore;
 use ferrosa_storage::StorageEngine;
 use ferrosa_storage::TableId;
 use ferrosa_storage::FILTER_PREDICATE_OPTION_KEY;
-use ferrosa_udf::UdfExecutor;
 
 use crate::ast::*;
 use crate::bridge;
@@ -858,12 +857,9 @@ enum ResolvedFunctionKind {
 
 /// Shared state available to all request handlers.
 pub struct SharedState {
-    pub engine: Arc<StorageEngine>,
-    pub schema: Arc<Schema>,
-    pub node_config: Arc<NodeConfig>,
-    pub cluster_state: Arc<ArcSwap<ferrosa_cluster::ClusterStateHolder>>,
-    pub write_path: Arc<ArcSwap<WritePath>>,
-    pub ddl_path: Arc<ArcSwap<DdlPath>>,
+    /// Protocol-agnostic engine state (storage, schema, routing, cluster mode,
+    /// Accord clock, peer manager), shared with other front-ends via `Deref`.
+    pub core: Arc<SessionCore>,
     pub prepared_cache: Arc<PreparedCache>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
@@ -871,32 +867,44 @@ pub struct SharedState {
     pub full_scan_tracker: Arc<crate::virtual_tables::FullScanTracker>,
     /// Records secondary-index usage for `system_observability.index_usage`.
     pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
-    /// WASM UDF executor for compiling and invoking user-defined functions.
-    pub udf_executor: Arc<UdfExecutor>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
-    /// Mode controller for checking CQL readiness (pair mode gating).
-    pub mode_controller: Arc<ferrosa_cluster::ModeController>,
     /// CQL request metrics (per-opcode counters and error counter).
     pub cql_metrics: Arc<CqlMetrics>,
     /// Decides whether a given connection should see public or internal
     /// topology addresses in `system.local` / `system.peers_v2`.
     pub topology_policy: ClientTopologyPolicy,
-    /// When `true`, permission failures are logged as warnings and allowed
-    /// through instead of returning 0x2100 Unauthorized.  Set from
-    /// `FERROSA_AUTH_WARN=true` to enable the soak observation period.
-    pub auth_warn: bool,
-    /// Peer connection manager for Accord coordinator fanout.
-    ///
-    /// `None` in standalone mode or when the cluster layer has not yet
-    /// provided a `PeerManager` (e.g. in unit tests).  When `None`, LWT
-    /// statements in cluster mode return a fail-loud `ServerError` instead
-    /// of routing through Accord.
-    pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
-    /// Hybrid logical clock used to generate monotone transaction timestamps.
-    ///
-    /// `None` when `peer_manager` is `None`.
-    pub accord_clock: Option<Arc<ferrosa_common::accord::HybridLogicalClock>>,
+}
+
+impl std::ops::Deref for SharedState {
+    type Target = SessionCore;
+    fn deref(&self) -> &SessionCore {
+        &self.core
+    }
+}
+
+#[cfg(test)]
+impl SharedState {
+    /// Rebuild `core` with a replacement `node_config`, preserving all other
+    /// neutral fields. Test-only helper: `core` is an `Arc<SessionCore>`, so a
+    /// neutral field can no longer be reassigned in place via `Deref` (which is
+    /// `&`-only); tests that reconfigure addressing rebuild the core instead.
+    fn set_node_config_for_test(&mut self, node_config: Arc<ferrosa_schema::NodeConfig>) {
+        let old = &*self.core;
+        self.core = Arc::new(SessionCore {
+            engine: old.engine.clone(),
+            schema: old.schema.clone(),
+            node_config,
+            cluster_state: old.cluster_state.clone(),
+            write_path: old.write_path.clone(),
+            ddl_path: old.ddl_path.clone(),
+            udf_executor: old.udf_executor.clone(),
+            mode_controller: old.mode_controller.clone(),
+            auth_warn: old.auth_warn,
+            peer_manager: old.peer_manager.clone(),
+            accord_clock: old.accord_clock.clone(),
+        });
+    }
 }
 
 /// Per-request context: authentication, current keyspace, and consistency level.
@@ -957,11 +965,13 @@ pub enum RouteResult {
     Result(BytesMut),
     /// USE keyspace: returns the new keyspace name and a SetKeyspace frame body.
     SetKeyspace(String, BytesMut),
-    /// Subscription accepted — connection should spawn a polling task.
+    /// Subscription accepted — connection should spawn the delivery task
+    /// (snapshot poll, or an event-driven CDC subscriber per `streams`).
     Subscribe {
         inner: Box<Statement>,
         interval: Option<std::time::Duration>,
         delta: bool,
+        streams: crate::ast::SubscribeStreams,
     },
     /// Unsubscribe — cancel one or all subscriptions.
     Unsubscribe { stream_id: Option<u16> },
@@ -1034,6 +1044,123 @@ fn build_lwt_mutation(
     mutation.serialize_into(&mut mutation_bytes);
 
     Ok((key_bytes, mutation_bytes))
+}
+
+/// Encode a DML statement as a buffered [`TransactionWrite`] for a CQL
+/// `BEGIN`/`COMMIT` transaction — the same key + commit-log mutation encoding as
+/// [`build_lwt_mutation`], plus the keyspace so the committer can resolve the
+/// key's replicas from that keyspace's replication.
+fn build_transaction_write(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+) -> Result<ferrosa_storage::accord::TransactionWrite, CqlError> {
+    use ferrosa_storage::Mutation;
+
+    let now_micros = || -> Result<i64, CqlError> {
+        Ok(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CqlError::ServerError(format!("system clock error: {e}")))?
+            .as_micros() as i64)
+    };
+
+    let (table_id, key, row, ts) = match stmt {
+        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+        Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        _ => {
+            return Err(CqlError::Invalid(
+                "only INSERT/UPDATE/DELETE may be buffered in a transaction".into(),
+            ));
+        }
+    };
+
+    let keyspace = table_id.keyspace.clone();
+    let key_bytes = key.key.as_bytes().to_vec();
+    let mutation = Mutation::new(
+        table_id.keyspace.clone(),
+        table_id.table.clone(),
+        key,
+        vec![row],
+        ts,
+    );
+    let mut mutation_bytes = vec![0u8; mutation.serialized_size()];
+    mutation.serialize_into(&mut mutation_bytes);
+
+    Ok(ferrosa_storage::accord::TransactionWrite {
+        keyspace,
+        key: key_bytes,
+        mutation: mutation_bytes,
+    })
+}
+
+/// Intercept transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) and in-transaction
+/// DML for a CQL session. Returns `Some(result)` if the statement was handled as
+/// a transaction operation; `None` if it should be routed normally.
+///
+/// In an open transaction, `INSERT`/`UPDATE`/`DELETE` are **buffered** (not
+/// executed); `COMMIT` commits the whole buffered write-set as one multi-key
+/// Accord transaction via the `SessionCore` committer
+/// (`accord_transaction_committer`); `ROLLBACK` drops the buffer.
+pub async fn route_transactional(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    stmt: &Statement,
+    txn: &mut crate::session::CqlTransaction,
+) -> Option<Result<RouteResult, CqlError>> {
+    match stmt {
+        Statement::BeginTransaction => Some(
+            txn.begin()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Rollback => Some(
+            txn.rollback()
+                .map(|()| RouteResult::Result(crate::result::encode_void())),
+        ),
+        Statement::Commit => Some(commit_cql_transaction(state, txn).await),
+        // Buffer DML only while a transaction is open; otherwise route normally.
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if txn.is_open() => {
+            Some(
+                match build_transaction_write(state, ctx, stmt).and_then(|w| txn.stage(w)) {
+                    Ok(()) => Ok(RouteResult::Result(crate::result::encode_void())),
+                    Err(e) => {
+                        // A statement that fails inside a transaction POISONS it,
+                        // so the next COMMIT fails loud rather than committing an
+                        // incomplete write-set (never a silently partial txn).
+                        txn.poison();
+                        Err(e)
+                    }
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Commit the buffered write-set through the Accord committer. Fails loud (and
+/// closes the transaction) when not in cluster mode or when the commit cannot be
+/// driven — the client never gets a success it did not earn.
+async fn commit_cql_transaction(
+    state: &SharedState,
+    txn: &mut crate::session::CqlTransaction,
+) -> Result<RouteResult, CqlError> {
+    use ferrosa_storage::accord::CommitOutcome;
+    let committer = match state.accord_transaction_committer() {
+        Some(c) => c,
+        None => {
+            let _ = txn.rollback();
+            return Err(CqlError::Invalid(
+                "multi-statement transactions require cluster mode (Accord)".into(),
+            ));
+        }
+    };
+    match txn.commit(committer.as_ref()).await {
+        Ok(CommitOutcome::Committed) => Ok(RouteResult::Result(crate::result::encode_void())),
+        Ok(CommitOutcome::Aborted { reason }) => {
+            Err(CqlError::Invalid(format!("transaction aborted: {reason}")))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Decode the agreed row-at-`t` bytes (a serialized single-partition
@@ -1180,17 +1307,20 @@ async fn route_lwt_via_accord(
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_cluster::accord::AccordCoordinatorDriver;
 
-    // Build the replica set from the live peer map plus this node itself.
-    // Ordering is deterministic: local node first, then peers sorted by UUID.
+    // Fallback replica set: the live peer map plus this node itself. Used when
+    // the write path has no ring (standalone/pair/degraded) and as the basis for
+    // the "no peers at all" guard below. Cluster mode replaces this with the
+    // key's token-aware RF replicas (see `select_accord_replicas` after the
+    // keyspace is resolved). Ordering is deterministic: sorted by UUID.
     let host_id = state.node_config.host_id;
-    let mut replica_ids: Vec<uuid::Uuid> = peers.live_peer_ids();
+    let mut fallback_replicas: Vec<uuid::Uuid> = peers.live_peer_ids();
     // Include local node if not already in the list.
-    if !replica_ids.contains(&host_id) {
-        replica_ids.push(host_id);
+    if !fallback_replicas.contains(&host_id) {
+        fallback_replicas.push(host_id);
     }
-    replica_ids.sort_unstable();
+    fallback_replicas.sort_unstable();
 
-    if replica_ids.is_empty() {
+    if fallback_replicas.is_empty() {
         return Err(CqlError::ServerError(
             "Accord replica set is empty — no peers connected for LWT consensus".into(),
         ));
@@ -1210,6 +1340,25 @@ async fn route_lwt_via_accord(
     // Resolve the target keyspace/table for the generic-IF read-vote so replicas
     // (and the coordinator's own local reader) can target the read-at-`t`.
     let (ks, table) = lwt_keyspace_table(ctx, stmt)?;
+
+    // Token-aware participant resolution (ADR-021): in cluster mode the write
+    // path maps the key to its RF replicas from the ring (a proper subset of the
+    // cluster); otherwise we keep the live-peer fallback. This makes the live
+    // Accord LWT path RF-correct rather than replicating every key to every
+    // connected peer. Placement stays behind `WritePath` — the CQL front-end
+    // only passes raw key bytes + keyspace replication.
+    let replication = state
+        .schema
+        .snapshot()
+        .keyspaces
+        .get(&ks)
+        .map(|k| k.replication.clone());
+    let replica_ids = select_accord_replicas(
+        &state.write_path.load(),
+        replication.as_ref(),
+        &key,
+        fallback_replicas,
+    )?;
 
     // Classify the IF predicate. `NotExists` uses the replica existence path;
     // `Generic` reads the row at `t` so the coordinator evaluates `IF col=val`.
@@ -1300,6 +1449,35 @@ async fn route_lwt_via_accord(
     }
 
     finish_lwt_via_accord(state, &ks, &table, driver, None).await
+}
+
+/// Select the Accord participant replicas for a single-key LWT.
+///
+/// In cluster mode the write path resolves the key's owning replicas from the
+/// ring (token-aware, RF-correct — a proper subset of the cluster). Outside
+/// cluster mode (or when the keyspace replication is unknown) we keep the
+/// caller's `fallback` set (the live peer map), since Accord placement is a
+/// cluster concern. An unparseable strategy or an empty cluster-mode resolution
+/// fails loud rather than silently writing to the wrong/empty replica set.
+fn select_accord_replicas(
+    write_path: &ferrosa_cluster::WritePath,
+    replication: Option<&ReplicationParams>,
+    key: &[u8],
+    fallback: Vec<uuid::Uuid>,
+) -> Result<Vec<uuid::Uuid>, CqlError> {
+    let Some(replication) = replication else {
+        return Ok(fallback);
+    };
+    match write_path.accord_replicas_for_key(key, replication) {
+        Ok(Some(resolved)) if !resolved.is_empty() => Ok(resolved),
+        Ok(Some(_)) => Err(CqlError::ServerError(
+            "Accord cluster-mode replica resolution returned no replicas for the LWT key".into(),
+        )),
+        Ok(None) => Ok(fallback),
+        Err(e) => Err(CqlError::ServerError(format!(
+            "LWT replica resolution: {e}"
+        ))),
+    }
 }
 
 /// Drive the Accord transaction to completion and map its result to a CQL LWT
@@ -1532,11 +1710,13 @@ pub async fn route(
         Statement::DropIndex(di) => route_drop_index(state, ctx, di)
             .await
             .map(RouteResult::Result),
-        Statement::Subscribe {
-            inner,
-            interval,
-            delta,
-        } => {
+        Statement::Subscribe(spec) => {
+            let crate::ast::SubscribeSpec {
+                inner,
+                interval,
+                delta,
+                streams,
+            } = spec;
             // Validate: inner must be a Select
             match inner.as_ref() {
                 Statement::Select(s) => {
@@ -1557,10 +1737,15 @@ pub async fn route(
                     ))
                 }
             }
+            // Snapshot mode re-executes the SELECT on an interval; CDC mode
+            // (ON LOCAL|COMMITTED) streams change events from the engine's CDC
+            // bus. The connection layer spawns the right delivery task per
+            // `streams`.
             Ok(RouteResult::Subscribe {
                 inner,
                 interval,
                 delta,
+                streams,
             })
         }
         Statement::Unsubscribe { stream_id } => Ok(RouteResult::Unsubscribe { stream_id }),
@@ -3371,25 +3556,50 @@ async fn route_select_user_table(
             .index_usage_tracker
             .record(ks, &s.table, index_name, "FullText");
 
+        // Route the FTI lookup through the write path so it scatter-gathers
+        // across the cluster. `fts_match` carries no partition key, so its hits
+        // span all token ranges; a coordinator-local lookup returned 0/1
+        // depending on which node served the query (BUG-F-007 / t_0d08aa43).
+        // Standalone/pair still resolves locally via the same call.
         let matching_pks = state
-            .engine
+            .write_path
+            .load()
             .fulltext_search(&table_id, index_name, fts_query)
+            .await
             .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
 
-        // Fetch each matching partition and apply post-filter.
-        // The raw_pk bytes are the PartitionKey bytes as stored in the FTI.
-        // Reconstruct a DecoratedKey by wrapping them in PartitionKey directly.
+        // `matching_pks` are full-key document ids (partition + clustering), one
+        // per matching ROW. Read each distinct partition once, keep ONLY the rows
+        // whose full key actually matched — so non-matching clustering rows in a
+        // matched partition don't leak (t_da51e20c) — then post-filter.
+        let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+        let mut seen_partitions = std::collections::HashSet::new();
         let mut fts_rows = Vec::new();
-        for raw_pk in matching_pks {
+        for doc_key in &matched {
+            let Some(pk) = ferrosa_index::fulltext::keys::doc_key_partition(doc_key) else {
+                // Legacy/malformed id (e.g. a sidecar built before row-granular
+                // keys, pending rebuild) — skip rather than misread.
+                continue;
+            };
+            if !seen_partitions.insert(pk.to_vec()) {
+                continue; // partition already read
+            }
             let decorated =
-                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(raw_pk));
-            if let Some(partition) = state
+                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
+            if let Some(mut partition) = state
                 .write_path
                 .load()
                 .read(&table_id, &decorated)
                 .await
                 .map_err(|e| CqlError::ServerError(format!("{e}")))?
             {
+                // Keep only the rows whose full key is in the FTS match set.
+                partition.rows.retain(|row| {
+                    matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
+                        pk,
+                        &row.clustering,
+                    ))
+                });
                 let mut prows = bridge::partition_to_rows_with_storage_mapping(
                     &partition,
                     &all_col_names,
@@ -4661,6 +4871,81 @@ pub async fn route_select_raw(
         .or(ctx.current_keyspace.as_deref())
         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
     route_select_user_table(state, ctx, ks, s).await
+}
+
+/// Encode a single CDC change event's rows (one mutation, for `ks.{select.table}`)
+/// into a CQL RESULT frame matching `select`'s projection.
+///
+/// Reuses the exact row-mapping pipeline as the SELECT read path
+/// (`build_column_info` + `storage_to_table_indices` +
+/// `partition_to_rows_with_storage_mapping` + `select_columns` + `encode_rows`)
+/// so a change event encodes identically to how the same rows would read back.
+///
+/// Streaming by construction: it handles **one event's rows** (a single write),
+/// never a materialized result set. Returns `Ok(None)` if the table is unknown
+/// (e.g. dropped between subscribe and delivery) so the caller can skip it.
+pub(crate) fn cdc_event_to_result_frame(
+    schema: &Schema,
+    ks: &str,
+    select: &SelectStatement,
+    key: ferrosa_common::DecoratedKey,
+    rows: Vec<ferrosa_sstable::types::Row>,
+) -> Result<Option<BytesMut>, CqlError> {
+    let snap = schema.snapshot();
+    let table_meta = match snap.tables.get(&(ks.to_string(), select.table.clone())) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let (col_names, col_types) = build_column_info(table_meta, &select.columns, ks, schema)?;
+    let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+    let all_col_types: Vec<CqlType> = table_meta
+        .columns
+        .values()
+        .map(|c| resolve_col_type(&c.column_type, ks, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let pk_indices: Vec<usize> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("partition key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ck_indices: Vec<usize> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| {
+            table_meta.columns.get_index_of(name).ok_or_else(|| {
+                CqlError::Invalid(format!("clustering key column '{}' not found", name))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let storage_to_table = storage_to_table_indices(table_meta);
+
+    let partition = ferrosa_sstable::types::Partition {
+        key,
+        deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+        static_row: None,
+        rows,
+    };
+    let all_rows = bridge::partition_to_rows_with_storage_mapping(
+        &partition,
+        &all_col_names,
+        &all_col_types,
+        &pk_indices,
+        &ck_indices,
+        &storage_to_table,
+    );
+    let selected = select_columns(&all_rows, &all_col_names, &col_names);
+    Ok(Some(result::encode_rows(
+        &col_names,
+        &col_types,
+        ks,
+        &select.table,
+        &selected,
+    )))
 }
 
 // ── Virtual table helpers ────────────────────────────────────────────────
@@ -7804,6 +8089,7 @@ async fn route_create_role(
         can_login: s.login.unwrap_or(false),
         salted_hash: None,
         member_of: HashSet::new(),
+        scram: None,
     };
 
     let ddl_guard = state.ddl_path.load();
@@ -8187,7 +8473,21 @@ async fn route_grant(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.grant(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (also emits the audit event). Then run the same
+            // persisted DDL path the Pair/Cluster arms use so the grant is
+            // written to system_auth.role_permissions and survives a restart —
+            // standalone mode otherwise only updated memory, silently losing
+            // grants on restart (t_fb280b30). grant_internal is idempotent.
+            state
+                .schema
+                .grant(&s.role, &resource, perms.clone(), ctx.auth)?;
+            ddl.execute(DdlOperation::Grant(GrantEntry {
+                role: s.role.clone(),
+                resource,
+                permissions: perms,
+            }))
+            .await
+            .map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::Grant(GrantEntry {
@@ -8234,7 +8534,21 @@ async fn route_revoke(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            state.schema.revoke(&s.role, &resource, perms, ctx.auth)?;
+            // In-memory apply (+ audit), then persist each revoke to
+            // system_auth.role_permissions so it survives a restart — else the
+            // revoked permission silently reappears after restart (t_fb280b30).
+            state
+                .schema
+                .revoke(&s.role, &resource, perms.clone(), ctx.auth)?;
+            for perm in perms {
+                ddl.execute(DdlOperation::Revoke {
+                    role: s.role.clone(),
+                    resource: resource.clone(),
+                    permission: perm,
+                })
+                .await
+                .map_err(CqlError::from)?;
+            }
         }
         DdlPath::Pair(coordinator) => {
             // DdlOperation::Revoke carries one permission at a time; emit one
@@ -8316,11 +8630,11 @@ async fn route_grant_role(
     let ddl = &**ddl_guard;
     match ddl {
         DdlPath::Direct { .. } => {
-            if grant {
-                state.schema.grant_role_internal(&member, &role)?;
-            } else {
-                state.schema.revoke_role_internal(&member, &role)?;
-            }
+            // Route through the persisted DDL path (apply_direct) so the
+            // membership change is written to system_auth.role_members and
+            // survives a restart — Direct mode previously only updated memory,
+            // silently losing role grants on restart (t_fb280b30).
+            ddl.execute(op).await.map_err(CqlError::from)?;
         }
         DdlPath::Pair(coordinator) => {
             coordinator.coordinate_ddl(op).await?;
@@ -8949,6 +9263,111 @@ fn evaluate_where_rhs_term(
     bridge::term_to_cql_value(term, expected_type)
 }
 
+/// Compute the Murmur3 partition token for a candidate `row` on the Direct
+/// (standalone) read path.
+///
+/// Gathers the partition-key column values in declared PK order and decorates
+/// them with the same composite encoding the engine uses for placement. Returns
+/// `Ok(None)` when any partition-key column is absent or NULL in the row — such
+/// a row cannot satisfy a `token()` bound, so the caller rejects it.
+fn row_partition_token(
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    table_meta: &TableMetadata,
+) -> Result<Option<ferrosa_common::Token>, CqlError> {
+    let mut pk_values: Vec<CqlValue> = Vec::with_capacity(table_meta.partition_key.len());
+    let mut pk_types: Vec<CqlType> = Vec::with_capacity(table_meta.partition_key.len());
+    for pk_col in &table_meta.partition_key {
+        let Some(idx) = all_col_names.iter().position(|n| n == pk_col) else {
+            return Ok(None);
+        };
+        let Some(value) = row.get(idx).and_then(Option::as_ref) else {
+            return Ok(None);
+        };
+        pk_values.push(value.clone());
+        pk_types.push(all_col_types[idx].clone());
+    }
+    if pk_values.is_empty() {
+        return Ok(None);
+    }
+    let dk = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    Ok(Some(dk.token))
+}
+
+/// Resolve the bound token on the RHS of a `token(pk) op <bound>` predicate.
+///
+/// Two RHS shapes are accepted, matching the parser and Cassandra:
+/// - `token(<literal>)` — a `FunctionCall` whose argument is encoded and hashed
+///   exactly like a partition key, yielding its ring position.
+/// - a bare integer literal — the raw token value itself (`Token(n)`).
+fn token_bound_value(term: &Term) -> Result<ferrosa_common::Token, CqlError> {
+    match term {
+        Term::FunctionCall { name, args, .. } if name.eq_ignore_ascii_case("token") => {
+            if args.len() != 1 {
+                return Err(CqlError::Invalid(
+                    "token() bound must take exactly one argument".into(),
+                ));
+            }
+            let value = bridge::term_to_cql_value(&args[0], &CqlType::Varchar).or_else(|_| {
+                // Numeric/other literals: infer the encoding from the literal
+                // itself rather than forcing a text coercion.
+                bridge::term_to_cql_value(&args[0], &literal_inferred_type(&args[0]))
+            })?;
+            let dk = bridge::build_decorated_key(&[value], &[CqlType::Varchar])?;
+            Ok(dk.token)
+        }
+        Term::IntegerLiteral(n) => Ok(ferrosa_common::Token(*n)),
+        other => Err(CqlError::Invalid(format!(
+            "token() bound must be token(<value>) or an integer literal, got {other:?}"
+        ))),
+    }
+}
+
+/// Best-effort CQL type for a literal term, used when a `token(<literal>)`
+/// argument is not text and must be encoded with its natural representation.
+fn literal_inferred_type(term: &Term) -> CqlType {
+    match term {
+        Term::IntegerLiteral(_) => CqlType::Bigint,
+        Term::FloatLiteral(_) => CqlType::Double,
+        Term::BoolLiteral(_) => CqlType::Boolean,
+        Term::UuidLiteral(_) => CqlType::Uuid,
+        Term::BlobLiteral(_) => CqlType::Blob,
+        _ => CqlType::Varchar,
+    }
+}
+
+/// Apply a single `token(pk) op <bound>` predicate to a candidate row on the
+/// Direct read path. Returns whether the row's partition token satisfies the
+/// bound. The coordinator path routes by token range and never reaches here.
+fn token_clause_matches(
+    wc: &WhereClause,
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    table_meta: &TableMetadata,
+) -> Result<bool, CqlError> {
+    let Some(row_token) = row_partition_token(row, all_col_names, all_col_types, table_meta)?
+    else {
+        return Ok(false);
+    };
+    let bound = token_bound_value(&wc.value)?;
+    let matches = match &wc.op {
+        ComparisonOp::Gt => row_token > bound,
+        ComparisonOp::Lt => row_token < bound,
+        ComparisonOp::Ge => row_token >= bound,
+        ComparisonOp::Le => row_token <= bound,
+        ComparisonOp::Eq => row_token == bound,
+        ComparisonOp::Ne => row_token != bound,
+        other => {
+            return Err(CqlError::Invalid(format!(
+                "unsupported operator {other:?} on a token() WHERE predicate"
+            )));
+        }
+    };
+    Ok(matches)
+}
+
 /// Evaluate WHERE predicates against a row for ALLOW FILTERING post-filter.
 fn evaluate_where_predicates(
     row: &[Option<CqlValue>],
@@ -8960,10 +9379,16 @@ fn evaluate_where_predicates(
     state: &SharedState,
 ) -> Result<bool, CqlError> {
     for wc in where_clauses {
-        // Skip token() predicates — token range filtering is handled by
-        // the scan bounds, not by post-filter row evaluation.
+        // token() predicates: on the Direct/standalone read path there is no
+        // coordinator routing by token range, so the bound must be applied here
+        // by computing the candidate row's partition token. (The cluster
+        // coordinator path routes to replicas by token and never reaches this
+        // function, so it is unaffected.)
         if wc.token_fn {
-            continue;
+            if token_clause_matches(wc, row, all_col_names, all_col_types, table_meta)? {
+                continue;
+            }
+            return Ok(false);
         }
         // Skip fts_match() predicates — full-text search is handled by
         // the FTI lookup path, not by post-filter row evaluation.
@@ -11143,6 +11568,63 @@ mod tests {
     use super::*;
     use crate::virtual_tables::active_queries::ActiveQueriesTable;
     use crate::virtual_tables::connections::ConnectionsTable;
+    use arc_swap::ArcSwap;
+    use ferrosa_cluster::WritePath;
+    use ferrosa_schema::NodeConfig;
+
+    // ── select_accord_replicas: live-path replica selection ───────────────────
+
+    fn simple_replication_params(rf: usize) -> ReplicationParams {
+        ReplicationParams {
+            strategy: "SimpleStrategy".to_string(),
+            options: std::collections::HashMap::from([(
+                "replication_factor".to_string(),
+                rf.to_string(),
+            )]),
+        }
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_outside_cluster_mode() {
+        // No ring (standalone/degraded WritePath) → keep the caller's all-live-
+        // peers fallback rather than failing the LWT.
+        let fallback = vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)];
+        let params = simple_replication_params(3);
+        let got = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&params),
+            b"pk",
+            fallback.clone(),
+        )
+        .expect("fallback path must not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_falls_back_when_replication_absent() {
+        // No keyspace replication metadata → fall back rather than guess.
+        let fallback = vec![uuid::Uuid::from_u128(7)];
+        let got = select_accord_replicas(&WritePath::unavailable(), None, b"pk", fallback.clone())
+            .expect("absent replication must fall back, not error");
+        assert_eq!(got, fallback);
+    }
+
+    #[test]
+    fn select_accord_replicas_fails_loud_on_bad_strategy() {
+        // An unparseable strategy must surface an error, never silently fall back
+        // to a placement the operator did not configure.
+        let bad = ReplicationParams {
+            strategy: "NoSuchStrategy".to_string(),
+            options: std::collections::HashMap::new(),
+        };
+        let err = select_accord_replicas(
+            &WritePath::unavailable(),
+            Some(&bad),
+            b"pk",
+            vec![uuid::Uuid::from_u128(1)],
+        );
+        assert!(err.is_err(), "unparseable strategy must fail loud");
+    }
     use ferrosa_schema::{
         AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
         RateLimitConfig, SchemaConfig, TestAuditSink,
@@ -11183,6 +11665,10 @@ mod tests {
             memtable_num_shards: 64,
         };
         let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+        // Real startup registers the system tables unconditionally (main.rs:802);
+        // mirror that so the harness reflects standalone mode (system_auth.* must
+        // exist for grant persistence — t_fb280b30).
+        engine.register_system_tables().unwrap();
 
         let schema = Arc::new(
             Schema::new(SchemaConfig {
@@ -11222,27 +11708,29 @@ mod tests {
         let mode_controller =
             ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
         let state = SharedState {
-            engine: engine.clone(),
-            schema: schema.clone(),
-            node_config,
-            cluster_state: Arc::new(ArcSwap::from_pointee(
-                ferrosa_cluster::ClusterStateHolder::Standalone,
-            )),
-            write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
-            ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+            core: Arc::new(ferrosa_session::SessionCore {
+                engine: engine.clone(),
+                schema: schema.clone(),
+                node_config,
+                cluster_state: Arc::new(ArcSwap::from_pointee(
+                    ferrosa_cluster::ClusterStateHolder::Standalone,
+                )),
+                write_path: Arc::new(ArcSwap::from_pointee(WritePath::direct(engine.clone()))),
+                ddl_path: Arc::new(ArcSwap::from_pointee(DdlPath::Direct { schema, engine })),
+                udf_executor,
+                mode_controller,
+                auth_warn: false,
+                peer_manager: None,
+                accord_clock: None,
+            }),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
-            udf_executor,
             event_sender: tokio::sync::broadcast::channel(64).0,
-            mode_controller,
             cql_metrics: Arc::new(CqlMetrics::new()),
             topology_policy: ClientTopologyPolicy::default(),
-            auth_warn: false,
-            peer_manager: None,
-            accord_clock: None,
         };
         (state, dir)
     }
@@ -11503,6 +11991,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_transactional_handles_begin_rollback_and_fails_commit_in_standalone() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        let mut txn = crate::session::CqlTransaction::new();
+
+        // A non-transactional statement is NOT intercepted (routes normally).
+        let select = crate::parser::parse("SELECT * FROM system.local").unwrap();
+        assert!(
+            route_transactional(&state, &ctx, &select, &mut txn)
+                .await
+                .is_none(),
+            "SELECT must fall through to normal routing"
+        );
+
+        // BEGIN opens the transaction; ROLLBACK closes it.
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::BeginTransaction, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(txn.is_open());
+        assert!(matches!(
+            route_transactional(&state, &ctx, &Statement::Rollback, &mut txn).await,
+            Some(Ok(_))
+        ));
+        assert!(!txn.is_open());
+
+        // COMMIT in standalone mode (no Accord committer) must fail loud.
+        txn.begin().unwrap();
+        let committed = route_transactional(&state, &ctx, &Statement::Commit, &mut txn).await;
+        assert!(
+            matches!(committed, Some(Err(_))),
+            "COMMIT without a cluster committer must fail loud, not fake success"
+        );
+    }
+
+    #[tokio::test]
     async fn create_keyspace_then_table_then_insert_then_select() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -11550,6 +12081,65 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// The CDC change-event encoder must produce the *same* RESULT frame as the
+    /// proven SELECT read path for the same stored row — encoding-equivalence,
+    /// which guards against the CDC path mis-mapping columns/types/values.
+    #[tokio::test]
+    async fn cdc_event_frame_matches_select_for_same_row() {
+        use futures::StreamExt;
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.users (id int PRIMARY KEY, name text)",
+            "INSERT INTO ks.users (id, name) VALUES (1, 'alice')",
+        ] {
+            let stmt = crate::parser::parse(ddl).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        // Expected: how the SELECT read path encodes this row.
+        let select = match crate::parser::parse("SELECT * FROM ks.users").unwrap() {
+            Statement::Select(s) => s,
+            _ => panic!("expected SELECT"),
+        };
+        let raw = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(raw.rows.len(), 1, "exactly one row was inserted");
+        let expected = crate::result::encode_rows(
+            &raw.column_names,
+            &raw.column_types,
+            "ks",
+            "users",
+            &raw.rows,
+        );
+
+        // Actual: encode the stored partition's rows as a CDC change event.
+        let table_id = TableId::new("ks", "users");
+        let mut stream = state.engine.range_iter(&table_id, None, None);
+        let partition = stream
+            .next()
+            .await
+            .expect("one partition present")
+            .expect("partition read ok");
+        let frame =
+            cdc_event_to_result_frame(&state.schema, "ks", &select, partition.key, partition.rows)
+                .unwrap()
+                .expect("table exists");
+
+        assert_eq!(
+            frame, expected,
+            "CDC event frame must byte-match the SELECT-path frame for the same row"
+        );
     }
 
     /// Transient replication ('<full>/<transient>') must be rejected at the
@@ -11952,7 +12542,7 @@ mod tests {
         node_config.rpc_port = 19042;
         node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
         node_config.internal_rpc_port = 9042;
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
         state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
 
         let ctx = RequestContext {
@@ -11989,7 +12579,7 @@ mod tests {
         node_config.internal_rpc_port = 9042;
         node_config.listen_address = "10.89.1.48".parse().unwrap();
         node_config.broadcast_address = "10.89.1.48".parse().unwrap();
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
         state.topology_policy = ClientTopologyPolicy::from_csv("10.89.0.0/16").unwrap();
 
         let ctx = RequestContext {
@@ -12022,7 +12612,7 @@ mod tests {
         let mut node_config = (*state.node_config).clone();
         node_config.rpc_address = "127.0.0.1".parse().unwrap();
         node_config.rpc_port = 19042;
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
 
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -12048,7 +12638,7 @@ mod tests {
         }
     }
 
-    /// Regression test: cqlsh expects `tokens` column (set<varchar>) in
+    /// Regression test: cqlsh expects `tokens` column (set<text>) in
     /// system.local. Without it, cqlsh prints "'local' not found in
     /// keyspace 'system'" during startup introspection.
     #[tokio::test]
@@ -12252,7 +12842,7 @@ mod tests {
         node_config.internal_rpc_address = "10.89.1.48".parse().unwrap();
         node_config.listen_address = "10.89.1.48".parse().unwrap();
         node_config.broadcast_address = "10.89.1.48".parse().unwrap();
-        state.node_config = Arc::new(node_config);
+        state.set_node_config_for_test(Arc::new(node_config));
 
         let local_id = 1_u64;
         let peer_id = 2_u64;
@@ -17072,6 +17662,68 @@ mod tests {
         }
     }
 
+    /// TDD repro for the live memory FTS failure: every ferrosa-memory query is
+    /// `... WHERE <pk preds> AND <col> = fts_match('...') ... ALLOW FILTERING`.
+    /// The end-to-end test above uses fts_match with NO partition-key predicate;
+    /// this exercises the PK-predicate + fts_match combination (entity_store
+    /// shape: partition key + clustering key + fts on a regular column).
+    // KNOWN BUG (unfixed): with PK predicates present, fts_match is matched at
+    // PARTITION granularity and the post-filter skips re-applying it per-row
+    // (evaluate_where_predicates_skips_fts_match_clauses), so a matched
+    // partition leaks rows that don't contain the term. Reproduced here;
+    // ignored until the per-row fts re-evaluation / row-granular FTI lands.
+    #[ignore = "known bug: fts_match dropped to partition granularity when PK predicates present"]
+    #[tokio::test]
+    async fn fts_match_with_pk_predicates_returns_matches() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE fpk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fpk.docs (tenant int, sid int, id int, body text, PRIMARY KEY (tenant, sid, id))",
+            "CREATE INDEX docs_body_fts ON fpk.docs (body) USING 'fulltext'",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 1, 'rust distributed database')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (1, 1, 2, 'cassandra storage engine')",
+            "INSERT INTO fpk.docs (tenant, sid, id, body) VALUES (2, 9, 3, 'rust other tenant')",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fpk", "docs"))
+            .unwrap();
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM fpk.docs WHERE tenant = 1 AND sid = 1 AND body = fts_match('rust') ALLOW FILTERING",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "fts_match+pk query errored: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "only (tenant=1,sid=1,id=1) matches 'rust' AND the PK filter; got {count}"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     #[tokio::test]
     async fn fulltext_index_fts_match_reads_unflushed_memtable_row() {
         let (state, _dir) = setup();
@@ -18936,6 +19588,150 @@ mod tests {
         );
     }
 
+    // ── token() WHERE bounds on the standalone Direct read path ─────────
+
+    /// Regression test: on the Direct/standalone read path,
+    /// `evaluate_where_predicates` must apply `token(pk)` lower/upper bounds
+    /// by computing each candidate row's partition token and comparing it
+    /// against the bound tokens. Before the fix it skipped `token_fn` clauses
+    /// entirely, so `SELECT ... WHERE token(pk) > A AND token(pk) <= B`
+    /// returned ALL rows instead of only those in the half-open range `(A, B]`.
+    #[tokio::test]
+    async fn evaluate_where_predicates_applies_token_bounds_on_direct_path() {
+        use crate::ast::{ComparisonOp, Term, WhereClause};
+        use ferrosa_common::cql_type::CqlValue;
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE tok_ks WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let stmt =
+            crate::parser::parse("CREATE TABLE tok_ks.parts (id text PRIMARY KEY, v int)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let snap = state.schema.snapshot();
+        let table_meta = snap
+            .tables
+            .get(&("tok_ks".to_string(), "parts".to_string()))
+            .unwrap();
+
+        let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
+        let all_col_types: Vec<CqlType> = all_col_names
+            .iter()
+            .map(|name| {
+                resolve_col_type(
+                    &table_meta.columns[name].column_type,
+                    "tok_ks",
+                    &state.schema,
+                )
+                .unwrap()
+            })
+            .collect();
+        let id_idx = all_col_names.iter().position(|n| n == "id").unwrap();
+
+        // Candidate partition keys. Compute each one's Murmur3 token with the
+        // SAME helper the fix uses, so the expected set is derived, not magic.
+        let keys = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let mut tokens: Vec<(String, i64)> = keys
+            .iter()
+            .map(|k| {
+                let dk = bridge::build_decorated_key(
+                    &[CqlValue::Text((*k).to_string())],
+                    &[CqlType::Varchar],
+                )
+                .unwrap();
+                ((*k).to_string(), dk.token.0)
+            })
+            .collect();
+        tokens.sort_by_key(|(_, t)| *t);
+
+        // Choose bounds so a strict subset lies in (A, B]: drop the lowest
+        // token (excluded by `>`) and keep the rest up to the 2nd-highest.
+        let lower_key = tokens[0].0.clone();
+        let upper_key = tokens[tokens.len() - 2].0.clone();
+        let lower_token = tokens[0].1;
+        let upper_token = tokens[tokens.len() - 2].1;
+
+        let lower_clause = WhereClause {
+            column: "id".to_string(),
+            op: ComparisonOp::Gt,
+            value: Term::FunctionCall {
+                keyspace: None,
+                name: "token".to_string(),
+                args: vec![Term::StringLiteral(lower_key)],
+            },
+            token_fn: true,
+        };
+        let upper_clause = WhereClause {
+            column: "id".to_string(),
+            op: ComparisonOp::Le,
+            value: Term::FunctionCall {
+                keyspace: None,
+                name: "token".to_string(),
+                args: vec![Term::StringLiteral(upper_key)],
+            },
+            token_fn: true,
+        };
+
+        let mut kept = 0usize;
+        for (key, tok) in &tokens {
+            let row: Vec<Option<CqlValue>> = all_col_names
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    if i == id_idx {
+                        Some(CqlValue::Text(key.clone()))
+                    } else {
+                        Some(CqlValue::Int(0))
+                    }
+                })
+                .collect();
+
+            let in_range = *tok > lower_token && *tok <= upper_token;
+            let result = evaluate_where_predicates(
+                &row,
+                &[lower_clause.clone(), upper_clause.clone()],
+                &all_col_names,
+                &all_col_types,
+                table_meta,
+                "tok_ks",
+                &state,
+            )
+            .unwrap();
+            assert_eq!(
+                result, in_range,
+                "row key={key} token={tok} expected in_range={in_range} \
+                 for bounds ({lower_token}, {upper_token}]; token() WHERE \
+                 bounds must be applied on the Direct path"
+            );
+            if in_range {
+                kept += 1;
+            }
+        }
+
+        // Sanity: the bounds must actually exclude at least the lowest row,
+        // otherwise the test would pass even if token bounds were ignored.
+        assert!(
+            kept < tokens.len(),
+            "test bounds must exclude at least one row; got kept={kept} of {}",
+            tokens.len()
+        );
+        assert!(kept > 0, "test bounds must keep at least one row");
+    }
+
     // ── ferrosa_bugs: COUNT(*) column name ──────────────────────────────
 
     /// COUNT(*) result column must be named "count" so drivers can access
@@ -19097,6 +19893,82 @@ mod tests {
             "COUNT(*) over key-filtered broad scans must match the equivalent streamed key-column scan"
         );
         assert_eq!(count_value, 7);
+    }
+
+    /// Regression for the COUNT(*) undercount bug (forge t_8c4e44e8): a bare
+    /// `SELECT COUNT(*)` over N distinct single-row partitions returned a
+    /// nondeterministic undercount (observed 12/15/23 for N=50) even though a
+    /// full `SELECT id` scan saw all N. The undercount only manifests when the
+    /// rows are spread across MANY token-overlapping SSTables plus the active
+    /// memtable — exactly the LSM state a fresh load produces once the active
+    /// memtable crosses `flush_threshold_bytes` several times. The earlier
+    /// store-level regression only ever produced a single SSTable, so it never
+    /// exercised the multi-run metadata merge that drops partitions.
+    ///
+    /// COUNT(*) goes through the ADR-020 metadata fast path
+    /// (`WritePath::count_range`); the full scan streams partitions. Both must
+    /// equal N regardless of how many SSTable runs the partitions land in.
+    #[tokio::test]
+    async fn count_star_counts_every_partition_across_many_sstable_runs() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+
+        let stmt = crate::parser::parse(
+            "CREATE KEYSPACE cnt_runs WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+        )
+        .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+        let stmt =
+            crate::parser::parse("CREATE TABLE cnt_runs.t (id int PRIMARY KEY, v text)").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        const N: i32 = 50;
+        let table_id = ferrosa_storage::TableId::new("cnt_runs", "t");
+        // Insert N distinct partitions, flushing every 10 rows so the rows end
+        // up spread across several SSTables (each holding a token-interleaved
+        // subset of the murmur3-hashed keys) plus the trailing active memtable.
+        for i in 0..N {
+            let stmt = crate::parser::parse(&format!(
+                "INSERT INTO cnt_runs.t (id, v) VALUES ({i}, 'v{i}')"
+            ))
+            .unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+            if i % 10 == 9 {
+                state.engine.flush(&table_id).unwrap();
+            }
+        }
+
+        // Bare COUNT(*) — ADR-020 metadata fast path.
+        let count_stmt = crate::parser::parse("SELECT COUNT(*) FROM cnt_runs.t").unwrap();
+        let count_value = match &route(&state, &ctx, count_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_first_bigint_value(b),
+            _ => panic!("expected count result"),
+        };
+
+        // Full scan — must see every partition.
+        let scan_stmt = crate::parser::parse("SELECT id FROM cnt_runs.t").unwrap();
+        let scanned_rows = match &route(&state, &ctx, scan_stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(b),
+            _ => panic!("expected scan result"),
+        };
+
+        assert_eq!(
+            scanned_rows, N,
+            "full SELECT must see every partition (got {scanned_rows})"
+        );
+        assert_eq!(
+            count_value, N as i64,
+            "COUNT(*) must equal the {N} inserted partitions across all SSTable \
+             runs + memtable, got {count_value}"
+        );
     }
 
     // ── ferrosa_bugs: phonetic match ────────────────────────────────────
@@ -20068,6 +20940,49 @@ mod tests {
             result.is_ok(),
             "GRANT SELECT ON TABLE should succeed: {:?}",
             result.err()
+        );
+    }
+
+    /// t_fb280b30: in standalone (Direct) mode a GRANT must be written to
+    /// `system_auth.role_permissions` so it survives a restart — the startup
+    /// replay (`SystemTableLoader::replay_role_permissions_into_schema`) reads
+    /// that table. Previously Direct mode only updated in-memory state, so grants
+    /// silently vanished on restart.
+    #[tokio::test]
+    async fn grant_persists_to_storage_to_survive_restart() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+        };
+        for cql in [
+            "CREATE KEYSPACE pgks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE pgks.t (k int PRIMARY KEY, v text)",
+            "CREATE ROLE pg_user WITH PASSWORD = 'pass' AND LOGIN = true",
+            "GRANT SELECT ON pgks.t TO pg_user",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        // Simulate a restart: flush the auth table, then read grants straight
+        // from storage via the same loader startup uses.
+        let _ = state.engine.flush(&ferrosa_storage::TableId::new(
+            "system_auth",
+            "role_permissions",
+        ));
+        let loader =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone());
+        let grants = loader.load_role_permissions().unwrap();
+        assert!(
+            grants.iter().any(|g| g.role == "pg_user"),
+            "GRANT must persist to system_auth.role_permissions to survive restart; got {grants:?}"
         );
     }
 

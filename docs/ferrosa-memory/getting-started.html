@@ -58,16 +58,28 @@
   </style>
 </head>
 <body>
-<nav><div class="inner"><a href="./"><img src="assets/brand/fm-logo.svg" alt="Fm" width="24" height="24" style="border-radius:6px;vertical-align:middle;margin-right:.4rem;"><strong>Ferrosa <span style="color:var(--accent)">Memory</span></strong></a><div class="links" id="site-nav-links"><a href="./">Overview</a><a href="how-it-works.html">How it works</a><a href="tools.html">Tools</a><a href="compare.html">Compare</a><a href="getting-started.html">Setup</a><a href="../database/">Database</a><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></div><a href="#quickstart" class="nav-cta">Get Started</a><button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button></div></nav>
+<nav><div class="inner"><a href="./"><img src="assets/brand/fm-logo.svg" alt="Fm" width="24" height="24" style="border-radius:6px;vertical-align:middle;margin-right:.4rem;"><strong>Ferrosa <span style="color:var(--accent)">Memory</span></strong></a><div class="links" id="site-nav-links"><a href="./">Overview</a><a href="how-it-works.html">How it works</a><a href="tools.html">Tools</a><a href="compare.html">Compare</a><a href="getting-started.html">Setup</a><a href="how-to-use.html">How to use</a><a href="../database/">Database</a><a href="https://github.com/ferrosadb" target="_blank" rel="noopener noreferrer">GitHub</a></div><a href="#quickstart" class="nav-cta">Get Started</a><button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="site-nav-links"><span></span></button></div></nav>
 <main>
   <section class="hero">
     <span class="pill">Developer preview</span>
-    <h1>Run and use Ferrosa Memory locally.</h1>
-    <p>Ferrosa Memory is an MCP-compatible memory layer for agents. It stores entities, temporal facts, graph edges, raw context segments, retrieval traces, and derived facts on top of Ferrosa Database.</p>
+    <h1>Let's get Ferrosa Memory running.</h1>
+    <p>Ferrosa Memory is a persistent memory layer for your AI agents. You give it your code and docs once, and your agent can <em>recall</em> exactly what it needs later — instead of re-reading files and re-discovering context every session. In a few minutes you'll have it running locally and connected to your agent.</p>
   </section>
 
-  <h2 id="quickstart">Fast setup</h2>
-  <p>Most users should start with the hosted setup scripts instead of cloning repositories manually.</p>
+  <h2 id="steps">Three steps to memory</h2>
+  <p>That's the whole journey. The dense reference for every option is below — but most people only need these three:</p>
+  <div class="grid">
+    <div class="card"><strong>1 · Install &amp; start</strong><p>Run one setup script. You'll have Ferrosa Database and the Ferrosa Memory MCP server up locally.</p></div>
+    <div class="card"><strong>2 · Connect your agent</strong><p>Point your MCP client at the local memory server. Your agent gains memory tools instantly.</p></div>
+    <div class="card"><strong>3 · Ingest &amp; retrieve</strong><p>Feed in knowledge, then ask for it back. The agent fetches the relevant pieces semantically.</p></div>
+  </div>
+
+  <div class="warn">
+    <strong>Why it's worth a few minutes:</strong> ingest your whole codebase and docs once, and your agent <em>retrieves</em> the relevant pieces semantically instead of grepping, listing files, and re-reading whole files every session. That means fewer tokens and less latency — no re-grepping, no re-reading a large file just to find one function, no re-deriving context the agent already had. Memoization skips redundant LLM sub-calls, and session-restore lets the agent start <em>with</em> context instead of rebuilding it from scratch. It's still a developer preview, so run it locally and kick the tires.
+  </div>
+
+  <h2 id="quickstart">Step 1 · Fast setup</h2>
+  <p>Good news: you don't need to clone anything by hand. The hosted setup scripts do the heavy lifting for you.</p>
   <pre><code># Ferrosa Database only
 curl -fsSL https://ferrosadb.com/install.sh | bash
 
@@ -173,9 +185,12 @@ curl -fsS http://127.0.0.1:18766/viz | head -c 64 && echo</code></pre>
 
   <p>Expected output includes <code>ok</code>, <code>ready</code>, and an HTML doctype from the viz UI.</p>
 
-  <h2>Connect an MCP client</h2>
-  <p>Configure an MCP HTTP server pointing at:</p>
+  <h2 id="connect">Step 2 · Connect an MCP client</h2>
+  <p>Now hand your agent the keys. Configure an MCP HTTP server pointing at:</p>
   <pre><code>http://127.0.0.1:18765/mcp</code></pre>
+  <div class="warn">
+    <strong>Your agent won't be overwhelmed.</strong> The server progressively discloses its ~80 tools across two tiers — a small, focused default set shows up first, and the fuller toolbox is revealed only as it's needed. That keeps your agent's tool context small: fewer tool schemas loaded means fewer tokens spent and less chance of the agent reaching for the wrong tool.
+  </div>
   <p>Generic MCP server shape:</p>
   <pre><code>{
   "name": "ferrosa-memory",
@@ -198,7 +213,8 @@ curl -sS -u ferrosa_user:ferrosa_user \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_stats","arguments":{}}}' \
   http://127.0.0.1:18765/mcp</code></pre>
 
-  <h2 id="examples">Memory examples</h2>
+  <h2 id="examples">Step 3 · Ingest and retrieve</h2>
+  <p>This is the payoff. Store a piece of knowledge once, then ask for it back in plain language — your agent gets the relevant memory without re-reading anything. Try these from your agent or the smoke-test tools above.</p>
   <h3>Ingest a memory entity</h3>
   <pre><code>{
   "tool": "smart_ingest",
@@ -280,15 +296,17 @@ docker compose start
   <pre><code>cd ~/src/ferrosa-suite/ferrosa-memory
 docker compose logs --tail=100 node1 node2 node3 ferrosa-memory-mcp</code></pre>
 
-  <h2>Next steps</h2>
+  <h2>You're up — what next?</h2>
+  <p>Nice work. Once memory is running and connected, here's where to go from here:</p>
   <ul>
-    <li>Add Ferrosa Memory as an MCP server to your agent harness.</li>
-    <li>Run the ingest, retrieval, temporal fact, and context segment examples.</li>
+    <li>Add Ferrosa Memory as an MCP server to your agent harness, if you haven't already.</li>
+    <li>Run the ingest, retrieval, temporal fact, and context segment examples to feel the workflow.</li>
     <li>Use the workbench and viz UI to inspect stored memories and graph links.</li>
+    <li>Read <a href="how-to-use.html">How to use</a> for day-to-day patterns once you're set up.</li>
     <li>Run long-horizon evaluation scenarios before making broad reasoning claims.</li>
   </ul>
 </main>
-<footer>Ferrosa Suite · Developer preview · <a href="./">Memory overview</a></footer>
+<footer>Ferrosa Suite · Developer preview · <a href="./">Memory overview</a> · <a href="how-to-use.html">How to use</a></footer>
 
 <script>
   document.querySelectorAll('nav').forEach((nav) => {

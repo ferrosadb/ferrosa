@@ -161,8 +161,10 @@ impl Schema {
             None => ("cassandra".to_string(), true),
         };
 
-        // Hash the password
+        // Hash the password and derive the SCRAM verifier (D4) from the same
+        // cleartext so the bootstrap superuser can authenticate over Postgres.
         let salted_hash = config.hasher.hash_password(&password)?;
+        let scram = crate::auth::scram::derive_with_random_salt(&password);
 
         // Create the cassandra superuser role
         let role = RoleMetadata {
@@ -171,6 +173,7 @@ impl Schema {
             can_login: true,
             salted_hash: Some(salted_hash),
             member_of: HashSet::new(),
+            scram: Some(scram),
         };
         snapshot.roles.insert("cassandra".to_string(), role);
 
@@ -250,6 +253,19 @@ impl Schema {
     /// Return a lock-free snapshot of the current schema state.
     pub fn snapshot(&self) -> Arc<SchemaSnapshot> {
         self.inner.load_full()
+    }
+
+    /// Look up the stored SCRAM-SHA-256 verifier for a role (D4).
+    ///
+    /// Returns a clone from the current snapshot, or `None` if the role does
+    /// not exist or has no verifier (e.g. a `HASHED PASSWORD` role that has not
+    /// had a plaintext password reset). Used by the Postgres front-end's
+    /// `VerifierStore` adapter to authenticate real roles.
+    pub fn scram_credential(&self, role: &str) -> Option<crate::auth::ScramCredential> {
+        self.snapshot()
+            .roles
+            .get(role)
+            .and_then(|r| r.scram.clone())
     }
 
     /// Returns a reference to the configured `PasswordHasher`.
@@ -1201,11 +1217,17 @@ impl Schema {
         auth: &AuthContext,
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Create, &Resource::AllRoles)?;
-        let salted_hash = if let Some(pw) = password {
+        // On the plaintext path, derive both the bcrypt/Argon2 hash (CQL login)
+        // and the SCRAM verifier (Postgres login, D4). A bcrypt hash cannot
+        // produce a SCRAM verifier, so it must be derived from the cleartext.
+        let (salted_hash, scram) = if let Some(pw) = password {
             self.password_policy.validate(pw, &role.name)?;
-            Some(self.hasher_config.hash_password(pw)?)
+            (
+                Some(self.hasher_config.hash_password(pw)?),
+                Some(crate::auth::scram::derive_with_random_salt(pw)),
+            )
         } else {
-            None
+            (None, None)
         };
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
@@ -1221,6 +1243,7 @@ impl Schema {
         let is_su = role.is_superuser;
         let mut role = role;
         role.salted_hash = salted_hash;
+        role.scram = scram;
         snap.roles.insert(role.name.clone(), role);
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
@@ -1246,6 +1269,12 @@ impl Schema {
     /// it is NOT re-hashed and the password-strength policy is NOT applied
     /// (there is no plaintext to evaluate). The supplied hash never appears in
     /// the audit payload.
+    ///
+    /// No SCRAM verifier is derived: a bcrypt/Argon2 hash cannot produce one,
+    /// so `scram` is left `None`. **Postgres SCRAM login is therefore
+    /// unavailable for `HASHED PASSWORD` roles until a plaintext password reset
+    /// (`ALTER ROLE ... WITH PASSWORD '...'`) populates the verifier** — a known
+    /// D4 gap.
     pub fn create_role_hashed(
         &self,
         role: RoleMetadata,
@@ -1268,6 +1297,8 @@ impl Schema {
         let is_su = role.is_superuser;
         let mut role = role;
         role.salted_hash = Some(hashed_password.to_string());
+        // HASHED PASSWORD path: no cleartext, so no SCRAM verifier (D4 gap).
+        role.scram = None;
         snap.roles.insert(role.name.clone(), role);
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
@@ -1297,16 +1328,24 @@ impl Schema {
         // Validate and hash password outside the write lock (expensive)
         // PASSWORD is hashed under policy; HASHED PASSWORD is stored verbatim
         // after format validation. They are mutually exclusive.
-        let new_hash = match (&updates.password, &updates.hashed_password) {
+        // `new_hash` is the new bcrypt/Argon2 hash (or verbatim HASHED value);
+        // `new_scram` carries the SCRAM verifier change for the plaintext path:
+        //   - plaintext PASSWORD  -> Some(Some(verifier)) (derive + store)
+        //   - HASHED PASSWORD     -> Some(None) (clear stale verifier; D4 gap)
+        //   - no password change  -> None (leave existing verifier untouched)
+        let (new_hash, new_scram) = match (&updates.password, &updates.hashed_password) {
             (Some(pw), None) => {
                 self.password_policy.validate(pw, name)?;
-                Some(self.hasher_config.hash_password(pw)?)
+                (
+                    Some(self.hasher_config.hash_password(pw)?),
+                    Some(Some(crate::auth::scram::derive_with_random_salt(pw))),
+                )
             }
             (None, Some(h)) => {
                 PasswordHasher::validate_password_hash(h)?;
-                Some(h.clone())
+                (Some(h.clone()), Some(None))
             }
-            (None, None) => None,
+            (None, None) => (None, None),
             (Some(_), Some(_)) => {
                 return Err(SchemaError::InvalidSchema(
                     "cannot specify both PASSWORD and HASHED PASSWORD".to_string(),
@@ -1339,6 +1378,9 @@ impl Schema {
         let password_changed = new_hash.is_some();
         if let Some(hash) = new_hash {
             role.salted_hash = Some(hash);
+        }
+        if let Some(scram) = new_scram {
+            role.scram = scram;
         }
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
@@ -2544,6 +2586,7 @@ mod tests {
                     can_login: true,
                     salted_hash: None,
                     member_of: HashSet::new(),
+                    scram: None,
                 },
                 Some("password123!A"),
                 &auth,
@@ -2584,6 +2627,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         }
     }
 
@@ -3315,6 +3359,7 @@ mod tests {
             can_login: true,
             salted_hash: Some("$hashed$".to_string()),
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role.clone()).unwrap();
         schema.create_role_internal(role).unwrap(); // idempotent
@@ -3338,6 +3383,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role).unwrap();
 
@@ -3392,6 +3438,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role).unwrap();
         schema
@@ -3419,6 +3466,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role).unwrap();
 
@@ -3454,6 +3502,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role).unwrap();
         schema
@@ -3487,6 +3536,7 @@ mod tests {
             can_login: true,
             salted_hash: None,
             member_of: HashSet::new(),
+            scram: None,
         };
         schema.create_role_internal(role).unwrap();
         schema

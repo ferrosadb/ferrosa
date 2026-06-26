@@ -17,6 +17,20 @@ use crate::history::{History, HistoryRecorder};
 #[async_trait]
 pub trait CqlSession: Send + Sync {
     async fn execute(&self, query: &str) -> Result<Vec<Vec<(String, String)>>>;
+
+    /// Execute `statements` as one **connection-affine** unit — used for a
+    /// `BEGIN TRANSACTION; …; COMMIT` block, whose buffer lives on a single
+    /// server connection. The default runs them sequentially via [`execute`],
+    /// which is correct for a single-connection session (see `ScyllaCqlSession`,
+    /// pinned to one node so the whole block shares one TCP connection).
+    ///
+    /// [`execute`]: CqlSession::execute
+    async fn transaction(&self, statements: &[String]) -> Result<()> {
+        for stmt in statements {
+            self.execute(stmt).await?;
+        }
+        Ok(())
+    }
 }
 
 /// A workload that generates operations and checks invariants.
