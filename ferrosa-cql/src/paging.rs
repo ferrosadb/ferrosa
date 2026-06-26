@@ -10,7 +10,61 @@
 //! length-prefixed binary format. This is an opaque token from the client's
 //! perspective.
 
+use std::sync::OnceLock;
+
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use sha2::Sha256;
+
 use crate::error::CqlError;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Length of the HMAC-SHA256 tag appended to every paging token.
+const PAGING_HMAC_LEN: usize = 32;
+
+/// Process-wide key used to sign paging tokens (FMEA CQL-2). Without a signature
+/// a client can forge a cursor to resume at an arbitrary partition key — an
+/// IDOR-class cross-partition read. Sourced from `FERROSA_PAGING_HMAC_KEY` (64
+/// hex chars) when set; otherwise a random per-process key is generated.
+///
+/// NOTE: in a multi-node cluster set `FERROSA_PAGING_HMAC_KEY` identically on
+/// every node — a token issued by one coordinator is otherwise rejected by
+/// another (paging would break across coordinators). Single-node is unaffected.
+fn paging_hmac_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Ok(hex) = std::env::var("FERROSA_PAGING_HMAC_KEY") {
+            match decode_hex_32(hex.trim()) {
+                Some(k) => return k,
+                None => tracing::warn!(
+                    "FERROSA_PAGING_HMAC_KEY is set but is not 64 hex chars; \
+                     using a random per-process paging signing key instead"
+                ),
+            }
+        }
+        let mut k = [0u8; 32];
+        rand::rng().fill_bytes(&mut k);
+        tracing::warn!(
+            "FERROSA_PAGING_HMAC_KEY unset — generated a random per-process paging \
+             signing key. Multi-node clusters MUST set a shared key or cross-coordinator \
+             paging will reject cursors."
+        );
+        k
+    })
+}
+
+/// Parse exactly 64 hex chars into a 32-byte key, or `None` if malformed.
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
 
 /// Opaque cursor encoding the position to resume from.
 ///
@@ -30,59 +84,81 @@ impl PagingState {
     /// Serialize to opaque bytes for inclusion in RESULT frames.
     ///
     /// Format: `[u32 pk_len][pk_bytes][u32 ck_len][ck_bytes][u8 remaining_flag]`
+    /// followed by an `HMAC-SHA256` tag over that payload, so a forged or
+    /// tampered cursor is rejected at [`decode`](Self::decode) (FMEA CQL-2).
     pub fn encode(&self) -> Vec<u8> {
-        let total_len = 4 + self.partition_key.len() + 4 + self.clustering_key.len() + 1;
-        let mut buf = Vec::with_capacity(total_len);
+        let payload_len = 4 + self.partition_key.len() + 4 + self.clustering_key.len() + 1;
+        let mut buf = Vec::with_capacity(payload_len + PAGING_HMAC_LEN);
         buf.extend_from_slice(&(self.partition_key.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.partition_key);
         buf.extend_from_slice(&(self.clustering_key.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.clustering_key);
         buf.push(if self.remaining_in_partition { 1 } else { 0 });
+
+        let mut mac =
+            HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
+        mac.update(&buf);
+        buf.extend_from_slice(&mac.finalize().into_bytes());
         buf
     }
 
     /// Deserialize from opaque bytes received in QUERY/EXECUTE frames.
+    ///
+    /// The HMAC signature is verified (constant-time) BEFORE any contents are
+    /// parsed or trusted — a client-forged cursor cannot redirect the read to
+    /// another partition/tenant.
     pub fn decode(bytes: &[u8]) -> Result<Self, CqlError> {
-        if bytes.len() < 9 {
+        if bytes.len() < PAGING_HMAC_LEN {
+            return Err(CqlError::Protocol("paging_state too short".into()));
+        }
+        let (payload, tag) = bytes.split_at(bytes.len() - PAGING_HMAC_LEN);
+        let mut mac =
+            HmacSha256::new_from_slice(paging_hmac_key()).expect("HMAC accepts a 32-byte key");
+        mac.update(payload);
+        mac.verify_slice(tag)
+            .map_err(|_| CqlError::Protocol("paging_state: invalid or forged signature".into()))?;
+
+        // Signature verified — the payload is authentic; parse it.
+        if payload.len() < 9 {
             return Err(CqlError::Protocol("paging_state too short".into()));
         }
 
         let mut pos = 0;
 
         // Partition key
-        let pk_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let pk_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        if pos + pk_len > bytes.len() {
+        if pos + pk_len > payload.len() {
             return Err(CqlError::Protocol(
                 "paging_state: partition key truncated".into(),
             ));
         }
-        let partition_key = bytes[pos..pos + pk_len].to_vec();
+        let partition_key = payload[pos..pos + pk_len].to_vec();
         pos += pk_len;
 
         // Clustering key
-        if pos + 4 > bytes.len() {
+        if pos + 4 > payload.len() {
             return Err(CqlError::Protocol(
                 "paging_state: clustering key length truncated".into(),
             ));
         }
-        let ck_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let ck_len = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        if pos + ck_len > bytes.len() {
+        if pos + ck_len > payload.len() {
             return Err(CqlError::Protocol(
                 "paging_state: clustering key truncated".into(),
             ));
         }
-        let clustering_key = bytes[pos..pos + ck_len].to_vec();
+        let clustering_key = payload[pos..pos + ck_len].to_vec();
         pos += ck_len;
 
         // Remaining flag
-        if pos >= bytes.len() {
+        if pos >= payload.len() {
             return Err(CqlError::Protocol(
                 "paging_state: missing remaining_in_partition flag".into(),
             ));
         }
-        let remaining_in_partition = bytes[pos] != 0;
+        let remaining_in_partition = payload[pos] != 0;
 
         Ok(Self {
             partition_key,
@@ -233,6 +309,39 @@ mod tests {
     fn paging_state_decode_too_short() {
         let result = PagingState::decode(&[0, 1, 2]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tampered_paging_state_is_rejected() {
+        // FMEA CQL-2: an attacker edits a signed cursor to resume at a different
+        // partition key. The HMAC must reject it (IDOR prevention).
+        let state = PagingState {
+            partition_key: vec![1, 2, 3, 4],
+            clustering_key: vec![5, 6],
+            remaining_in_partition: true,
+        };
+        let mut encoded = state.encode();
+        encoded[5] ^= 0xff; // flip a payload byte (forge a different pk)
+        assert!(
+            PagingState::decode(&encoded).is_err(),
+            "a tampered paging cursor must be rejected"
+        );
+    }
+
+    #[test]
+    fn unsigned_forged_paging_state_is_rejected() {
+        // A hand-built cursor with a bogus signature — what a client could forge
+        // to read an arbitrary partition — must not be accepted.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&8u32.to_be_bytes());
+        buf.extend_from_slice(&999u64.to_be_bytes()); // forged offset / pk
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&[0u8; PAGING_HMAC_LEN]); // invalid tag
+        assert!(
+            PagingState::decode(&buf).is_err(),
+            "an unsigned/forged paging cursor must be rejected"
+        );
     }
 
     #[test]
