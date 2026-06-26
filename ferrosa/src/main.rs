@@ -730,6 +730,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // else reads `FERROSA_DATA_DIR`.)
     std::env::set_var("FERROSA_DATA_DIR", &data_dir);
 
+    // Durable local `file://` object-store backend (single-node durability
+    // without S3). Resolve from `FERROSA_LOCAL_STORE_PATH` env or `[s3].local_path`
+    // TOML, expand a leading `~`, and pin it back into the env so the engine's
+    // `ObjectStoreConfig::from_env()` selects the local backend. When set, the
+    // `FERROSA_S3_*` settings are ignored. Absent → existing S3/no-store
+    // behavior is unchanged.
+    if let Some(local_store_path) =
+        config_val_opt("FERROSA_LOCAL_STORE_PATH", &file_config, "s3", "local_path")
+            .map(expand_tilde)
+            .filter(|p| !p.trim().is_empty())
+    {
+        tracing::info!(
+            path = %local_store_path,
+            "using durable local file:// object-store backend (S3 settings ignored; \
+             disk is the durable store, SSTable eviction disabled)"
+        );
+        std::env::set_var("FERROSA_LOCAL_STORE_PATH", &local_store_path);
+    }
+
     // 3. Create StorageEngine — use open() on restart to replay commit log
     let mut storage_config = ferrosa_storage::StorageEngineConfig::from_env()?;
     // Allow TOML to override the memtable shard count. `from_env`

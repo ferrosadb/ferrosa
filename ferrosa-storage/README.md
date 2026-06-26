@@ -39,8 +39,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. **Wired into the flush path.**
+- **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
+  the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
+  Set `FERROSA_LOCAL_STORE_PATH` (or `[s3].local_path` in `ferrosa.toml`) to use
+  a durable **local `file://` backend** (`object_store::LocalFileSystem`) for
+  single-node durability without S3 — the previous "no object store" mode lost
+  flushed SSTables silently. The local backend does **not** support conditional
+  PUT (CAS); the startup probe (`probe_conditional_put_support`) detects this and
+  manifest saves fall back to unconditional PUT. Last-writer-wins is correct
+  because a single node is the only manifest writer.
 - **Local cache** (`cache.rs`) — LRU eviction with manifest-pinned entries that
-  are never evicted.
+  are never evicted. With the local `file://` backend the cache is constructed
+  durable (`new_with_durability`): the local disk *is* the store of record, so
+  `evict_if_needed` is a no-op — evicting a flushed SSTable would drop its only
+  durable copy.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —

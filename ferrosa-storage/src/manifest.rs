@@ -438,6 +438,34 @@ mod tests {
         });
     }
 
+    /// Local `file://` backend: CAS is unsupported, so the engine must fall
+    /// back to the no-CAS manifest path. Single-node = exactly one writer, so
+    /// last-writer-wins is correct. Proves the no-CAS save/load round-trips on
+    /// a real `LocalFileSystem`.
+    #[tokio::test]
+    async fn local_store_cas_probe_is_false_and_manifest_saves_without_cas() {
+        use object_store::local::LocalFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+
+        assert!(
+            !probe_conditional_put_support(&store).await,
+            "LocalFileSystem must not advertise conditional-PUT (CAS) support"
+        );
+
+        let mut manifest = Manifest::new();
+        manifest.add_sstable("ks.table", sample_entry("sst-local"));
+        manifest
+            .save_without_cas(&store, "test")
+            .await
+            .expect("no-CAS save must succeed on local backend");
+
+        let (loaded, _) = Manifest::load(&store, "test").await.unwrap();
+        assert_eq!(loaded.sstables["ks.table"].len(), 1);
+        assert_eq!(loaded.sstables["ks.table"][0].id, "sst-local");
+    }
+
     #[test]
     fn remove_sstables() {
         let mut manifest = Manifest::new();

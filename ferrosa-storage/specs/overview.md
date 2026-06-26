@@ -74,6 +74,12 @@ for the mermaid diagrams.
 
 1. **S3 is authoritative; local disk is a write-behind cache.** Cache eviction
    must never delete the only copy — manifest-pinned entries are never evicted.
+   **Exception — local `file://` backend** (`FERROSA_LOCAL_STORE_PATH` /
+   `[s3].local_path`): the local disk *is* the authoritative durable store, so
+   `ObjectStoreConfig::is_local()` is threaded into `LocalCache` as `durable` and
+   eviction is disabled entirely (`evict_if_needed` is a no-op). The local
+   backend has no conditional-PUT (CAS) support, so manifest saves use the
+   unconditional path; this is safe because a single node is the sole writer.
 2. **Reads are wait-free; flush never blocks reads/writes.** All view
    transitions go through `ArcSwap`; only flushes contend, on a per-table `Mutex`.
 3. **Cell-level last-write-wins everywhere.** Memtable merge-on-write, read-path

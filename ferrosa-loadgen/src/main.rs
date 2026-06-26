@@ -187,6 +187,7 @@ fn main() {
     std::fs::create_dir_all(&args.data_dir).expect("create data dir");
 
     let object_store = args.s3_endpoint.map(|endpoint| ObjectStoreConfig {
+        local_path: None,
         endpoint,
         bucket: args.s3_bucket,
         region: "us-east-1".into(),

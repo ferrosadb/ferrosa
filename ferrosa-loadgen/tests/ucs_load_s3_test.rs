@@ -27,6 +27,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         .unwrap_or_else(|_| "http://127.0.0.1:29000".into());
 
     let object_store = ObjectStoreConfig {
+        local_path: None,
         endpoint: s3_endpoint,
         bucket: "ferrosa-compaction-test".into(),
         region: "us-east-1".into(),
