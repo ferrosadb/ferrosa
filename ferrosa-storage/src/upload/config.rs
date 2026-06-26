@@ -1,14 +1,29 @@
 //! Object store configuration from environment variables.
 
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
-/// S3-compatible object store configuration.
+/// Object store configuration.
 ///
-/// All settings are read from `FERROSA_S3_*` environment variables,
-/// following 12-factor app principles.
+/// By default this describes an S3-compatible backend whose settings are read
+/// from `FERROSA_S3_*` environment variables, following 12-factor app
+/// principles. When [`local_path`](Self::local_path) is `Some`, the engine
+/// instead builds a durable local `file://` backend
+/// ([`object_store::local::LocalFileSystem`]) rooted at that path — intended
+/// for single-node deployments that want durable storage without S3. The S3
+/// fields are ignored in that mode.
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {
+    /// When set, use a local `file://` backend rooted at this directory instead
+    /// of S3. Single-node durability: flushed SSTables get a durable copy on
+    /// local disk and eviction is disabled (disk is the durable store).
+    ///
+    /// The local backend does **not** support conditional PUT (CAS); the
+    /// startup CAS probe detects this and manifest saves fall back to
+    /// unconditional PUT. This is safe because a single node is the only
+    /// manifest writer.
+    pub local_path: Option<std::path::PathBuf>,
     /// S3-compatible endpoint URL (e.g., `https://s3.amazonaws.com`).
     pub endpoint: String,
     /// Bucket name.
@@ -36,11 +51,49 @@ pub struct ObjectStoreConfig {
 }
 
 impl ObjectStoreConfig {
-    /// Reads configuration from `FERROSA_S3_*` environment variables.
+    /// Reads configuration from environment variables.
     ///
-    /// Required: `FERROSA_S3_ENDPOINT`, `FERROSA_S3_BUCKET`.
-    /// Optional with defaults: region, allow_http, prefix, queue_depth.
+    /// If `FERROSA_LOCAL_STORE_PATH` is set, returns a **local `file://`
+    /// backend** configuration rooted at that path; the `FERROSA_S3_*`
+    /// variables are ignored. Otherwise reads the S3 configuration, where
+    /// `FERROSA_S3_ENDPOINT` and `FERROSA_S3_BUCKET` are required and the rest
+    /// have defaults (region, allow_http, prefix, queue/worker counts).
     pub fn from_env() -> ferrosa_common::Result<Self> {
+        // Shared worker/queue tuning is honored in both backends.
+        let prefix = std::env::var("FERROSA_S3_PREFIX").unwrap_or_default();
+        let upload_queue_depth = Self::queue_depth_from_env();
+        let upload_workers = Self::workers_from_env("FERROSA_S3_UPLOAD_WORKERS", 8);
+        let compaction_upload_workers =
+            Self::workers_from_env("FERROSA_S3_COMPACTION_UPLOAD_WORKERS", 4);
+        let compaction_upload_queue_depth =
+            std::env::var("FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(upload_queue_depth);
+        let delete_workers = Self::workers_from_env("FERROSA_S3_DELETE_WORKERS", 2);
+
+        // Local file:// backend takes precedence when its path is set.
+        if let Ok(local_path) = std::env::var("FERROSA_LOCAL_STORE_PATH") {
+            if !local_path.trim().is_empty() {
+                return Ok(Self {
+                    local_path: Some(std::path::PathBuf::from(local_path)),
+                    endpoint: String::new(),
+                    bucket: String::new(),
+                    region: String::new(),
+                    access_key_id: None,
+                    secret_access_key: None,
+                    allow_http: false,
+                    prefix,
+                    upload_queue_depth,
+                    upload_workers,
+                    compaction_upload_workers,
+                    compaction_upload_queue_depth,
+                    delete_workers,
+                });
+            }
+        }
+
         let endpoint = std::env::var("FERROSA_S3_ENDPOINT").map_err(|_| {
             ferrosa_common::Error::InvalidFormat(
                 "FERROSA_S3_ENDPOINT environment variable is required".into(),
@@ -63,39 +116,8 @@ impl ObjectStoreConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(false);
 
-        let prefix = std::env::var("FERROSA_S3_PREFIX").unwrap_or_default();
-
-        let upload_queue_depth = std::env::var("FERROSA_S3_UPLOAD_QUEUE_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16);
-
-        let upload_workers = std::env::var("FERROSA_S3_UPLOAD_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(8);
-
-        let compaction_upload_workers = std::env::var("FERROSA_S3_COMPACTION_UPLOAD_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(4);
-
-        let compaction_upload_queue_depth =
-            std::env::var("FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|&v| v > 0)
-                .unwrap_or(upload_queue_depth);
-
-        let delete_workers = std::env::var("FERROSA_S3_DELETE_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(2);
-
         Ok(Self {
+            local_path: None,
             endpoint,
             bucket,
             region,
@@ -111,8 +133,48 @@ impl ObjectStoreConfig {
         })
     }
 
+    /// Whether this configuration targets the local `file://` backend.
+    pub fn is_local(&self) -> bool {
+        self.local_path.is_some()
+    }
+
+    fn queue_depth_from_env() -> usize {
+        std::env::var("FERROSA_S3_UPLOAD_QUEUE_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    }
+
+    fn workers_from_env(var: &str, default: usize) -> usize {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    }
+
     /// Builds an `ObjectStore` instance from this configuration.
+    ///
+    /// When [`local_path`](Self::local_path) is set, builds a durable local
+    /// `file://` backend rooted there (creating the directory if missing).
+    /// Otherwise builds the S3-compatible client.
     pub fn build_object_store(&self) -> ferrosa_common::Result<Box<dyn ObjectStore>> {
+        if let Some(ref path) = self.local_path {
+            std::fs::create_dir_all(path).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to create local object store dir {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let store = LocalFileSystem::new_with_prefix(path).map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to build local file:// object store at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            return Ok(Box::new(store));
+        }
+
         let mut builder = AmazonS3Builder::new()
             .with_endpoint(&self.endpoint)
             .with_bucket_name(&self.bucket)
@@ -138,6 +200,7 @@ impl ObjectStoreConfig {
     #[cfg(test)]
     pub fn test_config() -> Self {
         Self {
+            local_path: None,
             endpoint: "http://localhost:9000".into(),
             bucket: "test-bucket".into(),
             region: "us-east-1".into(),
@@ -204,5 +267,33 @@ mod tests {
         let store = object_store::memory::InMemory::new();
         let warnings = validate_s3_bucket(&store).await.unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_object_store_round_trips() {
+        use object_store::path::Path as ObjectPath;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("does-not-exist-yet");
+        let config = ObjectStoreConfig {
+            local_path: Some(store_root.clone()),
+            ..ObjectStoreConfig::test_config()
+        };
+        assert!(config.is_local());
+
+        // build_object_store creates the missing directory and returns a
+        // LocalFileSystem rooted there.
+        let store = config.build_object_store().unwrap();
+        assert!(store_root.is_dir(), "build must create the store dir");
+
+        let path = ObjectPath::from("sub/dir/blob.bin");
+        let payload = bytes::Bytes::from_static(b"durable-local-bytes");
+        store.put(&path, payload.clone().into()).await.unwrap();
+
+        let got = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(got, payload);
+
+        // The blob is a real file on disk under the store root.
+        assert!(store_root.join("sub/dir/blob.bin").is_file());
     }
 }
