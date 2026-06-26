@@ -1,0 +1,187 @@
+diff --git a/ferrosa-cql/src/connection.rs b/ferrosa-cql/src/connection.rs
+index 26dad63f..08044502 100644
+--- a/ferrosa-cql/src/connection.rs
++++ b/ferrosa-cql/src/connection.rs
+@@ -1456,2 +1456,12 @@ async fn handle_query(
+
++    if crate::router::count_probe::enabled() {
++        crate::router::count_probe::start_dumper();
++        crate::router::count_probe::QFRAMES
++            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        if matches!(&stmt, crate::ast::Statement::Select(s) if crate::router::is_count_only_select_pub(&s.columns)) {
++            crate::router::count_probe::QCOUNT
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++
+     // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
+@@ -1528,2 +1538,8 @@ pub(crate) async fn handle_prepare(
+
++    if crate::router::count_probe::enabled() {
++        crate::router::count_probe::start_dumper();
++        crate::router::count_probe::PFRAMES
++            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++
+     let id = PreparedCache::compute_id(query);
+@@ -1678,2 +1694,12 @@ async fn handle_execute(
+
++    if crate::router::count_probe::enabled() {
++        crate::router::count_probe::start_dumper();
++        crate::router::count_probe::EFRAMES
++            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        if matches!(&plan.statement, crate::ast::Statement::Select(s) if crate::router::is_count_only_select_pub(&s.columns)) {
++            crate::router::count_probe::ECOUNT
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
++    }
++
+     // Parse bound values from the EXECUTE frame. Common prepared INSERTs can
+diff --git a/ferrosa-cql/src/router.rs b/ferrosa-cql/src/router.rs
+index dc6caf74..a27ac56e 100644
+--- a/ferrosa-cql/src/router.rs
++++ b/ferrosa-cql/src/router.rs
+@@ -423,2 +423,6 @@ fn projection_storage_ordinals_for_select_scan(
+
++pub(crate) fn is_count_only_select_pub(columns: &[SelectColumn]) -> bool {
++    is_count_only_select(columns)
++}
++
+ fn is_count_only_select(columns: &[SelectColumn]) -> bool {
+@@ -620,2 +624,6 @@ async fn count_rows_from_partition_stream(
+     }
++    if count_probe::enabled() {
++        count_probe::STREAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        count_probe::min_parts(processed_partitions as u64);
++    }
+     Ok(count)
+@@ -1644,3 +1652,12 @@ pub async fn route(
+     let result = match stmt {
+-        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
++        Statement::Select(s) => {
++            if count_probe::enabled() {
++                count_probe::start_dumper();
++                count_probe::ALL_SELECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                if is_count_only_select(&s.columns) {
++                    count_probe::ALL_COUNT_SELECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                }
++            }
++            route_select(state, ctx, s).await.map(RouteResult::Result)
++        }
+         Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
+@@ -1895,2 +1912,67 @@ fn statement_query_label(stmt: &Statement, opcode: CqlOpcode) -> String {
+
++// ---- COUNT(*) durable probe counters (starvation-tolerant via an OS thread) ----
++pub(crate) mod count_probe {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    use std::sync::OnceLock;
++    pub static RS: AtomicU64 = AtomicU64::new(0); // route_select reached (count-only)
++    pub static RSUT: AtomicU64 = AtomicU64::new(0); // route_select_user_table reached
++    pub static FAST: AtomicU64 = AtomicU64::new(0); // ADR-020 fast path taken
++    pub static STREAM: AtomicU64 = AtomicU64::new(0); // streaming count branch taken
++    pub static STREAM_CALLS: AtomicU64 = AtomicU64::new(0); // count_rows_from_partition_stream calls
++    pub static STREAM_MIN_PARTS: AtomicU64 = AtomicU64::new(u64::MAX); // min partitions a stream yielded
++    pub static EARLY_OTHER: AtomicU64 = AtomicU64::new(0); // RSUT count-only that returned before fast-path check
++    pub static ALL_SELECT: AtomicU64 = AtomicU64::new(0); // every Statement::Select reaching route()
++    pub static ALL_COUNT_SELECT: AtomicU64 = AtomicU64::new(0); // count-only Selects reaching route()
++    // Frame-level (connection layer, before route): how the request arrived.
++    pub static QFRAMES: AtomicU64 = AtomicU64::new(0); // QUERY frames
++    pub static QCOUNT: AtomicU64 = AtomicU64::new(0); // QUERY frames that parse to count-only SELECT
++    pub static EFRAMES: AtomicU64 = AtomicU64::new(0); // EXECUTE frames (prepared)
++    pub static ECOUNT: AtomicU64 = AtomicU64::new(0); // EXECUTE frames whose plan is a count-only SELECT
++    pub static PFRAMES: AtomicU64 = AtomicU64::new(0); // PREPARE frames
++    pub static BFRAMES: AtomicU64 = AtomicU64::new(0); // BATCH frames
++
++    pub fn enabled() -> bool {
++        static EN: OnceLock<bool> = OnceLock::new();
++        *EN.get_or_init(|| std::env::var("FERROSA_COUNT_PROBE").is_ok())
++    }
++
++    pub fn min_parts(p: u64) {
++        let mut cur = STREAM_MIN_PARTS.load(Ordering::Relaxed);
++        while p < cur {
++            match STREAM_MIN_PARTS.compare_exchange_weak(cur, p, Ordering::Relaxed, Ordering::Relaxed) {
++                Ok(_) => break,
++                Err(x) => cur = x,
++            }
++        }
++    }
++
++    pub fn start_dumper() {
++        static STARTED: OnceLock<()> = OnceLock::new();
++        STARTED.get_or_init(|| {
++            std::thread::spawn(|| loop {
++                let s = format!(
++                    "QFRAMES={} QCOUNT={} EFRAMES={} ECOUNT={} PFRAMES={} BFRAMES={} | ALL_SELECT={} ALL_COUNT_SELECT={} RS={} RSUT={} FAST={} STREAM={} STREAM_CALLS={} STREAM_MIN_PARTS={} EARLY_OTHER={}\n",
++                    QFRAMES.load(Ordering::Relaxed),
++                    QCOUNT.load(Ordering::Relaxed),
++                    EFRAMES.load(Ordering::Relaxed),
++                    ECOUNT.load(Ordering::Relaxed),
++                    PFRAMES.load(Ordering::Relaxed),
++                    BFRAMES.load(Ordering::Relaxed),
++                    ALL_SELECT.load(Ordering::Relaxed),
++                    ALL_COUNT_SELECT.load(Ordering::Relaxed),
++                    RS.load(Ordering::Relaxed),
++                    RSUT.load(Ordering::Relaxed),
++                    FAST.load(Ordering::Relaxed),
++                    STREAM.load(Ordering::Relaxed),
++                    STREAM_CALLS.load(Ordering::Relaxed),
++                    STREAM_MIN_PARTS.load(Ordering::Relaxed),
++                    EARLY_OTHER.load(Ordering::Relaxed),
++                );
++                let _ = std::fs::write("/tmp/ferrosa-count-counters.txt", s);
++                std::thread::sleep(std::time::Duration::from_millis(200));
++            });
++        });
++    }
++}
++
+ async fn route_select(
+@@ -1900,2 +1982,6 @@ async fn route_select(
+ ) -> Result<BytesMut, CqlError> {
++    if is_count_only_select(&s.columns) && count_probe::enabled() {
++        count_probe::start_dumper();
++        count_probe::RS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
+     let ks = s
+@@ -3466,2 +3552,5 @@ async fn route_select_user_table(
+ ) -> Result<SelectRawResult, CqlError> {
++    if is_count_only_select(&s.columns) && count_probe::enabled() {
++        count_probe::RSUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
+     validate_keyspace_exists(&state.schema, ks)?;
+@@ -3697,2 +3786,5 @@ async fn route_select_user_table(
+     if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
++        if count_probe::enabled() {
++            count_probe::FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         let count = state.write_path.load().count_range(&table_id).await?;
+@@ -4468,2 +4560,5 @@ async fn route_select_user_table(
+                         if count_only_select {
++                            if count_probe::enabled() {
++                                count_probe::STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                            }
+                             let row_context = PartitionRowContext {
+diff --git a/ferrosa-storage/src/store.rs b/ferrosa-storage/src/store.rs
+index 2f20f1f4..009dd54a 100644
+--- a/ferrosa-storage/src/store.rs
++++ b/ferrosa-storage/src/store.rs
+@@ -2546,2 +2546,3 @@ impl<F: FlushTarget> TableStore<F> {
+         let mut total: u64 = 0;
++        let mut parts: u64 = 0;
+         // Each row in the merged partition contributes 1 to the
+@@ -2554,2 +2555,3 @@ impl<F: FlushTarget> TableStore<F> {
+         while let Some(p) = merger.next_merged_partition()? {
++            parts += 1;
+             total = total.saturating_add(p.rows.len() as u64);
+@@ -2559,2 +2561,10 @@ impl<F: FlushTarget> TableStore<F> {
+         }
++        if std::env::var("FERROSA_COUNT_PROBE").is_ok() {
++            let active_pc = view.active.partition_count();
++            let flushing_pc = view.flushing.as_ref().map(|f| f.partition_count());
++            eprintln!(
++                "COUNT_PROBE total={total} parts={parts} sstables={} active_pc={active_pc} flushing_pc={flushing_pc:?}",
++                view.sstables.len(),
++            );
++        }
+         Ok(total)
