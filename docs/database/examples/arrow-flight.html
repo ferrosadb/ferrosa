@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="Asciidoctor 2.0.20">
+<title>Arrow Flight Query Endpoint</title>
+<link rel="stylesheet" href="./theme/ferrosa.css">
+<link rel="icon" type="image/svg+xml" href="../favicon.svg">
+</head>
+<body class="article toc2 toc-left">
+<div id="header">
+<h1>Arrow Flight Query Endpoint</h1>
+<div id="toc" class="toc2">
+<div id="toctitle">Table of Contents</div>
+<ul class="sectlevel1">
+<li><a href="#_prerequisites">Prerequisites</a></li>
+<li><a href="#_authentication">Authentication</a></li>
+<li><a href="#_reading_getflightinfo_doget">Reading: GetFlightInfo + DoGet</a></li>
+<li><a href="#_writing_doput_doexchange">Writing: DoPut + DoExchange</a></li>
+<li><a href="#_discovery_and_actions">Discovery and actions</a></li>
+<li><a href="#_cql_arrow_type_mapping">CQL ↔ Arrow type mapping</a></li>
+<li><a href="#_live_change_streams_subscribe">Live change streams (SUBSCRIBE)</a></li>
+<li><a href="#_reference_client">Reference client</a></li>
+</ul>
+</div>
+</div>
+<div id="content">
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Ferrosa exposes an <a href="https://arrow.apache.org/docs/format/Flight.html">Apache Arrow Flight</a> (gRPC) endpoint so analytics clients can read and write query results as Arrow record batches — no row-by-row CQL decoding, columnar on the wire.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+The Flight endpoint is built behind the <code>flight</code> cargo feature and listens on gRPC port <code>8815</code> by default (<code>FERROSA_FLIGHT_BIND</code>). It runs alongside the CQL endpoint (<code>9042</code>); the schema you create over CQL is what Flight serves.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_prerequisites">Prerequisites</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p>A Ferrosa build with the <code>flight</code> feature, with <code>FERROSA_FLIGHT_SIGNING_KEY</code> set (so bearer tokens survive restarts and work across nodes).</p>
+</li>
+<li>
+<p>CQL reachable on <code>localhost:9042</code>, Flight on <code>localhost:8815</code>.</p>
+</li>
+<li>
+<p>Run <code>schema.cql</code> first to create the table the examples read/write.</p>
+</li>
+</ul>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-sql" data-lang="sql">-- Arrow Flight example — schema + seed data.
+--
+-- Run this against a running Ferrosa (CQL on localhost:9042) before exercising
+-- the Flight endpoint (gRPC on localhost:8815). The Flight DoGet/DoPut RPCs read
+-- and write this same table over Arrow; the CQL here is the setup the
+-- "Example CQL Scripts" CI job executes.
+
+CREATE KEYSPACE IF NOT EXISTS flight_demo
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+
+CREATE TABLE IF NOT EXISTS flight_demo.sensor_readings (
+    sensor_id  text,
+    ts         timestamp,
+    temperature double,
+    humidity   double,
+    PRIMARY KEY (sensor_id, ts)
+) WITH CLUSTERING ORDER BY (ts DESC);
+
+INSERT INTO flight_demo.sensor_readings (sensor_id, ts, temperature, humidity)
+    VALUES ('sensor-1', '2026-06-19T10:00:00Z', 21.5, 44.0);
+INSERT INTO flight_demo.sensor_readings (sensor_id, ts, temperature, humidity)
+    VALUES ('sensor-1', '2026-06-19T10:01:00Z', 21.7, 43.8);
+INSERT INTO flight_demo.sensor_readings (sensor_id, ts, temperature, humidity)
+    VALUES ('sensor-2', '2026-06-19T10:00:00Z', 19.2, 51.3);
+
+-- Read it back over CQL (the same rows DoGet returns as an Arrow stream):
+SELECT sensor_id, ts, temperature, humidity FROM flight_demo.sensor_readings;</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_authentication">Authentication</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Every Flight RPC except <code>Handshake</code> requires a bearer token. The handshake contract is deliberately simple:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p>The client opens <code>Handshake</code> and sends one <code>HandshakeRequest</code> whose <code>payload</code> is the bytes <code>username\0password</code> (username, a NUL byte, password).</p>
+</li>
+<li>
+<p>Ferrosa validates the credentials against its CQL roles and replies with a <code>HandshakeResponse</code> whose <code>payload</code> is the signed token.</p>
+</li>
+<li>
+<p>On every subsequent RPC the client sets the <code>authorization: Bearer &lt;token&gt;</code> gRPC metadata header.</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>Tokens carry the role + superuser flag and expire after <code>FERROSA_FLIGHT_TOKEN_TTL_SECS</code> (default 3600s). Signing keys rotate via <code>FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS</code> (all listed keys verify; the primary signs) so tokens issued by a just-retired key still validate during the overlap window.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_reading_getflightinfo_doget">Reading: GetFlightInfo + DoGet</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A read places a CQL <code>SELECT</code> string in the descriptor command. <code>GetFlightInfo</code> returns the Arrow schema plus the endpoint(s) to fetch; <code>DoGet</code> streams the result one page at a time (peak memory is bounded to a single page, not the whole result set).</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>GetSchema</code> returns just the Arrow schema for a command (no data).</p>
+</li>
+<li>
+<p>On a cluster, <code>GetFlightInfo</code> returns <strong>one endpoint per token range</strong> — each ticket a token-bounded <code>SELECT</code>, located on the replica(s) that own the range — so a client can fetch ranges in parallel. On a single node it returns one endpoint redeeming the command on this connection.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_writing_doput_doexchange">Writing: DoPut + DoExchange</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><code>DoPut</code> ingests Arrow record batches as CQL <code>INSERT`s into the table named by the `ferrosa-table: keyspace.table</code> gRPC metadata header. Identifiers are validated and literals escaped (injection-safe). The <code>PutResult.app_metadata</code> carries the number of rows applied.</p>
+</li>
+<li>
+<p><code>DoExchange</code> is a bidirectional streaming upsert: the client streams record batches in and receives one acknowledgement frame per batch (rows-applied count in <code>app_metadata</code>), reusing the same Arrow→CQL write path as <code>DoPut</code>.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_discovery_and_actions">Discovery and actions</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><code>ListFlights</code> enumerates the queryable (non-system) tables, one <code>FlightInfo</code> each, with a <code>SELECT * FROM ks.t</code> ticket; an optional <code>Criteria</code> expression prefix-filters by <code>keyspace.table</code>.</p>
+</li>
+<li>
+<p><code>PollFlightInfo</code> returns a completed <code>PollInfo</code> for a command.</p>
+</li>
+<li>
+<p><code>ListActions</code> / <code>DoAction</code> expose <code>server.info</code> (service + version) and <code>token.validate</code> (echoes the verified bearer identity).</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_cql_arrow_type_mapping">CQL ↔ Arrow type mapping</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The converter covers the full CQL type set: integers/floats/booleans/text/blob/uuid/timestamp map to their Arrow equivalents; <code>decimal</code> is rendered exactly; <code>list</code>/<code>set</code>/<code>map</code>/<code>tuple</code>/UDT map to Arrow <code>List</code>/<code>Struct</code>/<code>Map</code>; vector columns map to fixed-size lists.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_live_change_streams_subscribe">Live change streams (SUBSCRIBE)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>For <strong>streaming</strong> changes rather than point-in-time reads, use CQL <code>SUBSCRIBE</code> via the Python drop-in driver in <code>drivers/ferrosa_driver</code> (<code>SUBSCRIBE SELECT * FROM ks.t ON LOCAL|COMMITTED</code>). It delivers each committed change in real time over the CQL wire. See <code>drivers/README.md</code>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_reference_client">Reference client</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p><code>flight_demo.py</code> is a runnable <code>pyarrow.flight</code> client that performs the handshake above (custom <code>ClientAuthHandler</code> sending <code>username\0password</code>, capturing the token, then attaching <code>authorization: Bearer</code>), calls <code>GetFlightInfo</code>, and <code>DoGet`s each endpoint as Arrow. It is verified live against a `flight</code>-enabled server (<code>pip install pyarrow</code>):</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-python" data-lang="python">    ap.add_argument("--flight", default="grpc://127.0.0.1:8815")
+    ap.add_argument("--user", default="cassandra")
+    ap.add_argument("--password", default="cassandra")
+    ap.add_argument("--keyspace", default="flight_demo")
+    ap.add_argument("--table", default="sensor_readings")
+    args = ap.parse_args()
+
+    client = flight.FlightClient(args.flight)
+
+    # 1. Handshake -&gt; bearer token, then attach it to every call.
+    hs = _Handshake(args.user, args.password)
+    client.authenticate(hs)
+    opts = flight.FlightCallOptions(headers=[(b"authorization", b"Bearer " + hs.token)])
+    print(f"[flight] authenticated, token {len(hs.token)} bytes")
+
+    # 2. GetFlightInfo for a SELECT, then DoGet each endpoint as Arrow.
+    cmd = f"SELECT sensor_id, ts, temperature, humidity FROM {args.keyspace}.{args.table}".encode()
+    info = client.get_flight_info(flight.FlightDescriptor.for_command(cmd), opts)
+    print(f"[flight] GetFlightInfo: {len(info.endpoints)} endpoint(s), columns {info.schema.names}")
+    total = 0
+    for endpoint in info.endpoints:
+        table = client.do_get(endpoint.ticket, opts).read_all()
+        total += table.num_rows
+        for row in table.to_pylist():
+            print(f"[flight] row: {row}")
+    print(f"[flight] read {total} rows over Arrow Flight")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Running it against the seeded <code>schema.cql</code> prints the three sensor rows read back over Arrow:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre>[flight] authenticated, token 109 bytes
+[flight] GetFlightInfo: 1 endpoint(s), columns ['sensor_id', 'ts', 'temperature', 'humidity']
+[flight] read 3 rows over Arrow Flight</pre>
+</div>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+Wiring <code>flight_demo.py</code> into CI (a job that boots a <code>flight</code>-enabled server and runs it, alongside the existing "Example CQL Scripts" job which already runs <code>schema.cql</code>) is tracked in forge <code>t_0c1f92ee</code>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div id="footer">
+<div id="footer-text">
+</div>
+</div>
+<script>
+// Add a "Copy" button to every code listing.
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.listingblock .content').forEach(function (content) {
+    var pre = content.querySelector('pre');
+    if (!pre) { return; }
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'copy-btn';
+    button.textContent = 'Copy';
+    button.setAttribute('aria-label', 'Copy code to clipboard');
+    button.addEventListener('click', function () {
+      var text = pre.innerText;
+      var done = function () {
+        button.textContent = 'Copied';
+        setTimeout(function () { button.textContent = 'Copy'; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(area);
+        done();
+      }
+    });
+    content.appendChild(button);
+  });
+});
+</script>
+</body>
+</html>
