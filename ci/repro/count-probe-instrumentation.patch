@@ -5,7 +5,7 @@ index ba477b59..967a08a6 100644
 @@ -1395,6 +1395,16 @@ async fn handle_query(
      // Build an auth context for routing (use a default if auth was disabled).
      let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
- 
+
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
 +        crate::router::count_probe::QFRAMES
@@ -22,7 +22,7 @@ index ba477b59..967a08a6 100644
 @@ -1449,6 +1459,12 @@ pub(crate) async fn handle_prepare(
          }
      };
- 
+
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
 +        crate::router::count_probe::PFRAMES
@@ -35,7 +35,7 @@ index ba477b59..967a08a6 100644
 @@ -1599,6 +1615,16 @@ async fn handle_execute(
          }
      };
- 
+
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
 +        crate::router::count_probe::EFRAMES
@@ -56,7 +56,7 @@ index 3dec34f8..12fe458c 100644
 @@ -422,6 +422,10 @@ fn projection_storage_ordinals_for_select_scan(
      projection_storage_ordinals(&needed, table_meta)
  }
- 
+
 +pub(crate) fn is_count_only_select_pub(columns: &[SelectColumn]) -> bool {
 +    is_count_only_select(columns)
 +}
@@ -74,10 +74,10 @@ index 3dec34f8..12fe458c 100644
 +    }
      Ok(count)
  }
- 
+
 @@ -1464,7 +1472,16 @@ pub async fn route(
      }
- 
+
      let result = match stmt {
 -        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
 +        Statement::Select(s) => {
@@ -94,9 +94,9 @@ index 3dec34f8..12fe458c 100644
          Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
          Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
 @@ -1708,11 +1725,80 @@ fn statement_query_label(stmt: &Statement, opcode: CqlOpcode) -> String {
- 
+
  // ── SELECT ───────────────────────────────────────────────────────────────
- 
+
 +// ---- COUNT(*) durable probe counters (starvation-tolerant via an OS thread) ----
 +pub(crate) mod count_probe {
 +    use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,7 +182,7 @@ index 3dec34f8..12fe458c 100644
 +        count_probe::RSUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +    }
      validate_keyspace_exists(&state.schema, ks)?;
- 
+
      // Permission check (M8)
 @@ -3485,6 +3574,9 @@ async fn route_select_user_table(
      let no_order_by = s.order_by.is_empty();
@@ -210,7 +210,7 @@ index cb943d56..189e33b0 100644
 +++ b/ferrosa-storage/src/store.rs
 @@ -2393,6 +2393,7 @@ impl<F: FlushTarget> TableStore<F> {
          )?;
- 
+
          let mut total: u64 = 0;
 +        let mut parts: u64 = 0;
          // Each row in the merged partition contributes 1 to the
@@ -236,11 +236,11 @@ index cb943d56..189e33b0 100644
 +        }
          Ok(total)
      }
- 
+
 @@ -5543,6 +5553,64 @@ mod tests {
          );
      }
- 
+
 +    /// Regression for the COUNT(*) undercount bug (t_8c4e44e8): a bare
 +    /// `SELECT count(*)` over a table with N distinct partitions returned a
 +    /// nondeterministic undercount (observed 12/23/15 for N=50) even though a
