@@ -5818,6 +5818,64 @@ mod tests {
         );
     }
 
+    /// Regression for the COUNT(*) undercount bug (t_8c4e44e8): a bare
+    /// `SELECT count(*)` over a table with N distinct partitions returned a
+    /// nondeterministic undercount (observed 12/23/15 for N=50) even though a
+    /// full materializing scan saw all N. COUNT(*) goes through
+    /// `count_range` (ADR-020 fast path); the full scan goes through
+    /// `range_iter`. Both must agree, and both must equal N regardless of
+    /// storage layout (pure memtable, sstable-only, or a mix).
+    #[test]
+    fn count_range_counts_every_partition_memtable_only() {
+        let store = test_store();
+        const N: i64 = 50;
+        for i in 0..N {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        // Repeat to expose any per-call nondeterminism (the live repro
+        // cycled 12/23/15 across consecutive calls).
+        for call in 0..8 {
+            let count = store.count_range(None, None).unwrap();
+            assert_eq!(
+                count, N as u64,
+                "COUNT(*) call {call} must see all {N} partitions, got {count}",
+            );
+        }
+    }
+
+    /// Same invariant after a flush (sstable-only) and across a memtable +
+    /// sstable mix — count_range must merge sources without dropping rows.
+    #[test]
+    fn count_range_counts_every_partition_after_flush_and_mixed() {
+        let store = test_store();
+        const N: i64 = 50;
+        for i in 0..N {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        assert_eq!(
+            store.count_range(None, None).unwrap(),
+            N as u64,
+            "COUNT(*) over a single flushed sstable must equal {N}",
+        );
+        // Add N more distinct partitions into the fresh active memtable.
+        for i in N..(2 * N) {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        assert_eq!(
+            store.count_range(None, None).unwrap(),
+            (2 * N) as u64,
+            "COUNT(*) over memtable + sstable must equal {}",
+            2 * N,
+        );
+    }
+
     #[test]
     fn count_range_propagates_truncated_sstable_error() {
         // Given one readable SSTable and one legacy/truncated SSTable loaded
