@@ -308,10 +308,57 @@ async fn apply_per_partition_row_limit(
     }
 }
 
+/// Map a streaming-fragment failure to the error surfaced to the client.
+///
+/// t_4b94ab56: a remote replica's fragment stream closing or going idle before
+/// its terminating `Done` is a TRANSIENT, RETRYABLE condition (a replica dropped
+/// mid-stream), not an internal bug. Range scans are idempotent, so we surface
+/// these as `ReadTimeout` — which standard drivers (and ferrosa-memory) retry —
+/// instead of an opaque `internal: ChannelClosedBeforeDone`. Genuine protocol
+/// faults (decode / unexpected frame) stay `Internal` so they remain loud for
+/// diagnosis.
 fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition> {
-    Err(ClusterError::Internal(format!(
-        "streaming range read: {err:?}"
-    )))
+    let cluster_err = match err {
+        StreamConsumeError::ChannelClosedBeforeDone {
+            delivered_done,
+            expected_done,
+        } => {
+            tracing::warn!(
+                delivered_done,
+                expected_done,
+                "streaming range read: remote stream closed before Done — returning retryable ReadTimeout"
+            );
+            ClusterError::ReadTimeout {
+                // Per-replica fragment granularity; representative — the exact
+                // fan-out CL is not threaded to this depth.
+                consistency: "ONE".to_string(),
+                received: delivered_done,
+                required: expected_done,
+                // The scan was incomplete, so no usable data — signal retry.
+                data_present: false,
+            }
+        }
+        StreamConsumeError::IdleTimeout {
+            request_id,
+            idle_timeout,
+        } => {
+            tracing::warn!(
+                request_id,
+                ?idle_timeout,
+                "streaming range read: idle timeout — returning retryable ReadTimeout"
+            );
+            ClusterError::ReadTimeout {
+                consistency: "ONE".to_string(),
+                received: 0,
+                required: 1,
+                data_present: false,
+            }
+        }
+        // Decode / unexpected-frame faults are genuine protocol bugs — keep them
+        // loud (non-retryable) so they surface for diagnosis.
+        other => ClusterError::Internal(format!("streaming range read: {other:?}")),
+    };
+    Err(cluster_err)
 }
 
 async fn forward_remote_range_stream(
@@ -1728,6 +1775,50 @@ mod tests {
     use crate::consistency::ConsistencyLevel as CL;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+
+    #[test]
+    fn channel_closed_before_done_is_retryable_read_timeout() {
+        // t_4b94ab56: a remote stream closing before Done must surface as a
+        // RETRYABLE ReadTimeout (drivers/fmem retry the idempotent scan), not an
+        // opaque `internal: ChannelClosedBeforeDone`.
+        let e = next_remote_error(StreamConsumeError::ChannelClosedBeforeDone {
+            delivered_done: 0,
+            expected_done: 1,
+        });
+        match e {
+            Err(ClusterError::ReadTimeout {
+                received,
+                required,
+                data_present,
+                ..
+            }) => {
+                assert_eq!(received, 0);
+                assert_eq!(required, 1);
+                assert!(!data_present, "incomplete scan must signal retry");
+            }
+            other => panic!("expected retryable ReadTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_timeout_is_retryable_read_timeout() {
+        let e = next_remote_error(StreamConsumeError::IdleTimeout {
+            request_id: 7,
+            idle_timeout: std::time::Duration::from_secs(30),
+        });
+        assert!(matches!(e, Err(ClusterError::ReadTimeout { .. })));
+    }
+
+    #[test]
+    fn decode_fault_stays_internal_non_retryable() {
+        // A genuine protocol/decode bug must stay loud and non-retryable.
+        let e = next_remote_error(StreamConsumeError::Decode {
+            request_id: 1,
+            which: "RangeReadStreamChunk",
+            message: "boom".to_string(),
+        });
+        assert!(matches!(e, Err(ClusterError::Internal(_))));
+    }
 
     fn dk(tok_seed: &[u8]) -> DecoratedKey {
         DecoratedKey::new(PartitionKey::from(tok_seed))
