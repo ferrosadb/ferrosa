@@ -1803,7 +1803,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tracing::info!(%bolt_bind, "Bolt server starting");
     } else {
+        // t_2dd438d2: the graph engine is disabled, but instead of leaving the
+        // graph HTTP port unbound (clients get an opaque connection-refused, or
+        // a misleading missing-table error), serve a thin endpoint that returns
+        // a clear "graph engine disabled" error + remediation on every request.
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
+        let disabled_http_config = ferrosa_graph::http::GraphHttpConfig {
+            require_tls: false,
+            ..ferrosa_graph::http::GraphHttpConfig::default()
+        };
+        runtimes.background.spawn(async move {
+            if let Err(e) =
+                ferrosa_graph::http::start_graph_disabled_http(&disabled_http_config).await
+            {
+                tracing::error!(%e, "graph disabled-engine HTTP stub failed");
+            }
+        });
     }
 
     // 11. SPARQL endpoint (check FERROSA_SPARQL_ENABLED)
