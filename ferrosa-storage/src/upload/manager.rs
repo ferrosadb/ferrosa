@@ -958,6 +958,112 @@ mod tests {
         });
     }
 
+    /// Durability guarantee for the local `file://` backend: a flushed SSTable
+    /// uploaded through the normal upload pipeline lands as a real file under
+    /// the local store directory and survives reopening the store (i.e. a
+    /// process restart). This is the fix for silent data loss when no object
+    /// store was configured.
+    #[test]
+    fn flushed_sstable_is_durable_on_local_backend() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_dir = dir.path().join("objstore");
+            let component_path = dir.path().join("abc123-Data.db");
+            std::fs::write(&component_path, b"flushed sstable bytes").unwrap();
+
+            // Build the durable local backend via ObjectStoreConfig.
+            let config = crate::upload::ObjectStoreConfig {
+                local_path: Some(store_dir.clone()),
+                ..crate::upload::ObjectStoreConfig::test_config()
+            };
+            assert!(config.is_local());
+            let store: Arc<dyn ObjectStore> = Arc::from(config.build_object_store().unwrap());
+
+            let manager = UploadManager::new(
+                Arc::clone(&store),
+                "test".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.table".into(),
+                    sstable_id: "abc123".into(),
+                    files: vec![SstableComponentFile::new("abc123-Data.db", component_path)],
+                    on_complete: None,
+                })
+                .await
+                .unwrap();
+            manager.shutdown().await;
+
+            let hex = hex_prefix_for("abc123");
+            let path = sstable_object_key("test", &hex, "ks.table", "abc123", "Data.db");
+
+            // Present via the live store handle.
+            let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(bytes.as_ref(), b"flushed sstable bytes");
+
+            // Durable: a freshly opened store over the same dir still has it
+            // (simulates a restart reattaching to the local store).
+            let reopened =
+                object_store::local::LocalFileSystem::new_with_prefix(&store_dir).unwrap();
+            let durable = reopened.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(durable.as_ref(), b"flushed sstable bytes");
+        });
+    }
+
+    /// A multipart-sized upload (> the 8 MiB part threshold) lands durably on
+    /// the local backend. `put_multipart` sets no attributes, so the
+    /// LocalFileSystem multipart path is exercised without the NotImplemented
+    /// attributes special-case — no fallback needed.
+    #[test]
+    fn multipart_sized_upload_is_durable_on_local_backend() {
+        let rt = make_runtime();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_dir = dir.path().join("objstore");
+            let component_path = dir.path().join("big-Data.db");
+
+            // Larger than one part so the upload routes through put_multipart.
+            let total_len = S3_UPLOAD_PART_BYTES + 4096;
+            let data: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&component_path, &data).unwrap();
+
+            let config = crate::upload::ObjectStoreConfig {
+                local_path: Some(store_dir.clone()),
+                ..crate::upload::ObjectStoreConfig::test_config()
+            };
+            let store: Arc<dyn ObjectStore> = Arc::from(config.build_object_store().unwrap());
+
+            let manager = UploadManager::new(
+                Arc::clone(&store),
+                "test".into(),
+                16,
+                &tokio::runtime::Handle::current(),
+            );
+            manager
+                .submit(UploadTask::SSTable {
+                    table_id: "ks.table".into(),
+                    sstable_id: "big".into(),
+                    files: vec![SstableComponentFile::new("big-Data.db", component_path)],
+                    on_complete: None,
+                })
+                .await
+                .unwrap();
+            manager.shutdown().await;
+
+            let hex = hex_prefix_for("big");
+            let path = sstable_object_key("test", &hex, "ks.table", "big", "Data.db");
+
+            let reopened =
+                object_store::local::LocalFileSystem::new_with_prefix(&store_dir).unwrap();
+            let durable = reopened.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_eq!(durable.len(), total_len);
+            assert_eq!(durable.as_ref(), data.as_slice());
+        });
+    }
+
     #[test]
     fn upload_sstable_bytes_round_trip() {
         let rt = make_runtime();

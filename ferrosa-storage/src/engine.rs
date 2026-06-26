@@ -1808,8 +1808,23 @@ impl StorageEngine {
             object_store.as_ref(),
         );
 
-        let local_cache =
-            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+        // Durable local file:// backend → disk is the store of record, so the
+        // SSTable cache must never evict (would drop the only durable copy).
+        let durable_local = config
+            .object_store
+            .as_ref()
+            .is_some_and(crate::upload::ObjectStoreConfig::is_local);
+        if durable_local {
+            tracing::info!(
+                "object store backend is local file:// — treating local disk as durable; \
+                 SSTable cache eviction disabled"
+            );
+        }
+        let local_cache = LocalCache::new_with_durability(
+            config.data_dir.join("cache"),
+            config.local_cache_max_bytes,
+            durable_local,
+        );
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
@@ -1931,8 +1946,23 @@ impl StorageEngine {
             object_store.as_ref(),
         );
 
-        let local_cache =
-            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+        // Durable local file:// backend → disk is the store of record, so the
+        // SSTable cache must never evict (would drop the only durable copy).
+        let durable_local = config
+            .object_store
+            .as_ref()
+            .is_some_and(crate::upload::ObjectStoreConfig::is_local);
+        if durable_local {
+            tracing::info!(
+                "object store backend is local file:// — treating local disk as durable; \
+                 SSTable cache eviction disabled"
+            );
+        }
+        let local_cache = LocalCache::new_with_durability(
+            config.data_dir.join("cache"),
+            config.local_cache_max_bytes,
+            durable_local,
+        );
 
         // Set up archiver if enabled.
         let archiver_handle = match (&config.commit_log.archive, archive_store, runtime) {
@@ -2059,8 +2089,23 @@ impl StorageEngine {
             object_store.as_ref(),
         );
 
-        let local_cache =
-            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+        // Durable local file:// backend → disk is the store of record, so the
+        // SSTable cache must never evict (would drop the only durable copy).
+        let durable_local = config
+            .object_store
+            .as_ref()
+            .is_some_and(crate::upload::ObjectStoreConfig::is_local);
+        if durable_local {
+            tracing::info!(
+                "object store backend is local file:// — treating local disk as durable; \
+                 SSTable cache eviction disabled"
+            );
+        }
+        let local_cache = LocalCache::new_with_durability(
+            config.data_dir.join("cache"),
+            config.local_cache_max_bytes,
+            durable_local,
+        );
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
@@ -8227,8 +8272,23 @@ impl StorageEngine {
             runtime,
         ));
 
-        let local_cache =
-            LocalCache::new(config.data_dir.join("cache"), config.local_cache_max_bytes);
+        // Durable local file:// backend → disk is the store of record, so the
+        // SSTable cache must never evict (would drop the only durable copy).
+        let durable_local = config
+            .object_store
+            .as_ref()
+            .is_some_and(crate::upload::ObjectStoreConfig::is_local);
+        if durable_local {
+            tracing::info!(
+                "object store backend is local file:// — treating local disk as durable; \
+                 SSTable cache eviction disabled"
+            );
+        }
+        let local_cache = LocalCache::new_with_durability(
+            config.data_dir.join("cache"),
+            config.local_cache_max_bytes,
+            durable_local,
+        );
 
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
