@@ -1,0 +1,74 @@
+= Arrow Flight Query Endpoint
+:toc: left
+:toclevels: 3
+:stylesheet: ../theme/ferrosa.css
+
+Ferrosa exposes an https://arrow.apache.org/docs/format/Flight.html[Apache Arrow Flight] (gRPC) endpoint so analytics clients can read and write query results as Arrow record batches — no row-by-row CQL decoding, columnar on the wire.
+
+NOTE: The Flight endpoint is built behind the `flight` cargo feature and listens on gRPC port `8815` by default (`FERROSA_FLIGHT_BIND`). It runs alongside the CQL endpoint (`9042`); the schema you create over CQL is what Flight serves.
+
+== Prerequisites
+
+* A Ferrosa build with the `flight` feature, with `FERROSA_FLIGHT_SIGNING_KEY` set (so bearer tokens survive restarts and work across nodes).
+* CQL reachable on `localhost:9042`, Flight on `localhost:8815`.
+* Run `schema.cql` first to create the table the examples read/write.
+
+[source,sql]
+----
+include::schema.cql[]
+----
+
+== Authentication
+
+Every Flight RPC except `Handshake` requires a bearer token. The handshake contract is deliberately simple:
+
+. The client opens `Handshake` and sends one `HandshakeRequest` whose `payload` is the bytes `username\0password` (username, a NUL byte, password).
+. Ferrosa validates the credentials against its CQL roles and replies with a `HandshakeResponse` whose `payload` is the signed token.
+. On every subsequent RPC the client sets the `authorization: Bearer <token>` gRPC metadata header.
+
+Tokens carry the role + superuser flag and expire after `FERROSA_FLIGHT_TOKEN_TTL_SECS` (default 3600s). Signing keys rotate via `FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS` (all listed keys verify; the primary signs) so tokens issued by a just-retired key still validate during the overlap window.
+
+== Reading: GetFlightInfo + DoGet
+
+A read places a CQL `SELECT` string in the descriptor command. `GetFlightInfo` returns the Arrow schema plus the endpoint(s) to fetch; `DoGet` streams the result one page at a time (peak memory is bounded to a single page, not the whole result set).
+
+* `GetSchema` returns just the Arrow schema for a command (no data).
+* On a cluster, `GetFlightInfo` returns *one endpoint per token range* — each ticket a token-bounded `SELECT`, located on the replica(s) that own the range — so a client can fetch ranges in parallel. On a single node it returns one endpoint redeeming the command on this connection.
+
+== Writing: DoPut + DoExchange
+
+* `DoPut` ingests Arrow record batches as CQL `INSERT`s into the table named by the `ferrosa-table: keyspace.table` gRPC metadata header. Identifiers are validated and literals escaped (injection-safe). The `PutResult.app_metadata` carries the number of rows applied.
+* `DoExchange` is a bidirectional streaming upsert: the client streams record batches in and receives one acknowledgement frame per batch (rows-applied count in `app_metadata`), reusing the same Arrow→CQL write path as `DoPut`.
+
+== Discovery and actions
+
+* `ListFlights` enumerates the queryable (non-system) tables, one `FlightInfo` each, with a `SELECT * FROM ks.t` ticket; an optional `Criteria` expression prefix-filters by `keyspace.table`.
+* `PollFlightInfo` returns a completed `PollInfo` for a command.
+* `ListActions` / `DoAction` expose `server.info` (service + version) and `token.validate` (echoes the verified bearer identity).
+
+== CQL ↔ Arrow type mapping
+
+The converter covers the full CQL type set: integers/floats/booleans/text/blob/uuid/timestamp map to their Arrow equivalents; `decimal` is rendered exactly; `list`/`set`/`map`/`tuple`/UDT map to Arrow `List`/`Struct`/`Map`; vector columns map to fixed-size lists.
+
+== Live change streams (SUBSCRIBE)
+
+For *streaming* changes rather than point-in-time reads, use CQL `SUBSCRIBE` via the Python drop-in driver in `drivers/ferrosa_driver` (`SUBSCRIBE SELECT * FROM ks.t ON LOCAL|COMMITTED`). It delivers each committed change in real time over the CQL wire. See `drivers/README.md`.
+
+== Reference client
+
+`flight_demo.py` is a runnable `pyarrow.flight` client that performs the handshake above (custom `ClientAuthHandler` sending `username\0password`, capturing the token, then attaching `authorization: Bearer`), calls `GetFlightInfo`, and `DoGet`s each endpoint as Arrow. It is verified live against a `flight`-enabled server (`pip install pyarrow`):
+
+[source,python]
+----
+include::flight_demo.py[lines=39..72]
+----
+
+Running it against the seeded `schema.cql` prints the three sensor rows read back over Arrow:
+
+----
+[flight] authenticated, token 109 bytes
+[flight] GetFlightInfo: 1 endpoint(s), columns ['sensor_id', 'ts', 'temperature', 'humidity']
+[flight] read 3 rows over Arrow Flight
+----
+
+NOTE: Wiring `flight_demo.py` into CI (a job that boots a `flight`-enabled server and runs it, alongside the existing "Example CQL Scripts" job which already runs `schema.cql`) is tracked in forge `t_0c1f92ee`.

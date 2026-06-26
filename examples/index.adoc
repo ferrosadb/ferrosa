@@ -66,6 +66,11 @@ Player stats, rankings, and match history.
 link:vector-indexes.html[*Vector Indexes: HNSW and HVQ*] _New!_::
 Semantic similarity search over embeddings, comparing the full-precision HNSW index with the quantized HVQ index -- plus a BTree secondary index -- all from plain CQL.
 
+== Analytics Integration
+
+link:arrow-flight.html[*Arrow Flight Query Endpoint*] _New!_::
+Read and write query results as columnar Apache Arrow over a gRPC Flight endpoint -- bearer-token auth, paged DoGet, DoPut/DoExchange ingest, and per-token-range endpoints for parallel reads. Pairs with the Python `SUBSCRIBE` driver for live change streams.
+
 == Multi-Model Search
 
 The lens that makes Ferrosa _not just Cassandra_: one dataset queried five ways -- keyword (LIKE), meaning (vector ANN), fuzzy name (phonetic), trending (RRD), and influence (graph) -- and the results fused into one ranked list. No five-system stack, no ETL.
