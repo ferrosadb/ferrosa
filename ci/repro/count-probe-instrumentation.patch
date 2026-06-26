@@ -1,10 +1,8 @@
 diff --git a/ferrosa-cql/src/connection.rs b/ferrosa-cql/src/connection.rs
-index ba477b59..967a08a6 100644
+index 26dad63f..08044502 100644
 --- a/ferrosa-cql/src/connection.rs
 +++ b/ferrosa-cql/src/connection.rs
-@@ -1395,6 +1395,16 @@ async fn handle_query(
-     // Build an auth context for routing (use a default if auth was disabled).
-     let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+@@ -1456,2 +1456,12 @@ async fn handle_query(
 
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
@@ -16,12 +14,8 @@ index ba477b59..967a08a6 100644
 +        }
 +    }
 +
-     match crate::router::route(state, &ctx, stmt).await {
-         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
-         Ok(RouteResult::SetKeyspace(ks, body)) => {
-@@ -1449,6 +1459,12 @@ pub(crate) async fn handle_prepare(
-         }
-     };
+     // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
+@@ -1528,2 +1538,8 @@ pub(crate) async fn handle_prepare(
 
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
@@ -30,11 +24,7 @@ index ba477b59..967a08a6 100644
 +    }
 +
      let id = PreparedCache::compute_id(query);
-     if let Some(plan) = state.prepared_cache.get(&id) {
-         if plan.query == query && plan.keyspace.as_ref() == current_keyspace.as_ref() {
-@@ -1599,6 +1615,16 @@ async fn handle_execute(
-         }
-     };
+@@ -1678,2 +1694,12 @@ async fn handle_execute(
 
 +    if crate::router::count_probe::enabled() {
 +        crate::router::count_probe::start_dumper();
@@ -47,37 +37,25 @@ index ba477b59..967a08a6 100644
 +    }
 +
      // Parse bound values from the EXECUTE frame. Common prepared INSERTs can
-     // route directly from the cached plan and bound terms; complex statements
-     // fall back to the generic AST substitution path.
 diff --git a/ferrosa-cql/src/router.rs b/ferrosa-cql/src/router.rs
-index 3dec34f8..12fe458c 100644
+index dc6caf74..a27ac56e 100644
 --- a/ferrosa-cql/src/router.rs
 +++ b/ferrosa-cql/src/router.rs
-@@ -422,6 +422,10 @@ fn projection_storage_ordinals_for_select_scan(
-     projection_storage_ordinals(&needed, table_meta)
- }
+@@ -423,2 +423,6 @@ fn projection_storage_ordinals_for_select_scan(
 
 +pub(crate) fn is_count_only_select_pub(columns: &[SelectColumn]) -> bool {
 +    is_count_only_select(columns)
 +}
 +
  fn is_count_only_select(columns: &[SelectColumn]) -> bool {
-     !columns.is_empty()
-         && columns.iter().all(|c| {
-@@ -619,6 +623,10 @@ async fn count_rows_from_partition_stream(
-             tokio::task::yield_now().await;
-         }
+@@ -620,2 +624,6 @@ async fn count_rows_from_partition_stream(
      }
 +    if count_probe::enabled() {
 +        count_probe::STREAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +        count_probe::min_parts(processed_partitions as u64);
 +    }
      Ok(count)
- }
-
-@@ -1464,7 +1472,16 @@ pub async fn route(
-     }
-
+@@ -1644,3 +1652,12 @@ pub async fn route(
      let result = match stmt {
 -        Statement::Select(s) => route_select(state, ctx, s).await.map(RouteResult::Result),
 +        Statement::Select(s) => {
@@ -91,11 +69,7 @@ index 3dec34f8..12fe458c 100644
 +            route_select(state, ctx, s).await.map(RouteResult::Result)
 +        }
          Statement::Insert(i) => route_insert(state, ctx, i).await.map(RouteResult::Result),
-         Statement::Update(u) => route_update(state, ctx, u).await.map(RouteResult::Result),
-         Statement::Delete(d) => route_delete(state, ctx, d).await.map(RouteResult::Result),
-@@ -1708,11 +1725,80 @@ fn statement_query_label(stmt: &Statement, opcode: CqlOpcode) -> String {
-
- // ── SELECT ───────────────────────────────────────────────────────────────
+@@ -1895,2 +1912,67 @@ fn statement_query_label(stmt: &Statement, opcode: CqlOpcode) -> String {
 
 +// ---- COUNT(*) durable probe counters (starvation-tolerant via an OS thread) ----
 +pub(crate) mod count_probe {
@@ -163,68 +137,44 @@ index 3dec34f8..12fe458c 100644
 +}
 +
  async fn route_select(
-     state: &SharedState,
-     ctx: &RequestContext<'_>,
-     s: SelectStatement,
+@@ -1900,2 +1982,6 @@ async fn route_select(
  ) -> Result<BytesMut, CqlError> {
 +    if is_count_only_select(&s.columns) && count_probe::enabled() {
 +        count_probe::start_dumper();
 +        count_probe::RS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +    }
      let ks = s
-         .keyspace
-         .as_deref()
-@@ -3279,6 +3365,9 @@ async fn route_select_user_table(
-     ks: &str,
-     s: &SelectStatement,
+@@ -3466,2 +3552,5 @@ async fn route_select_user_table(
  ) -> Result<SelectRawResult, CqlError> {
 +    if is_count_only_select(&s.columns) && count_probe::enabled() {
 +        count_probe::RSUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +    }
      validate_keyspace_exists(&state.schema, ks)?;
-
-     // Permission check (M8)
-@@ -3485,6 +3574,9 @@ async fn route_select_user_table(
-     let no_order_by = s.order_by.is_empty();
-     let no_limit = s.limit.is_none();
+@@ -3697,2 +3786,5 @@ async fn route_select_user_table(
      if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
 +        if count_probe::enabled() {
 +            count_probe::FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +        }
          let count = state.write_path.load().count_range(&table_id).await?;
-         return Ok(SelectRawResult {
-             column_names: col_names.to_vec(),
-@@ -4256,6 +4348,9 @@ async fn route_select_user_table(
-                             None
-                         };
+@@ -4468,2 +4560,5 @@ async fn route_select_user_table(
                          if count_only_select {
 +                            if count_probe::enabled() {
 +                                count_probe::STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +                            }
                              let row_context = PartitionRowContext {
-                                 all_col_names: &all_col_names,
-                                 all_col_types: &all_col_types,
 diff --git a/ferrosa-storage/src/store.rs b/ferrosa-storage/src/store.rs
-index cb943d56..189e33b0 100644
+index 2f20f1f4..009dd54a 100644
 --- a/ferrosa-storage/src/store.rs
 +++ b/ferrosa-storage/src/store.rs
-@@ -2393,6 +2393,7 @@ impl<F: FlushTarget> TableStore<F> {
-         )?;
-
+@@ -2546,2 +2546,3 @@ impl<F: FlushTarget> TableStore<F> {
          let mut total: u64 = 0;
 +        let mut parts: u64 = 0;
          // Each row in the merged partition contributes 1 to the
-         // count unless its tombstone marker covers it.
-         // `merge::apply_deletions` (called inside the merger) has
-@@ -2401,11 +2402,20 @@ impl<F: FlushTarget> TableStore<F> {
-         // semantics for COUNT(*) include the static row when
-         // present).
+@@ -2554,2 +2555,3 @@ impl<F: FlushTarget> TableStore<F> {
          while let Some(p) = merger.next_merged_partition()? {
 +            parts += 1;
              total = total.saturating_add(p.rows.len() as u64);
-             if p.static_row.is_some() {
-                 total = total.saturating_add(1);
-             }
+@@ -2559,2 +2561,10 @@ impl<F: FlushTarget> TableStore<F> {
          }
 +        if std::env::var("FERROSA_COUNT_PROBE").is_ok() {
 +            let active_pc = view.active.partition_count();
@@ -235,70 +185,3 @@ index cb943d56..189e33b0 100644
 +            );
 +        }
          Ok(total)
-     }
-
-@@ -5543,6 +5553,64 @@ mod tests {
-         );
-     }
-
-+    /// Regression for the COUNT(*) undercount bug (t_8c4e44e8): a bare
-+    /// `SELECT count(*)` over a table with N distinct partitions returned a
-+    /// nondeterministic undercount (observed 12/23/15 for N=50) even though a
-+    /// full materializing scan saw all N. COUNT(*) goes through
-+    /// `count_range` (ADR-020 fast path); the full scan goes through
-+    /// `range_iter`. Both must agree, and both must equal N regardless of
-+    /// storage layout (pure memtable, sstable-only, or a mix).
-+    #[test]
-+    fn count_range_counts_every_partition_memtable_only() {
-+        let store = test_store();
-+        const N: i64 = 50;
-+        for i in 0..N {
-+            store
-+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
-+                .unwrap();
-+        }
-+        // Repeat to expose any per-call nondeterminism (the live repro
-+        // cycled 12/23/15 across consecutive calls).
-+        for call in 0..8 {
-+            let count = store.count_range(None, None).unwrap();
-+            assert_eq!(
-+                count, N as u64,
-+                "COUNT(*) call {call} must see all {N} partitions, got {count}",
-+            );
-+        }
-+    }
-+
-+    /// Same invariant after a flush (sstable-only) and across a memtable +
-+    /// sstable mix — count_range must merge sources without dropping rows.
-+    #[test]
-+    fn count_range_counts_every_partition_after_flush_and_mixed() {
-+        let store = test_store();
-+        const N: i64 = 50;
-+        for i in 0..N {
-+            store
-+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
-+                .unwrap();
-+        }
-+        store.flush().unwrap();
-+        assert_eq!(
-+            store.count_range(None, None).unwrap(),
-+            N as u64,
-+            "COUNT(*) over a single flushed sstable must equal {N}",
-+        );
-+        // Add N more distinct partitions into the fresh active memtable.
-+        for i in N..(2 * N) {
-+            store
-+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
-+                .unwrap();
-+        }
-+        assert_eq!(
-+            store.count_range(None, None).unwrap(),
-+            (2 * N) as u64,
-+            "COUNT(*) over memtable + sstable must equal {}",
-+            2 * N,
-+        );
-+    }
-+
-     #[test]
-     fn count_range_propagates_truncated_sstable_error() {
-         // Given one readable SSTable and one legacy/truncated SSTable loaded
