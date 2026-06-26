@@ -35,9 +35,18 @@ memtable_num_shards = 64
 # region = "us-east-1"
 # allow_http = false
 
+# ── User-facing endpoints ────────────────────────────────────────────────────
+# All standard endpoints are ON by default so a fresh install exposes the full
+# feature set. To REDUCE THE ATTACK SURFACE, explicitly disable the ones you
+# don't need by setting `enabled = false` below (absence = enabled).
+#   Always-on (no toggle): CQL 9042 · Postgres 5432 · web/observability 9090
+
 [graph]
-enabled = false
+enabled = true                    # graph HTTP (7474) + Bolt (7687); set false to disable
 bind = "0.0.0.0:7474"
+
+[sparql]
+enabled = true                    # SPARQL 1.1 endpoint (8080); set false to disable
 
 [web]
 bind = "0.0.0.0:9090"
