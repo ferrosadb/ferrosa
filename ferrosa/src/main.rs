@@ -157,9 +157,11 @@ fn apply_internode_toml_overrides<F>(
 
 /// Resolve the graph-enabled flag honouring TOML when the env var is unset.
 ///
-/// Previously the binary only read `FERROSA_GRAPH_ENABLED`, so a user
-/// who set `[graph] enabled = true` in TOML saw the graph engine stay
-/// silently off — BUG-006.
+/// Defaults to ON (t_acc3c7fd): a fresh install should expose the full
+/// user-facing feature set, so the graph HTTP (7474) + Bolt (7687) endpoints
+/// come up by default. Opt out explicitly with `FERROSA_GRAPH_ENABLED=false`
+/// or `[graph] enabled = false`. (Env wins over TOML — historically the binary
+/// only read the env var, so a TOML-only `enabled` was silently ignored, BUG-006.)
 fn resolve_graph_enabled<F>(file_config: &toml::Value, env: F) -> bool
 where
     F: Fn(&str) -> Option<String>,
@@ -171,7 +173,26 @@ where
         .get("graph")
         .and_then(|s| s.get("enabled"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
+}
+
+/// Resolve the SPARQL-enabled flag honouring TOML when the env var is unset.
+///
+/// Defaults to ON (t_acc3c7fd) so a fresh install exposes the SPARQL 1.1
+/// endpoint (8080). Opt out with `FERROSA_SPARQL_ENABLED=false` or
+/// `[sparql] enabled = false`.
+fn resolve_sparql_enabled<F>(file_config: &toml::Value, env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = env("FERROSA_SPARQL_ENABLED") {
+        return v == "true" || v == "1";
+    }
+    file_config
+        .get("sparql")
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 /// Resolve the auth-enabled flag honouring TOML when the env var is unset.
@@ -1821,10 +1842,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 11. SPARQL endpoint (check FERROSA_SPARQL_ENABLED)
-    let sparql_enabled = std::env::var("FERROSA_SPARQL_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    // 11. SPARQL endpoint — on by default (t_acc3c7fd); env wins over TOML.
+    let sparql_enabled = resolve_sparql_enabled(&file_config, |k| std::env::var(k).ok());
 
     if sparql_enabled {
         let sparql_bind: std::net::SocketAddr = std::env::var("FERROSA_SPARQL_BIND")
@@ -2549,9 +2568,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_graph_enabled_defaults_false_when_unset_everywhere() {
+    fn resolve_graph_enabled_defaults_on_when_unset_everywhere() {
+        // t_acc3c7fd: a fresh install (no env, no TOML) exposes the graph engine.
         let toml = empty_config();
+        assert!(resolve_graph_enabled(&toml, |_| None));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_explicit_opt_out_is_honored() {
+        let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
         assert!(!resolve_graph_enabled(&toml, |_| None));
+        // env opt-out wins too.
+        let toml = empty_config();
+        assert!(!resolve_graph_enabled(&toml, |k| (k
+            == "FERROSA_GRAPH_ENABLED")
+            .then(|| "false".into())));
+    }
+
+    #[test]
+    fn resolve_sparql_enabled_defaults_on_with_explicit_opt_out() {
+        let toml = empty_config();
+        assert!(resolve_sparql_enabled(&toml, |_| None));
+        let toml: toml::Value = toml::from_str("[sparql]\nenabled = false\n").unwrap();
+        assert!(!resolve_sparql_enabled(&toml, |_| None));
+        let toml = empty_config();
+        assert!(!resolve_sparql_enabled(&toml, |k| (k
+            == "FERROSA_SPARQL_ENABLED")
+            .then(|| "false".into())));
     }
 
     /// Auth enabled via TOML.
