@@ -1217,7 +1217,7 @@ fn handle_options() -> HandleResult {
     // Encode a SUPPORTED string-multimap.
     // Format: [short n_keys]([short key_len][bytes key][short n_values]([short val_len][bytes val])*)*
     let mut body = BytesMut::new();
-    body.put_u16(2); // 2 keys
+    body.put_u16(3); // 3 keys
 
     // CQL_VERSION
     let key = b"CQL_VERSION";
@@ -1237,6 +1237,26 @@ fn handle_options() -> HandleResult {
     body.put_u16(val1.len() as u16);
     body.put_slice(val1);
     let val2 = b"snappy";
+    body.put_u16(val2.len() as u16);
+    body.put_slice(val2);
+
+    // PROTOCOL_VERSIONS
+    // v5 negotiation is accepted at the wire level but several v5-only query
+    // features (full query-parameter flag parsing, Skip_metadata/EXECUTE,
+    // Metadata_changed responses) are not yet complete. Until those land,
+    // advertise only v3/v4 so production drivers negotiate a fully supported
+    // version. v5 remains usable for explicit conformance testing.
+    //
+    // Format per native protocol v5 spec section 4.2.4: version number + slash +
+    // version description, e.g. "3/v3", "4/v4".
+    let key = b"PROTOCOL_VERSIONS";
+    body.put_u16(key.len() as u16);
+    body.put_slice(key);
+    body.put_u16(2); // 2 values: v3 and v4
+    let val1 = b"3/v3";
+    body.put_u16(val1.len() as u16);
+    body.put_slice(val1);
+    let val2 = b"4/v4";
     body.put_u16(val2.len() as u16);
     body.put_slice(val2);
 
@@ -3141,15 +3161,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_options_advertises_compression() {
+    fn handle_options_advertises_compression_and_protocol_versions() {
         let result = handle_options();
         match result {
             HandleResult::Reply(opcode, body) => {
                 assert_eq!(opcode, Opcode::Supported);
-                // Parse the string-multimap to verify COMPRESSION key.
+                // Parse the string-multimap to verify keys and values.
                 let mut cursor = &body[..];
                 let n_keys = cursor.get_u16();
-                assert_eq!(n_keys, 2);
+                assert_eq!(n_keys, 3);
 
                 // First key: CQL_VERSION
                 let key_len = cursor.get_u16() as usize;
@@ -3173,8 +3193,24 @@ mod tests {
                 cursor.advance(val_len);
                 let val_len = cursor.get_u16() as usize;
                 let val2 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                cursor.advance(val_len);
                 assert_eq!(val1, "lz4");
                 assert_eq!(val2, "snappy");
+
+                // Third key: PROTOCOL_VERSIONS
+                let key_len = cursor.get_u16() as usize;
+                let key = std::str::from_utf8(&cursor[..key_len]).unwrap();
+                cursor.advance(key_len);
+                assert_eq!(key, "PROTOCOL_VERSIONS");
+                let n_vals = cursor.get_u16();
+                assert_eq!(n_vals, 2);
+                let val_len = cursor.get_u16() as usize;
+                let val1 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                cursor.advance(val_len);
+                let val_len = cursor.get_u16() as usize;
+                let val2 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                assert_eq!(val1, "3/v3");
+                assert_eq!(val2, "4/v4");
             }
             _ => panic!("expected Reply"),
         }

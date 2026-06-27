@@ -403,6 +403,65 @@ async fn query_response_byte_matches_negotiated_version() {
     }
 }
 
+/// Build a v5-framed QUERY CqlFrame that mimics the DataStax Java driver's
+/// control-connection first query: `SELECT cluster_name FROM system.local`
+/// with `Page_size` and `Default_timestamp` query-parameter flags set.
+fn v5_query_frame_with_driver_flags(query: &str, stream_id: i16) -> CqlFrame {
+    let query_bytes = query.as_bytes();
+    let mut body = BytesMut::new();
+    body.put_i32(query_bytes.len() as i32);
+    body.put_slice(query_bytes);
+    body.put_u16(0x0001); // consistency ONE
+                          // v5 flags are a 4-byte [int]. Set Page_size (0x04) + Default_timestamp (0x20).
+    body.put_i32(0x0000_0024);
+    body.put_i32(5000); // page_size
+    body.put_i64(0); // default timestamp (milliseconds since epoch)
+
+    CqlFrame {
+        header: FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id,
+            opcode: Opcode::Query,
+            length: body.len() as u32,
+        },
+        body: body.freeze(),
+    }
+}
+
+/// A v5-framed simple QUERY must return a RESULT in v5 framing without dropping
+/// the connection. This mirrors the Java driver control connection's first query
+/// after STARTUP (`SELECT cluster_name FROM system.local`).
+#[tokio::test]
+async fn v5_framed_query_roundtrip_returns_result() {
+    let (addr, _dir) = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Legacy-envelope v5 STARTUP/READY handshake.
+    send_frame(&mut stream, &encode_startup_frame(0x05)).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.header.opcode, Opcode::Ready);
+    assert_eq!(resp.header.version, 0x85);
+
+    // Switch to v5 modern framing and send a SELECT against system.local.
+    send_v5_frame(
+        &mut stream,
+        v5_query_frame_with_driver_flags("SELECT cluster_name FROM system.local", 1),
+    )
+    .await;
+    let resp = read_v5_frame(&mut stream).await;
+    assert_v5_result(resp.clone());
+    assert_eq!(resp.header.version, 0x85, "v5 QUERY response must use 0x85");
+    assert_eq!(
+        resp.header.stream_id, 1,
+        "v5 QUERY response must preserve stream id"
+    );
+    // Body must be a Rows RESULT (kind 0x0002).
+    let mut cur = std::io::Cursor::new(&resp.body);
+    let kind = cur.get_i32();
+    assert_eq!(kind, 0x0002, "expected Rows result kind");
+}
+
 /// Parse the bind-variable metadata section of a PREPARED result and return
 /// the number of pk_indexes present. For v3 this must be 0 (field absent).
 fn parse_prepared_pk_count(body: &[u8], protocol_version: u8) -> usize {

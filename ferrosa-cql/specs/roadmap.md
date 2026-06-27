@@ -27,6 +27,17 @@ real backlog is structural and security-shaped.
 
 ## Next
 
+- **CQL native protocol v5 completeness** (follow-up to v3/v4/v5 conformance work).
+  The server now accepts v5, enables modern framing, and emits the v5
+  `result_metadata_id` in PREPARE responses. Remaining gaps before production
+  drivers can safely default to v5:
+  - Full query-parameter flag parsing for v5 QUERY/EXECUTE (page size,
+    default timestamp, serial consistency, keyspace override, `now_in_seconds`).
+  - `EXECUTE` `Skip_metadata` flag and `Metadata_changed` result-set metadata
+    responses.
+  - v5 error-body extensions (`WriteFailure`/`ReadFailure` endpoint maps).
+  - Continuous paging / backpressure.
+  Once these land, `handle_options()` can advertise v5 in `PROTOCOL_VERSIONS`.
 - **Complete LWT-on-Accord for non-cluster modes** (FMEA CQL-1). The CQL layer
   fails loud when `peer_manager`/`accord_clock` are absent; finish the coordinator
   driver (`fix/p0-03b-accord-network`, p0-03b gap) so standalone/pair-mode LWT

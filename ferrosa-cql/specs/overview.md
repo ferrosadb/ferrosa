@@ -103,6 +103,21 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 6. **16-byte TimeUUID from `now()`.** `eval_now()` guarantees a 16-byte encoding —
    a short one wedges TimeUUID-clustered tables at flush.
 
+## Native protocol version behavior
+
+- The wire codec accepts **v3, v4, and v5** request bytes and replies with the
+  negotiated response byte (`0x83`, `0x84`, or `0x85`).
+- **v6+ is rejected** with a `ProtocolVersionMismatch` error that advertises v5
+  as the greatest supported version.
+- The `SUPPORTED` response currently advertises **v3 and v4** in
+  `PROTOCOL_VERSIONS`. Production drivers therefore negotiate v4, which is fully
+  conformant today.
+- **v5 handshake and modern framing are implemented**, and the server emits the
+  v5 `result_metadata_id` in PREPARE responses. v5 can be used explicitly for
+  conformance testing and future driver support.
+- Remaining v5-only features not yet complete are tracked in
+  [roadmap.md](roadmap.md).
+
 ## Position in the dependency graph
 
 A hub, not a leaf. Depends on eleven sibling crates (`ferrosa-cdc`,
