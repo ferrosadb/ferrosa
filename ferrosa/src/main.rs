@@ -1934,11 +1934,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut delay = std::time::Duration::from_millis(500);
             let max_delay = std::time::Duration::from_secs(10);
 
+            // Track which seeds have successfully connected so we don't reconnect
+            // to already-connected peers on every retry cycle. Reconnecting to a
+            // live peer creates a new pool, shuts down the old pool's lane actors,
+            // and leaves stale TCP connections on the peer until it sends FIN.
+            // When another seed is down and the loop retries every 10s, this
+            // churns the live peer's connections until it hits max_connections
+            // and starts rejecting — "max connections reached". The lane actor's
+            // alive watcher handles reconnection if a live seed drops, so the
+            // seed loop only needs to handle initial connection.
+            let mut connected_seeds: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             'outer: loop {
                 tokio::time::sleep(delay).await;
 
+                let pending = seeds_to_connect(&seed_strs, &connected_seeds);
+                if pending.is_empty() {
+                    // All seeds connected.
+                    break 'outer;
+                }
                 let mut all_connected = true;
-                for seed in &seed_strs {
+                for seed in &pending {
                     // PriorityPool::connect resolves the hostname internally and
                     // stores the original string for DNS re-resolution on reconnect.
                     match ferrosa_net::pool::PriorityPool::connect(
@@ -1955,6 +1972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let seed_addr = pool.resolved_addr();
                             pm.add_peer((peer_host_id, seed_addr), pool).await;
                             tracing::info!(%seed, %peer_host_id, "seed connected");
+                            connected_seeds.insert(seed.clone());
                             continue; // This seed is done
                         }
                         Err(e) => {
@@ -2265,6 +2283,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("ferrosa stopped");
 
     Ok(())
+}
+
+/// Return the subset of `seeds` that have not yet been recorded in
+/// `connected`, preserving the original order.
+///
+/// Used by the seed-connect loop to avoid reconnecting to peers that are
+/// already connected. Reconnecting to a live peer every retry cycle churns
+/// the peer's connection pool: a new pool replaces the old one, the old
+/// pool's lane actors shut down, and stale TCP connections accumulate on
+/// the peer until it hits `max_connections` and starts rejecting inbound
+/// connections — "max connections reached". The lane actor's alive watcher
+/// handles reconnection if a live seed drops, so the seed loop only needs
+/// to drive the *initial* connection for each seed.
+fn seeds_to_connect(
+    seeds: &[String],
+    connected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    seeds
+        .iter()
+        .filter(|s| !connected.contains(*s))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -3075,5 +3115,75 @@ mod tests {
         let layer = ferrosa_cluster::telemetry::FerrosaTelemetryLayer::new(0.05);
         // After creation, no spans have been sampled.
         assert_eq!(layer.sampled(), 0);
+    }
+
+    // ---- Lane churn: seed loop must not reconnect to already-connected seeds ----
+
+    /// When one seed is down, the seed loop must not reconnect to the seed
+    /// that is already connected on every retry iteration. Reconnecting
+    /// churns the peer's pool (old lane actors shut down, stale TCP
+    /// connections accumulate) until the peer hits `max_connections` and
+    /// rejects new inbound connections — "max connections reached".
+    #[test]
+    fn seeds_to_connect_excludes_already_connected_seeds() {
+        let seeds = vec!["node2:7000".to_string(), "node3:7000".to_string()];
+        let mut connected = std::collections::HashSet::new();
+        connected.insert("node2:7000".to_string());
+
+        let pending = seeds_to_connect(&seeds, &connected);
+        assert_eq!(
+            pending,
+            vec!["node3:7000".to_string()],
+            "already-connected seed must not appear in the pending list"
+        );
+    }
+
+    /// With no seeds connected, all should be pending.
+    #[test]
+    fn seeds_to_connect_returns_all_when_none_connected() {
+        let seeds = vec!["node2:7000".to_string(), "node3:7000".to_string()];
+        let connected = std::collections::HashSet::new();
+
+        let pending = seeds_to_connect(&seeds, &connected);
+        assert_eq!(
+            pending, seeds,
+            "all seeds should be pending when none are connected"
+        );
+    }
+
+    /// Once all seeds are connected, the pending list should be empty —
+    /// the loop breaks immediately.
+    #[test]
+    fn seeds_to_connect_returns_empty_when_all_connected() {
+        let seeds = vec!["node2:7000".to_string(), "node3:7000".to_string()];
+        let mut connected = std::collections::HashSet::new();
+        connected.insert("node2:7000".to_string());
+        connected.insert("node3:7000".to_string());
+
+        let pending = seeds_to_connect(&seeds, &connected);
+        assert!(
+            pending.is_empty(),
+            "no seeds should be pending when all are connected"
+        );
+    }
+
+    /// The pending list must preserve the original seed order so that
+    /// retry behavior is deterministic across loop iterations.
+    #[test]
+    fn seeds_to_connect_preserves_seed_order() {
+        let seeds = vec![
+            "alpha:7000".to_string(),
+            "beta:7000".to_string(),
+            "gamma:7000".to_string(),
+        ];
+        let mut connected = std::collections::HashSet::new();
+        connected.insert("beta:7000".to_string());
+
+        let pending = seeds_to_connect(&seeds, &connected);
+        assert_eq!(
+            pending,
+            vec!["alpha:7000".to_string(), "gamma:7000".to_string()],
+            "remaining seeds must preserve original order"
+        );
     }
 }
