@@ -4,7 +4,7 @@
 # localhost:9042 (install via https://ferrosadb.com/install.sh first).
 #
 # SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory : docs/install-memory.sh).
-# It is mirrored into ferrosadb/ferrosa docs/install-memory.sh, which is what
+# It is mirrored into ferrosadb/ferrosa install/install-memory.sh, which is what
 # GitHub Pages serves at https://ferrosadb.com/install-memory.sh. Edit it HERE;
 # the ferrosa copy is a published mirror.
 #

@@ -1,7 +1,7 @@
 name: Install Smoke
 
 # User-grade install smoke: builds the release artifact ONCE per OS, then runs
-# the REAL docs/install.sh exactly as a documented user would — NON-ROOT,
+# the REAL install/install.sh exactly as a documented user would — NON-ROOT,
 # isolated $HOME, the bundled config, the documented launch — on macOS (arm64)
 # AND Linux. Covers fresh install, idempotent re-run, in-place upgrade that
 # PRESERVES the data dir, and partial-install recovery; the memory job also
@@ -93,7 +93,7 @@ jobs:
           name: ferrosa-tarball-${{ matrix.os }}
           path: prebuilt
       - name: Run the user-grade install smoke against the prebuilt tarball
-        # Installs the tarball via the real docs/install.sh (FERROSA_INSTALL_TARBALL)
+        # Installs the tarball via the real install/install.sh (FERROSA_INSTALL_TARBALL)
         # and asserts the daemon starts / serves / keeps its data across upgrade —
         # failing loud on a panic, an unbound port, or a dropped data dir. No
         # toolchain needed: --ferrosa-tarball skips the in-script build.
