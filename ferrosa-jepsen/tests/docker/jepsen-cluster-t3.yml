@@ -127,7 +127,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node1-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
@@ -176,7 +176,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node2-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
@@ -223,7 +223,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc1-node3-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
@@ -273,7 +273,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node1-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
@@ -320,7 +320,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node2-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
@@ -367,7 +367,7 @@ services:
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
     volumes:
       - jepsen-t3-dc2-node3-data:/var/lib/ferrosa
-    mem_limit: 1g
+    mem_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
       interval: 5s
