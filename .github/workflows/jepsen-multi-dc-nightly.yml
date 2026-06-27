@@ -125,7 +125,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run tier-multi-dc bank workload (prebuilt driver, no compile)
+      - name: Run tier-multi-dc 1h bank workload
         env:
           FERROSA_TEST_CONTAINERS: '1'
           # 10-min bank workload: 6 Docker containers on a 16 GB GitHub-hosted
