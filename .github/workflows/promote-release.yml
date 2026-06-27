@@ -86,3 +86,30 @@ jobs:
           NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
         # prerelease=false => release.yml marks it --latest (the stable channel).
         run: gh workflow run release.yml --ref "${NEXT_TAG}" -f prerelease=false
+
+      - name: Sync main's workspace version to the promoted release (PR)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_VERSION: ${{ steps.calc.outputs.next_version }}
+          NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
+        # Keep main's [workspace.package] version in step with the released tag
+        # instead of letting it drift. main is protected, so this opens a PR rather
+        # than pushing directly. Append-only + best-effort: the release is already
+        # cut above, so a failure here never blocks the release.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -q -B "chore/sync-version-${NEXT_TAG}" origin/main
+          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${NEXT_VERSION}"'"/s' Cargo.toml
+          cargo update -w >/dev/null 2>&1 || true
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "main already at ${NEXT_VERSION}; nothing to sync."
+            exit 0
+          fi
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): sync main version to ${NEXT_TAG}"
+          git push origin "chore/sync-version-${NEXT_TAG}"
+          gh pr create --base main --head "chore/sync-version-${NEXT_TAG}" \
+            --title "chore(release): sync main version to ${NEXT_TAG}" \
+            --body "Auto-opened by promote-release so main's version tracks stable ${NEXT_TAG} instead of drifting. Cosmetic; merge at convenience."
