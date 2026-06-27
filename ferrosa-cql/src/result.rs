@@ -238,6 +238,17 @@ pub fn encode_prepared(
     buf.put_u16(16u16);
     buf.put_slice(id);
 
+    // CQL native protocol v5 adds a result-set metadata ID between the prepared
+    // ID and the bind-variable metadata so clients can skip metadata on EXECUTE
+    // and detect metadata changes. v3/v4 do not have this field.
+    // See native_protocol_v5.spec section 4.2.5.4.
+    if protocol_version >= 5 {
+        // Re-use the prepared ID as the result metadata ID; it is a stable
+        // per-prepared-statement cache key.
+        buf.put_u16(16u16);
+        buf.put_slice(id);
+    }
+
     // Bind-variable metadata (includes pk_count + pk_indexes per CQL protocol v4+)
     encode_prepared_bind_metadata(
         &mut buf,

@@ -143,6 +143,80 @@ async fn send_frame(stream: &mut TcpStream, buf: &BytesMut) {
     stream.write_all(buf).await.unwrap();
 }
 
+/// Build a v5-framed QUERY CqlFrame (modern framing must be applied by the caller).
+fn v5_query_frame(query: &str, stream_id: i16) -> CqlFrame {
+    let query_bytes = query.as_bytes();
+    let mut body = BytesMut::new();
+    body.put_i32(query_bytes.len() as i32);
+    body.put_slice(query_bytes);
+    body.put_u16(0x0001); // consistency ONE
+    body.put_u8(0); // flags: none
+
+    CqlFrame {
+        header: FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id,
+            opcode: Opcode::Query,
+            length: body.len() as u32,
+        },
+        body: body.freeze(),
+    }
+}
+
+/// Build a v5-framed PREPARE CqlFrame (modern framing must be applied by the caller).
+fn v5_prepare_frame(query: &str, stream_id: i16) -> CqlFrame {
+    let query_bytes = query.as_bytes();
+    let mut body = BytesMut::new();
+    body.put_i32(query_bytes.len() as i32);
+    body.put_slice(query_bytes);
+
+    CqlFrame {
+        header: FrameHeader {
+            version: 0x05,
+            flags: 0,
+            stream_id,
+            opcode: Opcode::Prepare,
+            length: body.len() as u32,
+        },
+        body: body.freeze(),
+    }
+}
+
+/// Encode a single CqlFrame using a v5-framed codec.
+fn encode_v5_frame(frame: CqlFrame) -> BytesMut {
+    let mut codec = CqlCodec::new(1024 * 1024);
+    codec.enable_v5_framing();
+    let mut buf = BytesMut::new();
+    Encoder::encode(&mut codec, frame, &mut buf).unwrap();
+    buf
+}
+
+/// Send a v5-framed CqlFrame over an already-handshaked v5 connection.
+async fn send_v5_frame(stream: &mut TcpStream, frame: CqlFrame) {
+    let buf = encode_v5_frame(frame);
+    stream.write_all(&buf).await.unwrap();
+}
+
+/// Read one v5-framed CqlFrame from the stream.
+async fn read_v5_frame(stream: &mut TcpStream) -> CqlFrame {
+    let mut codec = CqlCodec::new(1024 * 1024);
+    codec.enable_v5_framing();
+    let mut rx = BytesMut::new();
+    loop {
+        let mut chunk = [0u8; 64];
+        let n = timeout(HANDSHAKE_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .expect("timed out reading v5 response")
+            .unwrap();
+        assert!(n > 0, "server closed connection during v5 framed read");
+        rx.extend_from_slice(&chunk[..n]);
+        if let Some(f) = Decoder::decode(&mut codec, &mut rx).unwrap() {
+            return f;
+        }
+    }
+}
+
 /// Parse an ERROR body and return (code, message).
 fn parse_error(body: &[u8]) -> (i32, String) {
     let mut cur = std::io::Cursor::new(body);
@@ -337,6 +411,13 @@ fn parse_prepared_pk_count(body: &[u8], protocol_version: u8) -> usize {
     let id_len = cur.get_u16() as usize;
     cur.advance(id_len); // skip prepared id
 
+    // CQL v5 inserts a result-set metadata ID (short bytes) between the
+    // prepared ID and the bind-variable metadata. v3/v4 do not.
+    if protocol_version >= 0x05 {
+        let metadata_id_len = cur.get_u16() as usize;
+        cur.advance(metadata_id_len);
+    }
+
     // Bind metadata
     let _flags = cur.get_i32();
     let _columns_count = cur.get_i32();
@@ -347,9 +428,7 @@ fn parse_prepared_pk_count(body: &[u8], protocol_version: u8) -> usize {
         pk_count
     } else {
         // v3: the next bytes are the keyspace string, not pk_count.
-        // Try to validate by reading the first u16 as a string length; if it
-        // were a pk_count it would be a tiny number followed by i16 indexes.
-        // We just report 0 pk_count because v3 has none.
+        // We report 0 pk_count because v3 has none.
         0
     }
 }
@@ -407,25 +486,7 @@ async fn prepare_metadata_includes_pk_indexes_for_v4() {
     let resp = read_frame(&mut stream).await;
     assert_eq!(resp.header.opcode, Opcode::Ready);
 
-    send_frame(
-        &mut stream,
-        &encode_query_frame(
-            0x04,
-            "CREATE KEYSPACE IF NOT EXISTS ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
-        ),
-    )
-    .await;
-    assert_result(&read_frame(&mut stream).await);
-
-    send_frame(
-        &mut stream,
-        &encode_query_frame(
-            0x04,
-            "CREATE TABLE IF NOT EXISTS ks.t (id int PRIMARY KEY, v text)",
-        ),
-    )
-    .await;
-    assert_result(&read_frame(&mut stream).await);
+    create_kv_table(&mut stream, 0x04).await;
 
     send_frame(
         &mut stream,
@@ -440,6 +501,111 @@ async fn prepare_metadata_includes_pk_indexes_for_v4() {
         pk_count, 1,
         "v4 PREPARE metadata must contain pk_count=1 for single-PK table"
     );
+}
+
+/// Helper: create keyspace and single-PK table using v5 modern framing.
+async fn create_kv_table_v5(stream: &mut TcpStream) {
+    send_v5_frame(stream, v5_query_frame(
+        "CREATE KEYSPACE IF NOT EXISTS ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        1,
+    ))
+    .await;
+    assert_v5_result(read_v5_frame(stream).await);
+
+    send_v5_frame(
+        stream,
+        v5_query_frame(
+            "CREATE TABLE IF NOT EXISTS ks.t (id int PRIMARY KEY, v text)",
+            2,
+        ),
+    )
+    .await;
+    assert_v5_result(read_v5_frame(stream).await);
+}
+
+/// Assert that a v5 CqlFrame is a RESULT; if it is ERROR, panic with details.
+fn assert_v5_result(frame: CqlFrame) {
+    if frame.header.opcode == Opcode::Error {
+        let mut cur = std::io::Cursor::new(&frame.body);
+        let code = cur.get_i32();
+        let msg_len = cur.get_u16() as usize;
+        let mut msg = vec![0u8; msg_len];
+        cur.copy_to_slice(&mut msg);
+        panic!(
+            "expected RESULT but got ERROR(0x{code:04X}): {}",
+            String::from_utf8_lossy(&msg)
+        );
+    }
+    assert_eq!(
+        frame.header.opcode,
+        Opcode::Result,
+        "expected RESULT opcode"
+    );
+}
+
+/// v5 PREPARE returns the same bind metadata as v4 plus a result-set metadata ID
+/// between the prepared ID and the bind metadata.
+#[tokio::test]
+async fn prepare_metadata_includes_result_metadata_id_for_v5() {
+    let (addr, _dir) = start_server().await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    send_frame(&mut stream, &encode_startup_frame(0x05)).await;
+    let resp = read_frame(&mut stream).await;
+    assert_eq!(resp.header.opcode, Opcode::Ready);
+
+    create_kv_table_v5(&mut stream).await;
+
+    send_v5_frame(
+        &mut stream,
+        v5_prepare_frame("INSERT INTO ks.t (id, v) VALUES (?, ?)", 3),
+    )
+    .await;
+    let resp = read_v5_frame(&mut stream).await;
+    assert_v5_result(resp.clone());
+    assert_eq!(resp.header.version, 0x85);
+
+    let mut cur = std::io::Cursor::new(&resp.body);
+    assert_eq!(cur.get_i32(), 0x0004, "prepared kind");
+    let id_len = cur.get_u16() as usize;
+    assert_eq!(id_len, 16, "prepared id length");
+    cur.advance(id_len);
+
+    // v5: result_metadata_id (short bytes) must immediately follow the prepared id.
+    let metadata_id_len = cur.get_u16() as usize;
+    assert_eq!(metadata_id_len, 16, "v5 result_metadata_id length");
+    cur.advance(metadata_id_len);
+
+    // Bind metadata should still decode correctly after the metadata id.
+    let flags = cur.get_i32();
+    assert_ne!(flags & 0x0001, 0, "Global_tables_spec flag must be set");
+    let columns_count = cur.get_i32();
+    assert_eq!(columns_count, 2, "two bind markers expected");
+    let pk_count = cur.get_i32() as usize;
+    assert_eq!(pk_count, 1, "single-PK table should report pk_count=1");
+}
+
+/// Helper: create keyspace and single-PK table for PREPARE metadata tests.
+async fn create_kv_table(stream: &mut TcpStream, version: u8) {
+    send_frame(
+        stream,
+        &encode_query_frame(
+            version,
+            "CREATE KEYSPACE IF NOT EXISTS ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        ),
+    )
+    .await;
+    assert_result(&read_frame(stream).await);
+
+    send_frame(
+        stream,
+        &encode_query_frame(
+            version,
+            "CREATE TABLE IF NOT EXISTS ks.t (id int PRIMARY KEY, v text)",
+        ),
+    )
+    .await;
+    assert_result(&read_frame(stream).await);
 }
 
 #[tokio::test]
