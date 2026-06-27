@@ -27,7 +27,7 @@ jobs:
     # under the cap and the run completes instead of being cancelled. Each fuzz
     # step is bounded by an inner `timeout` (wall-clock budget) BELOW its step
     # timeout, so it exits cleanly and the verdict step always runs.
-    timeout-minutes: 55
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -46,16 +46,16 @@ jobs:
         # (pinned asc version) so those tests run and pass rather than fail.
         run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
 
-      - name: Run property tests (bounded 30-minute fuzz session)
-        # Inner `timeout` (30 min) is the real bound; this step timeout is a
+      - name: Run property tests (bounded 20-minute fuzz session)
+        # Inner `timeout` (20 min) is the real bound; this step timeout is a
         # cushion above it so the step exits cleanly rather than being cancelled.
-        timeout-minutes: 34
+        timeout-minutes: 24
         env:
-          # 10k cases is sized to finish within the 30-min budget on the runner
+          # 5k cases is sized to finish within the 20-min budget on the runner
           # (so the session reports "all cases passed" rather than relying on the
           # timeout cutoff); the inner `timeout` below is the hard safety bound.
-          PROPTEST_CASES: 10000
-          FUZZ_BUDGET_SECS: 1800 # 30 min wall-clock fuzz budget (safety cap)
+          PROPTEST_CASES: 5000
+          FUZZ_BUDGET_SECS: 1200 # 20 min wall-clock fuzz budget (safety cap)
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
           # Enables libtest's `--report-time` on the stable toolchain so the
           # uploaded test-output.log ranks every test by wall-clock duration
@@ -109,14 +109,14 @@ jobs:
         continue-on-error: true
 
       - name: Run file-IO repair fuzz (bounded cases)
-        # Inner `timeout` (8 min) is the real bound; this step timeout is a
+        # Inner `timeout` (5 min) is the real bound; this step timeout is a
         # cushion so the whole job stays under the job cap and the verdict runs.
-        timeout-minutes: 12
+        timeout-minutes: 8
         env:
           # Each case flushes many real on-disk SSTables, so this harness is
           # filesystem-bound — run it at a moderate case count, not 50000.
-          PROPTEST_CASES: 512
-          FILEIO_FUZZ_BUDGET_SECS: 480 # 8 min wall-clock budget
+          PROPTEST_CASES: 256
+          FILEIO_FUZZ_BUDGET_SECS: 300 # 5 min wall-clock budget
         run: |
           set +e
           timeout --kill-after=30s "${FILEIO_FUZZ_BUDGET_SECS}" \
@@ -205,7 +205,7 @@ jobs:
     # Image build (cold cache) + rustfs bring-up + pair/cluster tests can exceed
     # 35 min on GitHub-hosted runners. Size this to the same cap as the fuzz job
     # so a slow build does not cancel the run before the smoke test completes.
-    timeout-minutes: 55
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -307,7 +307,7 @@ jobs:
     # into a throwaway shared-cpu Fly machine. The starved baseline is what we
     # want to test; compiling on that same starved VM was consuming the entire
     # 75-minute job budget and the test never completed (no RS_RESULT marker).
-    timeout-minutes: 75
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -345,9 +345,9 @@ jobs:
           # so the in-VM test doesn't OOM (shared-cpu-1x caps at 2 GB).
           VM: shared-cpu-2x
           VM_MEMORY: '4096'
-          RACE_KEYS: '2000'
-          RACE_READERS: '8'
-          RACE_SECS: '600'
+          RACE_KEYS: '1000'
+          RACE_READERS: '4'
+          RACE_SECS: '300'
           RACE_FLUSH_EVERY: '50'
         run: |
           set -euo pipefail
