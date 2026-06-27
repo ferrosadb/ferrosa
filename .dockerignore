@@ -6,4 +6,9 @@ docs/
 specs/
 *.md
 .claude/
+# Ignore dist/ generally, but keep the per-arch binaries that Dockerfile.release
+# COPYs from (dist/${TARGETARCH}/ferrosa, ferrosa-ctl). Without these exceptions
+# the GHCR container build fails: "/dist/arm64/ferrosa-ctl: not found".
 dist/
+!dist/amd64
+!dist/arm64
