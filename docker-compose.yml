@@ -68,8 +68,8 @@ services:
   node1:
     image: ${FERROSA_SMOKE_IMAGE:-ferrosa-smoke:latest}
     build:
-      context: .
-      dockerfile: tests/Dockerfile.smoke
+      context: ./tests
+      dockerfile: Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -106,8 +106,8 @@ services:
   node2:
     image: ferrosa-smoke:latest
     build:
-      context: .
-      dockerfile: tests/Dockerfile.smoke
+      context: ./tests
+      dockerfile: Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
@@ -138,8 +138,8 @@ services:
   node3:
     image: ferrosa-smoke:latest
     build:
-      context: .
-      dockerfile: tests/Dockerfile.smoke
+      context: ./tests
+      dockerfile: Dockerfile.smoke
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
