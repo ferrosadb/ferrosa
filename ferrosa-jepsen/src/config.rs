@@ -173,7 +173,13 @@ impl RunConfig {
     /// `JEPSEN_RUN_DURATION_SECS` env var overrides the tier default
     /// (used by nightly CI to fit the GitHub-hosted runner memory budget).
     pub fn run_duration_secs(&self) -> u64 {
-        if let Ok(v) = std::env::var("JEPSEN_RUN_DURATION_SECS") {
+        self.run_duration_secs_with_env(std::env::var("JEPSEN_RUN_DURATION_SECS").ok())
+    }
+
+    /// Same as `run_duration_secs` but with the env value injected. Separated
+    /// so tests can verify the override without racy `std::env::set_var`.
+    fn run_duration_secs_with_env(&self, env_val: Option<String>) -> u64 {
+        if let Some(v) = env_val {
             if let Ok(secs) = v.parse::<u64>() {
                 return secs;
             }
@@ -245,8 +251,6 @@ mod tests {
     /// concurrency, and a 1-hour run duration (overridable via env).
     #[test]
     fn multi_dc_tier_resolves_to_t3_one_hour() {
-        // Ensure the env override doesn't leak from other tests.
-        std::env::remove_var("JEPSEN_RUN_DURATION_SECS");
         let config = RunConfig {
             tier: Tier::MultiDc,
             topology: None,
@@ -270,8 +274,9 @@ mod tests {
             vec![Concurrency::Medium],
             "MultiDc tier uses medium concurrency"
         );
+        // With no env override, MultiDc is the 1-hour run.
         assert_eq!(
-            config.run_duration_secs(),
+            config.run_duration_secs_with_env(None),
             3_600,
             "MultiDc tier is the 1-hour run"
         );
@@ -280,7 +285,6 @@ mod tests {
     /// `JEPSEN_RUN_DURATION_SECS` env var overrides the tier default.
     #[test]
     fn run_duration_env_override() {
-        std::env::set_var("JEPSEN_RUN_DURATION_SECS", "600");
         let config = RunConfig {
             tier: Tier::MultiDc,
             topology: None,
@@ -295,10 +299,15 @@ mod tests {
             output_json: false,
         };
         assert_eq!(
-            config.run_duration_secs(),
+            config.run_duration_secs_with_env(Some("600".into())),
             600,
             "JEPSEN_RUN_DURATION_SECS should override the tier default"
         );
-        std::env::remove_var("JEPSEN_RUN_DURATION_SECS");
+        // Invalid env values fall back to the tier default.
+        assert_eq!(
+            config.run_duration_secs_with_env(Some("garbage".into())),
+            3_600,
+            "invalid env value should fall back to tier default"
+        );
     }
 }
