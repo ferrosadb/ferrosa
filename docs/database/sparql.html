@@ -284,9 +284,18 @@
 
   <table>
     <tr><th>Environment Variable</th><th>Default</th><th>Description</th></tr>
-    <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>false</code></td><td>Enable SPARQL endpoint</td></tr>
+    <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>true</code></td><td>SPARQL endpoint (8080) — on by default; set <code>false</code> to disable</td></tr>
     <tr><td><code>FERROSA_SPARQL_BIND</code></td><td><code>0.0.0.0:8080</code></td><td>SPARQL HTTP listen address</td></tr>
   </table>
+
+  <div class="note" style="margin-top:1.5rem">
+    <strong>Authentication &amp; authorization.</strong> The <code>/sparql</code> and <code>/sparql/update</code>
+    endpoints authenticate via HTTP Basic auth against Ferrosa roles and enforce
+    <em>per-keyspace</em> authorization — read (<code>SELECT</code>) for queries, write
+    (<code>MODIFY</code>) for updates. Requests without valid credentials are rejected.
+    Grant access with <code>GRANT&nbsp;SELECT/MODIFY&nbsp;ON&nbsp;KEYSPACE&nbsp;… TO&nbsp;role</code>.
+    When auth is disabled (development), the endpoint serves as superuser.
+  </div>
 
   <p style="margin-top: 4rem; color: var(--text-muted); font-size: 0.8rem;">
     Ferrosa SPARQL is currently in beta. Feature availability reflects the current release.
