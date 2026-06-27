@@ -273,17 +273,18 @@
   <h2 id="run">Run Ferrosa</h2>
 
   <h3>Minimal startup</h3>
-  <pre><span class="cm"># Start with defaults — CQL on :9042, operations console on :9090</span>
+  <pre><span class="cm"># Start with defaults — all user-facing endpoints come up:</span>
+<span class="cm"># CQL :9042 · Postgres :5432 · graph HTTP :7474 + Bolt :7687 · SPARQL :8080 · console :9090</span>
 <span class="kw">ferrosa</span></pre>
 
-  <h3>With graph engine enabled</h3>
-  <pre><span class="kw">FERROSA_GRAPH_ENABLED</span>=true ferrosa</pre>
+  <h3>Disable endpoints you don't need (reduce attack surface)</h3>
+  <pre><span class="cm"># Everything is on by default; opt out explicitly.</span>
+<span class="kw">FERROSA_GRAPH_ENABLED</span>=false <span class="kw">FERROSA_SPARQL_ENABLED</span>=false ferrosa</pre>
 
   <h3>Custom ports and auth disabled (development)</h3>
   <pre><span class="kw">FERROSA_CQL_BIND</span>=127.0.0.1:9042 \
 <span class="kw">FERROSA_WEB_BIND</span>=127.0.0.1:9090 \
 <span class="kw">FERROSA_AUTH_DISABLED</span>=true \
-<span class="kw">FERROSA_GRAPH_ENABLED</span>=true \
 ferrosa</pre>
 
   <div class="note">
@@ -305,8 +306,11 @@ ferrosa</pre>
     </thead>
     <tbody>
       <tr><td>CQL Server</td><td><code>9042</code></td><td>CQL native protocol (v4)</td></tr>
+      <tr><td>Postgres</td><td><code>5432</code></td><td>PostgreSQL v3 wire protocol (SCRAM-SHA-256)</td></tr>
       <tr><td>Web Console</td><td><code>9090</code></td><td>HTTP (REST API + static UI + WebSocket)</td></tr>
       <tr><td>Graph HTTP</td><td><code>7474</code></td><td>HTTP/JSON (Cypher queries)</td></tr>
+      <tr><td>Graph Bolt</td><td><code>7687</code></td><td>Bolt v5 (Neo4j drivers)</td></tr>
+      <tr><td>SPARQL</td><td><code>8080</code></td><td>SPARQL 1.1 protocol over HTTP</td></tr>
       <tr><td>Prometheus Metrics</td><td><code>9090/metrics</code></td><td>HTTP (text exposition)</td></tr>
       <tr><td>Internode (cluster)</td><td><code>17000</code></td><td>Custom binary protocol (changed from :7000 in v0.11.0 to avoid macOS ControlCenter conflict)</td></tr>
     </tbody>
@@ -438,13 +442,21 @@ session.execute(<span class="str">"""
       <tr><td><code>FERROSA_AUTH_WARN</code></td><td><code>false</code></td><td>Soak mode: log auth failures as warnings while still allowing requests</td></tr>
       <tr><td><code>FERROSA_AUTH_DISABLED</code></td><td><code>false</code></td><td>Development escape hatch that skips the CQL SASL handshake entirely</td></tr>
       <tr><td><code>FERROSA_SUPERUSER_PASSWORD</code></td><td>—</td><td>Optional override for the seeded <code>ferrosa_admin</code> password during bootstrap</td></tr>
-      <tr><td><code>FERROSA_GRAPH_ENABLED</code></td><td><code>false</code></td><td>Enable graph engine + HTTP endpoint</td></tr>
-      <tr><td><code>FERROSA_BOLT_PORT</code></td><td><code>7687</code></td><td>Bolt listener port when the graph engine is enabled</td></tr>
-      <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>false</code></td><td>Enable the SPARQL HTTP endpoint</td></tr>
+      <tr><td><code>FERROSA_GRAPH_ENABLED</code></td><td><code>true</code></td><td>Graph engine (HTTP 7474 + Bolt 7687) — on by default; set <code>false</code> to disable</td></tr>
+      <tr><td><code>FERROSA_BOLT_PORT</code></td><td><code>7687</code></td><td>Bolt listener port</td></tr>
+      <tr><td><code>FERROSA_SPARQL_ENABLED</code></td><td><code>true</code></td><td>SPARQL HTTP endpoint (8080) — on by default; set <code>false</code> to disable</td></tr>
       <tr><td><code>FERROSA_SPARQL_BIND</code></td><td><code>0.0.0.0:8080</code></td><td>SPARQL HTTP listen address</td></tr>
       <tr><td><code>RUST_LOG</code></td><td><code>info</code></td><td>Tracing filter (e.g. <code>debug</code>, <code>ferrosa_cql=trace</code>)</td></tr>
     </tbody>
   </table>
+
+  <div class="note">
+    <strong>Production safety gate.</strong> With <code>FERROSA_MODE=production</code>, Ferrosa
+    <em>refuses to start</em> if it would expose an unauthenticated or unencrypted surface —
+    notably authentication disabled or CQL TLS not required. This prevents accidentally
+    running an open admin surface in production; development mode stays permissive.
+    Client paging cursors are HMAC-signed so a forged cursor can't read another partition.
+  </div>
 
   <h3>Cluster, Internode, and Consensus</h3>
   <table>
@@ -657,6 +669,15 @@ session.execute(<span class="str">"""
 
   <!-- ── Operational Notes ── -->
   <h2 id="operational-notes">Operational Notes</h2>
+
+  <h3>Durable storage without S3 (single node)</h3>
+  <p>A single-node install no longer requires S3 to be durable. Point Ferrosa at a
+    local directory and it uses a durable local <code>file://</code> object-store backend —
+    flushed SSTables are persisted to that directory and treated as the source of truth
+    (eviction is disabled), so the corpus survives restarts on local disk alone:</p>
+  <pre><span class="kw">FERROSA_LOCAL_STORE_PATH</span>=~/.ferrosa/objectstore ferrosa</pre>
+  <p>This is ideal for laptops, single-VM, and air-gapped deployments. S3 remains the
+    recommended durable backend for multi-node clusters and off-host recovery.</p>
 
   <h3>S3 Storage Resilience</h3>
   <p>When S3 is configured as the durable backend, Ferrosa writes asynchronously to S3 via an

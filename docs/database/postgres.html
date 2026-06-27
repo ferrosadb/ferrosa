@@ -266,13 +266,14 @@ psql "host=127.0.0.1 port=5432 user=ferrosa_user dbname=ferrosa"
     <li>Values are converted per the target column type; out-of-range or type-mismatched values are rejected with a SQLSTATE error rather than coerced.</li>
     <li><code>NULL</code> deletes the cell (it reads back as SQL <code>NULL</code>, not <code>""</code> / <code>0</code>).</li>
     <li>Following Cassandra-storage semantics, <code>UPDATE</code> of a non-existent key is an upsert. The <code>WHERE</code> clause must specify the full primary key.</li>
+    <li><strong>Parameterized DML over the extended protocol:</strong> <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> accept <code>$N</code> bind parameters, and <code>INSERT … RETURNING</code> returns the written row — so ORMs that prepare statements (e.g. Ecto/Postgrex) drive inserts/updates/deletes the way they expect.</li>
   </ul>
 
   <!-- ── Transactions ── -->
   <h2 id="transactions">Transactions</h2>
   <p><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code> are honored at the protocol level: the connection moves through idle → in-transaction → (on error) failed, and a failed transaction rejects further statements with SQLSTATE <code>25P02</code> until <code>ROLLBACK</code>.</p>
   <div class="note">
-    <strong>In progress:</strong> multi-statement atomicity routes through Accord (Ferrosa's strict-serializable transaction engine). The protocol-state machine is complete; the atomic commit path is being wired up.
+    <strong>Atomic transactions:</strong> multi-statement transactions commit through Accord, Ferrosa's strict-serializable transaction engine. Writes inside <code>BEGIN</code>…<code>COMMIT</code> are buffered and applied <em>atomically</em> at <code>COMMIT</code>; <code>ROLLBACK</code> discards them, so nothing is ever partially applied. Atomic multi-statement <em>write</em> transactions require Accord (cluster mode); a standalone single node fails <code>COMMIT</code> loudly rather than apply non-atomically. Read-your-writes inside an open transaction is not yet supported.
   </div>
 
   <!-- ── Testing ── -->
@@ -289,8 +290,7 @@ psql "host=127.0.0.1 port=5432 user=ferrosa_user dbname=ferrosa"
   <table>
     <thead><tr><th>Feature</th><th>Status</th></tr></thead>
     <tbody>
-      <tr><td><code>$N</code> params in DML</td><td><span class="partial">in progress</span> — extended-protocol bind for writes</td></tr>
-      <tr><td><code>RETURNING</code> / <code>ON CONFLICT</code></td><td><span class="cross">planned</span></td></tr>
+      <tr><td><code>ON CONFLICT</code>, <code>UPDATE/DELETE … RETURNING</code>, <code>= ANY($N)</code></td><td><span class="cross">planned</span></td></tr>
       <tr><td><code>IS [NOT] NULL</code></td><td><span class="cross">planned</span></td></tr>
       <tr><td>Subqueries, <code>WITH</code>, <code>UNION</code>, window functions</td><td><span class="cross">not supported</span></td></tr>
       <tr><td>Non-<code>C</code> collations</td><td><span class="cross">v1 is <code>COLLATE "C"</code> only</span></td></tr>
