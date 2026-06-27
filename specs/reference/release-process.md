@@ -26,9 +26,21 @@ consumes them.
   - The CalVer/SemVer split makes the channel obvious in the releases list.
     `next-release-version.sh` only treats 3-segment `vX.Y.Z` tags as the stable
     base, so CalVer nightlies never pollute the version math.
-- **Releases are tag-only.** The version-bump commit lives on the tag, never on
-  `main`. `main`'s `Cargo.toml` version is therefore decorative between
-  releases; the released artifact always carries the correct version.
+- **Releases are tag-only.** The version-bump commit lives on the tag, never
+  directly on `main` (the `main` ruleset forbids direct pushes — see below). The
+  released artifact always carries the correct version.
+- **`main` is kept in step via a PR.** On a **stable promote**, `promote-release.yml`
+  opens a `chore(release): sync main version to vX.Y.Z` **pull request** that bumps
+  `main`'s `[workspace.package] version` to the promoted tag. This is cosmetic (the
+  release version is still derived from tags), but it stops `main` drifting behind
+  the latest release. Merge it at convenience; do **not** hand-edit the version in
+  an unrelated PR.
+- **`docs/LATEST` + the marketing-site version are release steps.** `docs/LATEST`
+  (the plain-text tag the install scripts fetch from `ferrosadb.com/LATEST`) and the
+  *descriptive* version strings on the site (`docs/index.html`, `docs/database/index.html`,
+  `docs/index.md`) are updated when a release is promoted. **`docs/LATEST` must only be
+  bumped once the release tarball exists** — pointing it at a tag with no built artifact
+  breaks `install.sh`. (Not yet automated; tracked separately.)
 - **Current promoted stable releases:** Ferrosa Database `v0.16.0`; Ferrosa
   Memory `v0.22.0`. Use GitHub's latest-release endpoint as the source of truth
   for installers and docs that need the current stable tag.
