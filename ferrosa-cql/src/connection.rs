@@ -1241,31 +1241,21 @@ fn handle_options() -> HandleResult {
     body.put_slice(val2);
 
     // PROTOCOL_VERSIONS
-    // v5 negotiation is accepted at the wire level but several v5-only query
-    // features (full query-parameter flag parsing, Skip_metadata/EXECUTE,
-    // Metadata_changed responses) are not yet complete. Until those land,
-    // advertise only v3/v4 so production drivers negotiate a fully supported
-    // version. v5 remains usable for explicit conformance testing.
-    //
-    // Format per native protocol v5 spec section 4.2.4: version number + slash +
-    // version description, e.g. "3/v3", "4/v4".
-    //
-    // We intentionally do not advertise v5 here yet. Ferrosa-CQL accepts v5
-    // STARTUP and responds correctly for explicit conformance testing, but the
-    // v5 modern-framed driver interop path still has gaps (e.g. complete
-    // v5 result metadata handling). Keeping the advertised max at v4 lets
-    // DataStax Java driver, cqlsh, and other default clients negotiate the
-    // well-tested v4 transport while we finish v5 conformance.
+    // Native protocol v3/v4/v5 are accepted. v5 modern framing is now
+    // compatible with the DataStax Java driver / native-protocol library.
     let key = b"PROTOCOL_VERSIONS";
     body.put_u16(key.len() as u16);
     body.put_slice(key);
-    body.put_u16(2); // 2 values: v3 and v4
+    body.put_u16(3); // 3 values: v3, v4, v5
     let val1 = b"3/v3";
     body.put_u16(val1.len() as u16);
     body.put_slice(val1);
     let val2 = b"4/v4";
     body.put_u16(val2.len() as u16);
     body.put_slice(val2);
+    let val3 = b"5/v5";
+    body.put_u16(val3.len() as u16);
+    body.put_slice(val3);
 
     HandleResult::Reply(Opcode::Supported, body)
 }
@@ -3210,14 +3200,19 @@ mod tests {
                 cursor.advance(key_len);
                 assert_eq!(key, "PROTOCOL_VERSIONS");
                 let n_vals = cursor.get_u16();
-                assert_eq!(n_vals, 2);
+                assert_eq!(n_vals, 3);
                 let val_len = cursor.get_u16() as usize;
                 let val1 = std::str::from_utf8(&cursor[..val_len]).unwrap();
                 cursor.advance(val_len);
                 let val_len = cursor.get_u16() as usize;
                 let val2 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                cursor.advance(val_len);
+                let val_len = cursor.get_u16() as usize;
+                let val3 = std::str::from_utf8(&cursor[..val_len]).unwrap();
+                cursor.advance(val_len);
                 assert_eq!(val1, "3/v3");
                 assert_eq!(val2, "4/v4");
+                assert_eq!(val3, "5/v5");
             }
             _ => panic!("expected Reply"),
         }

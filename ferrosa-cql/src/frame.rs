@@ -320,7 +320,7 @@ impl CqlCodec {
             src[crc32_start + 2],
             src[crc32_start + 3],
         ]);
-        let actual_crc32 = crc32_castagnoli(&src[payload_start..payload_end]);
+        let actual_crc32 = crc32_ieee_v5(&src[payload_start..payload_end]);
         if expected_crc32 != actual_crc32 {
             return Err(CqlError::Protocol(format!(
                 "v5 frame payload CRC32 mismatch: expected 0x{expected_crc32:08X}, \
@@ -683,6 +683,31 @@ fn crc32_castagnoli(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
+/// CRC32-IEEE used by CQL v5 frame payload checksums.
+///
+/// The DataStax Java driver/native-protocol library seeds the standard
+/// `java.util.zip.CRC32` with four magic bytes before updating it with the
+/// payload. The same seed must be used on encode and decode for v5 frames to
+/// interop.
+fn crc32_ieee_v5(data: &[u8]) -> u32 {
+    const CRC32_INIT: u32 = 0xFFFF_FFFF;
+    const CRC32_POLY: u32 = 0xEDB8_8320; // reflected IEEE polynomial
+    const MAGIC: &[u8] = &[0xFA, 0x2D, 0x55, 0xCA];
+
+    let mut crc = CRC32_INIT;
+    for &byte in MAGIC.iter().chain(data.iter()) {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ CRC32_POLY;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ CRC32_INIT
+}
+
 /// Encode a v5 frame around an envelope (header + body).
 ///
 /// Produces: [3-byte LE header][3-byte CRC24][payload][4-byte CRC32]
@@ -714,7 +739,7 @@ pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut Byt
     let payload_end = dst.len();
 
     // CRC32 of the payload
-    let crc32_val = crc32_castagnoli(&dst[payload_start..payload_end]);
+    let crc32_val = crc32_ieee_v5(&dst[payload_start..payload_end]);
     dst.put_u32_le(crc32_val);
 }
 
@@ -1278,6 +1303,44 @@ mod tests {
             ),
             "should be ProtocolVersionMismatch, got: {err}"
         );
+    }
+
+    /// Regression test for the DataStax Java driver v5 frame checksum.
+    ///
+    /// The Java driver's native-protocol library uses `java.util.zip.CRC32`
+    /// seeded with four magic bytes for the v5 frame payload checksum. This
+    /// test feeds the exact v5-framed QUERY bytes captured from a Java driver
+    /// control connection (`SELECT cluster_name FROM system.local`) and
+    /// asserts that our decoder accepts the frame instead of rejecting it with
+    /// a CRC mismatch.
+    #[test]
+    fn decodes_real_java_driver_v5_query_frame() {
+        // Captured from DataStax Java driver 4.18.1 after v5 STARTUP/READY.
+        // Frame layout: 3-byte LE header | 3-byte CRC24 | 9-byte envelope |
+        // payload | 4-byte CRC32.
+        #[rustfmt::skip]
+        let frame: Vec<u8> = vec![
+            0x38, 0x00, 0x02, 0x43, 0xa1, 0x53,
+            0x05, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x2f,
+            0x00, 0x00, 0x00, 0x25, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72, 0x5f, 0x6e,
+            0x61, 0x6d, 0x65, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73,
+            0x79, 0x73, 0x74, 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61,
+            0x6c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x12, 0xc2, 0x55, 0x69,
+        ];
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let mut buf = BytesMut::from(&frame[..]);
+        let decoded = codec
+            .decode(&mut buf)
+            .expect("v5 frame should decode without CRC error")
+            .expect("v5 frame should produce a complete envelope");
+        assert_eq!(decoded.header.version, 0x05);
+        assert_eq!(decoded.header.opcode, Opcode::Query);
+        assert_eq!(decoded.header.stream_id, 0);
+        assert_eq!(decoded.header.flags, 0);
     }
 
     #[test]
