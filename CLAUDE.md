@@ -38,7 +38,7 @@ cargo fmt --check                    # Format check
 
 ## Directory Layout
 
-- **`docs/`** — PUBLIC marketing site (ferrosadb.com) via GitHub Pages. HTML/CSS/SVG only. **Never put specs, rustdoc, or internal content here.**
+- **`docs/`** — **The marketing site moved to its own repo, [`ferrosadb/ferrosa-docs`](https://github.com/ferrosadb/ferrosa-docs)** (serves `www.ferrosadb.com`), so doc edits don't go through this repo's full CI. **Edit marketing pages there, not here.** What remains under `docs/` is only CI-tested artifacts: the install scripts (`install.sh`/`setup*.sh`/`LATEST`, exercised by `install-smoke`) and the generated CQL example HTML (`docs/database/examples/`, produced by `make -C examples html` and checked by `docs-examples.yml`). (Tracked: relocate those too — `t_9d49bd02`.)
 - **`specs/`** — Internal architecture specs, threat models, plans, proposed/open work, and evidence indexes. See [specs/README.md](specs/README.md).
 - **`specs/proposed/`** — Design proposals and investigations, not implemented release claims.
 - **`specs/todo/`** — Open work items awaiting implementation or triage.
