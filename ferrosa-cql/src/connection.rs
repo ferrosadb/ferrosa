@@ -1249,6 +1249,13 @@ fn handle_options() -> HandleResult {
     //
     // Format per native protocol v5 spec section 4.2.4: version number + slash +
     // version description, e.g. "3/v3", "4/v4".
+    //
+    // We intentionally do not advertise v5 here yet. Ferrosa-CQL accepts v5
+    // STARTUP and responds correctly for explicit conformance testing, but the
+    // v5 modern-framed driver interop path still has gaps (e.g. complete
+    // v5 result metadata handling). Keeping the advertised max at v4 lets
+    // DataStax Java driver, cqlsh, and other default clients negotiate the
+    // well-tested v4 transport while we finish v5 conformance.
     let key = b"PROTOCOL_VERSIONS";
     body.put_u16(key.len() as u16);
     body.put_slice(key);
