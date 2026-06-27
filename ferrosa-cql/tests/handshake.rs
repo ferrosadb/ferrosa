@@ -2192,40 +2192,19 @@ async fn query_with_bind_values_allow_filtering() {
     );
 }
 
-// ── CQL v4-cap negotiation tests ─────────────────────────────────────────
+// ── CQL v5 negotiation tests ────────────────────────────────────────────────
 //
-// ferrosa caps the native protocol at v4. v5 added a modern framing layer that
-// drivers implement inconsistently (gocql sends plain legacy envelopes at v5;
-// the DataStax Java driver sends CRC-checksummed modern frames), so no single
-// server framing mode serves both. The server therefore rejects any v5 STARTUP
-// with a protocol-version ERROR advertising `supported = 4`, and every
-// well-behaved driver falls back to the one well-tested v4 transport. Proper v5
-// modern framing is tracked as future work.
+// Ferrosa-CQL now accepts native protocol v5. The STARTUP/READY exchange still
+// uses legacy 9-byte envelopes; after READY the connection switches to modern
+// v5 framing (length-prefixed segments with per-segment CRCs). This keeps legacy
+// drivers working for the handshake while letting v5-aware clients use the full
+// modern transport afterwards.
 
-/// Parse the `[string]` message out of a CQL ERROR frame body
-/// (`[i32 code][u16 len][utf8 bytes]`).
-fn parse_error_message(body: &[u8]) -> String {
-    assert!(
-        body.len() >= 6,
-        "ERROR body too short to hold a message: {} bytes",
-        body.len()
-    );
-    let len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
-    assert!(
-        body.len() >= 6 + len,
-        "ERROR body truncated: need {} bytes, have {}",
-        6 + len,
-        body.len()
-    );
-    String::from_utf8_lossy(&body[6..6 + len]).into_owned()
-}
-
-/// A v5 STARTUP must be rejected with a protocol-version ERROR (code 0x000A),
-/// itself framed as v4 (0x84) so the driver can read it, advertising v4 as the
-/// greatest supported version. The server must NOT reply READY at v5 — that
-/// would leave a v5 driver expecting modern framing the server can't speak.
+/// A v5 STARTUP now completes the handshake and replies READY at 0x85. The
+/// handshake itself still uses legacy 9-byte envelopes; modern v5 framing is
+/// enabled only after READY/ERROR.
 #[tokio::test]
-async fn v5_startup_is_rejected_to_force_v4_fallback() {
+async fn v5_startup_is_accepted_and_replies_ready_at_v5() {
     let (state, _dir) = setup_state();
     let server = CqlServer::new(test_config(true), state);
     let addr = server.start_background().await.unwrap();
@@ -2235,45 +2214,18 @@ async fn v5_startup_is_rejected_to_force_v4_fallback() {
     // Send a v5 STARTUP (version byte 0x05 + USE_BETA flag).
     stream.write_all(&encode_startup_frame_v5()).await.unwrap();
 
-    // The server rejects v5 at decode and replies with a v4-framed ERROR.
+    // The server now supports v5: STARTUP → READY at 0x85.
     let resp = read_frame(&mut stream).await;
     assert_eq!(
         resp.opcode,
-        Opcode::Error,
-        "v5 STARTUP must be rejected with an ERROR, not accepted with READY"
+        Opcode::Ready,
+        "v5 STARTUP must be accepted with READY"
     );
     assert_eq!(
-        resp.header.version, 0x84,
-        "the rejection ERROR must be framed as v4 (0x84) so the driver can read it"
-    );
-    let error_code = i32::from_be_bytes(resp.body[0..4].try_into().unwrap());
-    assert_eq!(
-        error_code, 0x000A,
-        "protocol-version rejection must use error code 0x000A (protocol error)"
-    );
-    let msg = parse_error_message(&resp.body);
-    assert!(
-        msg.contains("greatest is 4"),
-        "rejection must advertise v4 as the greatest supported version; got: {msg}"
+        resp.header.version, 0x85,
+        "the READY response must carry negotiated v5 byte 0x85"
     );
 }
-
-// ── P0-22 regression: PREPARE response must carry bind-marker column metadata ──
-//
-// The CQL native protocol PREPARE response (RESULT/Prepared body) includes a
-// "bind-variable metadata" section that reports how many `?` placeholders the
-// statement has and what type each one maps to.  This metadata is:
-//
-//   [i32 flags] [i32 col_count] [i32 pk_count] [pk_indexes...] [ks] [tbl]
-//   [for each bind col: col_name_str + type_id_u16]
-//
-// Strict CQL drivers (scylla Rust driver, DataStax Java/C#, gocql, Python
-// cassandra-driver) read `col_count` and reject execute_unpaged when the
-// caller supplies a different number of values (WrongColumnCount).  The
-// cdrs-tokio fork used by fmem pre-p1-22 was lenient and ignored this.
-//
-// These tests assert the col_count from the raw PREPARE response body so that
-// any future regression is caught before it reaches a strict external driver.
 
 /// Parse the bind-variable `col_count` from a RESULT/Prepared body.
 ///
@@ -2541,10 +2493,10 @@ async fn prepare_no_bind_markers_reports_col_count_zero() {
     );
 }
 
-/// On the same server, a v4 connection succeeds while a v5 connection is
-/// rejected — the two do NOT coexist under the v4 cap.
+/// On the same server, v4 and v5 connections both succeed and negotiate
+/// independent response versions.
 #[tokio::test]
-async fn v4_works_and_v5_is_rejected_on_same_server() {
+async fn v4_and_v5_connections_work_on_same_server() {
     let (state, _dir) = setup_state();
     let server = CqlServer::new(test_config(true), state);
     let addr = server.start_background().await.unwrap();
@@ -2556,19 +2508,14 @@ async fn v4_works_and_v5_is_rejected_on_same_server() {
     assert_eq!(ready4.opcode, Opcode::Ready);
     assert_eq!(ready4.header.version, 0x84, "v4 response should be 0x84");
 
-    // v5 connection: STARTUP → protocol-version ERROR, forcing the driver to
-    // retry at v4.
+    // v5 connection: STARTUP → READY at 0x85.
     let mut v5 = TcpStream::connect(addr).await.unwrap();
     v5.write_all(&encode_startup_frame_v5()).await.unwrap();
     let resp5 = read_frame(&mut v5).await;
     assert_eq!(
         resp5.opcode,
-        Opcode::Error,
-        "v5 must be rejected, not accepted alongside v4"
+        Opcode::Ready,
+        "v5 must be accepted alongside v4"
     );
-    let error_code = i32::from_be_bytes(resp5.body[0..4].try_into().unwrap());
-    assert_eq!(
-        error_code, 0x000A,
-        "v5 rejection must use error code 0x000A (protocol error)"
-    );
+    assert_eq!(resp5.header.version, 0x85, "v5 response should be 0x85");
 }

@@ -229,6 +229,7 @@ pub fn encode_prepared(
     keyspace: &str,
     table: &str,
     pk_indexes: &[u16],
+    protocol_version: u8,
 ) -> BytesMut {
     let mut buf = BytesMut::new();
     buf.put_i32(0x0004); // Prepared kind
@@ -245,6 +246,7 @@ pub fn encode_prepared(
         keyspace,
         table,
         pk_indexes,
+        protocol_version,
     );
 
     // Result-column metadata
@@ -282,6 +284,9 @@ fn encode_string(buf: &mut BytesMut, s: &str) {
 /// to its 0-based position in the bind variable list — this enables
 /// token-aware routing in CQL drivers. An empty `pk_indexes` writes
 /// `pk_count=0`, which disables token-aware routing.
+///
+/// CQL v3 omitted `pk_count`/`pk_indexes`; when `protocol_version` is `3`,
+/// this function writes only the v3 bind-metadata layout.
 fn encode_prepared_bind_metadata(
     buf: &mut BytesMut,
     column_names: &[String],
@@ -289,12 +294,15 @@ fn encode_prepared_bind_metadata(
     keyspace: &str,
     table: &str,
     pk_indexes: &[u16],
+    protocol_version: u8,
 ) {
     buf.put_i32(0x0001); // flags: Global_tables_spec
     buf.put_i32(column_names.len() as i32);
-    buf.put_i32(pk_indexes.len() as i32);
-    for &idx in pk_indexes {
-        buf.put_i16(idx as i16);
+    if protocol_version >= 4 {
+        buf.put_i32(pk_indexes.len() as i32);
+        for &idx in pk_indexes {
+            buf.put_i16(idx as i16);
+        }
     }
     encode_string(buf, keyspace);
     encode_string(buf, table);
@@ -605,6 +613,7 @@ mod tests {
             "ks",
             "t",
             &[0], // PK column "k" is at bind variable index 0
+            4,
         );
         assert_eq!(&buf[0..4], &0x0004i32.to_be_bytes());
         // Verify ID follows
@@ -640,6 +649,7 @@ mod tests {
             keyspace,
             table,
             &[0], // PK column "id" is at bind variable index 0
+            4,
         );
 
         // --- Parse forward ---
@@ -738,6 +748,7 @@ mod tests {
             "ks",
             "t",
             &[], // no PK indexes — disables token-aware routing
+            4,
         );
 
         // Skip to bind metadata: kind(4) + id_len(2) + id(16) = offset 22
@@ -766,6 +777,7 @@ mod tests {
             "ks",
             "t",
             &[0, 2], // PK columns at bind indexes 0 and 2
+            4,
         );
 
         // Skip to bind metadata: kind(4) + id_len(2) + id(16) = offset 22
@@ -803,6 +815,7 @@ mod tests {
             "test_ks",
             "test_bool",
             &[0], // PK "id" at bind index 0
+            4,
         );
 
         let mut pos = 0usize;

@@ -1,9 +1,9 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-06-27
 executive_summary: >
-  The CQL native-protocol (v4/v5) server and the largest, most central crate in
+  The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
   codec, SASL auth, lexer/parser, query routing into schema and storage, result
   encoding, prepared statements, pagination, LWT over Accord, and the streaming
@@ -19,8 +19,9 @@ executive_summary: >
 from the raw TCP socket to the storage engine: it decodes CQL binary frames,
 authenticates, parses CQL text into an AST, routes statements through the schema
 and storage engines, and encodes result sets back onto the wire. It speaks the
-Cassandra native protocol (negotiating v4 for responses, accepting v5 requests)
-so unmodified CQL drivers connect to it.
+Cassandra native protocol (negotiating v3/v4/v5 for responses, rejecting v6+
+requests with a protocol-version mismatch that advertises supported v5) so
+unmodified CQL drivers connect to it.
 
 It is deliberately the **integration hub** rather than a leaf: it depends on
 eleven sibling crates and turns a wire frame into a storage mutation/read. The

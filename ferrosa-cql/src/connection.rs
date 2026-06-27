@@ -26,7 +26,9 @@ use crate::auth::{
 };
 use crate::bridge;
 use crate::error::CqlError;
-use crate::frame::{Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_RESPONSE};
+use crate::frame::{
+    Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_REQUEST, VERSION_RESPONSE,
+};
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
 use crate::result;
@@ -267,9 +269,8 @@ pub(crate) async fn handle_connection<S>(
     ));
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
-    let mut client_use_beta: bool = false; // USE_BETA flag (0x10) in STARTUP
+    let mut response_version: u8 = VERSION_RESPONSE; // default v4 until negotiated
 
-    // Channel for subscription tasks to push streaming frames.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
 
     // In-flight request limiter: bounds concurrent requests on this connection.
@@ -312,7 +313,7 @@ pub(crate) async fn handle_connection<S>(
                         let body = err.encode_body();
                         let resp = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id: 0,
                                 opcode: Opcode::Error,
@@ -399,7 +400,7 @@ pub(crate) async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: response_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -417,11 +418,10 @@ pub(crate) async fn handle_connection<S>(
                     None
                 };
 
-                // Track the client's protocol version and USE_BETA flag
-                // from the STARTUP frame.
+                // Track the client's protocol version from the STARTUP frame.
                 if matches!(phase, ConnectionPhase::AwaitingStartup) {
                     client_protocol_version = maybe_frame.header.version;
-                    client_use_beta = maybe_frame.header.flags & 0x10 != 0;
+                    response_version = client_protocol_version | 0x80;
                 }
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
@@ -433,11 +433,8 @@ pub(crate) async fn handle_connection<S>(
                 // multiplexed one (matching CQL native protocol semantics).
                 if was_ready && dispatches_concurrently(maybe_frame.header.opcode) {
                     let permit = acquired_permit.expect("permit acquired above for request opcode");
-                    let response_version = if client_protocol_version >= 0x05 {
-                        0x85
-                    } else {
-                        VERSION_RESPONSE
-                    };
+                    // Snapshot the negotiated response version for the spawned task.
+                    let response_version_for_spawn = response_version;
                     let opcode = maybe_frame.header.opcode;
                     let proto_version = client_protocol_version;
                     let body = maybe_frame.body.clone();
@@ -471,6 +468,7 @@ pub(crate) async fn handle_connection<S>(
                                         &mut ks_for_handler,
                                         &state_clone,
                                         &body,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -502,17 +500,16 @@ pub(crate) async fn handle_connection<S>(
                         })
                         .instrument(request_span)
                         .await;
-                        let keyspace_after = if ks_for_handler != ks_at_spawn {
-                            Some(ks_for_handler)
-                        } else {
-                            None
-                        };
                         let _ = resp_tx
                             .send(SpawnedResponse {
-                                stream_id,
                                 result,
-                                response_version,
-                                keyspace_after,
+                                stream_id,
+                                response_version: response_version_for_spawn,
+                                keyspace_after: if ks_for_handler != ks_at_spawn {
+                                    Some(ks_for_handler)
+                                } else {
+                                    None
+                                },
                                 bump_request_counter: true,
                                 _permit: permit,
                             })
@@ -583,12 +580,6 @@ pub(crate) async fn handle_connection<S>(
                         }
 
                         let body_bytes = body.freeze();
-                        // Use the correct response version: 0x84 for v4, 0x85 for v5.
-                        let response_version = if client_protocol_version >= 0x05 {
-                            0x85
-                        } else {
-                            VERSION_RESPONSE // 0x84
-                        };
                         if opcode == Opcode::Error {
                             log_error_reply_body(
                                 "inline-reply",
@@ -621,16 +612,15 @@ pub(crate) async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // Stay on legacy (unframed) envelope transport for
-                            // all clients. Real drivers that negotiate v5 —
-                            // including ones that set USE_BETA (0x10), like
-                            // gocql and the DataStax Java driver — send plain
-                            // 9-byte envelopes, NOT CRC24/CRC32 modern frames.
-                            // Switching to modern framing on USE_BETA misreads
-                            // their legacy envelopes (a v5 frame-header CRC24
-                            // mismatch on every request). v5 message semantics
-                            // ride over the legacy transport.
-                            let _ = client_use_beta;
+                            // For native protocol v5, switch to the modern framed
+                            // transport after the STARTUP/READY exchange. The
+                            // handshake itself (STARTUP + READY/ERROR) still uses
+                            // the legacy 9-byte envelope so the version can be
+                            // agreed before framing is active.
+                            if client_protocol_version == VERSION_REQUEST {
+                                debug!("enabling v5 modern framing for {peer}");
+                                framed.codec_mut().enable_v5_framing();
+                            }
                         }
                     }
                     HandleResult::StartSubscription {
@@ -654,7 +644,7 @@ pub(crate) async fn handle_connection<S>(
                                     let body = err.encode_body().freeze();
                                     let frame = CqlFrame {
                                         header: FrameHeader {
-                                            version: VERSION_RESPONSE,
+                                            version: response_version,
                                             flags: 0,
                                             stream_id,
                                             opcode: Opcode::Error,
@@ -681,7 +671,7 @@ pub(crate) async fn handle_connection<S>(
                             let body = err.encode_body().freeze();
                             let frame = CqlFrame {
                                 header: FrameHeader {
-                                    version: VERSION_RESPONSE,
+                                    version: response_version,
                                     flags: 0,
                                     stream_id,
                                     opcode: Opcode::Error,
@@ -699,7 +689,7 @@ pub(crate) async fn handle_connection<S>(
                         let ack_body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -757,7 +747,7 @@ pub(crate) async fn handle_connection<S>(
                         let body = crate::result::encode_void().freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Result,
@@ -773,7 +763,7 @@ pub(crate) async fn handle_connection<S>(
                         let body_bytes = body.freeze();
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id,
                                 opcode,
@@ -874,7 +864,7 @@ where
                         );
                         let frame = CqlFrame {
                             header: FrameHeader {
-                                version: VERSION_RESPONSE,
+                                version: response_version,
                                 flags: 0,
                                 stream_id,
                                 opcode: Opcode::Error,
@@ -895,7 +885,7 @@ where
                 let err = CqlError::Invalid(msg.to_string());
                 let frame = CqlFrame {
                     header: FrameHeader {
-                        version: VERSION_RESPONSE,
+                        version: response_version,
                         flags: 0,
                         stream_id,
                         opcode: Opcode::Error,
@@ -908,7 +898,7 @@ where
             let ack_body = crate::result::encode_void().freeze();
             let frame = CqlFrame {
                 header: FrameHeader {
-                    version: VERSION_RESPONSE,
+                    version: response_version,
                     flags: 0,
                     stream_id,
                     opcode: Opcode::Result,
@@ -960,7 +950,7 @@ where
             subscription_state.cancel(sub_id);
             let frame = CqlFrame {
                 header: FrameHeader {
-                    version: VERSION_RESPONSE,
+                    version: response_version,
                     flags: 0,
                     stream_id,
                     opcode: Opcode::Result,
@@ -973,7 +963,7 @@ where
         HandleResult::Close(opcode, body) => {
             let frame = CqlFrame {
                 header: FrameHeader {
-                    version: VERSION_RESPONSE,
+                    version: response_version,
                     flags: 0,
                     stream_id,
                     opcode,
@@ -1101,7 +1091,14 @@ async fn handle_frame(
                 .await
             }
             Opcode::Prepare => {
-                handle_prepare(auth_context, current_keyspace, state, &frame.body).await
+                handle_prepare(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Execute => {
                 handle_execute(
@@ -1440,6 +1437,7 @@ async fn handle_query(
             keyspace: current_keyspace.clone(),
             result_columns: Vec::new(),
             bound_columns,
+            pk_indexes: Vec::new(),
             table_keyspace: table_ks,
             table_name,
         };
@@ -1504,6 +1502,7 @@ pub(crate) async fn handle_prepare(
     current_keyspace: &mut Option<String>,
     state: &SharedState,
     body: &Bytes,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query]
     if body.len() < 4 {
@@ -1529,7 +1528,10 @@ pub(crate) async fn handle_prepare(
     let id = PreparedCache::compute_id(query);
     if let Some(plan) = state.prepared_cache.get(&id) {
         if plan.query == query && plan.keyspace.as_ref() == current_keyspace.as_ref() {
-            return HandleResult::Reply(Opcode::Result, encode_prepared_plan(&plan));
+            return HandleResult::Reply(
+                Opcode::Result,
+                encode_prepared_plan(&plan, protocol_version),
+            );
         }
     }
 
@@ -1604,16 +1606,42 @@ pub(crate) async fn handle_prepare(
         keyspace: current_keyspace.clone(),
         result_columns: result_columns.clone(),
         bound_columns: bound_columns.clone(),
+        pk_indexes: compute_pk_indexes(&table_ks, &table_name, &bound_columns, state),
         table_keyspace: table_ks.clone(),
         table_name: table_name.clone(),
     };
 
-    let result_body = encode_prepared_plan(&plan);
+    let result_body = encode_prepared_plan(&plan, protocol_version);
     state.prepared_cache.insert(plan);
     HandleResult::Reply(Opcode::Result, result_body)
 }
 
-fn encode_prepared_plan(plan: &PreparedPlan) -> BytesMut {
+fn compute_pk_indexes(
+    table_ks: &str,
+    table_name: &str,
+    bound_columns: &[(String, CqlType)],
+    state: &SharedState,
+) -> Vec<u16> {
+    if table_ks.is_empty() || table_name.is_empty() {
+        return Vec::new();
+    }
+    let snap = state.schema.snapshot();
+    let Some(table_meta) = snap
+        .tables
+        .get(&(table_ks.to_string(), table_name.to_string()))
+    else {
+        return Vec::new();
+    };
+    let mut pk_indexes = Vec::new();
+    for pk_col in &table_meta.partition_key {
+        if let Some(pos) = bound_columns.iter().position(|(name, _)| name == pk_col) {
+            pk_indexes.push(pos as u16);
+        }
+    }
+    pk_indexes
+}
+
+fn encode_prepared_plan(plan: &PreparedPlan, protocol_version: u8) -> BytesMut {
     let bound_names: Vec<String> = plan.bound_columns.iter().map(|(n, _)| n.clone()).collect();
     let bound_types: Vec<CqlType> = plan.bound_columns.iter().map(|(_, t)| t.clone()).collect();
     let result_names: Vec<String> = plan.result_columns.iter().map(|(n, _)| n.clone()).collect();
@@ -1627,7 +1655,8 @@ fn encode_prepared_plan(plan: &PreparedPlan) -> BytesMut {
         &result_types,
         &plan.table_keyspace,
         &plan.table_name,
-        &[],
+        &plan.pk_indexes,
+        protocol_version,
     )
 }
 
@@ -1808,6 +1837,7 @@ async fn handle_batch(
                 keyspace: current_keyspace.clone(),
                 result_columns: Vec::new(),
                 bound_columns,
+                pk_indexes: Vec::new(),
                 table_keyspace: table_ks,
                 table_name,
             };
@@ -2969,6 +2999,7 @@ mod tests {
             keyspace: None,
             result_columns: vec![("keyspace_name".to_string(), CqlType::Varchar)],
             bound_columns: Vec::new(),
+            pk_indexes: Vec::new(),
             table_keyspace: "system_schema".to_string(),
             table_name: "keyspaces".to_string(),
         });
@@ -2977,7 +3008,7 @@ mod tests {
         body.put_i32(query.len() as i32);
         body.put_slice(query.as_bytes());
 
-        let result = handle_prepare(&mut None, &mut None, &state, &body.freeze()).await;
+        let result = handle_prepare(&mut None, &mut None, &state, &body.freeze(), 4).await;
         match result {
             HandleResult::Reply(Opcode::Result, body) => {
                 assert_eq!(&body[0..4], &0x0004i32.to_be_bytes());
@@ -3223,6 +3254,7 @@ mod tests {
                 .into_iter()
                 .map(|(n, t)| (n.to_string(), t))
                 .collect(),
+            pk_indexes: Vec::new(),
             table_keyspace: table_ks,
             table_name,
         }

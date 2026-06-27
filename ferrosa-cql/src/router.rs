@@ -15122,6 +15122,7 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
+            4,
         )
         .await;
         match result {
@@ -15426,6 +15427,7 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
+            4,
         )
         .await;
         match result {
@@ -15497,6 +15499,7 @@ mod tests {
             &mut Some("ks".into()),
             &state,
             &body.freeze(),
+            4,
         )
         .await;
         match result {
@@ -19127,9 +19130,10 @@ mod tests {
 
         let result = crate::connection::handle_prepare(
             &mut None,
-            &mut Some("bug024".into()),
+            &mut Some("".into()),
             &state,
             &body.freeze(),
+            4,
         )
         .await;
 
@@ -19241,9 +19245,10 @@ mod tests {
 
         let result = crate::connection::handle_prepare(
             &mut None,
-            &mut Some("bug024b".into()),
+            &mut Some("".into()),
             &state,
             &body.freeze(),
+            4,
         )
         .await;
 
