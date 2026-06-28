@@ -69,7 +69,7 @@ fn spawn_schema_event_forwarder(
     cancel: CancellationToken,
 ) {
     let mut events = state.event_sender.subscribe();
-    let mut watch_rx = state.last_schema_event.subscribe();
+    let watch_rx = state.last_schema_event.subscribe();
     tokio::spawn(async move {
         // Check for a recently-emitted schema-change event that was missed
         // while the old control connection was closing and the new one was
@@ -962,8 +962,8 @@ fn dispatches_concurrently(opcode: Opcode) -> bool {
 /// Only handles cases reachable from `Query` / `Execute` / `Batch` —
 /// handshake-driven codec changes (compression, v5-framing) stay on the
 /// inline path because they only fire for `Opcode::Ready` /
-/// `Opcode::AuthSuccess` and the inline match has the
-
+/// `Opcode::AuthSuccess` and the inline match has the same logic.
+#[allow(clippy::too_many_arguments)]
 async fn apply_handle_result<S>(
     result: HandleResult,
     stream_id: i16,
