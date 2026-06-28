@@ -18,6 +18,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn, Instrument, Level, Span};
 
 use crate::ast::{Assignment, SelectColumn, SelectStatement, Statement, Term};
@@ -26,6 +27,7 @@ use crate::auth::{
 };
 use crate::bridge;
 use crate::error::CqlError;
+use crate::event::CqlEvent;
 use crate::frame::{
     Compression, CqlCodec, CqlFrame, FrameHeader, Opcode, VERSION_REQUEST, VERSION_RESPONSE,
 };
@@ -44,6 +46,71 @@ use futures::SinkExt;
 
 /// Idle timeout: drop connection if no complete frame arrives within this duration (M11).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn build_event_frame(event: CqlEvent, response_version: u8) -> CqlFrame {
+    let protocol_version = response_version & 0x7F;
+    let body = event.encode_body(protocol_version).freeze();
+    CqlFrame {
+        header: FrameHeader {
+            version: response_version,
+            flags: 0,
+            stream_id: -1,
+            opcode: Opcode::Event,
+            length: body.len() as u32,
+        },
+        body,
+    }
+}
+
+fn spawn_schema_event_forwarder(
+    state: Arc<SharedState>,
+    event_tx: tokio::sync::mpsc::Sender<CqlFrame>,
+    response_version: u8,
+    cancel: CancellationToken,
+) {
+    let mut events = state.event_sender.subscribe();
+    let mut watch_rx = state.last_schema_event.subscribe();
+    tokio::spawn(async move {
+        // Check for a recently-emitted schema-change event that was missed
+        // while the old control connection was closing and the new one was
+        // opening. Only deliver if it happened within the last 3 seconds.
+        let missed_event = watch_rx.borrow().as_ref().and_then(|(event, ts)| {
+            if ts.elapsed() < std::time::Duration::from_secs(3) {
+                Some(event.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(event) = missed_event {
+            if event_tx
+                .send(build_event_frame(event, response_version))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                recv = events.recv() => {
+                    match recv {
+                        Ok(event) if matches!(event, CqlEvent::SchemaChange { .. }) => {
+                            if event_tx.send(build_event_frame(event, response_version)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("schema event forwarder lagged, skipped {skipped} events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    });
+}
 
 fn cql_request_span(opcode: Opcode, peer: SocketAddr) -> Span {
     if tracing::enabled!(Level::DEBUG) {
@@ -272,6 +339,8 @@ pub(crate) async fn handle_connection<S>(
     let mut response_version: u8 = VERSION_RESPONSE; // default v4 until negotiated
 
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<crate::subscribe::SubscriptionPush>(64);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CqlFrame>(64);
+    let mut event_forwarder_cancel: Option<CancellationToken> = None;
 
     // In-flight request limiter: bounds concurrent requests on this connection.
     // `Arc<Semaphore>` so spawned per-request tasks can hold owned permits;
@@ -341,6 +410,9 @@ pub(crate) async fn handle_connection<S>(
             Some(push) = sub_rx.recv() => {
                 FrameOrPush::SubscriptionPush(push)
             }
+            Some(frame) = event_rx.recv() => {
+                FrameOrPush::Event(frame)
+            }
         };
 
         match frame_or_push {
@@ -378,6 +450,11 @@ pub(crate) async fn handle_connection<S>(
                     header: FrameHeader::streaming_response(push.stream_id, Opcode::Result),
                     body: push.body,
                 };
+                if framed.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            FrameOrPush::Event(frame) => {
                 if framed.send(frame).await.is_err() {
                     break;
                 }
@@ -425,6 +502,24 @@ pub(crate) async fn handle_connection<S>(
                 }
                 let was_awaiting_startup = matches!(phase, ConnectionPhase::AwaitingStartup);
                 let was_ready = matches!(phase, ConnectionPhase::Ready);
+
+                // Start the schema-event forwarder as soon as the client registers
+                // for events on a Ready connection. This is independent of whether
+                // REGISTER is handled inline or concurrently; we do it here because
+                // REGISTER is an inline opcode and we have the negotiated response
+                // version available.
+                if maybe_frame.header.opcode == Opcode::Register && event_forwarder_cancel.is_none()
+                {
+                    let cancel = CancellationToken::new();
+                    debug!("starting schema event forwarder for {peer}");
+                    spawn_schema_event_forwarder(
+                        state.clone(),
+                        event_tx.clone(),
+                        response_version,
+                        cancel.clone(),
+                    );
+                    event_forwarder_cancel = Some(cancel);
+                }
 
                 // Concurrent dispatch path: in `Ready` phase, run common
                 // request opcodes on spawned tasks so the main loop can
@@ -490,6 +585,7 @@ pub(crate) async fn handle_connection<S>(
                                         &state_clone,
                                         &body,
                                         peer_addr,
+                                        proto_version,
                                     )
                                     .await
                                 }
@@ -597,10 +693,25 @@ pub(crate) async fn handle_connection<S>(
                                 opcode,
                                 length: 0,
                             },
-                            body: body_bytes,
+                            body: body_bytes.clone(),
                         };
                         if framed.send(frame).await.is_err() {
                             break;
+                        }
+
+                        if was_ready
+                            && maybe_frame.header.opcode == Opcode::Register
+                            && opcode == Opcode::Ready
+                            && event_forwarder_cancel.is_none()
+                        {
+                            let cancel = CancellationToken::new();
+                            spawn_schema_event_forwarder(
+                                state.clone(),
+                                event_tx.clone(),
+                                response_version,
+                                cancel.clone(),
+                            );
+                            event_forwarder_cancel = Some(cancel);
                         }
 
                         // After READY or AUTH_SUCCESS, enable post-handshake features.
@@ -782,8 +893,11 @@ pub(crate) async fn handle_connection<S>(
         }
     }
 
-    // Cancel all active subscriptions on disconnect.
+    // Cancel all active subscriptions and schema event forwarding on disconnect.
     subscription_state.cancel_all();
+    if let Some(cancel) = event_forwarder_cancel {
+        cancel.cancel();
+    }
 
     debug!("connection handler for {peer} finished");
 }
@@ -809,8 +923,7 @@ fn dispatches_concurrently(opcode: Opcode) -> bool {
 /// handshake-driven codec changes (compression, v5-framing) stay on the
 /// inline path because they only fire for `Opcode::Ready` /
 /// `Opcode::AuthSuccess` and the inline match has the
-/// `client_protocol_version` / `pending_compression` it needs.
-#[allow(clippy::too_many_arguments)]
+
 async fn apply_handle_result<S>(
     result: HandleResult,
     stream_id: i16,
@@ -840,9 +953,10 @@ where
                     opcode,
                     length: 0,
                 },
-                body,
+                body: body.clone(),
             };
-            framed.send(frame).await.is_ok()
+            let send_ok = framed.send(frame).await.is_ok();
+            send_ok
         }
         HandleResult::StartSubscription {
             inner,
@@ -983,6 +1097,7 @@ where
 enum FrameOrPush {
     ClientFrame(CqlFrame),
     SubscriptionPush(crate::subscribe::SubscriptionPush),
+    Event(CqlFrame),
     Response(SpawnedResponse),
 }
 
@@ -1112,7 +1227,15 @@ async fn handle_frame(
                 .await
             }
             Opcode::Batch => {
-                handle_batch(auth_context, current_keyspace, state, &frame.body, peer).await
+                handle_batch(
+                    auth_context,
+                    current_keyspace,
+                    state,
+                    &frame.body,
+                    peer,
+                    frame.header.version,
+                )
+                .await
             }
             Opcode::Register => handle_register(),
             Opcode::Options => handle_options(),
@@ -1467,7 +1590,7 @@ async fn handle_query(
     }
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
 
     // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
     // Accord). The per-connection buffer is locked only for the duration of the
@@ -1703,8 +1826,22 @@ async fn handle_execute(
     id.copy_from_slice(&cursor[..16]);
     cursor.advance(16);
 
+    // CQL v5 EXECUTE carries [short bytes result_metadata_id] between the
+    // prepared id and query parameters. v3/v4 do not include this field.
+    if protocol_version >= 0x05 {
+        if cursor.remaining() < 2 {
+            let err = CqlError::Protocol("EXECUTE: truncated result metadata id length".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        let metadata_id_len = cursor.get_u16() as usize;
+        if cursor.remaining() < metadata_id_len {
+            let err = CqlError::Protocol("EXECUTE: truncated result metadata id".into());
+            return HandleResult::Reply(Opcode::Error, err.encode_body());
+        }
+        cursor.advance(metadata_id_len);
+    }
+
     // Parse consistency level: [short consistency]
-    // Note: CQL v4 EXECUTE has no result_metadata_id field.
     let cl = if cursor.remaining() >= 2 {
         let wire_cl = cursor.get_u16();
         ferrosa_cluster::consistency::ConsistencyLevel::from_wire(wire_cl)
@@ -1732,7 +1869,7 @@ async fn handle_execute(
         }
     };
 
-    let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+    let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
 
     if let Some(bound_terms) = bound_terms.as_ref() {
         let fast_result = match &plan.statement {
@@ -1785,6 +1922,7 @@ async fn handle_batch(
     state: &SharedState,
     body: &Bytes,
     peer: SocketAddr,
+    protocol_version: u8,
 ) -> HandleResult {
     // Parse batch: [byte batch_type][short n_statements]
     if body.len() < 3 {
@@ -1906,7 +2044,7 @@ async fn handle_batch(
 
     // Route each statement.
     for stmt in statements {
-        let ctx = build_request_context(auth_context, current_keyspace, cl, peer);
+        let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
@@ -1937,6 +2075,7 @@ fn build_request_context<'a>(
     current_keyspace: &'a Option<String>,
     consistency: ferrosa_cluster::consistency::ConsistencyLevel,
     peer: std::net::SocketAddr,
+    protocol_version: u8,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
     if auth_context.is_none() {
@@ -1953,6 +2092,7 @@ fn build_request_context<'a>(
         serial_consistency: None,
         paging: crate::paging::PagingParams::default(),
         client_address: peer.to_string(),
+        protocol_version,
     }
 }
 
@@ -2974,6 +3114,7 @@ mod tests {
                 full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
                 index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
                 event_sender: tokio::sync::broadcast::channel(64).0,
+                last_schema_event: tokio::sync::watch::channel(None).0,
                 cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
                 topology_policy: crate::topology::ClientTopologyPolicy::default(),
             },
@@ -3035,6 +3176,83 @@ mod tests {
             }
             _ => panic!("expected cached PREPARE result"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_v5_consumes_result_metadata_id_short_bytes_before_query_params() {
+        let (state, _dir) = shared_state_for_prepare_tests();
+        let query = "SELECT keyspace_name FROM system_schema.keyspaces";
+        let id = PreparedCache::compute_id(query);
+        state.prepared_cache.insert(PreparedPlan {
+            id,
+            query: query.to_string(),
+            statement: parser::parse(query).expect("select parses"),
+            keyspace: None,
+            result_columns: vec![("keyspace_name".to_string(), CqlType::Varchar)],
+            bound_columns: Vec::new(),
+            pk_indexes: Vec::new(),
+            table_keyspace: "system_schema".to_string(),
+            table_name: "keyspaces".to_string(),
+        });
+
+        let mut body = BytesMut::new();
+        body.put_u16(16);
+        body.put_slice(&id);
+        body.put_u16(4); // v5 [short bytes] result_metadata_id length
+        body.put_slice(&[0, 0, 0, 1]); // would be misread as v5 flags if not skipped
+        body.put_u16(0x0001); // consistency ONE
+        body.put_u32(0); // v5 query flags: no values
+
+        let result = handle_execute(
+            &mut None,
+            &mut None,
+            &state,
+            &body.freeze(),
+            "127.0.0.1:9042".parse().unwrap(),
+            5,
+        )
+        .await;
+
+        match result {
+            HandleResult::Reply(Opcode::Result, _) => {}
+            HandleResult::Reply(Opcode::Error, body) => {
+                panic!("v5 execute result_metadata_id was misparsed as an error: {body:?}");
+            }
+            _ => panic!("expected EXECUTE result reply"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_connection_schema_event_forwarder_emits_event_frame() {
+        let (state, _dir) = shared_state_for_prepare_tests();
+        let state = Arc::new(state);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        spawn_schema_event_forwarder(state.clone(), event_tx, 0x85, cancel.clone());
+
+        state
+            .event_sender
+            .send(CqlEvent::SchemaChange {
+                change_type: crate::event::SchemaChangeType::Created,
+                target: crate::event::SchemaTarget::Table,
+                keyspace: "ks".to_string(),
+                name: Some("tbl".to_string()),
+            })
+            .expect("event broadcast should have a subscriber");
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("event frame should arrive")
+            .expect("event channel should remain open");
+        cancel.cancel();
+
+        assert_eq!(frame.header.version, 0x85);
+        assert_eq!(frame.header.opcode, Opcode::Event);
+        assert_eq!(frame.header.stream_id, -1);
+        assert!(frame
+            .body
+            .windows("SCHEMA_CHANGE".len())
+            .any(|w| w == b"SCHEMA_CHANGE"));
     }
 
     #[tokio::test]

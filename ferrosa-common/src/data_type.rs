@@ -33,6 +33,8 @@ pub enum DataType {
     Boolean,
     /// Version 4 UUID.
     Uuid,
+    /// IP address (`inet`).
+    Inet,
     /// Timestamp (milliseconds since epoch in CQL; stored as `bigint`).
     Timestamp,
     /// Arbitrary bytes.
@@ -58,6 +60,7 @@ impl fmt::Display for DataType {
             DataType::Double => "double",
             DataType::Boolean => "boolean",
             DataType::Uuid => "uuid",
+            DataType::Inet => "inet",
             DataType::Timestamp => "timestamp",
             DataType::Blob => "blob",
             DataType::Duration => "duration",

@@ -37,7 +37,7 @@ echo "=== Starting ferrosa on port $PORT ==="
 FERROSA_DATA_DIR="$DATA_DIR" \
 FERROSA_CQL_BIND="127.0.0.1:$PORT" \
 FERROSA_AUTH_DISABLED=1 \
-    cargo run --manifest-path "$PROJECT_DIR/Cargo.toml" 2>"$DATA_DIR/ferrosa.log" &
+    cargo run --bin ferrosa --manifest-path "$PROJECT_DIR/Cargo.toml" 2>"$DATA_DIR/ferrosa.log" &
 FERROSA_PID=$!
 
 # Wait for server to be ready

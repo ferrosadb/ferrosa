@@ -115,6 +115,8 @@ pub enum WireType {
     /// `list<text>` — frame-encoded as: 4-byte BE element count, then
     /// for each element 4-byte BE length + UTF-8 bytes.
     ListText,
+    /// `set<text>` — same collection payload encoding as `list<text>`.
+    SetText,
 }
 
 impl VirtualColumnDef {

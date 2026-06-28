@@ -85,6 +85,10 @@ public class CqlSmokeTest {
                     // driver ignores nodes outside the configured local DC, so a
                     // mismatch yields "No node was available to execute the query".
                     .withLocalDatacenter("datacenter1")
+                    .withConfigLoader(com.datastax.oss.driver.api.core.config.DriverConfigLoader.programmaticBuilder()
+                            .withString(com.datastax.oss.driver.api.core.config.DefaultDriverOption.PROTOCOL_VERSION, "V5")
+                            .withDuration(com.datastax.oss.driver.api.core.config.DefaultDriverOption.REQUEST_TIMEOUT, java.time.Duration.ofSeconds(10))
+                            .build())
                     .build();
             System.out.println("  PASS  connect");
             passed++;

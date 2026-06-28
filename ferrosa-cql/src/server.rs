@@ -558,6 +558,7 @@ mod tests {
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             event_sender: tokio::sync::broadcast::channel(64).0,
+            last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
             topology_policy: crate::topology::ClientTopologyPolicy::default(),
         });
@@ -914,6 +915,7 @@ mod tests {
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             event_sender: tokio::sync::broadcast::channel(64).0,
+            last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
             topology_policy: crate::topology::ClientTopologyPolicy::default(),
         });

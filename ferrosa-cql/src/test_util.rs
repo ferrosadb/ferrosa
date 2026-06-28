@@ -111,6 +111,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         full_scan_tracker: Arc::new(FullScanTracker::new()),
         index_usage_tracker: Arc::new(IndexUsageTracker::new()),
         event_sender: tokio::sync::broadcast::channel(64).0,
+        last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(CqlMetrics::new()),
         topology_policy: ClientTopologyPolicy::default(),
     })

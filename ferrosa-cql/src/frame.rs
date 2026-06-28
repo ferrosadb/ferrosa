@@ -196,6 +196,11 @@ pub struct CqlCodec {
     v5_framed: bool,
     /// Buffer for reassembling segmented v5 messages (isSelfContained=0).
     v5_segment_buf: BytesMut,
+    /// Pending envelopes extracted from a multi-envelope v5 frame.
+    /// The v5 spec allows multiple 9-byte envelopes in a single
+    /// self-contained frame payload. We parse them all and queue them
+    /// here so the Decoder returns one at a time.
+    pending_envelopes: std::collections::VecDeque<CqlFrame>,
 }
 
 impl CqlCodec {
@@ -205,6 +210,7 @@ impl CqlCodec {
             compression: None,
             v5_framed: false,
             v5_segment_buf: BytesMut::new(),
+            pending_envelopes: std::collections::VecDeque::new(),
         }
     }
 
@@ -347,31 +353,57 @@ impl CqlCodec {
             self.v5_segment_buf.split().freeze()
         };
 
-        // The payload contains a standard 9-byte envelope header + body.
-        if envelope_data.len() < HEADER_SIZE {
+        // The payload contains one or more 9-byte envelope headers + bodies.
+        // The v5 spec allows pipelining multiple envelopes in a single
+        // self-contained frame. The DataStax Java driver does this (e.g.,
+        // sending SELECT system.local and SELECT system.peers_v2 in one frame).
+        // Parse all envelopes and queue them; return the first one immediately.
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        while offset + HEADER_SIZE <= envelope_data.len() {
+            let header = FrameHeader::decode(&envelope_data[offset..offset + HEADER_SIZE])?;
+            let body_end = offset + HEADER_SIZE + header.length as usize;
+            if body_end > envelope_data.len() {
+                return Err(CqlError::Protocol(format!(
+                    "v5 envelope body extends past payload: offset={offset}, body_end={body_end}, \
+                     payload_len={}",
+                    envelope_data.len()
+                )));
+            }
+            let body = envelope_data.slice(offset + HEADER_SIZE..body_end);
+
+            // Decompress if needed.
+            let body = if header.flags & COMPRESSION_FLAG != 0 {
+                match self.compression {
+                    Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
+                    Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
+                    None => {
+                        return Err(CqlError::Protocol(
+                            "received compressed frame but no compression negotiated".into(),
+                        ));
+                    }
+                }
+            } else {
+                body
+            };
+
+            frames.push(CqlFrame { header, body });
+            offset = body_end;
+        }
+
+        if frames.is_empty() {
             return Err(CqlError::Protocol(
                 "v5 frame payload too short for envelope header".into(),
             ));
         }
-        let header = FrameHeader::decode(&envelope_data[..HEADER_SIZE])?;
-        let body = envelope_data.slice(HEADER_SIZE..);
 
-        // Decompress if needed.
-        let body = if header.flags & COMPRESSION_FLAG != 0 {
-            match self.compression {
-                Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
-                Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
-                None => {
-                    return Err(CqlError::Protocol(
-                        "received compressed frame but no compression negotiated".into(),
-                    ));
-                }
-            }
-        } else {
-            body
-        };
-
-        Ok(Some(CqlFrame { header, body }))
+        // Queue all but the first; return the first immediately.
+        let mut iter = frames.into_iter();
+        let first = iter.next().expect("frames is non-empty (checked above)");
+        for f in iter {
+            self.pending_envelopes.push_back(f);
+        }
+        Ok(Some(first))
     }
 }
 
@@ -383,6 +415,11 @@ impl Decoder for CqlCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        // Return any pending envelopes from a previously-decoded multi-envelope v5 frame.
+        if let Some(frame) = self.pending_envelopes.pop_front() {
+            return Ok(Some(frame));
+        }
+
         // Valid request versions we accept: 0x03 (v3), 0x04 (v4), 0x05 (v5).
         // Anything higher is rejected with a protocol-version error.
         if src.len() >= HEADER_SIZE && !self.v5_framed {
@@ -1341,6 +1378,64 @@ mod tests {
         assert_eq!(decoded.header.opcode, Opcode::Query);
         assert_eq!(decoded.header.stream_id, 0);
         assert_eq!(decoded.header.flags, 0);
+    }
+
+    /// Regression test: DataStax Java driver pipelines multiple queries in a
+    /// single v5 self-contained frame. The captured frame contains two QUERY
+    /// envelopes: stream 0 = `SELECT * FROM system.local` and stream 1 =
+    /// `SELECT * FROM system.peers_v2`. Our decoder must extract BOTH envelopes
+    /// and return them on successive `decode()` calls.
+    #[test]
+    fn decodes_multi_envelope_v5_frame() {
+        // Captured from DataStax Java driver 4.18.1 during control-connection init.
+        // The driver sends both system.local and system.peers_v2 queries in one frame.
+        #[rustfmt::skip]
+        let frame: Vec<u8> = vec![
+            // 3-byte LE header: payload_len=93 | isSelfContained=1
+            0x5d, 0x00, 0x02,
+            // 3-byte CRC24 of header
+            0xc5, 0x52, 0x6e,
+            // Envelope 1: stream=0, QUERY, body_len=36
+            0x05, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x24,
+            // Body: "SELECT * FROM system.local" + consistency=ONE(0x0001) + flags=0x00
+            0x00, 0x00, 0x00, 0x1a, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x2a, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73, 0x79,
+            0x73, 0x74, 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61, 0x6c,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Envelope 2: stream=1, QUERY, body_len=39
+            0x05, 0x00, 0x00, 0x01, 0x07, 0x00, 0x00, 0x00, 0x27,
+            // Body: "SELECT * FROM system.peers_v2" + consistency=ONE(0x0001) + flags=0x00
+            0x00, 0x00, 0x00, 0x1d, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x2a, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73, 0x79,
+            0x73, 0x74, 0x65, 0x6d, 0x2e, 0x70, 0x65, 0x65, 0x72, 0x73,
+            0x5f, 0x76, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // 4-byte CRC32 of payload
+            0x43, 0x4e, 0xcd, 0x96,
+        ];
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let mut buf = BytesMut::from(&frame[..]);
+
+        // First decode: should return envelope 1 (stream 0)
+        let frame1 = codec
+            .decode(&mut buf)
+            .expect("first v5 envelope should decode")
+            .expect("should have a frame");
+        assert_eq!(frame1.header.stream_id, 0);
+        assert_eq!(frame1.header.opcode, Opcode::Query);
+
+        // Second decode: should return envelope 2 (stream 1) from pending queue
+        let frame2 = codec
+            .decode(&mut buf)
+            .expect("second v5 envelope should decode")
+            .expect("should have a second frame");
+        assert_eq!(frame2.header.stream_id, 1);
+        assert_eq!(frame2.header.opcode, Opcode::Query);
+
+        // Third decode: no more pending, no more data
+        let frame3 = codec.decode(&mut buf).expect("should be Ok(None)");
+        assert!(frame3.is_none(), "no more frames expected");
     }
 
     #[test]

@@ -110,12 +110,18 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
   negotiated response byte (`0x83`, `0x84`, or `0x85`).
 - **v6+ is rejected** with a `ProtocolVersionMismatch` error that advertises v5
   as the greatest supported version.
-- The `SUPPORTED` response currently advertises **v3 and v4** in
-  `PROTOCOL_VERSIONS`. Production drivers therefore negotiate v4, which is fully
-  conformant today.
-- **v5 handshake and modern framing are implemented**, and the server emits the
-  v5 `result_metadata_id` in PREPARE responses. v5 can be used explicitly for
-  conformance testing and future driver support.
+- The `SUPPORTED` response advertises **v3, v4, and v5** in
+  `PROTOCOL_VERSIONS`. The DataStax Java driver 4.x auto-negotiates v5 and
+  passes 37/38 smoke tests (all except `DROP KEYSPACE`, which hits a
+  control-connection reconnect race during schema-agreement).
+- **v5 handshake and modern framing are fully implemented**: self-contained
+  frames with CRC24/CRC32, multi-envelope decode (the DataStax driver pipelines
+  multiple queries in a single v5 frame), and the v5 `result_metadata_id` in
+  PREPARE/EXECUTE responses. v5 is compatible with the DataStax Java driver /
+  native-protocol library.
+- **Schema-change events** are broadcast to registered control connections via
+  a `broadcast` channel, with a `watch` channel fallback so that control
+  connections that reconnect after a DDL can still receive the missed event.
 - Remaining v5-only features not yet complete are tracked in
   [roadmap.md](roadmap.md).
 

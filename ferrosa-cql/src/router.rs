@@ -40,6 +40,7 @@ use ferrosa_storage::FILTER_PREDICATE_OPTION_KEY;
 use crate::ast::*;
 use crate::bridge;
 use crate::error::CqlError;
+use crate::event::{CqlEvent, SchemaChangeType, SchemaTarget};
 use crate::observability::{CqlMetrics, CqlOpcode};
 use crate::planner::{self, ScanPlan};
 use crate::prepared::PreparedCache;
@@ -65,8 +66,29 @@ fn max_batch_statements() -> usize {
         .unwrap_or(DEFAULT_MAX_BATCH_STATEMENTS)
 }
 
+/// Emit a CQL SCHEMA_CHANGE event to all registered listeners.
+fn emit_schema_change(
+    state: &SharedState,
+    change_type: SchemaChangeType,
+    target: SchemaTarget,
+    keyspace: &str,
+    name: Option<&str>,
+) {
+    let event = CqlEvent::SchemaChange {
+        change_type,
+        target,
+        keyspace: keyspace.to_string(),
+        name: name.map(|n| n.to_string()),
+    };
+    // best-effort broadcast; lagging receivers are dropped
+    let _ = state.event_sender.send(event.clone());
+    // Also retain in watch channel for late subscribers (control connection reconnect)
+    let _ = state
+        .last_schema_event
+        .send(Some((event, std::time::Instant::now())));
+}
+
 /// Default cooperative-yield cadence for long partition scans. Larger
-/// values reduce yield overhead but increase tail latency on competing
 /// tasks; smaller values do the opposite. Tune via
 /// `FERROSA_CQL_SCAN_YIELD_EVERY_PARTITIONS`.
 pub const DEFAULT_COOPERATIVE_SCAN_YIELD_EVERY_PARTITIONS: usize = 32;
@@ -869,6 +891,10 @@ pub struct SharedState {
     pub index_usage_tracker: Arc<crate::virtual_tables::IndexUsageTracker>,
     /// Broadcast channel for CQL EVENT push notifications.
     pub event_sender: tokio::sync::broadcast::Sender<crate::event::CqlEvent>,
+    /// Retains the most recent schema-change event so that control connections
+    /// that reconnect after a DDL can still receive the missed event.
+    pub last_schema_event:
+        tokio::sync::watch::Sender<Option<(crate::event::CqlEvent, std::time::Instant)>>,
     /// CQL request metrics (per-opcode counters and error counter).
     pub cql_metrics: Arc<CqlMetrics>,
     /// Decides whether a given connection should see public or internal
@@ -921,6 +947,12 @@ pub struct RequestContext<'a> {
     /// Remote peer address (e.g. "10.0.0.1:54321"), used by the query tracker
     /// for the `client_address` column in `system_observability.active_queries`.
     pub client_address: String,
+    /// Negotiated CQL native protocol version for this connection.
+    ///
+    /// Used when building `system.local` so the reported
+    /// `native_protocol_version` matches the protocol the client actually
+    /// opened (e.g. v4 or v5).
+    pub protocol_version: u8,
 }
 
 /// Raw (un-encoded) result of a user-table SELECT, used by delta subscriptions.
@@ -2029,7 +2061,12 @@ async fn route_select(
             let topology_view = state
                 .topology_policy
                 .topology_view_for_client_with_locals(&ctx.client_address, &local_addresses);
-            let mut info = query_local_with_view(&state.schema, &state.node_config, topology_view);
+            let mut info = query_local_with_view(
+                &state.schema,
+                &state.node_config,
+                topology_view,
+                ctx.protocol_version,
+            );
             info.rpc_address = harmonize_loopback_family(info.rpc_address, client_loopback_ip);
             let col_names: Vec<String> = vec![
                 "key",
@@ -2103,7 +2140,26 @@ async fn route_select(
                 &filt_rows,
             ))
         }
-        ("system", "peers" | "peers_v2") => {
+        ("system", "peers_v2") => {
+            tracing::debug!(
+                "route_select peers_v2 start for client {}",
+                ctx.client_address
+            );
+            let vtable = crate::virtual_tables::PeersV2Table::new(
+                Arc::clone(&state.node_config),
+                Arc::clone(&state.schema),
+                state.topology_policy.clone(),
+                Arc::clone(&state.cluster_state),
+                ctx.client_address.clone(),
+            );
+            let result = encode_virtual_rows_streaming("system", "peers_v2", &vtable, None);
+            tracing::debug!(
+                "route_select peers_v2 done for client {}",
+                ctx.client_address
+            );
+            result
+        }
+        ("system", "peers") => {
             let local_addresses = [
                 state.node_config.internal_rpc_address,
                 state.node_config.listen_address,
@@ -4959,6 +5015,7 @@ fn data_type_to_cql_type(dt: &DataType) -> CqlType {
         DataType::Double => CqlType::Double,
         DataType::Boolean => CqlType::Boolean,
         DataType::Uuid => CqlType::Uuid,
+        DataType::Inet => CqlType::Inet,
         DataType::Timestamp => CqlType::Timestamp,
         DataType::Blob => CqlType::Blob,
         DataType::Duration => CqlType::Duration,
@@ -4991,6 +5048,15 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
             let arr: [u8; 16] = bytes.as_slice().try_into().unwrap_or([0; 16]);
             CqlValue::Uuid(uuid::Uuid::from_bytes(arr))
         }
+        DataType::Inet => match bytes.len() {
+            4 => CqlValue::Inet(IpAddr::V4(std::net::Ipv4Addr::new(
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ))),
+            16 => CqlValue::Inet(IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]),
+            ))),
+            _ => CqlValue::Blob(bytes.clone()),
+        },
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
             CqlValue::Timestamp(i64::from_be_bytes(arr))
@@ -5049,6 +5115,7 @@ fn encode_virtual_rows_streaming(
         .enumerate()
         .map(|(idx, c)| match vtable.wire_type_for(idx) {
             Some(ferrosa_schema::WireType::ListText) => CqlType::List(Box::new(CqlType::Varchar)),
+            Some(ferrosa_schema::WireType::SetText) => CqlType::Set(Box::new(CqlType::Varchar)),
             None => data_type_to_cql_type(&c.data_type),
         })
         .collect();
@@ -5060,15 +5127,20 @@ fn encode_virtual_rows_streaming(
         table,
         |emit| {
             vtable.visit_rows(predicate, &mut |row| {
-                let cql_row: Vec<Option<CqlValue>> = row
-                    .cells
-                    .iter()
-                    .zip(columns.iter().enumerate())
-                    .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
-                        Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
-                        None => cell_to_cql_value(cell, &col.data_type),
-                    })
-                    .collect();
+                let cql_row: Vec<Option<CqlValue>> =
+                    row.cells
+                        .iter()
+                        .zip(columns.iter().enumerate())
+                        .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
+                            Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
+                            Some(ferrosa_schema::WireType::SetText) => decode_list_text_cell(cell)
+                                .map(|value| match value {
+                                    CqlValue::List(items) => CqlValue::Set(items),
+                                    other => other,
+                                }),
+                            None => cell_to_cql_value(cell, &col.data_type),
+                        })
+                        .collect();
                 emit(&cql_row);
             });
         },
@@ -6727,23 +6799,36 @@ async fn route_create_keyspace(
 
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
-    match ddl {
+    let actually_created = match ddl {
         DdlPath::Direct { .. } => {
             state.schema.create_keyspace(ks_meta, ctx.auth)?;
+            true
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
             coordinator.coordinate_ddl(op).await?;
+            true
         }
         DdlPath::Cluster { .. } => {
             let op = DdlOperation::CreateKeyspace(ks_meta);
             ddl.execute(op).await.map_err(CqlError::from)?;
+            true
         }
         DdlPath::Unavailable | DdlPath::Forming { .. } => {
             return Err(CqlError::ServerError(
                 "DDL unavailable: peer lost".to_string(),
             ));
         }
+    };
+
+    if actually_created {
+        emit_schema_change(
+            state,
+            SchemaChangeType::Created,
+            SchemaTarget::Keyspace,
+            &s.name,
+            None,
+        );
     }
 
     Ok(result::encode_schema_change(
@@ -6870,6 +6955,14 @@ async fn route_drop_keyspace(
             ));
         }
     }
+
+    emit_schema_change(
+        state,
+        SchemaChangeType::Dropped,
+        SchemaTarget::Keyspace,
+        &s.name,
+        None,
+    );
 
     Ok(result::encode_schema_change(
         "DROPPED",
@@ -7010,6 +7103,14 @@ async fn route_create_table(
             ));
         }
     }
+
+    emit_schema_change(
+        state,
+        SchemaChangeType::Created,
+        SchemaTarget::Table,
+        ks,
+        Some(&s.name),
+    );
 
     Ok(result::encode_schema_change(
         "CREATED",
@@ -7286,6 +7387,14 @@ async fn route_alter_table(
         }
     }
 
+    emit_schema_change(
+        state,
+        SchemaChangeType::Updated,
+        SchemaTarget::Table,
+        ks,
+        Some(&s.table),
+    );
+
     Ok(result::encode_schema_change(
         "UPDATED",
         "TABLE",
@@ -7350,6 +7459,14 @@ async fn route_drop_table(
             ));
         }
     }
+
+    emit_schema_change(
+        state,
+        SchemaChangeType::Dropped,
+        SchemaTarget::Table,
+        ks,
+        Some(&s.table),
+    );
 
     Ok(result::encode_schema_change(
         "DROPPED",
@@ -7862,6 +7979,20 @@ async fn route_create_index(
         .name
         .unwrap_or_else(|| format!("{}_{}_idx", s.table, s.columns.join("_")));
 
+    if s.if_not_exists
+        && state.schema.snapshot().indexes.contains_key(&(
+            ks.to_string(),
+            s.table.clone(),
+            index_name.clone(),
+        ))
+    {
+        return Ok(result::encode_schema_change(
+            "CREATED",
+            "TABLE",
+            &[ks, &s.table],
+        ));
+    }
+
     let index_meta = IndexMetadata {
         keyspace: ks.to_string(),
         table: s.table.clone(),
@@ -7974,6 +8105,14 @@ async fn route_create_index(
 
     // CQL native protocol: INDEX schema changes use TABLE as the target
     // so cqlsh refreshes the table metadata (which includes indexes).
+    emit_schema_change(
+        state,
+        SchemaChangeType::Created,
+        SchemaTarget::Index,
+        ks,
+        Some(&index_name),
+    );
+
     Ok(result::encode_schema_change(
         "CREATED",
         "TABLE",
@@ -8055,6 +8194,14 @@ async fn route_drop_index(
     }
 
     // Return TABLE event so cqlsh refreshes table metadata (includes indexes).
+    emit_schema_change(
+        state,
+        SchemaChangeType::Dropped,
+        SchemaTarget::Index,
+        ks,
+        Some(&s.name),
+    );
+
     Ok(result::encode_schema_change(
         "DROPPED",
         "TABLE",
@@ -11729,6 +11876,7 @@ mod tests {
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             event_sender: tokio::sync::broadcast::channel(64).0,
+            last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(CqlMetrics::new()),
             topology_policy: ClientTopologyPolicy::default(),
         };
@@ -11751,6 +11899,102 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn ddl_emits_schema_change_event_for_create_keyspace() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
+        let mut events = state.event_sender.subscribe();
+
+        route_create_keyspace(
+            &state,
+            &ctx,
+            CreateKeyspaceStatement {
+                name: "ks_events".to_string(),
+                if_not_exists: false,
+                replication: vec![
+                    ("class".to_string(), "SimpleStrategy".to_string()),
+                    ("replication_factor".to_string(), "1".to_string()),
+                ],
+                durable_writes: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("schema change event should arrive")
+            .expect("event sender should remain open");
+        match event {
+            CqlEvent::SchemaChange {
+                change_type,
+                target,
+                keyspace,
+                name,
+            } => {
+                assert!(matches!(change_type, SchemaChangeType::Created));
+                assert!(matches!(target, SchemaTarget::Keyspace));
+                assert_eq!(keyspace, "ks_events");
+                assert_eq!(name, None);
+            }
+            other => panic!("expected schema-change event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_table_emits_schema_change_event() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        create_test_keyspace(
+            &state.schema,
+            "ks_table_events",
+            "SimpleStrategy",
+            std::collections::HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+        );
+        let current_keyspace = Some("ks_table_events".to_string());
+        let ctx = test_ctx(&auth, &current_keyspace);
+        let mut events = state.event_sender.subscribe();
+
+        route_create_table(
+            &state,
+            &ctx,
+            CreateTableStatement {
+                keyspace: None,
+                name: "tbl_events".to_string(),
+                columns: vec![("id".to_string(), CqlTypeName::Simple("int".to_string()))],
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![],
+                if_not_exists: false,
+                table_options: vec![],
+                extensions: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("schema change event should arrive")
+            .expect("event sender should remain open");
+        match event {
+            CqlEvent::SchemaChange {
+                change_type,
+                target,
+                keyspace,
+                name,
+            } => {
+                assert!(matches!(change_type, SchemaChangeType::Created));
+                assert!(matches!(target, SchemaTarget::Table));
+                assert_eq!(keyspace, "ks_table_events");
+                assert_eq!(name.as_deref(), Some("tbl_events"));
+            }
+            other => panic!("expected schema-change event, got {other:?}"),
         }
     }
 
@@ -12000,6 +12244,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let mut txn = crate::session::CqlTransaction::new();
 
@@ -12043,6 +12288,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // CREATE KEYSPACE
@@ -12097,6 +12343,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for ddl in [
@@ -12157,6 +12404,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -12191,6 +12439,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for cql in [
@@ -12258,6 +12507,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             };
             match route(&state, &ctx, crate::parser::parse(&cql).unwrap())
                 .await
@@ -12285,6 +12535,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let full_scan = route(
             &state,
@@ -12333,6 +12584,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         route(
             &state,
@@ -12369,6 +12621,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let create_ks = crate::parser::parse(
@@ -12456,6 +12709,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         // Use a system keyspace — always exists, no need to create it.
         let stmt = crate::parser::parse("USE system").unwrap();
@@ -12478,6 +12732,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12517,6 +12772,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT now() FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12552,6 +12808,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "10.89.1.60:32123".into(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12589,6 +12846,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "10.89.1.48:32123".into(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12621,6 +12879,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "[::1]:32123".into(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT rpc_address, rpc_port FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12651,6 +12910,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -12707,6 +12967,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM users WHERE id = 1").unwrap();
         assert!(route(&state, &ctx, stmt).await.is_err());
@@ -12722,6 +12983,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         // Build a batch statement with > 500 entries programmatically
         let stmts: Vec<Statement> = (0..501)
@@ -12755,11 +13017,102 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
         match &result {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
+            _ => panic!("expected Result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_system_peers_v2_uses_virtual_table_shape() {
+        use ferrosa_cluster::raft::{NodeInfo, NodeState};
+        use ferrosa_cluster::ring::TokenRing;
+
+        let (state, _dir) = setup();
+        let local_id = 1_u64;
+        let peer_id = 2_u64;
+        let mut ring = TokenRing::new();
+        ring.add_node(
+            local_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.48:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19042".to_string()),
+            },
+        );
+        ring.add_node(
+            peer_id,
+            NodeInfo {
+                host_id: uuid::Uuid::new_v4(),
+                addr: "10.89.1.49:7000".to_string(),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: Some("127.0.0.1:19043".to_string()),
+            },
+        );
+        state
+            .cluster_state
+            .store(Arc::new(ferrosa_cluster::ClusterStateHolder::Cluster(
+                ferrosa_cluster::RaftClusterState::new(
+                    Arc::new(ArcSwap::from_pointee(ring)),
+                    local_id,
+                ),
+            )));
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: "127.0.0.1:32123".into(),
+            protocol_version: 4,
+        };
+        let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
+        let result = route(&state, &ctx, stmt).await.unwrap();
+        match &result {
+            RouteResult::Result(b) => {
+                assert_eq!(extract_row_count(b), 1);
+                assert_eq!(
+                    extract_column_names(b),
+                    vec![
+                        "peer",
+                        "peer_port",
+                        "data_center",
+                        "rack",
+                        "host_id",
+                        "native_address",
+                        "native_port",
+                        "schema_version",
+                        "release_version",
+                        "tokens",
+                    ]
+                );
+                assert_eq!(
+                    extract_column_type_ids(b),
+                    vec![
+                        0x0010, 0x0009, 0x000d, 0x000d, 0x000c, 0x0010, 0x0009, 0x000c, 0x000d,
+                        0x0022
+                    ]
+                );
+                let row = extract_single_row_cells(b, 10);
+                assert_eq!(
+                    decode_inet_cell(row[0].as_deref().unwrap()),
+                    "10.89.1.49".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(
+                    decode_inet_cell(row[5].as_deref().unwrap()),
+                    "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+                );
+                assert_eq!(decode_int_cell(row[6].as_deref().unwrap()), 19043);
+            }
             _ => panic!("expected Result"),
         }
     }
@@ -12813,6 +13166,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "10.89.1.60:32123".into(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
@@ -12885,6 +13239,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "10.89.1.48:32123".into(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
@@ -12951,6 +13306,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: "[::1]:32123".into(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT native_address, native_port FROM system.peers").unwrap();
@@ -12979,6 +13335,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_schema.keyspaces").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -13006,6 +13363,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -13064,6 +13422,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Write a system_schema.indexes row straight to storage, bypassing the
@@ -13125,6 +13484,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -13165,6 +13525,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Write a system_schema.types row straight to storage, bypassing the
@@ -13220,6 +13581,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Write a function row straight to storage, bypassing the Registry.
@@ -13309,6 +13671,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // SELECT * → 10 columns (DataStax/NoSQLBench path).
@@ -13355,6 +13718,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for table in ["keyspaces", "tables", "columns"] {
             let q = format!("SELECT * FROM system_virtual_schema.{table}");
@@ -13428,6 +13792,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local").unwrap();
         let _ = route(&state, &ctx, stmt).await;
@@ -13451,6 +13816,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -13487,6 +13853,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -13514,6 +13881,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace and table first
@@ -13543,6 +13911,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse("COMPACT ks.t").unwrap();
@@ -13626,6 +13995,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.test_vtable").unwrap();
@@ -13702,6 +14072,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse("SELECT * FROM test_ks.streaming_vtable").unwrap();
@@ -13778,6 +14149,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -13833,6 +14205,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + table + hash index
@@ -13885,6 +14258,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace first
@@ -13928,6 +14302,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + type
@@ -13969,6 +14344,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + type
@@ -14002,6 +14378,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -14028,6 +14405,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + type
@@ -14061,6 +14439,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + type
@@ -14095,6 +14474,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace first (with explicit ks in statement)
@@ -14123,6 +14503,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // CREATE TYPE without keyspace and no session keyspace
@@ -14142,6 +14523,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + type
@@ -14173,6 +14555,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace but no type
@@ -14203,6 +14586,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14237,6 +14621,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14271,6 +14656,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14306,6 +14692,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14325,6 +14712,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14352,6 +14740,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14379,6 +14768,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14406,6 +14796,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -14656,6 +15047,34 @@ mod tests {
         names
     }
 
+    fn extract_column_type_ids(buf: &[u8]) -> Vec<u16> {
+        assert_eq!(&buf[0..4], &0x0002i32.to_be_bytes());
+        let col_count = i32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let mut off = 12;
+        let ks_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + ks_len;
+        let tbl_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+        off += 2 + tbl_len;
+        let mut types = Vec::new();
+        for _ in 0..col_count {
+            let name_len = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+            off += 2 + name_len;
+            let type_id = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            types.push(type_id);
+            off += 2;
+            match type_id {
+                0x0020 | 0x0022 => off += 2,
+                0x0021 => off += 4,
+                0x0031 => {
+                    let n = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap()) as usize;
+                    off += 2 + n * 2;
+                }
+                _ => {}
+            }
+        }
+        types
+    }
+
     /// Extract the column count from a Rows result buffer.
     fn extract_column_count(buf: &[u8]) -> usize {
         assert_eq!(
@@ -14741,6 +15160,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT schema_version FROM system.local WHERE key = 'local'")
@@ -14772,6 +15192,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.local WHERE key = 'local'").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -14797,6 +15218,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system.peers_v2").unwrap();
         let result = route(&state, &ctx, stmt).await.unwrap();
@@ -14824,6 +15246,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT cluster_name, release_version FROM system.local").unwrap();
@@ -14852,6 +15275,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT peer, host_id, schema_version FROM system.peers").unwrap();
@@ -14881,6 +15305,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -14894,6 +15319,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TYPE temporal.serialized_event_batch (encoding_type text, version int, data blob)",
@@ -14917,6 +15343,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -14930,6 +15357,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
         route(&state, &ctx_ks, stmt).await.unwrap();
@@ -14979,6 +15407,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = \
@@ -14994,6 +15423,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text)").unwrap();
         route(&state, &ctx_ks, stmt).await.unwrap();
@@ -15050,6 +15480,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15063,6 +15494,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k int PRIMARY KEY, v text, extra blob)")
@@ -15091,6 +15523,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         // Create keyspace and table
         let stmt = crate::parser::parse(
@@ -15105,6 +15538,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.t (k text PRIMARY KEY, v text, n int)").unwrap();
@@ -15201,6 +15635,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15214,6 +15649,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE temporal.t (k int PRIMARY KEY) WITH COMPACTION = { 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' }",
@@ -15243,6 +15679,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -15297,6 +15734,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15310,6 +15748,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create the UDT first
@@ -15340,6 +15779,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15353,6 +15793,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -15385,6 +15826,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace and table with 2 columns
@@ -15400,6 +15842,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("CREATE TABLE ks.cluster_metadata (k int PRIMARY KEY, data blob)")
@@ -15467,6 +15910,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15480,6 +15924,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.meta (p int, name text, data blob, version bigint, PRIMARY KEY (p, name))",
@@ -15536,6 +15981,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15549,6 +15995,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.queue_metadata (queue_type int PRIMARY KEY, cluster_ack_level map<text, bigint>, version bigint)",
@@ -15593,6 +16040,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         route(
             &state,
@@ -15611,6 +16059,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         route(
             &state,
@@ -15672,6 +16121,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15685,6 +16135,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -15714,6 +16165,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15727,6 +16179,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.qm (qt int PRIMARY KEY, ack map<text, bigint>, ver bigint)",
@@ -15761,6 +16214,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -15774,6 +16228,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE TABLE ks.coll (k int PRIMARY KEY, ids set<uuid>, events list<text>)",
@@ -15801,6 +16256,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup: create keyspace and table
@@ -15885,6 +16341,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup
@@ -15917,6 +16374,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -15970,6 +16428,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup: table with PK = id, non-indexed column = category
@@ -16064,6 +16523,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Schema mirrors ferrosa-memory entity_store
@@ -16168,6 +16628,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -16261,6 +16722,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -16354,6 +16816,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -16463,6 +16926,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup: table with an index on `email` but NOT on `name`
@@ -16521,6 +16985,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -16562,6 +17027,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -16608,6 +17074,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup: table with composite key (pk, ck) and a value column
@@ -16671,6 +17138,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -16837,6 +17305,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse("SELECT * FROM system_observability.connections").unwrap();
         let result = route(&state, &ctx, stmt).await;
@@ -16862,6 +17331,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_observability.active_queries").unwrap();
@@ -16894,6 +17364,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             use_stmt,
         )
@@ -16916,6 +17387,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             sel_stmt,
         )
@@ -16995,6 +17467,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -17062,6 +17535,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE udf_as WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17107,6 +17581,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -17148,6 +17623,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE udf_admin_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17167,6 +17643,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let hex_body = hex_encode(&minimal_wasm_component());
         let cql = format!(
@@ -17195,6 +17672,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -17252,6 +17730,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -17302,6 +17781,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -17340,6 +17820,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -17381,6 +17862,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -17419,6 +17901,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace and function
@@ -17473,6 +17956,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE cur_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17489,6 +17973,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let hex_body = hex_encode(&minimal_wasm_component());
@@ -17523,6 +18008,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace
@@ -17570,6 +18056,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -17628,6 +18115,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for cql in [
             "CREATE KEYSPACE fts_ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17686,6 +18174,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for cql in [
             "CREATE KEYSPACE fpk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17737,6 +18226,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for cql in [
             "CREATE KEYSPACE fts_mem WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -17784,6 +18274,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -17841,6 +18332,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -17904,6 +18396,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for cql in [
@@ -17974,6 +18467,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for cql in [
@@ -18975,6 +19469,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace and table
@@ -19080,6 +19575,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -19100,6 +19596,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // CREATE TABLE with 3 columns (pk, a, b)
@@ -19193,6 +19690,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         route(
@@ -19213,6 +19711,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // CREATE TABLE with 4 columns including c
@@ -19499,6 +19998,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create table via router (sets up schema properly)
@@ -19614,6 +20114,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -19752,6 +20253,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -19801,6 +20303,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -19842,6 +20345,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -19923,6 +20427,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -19990,6 +20495,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20046,6 +20552,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20131,6 +20638,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20182,6 +20690,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20234,6 +20743,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup keyspace + function
@@ -20285,6 +20795,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace + table
@@ -20328,6 +20839,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create keyspace only (no table)
@@ -20356,6 +20868,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20380,6 +20893,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20422,6 +20936,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20477,6 +20992,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse("CREATE USER alice WITH PASSWORD = 'a-password-123'") // pragma: allowlist secret
@@ -20512,6 +21028,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for name in ["alpha", "beta", "gamma"] {
@@ -20565,6 +21082,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create a role with a password under the superuser context.
@@ -20610,6 +21128,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse("SELECT * FROM system_auth.roles WHERE role = 'redact_test'")
@@ -20647,6 +21166,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let create = crate::parser::parse(
@@ -20688,6 +21208,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE ROLE netrole WITH PASSWORD = 'p' AND ACCESS TO DATACENTERS {'DC1'}", // pragma: allowlist secret
@@ -20710,6 +21231,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         // A valid bcrypt hash string (HASHED PASSWORD input).
         let hash = "$2a$10$JSJEMFm6GeaW9XxT5JIheuEtPvat6i7uKbnTcxX3c1wshIIsGyUtG";
@@ -20741,6 +21263,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create role first
@@ -20781,6 +21304,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Create + drop role
@@ -20816,6 +21340,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup keyspace + table + index
@@ -20869,6 +21394,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20895,6 +21421,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -20922,6 +21449,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup keyspace + table + role
@@ -20963,6 +21491,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for cql in [
             "CREATE KEYSPACE pgks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -21001,6 +21530,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         // Setup keyspace + table + role + grant
@@ -21040,6 +21570,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -21071,6 +21602,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for r in ["reporter", "alice"] {
             let stmt = crate::parser::parse(&format!(
@@ -21122,6 +21654,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for q in [
             "CREATE KEYSPACE lpks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -21156,6 +21689,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -21198,6 +21732,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt = crate::parser::parse(
             "CREATE KEYSPACE atrk WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -21231,6 +21766,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -21392,6 +21928,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         for cql in [
@@ -21468,6 +22005,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for cql in [
             "CREATE KEYSPACE vidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -21542,6 +22080,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let run = |cql: String| {
             let state = &state;
@@ -21600,6 +22139,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let run = |cql: String| {
             let state = &state;
@@ -21671,6 +22211,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let run = |cql: String| {
             let state = &state;
@@ -21947,6 +22488,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -21995,6 +22537,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -22013,6 +22556,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse("CREATE INDEX idx_sk ON t (v)").unwrap();
@@ -22036,6 +22580,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -22070,6 +22615,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let stmt = crate::parser::parse(
@@ -22108,6 +22654,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22144,6 +22691,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22181,6 +22729,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22213,6 +22762,7 @@ mod tests {
                 serial_consistency: None,
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22280,6 +22830,7 @@ mod tests {
                 serial_consistency: Some(ConsistencyLevel::Serial),
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22331,6 +22882,7 @@ mod tests {
                 serial_consistency: Some(ConsistencyLevel::Serial),
                 paging: crate::paging::PagingParams::default(),
                 client_address: String::new(),
+                protocol_version: 4,
             },
             stmt,
         )
@@ -22497,6 +23049,7 @@ mod tests {
                 paging_state,
             },
             client_address: String::new(),
+            protocol_version: 4,
         }
     }
 
