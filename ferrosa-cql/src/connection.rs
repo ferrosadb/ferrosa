@@ -75,7 +75,7 @@ fn spawn_schema_event_forwarder(
         // while the old control connection was closing and the new one was
         // opening. Only deliver if it happened within the last 3 seconds.
         let missed_event = watch_rx.borrow().as_ref().and_then(|(event, ts)| {
-            if ts.elapsed() < std::time::Duration::from_secs(3) {
+            if ts.elapsed() < std::time::Duration::from_secs(10) {
                 Some(event.clone())
             } else {
                 None
