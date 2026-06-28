@@ -82,7 +82,15 @@ impl ModeController {
     /// the peer reconnects. Does NOT clear pair_context or connected_peers —
     /// unlike the old behavior which reset to Standalone and lost everything.
     pub(super) fn transition_to_degraded(&self) {
-        self.write_path.store(Arc::new(WritePath::unavailable()));
+        // Preserve the PairCoordinator so local (stale) reads keep working.
+        // Writes are rejected by WritePath::DegradedPair; reads delegate to
+        // `coordinator.local_storage()` exactly as in normal pair mode.
+        let degraded = match self.write_path.load().as_ref() {
+            WritePath::Pair(coordinator) => WritePath::degraded_pair(coordinator.clone()),
+            // If we're already degraded or not in pair mode, keep unavailable.
+            _ => WritePath::unavailable(),
+        };
+        self.write_path.store(Arc::new(degraded));
         self.ddl_path.store(Arc::new(DdlPath::Unavailable));
         // Keep pair cluster state — the peer info is still valid for recovery.
         self.mode.store(Arc::new(DeploymentMode::DegradedPair));

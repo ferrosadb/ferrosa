@@ -138,7 +138,13 @@ pub enum WritePath {
     Pair(Arc<PairCoordinator>),
     /// Cluster mode: delegates to ClusterCoordinator with CL enforcement.
     Cluster(Arc<ClusterCoordinator>),
-    /// Degraded: peer lost, writes rejected until operator promotes.
+    /// Degraded pair: peer lost, writes rejected, **local reads preserved**.
+    ///
+    /// The `PairCoordinator` is retained so `local_storage()` can serve
+    /// stale reads of replicated data while writes remain rejected until
+    /// an operator promotes the node.
+    DegradedPair(Arc<PairCoordinator>),
+    /// Fully unavailable (used in tests / edge cases).
     Unavailable,
 }
 
@@ -151,6 +157,11 @@ impl WritePath {
     /// Create a pair mode write path.
     pub fn pair(coordinator: Arc<PairCoordinator>) -> Self {
         Self::Pair(coordinator)
+    }
+
+    /// Create a degraded pair write path.
+    pub fn degraded_pair(coordinator: Arc<PairCoordinator>) -> Self {
+        Self::DegradedPair(coordinator)
     }
 
     /// Create a cluster mode write path.
@@ -177,6 +188,9 @@ impl WritePath {
         match self {
             Self::Direct(engine) => engine.write_atomic_batch(mutations),
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+            Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
                 "pair mode: primary unavailable, writes rejected until operator promotes".into(),
             )),
             Self::Pair(coordinator) => {
@@ -255,7 +269,7 @@ impl WritePath {
     ) -> ferrosa_common::Result<Option<Partition>> {
         match self {
             Self::Direct(engine) => engine.read_limited_rows(table_id, key, row_limit),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .read_limited_rows(table_id, key, row_limit),
             Self::Cluster(coordinator) => {
@@ -307,7 +321,7 @@ impl WritePath {
     ) -> ferrosa_common::Result<Option<Partition>> {
         match self {
             Self::Direct(engine) => engine.read_clustering_row(table_id, key, clustering),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .read_clustering_row(table_id, key, clustering),
             Self::Cluster(coordinator) => {
@@ -360,7 +374,9 @@ impl WritePath {
     ) -> ferrosa_common::Result<Option<Partition>> {
         match self {
             Self::Direct(engine) => engine.read(table_id, key),
-            Self::Pair(coordinator) => coordinator.local_storage().read(table_id, key),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                coordinator.local_storage().read(table_id, key)
+            }
             Self::Cluster(coordinator) => match coordinator.coordinate_read(table_id, key).await {
                 Ok(Some(rows)) => Ok(Some(Partition {
                     key: key.clone(),
@@ -450,7 +466,7 @@ impl WritePath {
     ) -> crate::error::Result<PartitionResultStream> {
         match self {
             Self::Direct(engine) => Ok(local_range_stream(engine.clone(), table_id, row_limit)),
-            Self::Pair(coordinator) => Ok(local_range_stream(
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(local_range_stream(
                 coordinator.local_storage().clone(),
                 table_id,
                 row_limit,
@@ -501,11 +517,9 @@ impl WritePath {
     ) -> crate::error::Result<PartitionResultStream> {
         match self {
             Self::Direct(engine) => Ok(local_range_stream_from(engine.clone(), table_id, start)),
-            Self::Pair(coordinator) => Ok(local_range_stream_from(
-                coordinator.local_storage().clone(),
-                table_id,
-                start,
-            )),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(
+                local_range_stream_from(coordinator.local_storage().clone(), table_id, start),
+            ),
             Self::Cluster(coordinator) => {
                 if !coordinator.streaming_range_reads {
                     return Err(crate::error::ClusterError::Internal(
@@ -546,12 +560,14 @@ impl WritePath {
                 wanted,
                 start,
             )),
-            Self::Pair(coordinator) => Ok(local_projected_range_stream_from(
-                coordinator.local_storage().clone(),
-                table_id,
-                wanted,
-                start,
-            )),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                Ok(local_projected_range_stream_from(
+                    coordinator.local_storage().clone(),
+                    table_id,
+                    wanted,
+                    start,
+                ))
+            }
             Self::Cluster(coordinator) => {
                 if !coordinator.streaming_range_reads {
                     return Err(crate::error::ClusterError::Internal(
@@ -585,7 +601,7 @@ impl WritePath {
             Self::Direct(engine) => engine
                 .count_range(table_id, None, None)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .count_range(table_id, None, None)
                 .map_err(crate::error::ClusterError::Storage),
@@ -615,12 +631,14 @@ impl WritePath {
                 wanted,
                 partition_limit,
             )),
-            Self::Pair(coordinator) => Ok(local_projected_range_stream(
-                coordinator.local_storage().clone(),
-                table_id,
-                wanted,
-                partition_limit,
-            )),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                Ok(local_projected_range_stream(
+                    coordinator.local_storage().clone(),
+                    table_id,
+                    wanted,
+                    partition_limit,
+                ))
+            }
             Self::Cluster(coordinator) => {
                 if partition_limit.is_some() {
                     return Err(crate::error::ClusterError::Internal(
@@ -663,7 +681,9 @@ impl WritePath {
         use futures::stream::StreamExt;
         let engine = match self {
             Self::Direct(engine) => engine.clone(),
-            Self::Pair(coordinator) => coordinator.local_storage().clone(),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                coordinator.local_storage().clone()
+            }
             Self::Cluster(coordinator) => coordinator.storage.clone(),
             Self::Unavailable => {
                 return Err(crate::error::ClusterError::Internal(
@@ -719,7 +739,7 @@ impl WritePath {
             Self::Direct(engine) => engine
                 .read_range_limited_rows(table_id, None, None, limit, row_limit)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .read_range_limited_rows(table_id, None, None, limit, row_limit)
                 .map_err(crate::error::ClusterError::Storage),
@@ -750,7 +770,7 @@ impl WritePath {
             Self::Direct(engine) => engine
                 .read_by_index(table_id, index_name, index_key)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .read_by_index(table_id, index_name, index_key)
                 .map_err(crate::error::ClusterError::Storage),
@@ -781,7 +801,7 @@ impl WritePath {
             Self::Direct(engine) => engine
                 .fulltext_search(table_id, index_name, query)
                 .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) => coordinator
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .fulltext_search(table_id, index_name, query)
                 .map_err(crate::error::ClusterError::Storage),
@@ -811,7 +831,7 @@ impl WritePath {
     ) -> Option<Vec<uuid::Uuid>> {
         match self {
             Self::Cluster(coordinator) => Some(coordinator.replica_host_ids_for(token, strategy)),
-            Self::Direct(_) | Self::Pair(_) | Self::Unavailable => None,
+            Self::Direct(_) | Self::Pair(_) | Self::DegradedPair(_) | Self::Unavailable => None,
         }
     }
 
@@ -847,6 +867,9 @@ impl WritePath {
                 .coordinate_truncate(table_id)
                 .await
                 .map_err(|e| ferrosa_common::Error::InvalidData(format!("cluster truncate: {e}"))),
+            Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
                 "pair mode: primary unavailable, truncate rejected until operator promotes".into(),
             )),
@@ -870,6 +893,9 @@ impl WritePath {
         match self {
             Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+            Self::DegradedPair(_) => Err(ferrosa_common::Error::InvalidData(
                 "pair mode: primary unavailable, writes rejected until operator promotes".into(),
             )),
             Self::Pair(coordinator) => {
