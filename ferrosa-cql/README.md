@@ -59,9 +59,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast
   channel.
-- **Virtual tables** (`virtual_tables/`) — `system_observability.*` and runtime
+- **Virtual tables** (`virtual_tables/`) — `system_observability.*` runtime
   introspection tables (active_queries, connections, billing, index_usage,
-  full_scan_reasons, materialization queues, alerts, query_fingerprints, …).
+  full_scan_reasons, materialization queues, alerts, query_fingerprints, …) plus
+  the Cassandra-compatible `system.peers_v2` topology table.
 - **Observability** (`observability.rs`, `prometheus.rs`) — per-opcode CQL
   metrics and a Prometheus text renderer.
 - **Topology** (`topology.rs`) — public-vs-internal address policy for

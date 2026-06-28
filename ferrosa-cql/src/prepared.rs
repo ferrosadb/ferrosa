@@ -15,6 +15,7 @@ pub struct PreparedPlan {
     pub keyspace: Option<String>,
     pub result_columns: Vec<(String, CqlType)>,
     pub bound_columns: Vec<(String, CqlType)>,
+    pub pk_indexes: Vec<u16>,
     pub table_keyspace: String,
     pub table_name: String,
 }
@@ -93,6 +94,7 @@ mod tests {
             keyspace: Some("ks".into()),
             result_columns: vec![("id".into(), CqlType::Int)],
             bound_columns: vec![],
+            pk_indexes: vec![],
             table_keyspace: "ks".into(),
             table_name: "t".into(),
         }

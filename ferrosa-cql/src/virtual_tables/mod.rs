@@ -12,6 +12,7 @@ pub mod consolidation_status;
 pub mod full_scan_reasons;
 pub mod index_usage;
 pub mod materialization;
+pub mod peers_v2;
 pub mod query_fingerprints;
 pub mod rrd_runtime_settings;
 pub mod stubs;
@@ -29,6 +30,7 @@ pub use materialization::{
     MaterializationQueueSnapshot, MaterializationQueuesTable, MaterializationStatusSnapshot,
     MaterializationStatusTable, StorageMaterializationProvider,
 };
+pub use peers_v2::PeersV2Table;
 pub use query_fingerprints::{QueryFingerprintTracker, QueryFingerprintsTable};
 pub use rrd_runtime_settings::RrdRuntimeSettingsTable;
 pub use stubs::register_all_stubs;

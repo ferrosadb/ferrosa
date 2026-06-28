@@ -1463,6 +1463,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_scan_tracker: full_scan_tracker.clone(),
         index_usage_tracker: index_usage_tracker.clone(),
         event_sender: tokio::sync::broadcast::channel(64).0,
+        last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
     });
@@ -1483,6 +1484,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shared_state.query_tracker.clone(),
         ),
     ));
+    schema
+        .virtual_tables()
+        .register(Arc::new(ferrosa_cql::virtual_tables::PeersV2Table::new(
+            shared_state.node_config.clone(),
+            schema.clone(),
+            shared_state.topology_policy.clone(),
+            shared_state.cluster_state.clone(),
+            "",
+        )));
     schema.virtual_tables().register(Arc::new(
         ferrosa_cql::virtual_tables::consolidation_status::ConsolidationStatusTable::new(
             schema.clone(),
