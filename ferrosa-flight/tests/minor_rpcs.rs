@@ -50,6 +50,7 @@ fn ctx<'a>(auth: &'a ferrosa_schema::AuthContext, ks: &'a Option<String>) -> Req
         serial_consistency: None,
         paging: ferrosa_cql::paging::PagingParams::default(),
         client_address: String::new(),
+        protocol_version: 4,
     }
 }
 

@@ -1,9 +1,9 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-06-27
 executive_summary: >
-  The CQL native-protocol (v4/v5) server and the largest, most central crate in
+  The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
   codec, SASL auth, lexer/parser, query routing into schema and storage, result
   encoding, prepared statements, pagination, LWT over Accord, and the streaming
@@ -19,8 +19,10 @@ executive_summary: >
 from the raw TCP socket to the storage engine: it decodes CQL binary frames,
 authenticates, parses CQL text into an AST, routes statements through the schema
 and storage engines, and encodes result sets back onto the wire. It speaks the
-Cassandra native protocol (negotiating v4 for responses, accepting v5 requests)
-so unmodified CQL drivers connect to it.
+Cassandra native protocol (v3/v4 fully, v5 accepted for explicit conformance
+testing but not yet advertised in `SUPPORTED`, v6+ rejected with a
+protocol-version mismatch that advertises supported v5) so unmodified CQL drivers
+connect to it.
 
 It is deliberately the **integration hub** rather than a leaf: it depends on
 eleven sibling crates and turns a wire frame into a storage mutation/read. The
@@ -101,6 +103,27 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
    local path (p0-03 policy).
 6. **16-byte TimeUUID from `now()`.** `eval_now()` guarantees a 16-byte encoding —
    a short one wedges TimeUUID-clustered tables at flush.
+
+## Native protocol version behavior
+
+- The wire codec accepts **v3, v4, and v5** request bytes and replies with the
+  negotiated response byte (`0x83`, `0x84`, or `0x85`).
+- **v6+ is rejected** with a `ProtocolVersionMismatch` error that advertises v5
+  as the greatest supported version.
+- The `SUPPORTED` response advertises **v3, v4, and v5** in
+  `PROTOCOL_VERSIONS`. The DataStax Java driver 4.x auto-negotiates v5 and
+  passes 37/38 smoke tests (all except `DROP KEYSPACE`, which hits a
+  control-connection reconnect race during schema-agreement).
+- **v5 handshake and modern framing are fully implemented**: self-contained
+  frames with CRC24/CRC32, multi-envelope decode (the DataStax driver pipelines
+  multiple queries in a single v5 frame), and the v5 `result_metadata_id` in
+  PREPARE/EXECUTE responses. v5 is compatible with the DataStax Java driver /
+  native-protocol library.
+- **Schema-change events** are broadcast to registered control connections via
+  a `broadcast` channel, with a `watch` channel fallback so that control
+  connections that reconnect after a DDL can still receive the missed event.
+- Remaining v5-only features not yet complete are tracked in
+  [roadmap.md](roadmap.md).
 
 ## Position in the dependency graph
 

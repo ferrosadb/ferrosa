@@ -215,6 +215,7 @@ pub fn spawn_subscription_poll(
                             paging_state: None,
                         },
                         client_address: String::new(),
+                        protocol_version: 4,
                     };
 
                     if delta {
@@ -546,6 +547,7 @@ mod tests {
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
             index_usage_tracker: Arc::new(crate::virtual_tables::IndexUsageTracker::new()),
             event_sender: tokio::sync::broadcast::channel(64).0,
+            last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
             topology_policy: crate::topology::ClientTopologyPolicy::default(),
         };
@@ -625,6 +627,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         for ddl in [
             "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
@@ -924,6 +927,7 @@ mod tests {
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         let stmt =
             crate::parser::parse(cql).unwrap_or_else(|e| panic!("parse failed for {cql:?}: {e}"));
