@@ -31,6 +31,7 @@ async fn exec(state: &SharedState, cql: &str) {
         serial_consistency: None,
         paging: ferrosa_cql::paging::PagingParams::default(),
         client_address: String::new(),
+        protocol_version: 4,
     };
     let stmt = ferrosa_cql::parser::parse(cql).unwrap_or_else(|e| panic!("parse {cql:?}: {e}"));
     route(state, &ctx, stmt)
