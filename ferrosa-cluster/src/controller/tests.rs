@@ -5,6 +5,7 @@ use super::cluster::{
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
+use crate::write_path::WritePath;
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::server::RpcServer;
 use ferrosa_net::rpc::{PeerId, RpcHandler};
@@ -282,6 +283,24 @@ async fn degraded_pair_serves_stale_reads() {
 
     // CQL is still ready (stale reads available)
     assert!(controller.is_cql_ready());
+
+    // WritePath must be DegradedPair (not Unavailable) so local reads work.
+    let wp = controller.write_path.load();
+    assert!(
+        matches!(wp.as_ref(), WritePath::DegradedPair(_)),
+        "WritePath should be DegradedPair after peer loss, got {}",
+        if matches!(wp.as_ref(), WritePath::Direct(_)) {
+            "Direct"
+        } else if matches!(wp.as_ref(), WritePath::Pair(_)) {
+            "Pair"
+        } else if matches!(wp.as_ref(), WritePath::Cluster(_)) {
+            "Cluster"
+        } else if matches!(wp.as_ref(), WritePath::DegradedPair(_)) {
+            "DegradedPair"
+        } else {
+            "Unavailable"
+        },
+    );
 }
 
 #[tokio::test]
