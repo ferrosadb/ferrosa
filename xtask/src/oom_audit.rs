@@ -39,6 +39,11 @@ pub mod rule {
     pub const WITH_CAPACITY_LIMIT: &str = "with-capacity-limit";
     pub const STREAM_PUSH_ACCUMULATION: &str = "stream-push-accumulation";
     pub const LIMITED_ROWS_CALL_SITE: &str = "limited-rows-call-site";
+    pub const COLLECT_VEC_PARTITION_OR_ROW: &str = "collect-vec-partition-or-row";
+    pub const UNBOUNDED_RANGE_READ: &str = "unbounded-range-read";
+    pub const MATERIALIZING_RANGE_READ_CALL_SITE: &str = "materializing-range-read-call-site";
+    pub const CQLVALUE_ROW_ACCUMULATION: &str = "cqlvalue-row-accumulation";
+    pub const CLONE_ON_ROW_DATA: &str = "clone-on-row-data";
     pub const EXPIRED_ALLOW: &str = "expired-allow-entry";
 }
 
@@ -217,6 +222,143 @@ fn is_limited_rows_call(method: &str) -> bool {
         || (method.starts_with("coordinate_") && method.ends_with("_limited_rows"))
 }
 
+/// `Partition`/`Row` element idents that signal broad-scan row materialization.
+fn is_partition_or_row_ident(id: &str) -> bool {
+    id == "Partition" || id == "Row"
+}
+
+/// If `ty` (through an outer `Vec`/`Result`) is a `Vec<Partition>` / `Vec<Row>`,
+/// return the element ident.
+fn vec_partition_or_row_elem(ty: &syn::Type) -> Option<String> {
+    let elem = vec_element_ident(ty)?;
+    is_partition_or_row_ident(&elem).then_some(elem)
+}
+
+/// True if `ty` is `Vec<Vec<Option<CqlValue>>>` or `Vec<Vec<CqlValue>>`
+/// (broad-scan CQL row materialization). Best-effort on last-segment idents.
+fn is_cqlvalue_row_matrix(ty: &syn::Type) -> bool {
+    // Outer must be Vec<inner>.
+    let Some(inner) = vec_inner(ty) else {
+        return false;
+    };
+    // inner must be Vec<cell>.
+    let Some(cell) = vec_inner(inner) else {
+        return false;
+    };
+    // cell is either `CqlValue` directly or `Option<CqlValue>`.
+    if last_segment_ident(cell).as_deref() == Some("CqlValue") {
+        return true;
+    }
+    if last_segment_ident(cell).as_deref() == Some("Option") {
+        if let syn::Type::Path(tp) = cell {
+            if let Some(seg) = tp.path.segments.last() {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    return args.args.iter().any(|a| {
+                        matches!(a, syn::GenericArgument::Type(t)
+                            if last_segment_ident(t).as_deref() == Some("CqlValue"))
+                    });
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Turbofish element of a `.collect::<Vec<Partition>>()` call, if it is a
+/// `Vec<Partition>` / `Vec<Row>`.
+fn collect_turbofish_partition_or_row(node: &syn::ExprMethodCall) -> Option<String> {
+    if node.method != "collect" {
+        return None;
+    }
+    let args = node.turbofish.as_ref()?;
+    args.args.iter().find_map(|a| match a {
+        syn::GenericArgument::Type(t) => vec_partition_or_row_elem(t),
+        _ => None,
+    })
+}
+
+/// Receiver idents whose per-element `.clone()`/`.to_vec()`/`.to_owned()` we flag
+/// as a row-data copy on a scan path (rule: clone-on-row-data). Case-insensitive.
+const ROW_DATA_IDENTS: &[&str] = &["partition", "partitions", "row", "rows", "cell", "cells"];
+
+/// Copying method names that materialize a clone of row data.
+fn is_copying_method(method: &str) -> bool {
+    method == "clone" || method == "to_vec" || method == "to_owned"
+}
+
+/// Trailing ident of a receiver expression: a bare ident, or the field name of a
+/// field access (`self.rows` -> `rows`, `rows` -> `rows`). None otherwise.
+fn receiver_trailing_ident(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        syn::Expr::Field(f) => match &f.member {
+            syn::Member::Named(id) => Some(id.to_string()),
+            syn::Member::Unnamed(_) => None,
+        },
+        _ => None,
+    }
+}
+
+/// True if `ident` (case-insensitive exact match) is in the row-data set.
+fn is_row_data_ident(ident: &str) -> bool {
+    let lower = ident.to_ascii_lowercase();
+    ROW_DATA_IDENTS.contains(&lower.as_str())
+}
+
+/// True if `expr` (or any subexpression) references a streaming source: a call
+/// to `range_iter`, an ident/method containing `stream`, or a `.next()` call.
+fn contains_stream_source(expr: &syn::Expr) -> bool {
+    struct StreamFinder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for StreamFinder {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let m = node.method.to_string();
+            if m == "range_iter" || m == "next" || m.contains("stream") {
+                self.found = true;
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+        fn visit_path(&mut self, node: &'ast syn::Path) {
+            if node
+                .segments
+                .iter()
+                .any(|s| s.ident == "range_iter" || s.ident.to_string().contains("stream"))
+            {
+                self.found = true;
+            }
+            syn::visit::visit_path(self, node);
+        }
+    }
+    let mut f = StreamFinder { found: false };
+    f.visit_expr(expr);
+    f.found
+}
+
+/// Call sites we flag as materializing range reads (rule:
+/// materializing-range-read-call-site): the plain/projected variants, excluding
+/// stream and `_from`/`_limited_rows` siblings.
+fn is_materializing_range_read_call(method: &str) -> bool {
+    method == "range_read" || method == "range_read_projected"
+}
+
+/// True if two CONSECUTIVE arguments are both the literal `None` — the
+/// range-bound `(.., None, None, ..)` shape of an unbounded full-table read.
+/// Mirrors the retired `scripts/check-unbounded-reads.py` regex in the AST.
+fn has_consecutive_none_pair<'a, I>(args: I) -> bool
+where
+    I: IntoIterator<Item = &'a syn::Expr>,
+{
+    let nones: Vec<bool> = args.into_iter().map(is_none_literal).collect();
+    nones.windows(2).any(|w| w[0] && w[1])
+}
+
+/// True if `expr` is the literal `None` (path whose last segment is `None`).
+fn is_none_literal(expr: &syn::Expr) -> bool {
+    matches!(expr, syn::Expr::Path(p)
+        if p.path.segments.last().map(|s| s.ident == "None") == Some(true))
+}
+
 // ---------------------------------------------------------------------------
 // Visitor
 // ---------------------------------------------------------------------------
@@ -238,12 +380,19 @@ impl<'a> Auditor<'a> {
     }
 
     fn push(&mut self, line: usize, rule: &'static str, message: String) {
+        let symbol = self.current_fn.clone();
+        self.push_with_symbol(line, rule, message, &symbol);
+    }
+
+    /// Push a finding with an explicit symbol (used by call-site rules whose
+    /// allowlist key is the called method / receiver, not the enclosing fn).
+    fn push_with_symbol(&mut self, line: usize, rule: &'static str, message: String, symbol: &str) {
         self.findings.push(Finding {
             path: self.path.to_string(),
             line,
             rule,
             message,
-            symbol: self.current_fn.clone(),
+            symbol: symbol.to_string(),
         });
     }
 
@@ -264,7 +413,7 @@ impl<'a> Auditor<'a> {
 
         // Rule (b): production fn returning Vec<Partition> / Vec<Row>.
         if let Some(elem) = vec_element_ident(ret) {
-            if elem == "Partition" || elem == "Row" {
+            if is_partition_or_row_ident(&elem) {
                 let line = sig.ident.span().start().line;
                 self.push(
                     line,
@@ -273,7 +422,84 @@ impl<'a> Auditor<'a> {
                 );
             }
         }
+
+        // Rule 4: fn returning Vec<Vec<(Option<)CqlValue(>)>>.
+        if is_cqlvalue_row_matrix(ret) {
+            let line = sig.ident.span().start().line;
+            self.push(
+                line,
+                rule::CQLVALUE_ROW_ACCUMULATION,
+                format!("fn `{name}` returns a Vec<Vec<CqlValue>> row matrix (broad-scan rows)"),
+            );
+        }
     }
+
+    /// Free-function call rules (rule (c) with_capacity, rule 2 free-fn
+    /// `read_range(None, None, ..)`).
+    fn check_expr_call(&mut self, node: &syn::ExprCall) {
+        let syn::Expr::Path(p) = &*node.func else {
+            return;
+        };
+        let segs: Vec<String> = p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        let last = segs.last().map(String::as_str);
+
+        // Rule (c): Vec::with_capacity(<paging cap>).
+        if last == Some("with_capacity") && segs.iter().any(|s| s == "Vec") {
+            if let Some(arg) = node.args.first() {
+                if is_paging_capacity_arg(arg) {
+                    self.push(
+                        node.span().start().line,
+                        rule::WITH_CAPACITY_LIMIT,
+                        "Vec::with_capacity from a paging/limit-derived size pre-allocates an \
+                         unbounded buffer"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Rule 2: free-fn `read_range(None, None, ..)`.
+        if last == Some("read_range") && has_consecutive_none_pair(node.args.iter()) {
+            self.push(
+                node.span().start().line,
+                rule::UNBOUNDED_RANGE_READ,
+                "read_range(None, None, ..) is an unbounded full-table range read".to_string(),
+            );
+        }
+    }
+
+    /// Typed-binding rules (rule 1 collect-to-typed-Vec, rule 4 CqlValue matrix).
+    fn check_typed_binding(&mut self, ty: &syn::Type, init: Option<&syn::Expr>, line: usize) {
+        // Rule 1 (collect via typed binding): only when the initializer is a
+        // `.collect()` call, so this doesn't double-flag plain Vec<Partition>
+        // bindings already covered by the return-type rule.
+        if init.is_some_and(expr_is_collect_call) {
+            if let Some(elem) = vec_partition_or_row_elem(ty) {
+                self.push(
+                    line,
+                    rule::COLLECT_VEC_PARTITION_OR_ROW,
+                    format!("collect into a Vec<{elem}>-typed binding materializes the scan"),
+                );
+            }
+        }
+        if is_cqlvalue_row_matrix(ty) {
+            self.push(
+                line,
+                rule::CQLVALUE_ROW_ACCUMULATION,
+                "binding typed Vec<Vec<CqlValue>> accumulates a broad-scan row matrix".to_string(),
+            );
+        }
+    }
+}
+
+/// True if `expr` is (or ends in) a `.collect()` method call.
+fn expr_is_collect_call(expr: &syn::Expr) -> bool {
+    matches!(expr, syn::Expr::MethodCall(mc) if mc.method == "collect")
 }
 
 impl<'ast> Visit<'ast> for Auditor<'_> {
@@ -291,47 +517,111 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         self.current_fn = prev;
     }
 
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        // Rule (c): Vec::with_capacity(<paging cap>).
-        if let syn::Expr::Path(p) = &*node.func {
-            let segs: Vec<String> = p
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect();
-            let is_with_cap = segs.last().map(String::as_str) == Some("with_capacity")
-                && segs.iter().any(|s| s == "Vec");
-            if is_with_cap {
-                if let Some(arg) = node.args.first() {
-                    if is_paging_capacity_arg(arg) {
-                        self.push(
-                            node.span().start().line,
-                            rule::WITH_CAPACITY_LIMIT,
-                            "Vec::with_capacity from a paging/limit-derived size pre-allocates an \
-                             unbounded buffer"
-                                .to_string(),
-                        );
-                    }
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let method = node.method.to_string();
+        let line = node.method.span().start().line;
+
+        // Rule (e): broad-scan limited-rows call site. The call-site method name
+        // is the symbol (so allowlist `symbol` matches the called method).
+        if is_limited_rows_call(&method) {
+            self.push_with_symbol(
+                line,
+                rule::LIMITED_ROWS_CALL_SITE,
+                format!("call to broad-scan `{method}` materializes the read path"),
+                &method,
+            );
+        }
+
+        // Rule 1 (collect): `.collect::<Vec<Partition>>()` turbofish form.
+        if let Some(elem) = collect_turbofish_partition_or_row(node) {
+            self.push(
+                line,
+                rule::COLLECT_VEC_PARTITION_OR_ROW,
+                format!(".collect::<Vec<{elem}>>() materializes the scan into a Vec"),
+            );
+        }
+
+        // Rule 1 (extend): `.extend(<stream-source expr>)`.
+        if method == "extend" {
+            if let Some(arg) = node.args.first() {
+                if contains_stream_source(arg) {
+                    self.push(
+                        line,
+                        rule::COLLECT_VEC_PARTITION_OR_ROW,
+                        ".extend() from a streaming source (range_iter/stream/next) materializes \
+                         the stream into a Vec"
+                            .to_string(),
+                    );
                 }
             }
         }
+
+        // Rule 2: `read_range` whose first two args are both `None` (unbounded).
+        if method == "read_range" && has_consecutive_none_pair(node.args.iter()) {
+            self.push(
+                line,
+                rule::UNBOUNDED_RANGE_READ,
+                "read_range(None, None, ..) is an unbounded full-table range read".to_string(),
+            );
+        }
+
+        // Rule 3: materializing range-read call site (plain / projected).
+        if is_materializing_range_read_call(&method) {
+            self.push_with_symbol(
+                line,
+                rule::MATERIALIZING_RANGE_READ_CALL_SITE,
+                format!("call to materializing `{method}` (non-stream) reads the whole range"),
+                &method,
+            );
+        }
+
+        // Rule 5: per-element clone of row data (move-based guard). The receiver
+        // ident is the symbol so site-specific clones can be allowlisted.
+        if is_copying_method(&method) {
+            if let Some(recv) = receiver_trailing_ident(&node.receiver) {
+                if is_row_data_ident(&recv) {
+                    self.push_with_symbol(
+                        line,
+                        rule::CLONE_ON_ROW_DATA,
+                        format!("`{recv}.{method}()` copies row data on a scan path (prefer move)"),
+                        &recv,
+                    );
+                }
+            }
+        }
+
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        self.check_expr_call(node);
         syn::visit::visit_expr_call(self, node);
     }
 
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        // Rule (e): broad-scan limited-rows call site.
-        let method = node.method.to_string();
-        if is_limited_rows_call(&method) {
-            let prev = std::mem::replace(&mut self.current_fn, method.clone());
-            self.push(
-                node.method.span().start().line,
-                rule::LIMITED_ROWS_CALL_SITE,
-                format!("call to broad-scan `{method}` materializes the read path"),
-            );
-            self.current_fn = prev;
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        // Typed-binding rules: `let x: <Ty> = ..;`.
+        if let syn::Pat::Type(pt) = &node.pat {
+            let init = node.init.as_ref().map(|i| &*i.expr);
+            self.check_typed_binding(&pt.ty, init, node.let_token.span().start().line);
         }
-        syn::visit::visit_expr_method_call(self, node);
+        syn::visit::visit_local(self, node);
+    }
+
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        // Rule 4: struct field typed as a CqlValue row matrix.
+        if is_cqlvalue_row_matrix(&node.ty) {
+            let name = node
+                .ident
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            self.push(
+                node.ty.span().start().line,
+                rule::CQLVALUE_ROW_ACCUMULATION,
+                format!("field `{name}` is a Vec<Vec<CqlValue>> row matrix (broad-scan rows)"),
+            );
+        }
+        syn::visit::visit_field(self, node);
     }
 
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
@@ -767,6 +1057,204 @@ mod tests {
         assert!(
             expired.is_empty(),
             "future expiry must not flag: {expired:?}"
+        );
+    }
+
+    // -- Rule 1: collect-vec-partition-or-row ------------------------------
+    #[test]
+    fn rule_collect_fires_on_turbofish_and_typed_binding() {
+        let src = r#"
+            fn a(it: I) -> () {
+                let _v = it.map(|x| x).collect::<Vec<Partition>>();
+                let typed: Vec<Row> = it.map(|x| x).collect();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::COLLECT_VEC_PARTITION_OR_ROW)
+            .count();
+        assert_eq!(
+            count, 2,
+            "turbofish + typed-binding collect both fire: {f:?}"
+        );
+        assert!(f.iter().any(
+            |x| x.rule == rule::COLLECT_VEC_PARTITION_OR_ROW && x.message.contains("Partition")
+        ));
+    }
+
+    #[test]
+    fn rule_collect_fires_on_extend_from_stream() {
+        let src = r#"
+            fn a(out: &mut Vec<u8>, storage: S) {
+                out.extend(storage.range_iter(t, None, None));
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::COLLECT_VEC_PARTITION_OR_ROW)
+            .count();
+        assert_eq!(count, 1, "extend from a stream source fires: {f:?}");
+    }
+
+    #[test]
+    fn rule_collect_does_not_fire_on_plain_collect_or_extend() {
+        let src = r#"
+            fn a(it: I, out: &mut Vec<u8>, more: Vec<u8>) {
+                let _v: Vec<u8> = it.collect();
+                let _w = it.collect::<Vec<u8>>();
+                out.extend(more.iter().copied());
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter()
+                .any(|x| x.rule == rule::COLLECT_VEC_PARTITION_OR_ROW),
+            "non-row collect/extend must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 2: unbounded-range-read --------------------------------------
+    #[test]
+    fn rule_unbounded_range_read_fires_on_none_none() {
+        // Real shape: `read_range(&table_id, None, None, limit)` — the two
+        // consecutive `None` range bounds make it a full-table scan.
+        let src = r#"
+            fn a(storage: S, table_id: T) {
+                let _x = storage.read_range(&table_id, None, None, 100);
+                let _y = read_range(&table_id, None, None, 10_000);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::UNBOUNDED_RANGE_READ)
+            .count();
+        assert_eq!(
+            count, 2,
+            "method + free-fn read_range(.,None,None,.) fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_unbounded_range_read_does_not_fire_with_bounds() {
+        let src = r#"
+            fn a(storage: S, table_id: T, lo: K, hi: K) {
+                let _x = storage.read_range(&table_id, Some(lo), Some(hi), 100);
+                let _y = storage.read_range(&table_id, Some(lo), None, 100);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::UNBOUNDED_RANGE_READ),
+            "bounded reads must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 3: materializing-range-read-call-site ------------------------
+    #[test]
+    fn rule_materializing_call_site_fires_on_range_read_and_projected() {
+        let src = r#"
+            fn a(wp: W, table_id: T) {
+                let _x = wp.range_read(&table_id, bound);
+                let _y = wp.range_read_projected(&table_id, wanted, bound);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::MATERIALIZING_RANGE_READ_CALL_SITE)
+            .count();
+        assert_eq!(count, 2, "range_read + range_read_projected fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_materializing_call_site_does_not_fire_on_stream_or_from_variants() {
+        let src = r#"
+            fn a(wp: W, table_id: T) {
+                let _x = wp.range_read_stream(&table_id, bound);
+                let _y = wp.range_read_from(&table_id, bound);
+                let _z = wp.range_read_limited_rows(&table_id, bound, 0);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter()
+                .any(|x| x.rule == rule::MATERIALIZING_RANGE_READ_CALL_SITE),
+            "stream/_from/_limited_rows variants must not fire rule 3: {f:?}"
+        );
+    }
+
+    // -- Rule 4: cqlvalue-row-accumulation ---------------------------------
+    #[test]
+    fn rule_cqlvalue_matrix_fires_on_let_field_and_return() {
+        let src = r#"
+            struct Holder {
+                rows: Vec<Vec<Option<CqlValue>>>,
+            }
+            fn build() -> Vec<Vec<CqlValue>> {
+                let acc: Vec<Vec<Option<CqlValue>>> = Vec::new();
+                acc
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CQLVALUE_ROW_ACCUMULATION)
+            .count();
+        assert_eq!(count, 3, "field + let + return all fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_cqlvalue_matrix_does_not_fire_on_single_row() {
+        let src = r#"
+            fn build() -> Vec<Option<CqlValue>> {
+                Vec::new()
+            }
+            struct Holder { cells: Vec<CqlValue> }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CQLVALUE_ROW_ACCUMULATION),
+            "a single Vec<CqlValue> row must not fire (needs the outer Vec): {f:?}"
+        );
+    }
+
+    // -- Rule 5: clone-on-row-data -----------------------------------------
+    #[test]
+    fn rule_clone_on_row_data_fires_on_row_idents() {
+        let src = r#"
+            fn a(partition: P, rows: R, self_holder: H) {
+                let _x = partition.clone();
+                let _y = rows.to_vec();
+                let _z = self_holder.cells.to_owned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 3, "partition/rows/cells copies fire: {f:?}");
+        assert!(f
+            .iter()
+            .any(|x| x.rule == rule::CLONE_ON_ROW_DATA && x.symbol == "partition"));
+    }
+
+    #[test]
+    fn rule_clone_on_row_data_does_not_fire_on_other_idents() {
+        let src = r#"
+            fn a(config: C, name: N, key: K) {
+                let _x = config.clone();
+                let _y = name.to_owned();
+                let _z = key.to_vec();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONE_ON_ROW_DATA),
+            "non-row-data receivers must not fire: {f:?}"
         );
     }
 }
