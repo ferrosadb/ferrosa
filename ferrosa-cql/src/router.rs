@@ -4659,7 +4659,18 @@ async fn route_select_user_table(
                             } else {
                                 None
                             };
-                            let partitions = if let Some(wanted) = projection_wanted {
+                            let partitions = if count_only_select {
+                                // COUNT(*) must NEVER pre-materialize a capped Vec.
+                                // `range_read_limited_rows` clamps to the magic
+                                // `DEFAULT_RANGE_READ_LIMIT` (10_000): on a large
+                                // table that both silently undercounts (data loss)
+                                // and OOM-kills the node materializing the window.
+                                // Counting needs no materialized rows — fall through
+                                // to the streaming count branch below, which counts
+                                // over a bounded partition stream (O(1) partitions in
+                                // flight, uncapped, exact).
+                                None
+                            } else if let Some(wanted) = projection_wanted {
                                 // Push partition-count cap down to the merger so
                                 // `LIMIT N` stops the scan after N partitions
                                 // rather than walking every SSTable.
