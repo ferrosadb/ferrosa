@@ -712,7 +712,8 @@ async fn collect_page_from_partition_stream(
 
     'outer: while let Some(partition) = stream.next().await {
         let partition = partition?;
-        bridge::consume_partition_rows_with_clustering(
+        let mut cursor_from_current_partition = false;
+        let partition_key = bridge::consume_partition_rows_with_clustering(
             partition,
             row_context.all_col_names,
             row_context.all_col_types,
@@ -740,11 +741,14 @@ async fn collect_page_from_partition_stream(
                 rows.push(output_row);
                 last_ck = clustering;
                 if rows.len() == page_size {
-                    last_pk = pk_bytes.to_vec();
+                    cursor_from_current_partition = true;
                 }
                 ControlFlow::Continue(())
             },
         );
+        if cursor_from_current_partition {
+            last_pk = partition_key;
+        }
         if more_rows_remain {
             break 'outer;
         }
@@ -805,7 +809,8 @@ async fn collect_filtered_page_from_partition_stream(
     'outer: while let Some(partition) = stream.next().await {
         let partition = partition?;
         let mut predicate_error = None;
-        bridge::consume_partition_rows_with_clustering(
+        let mut cursor_from_current_partition = false;
+        let partition_key = bridge::consume_partition_rows_with_clustering(
             partition,
             row_context.all_col_names,
             row_context.all_col_types,
@@ -847,7 +852,7 @@ async fn collect_filtered_page_from_partition_stream(
                 rows.push(output_row);
                 last_ck = clustering;
                 if limit > target && rows.len() == target {
-                    last_pk = pk_bytes.to_vec();
+                    cursor_from_current_partition = true;
                 }
                 if rows.len() == limit {
                     return ControlFlow::Break(());
@@ -855,6 +860,9 @@ async fn collect_filtered_page_from_partition_stream(
                 ControlFlow::Continue(())
             },
         );
+        if cursor_from_current_partition {
+            last_pk = partition_key;
+        }
         if let Some(error) = predicate_error {
             return Err(error);
         }
@@ -17297,7 +17305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitrary_unbounded_order_by_reserves_and_cleans_temp_sort_table() {
+    async fn arbitrary_unbounded_order_by_fails_loud_without_temp_sort_leak() {
         let (state, dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -17353,7 +17361,17 @@ mod tests {
             }
         );
 
-        route(&state, &ctx, stmt).await.unwrap();
+        let error = match route(&state, &ctx, stmt).await {
+            Ok(_) => panic!("unbounded arbitrary ORDER BY must not materialize rows in memory"),
+            Err(error) => error,
+        };
+        match error {
+            CqlError::Invalid(message) => assert!(
+                message.contains("unbounded full-table materialization is disabled"),
+                "unexpected error message: {message}"
+            ),
+            other => panic!("expected invalid-query error, got {other:?}"),
+        }
 
         let tmp_root = dir.path().join("tmp_order_by_sort");
         if tmp_root.exists() {
@@ -23139,6 +23157,14 @@ mod tests {
             !collectors.contains("last_pk = pk_bytes.clone()"),
             "streaming page collectors must not clone the partition key once per accepted row"
         );
+        assert!(
+            !collectors.contains("pk_bytes.to_vec()"),
+            "streaming page collectors must move the consumed partition key into the paging cursor instead of copying it"
+        );
+        assert!(
+            collectors.contains("last_pk = partition_key"),
+            "streaming page collectors must store the moved partition key allocation only for page-boundary cursor rows"
+        );
     }
 
     #[test]
@@ -23157,6 +23183,10 @@ mod tests {
         assert!(
             !consumer.contains("row.clustering.clone()"),
             "consuming row visitor must not clone clustering bytes on the streaming cursor path"
+        );
+        assert!(
+            consumer.contains("key.key.into_bytes()"),
+            "consuming row visitor must return the original partition key allocation for cursor ownership"
         );
     }
 

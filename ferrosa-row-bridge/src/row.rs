@@ -160,8 +160,9 @@ pub fn visit_partition_rows_with_clustering<F>(
 ///
 /// Streaming read paths use this variant for page cursors: the output row is
 /// moved to the page buffer, and the clustering key of the accepted cursor row
-/// is moved rather than cloned from the source row. The partition key remains
-/// borrowed because one key is shared by every row in the partition.
+/// is moved rather than cloned from the source row. The returned partition key
+/// is the original owned key allocation from the consumed partition, so callers
+/// that need an owned paging cursor can move it without copying.
 pub fn consume_partition_rows_with_clustering<F>(
     partition: Partition,
     column_names: &[String],
@@ -170,13 +171,13 @@ pub fn consume_partition_rows_with_clustering<F>(
     ck_columns: &[usize],
     storage_to_table: &[usize],
     mut visit: F,
-) where
+) -> Vec<u8>
+where
     F: FnMut(&[u8], Vec<u8>, Vec<Option<CqlValue>>) -> ControlFlow<()>,
 {
     let Partition { key, rows, .. } = partition;
     let now_secs = read_now_secs();
     let pk_values = decode_pk(&key, pk_columns.len());
-    let pk_bytes = key.key.as_bytes();
     let decode_context = RowDecodeContext {
         pk_values: &pk_values,
         column_names,
@@ -187,16 +188,21 @@ pub fn consume_partition_rows_with_clustering<F>(
         now_secs,
     };
 
-    for row in rows {
-        if !row_is_visible(&row, now_secs) {
-            continue;
-        }
+    {
+        let pk_bytes = key.key.as_bytes();
+        for row in rows {
+            if !row_is_visible(&row, now_secs) {
+                continue;
+            }
 
-        let output_row = decode_output_row(&row, &decode_context);
-        if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
-            break;
+            let output_row = decode_output_row(&row, &decode_context);
+            if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
+                break;
+            }
         }
     }
+
+    key.key.into_bytes()
 }
 
 fn read_now_secs() -> i32 {
