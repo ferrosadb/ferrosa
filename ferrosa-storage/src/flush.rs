@@ -592,6 +592,7 @@ pub(crate) mod fsync_probe {
     static EXCLUSIVE: Mutex<()> = Mutex::new(());
     static SYNCED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static RENAMED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     pub(crate) struct ExclusiveGuard {
         _guard: MutexGuard<'static, ()>,
@@ -614,6 +615,7 @@ pub(crate) mod fsync_probe {
     fn reset() {
         SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
         SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
+        RENAMED_FILES.lock().expect("fsync probe poisoned").clear();
     }
 
     pub(crate) fn note_file(path: &Path) {
@@ -625,6 +627,13 @@ pub(crate) mod fsync_probe {
 
     pub(crate) fn note_dir(path: &Path) {
         SYNCED_DIRS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(path.to_path_buf());
+    }
+
+    pub(crate) fn note_rename(path: &Path) {
+        RENAMED_FILES
             .lock()
             .expect("fsync probe poisoned")
             .push(path.to_path_buf());
@@ -646,6 +655,10 @@ pub(crate) mod fsync_probe {
             .iter()
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn renamed_files() -> Vec<PathBuf> {
+        RENAMED_FILES.lock().expect("fsync probe poisoned").clone()
     }
 }
 
@@ -776,6 +789,34 @@ impl FileFlushTarget {
             Some("txt") => path.with_extension("txt.tmp"),
             _ => path.with_extension("db.tmp"),
         }
+    }
+
+    fn rename_path(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
+        std::fs::rename(source.as_ref(), target.as_ref())?;
+        #[cfg(test)]
+        fsync_probe::note_rename(target.as_ref());
+        Ok(())
+    }
+
+    fn promote_tmp_components(
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+    ) -> Result<()> {
+        let tmp = Self::tmp_component_path;
+
+        // `Data.db` is the discovery marker for a live generation. Promote it
+        // last so a crash between renames can leave side components without
+        // Data.db, but never a discoverable Data-only orphan.
+        Self::rename_path(tmp(&paths.partitions), &paths.partitions)?;
+        Self::rename_path(tmp(&paths.rows), &paths.rows)?;
+        Self::rename_path(tmp(&paths.filter), &paths.filter)?;
+        Self::rename_path(tmp(&paths.statistics), &paths.statistics)?;
+        Self::rename_path(tmp(&paths.toc), &paths.toc)?;
+        if has_compression_info {
+            Self::rename_path(tmp(&paths.compression_info), &paths.compression_info)?;
+        }
+        Self::rename_path(tmp(&paths.data), &paths.data)?;
+        Ok(())
     }
 
     /// fsync a single file so its bytes are durable on the underlying device.
@@ -1126,16 +1167,9 @@ impl FlushTarget for FileFlushTarget {
         }
 
         // All tmp files written successfully — atomically rename to final names.
-        // rename() is atomic on POSIX (same filesystem).
-        std::fs::rename(tmp(&paths.data), &paths.data)?;
-        std::fs::rename(tmp(&paths.partitions), &paths.partitions)?;
-        std::fs::rename(tmp(&paths.rows), &paths.rows)?;
-        std::fs::rename(tmp(&paths.filter), &paths.filter)?;
-        std::fs::rename(tmp(&paths.statistics), &paths.statistics)?;
-        std::fs::rename(&toc_tmp, &paths.toc)?;
-        if has_compression_info {
-            std::fs::rename(tmp(&paths.compression_info), &paths.compression_info)?;
-        }
+        // rename() is atomic on POSIX (same filesystem). Data.db is promoted
+        // last because it is the generation discovery marker.
+        Self::promote_tmp_components(&paths, has_compression_info)?;
 
         // Verify the renamed Data.db file is the correct size.
         // If it differs from the tmp file we just checked, something else
@@ -1203,15 +1237,7 @@ impl FlushTarget for FileFlushTarget {
             )));
         }
 
-        std::fs::rename(tmp(&paths.data), &paths.data)?;
-        std::fs::rename(tmp(&paths.partitions), &paths.partitions)?;
-        std::fs::rename(tmp(&paths.rows), &paths.rows)?;
-        std::fs::rename(tmp(&paths.filter), &paths.filter)?;
-        std::fs::rename(tmp(&paths.statistics), &paths.statistics)?;
-        std::fs::rename(tmp(&paths.toc), &paths.toc)?;
-        if has_compression_info {
-            std::fs::rename(tmp(&paths.compression_info), &paths.compression_info)?;
-        }
+        Self::promote_tmp_components(&paths, has_compression_info)?;
 
         // Durability barrier: fsync every promoted component, then fsync the
         // directory once, BEFORE cleaning up staging or returning. This path is
@@ -1380,6 +1406,33 @@ mod tests {
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(ts),
             }],
+        }
+    }
+
+    fn assert_data_db_promoted_last(base_dir: &Path, gen: u64) {
+        let renamed = fsync_probe::renamed_files();
+        let expected_data = base_dir.join(format!("{gen}-Data.db"));
+        let data_pos = renamed
+            .iter()
+            .position(|path| path == &expected_data)
+            .unwrap_or_else(|| panic!("Data.db was not promoted; renamed={renamed:?}"));
+
+        assert_eq!(
+            data_pos,
+            renamed.len() - 1,
+            "Data.db must be the last final component promoted; renamed={renamed:?}"
+        );
+
+        for suffix in ["Partitions.db", "Rows.db"] {
+            let path = base_dir.join(format!("{gen}-{suffix}"));
+            let pos = renamed
+                .iter()
+                .position(|renamed_path| renamed_path == &path)
+                .unwrap_or_else(|| panic!("{suffix} was not promoted; renamed={renamed:?}"));
+            assert!(
+                pos < data_pos,
+                "{suffix} must be promoted before Data.db; renamed={renamed:?}"
+            );
         }
     }
 
@@ -1762,6 +1815,65 @@ mod tests {
             tmp_files.is_empty(),
             "no .tmp files should remain after successful flush, found: {tmp_files:?}"
         );
+    }
+
+    #[test]
+    fn flush_promotes_data_db_after_required_components() {
+        let _fsync_probe = fsync_probe::exclusive();
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let mut writer = SSTableWriter::new(options, header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(output).unwrap();
+        let gen = target.generation();
+
+        assert_data_db_promoted_last(dir.path(), gen);
+    }
+
+    #[test]
+    fn flush_files_promotes_data_db_after_required_components() {
+        let _fsync_probe = fsync_probe::exclusive();
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let options = WriteOptions::default();
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+
+        let _reader = target.flush_files(output).unwrap();
+        let gen = target.generation();
+
+        assert_data_db_promoted_last(dir.path(), gen);
     }
 
     #[test]

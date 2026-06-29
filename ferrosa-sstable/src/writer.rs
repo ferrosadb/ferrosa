@@ -3045,7 +3045,7 @@ mod tests {
         writer.add_partition(&partition).unwrap();
         let output = writer.finish().unwrap();
 
-        // Read back via sequential DataReader (same path as read_all_partitions)
+        // Read back via sequential DataReader.
         let mut reader = DataReader::new(&output.data, &header, 0);
         let read_back = reader
             .read_partition()
