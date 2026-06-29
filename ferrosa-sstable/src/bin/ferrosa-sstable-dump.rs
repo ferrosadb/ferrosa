@@ -10,6 +10,20 @@ use std::path::PathBuf;
 use ferrosa_sstable::io::FileReadAt;
 use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
 
+fn open_required_component(dir: &std::path::Path, gen: &str, component: &str) -> FileReadAt {
+    let path = dir.join(format!("{gen}-{component}"));
+    match FileReadAt::open(&path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "Error: required SSTable component {component} is missing or unreadable at {}: {e}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -28,10 +42,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let data = FileReadAt::open(&data_path).expect("open Data.db");
-    let partitions_file =
-        FileReadAt::open(dir.join(format!("{gen}-Partitions.db"))).expect("open Partitions.db");
-    let rows = FileReadAt::open(dir.join(format!("{gen}-Rows.db"))).expect("open Rows.db");
+    let data = open_required_component(&dir, gen, "Data.db");
+    let partitions_file = open_required_component(&dir, gen, "Partitions.db");
+    let rows = open_required_component(&dir, gen, "Rows.db");
     let filter = std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap_or_default();
     let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
     let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
