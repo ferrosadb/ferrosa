@@ -1,0 +1,537 @@
+# P0 OOM Guard — static-audit allowlist
+#
+# See specs/p0-oom-guard/blueprint.md (§2 D3, §3 Layer 1).
+#
+# Each `[[allow]]` suppresses findings whose file path CONTAINS `path`, whose
+# rule equals `rule`, and (optionally) whose fn/method symbol CONTAINS `symbol`.
+# Every entry MUST carry `reason`, `owner`, and an `expires` (YYYY-MM-DD). An
+# entry whose `expires` is in the past is itself reported as a finding
+# (`expired-allow-entry`) so exemptions cannot silently rubber-stamp forever.
+#
+# Policy: the audit runs in WARN mode by default (prints everything, exits 0).
+# `--enforce` exits non-zero on any un-suppressed finding. The entries below are
+# the documented baseline so `--enforce` passes on the current tree while the
+# underlying streaming fixes land. They fall into two groups:
+#
+#  1. The P0 SELECT-arm sites the streaming fix (forge t_15417b35) will remove.
+#     Short expiry (2026-09-30) — these must be re-audited when t_15417b35 lands.
+#  2. Pre-existing materialization across the read/storage stack predating the
+#     guard. Tracked under the materialization epic (forge t_110dd8a5); longer
+#     expiry while each path is migrated to streaming.
+
+# ---------------------------------------------------------------------------
+# Group 1 — P0 SELECT-arm materialization removed by t_15417b35 (expiry 2026-09-30)
+# ---------------------------------------------------------------------------
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "returns-vec-partition-or-row"
+symbol = "range_read_limited_rows"
+reason = "t_15417b35: SELECT-arm streaming fix removes this materializing range_read_limited_rows."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "limited-rows-call-site"
+symbol = "range_read_limited_rows"
+reason = "t_15417b35: write_path dispatch into the materializing range read; removed by SELECT-arm fix."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "limited-rows-call-site"
+symbol = "coordinate_range_read_limited_rows"
+reason = "t_15417b35: write_path -> coordinator materializing range read; removed by SELECT-arm fix."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "limited-rows-call-site"
+symbol = "range_read_limited_rows"
+reason = "t_15417b35: degraded IndexScanWithFilter/SingleIndex arm call sites; removed by SELECT-arm streaming fix."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "with-capacity-limit"
+reason = "t_15417b35: Vec::with_capacity(limit) in read_local_range_stream_limited_rows window collection; removed by SELECT-arm fix."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "stream-returns-vec"
+symbol = "read_local_range_stream_limited_rows"
+reason = "t_15417b35: stream-named fn still materializes a Vec<Partition>; removed by SELECT-arm fix."
+owner = "storage"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "returns-vec-partition-or-row"
+symbol = "read_local_range_stream_limited_rows"
+reason = "t_15417b35: read_local_range_stream_limited_rows returns Vec<Partition>; removed by SELECT-arm fix."
+owner = "storage"
+expires = "2026-09-30"
+
+# ---------------------------------------------------------------------------
+# Group 2 — pre-existing materialization predating the guard (epic t_110dd8a5)
+# Warn-mode first (FMEA: existing unfixed code must not block). Each path is
+# migrated to streaming under the epic; expiry 2026-12-31 forces re-review.
+# ---------------------------------------------------------------------------
+
+# -- ferrosa-cluster coordinator: range read / index read materialization ----
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "returns-vec-partition-or-row"
+symbol = "dedup_by_token"
+reason = "t_110dd8a5: dedup helper over an already-bounded window; migrate with the streaming range-read rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "stream-returns-vec"
+symbol = "coordinate_range_read_stream_limited_rows"
+reason = "t_110dd8a5: streaming coordinator still returns a materialized Vec window; tracked for the streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "returns-vec-partition-or-row"
+symbol = "coordinate_range_read_stream_limited_rows"
+reason = "t_110dd8a5: streaming coordinator window return; tracked for the streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: legacy coordinator range/index read materialization predating the guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "limited-rows-call-site"
+reason = "t_110dd8a5: legacy coordinator limited-rows dispatch predating the guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "stream-push-accumulation"
+reason = "t_110dd8a5: bounded accumulation loops in coordinator read path; migrate with streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/write.rs"
+rule = "stream-push-accumulation"
+reason = "t_110dd8a5: write-path accumulation loops over bounded batches; not on the broad-scan read path."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- ferrosa-cluster pair / repair --------------------------------------------
+[[allow]]
+path = "ferrosa-cluster/src/pair/catchup.rs"
+rule = "with-capacity-limit"
+reason = "t_110dd8a5: pair catchup pre-allocation over a bounded catchup batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/pair/coordinator.rs"
+rule = "with-capacity-limit"
+reason = "t_110dd8a5: pair coordinator pre-allocation over a bounded batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/executor.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: repair executor range/snapshot reads; repair operates over bounded token ranges."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/rpc.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: repair RPC range read over a bounded token range."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- ferrosa-cluster write_path read wrappers ---------------------------------
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: write_path range/index read wrappers predating the guard; migrate with streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "limited-rows-call-site"
+reason = "t_110dd8a5: write_path single-key limited-rows dispatch (not broad-scan); predates the guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "stream-push-accumulation"
+reason = "t_110dd8a5: write_path accumulation over bounded range windows."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- ferrosa-cql router -------------------------------------------------------
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "stream-push-accumulation"
+reason = "t_110dd8a5: router accumulation loops over bounded result windows."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: router index-intersection helpers materialize bounded partition sets."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- ferrosa-storage engine / store / memtable -------------------------------
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/driver.rs"
+rule = "stream-returns-vec"
+reason = "t_110dd8a5: compaction validator (test/validation oracle path), not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/driver.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: compaction validator oracle, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/oracle.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: compaction validation oracle, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/data_store.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: storage data_store read_range materialization; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/engine.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: storage engine range/index/ann read materialization; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/index/sidecar.rs"
+rule = "with-capacity-limit"
+reason = "t_110dd8a5: index sidecar pre-allocation over a bounded result set."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/memtable/sharded.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: memtable snapshot/merge materializes an in-memory (bounded) partition set."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/memtable/skiplist.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: memtable skiplist snapshot materializes an in-memory (bounded) partition set."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/store.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: storage store range/index/ann read materialization; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/test_support.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_110dd8a5: test_support merge helper used only by tests/harness, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+# ===========================================================================
+# Extended rules (collect / unbounded-range-read / materializing-call-site /
+# cqlvalue-row-accumulation / clone-on-row-data). Added with the second rule
+# batch. Same policy: the SELECT-arm scan site t_15417b35 removes gets the
+# short expiry; everything else is pre-existing under epic t_110dd8a5.
+# ===========================================================================
+
+# -- Group 1b: SELECT-arm site removed by t_15417b35 (expiry 2026-09-30) ------
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "materializing-range-read-call-site"
+symbol = "range_read_projected"
+reason = "t_15417b35: degraded SELECT scan arm range_read_projected call (router.rs:4670), adjacent to the range_read_limited_rows sites; removed by the SELECT-arm streaming fix."
+owner = "storage"
+expires = "2026-09-30"
+
+# -- Group 2b: rule `collect-vec-partition-or-row` (epic t_110dd8a5) ----------
+[[allow]]
+path = "ferrosa-cluster/src/accord/apply.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): accord apply collects a bounded partition batch, not a broad scan."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): coordinator read collects a bounded window; migrate with streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/executor.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): repair executor collects a bounded token-range batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/mod.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): repair collects a bounded token-range batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/rpc.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): repair RPC collects a bounded token-range batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/corpus.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator corpus builder, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/soak.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): compaction validator soak harness, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/store.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): storage store collects bounded partition/row sets; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/test_support.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_110dd8a5 (collect-vec-partition-or-row): test_support helpers used only by tests/harness."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- Group 2b: rule `unbounded-range-read` (epic t_110dd8a5) ------------------
+[[allow]]
+path = "ferrosa-cluster/src/controller/cluster.rs"
+rule = "unbounded-range-read"
+reason = "t_110dd8a5 (unbounded-range-read): bootstrap reads a system/control table over a bounded keyspace at startup."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "unbounded-range-read"
+reason = "t_110dd8a5 (unbounded-range-read): coordinator local read_range(None,None) under an explicit partition limit; migrate with streaming rework."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/system_table_loader.rs"
+rule = "unbounded-range-read"
+reason = "t_110dd8a5 (unbounded-range-read): system-table loader scans small bounded system tables at startup."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/engine.rs"
+rule = "unbounded-range-read"
+reason = "t_110dd8a5 (unbounded-range-read): engine-internal read_range(None,None) under an explicit limit; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- Group 2b: rule `cqlvalue-row-accumulation` (epic t_110dd8a5) -------------
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "cqlvalue-row-accumulation"
+reason = "t_110dd8a5 (cqlvalue-row-accumulation): CQL result-row encoding materializes the row matrix per query; convert to row streaming with the broader SELECT streaming work."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-row-bridge/src/row.rs"
+rule = "cqlvalue-row-accumulation"
+reason = "t_110dd8a5 (cqlvalue-row-accumulation): row-bridge value conversion materializes a bounded row matrix."
+owner = "storage"
+expires = "2026-12-31"
+
+# -- Group 2b: rule `clone-on-row-data` (epic t_110dd8a5) ---------------------
+# Acknowledged false-positive-prone (per-partition-boundary key/partition clones
+# in the streaming merge are legitimate). Suppressed per file while the move-based
+# scan-path audit is calibrated; clone-on-row-data stays an enforced rule so any
+# NEW file accumulating row clones surfaces in warn mode and fails enforce.
+[[allow]]
+path = "ferrosa-cluster/src/accord/apply.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): pre-existing row clone predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/accord/coordinator.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): pre-existing row clone predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/batch.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): pre-existing per-batch row clones predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): pre-existing row clone predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/hints/delivery.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): hint delivery row clone over a bounded hint batch."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/pair/coordinator.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): pair coordinator row clone predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/executor.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): repair executor row clones over bounded token ranges."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/rpc.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): repair RPC row clone over a bounded token range."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/streaming/sstable_transfer.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): sstable-transfer partition-boundary clone in the streaming merge (legit per-boundary copy)."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): write_path row clone predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cql/src/accord_router.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): accord router row clones predating the move-based guard."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): router result-encoding row clones; convert with the SELECT streaming work."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/commitlog/mod.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): commitlog row clone on the write/replay path, not a broad scan."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/driver.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): compaction validator clone, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/oracle.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): compaction validation oracle clones, not a serving read path."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/engine.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): engine row clones predating the move-based guard; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/flush.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): flush-path row clones over a bounded memtable snapshot."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/memtable/skiplist.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): memtable skiplist row clone over an in-memory bounded set."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-storage/src/store.rs"
+rule = "clone-on-row-data"
+reason = "t_110dd8a5 (clone-on-row-data): storage store row clones predating the move-based guard; migrate with the streaming engine API."
+owner = "storage"
+expires = "2026-12-31"
