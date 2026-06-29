@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -711,36 +712,41 @@ async fn collect_page_from_partition_stream(
 
     'outer: while let Some(partition) = stream.next().await {
         let partition = partition?;
-        let pk_bytes = partition.key.key.as_bytes().to_vec();
-        let paired = bridge::partition_to_rows_with_clustering(
-            &partition,
+        bridge::consume_partition_rows_with_clustering(
+            partition,
             row_context.all_col_names,
             row_context.all_col_types,
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        );
-
-        for (clustering, output_row) in paired {
-            // Skip rows already returned on a previous page. Only applies to
-            // the partition the cursor stopped in; once we pass it (or land in
-            // a later partition), nothing is skipped.
-            if let Some(ref cur) = resume {
-                if pk_bytes == cur.partition_key && clustering <= cur.clustering_key {
-                    continue;
+            |pk_bytes, clustering, output_row| {
+                // Skip rows already returned on a previous page. Only applies to
+                // the partition the cursor stopped in; once we pass it (or land in
+                // a later partition), nothing is skipped.
+                if let Some(ref cur) = resume {
+                    if pk_bytes == cur.partition_key.as_slice() && clustering <= cur.clustering_key
+                    {
+                        return ControlFlow::Continue(());
+                    }
                 }
-            }
 
-            if rows.len() == page_size {
-                // We already have a full page and just found another row — a
-                // continuation is required. Stop without consuming further.
-                more_rows_remain = true;
-                break 'outer;
-            }
+                if rows.len() == page_size {
+                    // We already have a full page and just found another row — a
+                    // continuation is required. Stop without consuming further.
+                    more_rows_remain = true;
+                    return ControlFlow::Break(());
+                }
 
-            rows.push(output_row);
-            last_pk = pk_bytes.clone();
-            last_ck = clustering;
+                rows.push(output_row);
+                last_ck = clustering;
+                if rows.len() == page_size {
+                    last_pk = pk_bytes.to_vec();
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        if more_rows_remain {
+            break 'outer;
         }
 
         processed_partitions += 1;
@@ -805,46 +811,62 @@ async fn collect_filtered_page_from_partition_stream(
 
     'outer: while let Some(partition) = stream.next().await {
         let partition = partition?;
-        let pk_bytes = partition.key.key.as_bytes().to_vec();
-        let paired = bridge::partition_to_rows_with_clustering(
-            &partition,
+        let mut predicate_error = None;
+        bridge::consume_partition_rows_with_clustering(
+            partition,
             row_context.all_col_names,
             row_context.all_col_types,
             row_context.pk_indices,
             row_context.ck_indices,
             row_context.storage_to_table,
-        );
-
-        for (clustering, output_row) in paired {
-            if let Some(ref cur) = resume {
-                if pk_bytes == cur.partition_key && clustering <= cur.clustering_key {
-                    continue;
+            |pk_bytes, clustering, output_row| {
+                if let Some(ref cur) = resume {
+                    if pk_bytes == cur.partition_key.as_slice() && clustering <= cur.clustering_key
+                    {
+                        return ControlFlow::Continue(());
+                    }
                 }
-            }
 
-            if !row_matches_select_predicates(
-                &output_row,
-                predicate_context.statement,
-                row_context.all_col_names,
-                row_context.all_col_types,
-                predicate_context.table_meta,
-                predicate_context.keyspace,
-                predicate_context.state,
-            )? {
-                continue;
-            }
+                let matches = match row_matches_select_predicates(
+                    &output_row,
+                    predicate_context.statement,
+                    row_context.all_col_names,
+                    row_context.all_col_types,
+                    predicate_context.table_meta,
+                    predicate_context.keyspace,
+                    predicate_context.state,
+                ) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        predicate_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                };
+                if !matches {
+                    return ControlFlow::Continue(());
+                }
 
-            if rows.len() == target {
-                more_rows_remain = true;
-                break 'outer;
-            }
+                if rows.len() == target {
+                    more_rows_remain = true;
+                    return ControlFlow::Break(());
+                }
 
-            rows.push(output_row);
-            last_pk = pk_bytes.clone();
-            last_ck = clustering;
-            if rows.len() == limit {
-                break 'outer;
-            }
+                rows.push(output_row);
+                last_ck = clustering;
+                if limit > target && rows.len() == target {
+                    last_pk = pk_bytes.to_vec();
+                }
+                if rows.len() == limit {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        if let Some(error) = predicate_error {
+            return Err(error);
+        }
+        if more_rows_remain || rows.len() == limit {
+            break 'outer;
         }
 
         processed_partitions += 1;
@@ -4354,26 +4376,29 @@ async fn route_select_user_table(
                     }
 
                     // Check ALLOW FILTERING requirement.
-                    let indexed_columns: Vec<String> = snap
-                        .indexes
-                        .iter()
-                        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-                        .flat_map(|(_, meta)| meta.target_columns.iter().cloned())
-                        .collect();
+                    let is_indexed_column = |column: &str| {
+                        snap.indexes.iter().any(|((idx_ks, idx_tbl, _), meta)| {
+                            idx_ks == ks
+                                && idx_tbl == &s.table
+                                && meta
+                                    .target_columns
+                                    .iter()
+                                    .any(|target| target.as_str() == column)
+                        })
+                    };
 
                     // Exclude token() predicates — they are range scan hints,
                     // not column filters that require indexing.
-                    let non_token_clauses: Vec<&WhereClause> =
-                        s.where_clauses.iter().filter(|wc| !wc.token_fn).collect();
-                    let all_where_columns_indexed = non_token_clauses
+                    let has_non_token_clauses = s.where_clauses.iter().any(|wc| !wc.token_fn);
+                    let all_where_columns_indexed = s
+                        .where_clauses
                         .iter()
-                        .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
-                    let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
+                        .filter(|wc| !wc.token_fn)
+                        .all(|wc| is_indexed_column(wc.column.as_str()));
+                    let may_stream_filter_fallback =
+                        (s.allow_filtering || all_where_columns_indexed) && has_non_token_clauses;
 
-                    if !non_token_clauses.is_empty()
-                        && !all_where_columns_indexed
-                        && !s.allow_filtering
-                    {
+                    if has_non_token_clauses && !all_where_columns_indexed && !s.allow_filtering {
                         return Err(CqlError::Invalid(
                             "Cannot execute this query as it requires filtering on non-indexed \
                          columns. Use ALLOW FILTERING, create a secondary index on the \
@@ -4483,8 +4508,13 @@ async fn route_select_user_table(
                     } else {
                         // Use a bounded upstream partition cap for unordered,
                         // non-aggregate scans so first pages do not wait behind an
-                        // unbounded table materialization. When ALLOW FILTERING has
+                        // unbounded table materialization. When a query needs
                         // post-filter predicates, no upstream partition cap is safe:
+                        // this includes explicit ALLOW FILTERING and declared
+                        // indexed-column shapes that the planner cannot yet
+                        // accelerate directly (for example BTree ranges or
+                        // multi-column composite prefixes). In those cases the
+                        // fallback must remain legal, but it must stream pages.
                         // LIMIT 1 may need to inspect many non-matching partitions
                         // before finding the first matching row, and a fixed cap would
                         // silently drop later matches. In that shape, stream the full
@@ -4496,7 +4526,7 @@ async fn route_select_user_table(
                             && s.ann_of.is_none()
                             && !count_only_select
                         {
-                            if has_post_filter {
+                            if may_stream_filter_fallback {
                                 None
                             } else {
                                 let page_size = ctx
@@ -4663,7 +4693,7 @@ async fn route_select_user_table(
                             });
                         }
                         let can_stream_post_filter_page = partitions.is_none()
-                            && has_post_filter
+                            && may_stream_filter_fallback
                             && s.order_by.is_empty()
                             && s.ann_of.is_none()
                             && !s.distinct
@@ -23145,6 +23175,52 @@ mod tests {
     }
 
     #[test]
+    fn streaming_page_collectors_must_consume_rows_without_partition_materialization() {
+        let source = include_str!("router.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production router source must precede tests");
+        let collectors = production
+            .split("async fn collect_page_from_partition_stream")
+            .nth(1)
+            .and_then(|rest| rest.split("fn storage_to_table_indices").next())
+            .expect("streaming page collectors must be present");
+
+        assert!(
+            collectors.contains("consume_partition_rows_with_clustering"),
+            "streaming page collectors must consume partition rows so clustering keys can move into the cursor"
+        );
+        assert!(
+            !collectors.contains("partition_to_rows_with_clustering("),
+            "streaming page collectors must not materialize every decoded row in the current partition"
+        );
+        assert!(
+            !collectors.contains("last_pk = pk_bytes.clone()"),
+            "streaming page collectors must not clone the partition key once per accepted row"
+        );
+    }
+
+    #[test]
+    fn row_bridge_consuming_visitor_moves_clustering_for_streaming_cursors() {
+        let source = include_str!("../../ferrosa-row-bridge/src/row.rs");
+        let consumer = source
+            .split("pub fn consume_partition_rows_with_clustering")
+            .nth(1)
+            .and_then(|rest| rest.split("fn read_now_secs").next())
+            .expect("row bridge consuming visitor must be present");
+
+        assert!(
+            consumer.contains("visit(pk_bytes, row.clustering, output_row)"),
+            "consuming row visitor must move clustering bytes into the caller instead of cloning"
+        );
+        assert!(
+            !consumer.contains("row.clustering.clone()"),
+            "consuming row visitor must not clone clustering bytes on the streaming cursor path"
+        );
+    }
+
+    #[test]
     fn full_scan_fallback_must_not_materialize_unbounded_stream() {
         let source = include_str!("router.rs");
         let production = source
@@ -23543,6 +23619,71 @@ mod tests {
         );
         assert_eq!(ids.first(), Some(&Some(CqlValue::Int(first_matching_id))));
         assert_eq!(ids.last(), Some(&Some(CqlValue::Int((n - 1) as i32))));
+    }
+
+    #[tokio::test]
+    async fn declared_btree_range_filter_streams_without_allow_filtering() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        for cql in [
+            "CREATE KEYSPACE idxrng WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idxrng.users (id int PRIMARY KEY, age int)",
+            "INSERT INTO idxrng.users (id, age) VALUES (1, 18)",
+            "INSERT INTO idxrng.users (id, age) VALUES (2, 71)",
+            "INSERT INTO idxrng.users (id, age) VALUES (3, 75)",
+            "CREATE INDEX idxrng_age ON idxrng.users (age) USING 'btree'",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse("SELECT id FROM idxrng.users WHERE age > 70").unwrap();
+        let row_count = match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(bytes) => extract_row_count(&bytes),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 2,
+            "declared BTree range predicate must stream-filter instead of hitting the OOM guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_composite_filter_streams_without_allow_filtering() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        for cql in [
+            "CREATE KEYSPACE idxcmp WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idxcmp.people (id int PRIMARY KEY, last_name text, first_name text)",
+            "INSERT INTO idxcmp.people (id, last_name, first_name) VALUES (1, 'Smith', 'Alice')",
+            "INSERT INTO idxcmp.people (id, last_name, first_name) VALUES (2, 'Smith', 'Bob')",
+            "INSERT INTO idxcmp.people (id, last_name, first_name) VALUES (3, 'Jones', 'Alice')",
+            "CREATE INDEX idxcmp_name ON idxcmp.people (last_name, first_name) USING 'composite'",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM idxcmp.people WHERE last_name = 'Smith' AND first_name = 'Alice'",
+        )
+        .unwrap();
+        let row_count = match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(bytes) => extract_row_count(&bytes),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count, 1,
+            "declared composite predicates must stream-filter instead of hitting the OOM guard"
+        );
     }
 
     #[tokio::test]

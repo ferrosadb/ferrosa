@@ -747,14 +747,15 @@ fn resolve_builtin_type(name: &str) -> Option<CqlType> {
 // Postgres front-end reuses the *exact same* path (no risk of divergent row
 // ordering). Re-exported here at the original public paths
 // (`ferrosa_cql::bridge::partition_to_rows[_with_storage_mapping|_with_clustering]`,
-// `write_partition_raw_rows_with_storage_mapping`) so in-crate callers,
-// `router.rs`, and the existing test suite need no changes. `decode_value`
-// (used internally below) maps RowBridgeError back to CqlError via the
-// `crate::types::decode_value` wrapper.
+// the visitor variant, and `write_partition_raw_rows_with_storage_mapping`) so
+// in-crate callers, `router.rs`, and the existing test suite need no changes.
+// `decode_value` (used internally below) maps RowBridgeError back to CqlError
+// via the `crate::types::decode_value` wrapper.
 pub use ferrosa_row_bridge::{
-    build_decorated_key, build_delete_row, build_row, decode_clustering, decode_pk,
-    encode_clustering, partition_to_rows, partition_to_rows_with_clustering,
-    partition_to_rows_with_storage_mapping, write_partition_raw_rows_with_storage_mapping,
+    build_decorated_key, build_delete_row, build_row, consume_partition_rows_with_clustering,
+    decode_clustering, decode_pk, encode_clustering, partition_to_rows,
+    partition_to_rows_with_clustering, partition_to_rows_with_storage_mapping,
+    visit_partition_rows_with_clustering, write_partition_raw_rows_with_storage_mapping,
 };
 
 // ---------------------------------------------------------------------------
