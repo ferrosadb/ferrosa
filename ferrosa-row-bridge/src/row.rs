@@ -5,10 +5,11 @@
 //! Duplicating this logic would risk silently-divergent row ordering — the top
 //! FMEA risk for the SQL front-end — so it lives here once.
 
+use std::ops::ControlFlow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrosa_common::{CellValue, CqlType, CqlValue, DecoratedKey, PartitionKey};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
 use crate::codec::{decode_value, encode_value};
 use crate::RowBridgeError;
@@ -65,17 +66,20 @@ pub fn partition_to_rows_with_storage_mapping(
     ck_columns: &[usize],
     storage_to_table: &[usize],
 ) -> Vec<Vec<Option<CqlValue>>> {
-    partition_to_rows_with_clustering(
+    let mut result = Vec::new();
+    visit_partition_rows_with_clustering(
         partition,
         column_names,
         column_types,
         pk_columns,
         ck_columns,
         storage_to_table,
-    )
-    .into_iter()
-    .map(|(_clustering, row)| row)
-    .collect()
+        |_clustering, row| {
+            result.push(row);
+            ControlFlow::Continue(())
+        },
+    );
+    result
 }
 
 /// Like [`partition_to_rows_with_storage_mapping`] but pairs each produced
@@ -94,98 +98,209 @@ pub fn partition_to_rows_with_clustering(
     storage_to_table: &[usize],
 ) -> Vec<(Vec<u8>, Vec<Option<CqlValue>>)> {
     let mut result = Vec::new();
+    visit_partition_rows_with_clustering(
+        partition,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+        |clustering, row| {
+            result.push((clustering.to_vec(), row));
+            ControlFlow::Continue(())
+        },
+    );
+    result
+}
 
-    // Wall-clock seconds for TTL expiry, evaluated once per call. Expiry is
-    // applied at read time because compaction does not purge expired cells.
-    let now_secs = i32::try_from(
+/// Visit surviving rows in a partition one at a time, paired with borrowed
+/// clustering-key bytes.
+///
+/// Callers that page or filter streams can move each decoded row directly to
+/// the next stage and stop early at a page boundary. The returned row owns its
+/// decoded CQL values, but the clustering bytes are borrowed from the source
+/// row so callers only copy them if they must persist an owned cursor.
+pub fn visit_partition_rows_with_clustering<F>(
+    partition: &ferrosa_sstable::types::Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+    mut visit: F,
+) where
+    F: FnMut(&[u8], Vec<Option<CqlValue>>) -> ControlFlow<()>,
+{
+    let now_secs = read_now_secs();
+    let pk_values = decode_pk(&partition.key, pk_columns.len());
+    let decode_context = RowDecodeContext {
+        pk_values: &pk_values,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+        now_secs,
+    };
+
+    for row in &partition.rows {
+        if !row_is_visible(row, now_secs) {
+            continue;
+        }
+
+        let output_row = decode_output_row(row, &decode_context);
+        if let ControlFlow::Break(()) = visit(row.clustering.as_slice(), output_row) {
+            break;
+        }
+    }
+}
+
+/// Consume surviving rows in a partition one at a time, moving clustering-key
+/// bytes into the visitor.
+///
+/// Streaming read paths use this variant for page cursors: the output row is
+/// moved to the page buffer, and the clustering key of the accepted cursor row
+/// is moved rather than cloned from the source row. The returned partition key
+/// is the original owned key allocation from the consumed partition, so callers
+/// that need an owned paging cursor can move it without copying.
+pub fn consume_partition_rows_with_clustering<F>(
+    partition: Partition,
+    column_names: &[String],
+    column_types: &[CqlType],
+    pk_columns: &[usize],
+    ck_columns: &[usize],
+    storage_to_table: &[usize],
+    mut visit: F,
+) -> Vec<u8>
+where
+    F: FnMut(&[u8], Vec<u8>, Vec<Option<CqlValue>>) -> ControlFlow<()>,
+{
+    let Partition { key, rows, .. } = partition;
+    let now_secs = read_now_secs();
+    let pk_values = decode_pk(&key, pk_columns.len());
+    let decode_context = RowDecodeContext {
+        pk_values: &pk_values,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+        now_secs,
+    };
+
+    {
+        let pk_bytes = key.key.as_bytes();
+        for row in rows {
+            if !row_is_visible(&row, now_secs) {
+                continue;
+            }
+
+            let output_row = decode_output_row(&row, &decode_context);
+            if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
+                break;
+            }
+        }
+    }
+
+    key.key.into_bytes()
+}
+
+fn read_now_secs() -> i32 {
+    i32::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
     )
-    .unwrap_or(i32::MAX);
+    .unwrap_or(i32::MAX)
+}
 
-    // Pre-decode PK values from the partition key
-    let pk_values = decode_pk(&partition.key, pk_columns.len());
-
-    for row in &partition.rows {
-        // TTL expiry: a row whose primary-key liveness was written with a TTL
-        // and has expired is gone — unless some cell is still live (a later
-        // non-TTL UPDATE can resurrect it). Mirrors Cassandra semantics.
-        let pkl = &row.primary_key_liveness;
-        let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
-        if liveness_expired {
-            let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
-            if !any_live_cell {
-                continue;
-            }
+fn row_is_visible(row: &Row, now_secs: i32) -> bool {
+    // TTL expiry: a row whose primary-key liveness was written with a TTL and
+    // has expired is gone — unless some cell is still live (a later non-TTL
+    // UPDATE can resurrect it). Mirrors Cassandra semantics.
+    let pkl = &row.primary_key_liveness;
+    let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
+    if liveness_expired {
+        let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
+        if !any_live_cell {
+            return false;
         }
-
-        // Skip tombstone rows — but only if no newer mutation supersedes the
-        // tombstone. In Cassandra semantics, an UPDATE or INSERT after a
-        // DELETE resurrects the row: the primary_key_liveness timestamp or
-        // cell timestamps may be newer than the row-level deletion.
-        if !row.deletion.is_live() {
-            let del_ts = row.deletion.marked_for_delete_at;
-            let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
-            let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
-            if !liveness_supersedes && !any_cell_supersedes {
-                continue;
-            }
-        }
-
-        let mut output_row: Vec<Option<CqlValue>> = vec![None; column_names.len()];
-
-        // Fill PK columns
-        for (i, &col_idx) in pk_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = pk_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        // Fill CK columns
-        let ck_values = decode_clustering(&row.clustering, ck_columns.len());
-        for (i, &col_idx) in ck_columns.iter().enumerate() {
-            if col_idx < column_types.len() {
-                if let Some(bytes) = ck_values.get(i) {
-                    if let Ok(val) = decode_value(&column_types[col_idx], bytes) {
-                        output_row[col_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        // Fill regular/static columns from cells.
-        //
-        // Cell indices are in storage column space (0-based within
-        // static+regular columns).  Translate to full-table column index
-        // via the mapping built above.
-        for (col_index, cell) in &row.cells {
-            let storage_idx = *col_index as usize;
-            let table_idx = match storage_to_table.get(storage_idx) {
-                Some(&idx) => idx,
-                None => continue, // out-of-range storage index — skip
-            };
-            if table_idx < column_types.len() {
-                if !cell_is_live(cell, now_secs) {
-                    // Tombstone or expired TTL cell → reads as null.
-                    output_row[table_idx] = None;
-                } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
-                        output_row[table_idx] = Some(val);
-                    }
-                }
-            }
-        }
-
-        result.push((row.clustering.clone(), output_row));
     }
 
-    result
+    // Skip tombstone rows — but only if no newer mutation supersedes the
+    // tombstone. In Cassandra semantics, an UPDATE or INSERT after a DELETE
+    // resurrects the row: the primary_key_liveness timestamp or cell timestamps
+    // may be newer than the row-level deletion.
+    if !row.deletion.is_live() {
+        let del_ts = row.deletion.marked_for_delete_at;
+        let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
+        let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
+        if !liveness_supersedes && !any_cell_supersedes {
+            return false;
+        }
+    }
+
+    true
+}
+
+struct RowDecodeContext<'a> {
+    pk_values: &'a [Vec<u8>],
+    column_names: &'a [String],
+    column_types: &'a [CqlType],
+    pk_columns: &'a [usize],
+    ck_columns: &'a [usize],
+    storage_to_table: &'a [usize],
+    now_secs: i32,
+}
+
+fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<CqlValue>> {
+    let mut output_row: Vec<Option<CqlValue>> = vec![None; context.column_names.len()];
+
+    // Fill PK columns.
+    for (i, &col_idx) in context.pk_columns.iter().enumerate() {
+        if col_idx < context.column_types.len() {
+            if let Some(bytes) = context.pk_values.get(i) {
+                if let Ok(val) = decode_value(&context.column_types[col_idx], bytes) {
+                    output_row[col_idx] = Some(val);
+                }
+            }
+        }
+    }
+
+    // Fill CK columns.
+    let ck_values = decode_clustering(&row.clustering, context.ck_columns.len());
+    for (i, &col_idx) in context.ck_columns.iter().enumerate() {
+        if col_idx < context.column_types.len() {
+            if let Some(bytes) = ck_values.get(i) {
+                if let Ok(val) = decode_value(&context.column_types[col_idx], bytes) {
+                    output_row[col_idx] = Some(val);
+                }
+            }
+        }
+    }
+
+    // Fill regular/static columns from cells. Cell indices are in storage
+    // column space (0-based within static+regular columns); translate to
+    // full-table column index via the mapping built above.
+    for (col_index, cell) in &row.cells {
+        let storage_idx = *col_index as usize;
+        let table_idx = match context.storage_to_table.get(storage_idx) {
+            Some(&idx) => idx,
+            None => continue,
+        };
+        if table_idx < context.column_types.len() {
+            if !cell_is_live(cell, context.now_secs) {
+                output_row[table_idx] = None;
+            } else if let Some(ref value_bytes) = cell.value {
+                if let Ok(val) = decode_value(&context.column_types[table_idx], value_bytes) {
+                    output_row[table_idx] = Some(val);
+                }
+            }
+        }
+    }
+
+    output_row
 }
 
 /// Decompose a storage `Partition` into raw per-column byte slices, invoking

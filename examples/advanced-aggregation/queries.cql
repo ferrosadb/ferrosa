@@ -16,6 +16,7 @@ SELECT avg(temperature)
 FROM sensor_readings
 WHERE sensor_id = 'sensor-001';
 
--- Built-in aggregation: temperature range statistics across all sensors.
+-- Built-in aggregation: bounded temperature range sample across sensors.
 SELECT min(temperature), max(temperature), avg(temperature), count(temperature)
-FROM sensor_readings;
+FROM sensor_readings
+LIMIT 100;

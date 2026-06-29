@@ -444,6 +444,7 @@ async fn forward_remote_range_stream_inner(
                         request_id,
                         "streaming range read: remote replica reported truncated stream"
                     );
+                    return Err(StreamConsumeError::TruncatedReplica { request_id });
                 }
                 delivered_done += 1;
             }
@@ -1818,6 +1819,30 @@ mod tests {
             message: "boom".to_string(),
         });
         assert!(matches!(e, Err(ClusterError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn truncated_remote_done_is_a_stream_error() {
+        let (frame_tx, frame_rx) = mpsc::channel(4);
+        let (partition_tx, _partition_rx) = mpsc::channel(4);
+        let done = RangeReadStreamDonePayload {
+            request_id: 42,
+            total_chunks: 0,
+            truncated: true,
+        };
+        frame_tx
+            .send(Message::RangeReadStreamDone(bytes::Bytes::from(
+                bincode::serialize(&done).unwrap(),
+            )))
+            .await
+            .unwrap();
+        drop(frame_tx);
+
+        let result = forward_remote_range_stream_inner(frame_rx, 42, 1, partition_tx).await;
+        assert!(
+            result.is_err(),
+            "truncated Done must fail the remote stream instead of being accepted as success"
+        );
     }
 
     fn dk(tok_seed: &[u8]) -> DecoratedKey {

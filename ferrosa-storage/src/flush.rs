@@ -1410,7 +1410,16 @@ mod tests {
     }
 
     fn assert_data_db_promoted_last(base_dir: &Path, gen: u64) {
-        let renamed = fsync_probe::renamed_files();
+        let generation_prefix = format!("{gen}-");
+        let renamed: Vec<_> = fsync_probe::renamed_files()
+            .into_iter()
+            .filter(|path| path.parent() == Some(base_dir))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&generation_prefix))
+            })
+            .collect();
         let expected_data = base_dir.join(format!("{gen}-Data.db"));
         let data_pos = renamed
             .iter()
