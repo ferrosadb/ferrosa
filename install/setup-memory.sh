@@ -19,6 +19,7 @@
 #   FERROSA_SUITE_DIR     — where to put cloned repos (default $HOME/src/ferrosa-suite)
 #   FERROSA_INSTALL_ROOT  — binary install prefix (default $HOME/.ferrosa)
 #   NOMIC_MODEL           — embedding model name (default nomic-embed-text-v2-moe)
+#   FERROSA_MEMORY_START  — start the MCP server when done: yes|no (default yes on macOS)
 set -euo pipefail
 
 FERROSA_REPO="ferrosadb/ferrosa"
@@ -40,8 +41,14 @@ WANT_CLONE=""    # ask|yes|no
 WANT_NOMIC=""    # ask|yes|no
 WANT_HERMES=""   # ask|yes|no
 WANT_HOOKS=""    # ask|yes|no — install harness hooks (default yes)
-HARNESS="${FERROSA_HARNESS:-auto}"   # auto|all|codex|claude|hermes|generic
+WANT_START="${FERROSA_MEMORY_START:-}"   # yes|no — start the MCP server (default yes on macOS)
+HARNESS="${FERROSA_HARNESS:-auto}"   # auto|all|codex|claude|hermes|pi|generic
 MCP_URL="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
+
+# Path to the LaunchAgent plist template shipped in the ferrosa-memory tarball.
+# Populated in Stage 1 (before the extract dir is cleaned) and consumed by the
+# server-start stage. Empty means "write the plist inline".
+LAUNCHD_TEMPLATE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +61,8 @@ while [ $# -gt 0 ]; do
     --no-hermes)  WANT_HERMES="no"; shift ;;
     --hooks)      WANT_HOOKS="yes"; shift ;;
     --no-hooks)   WANT_HOOKS="no"; shift ;;
+    --start)      WANT_START="yes"; shift ;;
+    --no-start)   WANT_START="no"; shift ;;
     --harness)    HARNESS="$2"; shift 2 ;;
     --mcp-url)    MCP_URL="$2"; shift 2 ;;
     -h|--help)
@@ -63,7 +72,8 @@ ferrosa-memory fast setup
   --clone / --no-clone     clone or update source repos under \$FERROSA_SUITE_DIR
   --nomic / --no-nomic     pull the Nomic embedding model via ollama
   --hooks / --no-hooks     install LLM-harness hooks (session-start/recall/turn)
-  --harness <name>         which harness hooks to install: auto|all|codex|claude|hermes|generic
+  --start / --no-start     start the MCP server now via a macOS LaunchAgent (default: start on macOS)
+  --harness <name>         which harness hooks to install: auto|all|codex|claude|hermes|pi|generic
   --mcp-url <url>          MCP endpoint baked into the hooks (default $MCP_URL)
   --hermes / --no-hermes   exec hermes "onboard me ..." when done
 EOF
@@ -144,6 +154,15 @@ cp "$M_TMP/ferrosa-memory-mcp" "$BIN_DIR/"
 chmod +x "$BIN_DIR/ferrosa-memory-mcp"
 if [ ! -f "$CONFIG_DIR/ferrosa-memory.toml" ]; then
   cp "$M_TMP/config/ferrosa-memory.example.toml" "$CONFIG_DIR/ferrosa-memory.toml"
+fi
+# The release tarball ships a LaunchAgent plist template (with __BINARY_PATH__ /
+# __REPO_ROOT__ / __CONFIG_PATH__ / __HOME__ placeholders). Stash it to a stable
+# location now, before $M_TMP is removed, so the server-start stage can render it.
+if [ -f "$M_TMP/launchd/com.ferrosa-memory.mcp.plist" ]; then
+  mkdir -p "$INSTALL_ROOT/share/ferrosa-memory/launchd"
+  cp "$M_TMP/launchd/com.ferrosa-memory.mcp.plist" \
+     "$INSTALL_ROOT/share/ferrosa-memory/launchd/com.ferrosa-memory.mcp.plist"
+  LAUNCHD_TEMPLATE="$INSTALL_ROOT/share/ferrosa-memory/launchd/com.ferrosa-memory.mcp.plist"
 fi
 rm -rf "$M_TMP"
 
@@ -265,7 +284,116 @@ case "$WANT_NOMIC" in
        fi ;;
 esac
 
+# ── Stage 4b: start the MCP server (macOS LaunchAgent) ──────────────────────
+# A fresh install lays down a binary + config but no running process, so nothing
+# is listening on :18765. Install a per-user LaunchAgent so the server comes up
+# now and on every login.
+#
+# IMPORTANT CAVEAT: a brand-new install has no ferrosa DB (CQL backend) yet, so
+# the server starts in *reconnecting/degraded* mode — it serves /healthz and
+# tools/list, but memory operations fail — until the agent's ONBOARDING.md flow
+# brings up the DB (native single-node or Compose). So "running" here means the
+# process is up and the endpoint is reachable, NOT that memory is fully ready.
+LAUNCH_AGENT_LABEL="com.ferrosa-memory.mcp"
+LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+LAUNCH_AGENT_LOG="/tmp/ferrosa-memory-mcp.log"
+STARTED="no"   # no|yes|failed|manual — for the final summary
+
+render_launch_agent_plist() {
+  local out="$1"
+  if [ -n "$LAUNCHD_TEMPLATE" ] && [ -f "$LAUNCHD_TEMPLATE" ]; then
+    # Prefer the tarball-shipped template; sed-replace its placeholders.
+    say "rendering LaunchAgent from tarball template"
+    sed -e "s|__BINARY_PATH__|${BIN_DIR}/ferrosa-memory-mcp|g" \
+        -e "s|__CONFIG_PATH__|${CONFIG_DIR}/ferrosa-memory.toml|g" \
+        -e "s|__REPO_ROOT__|${INSTALL_ROOT}|g" \
+        -e "s|__HOME__|${HOME}|g" \
+        "$LAUNCHD_TEMPLATE" > "$out"
+  else
+    # No template in the tarball — write a self-contained plist inline.
+    say "writing LaunchAgent plist inline"
+    cat > "$out" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${BIN_DIR}/ferrosa-memory-mcp</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${INSTALL_ROOT}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FERROSA_MEMORY_CONFIG</key>
+    <string>${CONFIG_DIR}/ferrosa-memory.toml</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>${LAUNCH_AGENT_LOG}</string>
+  <key>StandardErrorPath</key>
+  <string>${LAUNCH_AGENT_LOG}</string>
+</dict>
+</plist>
+PLIST
+  fi
+}
+
+start_server() {
+  local domain; domain="gui/$(id -u)"
+  mkdir -p "$(dirname "$LAUNCH_AGENT_PLIST")"
+  render_launch_agent_plist "$LAUNCH_AGENT_PLIST"
+  # Idempotent: drop any existing instance, then load fresh. Don't error if it
+  # was never loaded. Prefer modern bootout/bootstrap; fall back to unload/load
+  # on older launchd that lacks them.
+  launchctl bootout "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+  if launchctl bootstrap "${domain}" "$LAUNCH_AGENT_PLIST" 2>/dev/null; then
+    launchctl enable "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+    launchctl kickstart -k "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+  else
+    launchctl unload "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
+    if ! launchctl load "$LAUNCH_AGENT_PLIST" 2>/dev/null; then
+      say "could not load the LaunchAgent automatically."
+      say "Start it manually: launchctl load $LAUNCH_AGENT_PLIST"
+      return 1
+    fi
+  fi
+  say "MCP server started via LaunchAgent ($LAUNCH_AGENT_PLIST)"
+  say "  log: $LAUNCH_AGENT_LOG"
+  say "  note: reconnecting/degraded until a ferrosa DB is configured during onboarding"
+}
+
+if [ "$WANT_START" = "no" ]; then
+  say "skipping MCP server start (--no-start). Start it later with:"
+  say "  FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp"
+elif [ "$(uname -s)" = "Darwin" ]; then
+  if start_server; then STARTED="yes"; else STARTED="failed"; fi
+else
+  # Auto-start uses a macOS LaunchAgent; on other OSes, tell the user how to run
+  # it manually rather than failing.
+  STARTED="manual"
+  say "auto-start is macOS-only on this installer — start the server manually:"
+  say "  FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp"
+fi
+
 # ── Stage 5: hand off to LLM harness ────────────────────────────────────────
+case "$STARTED" in
+  yes)    SERVER_LINE="server:   started via LaunchAgent (reconnecting until the DB is configured during onboarding)
+  log:      $LAUNCH_AGENT_LOG" ;;
+  failed) SERVER_LINE="server:   LaunchAgent install FAILED — start manually: FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp" ;;
+  manual) SERVER_LINE="server:   not started (macOS-only auto-start) — run: FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp" ;;
+  *)      SERVER_LINE="server:   not started (--no-start) — run: FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp" ;;
+esac
+
 cat <<EOF >&2
 
 ferrosa-memory $VERSION installed.
@@ -274,6 +402,7 @@ ferrosa-memory $VERSION installed.
   config:   $CONFIG_DIR/ferrosa-memory.toml
   hooks:    ~/.config/ferrosa-memory/hooks (harness=$HARNESS; unless --no-hooks)
   onboard:  $ONBOARDING_PATH
+  $SERVER_LINE
 
 EOF
 
@@ -297,4 +426,8 @@ Claude Code / Codex / another harness — paste at the prompt:
 
 The onboarding prompt walks through native vs Compose runtime, skills, hooks,
 credentials, and ports.
+
+Note: the memory server is started, but it stays in reconnecting/degraded mode
+(serving /healthz + tools/list, memory ops failing) until the onboarding flow
+brings up a ferrosa DB. The MCP endpoint is at $MCP_URL once the DB is up.
 EOF

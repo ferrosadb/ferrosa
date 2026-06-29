@@ -7,7 +7,7 @@
 # This is the gate that would have caught issue #172 (daemon panicked on first
 # start; `[storage].data_dir` ignored → unwritable /var/lib/ferrosa).
 #
-# Scenarios (all via the real docs/install.sh):
+# Scenarios (all via the real install/install.sh):
 #   1. FRESH      — clean $HOME → install → daemon starts, binds CQL, no panic,
 #                   serves a trivial request.
 #   2. IDEMPOTENT — re-run the same version → "already up to date" no-op; daemon
@@ -105,11 +105,11 @@ build_tarball() {
   ok "staged tarball $FERROSA_TARBALL"
 }
 
-# --- run the REAL docs/install.sh against the local tarball, non-root, isolated -
+# --- run the REAL install/install.sh against the local tarball, non-root, isolated -
 run_installer() { # version-label  [extra-args...]
   local ver="$1"; shift
   HOME="$HOME_DIR" FERROSA_INSTALL_TARBALL="$FERROSA_TARBALL" \
-    bash "$REPO/docs/install.sh" --version "$ver" --no-service --no-password "$@" \
+    bash "$REPO/install/install.sh" --version "$ver" --no-service --no-password "$@" \
     > "$LOGDIR/install-$ver.log" 2>&1 \
     || { cat "$LOGDIR/install-$ver.log" >&2; fail "installer failed for $ver"; }
 }
@@ -333,11 +333,11 @@ PY
 run_memory_smoke() {
   build_memory_tarball
   HOME="$HOME_DIR" FERROSA_MEMORY_INSTALL_TARBALL="$MEMORY_TARBALL" \
-    bash "$REPO/docs/install-memory.sh" --version v0.0.0-smoke --no-service \
+    bash "$REPO/install/install-memory.sh" --version v0.0.0-smoke --no-service \
     > "$LOGDIR/install-memory.log" 2>&1 \
     || { cat "$LOGDIR/install-memory.log" >&2; fail "install-memory.sh failed"; }
   [ -x "$INSTALL/bin/ferrosa-memory-mcp" ] || fail "ferrosa-memory-mcp not installed"
-  ok "ferrosa-memory installed via docs/install-memory.sh to $INSTALL/bin"
+  ok "ferrosa-memory installed via install/install-memory.sh to $INSTALL/bin"
   write_memory_config
   start_memory
   exercise_memory
@@ -347,7 +347,7 @@ run_memory_smoke() {
 # Scenario 1 — FRESH install
 # ============================================================================
 build_tarball
-log "Scenario 1: FRESH install via docs/install.sh (non-root, HOME=$HOME_DIR)"
+log "Scenario 1: FRESH install via install/install.sh (non-root, HOME=$HOME_DIR)"
 run_installer "v0.0.0-smoke"
 [ -x "$INSTALL/bin/ferrosa" ] || fail "ferrosa binary not installed"
 [ -f "$INSTALL/config/ferrosa.toml" ] || fail "config not installed"
@@ -410,7 +410,7 @@ stop_ferrosa
 # Scenario 5 — ferrosa-memory integration (optional, --with-memory)
 # ============================================================================
 if [ "$WITH_MEMORY" = yes ]; then
-  log "Scenario 5: ferrosa-memory integration via docs/install-memory.sh (synthetic embeddings)"
+  log "Scenario 5: ferrosa-memory integration via install/install-memory.sh (synthetic embeddings)"
   start_ferrosa          # bring the freshly-installed ferrosa back up for memory to connect to
   serves_check
   graph_check

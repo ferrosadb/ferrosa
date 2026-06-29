@@ -10,3 +10,7 @@ scylla = "0.15"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+
+[patch.crates-io]
+scylla = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "1b146bf1" }
+scylla-cql = { git = "https://github.com/ferrosadb/scylla-rust-driver.git", rev = "1b146bf1" }

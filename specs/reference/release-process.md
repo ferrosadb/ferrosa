@@ -35,10 +35,10 @@ consumes them.
   release version is still derived from tags), but it stops `main` drifting behind
   the latest release. Merge it at convenience; do **not** hand-edit the version in
   an unrelated PR.
-- **`docs/LATEST` + the marketing-site version are release steps.** `docs/LATEST`
+- **`ferrosa-docs` `docs/LATEST` + the marketing-site version are release steps.** `ferrosa-docs` `docs/LATEST`
   (the plain-text tag the install scripts fetch from `ferrosadb.com/LATEST`) and the
   *descriptive* version strings on the site (`docs/index.html`, `docs/database/index.html`,
-  `docs/index.md`) are updated when a release is promoted. **`docs/LATEST` must only be
+  `docs/index.md`) are updated when a release is promoted. **`ferrosa-docs` `docs/LATEST` must only be
   bumped once the release tarball exists** — pointing it at a tag with no built artifact
   breaks `install.sh`. (Not yet automated; tracked separately.)
 - **Current promoted stable releases:** Ferrosa Database `v0.16.0`; Ferrosa

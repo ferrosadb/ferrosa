@@ -71,7 +71,7 @@ pub enum StatusChangeType {
 
 impl CqlEvent {
     /// Encode the EVENT frame body for the CQL native protocol.
-    pub fn encode_body(&self) -> BytesMut {
+    pub fn encode_body(&self, _protocol_version: u8) -> BytesMut {
         let mut buf = BytesMut::new();
         match self {
             CqlEvent::SchemaChange {
@@ -167,7 +167,7 @@ mod tests {
             keyspace: "ks1".into(),
             name: Some("t1".into()),
         };
-        let body = event.encode_body();
+        let body = event.encode_body(3);
         assert!(!body.is_empty());
         assert_eq!(event.event_type(), EventType::SchemaChange);
     }
@@ -178,7 +178,7 @@ mod tests {
             change_type: TopologyChangeType::NewNode,
             address: "10.0.0.1:9042".parse().unwrap(),
         };
-        let body = event.encode_body();
+        let body = event.encode_body(3);
         assert!(!body.is_empty());
         assert_eq!(event.event_type(), EventType::TopologyChange);
     }
@@ -189,7 +189,7 @@ mod tests {
             change_type: StatusChangeType::Down,
             address: "10.0.0.2:9042".parse().unwrap(),
         };
-        let body = event.encode_body();
+        let body = event.encode_body(3);
         assert!(!body.is_empty());
         assert_eq!(event.event_type(), EventType::StatusChange);
     }

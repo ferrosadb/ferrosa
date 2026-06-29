@@ -229,6 +229,7 @@ impl FerrosaFlight {
                 paging_state: None,
             },
             client_address: String::new(),
+            protocol_version: 4,
         };
 
         let raw = ferrosa_cql::router::route_select_raw(&self.state, &ctx, &select)
@@ -463,6 +464,7 @@ async fn write_batch(
             serial_consistency: None,
             paging: ferrosa_cql::paging::PagingParams::default(),
             client_address: String::new(),
+            protocol_version: 4,
         };
         ferrosa_cql::router::route(state, &ctx, stmt)
             .await
@@ -554,6 +556,7 @@ impl FlightService for FerrosaFlight {
                         paging_state: cursor,
                     },
                     client_address: String::new(),
+                    protocol_version: 4,
                 };
                 match ferrosa_cql::router::route_select_raw(&state, &ctx, &select).await {
                     Ok(page_res) => {
