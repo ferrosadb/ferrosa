@@ -164,7 +164,9 @@ fn open_vec_reader(table_dir: &Path, gen_str: &str) -> SSTableReader<Vec<u8>> {
 
 fn big_row(seed: usize, ts: i64) -> Row {
     // Vary the bytes per partition so the payload is not trivially deduplicated.
-    let value: Vec<u8> = (0..VALUE_BYTES).map(|j| (seed.wrapping_add(j)) as u8).collect();
+    let value: Vec<u8> = (0..VALUE_BYTES)
+        .map(|j| (seed.wrapping_add(j)) as u8)
+        .collect();
     Row {
         clustering: vec![],
         cells: vec![(0, CellValue::live(value, ts))],
@@ -226,7 +228,8 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
     drop(materialized);
 
     // The actual recovery entry point (also run by the periodic self-heal scan).
-    let (smoke_result, smoke) = measure_peak(|| StorageEngine::smoke_test_generation(&table_dir, gen));
+    let (smoke_result, smoke) =
+        measure_peak(|| StorageEngine::smoke_test_generation(&table_dir, gen));
     smoke_result.expect("a healthy SSTable must pass the startup smoke test");
 
     Peaks { materialize, smoke }

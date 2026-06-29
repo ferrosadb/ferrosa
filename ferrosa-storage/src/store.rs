@@ -2138,6 +2138,28 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
+        if partitions.is_empty() {
+            tracing::warn!(
+                keyspace = %schema.keyspace,
+                table = %schema.table,
+                quarantined_rows = total_quarantined,
+                "flush: all rows were quarantined; skipping empty SSTable publish"
+            );
+            let live = self.view.load();
+            let new_view = StoreView {
+                active: Arc::clone(&live.active),
+                flushing: None,
+                sstables: Arc::clone(&live.sstables),
+                sstable_ids: Arc::clone(&live.sstable_ids),
+                indexes: Arc::clone(&live.indexes),
+                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                vector_indexes: Arc::clone(&live.vector_indexes),
+            };
+            new_view.check_invariants("flush:clear_all_quarantined");
+            self.view.store(Arc::new(new_view));
+            return Ok(());
+        }
+
         let header = flush::build_serialization_header(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
@@ -5454,6 +5476,104 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+
+    struct SnapshotMemtable {
+        partitions: Vec<Partition>,
+    }
+
+    impl Memtable for SnapshotMemtable {
+        fn put(&self, _key: &DecoratedKey, _row: Row, _schema: &TableSchema) -> Result<()> {
+            panic!("SnapshotMemtable is read-only and only used as a legacy flush snapshot")
+        }
+
+        fn get(&self, key: &DecoratedKey) -> Result<Option<Arc<Partition>>> {
+            Ok(self
+                .partitions
+                .iter()
+                .find(|partition| &partition.key == key)
+                .cloned()
+                .map(Arc::new))
+        }
+
+        fn snapshot(&self) -> Vec<Partition> {
+            self.partitions.clone()
+        }
+
+        fn size_bytes(&self) -> usize {
+            0
+        }
+
+        fn partition_count(&self) -> usize {
+            self.partitions.len()
+        }
+    }
+
+    fn install_snapshot_memtable<F: FlushTarget>(
+        store: &TableStore<F>,
+        partitions: Vec<Partition>,
+    ) {
+        let current = store.view.load();
+        let replacement = StoreView {
+            active: Arc::new(SnapshotMemtable { partitions }),
+            flushing: None,
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        replacement.check_invariants("test:install_snapshot_memtable");
+        store.view.store(Arc::new(replacement));
+    }
+
+    #[test]
+    fn flush_all_quarantined_rows_does_not_publish_zero_byte_sstable() {
+        crate::quarantine::_reset_flush_quarantined_rows_total_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(dir.path());
+        let bad_row = Row {
+            // Int32 clustering must be exactly 4 bytes. This simulates a legacy
+            // malformed memtable row that predates the write-path validator.
+            clustering: vec![0; 8],
+            cells: vec![(0, CellValue::live(b"bad".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        install_snapshot_memtable(
+            &store,
+            vec![Partition {
+                key: make_key("pk_bad"),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![bad_row],
+            }],
+        );
+
+        store.flush().unwrap();
+
+        assert_eq!(
+            crate::quarantine::flush_quarantined_rows_total(),
+            1,
+            "the malformed legacy row must be preserved in row quarantine"
+        );
+        let data_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-Data.db"))
+            })
+            .collect();
+        assert!(
+            data_files.is_empty(),
+            "an entirely quarantined flush must not publish zero-byte Data.db files: {data_files:?}"
+        );
+        let view = store.view.load();
+        assert_eq!(view.sstables.len(), 0);
+        assert_eq!(view.sstable_ids.len(), 0);
     }
 
     fn two_column_schema(first: &str, second: &str) -> TableSchema {
