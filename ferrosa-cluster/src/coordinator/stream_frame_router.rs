@@ -16,7 +16,6 @@
 //! [`stream_consumer`]: super::stream_consumer
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,7 +27,10 @@ use ferrosa_net::stream_router::{RouteError, StreamRouter};
 
 use crate::raft::handlers::{RangeReadStreamChunkPayload, RangeReadStreamDonePayload};
 
-type StreamSeqKey = (u32, uuid::Uuid, SocketAddr);
+/// Sequence state follows the logical stream, not a particular TCP
+/// connection. The peer address includes the ephemeral source port and
+/// changes when a peer reconnects mid-stream.
+type StreamSeqKey = (u32, uuid::Uuid);
 
 struct PendingDone {
     total_chunks: u32,
@@ -62,7 +64,7 @@ impl StreamFrameRouter {
         self.seq_state
             .lock()
             .expect("stream sequence mutex poisoned")
-            .retain(|(id, _, _), _| *id != request_id);
+            .retain(|(id, _), _| *id != request_id);
     }
 
     fn accept_chunk_seq(
@@ -74,7 +76,7 @@ impl StreamFrameRouter {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamChunkPayload>(bytes) else {
             return Some(None);
         };
-        let key = (request_id, from.0, from.1);
+        let key = (request_id, from.0);
         let mut guard = self
             .seq_state
             .lock()
@@ -84,6 +86,7 @@ impl StreamFrameRouter {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
+                connection_addr = %from.1,
                 expected_seq = state.next_chunk_seq,
                 observed_seq = payload.seq,
                 "stream chunk sequence gap/reorder; closing stream route"
@@ -116,7 +119,7 @@ impl StreamFrameRouter {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamDonePayload>(bytes) else {
             return Some(Some(msg));
         };
-        let key = (request_id, from.0, from.1);
+        let key = (request_id, from.0);
         let mut guard = self
             .seq_state
             .lock()
@@ -128,6 +131,7 @@ impl StreamFrameRouter {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
+                connection_addr = %from.1,
                 observed_chunks = observed,
                 reported_chunks = payload.total_chunks,
                 "stream Done chunk count mismatch; closing stream route"
@@ -147,6 +151,7 @@ impl StreamFrameRouter {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
+                connection_addr = %from.1,
                 observed_chunks = observed,
                 reported_chunks = payload.total_chunks,
                 "duplicate early stream Done; closing stream route"
@@ -286,6 +291,10 @@ mod tests {
         (Uuid::nil(), "127.0.0.1:7000".parse().unwrap())
     }
 
+    fn peer_on_port(port: u16) -> PeerId {
+        (Uuid::nil(), format!("127.0.0.1:{port}").parse().unwrap())
+    }
+
     fn encoded_chunk(id: u32) -> Message {
         encoded_chunk_seq(id, 0)
     }
@@ -386,6 +395,56 @@ mod tests {
             rx.recv().await,
             Some(Message::RangeReadStreamDone(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_same_peer_continues_chunk_sequence() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 8);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler
+            .handle(peer_on_port(7000), encoded_chunk_seq(REQ_ID, 0))
+            .await;
+        handler
+            .handle(peer_on_port(7001), encoded_chunk_seq(REQ_ID, 1))
+            .await;
+
+        assert!(
+            !router.is_empty(),
+            "a TCP reconnect changes the source address but not the logical stream"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_same_peer_releases_done_after_prior_chunks() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 8);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        handler
+            .handle(peer_on_port(7000), encoded_chunk_seq(REQ_ID, 0))
+            .await;
+        handler
+            .handle(peer_on_port(7001), encoded_done(REQ_ID, 1))
+            .await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(Message::RangeReadStreamChunk(_))
+        ));
+        let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Done must not wait behind a stale connection-address key");
+        assert!(matches!(done, Some(Message::RangeReadStreamDone(_))));
     }
 
     /// Frame for an unregistered request_id is dropped silently
