@@ -83,10 +83,21 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      - id: cargo-clippy-prepush
-        name: cargo clippy (pre-push, all-targets, -D warnings)
+      - id: p0-oom-audit-prepush
+        name: p0-oom-audit (pre-push, AST read-path materialization guard)
         stages: [pre-push]
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        entry: bash -c 'cargo run --quiet -p xtask -- p0-oom-audit --enforce --today "$(date -u +%F)"'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy-prepush
+        name: cargo clippy (pre-push, all-targets, all-features, -D warnings)
+        stages: [pre-push]
+        # --all-features mirrors scripts/pre-push-mirror-ci.sh and CI: without it,
+        # --all-targets fails to compile the feature-gated `protocol_conformance`
+        # test (needs ferrosa-cql `test-util`), so the hook was unusable.
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
