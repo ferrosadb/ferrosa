@@ -196,6 +196,11 @@ pub struct CqlCodec {
     v5_framed: bool,
     /// Buffer for reassembling segmented v5 messages (isSelfContained=0).
     v5_segment_buf: BytesMut,
+    /// Pending envelopes extracted from a multi-envelope v5 frame.
+    /// The v5 spec allows multiple 9-byte envelopes in a single
+    /// self-contained frame payload. We parse them all and queue them
+    /// here so the Decoder returns one at a time.
+    pending_envelopes: std::collections::VecDeque<CqlFrame>,
 }
 
 impl CqlCodec {
@@ -205,6 +210,7 @@ impl CqlCodec {
             compression: None,
             v5_framed: false,
             v5_segment_buf: BytesMut::new(),
+            pending_envelopes: std::collections::VecDeque::new(),
         }
     }
 
@@ -320,7 +326,7 @@ impl CqlCodec {
             src[crc32_start + 2],
             src[crc32_start + 3],
         ]);
-        let actual_crc32 = crc32_castagnoli(&src[payload_start..payload_end]);
+        let actual_crc32 = crc32_ieee_v5(&src[payload_start..payload_end]);
         if expected_crc32 != actual_crc32 {
             return Err(CqlError::Protocol(format!(
                 "v5 frame payload CRC32 mismatch: expected 0x{expected_crc32:08X}, \
@@ -347,31 +353,57 @@ impl CqlCodec {
             self.v5_segment_buf.split().freeze()
         };
 
-        // The payload contains a standard 9-byte envelope header + body.
-        if envelope_data.len() < HEADER_SIZE {
+        // The payload contains one or more 9-byte envelope headers + bodies.
+        // The v5 spec allows pipelining multiple envelopes in a single
+        // self-contained frame. The DataStax Java driver does this (e.g.,
+        // sending SELECT system.local and SELECT system.peers_v2 in one frame).
+        // Parse all envelopes and queue them; return the first one immediately.
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        while offset + HEADER_SIZE <= envelope_data.len() {
+            let header = FrameHeader::decode(&envelope_data[offset..offset + HEADER_SIZE])?;
+            let body_end = offset + HEADER_SIZE + header.length as usize;
+            if body_end > envelope_data.len() {
+                return Err(CqlError::Protocol(format!(
+                    "v5 envelope body extends past payload: offset={offset}, body_end={body_end}, \
+                     payload_len={}",
+                    envelope_data.len()
+                )));
+            }
+            let body = envelope_data.slice(offset + HEADER_SIZE..body_end);
+
+            // Decompress if needed.
+            let body = if header.flags & COMPRESSION_FLAG != 0 {
+                match self.compression {
+                    Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
+                    Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
+                    None => {
+                        return Err(CqlError::Protocol(
+                            "received compressed frame but no compression negotiated".into(),
+                        ));
+                    }
+                }
+            } else {
+                body
+            };
+
+            frames.push(CqlFrame { header, body });
+            offset = body_end;
+        }
+
+        if frames.is_empty() {
             return Err(CqlError::Protocol(
                 "v5 frame payload too short for envelope header".into(),
             ));
         }
-        let header = FrameHeader::decode(&envelope_data[..HEADER_SIZE])?;
-        let body = envelope_data.slice(HEADER_SIZE..);
 
-        // Decompress if needed.
-        let body = if header.flags & COMPRESSION_FLAG != 0 {
-            match self.compression {
-                Some(Compression::Lz4) => Bytes::from(decompress_lz4(&body)?),
-                Some(Compression::Snappy) => Bytes::from(decompress_snappy(&body)?),
-                None => {
-                    return Err(CqlError::Protocol(
-                        "received compressed frame but no compression negotiated".into(),
-                    ));
-                }
-            }
-        } else {
-            body
-        };
-
-        Ok(Some(CqlFrame { header, body }))
+        // Queue all but the first; return the first immediately.
+        let mut iter = frames.into_iter();
+        let first = iter.next().expect("frames is non-empty (checked above)");
+        for f in iter {
+            self.pending_envelopes.push_back(f);
+        }
+        Ok(Some(first))
     }
 }
 
@@ -383,23 +415,20 @@ impl Decoder for CqlCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> std::result::Result<Option<Self::Item>, Self::Error> {
-        // ferrosa speaks CQL native protocol v3/v4 (legacy 9-byte envelopes).
-        // v5 added a modern framing layer that drivers implement
-        // inconsistently — gocql sends plain legacy envelopes at v5 while the
-        // DataStax Java driver sends CRC-checksummed modern frames — so no
-        // single server framing mode can serve both at v5. We therefore reject
-        // v5+ at negotiation with `supported = 4`, and every driver falls back
-        // to the one well-tested legacy transport.
-        // Valid request versions we accept: 0x03 (v3), 0x04 (v4). Garbage bytes
-        // (healthcheck probes, etc.) with a high version byte also trip this and
-        // get a protocol-version error rather than a confusing opcode error.
+        // Return any pending envelopes from a previously-decoded multi-envelope v5 frame.
+        if let Some(frame) = self.pending_envelopes.pop_front() {
+            return Ok(Some(frame));
+        }
+
+        // Valid request versions we accept: 0x03 (v3), 0x04 (v4), 0x05 (v5).
+        // Anything higher is rejected with a protocol-version error.
         if src.len() >= HEADER_SIZE && !self.v5_framed {
             let version_byte = src[0];
-            if (0x05..=0x7F).contains(&version_byte) {
+            if (0x06..=0x7F).contains(&version_byte) {
                 src.clear();
                 return Err(CqlError::ProtocolVersionMismatch {
                     requested: version_byte,
-                    supported: 0x04,
+                    supported: 0x05,
                 });
             }
         }
@@ -691,6 +720,31 @@ fn crc32_castagnoli(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
+/// CRC32-IEEE used by CQL v5 frame payload checksums.
+///
+/// The DataStax Java driver/native-protocol library seeds the standard
+/// `java.util.zip.CRC32` with four magic bytes before updating it with the
+/// payload. The same seed must be used on encode and decode for v5 frames to
+/// interop.
+fn crc32_ieee_v5(data: &[u8]) -> u32 {
+    const CRC32_INIT: u32 = 0xFFFF_FFFF;
+    const CRC32_POLY: u32 = 0xEDB8_8320; // reflected IEEE polynomial
+    const MAGIC: &[u8] = &[0xFA, 0x2D, 0x55, 0xCA];
+
+    let mut crc = CRC32_INIT;
+    for &byte in MAGIC.iter().chain(data.iter()) {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ CRC32_POLY;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^ CRC32_INIT
+}
+
 /// Encode a v5 frame around an envelope (header + body).
 ///
 /// Produces: [3-byte LE header][3-byte CRC24][payload][4-byte CRC32]
@@ -722,7 +776,7 @@ pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut Byt
     let payload_end = dst.len();
 
     // CRC32 of the payload
-    let crc32_val = crc32_castagnoli(&dst[payload_start..payload_end]);
+    let crc32_val = crc32_ieee_v5(&dst[payload_start..payload_end]);
     dst.put_u32_le(crc32_val);
 }
 
@@ -826,18 +880,15 @@ mod tests {
     }
 
     #[test]
-    fn codec_rejects_v5_use_beta_query() {
-        // gocql and the DataStax Java driver negotiate protocol v5 with the
-        // USE_BETA frame flag (0x10) but disagree on v5 framing (gocql sends
-        // legacy envelopes, DataStax sends CRC modern frames). ferrosa caps at
-        // v4, so any v5 request — USE_BETA or not — is rejected, forcing the
-        // driver to fall back to the single legacy v4 transport.
+    fn codec_accepts_v5_request_before_framing_is_enabled() {
+        // Before STARTUP/READY completes the transport is still legacy envelopes,
+        // so a v5 request is decoded as a plain 9-byte envelope.
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         assert!(!codec.is_v5_framed());
         let mut buf = BytesMut::new();
         let header = FrameHeader {
             version: 0x05,
-            flags: 0x10, // USE_BETA
+            flags: 0x10, // USE_BETA (ignored now that v5 is stable)
             stream_id: 0,
             opcode: Opcode::Query,
             length: 4,
@@ -845,17 +896,12 @@ mod tests {
         header.encode(&mut buf);
         buf.put_slice(&[0x00, 0x00, 0x00, 0x00]);
 
-        let err = codec.decode(&mut buf).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CqlError::ProtocolVersionMismatch {
-                    requested: 5,
-                    supported: 4
-                }
-            ),
-            "v5 request must be rejected, got: {err}"
-        );
+        let frame = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("v5 legacy envelope should decode");
+        assert_eq!(frame.header.version, 0x05);
+        assert_eq!(frame.header.opcode, Opcode::Query);
     }
 
     #[test]
@@ -1255,10 +1301,10 @@ mod tests {
     }
 
     #[test]
-    fn codec_rejects_v5_request_to_force_v4_fallback() {
-        // ferrosa caps at v4. A v5 STARTUP must be rejected with a
-        // ProtocolVersionMismatch advertising v4, so the driver downgrades and
-        // every client uses the single legacy transport.
+    fn codec_accepts_v5_startup_before_framing_is_enabled() {
+        // ferrosa now supports native protocol v5. The STARTUP/READY exchange
+        // still uses legacy 9-byte envelopes; modern v5 framing is enabled
+        // by the connection handler only after READY succeeds.
         let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
         let mut buf = BytesMut::new();
         let header = FrameHeader {
@@ -1269,17 +1315,12 @@ mod tests {
             length: 0,
         };
         header.encode(&mut buf);
-        let err = codec.decode(&mut buf).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CqlError::ProtocolVersionMismatch {
-                    requested: 5,
-                    supported: 4
-                }
-            ),
-            "v5 should be rejected with supported=4, got: {err}"
-        );
+        let frame = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("v5 STARTUP should decode as legacy envelope");
+        assert_eq!(frame.header.version, 0x05);
+        assert_eq!(frame.header.opcode, Opcode::Startup);
     }
 
     #[test]
@@ -1294,11 +1335,107 @@ mod tests {
                 err,
                 CqlError::ProtocolVersionMismatch {
                     requested: 6,
-                    supported: 4
+                    supported: 5
                 }
             ),
             "should be ProtocolVersionMismatch, got: {err}"
         );
+    }
+
+    /// Regression test for the DataStax Java driver v5 frame checksum.
+    ///
+    /// The Java driver's native-protocol library uses `java.util.zip.CRC32`
+    /// seeded with four magic bytes for the v5 frame payload checksum. This
+    /// test feeds the exact v5-framed QUERY bytes captured from a Java driver
+    /// control connection (`SELECT cluster_name FROM system.local`) and
+    /// asserts that our decoder accepts the frame instead of rejecting it with
+    /// a CRC mismatch.
+    #[test]
+    fn decodes_real_java_driver_v5_query_frame() {
+        // Captured from DataStax Java driver 4.18.1 after v5 STARTUP/READY.
+        // Frame layout: 3-byte LE header | 3-byte CRC24 | 9-byte envelope |
+        // payload | 4-byte CRC32.
+        #[rustfmt::skip]
+        let frame: Vec<u8> = vec![
+            0x38, 0x00, 0x02, 0x43, 0xa1, 0x53,
+            0x05, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x2f,
+            0x00, 0x00, 0x00, 0x25, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x63, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72, 0x5f, 0x6e,
+            0x61, 0x6d, 0x65, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73,
+            0x79, 0x73, 0x74, 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61,
+            0x6c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x12, 0xc2, 0x55, 0x69,
+        ];
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let mut buf = BytesMut::from(&frame[..]);
+        let decoded = codec
+            .decode(&mut buf)
+            .expect("v5 frame should decode without CRC error")
+            .expect("v5 frame should produce a complete envelope");
+        assert_eq!(decoded.header.version, 0x05);
+        assert_eq!(decoded.header.opcode, Opcode::Query);
+        assert_eq!(decoded.header.stream_id, 0);
+        assert_eq!(decoded.header.flags, 0);
+    }
+
+    /// Regression test: DataStax Java driver pipelines multiple queries in a
+    /// single v5 self-contained frame. The captured frame contains two QUERY
+    /// envelopes: stream 0 = `SELECT * FROM system.local` and stream 1 =
+    /// `SELECT * FROM system.peers_v2`. Our decoder must extract BOTH envelopes
+    /// and return them on successive `decode()` calls.
+    #[test]
+    fn decodes_multi_envelope_v5_frame() {
+        // Captured from DataStax Java driver 4.18.1 during control-connection init.
+        // The driver sends both system.local and system.peers_v2 queries in one frame.
+        #[rustfmt::skip]
+        let frame: Vec<u8> = vec![
+            // 3-byte LE header: payload_len=93 | isSelfContained=1
+            0x5d, 0x00, 0x02,
+            // 3-byte CRC24 of header
+            0xc5, 0x52, 0x6e,
+            // Envelope 1: stream=0, QUERY, body_len=36
+            0x05, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x24,
+            // Body: "SELECT * FROM system.local" + consistency=ONE(0x0001) + flags=0x00
+            0x00, 0x00, 0x00, 0x1a, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x2a, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73, 0x79,
+            0x73, 0x74, 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61, 0x6c,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // Envelope 2: stream=1, QUERY, body_len=39
+            0x05, 0x00, 0x00, 0x01, 0x07, 0x00, 0x00, 0x00, 0x27,
+            // Body: "SELECT * FROM system.peers_v2" + consistency=ONE(0x0001) + flags=0x00
+            0x00, 0x00, 0x00, 0x1d, 0x53, 0x45, 0x4c, 0x45, 0x43, 0x54,
+            0x20, 0x2a, 0x20, 0x46, 0x52, 0x4f, 0x4d, 0x20, 0x73, 0x79,
+            0x73, 0x74, 0x65, 0x6d, 0x2e, 0x70, 0x65, 0x65, 0x72, 0x73,
+            0x5f, 0x76, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // 4-byte CRC32 of payload
+            0x43, 0x4e, 0xcd, 0x96,
+        ];
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let mut buf = BytesMut::from(&frame[..]);
+
+        // First decode: should return envelope 1 (stream 0)
+        let frame1 = codec
+            .decode(&mut buf)
+            .expect("first v5 envelope should decode")
+            .expect("should have a frame");
+        assert_eq!(frame1.header.stream_id, 0);
+        assert_eq!(frame1.header.opcode, Opcode::Query);
+
+        // Second decode: should return envelope 2 (stream 1) from pending queue
+        let frame2 = codec
+            .decode(&mut buf)
+            .expect("second v5 envelope should decode")
+            .expect("should have a second frame");
+        assert_eq!(frame2.header.stream_id, 1);
+        assert_eq!(frame2.header.opcode, Opcode::Query);
+
+        // Third decode: no more pending, no more data
+        let frame3 = codec.decode(&mut buf).expect("should be Ok(None)");
+        assert!(frame3.is_none(), "no more frames expected");
     }
 
     #[test]

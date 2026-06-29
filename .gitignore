@@ -30,3 +30,4 @@ __pycache__/
 tests/ferrosa.deb
 tests/ferrosa
 target-linux/
+examples/build/

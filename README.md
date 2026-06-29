@@ -46,8 +46,11 @@ implementation that takes advantage of modern hardware and cloud infrastructure.
 
 - **S3 as the source of truth.** Nodes are ephemeral. SSTables live in object storage.
   A new node can serve reads within seconds by fetching from S3, not hours of streaming.
-- **CQL compatibility target.** Ferrosa speaks CQL native protocol v4/v5 and aims
-  for driver-compatible behavior, but compatibility is still being expanded and tested.
+- **CQL compatibility target.** Ferrosa speaks CQL native protocol v3/v4 as the
+  default, well-tested driver surface. v5 is accepted for explicit conformance
+  testing and is being hardened for production driver use; see
+  `ferrosa-cql/specs/roadmap.md` for remaining v5 work. v6+ is rejected. Ferrosa
+  aims for wire-compatible behavior with Apache Cassandra 3.x/4.x/5.x drivers.
 - **Rust-native, not a transliteration.** Ferrosa is built as idiomatic Rust with clean
   ownership boundaries, not a line-by-line port of Java code.
 - **Cassandra-shaped consistency model.** Tunable consistency levels (ONE, QUORUM, ALL)

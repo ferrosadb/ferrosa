@@ -1,7 +1,7 @@
 ADOC := $(wildcard */*.adoc)
 HTML := $(patsubst %.adoc,%.html,$(ADOC))
 THEME := theme/ferrosa.css
-OUTDIR := ../docs/database/examples
+OUTDIR := build
 
 .PHONY: html clean test
 

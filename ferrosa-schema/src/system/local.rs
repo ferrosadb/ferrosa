@@ -110,16 +110,24 @@ pub struct LocalInfo {
 ///
 /// Reads schema version from the current snapshot and combines it
 /// with the node configuration to produce a `LocalInfo`.
+///
+/// Defaults to native protocol v4 so existing callers/tests remain
+/// backward-compatible.
 pub fn query_local(schema: &Schema, node_config: &NodeConfig) -> LocalInfo {
-    query_local_with_view(schema, node_config, TopologyView::Public)
+    query_local_with_view(schema, node_config, TopologyView::Public, 4)
 }
 
 /// Query `system.local` for this node's information using the requested
-/// topology view.
+/// topology view and negotiated native protocol version.
+///
+/// `protocol_version` is used to populate `native_protocol_version` so drivers
+/// (e.g. DataStax Java driver) see a value consistent with the connection
+/// they opened.
 pub fn query_local_with_view(
     schema: &Schema,
     node_config: &NodeConfig,
     view: TopologyView,
+    protocol_version: u8,
 ) -> LocalInfo {
     let snap = schema.snapshot();
     let (rpc_address, rpc_port) = match view {
@@ -136,7 +144,7 @@ pub fn query_local_with_view(
         rack: node_config.rack.clone(),
         host_id: node_config.host_id,
         partitioner: "org.apache.cassandra.dht.Murmur3Partitioner".to_string(),
-        native_protocol_version: "4".to_string(),
+        native_protocol_version: protocol_version.to_string(),
         cql_version: "3.4.7".to_string(),
         release_version: crate::system::RELEASE_VERSION.to_string(),
         schema_version: snap.version,
@@ -215,6 +223,16 @@ mod tests {
         );
     }
 
+    /// BUG-021: native_protocol_version must reflect the negotiated protocol
+    /// version so drivers (DataStax Java driver) trust the connection.
+    #[test]
+    fn query_local_with_view_reports_negotiated_protocol_version() {
+        let schema = test_schema();
+        let node_config = NodeConfig::default();
+        let info = query_local_with_view(&schema, &node_config, TopologyView::Public, 5);
+        assert_eq!(info.native_protocol_version, "5");
+    }
+
     #[test]
     fn query_local_internal_view_uses_internal_rpc_endpoint() {
         let schema = test_schema();
@@ -226,12 +244,13 @@ mod tests {
             ..NodeConfig::default()
         };
 
-        let info = query_local_with_view(&schema, &node_config, TopologyView::Internal);
+        let info = query_local_with_view(&schema, &node_config, TopologyView::Internal, 5);
 
         assert_eq!(
             info.rpc_address,
             "10.89.1.48".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!(info.rpc_port, 9042);
+        assert_eq!(info.native_protocol_version, "5");
     }
 }

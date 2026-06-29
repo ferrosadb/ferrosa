@@ -169,14 +169,31 @@ impl RunConfig {
     ///
     /// Smoke: short runs to verify correctness, not endurance.
     /// Endurance: 24-hour continuous cycling.
+    ///
+    /// `JEPSEN_RUN_DURATION_SECS` env var overrides the tier default
+    /// (used by nightly CI to fit the GitHub-hosted runner memory budget).
     pub fn run_duration_secs(&self) -> u64 {
+        self.run_duration_secs_with_env(std::env::var("JEPSEN_RUN_DURATION_SECS").ok())
+    }
+
+    /// Same as `run_duration_secs` but with the env value injected. Separated
+    /// so tests can verify the override without racy `std::env::set_var`.
+    fn run_duration_secs_with_env(&self, env_val: Option<String>) -> u64 {
+        if let Some(v) = env_val {
+            if let Ok(secs) = v.parse::<u64>() {
+                return secs;
+            }
+        }
         match self.tier {
             Tier::Smoke => 5,
             Tier::Standard => 30,
             Tier::Full => 60,
             Tier::Endurance => 86_400,
-            // W7.11: 1-hour multi-DC bank workload (per the Sprint 7
-            // headline acceptance criterion).
+            // W7.11: multi-DC bank workload. Nightly CI overrides this
+            // to 600s (10 min) via JEPSEN_RUN_DURATION_SECS — 6 Docker
+            // containers on a 16 GB GitHub-hosted runner OOM before
+            // the original 1-hour budget. The 10-minute window still
+            // exercises cross-DC Accord drift under nemesis injection.
             Tier::MultiDc => 3_600,
         }
     }
@@ -231,7 +248,7 @@ mod tests {
     }
 
     /// W7.11 — the `MultiDc` tier resolves to T3 only, medium
-    /// concurrency, and a 1-hour run duration.
+    /// concurrency, and a 1-hour run duration (overridable via env).
     #[test]
     fn multi_dc_tier_resolves_to_t3_one_hour() {
         let config = RunConfig {
@@ -257,10 +274,40 @@ mod tests {
             vec![Concurrency::Medium],
             "MultiDc tier uses medium concurrency"
         );
+        // With no env override, MultiDc is the 1-hour run.
         assert_eq!(
-            config.run_duration_secs(),
+            config.run_duration_secs_with_env(None),
             3_600,
             "MultiDc tier is the 1-hour run"
+        );
+    }
+
+    /// `JEPSEN_RUN_DURATION_SECS` env var overrides the tier default.
+    #[test]
+    fn run_duration_env_override() {
+        let config = RunConfig {
+            tier: Tier::MultiDc,
+            topology: None,
+            nemesis: None,
+            pattern: None,
+            driver: None,
+            concurrency: None,
+            run_id: "multidc".into(),
+            output_dir: PathBuf::from("/tmp"),
+            fly_regions: vec![],
+            alert_webhook: None,
+            output_json: false,
+        };
+        assert_eq!(
+            config.run_duration_secs_with_env(Some("600".into())),
+            600,
+            "JEPSEN_RUN_DURATION_SECS should override the tier default"
+        );
+        // Invalid env values fall back to the tier default.
+        assert_eq!(
+            config.run_duration_secs_with_env(Some("garbage".into())),
+            3_600,
+            "invalid env value should fall back to tier default"
         );
     }
 }
