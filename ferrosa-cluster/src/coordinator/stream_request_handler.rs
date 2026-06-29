@@ -246,6 +246,8 @@ pub async fn handle_stream_request_with_cancel<R, S>(
                         request_id = req.request_id,
                         "stream request: per-partition decode error: {e}"
                     );
+                    batch.clear();
+                    total_chunks_emitted = 0;
                     any_decode_error = true;
                     break 'pull;
                 }
@@ -265,7 +267,7 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     }
 
     // Flush any final partial batch.
-    if !batch.is_empty() {
+    if !any_decode_error && !batch.is_empty() {
         emit_chunk(&req, &mut batch, chunk_seq, sink).await;
         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
     }
@@ -679,24 +681,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_decode_error_stops_stream_with_truncated_done() {
+    async fn partition_decode_error_emits_truncated_done_without_partial_chunks() {
         let reader = ErrorAfterReader;
         let sink = VecSink::new();
 
-        handle_stream_request(req(14), Arc::new(reader), &sink, 2).await;
+        handle_stream_request(req(14), Arc::new(reader), &sink, 4).await;
 
         let frames = sink.take();
         assert_eq!(
             frames.len(),
-            2,
-            "stream must stop at the decode error instead of continuing with later partitions"
+            1,
+            "decode errors must not emit partial data from a corrupt stream"
         );
-        assert!(matches!(frames[0], Message::RangeReadStreamChunk(_)));
-        let Message::RangeReadStreamDone(b) = &frames[1] else {
-            panic!("last frame must be Done");
+        let Message::RangeReadStreamDone(b) = &frames[0] else {
+            panic!("only frame must be Done");
         };
         let done: RangeReadStreamDonePayload = bincode::deserialize(b).unwrap();
-        assert_eq!(done.total_chunks, 1);
+        assert_eq!(done.total_chunks, 0);
         assert!(
             done.truncated,
             "decode error must fail closed at coordinator"

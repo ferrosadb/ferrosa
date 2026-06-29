@@ -259,7 +259,7 @@ include::queries.cql[lines=52..52]
 
 === Token function
 
-`token()` exposes the partition token, enabling range scans across the token ring.
+`token()` exposes the partition token, enabling bounded range scans across the token ring.
 
 [source,sql]
 ----
