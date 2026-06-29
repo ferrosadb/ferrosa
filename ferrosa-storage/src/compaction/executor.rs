@@ -713,6 +713,8 @@ impl CompactionExecutor {
         }
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(iters.len());
+        let mut last_input_keys: Vec<Option<ferrosa_common::DecoratedKey>> =
+            vec![None; iters.len()];
         for (idx, it) in iters.iter_mut().enumerate() {
             let read_start = Instant::now();
             let next = it.next_partition().map_err(|e| format!("iter init: {e}"))?;
@@ -721,6 +723,12 @@ impl CompactionExecutor {
                 read_start.elapsed(),
             );
             if let Some(mut partition) = next {
+                validate_compaction_input_key_order(
+                    &task.inputs[idx].id,
+                    &last_input_keys[idx],
+                    &partition.key,
+                )?;
+                last_input_keys[idx] = Some(partition.key.clone());
                 mappings[idx].remap_partition(&mut partition);
                 heap.push(HeapEntry {
                     partition,
@@ -762,6 +770,12 @@ impl CompactionExecutor {
             );
             if let Some(next) = next {
                 let mut next = next;
+                validate_compaction_input_key_order(
+                    &task.inputs[first_idx].id,
+                    &last_input_keys[first_idx],
+                    &next.key,
+                )?;
+                last_input_keys[first_idx] = Some(next.key.clone());
                 mappings[first_idx].remap_partition(&mut next);
                 heap.push(HeapEntry {
                     partition: next,
@@ -786,6 +800,12 @@ impl CompactionExecutor {
                 );
                 if let Some(next) = next {
                     let mut next = next;
+                    validate_compaction_input_key_order(
+                        &task.inputs[reader_idx].id,
+                        &last_input_keys[reader_idx],
+                        &next.key,
+                    )?;
+                    last_input_keys[reader_idx] = Some(next.key.clone());
                     mappings[reader_idx].remap_partition(&mut next);
                     heap.push(HeapEntry {
                         partition: next,
@@ -1049,6 +1069,26 @@ fn validate_partition_writable(
     Ok(())
 }
 
+fn validate_compaction_input_key_order(
+    gen: &str,
+    previous: &Option<ferrosa_common::DecoratedKey>,
+    next: &ferrosa_common::DecoratedKey,
+) -> std::result::Result<(), String> {
+    if let Some(previous) = previous {
+        if next <= previous {
+            return Err(format!(
+                "aborting compaction: SSTable {gen} corrupt: Data.db partitions out of token order: \
+                 key {:?} token {} <= previous key {:?} token {}",
+                next.key.as_bytes(),
+                next.token.0,
+                previous.key.as_bytes(),
+                previous.token.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_row_writable(
     row: &ferrosa_sstable::types::Row,
     is_static: bool,
@@ -1133,6 +1173,17 @@ mod tests {
 
     fn test_table_id() -> crate::TableId {
         crate::TableId::new("test_ks", "test_table")
+    }
+
+    fn collect_reader_partitions<R: ferrosa_sstable::io::ReadAt>(
+        reader: &ferrosa_sstable::reader::SSTableReader<R>,
+    ) -> Vec<ferrosa_sstable::types::Partition> {
+        let mut partitions = Vec::new();
+        let mut iter = reader.partitions_iter().expect("stream partitions");
+        while let Some(partition) = iter.next_partition().expect("read streamed partition") {
+            partitions.push(partition);
+        }
+        partitions
     }
 
     #[test]
@@ -1239,6 +1290,27 @@ mod tests {
             max_timestamp: 2000,
             partition_count: partitions.len() as u64,
         }
+    }
+
+    fn data_bytes_for_single_partition(
+        schema: &ferrosa_common::schema::TableSchema,
+        header_partitions: &[ferrosa_sstable::types::Partition],
+        partition: &ferrosa_sstable::types::Partition,
+    ) -> Vec<u8> {
+        use crate::flush;
+        use ferrosa_sstable::writer::SSTableWriter;
+        use ferrosa_sstable::WriteOptions;
+
+        let header = flush::build_serialization_header(schema, header_partitions);
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            header,
+        );
+        writer.add_partition(partition).unwrap();
+        writer.finish().unwrap().data
     }
 
     fn make_test_partition(
@@ -1488,7 +1560,7 @@ mod tests {
         )
         .unwrap();
 
-        let output_partitions = reader.read_all_partitions().unwrap();
+        let output_partitions = collect_reader_partitions(&reader);
         assert_eq!(
             output_partitions.len(),
             10,
@@ -1542,6 +1614,53 @@ mod tests {
             max_group_width,
             inputs.len(),
             "streaming compaction may hold at most one partition per input for a key"
+        );
+    }
+
+    #[test]
+    fn compaction_rejects_input_with_out_of_order_data_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let dir = tmp.path().join("sstable");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = make_test_partition("decision", "first", 1000);
+        let second = make_test_partition("org", "second", 1000);
+        assert!(
+            first.key > second.key,
+            "test keys must be descending by decorated token"
+        );
+
+        let meta = write_sstable_to_dir(&dir, &[first.clone(), second.clone()], &schema);
+        let data_path = dir.join(format!("{}-Data.db", meta.id));
+        let header_partitions = vec![second.clone(), first.clone()];
+        let mut unsorted_data =
+            data_bytes_for_single_partition(&schema, &header_partitions, &first);
+        unsorted_data.extend(data_bytes_for_single_partition(
+            &schema,
+            &header_partitions,
+            &second,
+        ));
+        std::fs::write(data_path, unsorted_data).unwrap();
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![meta],
+            output_dir,
+            schema,
+            table_id: test_table_id(),
+        };
+
+        let err = CompactionExecutor::execute_task(&task)
+            .expect_err("compaction must reject an input whose Data.db stream is not token-sorted");
+        assert!(
+            err.contains("partitions out of token order"),
+            "error must classify the input as corrupt, got: {err}"
+        );
+        assert!(
+            !err.contains("keys must be added in sorted order"),
+            "executor should reject the corrupt input before surfacing writer internals: {err}"
         );
     }
 
@@ -1623,7 +1742,7 @@ mod tests {
             statistics: std::fs::read(output_dir.join(format!("{gen}-Statistics.db"))).unwrap(),
         })
         .unwrap();
-        let partitions = reader.read_all_partitions().unwrap();
+        let partitions = collect_reader_partitions(&reader);
         assert_eq!(partitions.len(), 1);
         let cells = &partitions[0].rows[0].cells;
         assert_eq!(cells[0].0, 0);

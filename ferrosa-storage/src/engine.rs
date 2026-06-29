@@ -3685,25 +3685,53 @@ impl StorageEngine {
         // Note: the Data.db-truncation extent check (validate_data_extent) runs
         // mode-independently in the caller's load loop, BEFORE this smoke test,
         // so a truncated SSTable is already excluded by the time we get here.
-        let partitions = reader.read_all_partitions()?;
-        for partition in &partitions {
-            if let Some(static_row) = &partition.static_row {
+        //
+        // Keep this pass streaming. Self-heal runs the same smoke test on
+        // every unverified generation; materializing a whole SSTable here can
+        // turn corruption detection itself into an OOM vector.
+        let mut iter = reader.partitions_iter()?;
+        let mut previous_key: Option<DecoratedKey> = None;
+        let mut saw_real_cell_timestamp = false;
+        while let Some((key, _deletion, static_row)) = iter.next_partition_header_only()? {
+            if let Some(previous) = &previous_key {
+                if key <= *previous {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "startup smoke test found Data.db partition order violation: \
+                         key {:?} token {} <= previous key {:?} token {}",
+                        key.key.as_bytes(),
+                        key.token.0,
+                        previous.key.as_bytes(),
+                        previous.token.0
+                    )));
+                }
+            }
+
+            if let Some(static_row) = &static_row {
                 Self::validate_startup_row_timestamps(static_row, true)?;
-            }
-            for row in &partition.rows {
-                Self::validate_startup_row_timestamps(row, false)?;
-            }
-        }
-        if reader.header().min_timestamp == NO_TIMESTAMP
-            && partitions.iter().any(|partition| {
-                partition
-                    .static_row
+                if static_row
+                    .cells
                     .iter()
-                    .chain(partition.rows.iter())
-                    .flat_map(|row| row.cells.iter())
                     .any(|(_, cell)| cell.timestamp != NO_TIMESTAMP)
-            })
-        {
+                {
+                    saw_real_cell_timestamp = true;
+                }
+            }
+
+            iter.stream_clustered_rows(|row| {
+                Self::validate_startup_row_timestamps(row, false)?;
+                if row
+                    .cells
+                    .iter()
+                    .any(|(_, cell)| cell.timestamp != NO_TIMESTAMP)
+                {
+                    saw_real_cell_timestamp = true;
+                }
+                Ok(())
+            })?;
+
+            previous_key = Some(key);
+        }
+        if reader.header().min_timestamp == NO_TIMESTAMP && saw_real_cell_timestamp {
             return Err(ferrosa_common::Error::InvalidFormat(
                 "startup smoke test found real cell timestamps with NO_TIMESTAMP serialization header".to_string(),
             ));
@@ -11535,9 +11563,10 @@ mod tests {
         let mut total = 0usize;
         let mut cursor = i64::MIN;
         let mut chunks = 0;
+        let large_byte_budget = 1_000_000usize;
         loop {
             let (chunk, next) = engine
-                .read_token_range_bounded(&tid, cursor, i64::MAX, 5, usize::MAX)
+                .read_token_range_bounded(&tid, cursor, i64::MAX, 5, large_byte_budget)
                 .unwrap();
             if chunk.is_empty() {
                 break;

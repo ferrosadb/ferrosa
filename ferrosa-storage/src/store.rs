@@ -7886,6 +7886,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        let schema = test_schema();
+
+        let first = make_partition("decision", b"first", 1000);
+        let second = make_partition("org", b"second", 1000);
+        assert!(
+            first.key > second.key,
+            "test keys must be descending by decorated token"
+        );
+
+        store.write(&first.key, first.rows[0].clone()).unwrap();
+        store.write(&second.key, second.rows[0].clone()).unwrap();
+        store.flush().unwrap();
+
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let header_partitions = vec![second.clone(), first.clone()];
+        let mut unsorted_data =
+            data_bytes_for_single_partition(&schema, &header_partitions, &first);
+        unsorted_data.extend(data_bytes_for_single_partition(
+            &schema,
+            &header_partitions,
+            &second,
+        ));
+        std::fs::write(&data_path, unsorted_data).unwrap();
+
+        let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
+            .expect_err("startup/self-heal smoke test must detect Data.db token-order corruption");
+        assert!(
+            err.to_string().contains("partition order violation"),
+            "error must name the token-order corruption, got: {err}"
+        );
+    }
+
+    #[test]
+    fn production_table_read_paths_must_not_materialize_unbounded_sstables() {
+        let production_sources = [
+            ("engine.rs", include_str!("engine.rs")),
+            ("store.rs", include_str!("store.rs")),
+            (
+                "ferrosa-sstable/reader.rs",
+                include_str!("../../ferrosa-sstable/src/reader.rs"),
+            ),
+            (
+                "compaction/executor.rs",
+                include_str!("compaction/executor.rs"),
+            ),
+            (
+                "compaction/validator/driver.rs",
+                include_str!("compaction/validator/driver.rs"),
+            ),
+            (
+                "ferrosa-cql/router.rs",
+                include_str!("../../ferrosa-cql/src/router.rs"),
+            ),
+            (
+                "ferrosa-cluster/repair/trigger.rs",
+                include_str!("../../ferrosa-cluster/src/repair/trigger.rs"),
+            ),
+            (
+                "ferrosa-sstable-dump.rs",
+                include_str!("../../ferrosa-sstable/src/bin/ferrosa-sstable-dump.rs"),
+            ),
+        ];
+
+        let unbounded_read_all = concat!(".read_all", "_partitions(");
+        let unbounded_partition_limit = concat!("read_partitions_limited", "(usize::MAX");
+        for (name, source) in production_sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            assert!(
+                !production.contains(unbounded_read_all),
+                "{name} production code must stream SSTables; whole-table partition reads materialize an unbounded Vec"
+            );
+            assert!(
+                !production.contains(unbounded_partition_limit),
+                "{name} production code must not request an effectively unbounded materialized SSTable read"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // WP-003: sstable_metadata reports correct max_timestamp
     // -------------------------------------------------------------------------
@@ -8679,7 +8762,7 @@ mod tests {
         // `n_sstables` readers open at once — impossible under a pool capped at
         // `fanin`, forcing a soft-cap breach.
         let merged = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .read_token_range(i64::MIN, i64::MAX, distinct_keys)
             .unwrap();
         assert_eq!(
             merged.len(),
@@ -8892,8 +8975,11 @@ mod tests {
             (i64::MIN + 1, i64::MAX - 1),
         ];
 
+        let fixture_partition_limit = 5;
         for (start, end) in windows {
-            let rtr = store.read_token_range(start, end, usize::MAX).unwrap();
+            let rtr = store
+                .read_token_range(start, end, fixture_partition_limit)
+                .unwrap();
             let mut walk: Vec<Partition> = Vec::new();
             store
                 .walk_token_range(start, end, |p| {
@@ -8935,9 +9021,7 @@ mod tests {
             })
             .unwrap();
 
-        let rtr = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
-            .unwrap();
+        let rtr = store.read_token_range(i64::MIN, i64::MAX, 4).unwrap();
         assert_eq!(
             digest, rtr,
             "streaming digest walk partitions must match single-pass read_token_range"
@@ -8999,7 +9083,7 @@ mod tests {
 
         // Sanity: a single-pass read sees all distinct keys (the merged result).
         let merged = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .read_token_range(i64::MIN, i64::MAX, distinct_keys)
             .unwrap();
         assert_eq!(
             merged.len(),
@@ -9063,22 +9147,22 @@ mod tests {
         // the cell-merge / dedup / tombstone-preservation paths are exercised.
         let store = file_store_with_many_sstables(dir.path(), 1024, 64, 12);
 
-        // Reference: single-pass, unbounded.
-        let reference = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
-            .unwrap();
+        // Reference: single-pass with a fixture-sized finite limit.
+        let reference = store.read_token_range(i64::MIN, i64::MAX, 12).unwrap();
         assert!(!reference.is_empty(), "fixture must produce partitions");
 
         // Loop the bounded fetch over the full window under a spread of
         // (max_partitions, max_bytes) budgets; the result must reassemble to the
         // single-pass reference regardless of how the chunk boundaries fall.
+        let all_partitions = reference.len().max(1);
+        let large_byte_budget = 1_000_000usize;
         let cases: &[(usize, usize)] = &[
-            (usize::MAX, usize::MAX), // single chunk
-            (3, usize::MAX),          // count budget
-            (usize::MAX, 64),         // byte budget
-            (2, usize::MAX),          // tight count budget
-            (1, usize::MAX),          // one partition per chunk
-            (usize::MAX, 48),         // tight byte budget
+            (all_partitions, large_byte_budget), // single chunk
+            (3, large_byte_budget),              // count budget
+            (all_partitions, 64),                // byte budget
+            (2, large_byte_budget),              // tight count budget
+            (1, large_byte_budget),              // one partition per chunk
+            (all_partitions, 48),                // tight byte budget
         ];
 
         for &(max_partitions, max_bytes) in cases {
@@ -9093,7 +9177,7 @@ mod tests {
                     .unwrap();
                 if !chunk.is_empty() {
                     assert!(
-                        max_partitions == usize::MAX || chunk.len() <= max_partitions,
+                        chunk.len() <= max_partitions,
                         "chunk len {} exceeded count budget {max_partitions}",
                         chunk.len()
                     );
@@ -9135,9 +9219,10 @@ mod tests {
         inflight::reset();
         let mut total = 0usize;
         let mut cursor = i64::MIN;
+        let large_byte_budget = 1_000_000usize;
         loop {
             let (chunk, next) = store
-                .read_token_range_bounded(cursor, i64::MAX, 2, usize::MAX)
+                .read_token_range_bounded(cursor, i64::MAX, 2, large_byte_budget)
                 .unwrap();
             total += chunk.len();
             match next {

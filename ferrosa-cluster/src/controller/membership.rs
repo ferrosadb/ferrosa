@@ -667,8 +667,9 @@ mod streaming_contract_tests {
             .split("#[cfg(test)]")
             .next()
             .expect("production membership source must be present");
+        let unbounded_range_read = concat!("read_range", "(&table_id, None, None, usize::MAX)");
         assert!(
-            !source.contains("read_range(&table_id, None, None, usize::MAX)"),
+            !source.contains(unbounded_range_read),
             "decommission must stream partitions instead of materializing every partition with usize::MAX"
         );
     }
