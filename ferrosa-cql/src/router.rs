@@ -18896,7 +18896,9 @@ mod tests {
         }
 
         // No `status` predicate => the partial index does not imply the query.
-        let q = "SELECT id FROM fls.users WHERE name = 'alice'";
+        // ALLOW FILTERING is required so the complete fallback takes the bounded
+        // streaming scan path instead of the old unbounded materialization path.
+        let q = "SELECT id FROM fls.users WHERE name = 'alice' ALLOW FILTERING";
 
         // EXPLAIN must NOT report the filtered index; it falls to FullScan.
         let stmt = crate::parser::parse(&format!("EXPLAIN {q}")).unwrap();
@@ -20361,6 +20363,75 @@ mod tests {
             tokens.len()
         );
         assert!(kept > 0, "test bounds must keep at least one row");
+    }
+
+    #[tokio::test]
+    async fn token_range_with_limit_uses_bounded_scan() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE tok_bound WITH REPLICATION = \
+                 {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE tok_bound.parts (id int PRIMARY KEY, v text)")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        for id in 1..=5 {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO tok_bound.parts (id, v) VALUES ({id}, 'v{id}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let lower_token = (1..=5)
+            .map(|id| {
+                bridge::build_decorated_key(&[CqlValue::Int(id)], &[CqlType::Int])
+                    .unwrap()
+                    .token
+                    .0
+            })
+            .min()
+            .unwrap()
+            .saturating_sub(1);
+        let stmt = crate::parser::parse(&format!(
+            "SELECT * FROM tok_bound.parts WHERE token(id) > {lower_token} LIMIT 3"
+        ))
+        .unwrap();
+        let result = route(&state, &ctx, stmt)
+            .await
+            .expect("bounded token range scan must execute without unbounded materialization");
+        let row_count = match result {
+            RouteResult::Result(bytes) => extract_row_count(&bytes),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(row_count, 3, "LIMIT must bound token range scan rows");
     }
 
     // ── ferrosa_bugs: COUNT(*) column name ──────────────────────────────
@@ -23470,10 +23541,7 @@ mod tests {
             ids.len(),
             "filtered paging emitted duplicates"
         );
-        assert_eq!(
-            ids.first(),
-            Some(&Some(CqlValue::Int(first_matching_id as i32)))
-        );
+        assert_eq!(ids.first(), Some(&Some(CqlValue::Int(first_matching_id))));
         assert_eq!(ids.last(), Some(&Some(CqlValue::Int((n - 1) as i32))));
     }
 

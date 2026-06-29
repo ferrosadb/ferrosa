@@ -128,7 +128,7 @@ SELECT * FROM lwt_test WHERE id = 1;
 -- ============================================================
 -- Token function — range scan by token
 -- ============================================================
-SELECT * FROM all_types WHERE token(id) > token(3);
+SELECT * FROM all_types WHERE token(id) > token(3) LIMIT 100;
 
 -- ============================================================
 -- WRITETIME function
