@@ -621,38 +621,6 @@ async fn count_rows_from_partition_stream(
     Ok(count)
 }
 
-async fn extend_rows_from_partition_stream(
-    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
-    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
-    all_col_names: &[String],
-    all_col_types: &[CqlType],
-    pk_indices: &[usize],
-    ck_indices: &[usize],
-    storage_to_table: &[usize],
-) -> Result<(), CqlError> {
-    let mut processed_partitions = 0usize;
-    while let Some(partition) = stream.next().await {
-        let partition = partition?;
-        let mut prows = bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            all_col_names,
-            all_col_types,
-            pk_indices,
-            ck_indices,
-            storage_to_table,
-        );
-        all_rows.append(&mut prows);
-        processed_partitions += 1;
-        if should_yield_during_partition_scan(
-            processed_partitions,
-            cooperative_scan_yield_every_partitions(),
-        ) {
-            tokio::task::yield_now().await;
-        }
-    }
-    Ok(())
-}
-
 /// Resume cursor decoded from the wire `paging_state` for a streaming scan.
 ///
 /// `partition_key` / `clustering_key` are the raw serialized bytes of the last
@@ -751,6 +719,110 @@ async fn collect_page_from_partition_stream(
             rows.push(output_row);
             last_pk = pk_bytes.clone();
             last_ck = clustering;
+        }
+
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let next_paging_state = if more_rows_remain {
+        Some(
+            crate::paging::PagingState {
+                partition_key: last_pk,
+                clustering_key: last_ck,
+                remaining_in_partition: false,
+            }
+            .encode(),
+        )
+    } else {
+        None
+    };
+
+    Ok(StreamedPage {
+        rows,
+        next_paging_state,
+    })
+}
+
+/// Collect one bounded page from a post-filtered partition stream.
+///
+/// This is the ALLOW FILTERING counterpart to
+/// [`collect_page_from_partition_stream`]. It applies WHERE predicates as each
+/// decoded row is observed and only retains rows that match the predicates, so
+/// a full-table post-filter scan cannot accumulate the full table in
+/// coordinator memory before filtering.
+async fn collect_filtered_page_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    page_size: usize,
+    resume: Option<StreamResumeCursor>,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+    limit: Option<usize>,
+) -> Result<StreamedPage, CqlError> {
+    debug_assert!(page_size > 0, "page_size must be positive");
+
+    let limit = limit.unwrap_or(usize::MAX);
+    let target = std::cmp::min(page_size, limit);
+    if target == 0 {
+        return Ok(StreamedPage {
+            rows: Vec::new(),
+            next_paging_state: None,
+        });
+    }
+
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(target);
+    let mut last_pk: Vec<u8> = Vec::new();
+    let mut last_ck: Vec<u8> = Vec::new();
+    let mut more_rows_remain = false;
+    let mut processed_partitions = 0usize;
+
+    'outer: while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let pk_bytes = partition.key.key.as_bytes().to_vec();
+        let paired = bridge::partition_to_rows_with_clustering(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        );
+
+        for (clustering, output_row) in paired {
+            if let Some(ref cur) = resume {
+                if pk_bytes == cur.partition_key && clustering <= cur.clustering_key {
+                    continue;
+                }
+            }
+
+            if !row_matches_select_predicates(
+                &output_row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                continue;
+            }
+
+            if rows.len() == target {
+                more_rows_remain = true;
+                break 'outer;
+            }
+
+            rows.push(output_row);
+            last_pk = pk_bytes.clone();
+            last_ck = clustering;
+            if rows.len() == limit {
+                break 'outer;
+            }
         }
 
         processed_partitions += 1;
@@ -4240,6 +4312,7 @@ async fn route_select_user_table(
                     let all_where_columns_indexed = non_token_clauses
                         .iter()
                         .all(|wc| indexed_columns.iter().any(|ic| ic == &wc.column));
+                    let has_post_filter = s.allow_filtering && !non_token_clauses.is_empty();
 
                     if !non_token_clauses.is_empty()
                         && !all_where_columns_indexed
@@ -4261,9 +4334,12 @@ async fn route_select_user_table(
                     // default page applies when the client sends no `page_size`, so
                     // even an un-paged `SELECT *` cannot accumulate unbounded rows.
                     //
-                    // Other shapes (predicates, ORDER BY, ANN, DISTINCT, LIMIT,
-                    // COUNT) keep their existing materialize-bounded behavior, where
-                    // the scan window is already bounded by LIMIT/sort/count needs.
+                    // Other shapes (ORDER BY, ANN, DISTINCT, aggregates, function
+                    // projections) need global ordering/folding semantics and must
+                    // not fall back to full-table in-memory materialization. Plain
+                    // post-filter predicates are handled below with a streaming
+                    // filtered collector so ALLOW FILTERING cannot accumulate the
+                    // whole table in coordinator memory before applying predicates.
                     // Exclude any function-call projection: aggregates
                     // (COUNT/AVG/MIN/MAX/SUM) and UDAs fold over the WHOLE result,
                     // so paging the scan would compute them over a single page.
@@ -4356,15 +4432,14 @@ async fn route_select_user_table(
                         // LIMIT 1 may need to inspect many non-matching partitions
                         // before finding the first matching row, and a fixed cap would
                         // silently drop later matches. In that shape, stream the full
-                        // table and apply LIMIT/page semantics after filtering.
-                        // Ordered and aggregate queries still materialize their scan
-                        // window before sorting/counting.
+                        // table. That post-filter shape is handled by a streaming
+                        // filtered collector below. Remaining full-table shapes
+                        // that cannot prove a bounded scan fail loud instead of
+                        // falling back to stream-to-Vec materialization.
                         let scan_bound = if s.order_by.is_empty()
                             && s.ann_of.is_none()
                             && !count_only_select
                         {
-                            let has_post_filter =
-                                s.allow_filtering && !non_token_clauses.is_empty();
                             if has_post_filter {
                                 None
                             } else {
@@ -4531,50 +4606,98 @@ async fn route_select_user_table(
                                 paging_state: None,
                             });
                         }
-                        let mut all_rows = Vec::new();
-                        if let Some(partitions) = partitions.as_ref() {
-                            extend_rows_from_partitions(
-                                partitions,
-                                &mut all_rows,
-                                &all_col_names,
-                                &all_col_types,
-                                &pk_indices,
-                                &ck_indices,
-                                &storage_to_table,
-                            )
-                            .await;
-                        } else {
+                        let can_stream_post_filter_page = partitions.is_none()
+                            && has_post_filter
+                            && s.order_by.is_empty()
+                            && s.ann_of.is_none()
+                            && !s.distinct
+                            && !has_function_projection;
+                        if can_stream_post_filter_page {
+                            let page_size = ctx
+                                .paging
+                                .page_size
+                                .and_then(|ps| (ps > 0).then_some(ps as usize))
+                                .unwrap_or_else(crate::paging::default_scan_page_size);
+                            let limit_size = s
+                                .limit
+                                .as_ref()
+                                .and_then(|l| l.as_literal())
+                                .map(|n| n.max(0) as usize);
+                            let resume = StreamResumeCursor::from_paging_state(
+                                ctx.paging.paging_state.as_deref(),
+                            )?;
+                            let start_key = resume.as_ref().map(|cur| {
+                                ferrosa_common::key::DecoratedKey::new(
+                                    ferrosa_common::key::PartitionKey::from(
+                                        cur.partition_key.as_slice(),
+                                    ),
+                                )
+                            });
                             let stream = state
                                 .write_path
                                 .load()
-                                .range_read_stream_all_with(
+                                .range_read_stream_all_from(
                                     &table_id,
-                                    row_limit,
+                                    start_key.as_ref(),
                                     ctx.consistency,
                                     &table_strategy,
                                 )
                                 .await?;
-                            extend_rows_from_partition_stream(
+                            let page = collect_filtered_page_from_partition_stream(
                                 stream,
-                                &mut all_rows,
-                                &all_col_names,
-                                &all_col_types,
-                                &pk_indices,
-                                &ck_indices,
-                                &storage_to_table,
+                                page_size,
+                                resume,
+                                PartitionRowContext {
+                                    all_col_names: &all_col_names,
+                                    all_col_types: &all_col_types,
+                                    pk_indices: &pk_indices,
+                                    ck_indices: &ck_indices,
+                                    storage_to_table: &storage_to_table,
+                                },
+                                SelectPredicateContext {
+                                    statement: s,
+                                    table_meta,
+                                    keyspace: ks,
+                                    state,
+                                },
+                                limit_size,
                             )
                             .await?;
+                            streamed_paging_state = Some(page.next_paging_state);
+                            page.rows
+                        } else {
+                            let mut all_rows = Vec::new();
+                            if let Some(partitions) = partitions.as_ref() {
+                                extend_rows_from_partitions(
+                                    partitions,
+                                    &mut all_rows,
+                                    &all_col_names,
+                                    &all_col_types,
+                                    &pk_indices,
+                                    &ck_indices,
+                                    &storage_to_table,
+                                )
+                                .await;
+                            } else {
+                                return Err(CqlError::Invalid(
+                                    "unbounded full-table materialization is disabled; use a \
+                                     page-compatible scan, add a LIMIT/index/materialized view, \
+                                     or rewrite ORDER BY/DISTINCT/aggregate/function projection \
+                                     queries to a bounded plan"
+                                        .into(),
+                                ));
+                            }
+                            filter_rows_by_select_predicates(
+                                &mut all_rows,
+                                s,
+                                &all_col_names,
+                                &all_col_types,
+                                table_meta,
+                                ks,
+                                state,
+                            )?;
+                            all_rows
                         }
-                        filter_rows_by_select_predicates(
-                            &mut all_rows,
-                            s,
-                            &all_col_names,
-                            &all_col_types,
-                            table_meta,
-                            ks,
-                            state,
-                        )?;
-                        all_rows
                     }
                 }
             }
@@ -16158,9 +16281,11 @@ mod tests {
     #[tokio::test]
     async fn allow_filtering_partial_composite_partition_key_scans_all_matching_partitions() {
         let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
         let ctx = RequestContext {
-            auth: &dev_auth(),
-            current_keyspace: &None,
+            auth: &auth,
+            current_keyspace: &no_ks,
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
@@ -16232,18 +16357,18 @@ mod tests {
         .await
         .unwrap();
 
-        let stmt = crate::parser::parse(&format!(
+        let query = format!(
             "SELECT src_id, edge_type, dst_id FROM edge_scan.typed_edges \
              WHERE tenant_id = {tenant_a} ALLOW FILTERING"
-        ))
-        .unwrap();
-        let result = route(&state, &ctx, stmt).await.unwrap();
-        let row_count = match &result {
-            RouteResult::Result(b) => extract_row_count(b),
-            _ => panic!("expected Result"),
-        };
+        );
+        let (rows, pages) = collect_all_pages(&state, &auth, &no_ks, &query, None).await;
+        assert!(
+            pages > 1,
+            "partial composite partition-key scan should use bounded pages"
+        );
         assert_eq!(
-            row_count, matching_rows as i32,
+            rows.len(),
+            matching_rows,
             "ALLOW FILTERING on the first component of a composite partition key must scan every matching tenant/session partition"
         );
     }
@@ -16659,8 +16784,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitrary_unbounded_order_by_reserves_and_cleans_temp_sort_table() {
-        let (state, dir) = setup();
+    async fn arbitrary_unbounded_order_by_fails_loud_instead_of_materializing() {
+        let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
             current_keyspace: &None,
@@ -16714,12 +16839,12 @@ mod tests {
             }
         );
 
-        route(&state, &ctx, stmt).await.unwrap();
-
-        let tmp_root = dir.path().join("tmp_order_by_sort");
-        if tmp_root.exists() {
-            let leftovers = std::fs::read_dir(&tmp_root).unwrap().count();
-            assert_eq!(leftovers, 0, "ORDER BY temp-sort table must be cleaned up");
+        match route(&state, &ctx, stmt).await {
+            Err(CqlError::Invalid(msg)) => assert!(
+                msg.contains("unbounded full-table materialization is disabled"),
+                "unexpected ORDER BY error: {msg}"
+            ),
+            _ => panic!("unbounded arbitrary ORDER BY must fail loud"),
         }
     }
 
@@ -22367,6 +22492,49 @@ mod tests {
     }
 
     #[test]
+    fn allow_filtering_post_filter_scans_must_not_materialize_before_filtering() {
+        let source = include_str!("router.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production router source must precede tests");
+
+        let post_filter_stream_branch = production
+            .split("if can_stream_post_filter_page {")
+            .nth(1)
+            .and_then(|rest| rest.split("} else {").next())
+            .expect("post-filter streaming branch must be present");
+        assert!(
+            post_filter_stream_branch.contains("collect_filtered_page_from_partition_stream"),
+            "ALLOW FILTERING post-filter scans must filter while consuming the stream"
+        );
+        assert!(
+            !post_filter_stream_branch.contains("let mut all_rows = Vec::new();")
+                && !post_filter_stream_branch.contains("extend_rows_from_partition_stream(")
+                && !post_filter_stream_branch.contains("filter_rows_by_select_predicates("),
+            "ALLOW FILTERING must not append the full stream into all_rows before filtering"
+        );
+    }
+
+    #[test]
+    fn full_scan_fallback_must_not_materialize_unbounded_stream() {
+        let source = include_str!("router.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production router source must precede tests");
+
+        assert!(
+            !production.contains("extend_rows_from_partition_stream"),
+            "full-table fallback must fail loud or stream a bounded page instead of appending an unbounded partition stream into Vec rows"
+        );
+        assert!(
+            production.contains("unbounded full-table materialization is disabled"),
+            "non-pageable full-table shapes must fail loud instead of materializing"
+        );
+    }
+
+    #[test]
     fn single_partition_limit_pushes_row_cap_into_point_read() {
         let source = include_str!("router.rs");
         let pk_lookup_blocks: Vec<&str> = source
@@ -22678,6 +22846,77 @@ mod tests {
             n as usize,
             "default-paged traversal must still visit every row exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn allow_filtering_with_no_page_size_applies_default_bounded_page() {
+        // ALLOW FILTERING used to stream partitions from storage, append every
+        // decoded row into all_rows, and only then apply the predicate. With no
+        // client page_size, that returned every matching row in one response
+        // and could OOM the coordinator. It must instead return one default
+        // page plus a continuation.
+        let default = crate::paging::default_scan_page_size();
+        let n = (default as i64) + 17;
+
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select =
+            match crate::parser::parse("SELECT * FROM pageks.t WHERE v >= 0 ALLOW FILTERING")
+                .unwrap()
+            {
+                Statement::Select(s) => s,
+                other => panic!("expected select, got {other:?}"),
+            };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert!(
+            res.rows.len() <= default,
+            "filtered no-page-size scan returned {} rows, exceeds default page {default}",
+            res.rows.len()
+        );
+        assert!(
+            res.paging_state.is_some(),
+            "filtered no-page-size scan over more than one default page must return a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_filtering_paged_traversal_filters_without_gaps_or_dupes() {
+        let n = 1_000;
+        let threshold = 3_000;
+        let first_matching_id = threshold / 10;
+        let expected = (n as usize) - (first_matching_id as usize);
+
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let (paged, pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            &format!("SELECT * FROM pageks.t WHERE v >= {threshold} ALLOW FILTERING"),
+            Some(97),
+        )
+        .await;
+
+        assert!(pages > 1, "expected multiple filtered pages, got {pages}");
+        assert_eq!(
+            paged.len(),
+            expected,
+            "filtered paged traversal must return every matching row"
+        );
+        let mut ids: Vec<_> = paged.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        let mut unique = ids.clone();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "filtered paging emitted duplicates"
+        );
+        assert_eq!(
+            ids.first(),
+            Some(&Some(CqlValue::Int(first_matching_id as i32)))
+        );
+        assert_eq!(ids.last(), Some(&Some(CqlValue::Int((n - 1) as i32))));
     }
 
     #[tokio::test]
