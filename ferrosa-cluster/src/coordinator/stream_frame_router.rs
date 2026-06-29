@@ -50,6 +50,18 @@ struct StreamSeqState {
 pub struct StreamFrameRouter {
     router: Arc<StreamRouter>,
     seq_state: Mutex<HashMap<StreamSeqKey, StreamSeqState>>,
+    // Requests whose route we closed on a sequence gap/mismatch. A still-sending
+    // peer keeps emitting chunks after the close; without this each one would
+    // recreate fresh seq state (`next_chunk_seq = 0`) via `entry().or_default()`
+    // and re-close — turning ONE transient gap (or a reused request_id colliding
+    // with a peer's stale stream after a reconnect) into an unrecoverable close
+    // storm (the `expected=0 observed=162,163,164…` churn that stalls the scan
+    // into a `ReadTimeout`). Tombstoned requests drop frames silently, so the
+    // read fails fast once and retries on a fresh (monotonic) request_id instead
+    // of churning until the consumer's idle budget elapses. request_ids are
+    // monotonic per process, so a tombstone never needs to be reset.
+    closed: Mutex<std::collections::HashSet<u32>>,
+    route_closures: std::sync::atomic::AtomicU64,
 }
 
 impl StreamFrameRouter {
@@ -57,6 +69,8 @@ impl StreamFrameRouter {
         Self {
             router,
             seq_state: Mutex::new(HashMap::new()),
+            closed: Mutex::new(std::collections::HashSet::new()),
+            route_closures: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -67,12 +81,52 @@ impl StreamFrameRouter {
             .retain(|(id, _), _| *id != request_id);
     }
 
+    /// True if `request_id`'s route was already closed on a sequence error.
+    /// Tombstoned requests drop further frames silently (see `closed`).
+    fn is_closed(&self, request_id: u32) -> bool {
+        self.closed
+            .lock()
+            .expect("stream closed-set mutex poisoned")
+            .contains(&request_id)
+    }
+
+    /// Close a route exactly once on a sequence error: tombstone the request so
+    /// a still-sending peer's later frames are dropped instead of recreating
+    /// fresh seq state and re-closing on every frame.
+    fn close_route(&self, request_id: u32) {
+        let newly_closed = self
+            .closed
+            .lock()
+            .expect("stream closed-set mutex poisoned")
+            .insert(request_id);
+        if newly_closed {
+            self.route_closures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.router.unregister(request_id);
+        self.clear_request_state(request_id);
+    }
+
+    /// Number of distinct routes closed on a sequence error. A single transient
+    /// gap must count once, not once per straggler frame the peer keeps sending.
+    #[cfg(test)]
+    pub(crate) fn route_closures(&self) -> u64 {
+        self.route_closures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn accept_chunk_seq(
         &self,
         from: PeerId,
         request_id: u32,
         bytes: &[u8],
     ) -> Option<Option<Message>> {
+        // Already closed on an earlier sequence error: a still-sending peer's
+        // straggler frames are dropped silently. Recreating seq state here would
+        // restart the close storm.
+        if self.is_closed(request_id) {
+            return None;
+        }
         let Ok(payload) = bincode::deserialize::<RangeReadStreamChunkPayload>(bytes) else {
             return Some(None);
         };
@@ -92,8 +146,7 @@ impl StreamFrameRouter {
                 "stream chunk sequence gap/reorder; closing stream route"
             );
             drop(guard);
-            self.router.unregister(request_id);
-            self.clear_request_state(request_id);
+            self.close_route(request_id);
             return None;
         }
         state.next_chunk_seq = state.next_chunk_seq.saturating_add(1);
@@ -116,6 +169,10 @@ impl StreamFrameRouter {
         bytes: &[u8],
         msg: Message,
     ) -> Option<Option<Message>> {
+        // Route already closed on an earlier sequence error — drop the Done too.
+        if self.is_closed(request_id) {
+            return None;
+        }
         let Ok(payload) = bincode::deserialize::<RangeReadStreamDonePayload>(bytes) else {
             return Some(Some(msg));
         };
@@ -137,8 +194,7 @@ impl StreamFrameRouter {
                 "stream Done chunk count mismatch; closing stream route"
             );
             drop(guard);
-            self.router.unregister(request_id);
-            self.clear_request_state(request_id);
+            self.close_route(request_id);
             return None;
         }
 
@@ -157,8 +213,7 @@ impl StreamFrameRouter {
                 "duplicate early stream Done; closing stream route"
             );
             drop(guard);
-            self.router.unregister(request_id);
-            self.clear_request_state(request_id);
+            self.close_route(request_id);
             return None;
         }
 
@@ -361,6 +416,44 @@ mod tests {
         assert!(matches!(f1, Message::RangeReadStreamChunk(_)));
         assert!(matches!(f2, Message::RangeReadStreamHeartbeat(_)));
         assert!(matches!(f3, Message::RangeReadStreamDone(_)));
+    }
+
+    /// A single sequence gap closes the route exactly ONCE. A peer that keeps
+    /// streaming after the close (the `expected=0 observed=162,163,164…`
+    /// straggler churn) must have its later frames dropped silently — not
+    /// recreate fresh seq state via `entry().or_default()` and re-close on every
+    /// frame, which turned one transient gap (or a request_id reused after a
+    /// reconnect) into an unrecoverable `ReadTimeout` storm (t_0ae8b345). After a
+    /// clean single close the read fails fast and retries on a fresh request_id.
+    #[tokio::test]
+    async fn sequence_gap_closes_route_once_and_drops_straggler_frames() {
+        let router = Arc::new(StreamRouter::new());
+        let mut rx = router.register(REQ_ID, 16);
+        let handler = StreamFrameRouter::new(router.clone());
+
+        // In-sequence chunk 0 routes through.
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 0)).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::RangeReadStreamChunk(_))
+        ));
+
+        // Gap: chunk 9 (expected 1) closes the route — exactly once.
+        handler.handle(peer(), encoded_chunk_seq(REQ_ID, 9)).await;
+        assert!(router.is_empty(), "a sequence gap closes the route");
+        assert_eq!(handler.route_closures(), 1, "gap closes the route once");
+
+        // The peer keeps streaming (10, 11, 12). Pre-fix each recreated fresh seq
+        // state and re-closed (route_closures would climb to 4 — the churn).
+        // Tombstoned: they drop silently and the close count stays at 1.
+        for seq in [10u32, 11, 12] {
+            handler.handle(peer(), encoded_chunk_seq(REQ_ID, seq)).await;
+        }
+        assert_eq!(
+            handler.route_closures(),
+            1,
+            "straggler frames after a close must drop silently, not re-close (churn)"
+        );
     }
 
     /// Net dispatch spawns one task per inbound frame, so a Done frame
