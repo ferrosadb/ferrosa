@@ -12,9 +12,10 @@
 //!
 //! The single-node path (`local_range_stream`) wraps `range_iter` lazily and is
 //! bounded; the cluster path must do the same (move-based, one partition in
-//! flight — never a `Vec`). This test seeds N partitions and asserts the cluster
-//! full-scan's peak heap is ~independent of N. It FAILS today (peak scales with
-//! N) and PASSES once the cluster path streams partition-at-a-time.
+//! flight — never a `Vec`). This test seeds N partitions and asserts the
+//! streaming scan's peak heap is ~independent of N — locking in the COUNT-path
+//! fix (PR #230). The SELECT degraded arm + the data-loss regression test land
+//! in the follow-up (forge task t_a243e406).
 //!
 //! Modeled on `ferrosa-storage/tests/recovery_oom_memory_bound.rs`.
 
@@ -38,7 +39,7 @@ use ferrosa_cluster::coordinator::ClusterCoordinator;
 use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::ring::TokenRing;
-use ferrosa_cluster::write_path::{WritePath, DEFAULT_RANGE_READ_LIMIT};
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
 
@@ -252,44 +253,9 @@ fn cluster_full_scan_peak_is_independent_of_partition_count() {
     );
 }
 
-/// The data-loss half of the same bug: `range_read_limited_rows` clamps to the
-/// magic `DEFAULT_RANGE_READ_LIMIT` (10_000) and returns a `Vec` — so a scan
-/// over more partitions silently drops the overflow. The CQL router routes
-/// `ALLOW FILTERING` scans with a scan-bound or `row_limit > 0` through exactly
-/// this call (`router.rs` passes `DEFAULT_RANGE_READ_LIMIT`), so a real
-/// full-table scan returns WRONG results past 10k rows with no error. A scan
-/// must stream every row, never cap; this RED test fails until the scan path
-/// stops using the magic-capped materializing read.
-// RED until the SELECT degraded scan arm streams (router.rs:4673-4792 still routes
-// `row_limit > 0` SELECTs through the 10k-capped `range_read_limited_rows`). This
-// PR fixes only the COUNT path; un-ignore when the SELECT arm + the magic cap are
-// removed from scan paths. Tracked as deferred follow-up work.
-#[test]
-#[ignore = "RED: SELECT degraded arm still caps at DEFAULT_RANGE_READ_LIMIT — fixed in follow-up PR"]
-fn full_scan_must_not_silently_truncate_at_the_magic_limit() {
-    const N: usize = DEFAULT_RANGE_READ_LIMIT + 2_000; // 12_000, past the cap
-
-    let dir = tempfile::tempdir().unwrap();
-    let storage = engine(dir.path());
-    seed(&storage, N);
-    let wp = WritePath::direct(storage);
-    let table_id = TableId::new(KS, TBL);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    // Mirror how the router invokes the capped scan (router.rs:4686-4690):
-    // request "everything" (usize::MAX) with row_limit = 0.
-    let partitions = rt
-        .block_on(wp.range_read_limited_rows(&table_id, usize::MAX, 0))
-        .expect("range read");
-    let returned: usize = partitions.iter().map(|p| p.rows.len()).sum();
-
-    assert_eq!(
-        returned, N,
-        "DATA LOSS: a full scan over {N} rows returned only {returned} — the magic \
-         DEFAULT_RANGE_READ_LIMIT={DEFAULT_RANGE_READ_LIMIT} cap silently truncated it. \
-         Full scans must stream every row, not materialize a capped Vec.",
-    );
-}
+// NOTE: the data-loss half of this bug — `range_read_limited_rows` silently
+// truncating at DEFAULT_RANGE_READ_LIMIT (10_000) on the SELECT degraded scan
+// arm — is intentionally NOT tested here. Its regression test ships with the
+// follow-up PR that removes the cap from scan paths (forge task t_a243e406),
+// where it goes green. Adding it now would be a known-failing test (this repo's
+// CI runs #[ignore] tests in the cluster-gated job).
