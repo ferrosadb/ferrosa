@@ -2138,6 +2138,28 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
+        if partitions.is_empty() {
+            tracing::warn!(
+                keyspace = %schema.keyspace,
+                table = %schema.table,
+                quarantined_rows = total_quarantined,
+                "flush: all rows were quarantined; skipping empty SSTable publish"
+            );
+            let live = self.view.load();
+            let new_view = StoreView {
+                active: Arc::clone(&live.active),
+                flushing: None,
+                sstables: Arc::clone(&live.sstables),
+                sstable_ids: Arc::clone(&live.sstable_ids),
+                indexes: Arc::clone(&live.indexes),
+                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                vector_indexes: Arc::clone(&live.vector_indexes),
+            };
+            new_view.check_invariants("flush:clear_all_quarantined");
+            self.view.store(Arc::new(new_view));
+            return Ok(());
+        }
+
         let header = flush::build_serialization_header(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
@@ -5456,6 +5478,104 @@ mod tests {
         )
     }
 
+    struct SnapshotMemtable {
+        partitions: Vec<Partition>,
+    }
+
+    impl Memtable for SnapshotMemtable {
+        fn put(&self, _key: &DecoratedKey, _row: Row, _schema: &TableSchema) -> Result<()> {
+            panic!("SnapshotMemtable is read-only and only used as a legacy flush snapshot")
+        }
+
+        fn get(&self, key: &DecoratedKey) -> Result<Option<Arc<Partition>>> {
+            Ok(self
+                .partitions
+                .iter()
+                .find(|partition| &partition.key == key)
+                .cloned()
+                .map(Arc::new))
+        }
+
+        fn snapshot(&self) -> Vec<Partition> {
+            self.partitions.clone()
+        }
+
+        fn size_bytes(&self) -> usize {
+            0
+        }
+
+        fn partition_count(&self) -> usize {
+            self.partitions.len()
+        }
+    }
+
+    fn install_snapshot_memtable<F: FlushTarget>(
+        store: &TableStore<F>,
+        partitions: Vec<Partition>,
+    ) {
+        let current = store.view.load();
+        let replacement = StoreView {
+            active: Arc::new(SnapshotMemtable { partitions }),
+            flushing: None,
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        replacement.check_invariants("test:install_snapshot_memtable");
+        store.view.store(Arc::new(replacement));
+    }
+
+    #[test]
+    fn flush_all_quarantined_rows_does_not_publish_zero_byte_sstable() {
+        crate::quarantine::_reset_flush_quarantined_rows_total_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(dir.path());
+        let bad_row = Row {
+            // Int32 clustering must be exactly 4 bytes. This simulates a legacy
+            // malformed memtable row that predates the write-path validator.
+            clustering: vec![0; 8],
+            cells: vec![(0, CellValue::live(b"bad".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        install_snapshot_memtable(
+            &store,
+            vec![Partition {
+                key: make_key("pk_bad"),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![bad_row],
+            }],
+        );
+
+        store.flush().unwrap();
+
+        assert_eq!(
+            crate::quarantine::flush_quarantined_rows_total(),
+            1,
+            "the malformed legacy row must be preserved in row quarantine"
+        );
+        let data_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-Data.db"))
+            })
+            .collect();
+        assert!(
+            data_files.is_empty(),
+            "an entirely quarantined flush must not publish zero-byte Data.db files: {data_files:?}"
+        );
+        let view = store.view.load();
+        assert_eq!(view.sstables.len(), 0);
+        assert_eq!(view.sstable_ids.len(), 0);
+    }
+
     fn two_column_schema(first: &str, second: &str) -> TableSchema {
         TableSchema {
             keyspace: "test_ks".to_string(),
@@ -7886,6 +8006,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        let schema = test_schema();
+
+        let first = make_partition("decision", b"first", 1000);
+        let second = make_partition("org", b"second", 1000);
+        assert!(
+            first.key > second.key,
+            "test keys must be descending by decorated token"
+        );
+
+        store.write(&first.key, first.rows[0].clone()).unwrap();
+        store.write(&second.key, second.rows[0].clone()).unwrap();
+        store.flush().unwrap();
+
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let header_partitions = vec![second.clone(), first.clone()];
+        let mut unsorted_data =
+            data_bytes_for_single_partition(&schema, &header_partitions, &first);
+        unsorted_data.extend(data_bytes_for_single_partition(
+            &schema,
+            &header_partitions,
+            &second,
+        ));
+        std::fs::write(&data_path, unsorted_data).unwrap();
+
+        let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
+            .expect_err("startup/self-heal smoke test must detect Data.db token-order corruption");
+        assert!(
+            err.to_string().contains("partition order violation"),
+            "error must name the token-order corruption, got: {err}"
+        );
+    }
+
+    #[test]
+    fn production_table_read_paths_must_not_materialize_unbounded_sstables() {
+        let production_sources = [
+            ("engine.rs", include_str!("engine.rs")),
+            ("store.rs", include_str!("store.rs")),
+            (
+                "ferrosa-sstable/reader.rs",
+                include_str!("../../ferrosa-sstable/src/reader.rs"),
+            ),
+            (
+                "compaction/executor.rs",
+                include_str!("compaction/executor.rs"),
+            ),
+            (
+                "compaction/validator/driver.rs",
+                include_str!("compaction/validator/driver.rs"),
+            ),
+            (
+                "ferrosa-cql/router.rs",
+                include_str!("../../ferrosa-cql/src/router.rs"),
+            ),
+            (
+                "ferrosa-cluster/repair/trigger.rs",
+                include_str!("../../ferrosa-cluster/src/repair/trigger.rs"),
+            ),
+            (
+                "ferrosa-sstable-dump.rs",
+                include_str!("../../ferrosa-sstable/src/bin/ferrosa-sstable-dump.rs"),
+            ),
+        ];
+
+        let unbounded_read_all = concat!(".read_all", "_partitions(");
+        let unbounded_partition_limit = concat!("read_partitions_limited", "(usize::MAX");
+        for (name, source) in production_sources {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            assert!(
+                !production.contains(unbounded_read_all),
+                "{name} production code must stream SSTables; whole-table partition reads materialize an unbounded Vec"
+            );
+            assert!(
+                !production.contains(unbounded_partition_limit),
+                "{name} production code must not request an effectively unbounded materialized SSTable read"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------------
     // WP-003: sstable_metadata reports correct max_timestamp
     // -------------------------------------------------------------------------
@@ -8679,7 +8882,7 @@ mod tests {
         // `n_sstables` readers open at once — impossible under a pool capped at
         // `fanin`, forcing a soft-cap breach.
         let merged = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .read_token_range(i64::MIN, i64::MAX, distinct_keys)
             .unwrap();
         assert_eq!(
             merged.len(),
@@ -8892,8 +9095,11 @@ mod tests {
             (i64::MIN + 1, i64::MAX - 1),
         ];
 
+        let fixture_partition_limit = 5;
         for (start, end) in windows {
-            let rtr = store.read_token_range(start, end, usize::MAX).unwrap();
+            let rtr = store
+                .read_token_range(start, end, fixture_partition_limit)
+                .unwrap();
             let mut walk: Vec<Partition> = Vec::new();
             store
                 .walk_token_range(start, end, |p| {
@@ -8935,9 +9141,7 @@ mod tests {
             })
             .unwrap();
 
-        let rtr = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
-            .unwrap();
+        let rtr = store.read_token_range(i64::MIN, i64::MAX, 4).unwrap();
         assert_eq!(
             digest, rtr,
             "streaming digest walk partitions must match single-pass read_token_range"
@@ -8999,7 +9203,7 @@ mod tests {
 
         // Sanity: a single-pass read sees all distinct keys (the merged result).
         let merged = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
+            .read_token_range(i64::MIN, i64::MAX, distinct_keys)
             .unwrap();
         assert_eq!(
             merged.len(),
@@ -9063,22 +9267,22 @@ mod tests {
         // the cell-merge / dedup / tombstone-preservation paths are exercised.
         let store = file_store_with_many_sstables(dir.path(), 1024, 64, 12);
 
-        // Reference: single-pass, unbounded.
-        let reference = store
-            .read_token_range(i64::MIN, i64::MAX, usize::MAX)
-            .unwrap();
+        // Reference: single-pass with a fixture-sized finite limit.
+        let reference = store.read_token_range(i64::MIN, i64::MAX, 12).unwrap();
         assert!(!reference.is_empty(), "fixture must produce partitions");
 
         // Loop the bounded fetch over the full window under a spread of
         // (max_partitions, max_bytes) budgets; the result must reassemble to the
         // single-pass reference regardless of how the chunk boundaries fall.
+        let all_partitions = reference.len().max(1);
+        let large_byte_budget = 1_000_000usize;
         let cases: &[(usize, usize)] = &[
-            (usize::MAX, usize::MAX), // single chunk
-            (3, usize::MAX),          // count budget
-            (usize::MAX, 64),         // byte budget
-            (2, usize::MAX),          // tight count budget
-            (1, usize::MAX),          // one partition per chunk
-            (usize::MAX, 48),         // tight byte budget
+            (all_partitions, large_byte_budget), // single chunk
+            (3, large_byte_budget),              // count budget
+            (all_partitions, 64),                // byte budget
+            (2, large_byte_budget),              // tight count budget
+            (1, large_byte_budget),              // one partition per chunk
+            (all_partitions, 48),                // tight byte budget
         ];
 
         for &(max_partitions, max_bytes) in cases {
@@ -9093,7 +9297,7 @@ mod tests {
                     .unwrap();
                 if !chunk.is_empty() {
                     assert!(
-                        max_partitions == usize::MAX || chunk.len() <= max_partitions,
+                        chunk.len() <= max_partitions,
                         "chunk len {} exceeded count budget {max_partitions}",
                         chunk.len()
                     );
@@ -9135,9 +9339,10 @@ mod tests {
         inflight::reset();
         let mut total = 0usize;
         let mut cursor = i64::MIN;
+        let large_byte_budget = 1_000_000usize;
         loop {
             let (chunk, next) = store
-                .read_token_range_bounded(cursor, i64::MAX, 2, usize::MAX)
+                .read_token_range_bounded(cursor, i64::MAX, 2, large_byte_budget)
                 .unwrap();
             total += chunk.len();
             match next {

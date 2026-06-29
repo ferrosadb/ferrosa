@@ -103,11 +103,19 @@ pub fn open_reader(dir: &Path, generation: &str) -> SSTableReader<FileReadAt> {
     .expect("open output reader")
 }
 
+fn collect_partitions_streaming(reader: &SSTableReader<FileReadAt>) -> Vec<Partition> {
+    let mut partitions = Vec::new();
+    let mut iter = reader.partitions_iter().expect("stream output partitions");
+    while let Some(partition) = iter.next_partition().expect("read streamed partition") {
+        partitions.push(partition);
+    }
+    partitions
+}
+
 /// Read every partition from a compaction output SSTable `generation` in `dir`.
 pub fn read_sstable(dir: &Path, generation: &str) -> Vec<Partition> {
-    open_reader(dir, generation)
-        .read_all_partitions()
-        .expect("read output partitions")
+    let reader = open_reader(dir, generation);
+    collect_partitions_streaming(&reader)
 }
 
 /// Verify the reader's index-driven point reads agree with a full scan for
@@ -115,7 +123,7 @@ pub fn read_sstable(dir: &Path, generation: &str) -> Vec<Partition> {
 /// off-by-one seeking bugs hide. Returns the list of mismatches.
 pub fn audit_point_reads(dir: &Path, generation: &str) -> Vec<String> {
     let reader = open_reader(dir, generation);
-    let scanned = reader.read_all_partitions().expect("scan partitions");
+    let scanned = collect_partitions_streaming(&reader);
     let mut violations = Vec::new();
     for partition in &scanned {
         match reader.get_partition(&partition.key) {
@@ -450,7 +458,7 @@ mod tests {
 
         // Explicit first/last boundary point reads.
         let reader = open_reader(&dir, &meta.id);
-        let scanned = reader.read_all_partitions().unwrap();
+        let scanned = collect_partitions_streaming(&reader);
         for boundary in [scanned.first().unwrap(), scanned.last().unwrap()] {
             assert!(
                 reader.get_partition(&boundary.key).unwrap().is_some(),

@@ -664,19 +664,6 @@ impl<R: ReadAt> SSTableReader<R> {
         self.partition_index.largest_key()
     }
 
-    /// Read all partitions from this SSTable in storage order.
-    ///
-    /// Scans the Data.db file sequentially from position 0, reading each
-    /// partition until EOF. **Materializes the entire SSTable into memory.**
-    ///
-    /// Prefer [`Self::partitions_iter`] for compaction and other large-scan
-    /// callers — full materialization here was OOM-ing the compaction
-    /// executor on tombstone-heavy workloads (`cql_timeseries2`, IoT TTL
-    /// patterns).  See `specs/in-process/streaming-compaction.md`.
-    pub fn read_all_partitions(&self) -> Result<Vec<crate::types::Partition>> {
-        self.read_partitions_limited(usize::MAX)
-    }
-
     /// Stream partitions from this SSTable in storage (token) order, one at
     /// a time, without materializing the whole file into memory.
     ///
@@ -686,16 +673,17 @@ impl<R: ReadAt> SSTableReader<R> {
     /// uncompressed). Each call to [`PartitionIter::next_partition`] yields
     /// at most one partition; the iterator returns `Ok(None)` at EOF.
     ///
-    /// Memory: `O(decompressed_data_size)` for compressed SSTables (single
-    /// pre-decompressed buffer held for the iterator's lifetime), `O(1)`
-    /// for uncompressed.  Independent of partition count.
+    /// Memory: `O(decompressed_chunk_cache_entries * chunk_length)` for
+    /// compressed SSTables via the bounded chunk LRU, `O(1)` for uncompressed.
+    /// Independent of partition count.
     pub fn partitions_iter(&self) -> Result<PartitionIter<'_, R>> {
         PartitionIter::new(self)
     }
 
     /// Scan partitions sequentially, stopping once `limit` partitions have
-    /// been decoded. This bounds range-read materialization while preserving
-    /// the existing all-partitions API for compaction callers.
+    /// been decoded. Production full-table callers should use
+    /// [`Self::partitions_iter`] instead of passing an effectively unbounded
+    /// limit.
     pub fn read_partitions_limited(&self, limit: usize) -> Result<Vec<crate::types::Partition>> {
         self.read_partitions_limited_rows(limit, 0)
     }
@@ -2170,11 +2158,10 @@ mod tests {
         assert!(reader.compression_info().is_none());
     }
 
-    /// Parity: streaming `partitions_iter()` yields the same sequence as
-    /// the materializing `read_all_partitions()`.  This is the regression
-    /// guard for the streaming-compaction refactor.
+    /// Parity: streaming `partitions_iter()` yields the same sequence as a
+    /// small, explicitly bounded partition read.
     #[test]
-    fn partitions_iter_matches_read_all_partitions() {
+    fn partitions_iter_matches_bounded_partition_read() {
         let header = test_header();
         let dks: Vec<_> = (0..7u32)
             .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
@@ -2201,7 +2188,9 @@ mod tests {
         };
         let reader = SSTableReader::open(components).unwrap();
 
-        let materialized = reader.read_all_partitions().expect("read_all");
+        let materialized = reader
+            .read_partitions_limited(dks.len())
+            .expect("bounded partition read");
         let mut streamed = Vec::new();
         let mut iter = reader.partitions_iter().expect("partitions_iter");
         while let Some(p) = iter.next_partition().expect("next") {

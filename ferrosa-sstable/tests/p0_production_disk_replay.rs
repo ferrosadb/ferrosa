@@ -37,14 +37,28 @@ fn open_fixture(dir: &Path) -> SSTableReader<Vec<u8>> {
     SSTableReader::open(components).expect("open SSTable fixture")
 }
 
+fn collect_fixture_partitions(
+    reader: &SSTableReader<Vec<u8>>,
+) -> Vec<ferrosa_sstable::types::Partition> {
+    let mut partitions = Vec::new();
+    let mut iter = reader
+        .partitions_iter()
+        .expect("reader replay must open a streaming iterator");
+    while let Some(partition) = iter
+        .next_partition()
+        .expect("reader replay must decode streamed partition")
+    {
+        partitions.push(partition);
+    }
+    partitions
+}
+
 #[test]
 fn replay_entity_store_fixture_sstable_end_to_end() {
     let dir = fixture_dir("multi_partition");
     let reader = open_fixture(&dir);
 
-    let partitions = reader
-        .read_all_partitions()
-        .expect("reader replay must decode all partitions");
+    let partitions = collect_fixture_partitions(&reader);
     assert_eq!(partitions.len() as u64, reader.key_count());
     assert!(!partitions.is_empty());
 }
@@ -54,9 +68,7 @@ fn replay_typed_edges_fixture_sstable_end_to_end() {
     let dir = fixture_dir("wide_partition");
     let reader = open_fixture(&dir);
 
-    let partitions = reader
-        .read_all_partitions()
-        .expect("reader replay must decode all partitions");
+    let partitions = collect_fixture_partitions(&reader);
     assert_eq!(partitions.len() as u64, reader.key_count());
     assert!(!partitions.is_empty());
 }
