@@ -83,6 +83,14 @@ repos:
         types: [rust]
         pass_filenames: false
 
+      - id: p0-oom-audit-prepush
+        name: p0-oom-audit (pre-push, AST read-path materialization guard)
+        stages: [pre-push]
+        entry: bash -c 'cargo run --quiet -p xtask -- p0-oom-audit --enforce --today "$(date -u +%F)"'
+        language: system
+        types: [rust]
+        pass_filenames: false
+
       - id: cargo-clippy-prepush
         name: cargo clippy (pre-push, all-targets, all-features, -D warnings)
         stages: [pre-push]

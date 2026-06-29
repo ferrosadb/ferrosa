@@ -54,6 +54,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - name: Guard against unbounded materializing reads
         run: python3 scripts/check-unbounded-reads.py
+      - name: P0 OOM guard — AST read-path materialization audit
+        # AST-based (syn) audit: bans Vec materialization / capped reads on scan
+        # paths. Passes today via specs/p0-oom-guard/oom-audit-allow.toml; --today
+        # is the run date so expired allow entries (the t_15417b35 migration
+        # deadline) start failing the gate and force the streaming fix.
+        run: cargo run --quiet -p xtask -- p0-oom-audit --enforce --today "$(date -u +%F)"
 
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
