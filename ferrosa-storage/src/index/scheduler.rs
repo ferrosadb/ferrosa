@@ -236,7 +236,7 @@ impl IndexBuildBackend for LocalBackend {
         .map_err(|e| format!("open sstable: {e}"))?;
 
         // Stream partitions one at a time rather than materializing the whole
-        // SSTable. `read_all_partitions()` would hold every decoded partition —
+        // SSTable. A full partition Vec would hold every decoded partition —
         // all cell values of all columns — in memory at once; on a large
         // SSTable that is an OOM hazard. `partitions_iter()` keeps a single
         // partition live plus the (much smaller) extracted index entries:

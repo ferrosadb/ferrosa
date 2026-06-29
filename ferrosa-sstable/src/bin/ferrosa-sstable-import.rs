@@ -7,6 +7,19 @@
 
 use std::path::PathBuf;
 
+fn temp_import_directory(table_dir: &std::path::Path, gen: &str) -> PathBuf {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_nanos())
+        .unwrap_or(0);
+    table_dir.join(format!(".import-{gen}-{}-{suffix}", std::process::id()))
+}
+
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(dir)?;
+    file.sync_all()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 6 {
@@ -26,10 +39,16 @@ fn main() {
     let keyspace = &args[4];
     let table = &args[5];
 
-    let data_path = source_dir.join(format!("{gen}-Data.db"));
-    if !data_path.exists() {
-        eprintln!("Error: Data.db not found: {}", data_path.display());
-        std::process::exit(1);
+    let required_components = ["Data.db", "Partitions.db", "Rows.db"];
+    for component in required_components {
+        let path = source_dir.join(format!("{gen}-{component}"));
+        if !path.exists() {
+            eprintln!(
+                "Error: required SSTable component {component} not found: {}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
     }
 
     let table_dir = target_dir
@@ -37,6 +56,19 @@ fn main() {
         .join(format!("{keyspace}.{table}"));
     if let Err(e) = std::fs::create_dir_all(&table_dir) {
         eprintln!("Error creating target dir: {e}");
+        std::process::exit(1);
+    }
+    let final_dir = table_dir.join(gen);
+    if final_dir.exists() {
+        eprintln!(
+            "Error: target generation directory already exists: {}",
+            final_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let staging_dir = temp_import_directory(&table_dir, gen);
+    if let Err(e) = std::fs::create_dir(&staging_dir) {
+        eprintln!("Error creating import staging dir: {e}");
         std::process::exit(1);
     }
 
@@ -54,7 +86,7 @@ fn main() {
     for ext in &extensions {
         let src = source_dir.join(format!("{gen}-{ext}"));
         if src.exists() {
-            let dst = table_dir.join(format!("{gen}-{ext}"));
+            let dst = staging_dir.join(format!("{gen}-{ext}"));
             match std::fs::copy(&src, &dst) {
                 Ok(bytes) => {
                     println!("  {gen}-{ext} ({bytes} bytes)");
@@ -62,11 +94,28 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("  Error copying {gen}-{ext}: {e}");
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    std::process::exit(1);
                 }
             }
         }
     }
 
-    println!("Imported {copied} files to {}/", table_dir.display());
+    if let Err(e) = sync_directory(&staging_dir) {
+        eprintln!("Error syncing import staging dir: {e}");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::rename(&staging_dir, &final_dir) {
+        eprintln!("Error promoting import into {}: {e}", final_dir.display());
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        std::process::exit(1);
+    }
+    if let Err(e) = sync_directory(&table_dir) {
+        eprintln!("Error syncing target table dir: {e}");
+        std::process::exit(1);
+    }
+
+    println!("Imported {copied} files to {}/", final_dir.display());
     println!("Restart ferrosa to load the imported SSTable.");
 }

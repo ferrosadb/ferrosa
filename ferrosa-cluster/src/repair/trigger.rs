@@ -25,8 +25,9 @@
 //! periodic repair cycle is the backstop (design Q3 / FMEA #10). Corruption is
 //! therefore never silently dropped from observability.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ferrosa_net::task_pool::TaskPool;
 use ferrosa_storage::self_heal::{RepairTrigger, TableKey};
@@ -114,6 +115,25 @@ pub struct ClusterRepairTrigger {
     topology: Arc<dyn ClusterTopology>,
     probe: Arc<dyn RepairProbe>,
     executor: Arc<dyn ExecutorProvider>,
+    in_flight: Arc<Mutex<HashSet<RefillKey>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RefillKey {
+    table: TableId,
+    range: (i64, i64),
+    peer_ring_id: u64,
+}
+
+struct RefillInFlightGuard {
+    in_flight: Arc<Mutex<HashSet<RefillKey>>>,
+    key: RefillKey,
+}
+
+impl Drop for RefillInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.lock().unwrap().remove(&self.key);
+    }
 }
 
 impl ClusterRepairTrigger {
@@ -127,6 +147,7 @@ impl ClusterRepairTrigger {
             topology,
             probe,
             executor,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -155,11 +176,36 @@ impl ClusterRepairTrigger {
     /// (which may touch the ring snapshot) never runs on the controller tick. A
     /// `None` executor (node not ring-ready) is logged loudly — the periodic
     /// cycle is the backstop (FMEA #10).
-    fn schedule_session(&self, table: &TableId, range: (i64, i64), peer_ring_id: u64) {
+    fn schedule_session(&self, table: &TableId, range: (i64, i64), peer_ring_id: u64) -> bool {
+        let key = RefillKey {
+            table: table.clone(),
+            range,
+            peer_ring_id,
+        };
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            if !in_flight.insert(key.clone()) {
+                tracing::debug!(
+                    keyspace = table.keyspace(),
+                    table = table.table(),
+                    range_start = range.0,
+                    range_end = range.1,
+                    peer = peer_ring_id,
+                    "anti-entropy refill: duplicate targeted refill already in flight; coalescing request"
+                );
+                return false;
+            }
+        }
+
         let provider = self.executor.clone();
         let table = table.clone();
         let (start, end) = range;
+        let guard = RefillInFlightGuard {
+            in_flight: self.in_flight.clone(),
+            key,
+        };
         TaskPool::current("anti-entropy-refill").spawn(async move {
+            let _guard = guard;
             let Some(executor) = provider.current_executor() else {
                 tracing::warn!(
                     keyspace = table.keyspace(),
@@ -198,6 +244,7 @@ impl ClusterRepairTrigger {
                 }
             }
         });
+        true
     }
 }
 
@@ -206,17 +253,18 @@ impl RepairTrigger for ClusterRepairTrigger {
         for &range in ranges {
             match self.healthy_peer_for(table, range) {
                 Some((ring_id, host_id)) => {
-                    REFILLS_SCHEDULED.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
-                        keyspace = table.keyspace(),
-                        table = table.table(),
-                        range_start = range.0,
-                        range_end = range.1,
-                        peer = ring_id,
-                        %host_id,
-                        "anti-entropy refill: verified healthy replica; scheduling targeted refill"
-                    );
-                    self.schedule_session(table, range, ring_id);
+                    if self.schedule_session(table, range, ring_id) {
+                        REFILLS_SCHEDULED.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            keyspace = table.keyspace(),
+                            table = table.table(),
+                            range_start = range.0,
+                            range_end = range.1,
+                            peer = ring_id,
+                            %host_id,
+                            "anti-entropy refill: verified healthy replica; scheduling targeted refill"
+                        );
+                    }
                 }
                 None => {
                     REFILLS_NO_SOURCE.fetch_add(1, Ordering::Relaxed);
@@ -239,6 +287,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     use super::super::cluster_view::{ClusterTopology, RepairProbe};
@@ -308,10 +357,38 @@ mod tests {
         }
     }
 
+    /// Executor that blocks sessions until the test releases them, so duplicate
+    /// refill requests can be made while the first session is definitely still
+    /// in flight.
+    #[derive(Default)]
+    struct BlockingExecutor {
+        calls: AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl SessionExecutor for BlockingExecutor {
+        async fn run_session(
+            &self,
+            _table: &TableId,
+            _range_start: i64,
+            _range_end: i64,
+            _peer: u64,
+        ) -> Result<SessionStats, String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.release.notified().await;
+            Ok(SessionStats::default())
+        }
+    }
+
     /// Build an [`ExecutorProvider`] that always resolves to `exec` — the
     /// healthy, ring-ready case the production closure hits once the node is
     /// placed in the ring.
     fn provider_for(exec: &Arc<RecordingExecutor>) -> Arc<dyn ExecutorProvider> {
+        let exec = exec.clone();
+        Arc::new(move || Some(exec.clone() as Arc<dyn SessionExecutor>))
+    }
+
+    fn blocking_provider_for(exec: &Arc<BlockingExecutor>) -> Arc<dyn ExecutorProvider> {
         let exec = exec.clone();
         Arc::new(move || Some(exec.clone() as Arc<dyn SessionExecutor>))
     }
@@ -330,6 +407,27 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         exec.calls.lock().unwrap().clone()
+    }
+
+    async fn wait_for_blocking_calls(exec: &Arc<BlockingExecutor>, n: usize) -> usize {
+        for _ in 0..200 {
+            let calls = exec.calls.load(Ordering::Relaxed);
+            if calls >= n {
+                return calls;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        exec.calls.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for_no_refills_in_flight(trigger: &ClusterRepairTrigger) {
+        for _ in 0..200 {
+            if trigger.in_flight.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("refill in-flight set did not drain");
     }
 
     /// RED: a quarantine refill request must enqueue exactly one targeted repair
@@ -373,6 +471,47 @@ mod tests {
             anti_entropy_refills_scheduled_total() > before,
             "the scheduled-refill metric must increment (corruption self-heal is observable)"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_refill_requests_for_same_table_range_are_coalesced_while_in_flight() {
+        let healthy_peer = (3u64, uuid::Uuid::from_u128(0xBBBB));
+        let topology = Arc::new(MockTopology {
+            peers: vec![healthy_peer],
+        });
+        let probe = Arc::new(MockProbe::new(vec![(
+            healthy_peer.1,
+            ProbeOutcome::HealthyNonEmpty,
+        )]));
+        let exec = Arc::new(BlockingExecutor::default());
+        let trigger = ClusterRepairTrigger::new(topology, probe, blocking_provider_for(&exec));
+
+        let table = TableId::new("ks", "t");
+        let range = (100i64, 200i64);
+
+        trigger.request_refill(&table, &[range]);
+        assert_eq!(wait_for_blocking_calls(&exec, 1).await, 1);
+
+        for _ in 0..100 {
+            trigger.request_refill(&table, &[range]);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            exec.calls.load(Ordering::Relaxed),
+            1,
+            "duplicate refill requests for the same table/range/peer must coalesce while in flight"
+        );
+
+        exec.release.notify_waiters();
+        wait_for_no_refills_in_flight(&trigger).await;
+
+        trigger.request_refill(&table, &[range]);
+        assert_eq!(
+            wait_for_blocking_calls(&exec, 2).await,
+            2,
+            "a later refill after the first completed must be schedulable"
+        );
+        exec.release.notify_waiters();
     }
 
     /// WIRING (FMEA #10): when a verified-healthy replica IS found but the

@@ -10,9 +10,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::manifest::Manifest;
 use crate::snapshot::metadata::SnapshotMetadata;
@@ -24,6 +26,23 @@ pub struct RestoreManager {
 }
 
 impl RestoreManager {
+    const REQUIRED_SSTABLE_COMPONENTS: [&'static str; 3] = ["Data.db", "Partitions.db", "Rows.db"];
+    const OPTIONAL_SSTABLE_COMPONENTS: [&'static str; 4] = [
+        "Filter.db",
+        "Statistics.db",
+        "TOC.txt",
+        "CompressionInfo.db",
+    ];
+    const ALL_SSTABLE_COMPONENTS: [&'static str; 7] = [
+        "Data.db",
+        "Partitions.db",
+        "Rows.db",
+        "Filter.db",
+        "Statistics.db",
+        "TOC.txt",
+        "CompressionInfo.db",
+    ];
+
     /// Creates a new manager backed by `store` with the given key prefix.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
@@ -91,16 +110,6 @@ impl RestoreManager {
         manifest: &Manifest,
         dest_dir: &Path,
     ) -> ferrosa_common::Result<usize> {
-        let components = [
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
-            "CompressionInfo.db",
-        ];
-
         let mut total = 0usize;
 
         for (table_id_str, entries) in &manifest.sstables {
@@ -114,11 +123,25 @@ impl RestoreManager {
 
             for entry in entries {
                 let hex = crate::upload::manager::hex_prefix_for(&entry.id);
+                let local_complete = Self::REQUIRED_SSTABLE_COMPONENTS.iter().all(|component| {
+                    Self::generation_component_path(&table_dir, &entry.id, component).is_some()
+                });
+                if local_complete {
+                    total += 1;
+                    continue;
+                }
 
-                for component in &components {
-                    // Use the shared key constructor — guarantees upload and
-                    // download always agree on the path format.  The key
-                    // format is: {prefix}/{hex}/{table}/{sstable}/{sstable}-{component}
+                let local_incomplete = Self::generation_exists(&table_dir, &entry.id);
+                let staging_dir = Self::temp_download_directory(&table_dir, &entry.id);
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                tokio::fs::create_dir_all(&staging_dir).await.map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "failed to create SSTable restore staging dir {}: {e}",
+                        staging_dir.display()
+                    ))
+                })?;
+
+                for component in &Self::REQUIRED_SSTABLE_COMPONENTS {
                     let s3_path = crate::upload::manager::sstable_object_key(
                         &self.prefix,
                         &hex,
@@ -126,36 +149,79 @@ impl RestoreManager {
                         &entry.id,
                         component,
                     );
-                    let local_path = table_dir.join(format!("{}-{component}", entry.id));
+                    let local_path = staging_dir.join(format!("{}-{component}", entry.id));
 
-                    // Skip if already present.
-                    if local_path.exists() {
-                        continue;
-                    }
-
-                    match self.store.get(&s3_path).await {
-                        Ok(result) => {
-                            let data = result.bytes().await.map_err(|e| {
-                                ferrosa_common::Error::InvalidFormat(format!(
-                                    "failed to read bytes from {s3_path}: {e}"
-                                ))
-                            })?;
-                            std::fs::write(&local_path, &data).map_err(|e| {
-                                ferrosa_common::Error::InvalidFormat(format!(
-                                    "failed to write {}: {e}",
-                                    local_path.display()
-                                ))
-                            })?;
+                    if Self::download_component_to_path(self.store.as_ref(), &s3_path, &local_path)
+                        .await?
+                        .is_none()
+                    {
+                        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                        if local_incomplete {
+                            Self::quarantine_incomplete_generation(&table_dir, &entry.id);
                         }
-                        // Optional components (e.g., CompressionInfo.db) may be absent.
-                        Err(object_store::Error::NotFound { .. }) => continue,
-                        Err(e) => {
-                            return Err(ferrosa_common::Error::InvalidFormat(format!(
-                                "S3 download failed for {s3_path}: {e}"
-                            )));
-                        }
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "snapshot SSTable {} for table {table_id_str} is missing required \
+                             component {component} at {s3_path}; refusing to publish partial restore",
+                            entry.id
+                        )));
                     }
                 }
+
+                for component in &Self::OPTIONAL_SSTABLE_COMPONENTS {
+                    let s3_path = crate::upload::manager::sstable_object_key(
+                        &self.prefix,
+                        &hex,
+                        table_id_str,
+                        &entry.id,
+                        component,
+                    );
+                    let local_path = staging_dir.join(format!("{}-{component}", entry.id));
+
+                    if Self::download_component_to_path(self.store.as_ref(), &s3_path, &local_path)
+                        .await?
+                        .is_none()
+                    {
+                        tracing::debug!(
+                            table = table_id_str,
+                            sstable = entry.id,
+                            component,
+                            "optional snapshot SSTable component absent in object store"
+                        );
+                    }
+                }
+
+                Self::sync_directory(&staging_dir).map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "failed to sync SSTable restore staging dir {}: {e}",
+                        staging_dir.display()
+                    ))
+                })?;
+
+                if local_incomplete {
+                    Self::quarantine_incomplete_generation(&table_dir, &entry.id);
+                }
+
+                let final_dir = table_dir.join(&entry.id);
+                if final_dir.exists() {
+                    Self::quarantine_incomplete_generation(&table_dir, &entry.id);
+                }
+                tokio::fs::rename(&staging_dir, &final_dir)
+                    .await
+                    .map_err(|e| {
+                        let _ = std::fs::remove_dir_all(&staging_dir);
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "failed to atomically promote SSTable restore {} to {}: {e}",
+                            staging_dir.display(),
+                            final_dir.display()
+                        ))
+                    })?;
+                Self::sync_directory(&table_dir).map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "failed to sync table dir {} after SSTable restore promotion: {e}",
+                        table_dir.display()
+                    ))
+                })?;
                 total += 1;
             }
         }
@@ -214,6 +280,138 @@ impl RestoreManager {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    fn generation_component_path(
+        table_dir: &Path,
+        sstable_id: &str,
+        component: &str,
+    ) -> Option<std::path::PathBuf> {
+        let generation_dir_path = table_dir
+            .join(sstable_id)
+            .join(format!("{sstable_id}-{component}"));
+        if generation_dir_path.exists() {
+            return Some(generation_dir_path);
+        }
+
+        let flat_path = table_dir.join(format!("{sstable_id}-{component}"));
+        flat_path.exists().then_some(flat_path)
+    }
+
+    fn generation_exists(table_dir: &Path, sstable_id: &str) -> bool {
+        table_dir.join(sstable_id).exists()
+            || Self::ALL_SSTABLE_COMPONENTS
+                .iter()
+                .any(|component| table_dir.join(format!("{sstable_id}-{component}")).exists())
+    }
+
+    fn temp_download_directory(table_dir: &Path, sstable_id: &str) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0);
+        table_dir.join(format!(
+            ".download-{sstable_id}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    async fn download_component_to_path(
+        store: &dyn ObjectStore,
+        s3_path: &ObjectPath,
+        local_path: &Path,
+    ) -> ferrosa_common::Result<Option<u64>> {
+        let result = match store.get(s3_path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "S3 download failed for {s3_path}: {e}"
+                )));
+            }
+        };
+
+        let mut stream = result.into_stream();
+        let mut file = tokio::fs::File::create(local_path).await.map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create SSTable restore temp file {}: {e}",
+                local_path.display()
+            ))
+        })?;
+        let mut bytes = 0u64;
+        while let Some(chunk) = stream.try_next().await.map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to stream SSTable component {s3_path}: {e}"
+            ))
+        })? {
+            bytes = bytes.saturating_add(chunk.len() as u64);
+            file.write_all(&chunk).await.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to write SSTable restore temp file {}: {e}",
+                    local_path.display()
+                ))
+            })?;
+        }
+        file.sync_data().await.map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to sync SSTable restore temp file {}: {e}",
+                local_path.display()
+            ))
+        })?;
+        Ok(Some(bytes))
+    }
+
+    fn sync_directory(dir: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::open(dir)?;
+        file.sync_all()
+    }
+
+    fn quarantine_incomplete_generation(table_dir: &Path, sstable_id: &str) {
+        let quarantine_dir = table_dir.join("quarantine");
+        if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+            tracing::warn!(
+                %e,
+                sstable = sstable_id,
+                dir = %table_dir.display(),
+                "failed to create quarantine dir for incomplete SSTable restore"
+            );
+            return;
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0);
+        let generation_dir = table_dir.join(sstable_id);
+        if generation_dir.exists() {
+            let dst = quarantine_dir.join(format!("{sstable_id}-{suffix}"));
+            if let Err(e) = std::fs::rename(&generation_dir, &dst) {
+                tracing::warn!(
+                    %e,
+                    sstable = sstable_id,
+                    src = %generation_dir.display(),
+                    dst = %dst.display(),
+                    "failed to quarantine incomplete generation directory"
+                );
+            }
+        }
+
+        for component in &Self::ALL_SSTABLE_COMPONENTS {
+            let src = table_dir.join(format!("{sstable_id}-{component}"));
+            if !src.exists() {
+                continue;
+            }
+            let dst = quarantine_dir.join(format!("{sstable_id}-{suffix}-{component}"));
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                tracing::warn!(
+                    %e,
+                    sstable = sstable_id,
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    "failed to quarantine incomplete flat component"
+                );
+            }
+        }
+    }
 
     async fn get_bytes(&self, path: &ObjectPath) -> ferrosa_common::Result<bytes::Bytes> {
         let result = self.store.get(path).await.map_err(|e| {
@@ -276,6 +474,24 @@ mod tests {
             .create_snapshot(name, &manifest, b"{}", pos, node_id, None, false)
             .await
             .unwrap()
+    }
+
+    async fn put_sstable_component(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &str,
+        table_id: &str,
+        sstable_id: &str,
+        component: &str,
+        bytes: &'static [u8],
+    ) {
+        let hex = crate::upload::manager::hex_prefix_for(sstable_id);
+        let s3_path = crate::upload::manager::sstable_object_key(
+            prefix, &hex, table_id, sstable_id, component,
+        );
+        store
+            .put(&s3_path, PutPayload::from(bytes::Bytes::from_static(bytes)))
+            .await
+            .unwrap();
     }
 
     // ── Test 1: load_and_validate_snapshot ────────────────────────────────
@@ -360,19 +576,19 @@ mod tests {
         // Place a fake SSTable file in S3 at the canonical path.
         let table_id = "ks.users";
         let sstable_id = "0001";
-        let hex = crate::upload::manager::hex_prefix_for(sstable_id);
-        // Use sstable_object_key so this test always stays in sync with the
-        // upload path.  The file must be at {prefix}/{hex}/{table}/{id}/{id}-Data.db.
-        let s3_path = crate::upload::manager::sstable_object_key(
-            prefix, &hex, table_id, sstable_id, "Data.db",
-        );
-        store
-            .put(
-                &s3_path,
-                PutPayload::from(bytes::Bytes::from_static(b"data")),
-            )
-            .await
-            .unwrap();
+        // Use sstable_object_key via the helper so this test always stays in
+        // sync with the upload path.
+        put_sstable_component(&store, prefix, table_id, sstable_id, "Data.db", b"data").await;
+        put_sstable_component(
+            &store,
+            prefix,
+            table_id,
+            sstable_id,
+            "Partitions.db",
+            b"partitions",
+        )
+        .await;
+        put_sstable_component(&store, prefix, table_id, sstable_id, "Rows.db", b"rows").await;
 
         let mut manifest = Manifest::new();
         manifest.add_sstable(
@@ -394,10 +610,56 @@ mod tests {
         assert_eq!(count, 1);
 
         // The file should exist on local disk.
-        let local = dir
-            .path()
-            .join(table_id)
-            .join(format!("{sstable_id}-Data.db"));
+        let local = RestoreManager::generation_component_path(
+            &dir.path().join(table_id),
+            sstable_id,
+            "Data.db",
+        )
+        .expect("Data.db should be present on disk");
         assert!(local.exists(), "Data.db should be present on disk");
+    }
+
+    #[tokio::test]
+    async fn download_sstables_rejects_data_only_without_publishing_live_file() {
+        let store = make_store();
+        let prefix = "test-data-only";
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = "ks.users";
+        let sstable_id = "0007";
+
+        put_sstable_component(&store, prefix, table_id, sstable_id, "Data.db", b"data").await;
+
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(
+            table_id,
+            ManifestEntry {
+                id: sstable_id.to_string(),
+                size: 4,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        let result = mgr.download_sstables(&manifest, dir.path()).await;
+
+        assert!(
+            result.is_err(),
+            "Data-only snapshot restore must fail closed instead of publishing an orphan"
+        );
+        let table_dir = dir.path().join(table_id);
+        assert!(
+            !table_dir.join(format!("{sstable_id}-Data.db")).exists(),
+            "restore must not publish a flat Data-only component"
+        );
+        assert!(
+            !table_dir
+                .join(sstable_id)
+                .join(format!("{sstable_id}-Data.db"))
+                .exists(),
+            "restore must not publish a generation-dir Data-only component"
+        );
     }
 }
