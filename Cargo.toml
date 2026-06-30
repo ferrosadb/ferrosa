@@ -26,6 +26,7 @@ members = [
     "ferrosa-sparql",
     "ferrosa-index-builder",
     "ferrosa-sim",
+    "xtask",
 ]
 
 [patch.crates-io]

@@ -21,7 +21,12 @@ PATTERNS = [
     re.compile(r"\.read_range\s*\(\s*None\s*,\s*None\s*,"),
     re.compile(r"\bread_range\s*\(\s*None\s*,\s*None\s*,"),
 ]
-SKIP_DIRS = {".git", "target", ".worktrees"}
+# `xtask` is build tooling (the p0-oom-audit lives there and *describes* these
+# patterns in rule messages/fixtures); it is not production read-path code, so
+# this guard must not scan it. The AST audit (p0-oom-audit `unbounded-range-read`)
+# covers xtask and everything else; this regex guard is slated for retirement
+# once AST parity is confirmed (forge t_d84b95b9).
+SKIP_DIRS = {".git", "target", ".worktrees", "xtask"}
 
 
 def is_test_file(path: Path) -> bool:
