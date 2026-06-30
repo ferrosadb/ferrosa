@@ -1,9 +1,13 @@
 # Streaming range reads — remove the server-side result cap
 
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
-**Supersedes:** the `DEFAULT_RANGE_READ_LIMIT` fail-loud stopgap (#232) — kept as a safety
-net until streaming lands so nothing silently truncates in between. Closes the direction
-behind the rejected #234.
+**Fixes a live failure seam.** #232's fail-loud guard did **not** reliably land, and the
+**projected** complex arm (`range_read_projected`, `router.rs:4681`) truncates at 10k with
+**no check at all** — silently returning wrong results for projected `DISTINCT`/complex
+scans past 10k. (#234, which tried to bolt fail-loud onto that arm, was rejected: a
+server-side limit is the wrong fix.) Removing the cap + streaming eliminates truncation
+entirely — there is no cap to truncate at. The non-projected arm's existing
+`range_read_limited_rows_checked` probe is treated as untrustworthy, not a safety net.
 
 ## Principle
 
@@ -56,7 +60,20 @@ size* (memory bound), never a result-count cap.
 5. Aggregates (`SUM`/`AVG`) over >10k rows are exact (not over a 10k window).
 6. No `clone` of row payloads on the hot path (move-only); buffers are fixed-capacity `VecDeque`.
 
-## Open knobs
+## Memory budget + spill threshold (decided)
 
-- Buffer/page capacity default + whether it's configurable (`FERROSA_RANGE_READ_PAGE`?).
-- Spill threshold (per-query memory budget before `ORDER BY`/`GROUP BY` spills).
+There is no configured-RAM reader yet (only per-feature env budgets like
+`FERROSA_RRD_RING_MEMORY_BUDGET_BYTES`). Add one:
+
+- **Detect the RAM budget**: cgroup v2 `memory.max` (then cgroup v1
+  `memory.limit_in_bytes`), falling back to system total (`sysinfo`/`/proc/meminfo`).
+  Cache it at startup.
+- **Spill threshold = 50% of that budget by default, tunable.**
+  `FERROSA_RANGE_SPILL_THRESHOLD_PCT` (default `50`), with an absolute
+  `FERROSA_RANGE_SPILL_THRESHOLD_BYTES` override. When an `ORDER BY`/`GROUP BY`
+  accumulation crosses the threshold, spill to the temp-sort table.
+- **Buffer/page capacity is tunable**, derived from the same budget (a small fraction,
+  e.g. `FERROSA_RANGE_READ_PAGE_BYTES`), so the streaming pipeline's in-flight memory is a
+  bounded slice of the budget independent of result size.
+
+The 50% default is a starting assumption to be tuned against soak results.
