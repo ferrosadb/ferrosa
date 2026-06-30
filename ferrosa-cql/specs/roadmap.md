@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-06-30
 ---
 
 # ferrosa-cql — Roadmap
@@ -27,6 +27,13 @@ real backlog is structural and security-shaped.
 
 ## Next
 
+- **Streaming range reads — remove the server-side result cap**
+  (`specs/proposed/streaming-range-reads-no-cap.md`). Step 1 landed: the
+  *projected* full-scan arm in `router.rs` now consumes the uncapped streaming
+  variant `range_read_projected_stream_all_with` (move-only, no `Vec<Partition>`
+  materialization), bounded solely by the query's `LIMIT`. Remaining steps
+  (other cap sites, aggregates, ORDER BY/GROUP BY spill, RAM-budget reader) are
+  cluster-side and tracked in the spec.
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and
