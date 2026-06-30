@@ -73,8 +73,8 @@ sequenceDiagram
     Rt->>Rt: check_permission (M8)
     Rt->>Pl: classify scan + ORDER BY plan
     Pl-->>Rt: ScanPlan (inline or spillable temp-sort)
-    Rt->>Eng: read Partition(s)
-    Eng-->>Rt: Vec&lt;Partition&gt;
+    Rt->>Eng: stream page or read bounded/probed Partition(s)
+    Eng-->>Rt: Partition stream or capped Vec&lt;Partition&gt;
     Rt->>Br: partition_to_rows_with_storage_mapping<br/>(tombstone/TTL skip, storage→table order)
     Br-->>Rt: Vec&lt;Vec&lt;Option&lt;CqlValue&gt;&gt;&gt;
     Rt->>Res: project + LIMIT + paging_state
@@ -84,8 +84,16 @@ sequenceDiagram
 ```
 
 When more rows remain, `result.rs` attaches an opaque `paging::PagingState`
-cursor (pk + ck + remaining flag). NOTE: that cursor is currently unsigned —
-FMEA CQL-2.
+cursor (pk + ck + remaining flag) signed with HMAC-SHA256. Multi-node clusters
+must set the same `FERROSA_PAGING_HMAC_KEY` on every coordinator so a cursor
+created on one node can resume on another.
+
+Page-compatible full scans consume partition streams directly. Complex
+whole-input shapes (`ORDER BY`, `DISTINCT`, ANN, aggregate/function projection)
+may still need a materialized input, but those reads are capped/probed; if the
+probe sees more data beyond `DEFAULT_RANGE_READ_LIMIT`, the router increments
+`range_read_truncated_total` and returns an error instead of computing over a
+partial window.
 
 ## Bridge re-export relationship (D10)
 

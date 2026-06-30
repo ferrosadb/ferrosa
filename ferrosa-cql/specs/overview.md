@@ -73,11 +73,16 @@ and applies through `SessionCore`'s write path / `StorageEngine`. LWT statements
 `route_lwt_via_accord`. A void/applied RESULT frame is encoded back.
 
 **Read (SELECT).** Same front half; `router::route_select` resolves the table,
-plans the scan (`planner`, ORDER BY classification), reads `Partition`s from
-storage, decomposes them to rows via the re-exported
-`partition_to_rows_with_storage_mapping` (tombstone/TTL skipping, storage→table
-column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
-Rows RESULT frame (with `paging_state` when more pages remain).
+plans the scan (`planner`, ORDER BY classification), then chooses a streaming
+page collector or a bounded/probed materialized input. Page-compatible broad
+scans stream partitions into a bounded page and return a `paging_state`;
+complex full-scan shapes that require whole-input semantics (`ORDER BY`,
+`DISTINCT`, ANN, aggregate/function projection) refuse to silently truncate when
+the default range-read window clips data. The router decomposes partitions to
+rows via the re-exported `partition_to_rows_with_storage_mapping`
+(tombstone/TTL skipping, storage→table column mapping), applies
+projection/LIMIT/paging, and `result.rs` encodes the Rows RESULT frame (with
+`paging_state` when more pages remain).
 
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
 it resolves the matching partition keys through the cluster write path
@@ -103,6 +108,9 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
    local path (p0-03 policy).
 6. **16-byte TimeUUID from `now()`.** `eval_now()` guarantees a 16-byte encoding —
    a short one wedges TimeUUID-clustered tables at flush.
+7. **No silent full-scan truncation.** Capped complex SELECT inputs use a
+   `DEFAULT_RANGE_READ_LIMIT + 1` probe and increment
+   `range_read_truncated_total` before returning an error when more data exists.
 
 ## Native protocol version behavior
 

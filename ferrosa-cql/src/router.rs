@@ -483,6 +483,16 @@ fn safe_partition_key_filter_row_limit(
         .then_some(limit)
 }
 
+fn capped_full_scan_shape_truncated_error() -> CqlError {
+    CqlError::Invalid(format!(
+        "query scans more than {} rows and cannot be bounded for this full-scan \
+         shape (ORDER BY / DISTINCT / aggregate / function projection); add a \
+         scan-bounding LIMIT, create an index on the filtered/ordered columns, \
+         or narrow the predicate",
+        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+    ))
+}
+
 fn row_matches_select_predicates(
     row: &[Option<CqlValue>],
     s: &SelectStatement,
@@ -4671,16 +4681,32 @@ async fn route_select_user_table(
                                 // flight, uncapped, exact).
                                 None
                             } else if let Some(wanted) = projection_wanted {
+                                let guard_unbounded_projected_shape = scan_bound.is_none()
+                                    && (s.distinct || !s.order_by.is_empty() || s.ann_of.is_some());
+                                let partition_limit = if guard_unbounded_projected_shape {
+                                    Some(
+                                        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+                                            .saturating_add(1),
+                                    )
+                                } else {
+                                    scan_bound
+                                };
                                 // Push partition-count cap down to the merger so
                                 // `LIMIT N` stops the scan after N partitions
                                 // rather than walking every SSTable.
-                                Some(
-                                    state
-                                        .write_path
-                                        .load()
-                                        .range_read_projected(&table_id, wanted, scan_bound)
-                                        .await?,
-                                )
+                                let partitions = state
+                                    .write_path
+                                    .load()
+                                    .range_read_projected(&table_id, wanted, partition_limit)
+                                    .await?;
+                                if guard_unbounded_projected_shape
+                                    && partitions.len()
+                                        > ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+                                {
+                                    ferrosa_storage::metrics::inc_range_read_truncated();
+                                    return Err(capped_full_scan_shape_truncated_error());
+                                }
+                                Some(partitions)
                             } else if let Some(bound) = scan_bound {
                                 // User-supplied LIMIT (or page size) provided the
                                 // bound: returning exactly the requested rows is
@@ -4711,14 +4737,7 @@ async fn route_select_user_table(
                                     .await?;
                                 if truncated {
                                     ferrosa_storage::metrics::inc_range_read_truncated();
-                                    return Err(CqlError::Invalid(
-                                        "query scans more than 10000 rows and cannot be bounded \
-                                         for this shape (ORDER BY / DISTINCT / aggregate / \
-                                         function projection over ALLOW FILTERING); add a LIMIT, \
-                                         create an index on the filtered/ordered columns, or \
-                                         narrow the predicate"
-                                            .into(),
-                                    ));
+                                    return Err(capped_full_scan_shape_truncated_error());
                                 }
                                 Some(partitions)
                             } else {
@@ -17010,6 +17029,88 @@ mod tests {
         assert_eq!(
             row_count, 2,
             "SELECT DISTINCT tenant_id must deduplicate repeated tenant partition-key components"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_distinct_projection_over_cap_fails_loud_instead_of_materializing() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE distinct_over_cap WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE distinct_over_cap.t (
+                    tenant int,
+                    bucket int,
+                    id int,
+                    payload text,
+                    PRIMARY KEY ((tenant, bucket), id)
+                )",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        for bucket in 0..=ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO distinct_over_cap.t \
+                     (tenant, bucket, id, payload) VALUES (1, {bucket}, 0, 'row-{bucket}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = ferrosa_storage::metrics::range_read_truncated_total();
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT DISTINCT tenant FROM distinct_over_cap.t").unwrap(),
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("over-cap projected DISTINCT scan must fail loud, not materialize all rows")
+            }
+        };
+        match error {
+            CqlError::Invalid(message) => assert!(
+                message.contains("query scans more than 10000 rows"),
+                "unexpected projected DISTINCT over-cap error: {message}"
+            ),
+            other => panic!("expected invalid-query error, got {other:?}"),
+        }
+
+        assert!(
+            ferrosa_storage::metrics::range_read_truncated_total() > before,
+            "over-cap projected DISTINCT scan must increment the truncation guard metric"
         );
     }
 

@@ -13,21 +13,22 @@
 # the documented baseline so `--enforce` passes on the current tree while the
 # underlying streaming fixes land. They fall into two groups:
 #
-#  1. The P0 SELECT-arm sites the streaming fix (forge t_15417b35) will remove.
-#     Short expiry (2026-09-30) — these must be re-audited when t_15417b35 lands.
+#  1. The P0 SELECT-arm sites covered by the t_15417b35 fail-loud guard.
+#     Short expiry (2026-09-30) — these are intentionally not permanent
+#     suppressions and must be re-audited for a full streaming replacement.
 #  2. Pre-existing materialization across the read/storage stack predating the
 #     guard. Tracked under the materialization epic (forge t_110dd8a5); longer
 #     expiry while each path is migrated to streaming.
 
 # ---------------------------------------------------------------------------
-# Group 1 — P0 SELECT-arm materialization removed by t_15417b35 (expiry 2026-09-30)
+# Group 1 — P0 SELECT-arm materialization guarded by t_15417b35 (expiry 2026-09-30)
 # ---------------------------------------------------------------------------
 
 [[allow]]
 path = "ferrosa-cluster/src/write_path.rs"
 rule = "returns-vec-partition-or-row"
 symbol = "range_read_limited_rows"
-reason = "t_15417b35: SELECT-arm streaming fix removes this materializing range_read_limited_rows."
+reason = "t_15417b35: SELECT complex-scan callers are guarded by limit+1 probes or bounded user limits; the Vec-returning API remains short-term debt pending full streaming replacement."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -35,7 +36,7 @@ expires = "2026-09-30"
 path = "ferrosa-cluster/src/write_path.rs"
 rule = "limited-rows-call-site"
 symbol = "range_read_limited_rows"
-reason = "t_15417b35: write_path dispatch into the materializing range read; removed by SELECT-arm fix."
+reason = "t_15417b35: dispatch is still materializing, but SELECT complex-scan callers use checked/fail-loud probes; keep short expiry for streaming migration."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -43,7 +44,7 @@ expires = "2026-09-30"
 path = "ferrosa-cluster/src/write_path.rs"
 rule = "limited-rows-call-site"
 symbol = "coordinate_range_read_limited_rows"
-reason = "t_15417b35: write_path -> coordinator materializing range read; removed by SELECT-arm fix."
+reason = "t_15417b35: coordinator limited-row dispatch remains materializing, but SELECT complex-scan callers fail loud on cap clipping; keep short expiry for streaming migration."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -51,14 +52,14 @@ expires = "2026-09-30"
 path = "ferrosa-cql/src/router.rs"
 rule = "limited-rows-call-site"
 symbol = "range_read_limited_rows"
-reason = "t_15417b35: degraded IndexScanWithFilter/SingleIndex arm call sites; removed by SELECT-arm streaming fix."
+reason = "t_15417b35: router limited-row call sites are bounded by user/page limits or checked/fail-loud complex-scan guards; not a silent truncation exemption."
 owner = "storage"
 expires = "2026-09-30"
 
 [[allow]]
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "with-capacity-limit"
-reason = "t_15417b35: Vec::with_capacity(limit) in read_local_range_stream_limited_rows window collection; removed by SELECT-arm fix."
+reason = "t_15417b35: coordinator window collection is still materializing; SELECT complex-scan callers detect cap clipping and fail loud while streaming replacement remains pending."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -66,7 +67,7 @@ expires = "2026-09-30"
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "stream-returns-vec"
 symbol = "read_local_range_stream_limited_rows"
-reason = "t_15417b35: stream-named fn still materializes a Vec<Partition>; removed by SELECT-arm fix."
+reason = "t_15417b35: stream-named helper still returns a materialized window; SELECT callers are fail-loud/bounded, with full streaming migration due before expiry."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -74,7 +75,7 @@ expires = "2026-09-30"
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "returns-vec-partition-or-row"
 symbol = "read_local_range_stream_limited_rows"
-reason = "t_15417b35: read_local_range_stream_limited_rows returns Vec<Partition>; removed by SELECT-arm fix."
+reason = "t_15417b35: helper still returns Vec<Partition>; SELECT callers are fail-loud/bounded, with full streaming migration due before expiry."
 owner = "storage"
 expires = "2026-09-30"
 
@@ -286,7 +287,7 @@ expires = "2026-12-31"
 path = "ferrosa-cql/src/router.rs"
 rule = "materializing-range-read-call-site"
 symbol = "range_read_projected"
-reason = "t_15417b35: degraded SELECT scan arm range_read_projected call (router.rs:4670), adjacent to the range_read_limited_rows sites; removed by the SELECT-arm streaming fix."
+reason = "t_15417b35: projected complex SELECT scan arm is capped/probed at DEFAULT_RANGE_READ_LIMIT + 1 and fails loud via range_read_truncated_total instead of materializing an unbounded result."
 owner = "storage"
 expires = "2026-09-30"
 

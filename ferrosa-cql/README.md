@@ -39,7 +39,11 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   delegates to `route_select`/`route_insert`/`route_update`/`route_delete`/
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
-  plan. Carries the security mitigations (M8 permissions, M12 batch cap).
+  plan. Page-compatible full scans stream bounded pages; complex full-scan
+  shapes that still need a materialized input (`ORDER BY`, `DISTINCT`, ANN, or
+  aggregate/function projection) are capped/probed and fail loud above the
+  default range-read window instead of returning partial results. Carries the
+  security mitigations (M8 permissions, M12 batch cap).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
@@ -126,7 +130,7 @@ SQL-front-end FMEA risk.
 
 ## Tests
 
-~945 in-crate test functions (heaviest: `router.rs` 253, `parser.rs` 158,
+~974 in-crate test functions (heaviest: `router.rs` 254, `parser.rs` 158,
 `bridge.rs` 121, `connection.rs` 43) plus integration tests under `tests/`
 (`handshake`, `auth_integration`, `auth_warn_mode`, `bolt_transaction_state`,
 `cassandra_cql_examples`). The ignored live-cluster test `fts_live_cluster`
