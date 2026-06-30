@@ -7514,10 +7514,37 @@ impl StorageEngine {
         u64,
         std::time::SystemTime,
     )> {
+        // Generations still listed in the pending-upload log are flushed locally
+        // but NOT yet confirmed durable in S3 (the entry is removed only after S3
+        // confirms). Evicting their only local copy is the #235 data-loss path,
+        // so they must never be eviction candidates. If the pending set cannot be
+        // read, fail closed: evict nothing rather than risk deleting an SSTable
+        // whose durability we cannot confirm.
+        let pending: std::collections::HashSet<(String, String)> =
+            match crate::upload::PendingUploadsLog::open(
+                &self.config.data_dir.join("pending-uploads.log"),
+            )
+            .and_then(|log| log.pending_entries())
+            {
+                Ok(pending_entries) => pending_entries.into_iter().collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "s3-sync: cannot read pending-upload log; skipping uploaded-cache eviction to avoid deleting not-yet-durable SSTables"
+                    );
+                    return Vec::new();
+                }
+            };
+
         let mut entries = Vec::new();
         for (table_id, manifest_entries) in &manifest.sstables {
             let table_dir = self.config.data_dir.join("sstables").join(table_id);
             for entry in manifest_entries {
+                if pending.contains(&(table_id.clone(), entry.id.clone())) {
+                    // Flushed but not yet durable in S3 — the local copy is the
+                    // only copy; never evict it.
+                    continue;
+                }
                 let Ok(gen) = entry.id.parse::<u64>() else {
                     continue;
                 };
@@ -9147,6 +9174,56 @@ mod tests {
         assert!(
             table_dir.join("3-Data.db").exists(),
             "unmanifested local SSTables must not be evicted"
+        );
+    }
+
+    #[test]
+    fn uploaded_cache_eviction_skips_generations_still_pending_upload() {
+        // RED (#235): a generation still listed in the pending-upload log is
+        // flushed locally but NOT yet confirmed durable in S3 (the log entry is
+        // removed only after S3 confirms). Evicting its local copy deletes the
+        // ONLY durable copy — the typed_edges data-loss path. Eviction must skip
+        // any generation that is still pending upload.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.local_cache_max_bytes = 100; // force eviction pressure
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let table_id = table_id().to_string();
+        let table_dir = dir.path().join("sstables").join(&table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        // gen "1" written first (oldest → first eviction candidate) and is the
+        // one still pending upload; gen "2" is confirmed in S3.
+        std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
+        std::fs::write(table_dir.join("2-Data.db"), vec![2u8; 80]).unwrap();
+
+        let pending =
+            crate::upload::PendingUploadsLog::open(&dir.path().join("pending-uploads.log"))
+                .unwrap();
+        pending.add_entry(&table_id, "1").unwrap();
+
+        let mut manifest = crate::manifest::Manifest::new();
+        for id in ["1", "2"] {
+            manifest.add_sstable(
+                &table_id,
+                crate::manifest::ManifestEntry {
+                    id: id.to_string(),
+                    size: 80,
+                    min_token: i64::MIN,
+                    max_token: i64::MAX,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+        }
+
+        engine
+            .enforce_uploaded_sstable_cache_limit(&manifest)
+            .unwrap();
+
+        assert!(
+            table_dir.join("1-Data.db").exists(),
+            "generation still pending upload (not yet durable in S3) must not be evicted"
         );
     }
 
