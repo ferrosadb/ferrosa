@@ -1,13 +1,23 @@
 # Streaming range reads — remove the server-side result cap
 
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
-**Fixes a live failure seam.** #232's fail-loud guard did **not** reliably land, and the
-**projected** complex arm (`range_read_projected`, `router.rs:4681`) truncates at 10k with
-**no check at all** — silently returning wrong results for projected `DISTINCT`/complex
-scans past 10k. (#234, which tried to bolt fail-loud onto that arm, was rejected: a
-server-side limit is the wrong fix.) Removing the cap + streaming eliminates truncation
-entirely — there is no cap to truncate at. The non-projected arm's existing
-`range_read_limited_rows_checked` probe is treated as untrustworthy, not a safety net.
+**Premise corrected during step 1.** The projected arm does **not** clamp at 10k —
+`range_read_projected` iterates uncapped (`cap = usize::MAX`). Its real defect was on the
+**cluster** path: it read only the local node (`coordinator.storage`) and returned
+**silently partial** results. Step 1 (commit `34576b1e`) routes it through coordinated
+streaming (`range_read_projected_stream_all_with`), fixing that and removing a full
+`Vec<Partition>` materialization. The actual `DEFAULT_RANGE_READ_LIMIT` clamps live in
+`range_read_limited_rows` (`write_path.rs:737/796`) and the coordinator/raft range-read
+paths — used by the **non-projected** complex arm (`range_read_limited_rows_checked`,
+fail-loud at `router.rs ~4695`) and simple coordinated reads. **Those are the cap sites to
+remove in steps 2+.** (#234, a server-side fail-loud guard, was rejected as the wrong fix.)
+
+Two follow-ups from step 1: (a) `range_read_projected` is now orphaned (no real callers;
+survives only as `pub`) — delete it once streaming is complete; (b) a cluster projected
+scan **with** a `scan_bound` (LIMIT/page_size) now fail-louds (`partition_limit`
+unimplemented for the coordinated projected stream) instead of returning local-only
+partial — implement coordinated projected partition-limit if that shape needs cluster
+support.
 
 ## Principle
 
