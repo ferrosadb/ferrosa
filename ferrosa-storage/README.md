@@ -38,7 +38,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   checks) gates correctness.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
-  separate flush vs. compaction upload managers. **Wired into the flush path.**
+  separate flush vs. compaction upload managers. Pending-upload replay recognizes
+  both legacy flat SSTable components and restored generation directories.
+  **Wired into the flush path.**
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
   Set `FERROSA_LOCAL_STORE_PATH` (or `[s3].local_path` in `ferrosa.toml`) to use
