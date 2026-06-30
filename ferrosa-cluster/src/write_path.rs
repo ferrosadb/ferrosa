@@ -735,6 +735,21 @@ impl WritePath {
         row_limit: usize,
     ) -> crate::error::Result<Vec<Partition>> {
         let limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
+        self.range_read_partitions_inner(table_id, limit, row_limit)
+            .await
+    }
+
+    /// Shared range-read dispatch with an explicit partition `limit` and no
+    /// hard-cap clamping. Callers are responsible for bounding `limit`. This
+    /// exists so [`Self::range_read_limited_rows_checked`] can probe exactly one
+    /// partition past the hard cap to detect truncation, which the public
+    /// clamping wrapper cannot express.
+    async fn range_read_partitions_inner(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> crate::error::Result<Vec<Partition>> {
         match self {
             Self::Direct(engine) => engine
                 .read_range_limited_rows(table_id, None, None, limit, row_limit)
@@ -752,6 +767,42 @@ impl WritePath {
                 "range read unavailable: write path is in degraded mode".into(),
             )),
         }
+    }
+
+    /// Truncation-aware variant of [`Self::range_read_limited_rows`].
+    ///
+    /// Reads up to `limit + 1` partitions internally and returns at most the
+    /// first `limit`, plus a `truncated` flag that is `true` when more than
+    /// `limit` partitions existed (i.e. the cap clipped the result). Callers
+    /// that must not silently truncate — complex query shapes (ORDER BY /
+    /// DISTINCT / aggregate / function projection over a full scan) where the
+    /// cap is the engine's `DEFAULT_RANGE_READ_LIMIT` rather than a user
+    /// `LIMIT` — use this to fail loud instead of computing a wrong answer over
+    /// a clipped set.
+    ///
+    /// The internal probe of `limit + 1` is still bounded by
+    /// `DEFAULT_RANGE_READ_LIMIT + 1`; this method does not widen the hard cap.
+    pub async fn range_read_limited_rows_checked(
+        &self,
+        table_id: &TableId,
+        limit: usize,
+        row_limit: usize,
+    ) -> crate::error::Result<(Vec<Partition>, bool)> {
+        // Apply the same hard cap the public reader uses, then probe exactly one
+        // partition past it via the unclamped inner dispatch. This distinguishes
+        // "the table has at most `effective_limit` partitions" from "the table
+        // has more and we are about to clip it" even when `limit` is the hard
+        // cap itself (the silent-truncation case we exist to catch).
+        let effective_limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
+        let probe_limit = effective_limit.saturating_add(1);
+        let mut partitions = self
+            .range_read_partitions_inner(table_id, probe_limit, row_limit)
+            .await?;
+        let truncated = partitions.len() > effective_limit;
+        if truncated {
+            partitions.truncate(effective_limit);
+        }
+        Ok((partitions, truncated))
     }
 
     /// Read by secondary index, scattering to all nodes in cluster mode.

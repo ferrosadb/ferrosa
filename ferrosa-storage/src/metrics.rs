@@ -316,6 +316,7 @@ static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
+static RANGE_READ_TRUNCATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -447,6 +448,22 @@ pub fn inc_compaction_pool_input_opens() {
 /// Total compaction input readers obtained via the reader pool since startup.
 pub fn compaction_pool_input_opens_total() -> u64 {
     COMPACTION_POOL_INPUT_OPENS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// A capped range read hit its partition cap while more data still existed,
+/// so the caller refused to silently truncate and failed loud instead. A
+/// non-zero value indicates a query shape (ORDER BY / DISTINCT / aggregate /
+/// function projection over `ALLOW FILTERING`) that scanned past the default
+/// range-read window; the query must add a LIMIT, an index, or a narrower
+/// predicate.
+pub fn inc_range_read_truncated() {
+    RANGE_READ_TRUNCATED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total capped range reads that detected more data beyond the cap and failed
+/// loud rather than truncating, since startup.
+pub fn range_read_truncated_total() -> u64 {
+    RANGE_READ_TRUNCATED_TOTAL.load(Ordering::Relaxed)
 }
 
 pub fn observe_compaction_completed(
@@ -900,6 +917,14 @@ pub fn render_prometheus() -> String {
     }
 
     out.push_str(
+        "# HELP ferrosa_storage_range_read_truncated_total Capped range reads that hit their cap with more data available and failed loud instead of truncating.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_range_read_truncated_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_range_read_truncated_total {}\n",
+        RANGE_READ_TRUNCATED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
         "# HELP ferrosa_storage_read_limited_rows_total Partition read_limited_rows calls.\n",
     );
     out.push_str("# TYPE ferrosa_storage_read_limited_rows_total counter\n");
@@ -1283,6 +1308,21 @@ mod tests {
         assert!(text.contains("ferrosa_archive_upload_errors_total 1"));
         assert!(text.contains("ferrosa_archive_lag_segments 3"));
         assert!(text.contains("ferrosa_snapshots_total 5"));
+    }
+
+    #[test]
+    fn range_read_truncated_increment_and_read() {
+        // Process-wide counter: assert on the delta, not an absolute value,
+        // so the test is robust to other tests touching the same counter.
+        let before = range_read_truncated_total();
+        inc_range_read_truncated();
+        inc_range_read_truncated();
+        let after = range_read_truncated_total();
+        assert_eq!(after - before, 2);
+
+        // The counter is exported in the Prometheus text rendering.
+        let text = render_prometheus();
+        assert!(text.contains("ferrosa_storage_range_read_truncated_total"));
     }
 
     #[test]
