@@ -92,7 +92,16 @@ pub(crate) fn find_pending_upload_files(
 
 fn collect_sstable_files(table_dir: &Path, gen: u64) -> Vec<SstableComponentFile> {
     let gen_str = gen.to_string();
-    std::fs::read_dir(table_dir)
+    let generation_dir = table_dir.join(&gen_str);
+    if generation_dir.join(format!("{gen_str}-Data.db")).exists() {
+        return collect_sstable_files_in_dir(&generation_dir, &gen_str);
+    }
+
+    collect_sstable_files_in_dir(table_dir, &gen_str)
+}
+
+fn collect_sstable_files_in_dir(dir: &Path, gen_str: &str) -> Vec<SstableComponentFile> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
@@ -104,7 +113,9 @@ fn collect_sstable_files(table_dir: &Path, gen: u64) -> Vec<SstableComponentFile
                 None
             }
         })
-        .collect()
+        .collect();
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    files
 }
 
 #[cfg(test)]
@@ -118,6 +129,16 @@ mod tests {
         let table_dir = root.join(table_id);
         std::fs::create_dir_all(&table_dir).unwrap();
         std::fs::write(table_dir.join(format!("{sstable_id}-Data.db")), b"sstable").unwrap();
+    }
+
+    fn write_component_in_generation_dir(root: &Path, table_id: &str, sstable_id: &str) {
+        let generation_dir = root.join(table_id).join(sstable_id);
+        std::fs::create_dir_all(&generation_dir).unwrap();
+        std::fs::write(
+            generation_dir.join(format!("{sstable_id}-Data.db")),
+            b"sstable",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -204,6 +225,30 @@ mod tests {
         let compaction_dir = dir.path().join("compaction");
         let table_id = "test_keyspace.test_table";
         write_component(&compaction_dir, table_id, "7");
+        let entries = vec![(table_id.to_string(), "7".to_string())];
+        let mut submitted_file_names = Vec::new();
+
+        let report = replay_pending_upload_entries(&entries, &data_dir, &compaction_dir, |task| {
+            let UploadTask::SSTable { files, .. } = task else {
+                panic!("unexpected upload task");
+            };
+            submitted_file_names.extend(files.into_iter().map(|file| file.name));
+            PendingUploadReplaySubmit::Submitted
+        });
+
+        assert_eq!(report.submitted, 1);
+        assert_eq!(submitted_file_names, vec!["7-Data.db"]);
+        assert!(report.missing_files.is_empty());
+        assert_eq!(report.remaining_entries, 0);
+    }
+
+    #[test]
+    fn pending_upload_replay_submits_generation_directory_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let compaction_dir = dir.path().join("compaction");
+        let table_id = "test_keyspace.test_table";
+        write_component_in_generation_dir(&data_dir.join("sstables"), table_id, "7");
         let entries = vec![(table_id.to_string(), "7".to_string())];
         let mut submitted_file_names = Vec::new();
 

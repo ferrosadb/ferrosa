@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-06-30
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -39,7 +39,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
 | `merge`, `range_merger` | Read-path cell-level LWW merge; streaming range/token-range merge |
 | `compaction/` | `CompactionExecutor`, STCS + UCS strategies, `CompactionGate`, validator (oracle + differential) |
-| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay |
+| `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay across flat and generation-dir SSTable layouts |
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
 | `index/` | Index state tracker, build scheduler, local/remote/off backends, artifact manifest, virtual table |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR) |
