@@ -4682,6 +4682,9 @@ async fn route_select_user_table(
                                         .await?,
                                 )
                             } else if let Some(bound) = scan_bound {
+                                // User-supplied LIMIT (or page size) provided the
+                                // bound: returning exactly the requested rows is
+                                // intentional and correct, so no truncation check.
                                 Some(
                                     state
                                         .write_path
@@ -4690,17 +4693,34 @@ async fn route_select_user_table(
                                         .await?,
                                 )
                             } else if row_limit > 0 {
-                                Some(
-                                    state
-                                        .write_path
-                                        .load()
-                                        .range_read_limited_rows(
-                                            &table_id,
-                                            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
-                                            row_limit,
-                                        )
-                                        .await?,
-                                )
+                                // Complex shape (ORDER BY / DISTINCT / aggregate /
+                                // function projection) over a full ALLOW FILTERING
+                                // scan with no user bound: the read is capped at the
+                                // engine's DEFAULT_RANGE_READ_LIMIT only. Sorting,
+                                // distincting, or aggregating over a silently clipped
+                                // window yields a wrong answer, so fail loud when the
+                                // cap actually clipped data (D4) instead of truncating.
+                                let (partitions, truncated) = state
+                                    .write_path
+                                    .load()
+                                    .range_read_limited_rows_checked(
+                                        &table_id,
+                                        ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT,
+                                        row_limit,
+                                    )
+                                    .await?;
+                                if truncated {
+                                    ferrosa_storage::metrics::inc_range_read_truncated();
+                                    return Err(CqlError::Invalid(
+                                        "query scans more than 10000 rows and cannot be bounded \
+                                         for this shape (ORDER BY / DISTINCT / aggregate / \
+                                         function projection over ALLOW FILTERING); add a LIMIT, \
+                                         create an index on the filtered/ordered columns, or \
+                                         narrow the predicate"
+                                            .into(),
+                                    ));
+                                }
+                                Some(partitions)
                             } else {
                                 None
                             };
