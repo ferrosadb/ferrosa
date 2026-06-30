@@ -604,6 +604,47 @@ async fn extend_rows_from_partitions(
     }
 }
 
+/// Drain a projected partition stream into `all_rows`, moving each partition
+/// through the row builder one at a time.
+///
+/// Unlike [`extend_rows_from_partitions`], this never materializes the whole
+/// scan into a `Vec<Partition>` first: in-flight memory is `O(num_sources)`
+/// partitions plus the accumulated result rows, and there is no server-side
+/// result cap — the scan is bounded only by the query's own LIMIT (already
+/// pushed into the producer as a partition stop) and the row-level predicate
+/// filter applied by the caller.
+async fn extend_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+    storage_to_table: &[usize],
+) -> Result<(), CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut prows = bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+            storage_to_table,
+        );
+        all_rows.append(&mut prows);
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
 async fn count_rows_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     row_context: PartitionRowContext<'_>,
@@ -4659,6 +4700,20 @@ async fn route_select_user_table(
                             } else {
                                 None
                             };
+                            // Projected full-scan stream. When the query only needs
+                            // a subset of regular cells (e.g. `SELECT DISTINCT
+                            // <partition-key column>`), route through the streaming,
+                            // *uncapped* projection variant instead of materializing
+                            // a `Vec<Partition>`. The result is bounded only by the
+                            // query's own LIMIT — there is NO server-side row cap —
+                            // and memory stays bounded because the stream pages
+                            // internally (O(num_sources) partitions resident, rows
+                            // moved through). On a real cluster this also performs the
+                            // proper coordinated scatter-gather, which the local
+                            // `Vec`-returning path did not.
+                            let mut projected_stream: Option<
+                                ferrosa_cluster::write_path::PartitionResultStream,
+                            > = None;
                             let partitions = if count_only_select {
                                 // COUNT(*) must NEVER pre-materialize a capped Vec.
                                 // `range_read_limited_rows` clamps to the magic
@@ -4673,14 +4728,22 @@ async fn route_select_user_table(
                             } else if let Some(wanted) = projection_wanted {
                                 // Push partition-count cap down to the merger so
                                 // `LIMIT N` stops the scan after N partitions
-                                // rather than walking every SSTable.
-                                Some(
+                                // rather than walking every SSTable. The stream is
+                                // consumed below directly into `all_rows`.
+                                projected_stream = Some(
                                     state
                                         .write_path
                                         .load()
-                                        .range_read_projected(&table_id, wanted, scan_bound)
+                                        .range_read_projected_stream_all_with(
+                                            &table_id,
+                                            wanted,
+                                            scan_bound,
+                                            ctx.consistency,
+                                            &table_strategy,
+                                        )
                                         .await?,
-                                )
+                                );
+                                None
                             } else if let Some(bound) = scan_bound {
                                 // User-supplied LIMIT (or page size) provided the
                                 // bound: returning exactly the requested rows is
@@ -4791,7 +4854,21 @@ async fn route_select_user_table(
                                 });
                             }
                             let mut all_rows = Vec::new();
-                            if let Some(partitions) = partitions.as_ref() {
+                            if let Some(stream) = projected_stream {
+                                // Stream the uncapped projected scan straight into
+                                // rows. Partitions move from the reader into the row
+                                // builder one at a time — no full-table Vec, no cap.
+                                extend_rows_from_partition_stream(
+                                    stream,
+                                    &mut all_rows,
+                                    &all_col_names,
+                                    &all_col_types,
+                                    &pk_indices,
+                                    &ck_indices,
+                                    &storage_to_table,
+                                )
+                                .await?;
+                            } else if let Some(partitions) = partitions.as_ref() {
                                 extend_rows_from_partitions(
                                     partitions,
                                     &mut all_rows,
@@ -17010,6 +17087,94 @@ mod tests {
         assert_eq!(
             row_count, 2,
             "SELECT DISTINCT tenant_id must deduplicate repeated tenant partition-key components"
+        );
+    }
+
+    /// Regression: a projected full-scan (here `SELECT DISTINCT` over a
+    /// partition-key column) MUST return every distinct partition even when the
+    /// table has more than `DEFAULT_RANGE_READ_LIMIT` (10_000) partitions.
+    ///
+    /// The projected arm now routes through the streaming, uncapped
+    /// `range_read_projected_stream_all_with` variant: there is NO server-side
+    /// result cap — only the query's own LIMIT bounds the result — and the scan
+    /// streams partitions instead of materializing a full `Vec<Partition>`, so
+    /// memory stays bounded regardless of result size. All 10_500 distinct
+    /// values must come back.
+    ///
+    /// Spec: specs/proposed/streaming-range-reads-no-cap.md (step 1).
+    #[tokio::test]
+    async fn select_distinct_partition_key_returns_all_partitions_past_10k() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE distinct_big WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE distinct_big.t (tenant_id int PRIMARY KEY, v text)")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Insert >10k distinct partitions, flushing periodically so the rows
+        // spread across many token-interleaved SSTables plus the active memtable
+        // (the LSM state that exercises the multi-run merge).
+        let total = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 500;
+        let table_id = ferrosa_storage::TableId::new("distinct_big", "t");
+        for i in 0..total {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO distinct_big.t (tenant_id, v) VALUES ({i}, 'v{i}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if i % 2000 == 1999 {
+                state.engine.flush(&table_id).unwrap();
+            }
+        }
+        state.engine.flush(&table_id).unwrap();
+
+        // No LIMIT, default paging: DISTINCT with no page size returns the full
+        // deduplicated result set in a single buffer.
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT DISTINCT tenant_id FROM distinct_big.t").unwrap(),
+        )
+        .await
+        .unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b) as usize,
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count,
+            total,
+            "SELECT DISTINCT over {total} partitions must return every distinct \
+             partition key, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
         );
     }
 
