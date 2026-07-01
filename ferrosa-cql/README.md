@@ -40,10 +40,16 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
   plan. Carries the security mitigations (M8 permissions, M12 batch cap).
-  Projected full-scans (e.g. `SELECT DISTINCT <partition-key column>`) stream
-  through the uncapped `range_read_projected_stream_all_with` variant — bounded
-  only by the query's own `LIMIT`, never a server-side row cap — moving
-  partitions into rows one at a time instead of materializing a `Vec<Partition>`
+  The `DEFAULT_RANGE_READ_LIMIT` (10_000) result cap is removed for the
+  O(1)-streamable full-scan shapes, which are bounded only by the query's own
+  `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
+  <partition-key column>`) stream through `range_read_projected_stream_all_with`;
+  scalar aggregates (`SUM`/`MIN`/`MAX`/`AVG`) fold through an O(1) streaming
+  accumulator (`stream_builtin_aggregates`) over the uncapped
+  `range_read_stream_all_with` (exact over the whole table, no `all_rows`
+  materialization); a user `LIMIT N` above the storage OOM guard streams
+  (take-`N`) instead of a `Vec` materialization. Only the unbounded `ORDER BY`
+  global sort stays fail-loud-bounded until spill lands (step 5)
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,

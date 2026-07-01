@@ -87,6 +87,12 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   on full success) with replay task; `DEFAULT_BATCH_CONCURRENCY = 32`.
 - `coordinator/{range_read_stream,stream_*}.rs` — ADR-020 streaming range reads
   (default; legacy capped path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
+  `DEFAULT_RANGE_READ_LIMIT` (10_000) is **not** a result cap on streamable
+  shapes: `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
+  honor the caller's own bound (a user `LIMIT N`) uncapped; the const now only
+  bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
+  still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
+  degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
