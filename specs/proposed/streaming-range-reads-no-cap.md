@@ -1,6 +1,42 @@
 # Streaming range reads — remove the server-side result cap
 
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
+**Steps 1–2 landed.**
+
+**Step 2 (landed).** The `DEFAULT_RANGE_READ_LIMIT` (10_000) **result cap** is removed
+for the O(1)-streamable shapes; each is bounded ONLY by the query's own `LIMIT`:
+
+- **Scalar aggregates** (`SUM`/`MIN`/`MAX`/`AVG`) over a full ALLOW FILTERING scan now
+  fold through an O(1) streaming accumulator (`router.rs` `stream_builtin_aggregates` +
+  `StreamingAggAcc`) over the uncapped `range_read_stream_all_with` — exact over the whole
+  table, no `all_rows` materialization, move-only. Previously `SELECT SUM(v) FROM t` (no
+  LIMIT) was **refused entirely** ("unbounded full-table materialization is disabled").
+  (`COUNT(*)` keeps its existing dedicated streaming/metadata path.)
+- **User `LIMIT N`** larger than the storage Vec-materialization OOM guard now streams
+  (`range_read_stream_all_with().take(N)`) instead of the Vec path — the router `scan_bound`
+  arm. `range_read_limited_rows` / `coordinate_range_read_stream_limited_rows` no longer
+  re-clamp the caller's bound to 10_000 (`write_path.rs`, `range_read_stream.rs`).
+- **`SELECT DISTINCT <partition key>`** and simple **`WHERE … ALLOW FILTERING`** scans were
+  already uncapped (step 1 projected stream / paged-filter path); step-2 tests lock this in.
+
+**Still bounded (fail-loud) until step 5 (spill-to-disk):** an unbounded `ORDER BY` (no
+`LIMIT`) global sort keeps the truncation-detecting cap
+(`range_read_limited_rows_checked`, still using `DEFAULT_RANGE_READ_LIMIT` as its probe
+bound) rather than materializing the whole table for an in-memory sort. `GROUP BY` is not
+yet parsed in the CQL AST, so high-cardinality group state is N/A (no cap to remove;
+add per-group spill when `GROUP BY` lands, with step 5). The legacy non-streaming
+coordinated RPC (`FERROSA_BULK_STREAMING_RANGE_READ=0`, a documented degraded opt-out) and
+the raft `RangeReadHandler` keep their per-replica cap intentionally.
+
+Step-2 tests (all RED→GREEN or bounded-guard): `router.rs`
+`sum_aggregate_is_exact_past_10k` (RED→GREEN), `user_limit_above_10k_returns_all_requested_rows`
+(RED→GREEN), `streaming_aggregates_are_correct_with_where_and_nulls`,
+`allow_filtering_scan_returns_all_rows_past_10k`,
+`distinct_partition_key_returns_all_rows_past_10k_non_projected`,
+`order_by_no_limit_stays_bounded_past_10k` (bounded guard); cluster
+`range_scan_streaming_memory_bound.rs` covers the memory-bound + >10k data-completeness at
+the coordinated `range_read_stream_all_with` layer.
+
 **Premise corrected during step 1.** The projected arm does **not** clamp at 10k —
 `range_read_projected` iterates uncapped (`cap = usize::MAX`). Its real defect was on the
 **cluster** path: it read only the local node (`coordinator.storage`) and returned
@@ -40,13 +76,14 @@ Safety comes from bounding **memory**, not result count:
 
 | Shape | Today | Target |
 |-------|-------|--------|
-| Simple `WHERE … ALLOW FILTERING` | already streams/pages | unchanged; drop any residual clamp |
+| Simple `WHERE … ALLOW FILTERING` | already streams/pages | **done** — paged-filter stream; step-2 test locks uncapped >10k |
 | `COUNT(*)` | streams (#230) | unchanged |
-| Other aggregates (`SUM`/`MIN`/`MAX`/`AVG`) | capped at 10k | O(1) streaming accumulator |
-| `DISTINCT <partition key>` | capped at 10k | stream: a token-ordered scan visits each partition once, so distinct partition keys emit with no dedup buffer (`router.rs:3723`) |
-| Projected scan (subset of columns) | `range_read_projected(.., scan_bound)` capped | `range_read_projected_stream_all_with` (`write_path.rs:619`) |
-| `GROUP BY` (high cardinality) | capped | per-group accumulator; spill group state past the memory budget |
-| `ORDER BY` (no `LIMIT`, arbitrary) | capped + fail-loud | spillable temp-sort (already classified at `router.rs:112-204`) |
+| Other aggregates (`SUM`/`MIN`/`MAX`/`AVG`) | ~~capped at 10k~~ **was fail-loud refused** | **done (step 2)** — O(1) streaming accumulator (`stream_builtin_aggregates`) |
+| User `LIMIT N` (> OOM guard) | ~~clamped to 10k (Vec)~~ | **done (step 2)** — `range_read_stream_all_with().take(N)` |
+| `DISTINCT <partition key>` | capped at 10k | **done (step 1)** — token-ordered scan visits each partition once, no dedup buffer |
+| Projected scan (subset of columns) | `range_read_projected(.., scan_bound)` capped | **done (step 1)** — `range_read_projected_stream_all_with` (`write_path.rs:619`) |
+| `GROUP BY` (high cardinality) | N/A — not parsed in the AST yet | add per-group accumulator + spill when `GROUP BY` lands (step 5) |
+| `ORDER BY` (no `LIMIT`, arbitrary) | capped + fail-loud | **still fail-loud-bounded** until step 5 spillable temp-sort |
 | `ORDER BY … LIMIT N` / clustering-order | bounded | bounded top-N heap (size N), no spill |
 | ANN | top-`K` | bounded heap of size `K` (query-specified) |
 

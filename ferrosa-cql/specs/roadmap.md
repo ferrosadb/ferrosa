@@ -28,12 +28,24 @@ real backlog is structural and security-shaped.
 ## Next
 
 - **Streaming range reads — remove the server-side result cap**
-  (`specs/proposed/streaming-range-reads-no-cap.md`). Step 1 landed: the
-  *projected* full-scan arm in `router.rs` now consumes the uncapped streaming
-  variant `range_read_projected_stream_all_with` (move-only, no `Vec<Partition>`
-  materialization), bounded solely by the query's `LIMIT`. Remaining steps
-  (other cap sites, aggregates, ORDER BY/GROUP BY spill, RAM-budget reader) are
-  cluster-side and tracked in the spec.
+  (`specs/proposed/streaming-range-reads-no-cap.md`). Steps 1–2 landed:
+  - Step 1: the *projected* full-scan arm in `router.rs` consumes the uncapped
+    streaming variant `range_read_projected_stream_all_with` (move-only, no
+    `Vec<Partition>` materialization), bounded solely by the query's `LIMIT`.
+  - Step 2: the `DEFAULT_RANGE_READ_LIMIT` (10_000) **result cap** is removed
+    from the O(1)-streamable shapes. `SELECT SUM/MIN/MAX/AVG` over a full scan
+    now folds through an O(1) streaming accumulator
+    (`stream_builtin_aggregates`) over the uncapped
+    `range_read_stream_all_with` — exact over the whole table, no `all_rows`
+    materialization. A user `LIMIT N` above the storage OOM guard streams (take-`N`
+    partitions) instead of hitting the Vec-materialization cap. `SELECT DISTINCT
+    <partition key>` and simple `WHERE … ALLOW FILTERING` scans were already
+    uncapped (step 1 / paged-filter path).
+  - **Still bounded (fail-loud) until step 5 (spill-to-disk):** an unbounded
+    `ORDER BY` (no `LIMIT`) global sort — it keeps the truncation-detecting cap
+    (`range_read_limited_rows_checked`) rather than materializing the whole
+    table. (`GROUP BY` is not yet parsed, so high-cardinality group state is
+    N/A.) Remaining spec steps: ORDER BY/GROUP BY spill, RAM-budget reader.
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and

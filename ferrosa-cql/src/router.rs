@@ -685,6 +685,255 @@ async fn count_rows_from_partition_stream(
     Ok(count)
 }
 
+/// Per-column streaming aggregate accumulator for a builtin scalar aggregate
+/// (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) folded over a partition stream.
+///
+/// Holds O(1) state per aggregate column (never the scanned rows), so a
+/// `SELECT SUM(v) FROM t` over an arbitrarily large table computes the exact
+/// answer with bounded memory — no server-side row cap. `COUNT(*)`/`COUNT(col)`
+/// count matched rows; `SUM`/`AVG` keep a running `f64` sum + non-NULL count;
+/// `MIN`/`MAX` keep the running extremum. NULL source cells are skipped (matching
+/// [`compute_builtin_aggregate`]).
+enum StreamingAggAcc {
+    /// COUNT(*) or COUNT(col): number of matched rows (Cassandra `COUNT` counts
+    /// rows, not non-NULL values, for `COUNT(*)`). `count_non_null` is only used
+    /// when the argument is a specific column.
+    Count { count: i64 },
+    /// SUM / AVG: running sum and count of non-NULL numeric values.
+    SumAvg {
+        is_avg: bool,
+        sum: f64,
+        n: u64,
+        src_idx: usize,
+        col_type: CqlType,
+    },
+    /// MIN / MAX: running extremum of non-NULL numeric values.
+    MinMax {
+        is_max: bool,
+        acc: f64,
+        seen: bool,
+        src_idx: usize,
+        col_type: CqlType,
+    },
+}
+
+impl StreamingAggAcc {
+    /// Fold one matched row into the accumulator.
+    fn observe(&mut self, row: &[Option<CqlValue>]) {
+        match self {
+            StreamingAggAcc::Count { count } => {
+                *count += 1;
+            }
+            StreamingAggAcc::SumAvg {
+                sum, n, src_idx, ..
+            } => {
+                if let Some(v) = row.get(*src_idx).and_then(|c| c.as_ref()) {
+                    if let Some(f) = cql_value_to_f64(v) {
+                        *sum += f;
+                        *n += 1;
+                    }
+                }
+            }
+            StreamingAggAcc::MinMax {
+                is_max,
+                acc,
+                seen,
+                src_idx,
+                ..
+            } => {
+                if let Some(v) = row.get(*src_idx).and_then(|c| c.as_ref()) {
+                    if let Some(f) = cql_value_to_f64(v) {
+                        if *is_max {
+                            *acc = if *seen { acc.max(f) } else { f };
+                        } else {
+                            *acc = if *seen { acc.min(f) } else { f };
+                        }
+                        *seen = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Materialize the final aggregate cell.
+    fn finish(&self) -> Option<CqlValue> {
+        match self {
+            StreamingAggAcc::Count { count } => Some(CqlValue::Bigint(*count)),
+            StreamingAggAcc::SumAvg {
+                is_avg,
+                sum,
+                n,
+                col_type,
+                ..
+            } => {
+                if *n == 0 {
+                    return Some(CqlValue::Null);
+                }
+                let val = if *is_avg { *sum / *n as f64 } else { *sum };
+                Some(f64_to_cql_aggregate(val, col_type))
+            }
+            StreamingAggAcc::MinMax {
+                acc,
+                seen,
+                col_type,
+                ..
+            } => {
+                if !*seen {
+                    return Some(CqlValue::Null);
+                }
+                Some(f64_to_cql_aggregate(*acc, col_type))
+            }
+        }
+    }
+}
+
+/// True when `s` is a full-scan **builtin scalar aggregate** query that can be
+/// computed by an O(1) streaming fold: every projected column is a builtin
+/// aggregate function (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), and there is no
+/// `ORDER BY`, `ANN`, or `DISTINCT` that would require materializing/sorting the
+/// scanned rows. (`GROUP BY` is not yet parsed, so per-group state is N/A.)
+///
+/// UDAs are excluded because they are `FunctionCall`s whose name is not a
+/// builtin aggregate — they keep the existing bounded path until spill lands.
+fn builtin_scalar_aggregate_stream_shape(s: &SelectStatement) -> bool {
+    if !s.order_by.is_empty() || s.ann_of.is_some() || s.distinct {
+        return false;
+    }
+    if s.columns.is_empty() {
+        return false;
+    }
+    s.columns.iter().all(|c| match c {
+        SelectColumn::FunctionCall { name, .. } => {
+            let n = name.to_lowercase();
+            matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max")
+        }
+        _ => false,
+    })
+}
+
+/// Build the per-column streaming accumulators for a
+/// [`builtin_scalar_aggregate_stream_shape`] query. Returns `None` when a column
+/// references an unknown source column (caller falls back to the error path).
+fn build_streaming_agg_accumulators(
+    s: &SelectStatement,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<Vec<StreamingAggAcc>, CqlError> {
+    let mut accs = Vec::with_capacity(s.columns.len());
+    for sc in &s.columns {
+        let SelectColumn::FunctionCall { name, args, .. } = sc else {
+            return Err(CqlError::Invalid(
+                "streaming aggregate: non-aggregate column in aggregate projection".into(),
+            ));
+        };
+        let fn_lower = name.to_lowercase();
+        if fn_lower == "count" {
+            accs.push(StreamingAggAcc::Count { count: 0 });
+            continue;
+        }
+        // SUM/AVG/MIN/MAX need a numeric source column.
+        let col_name = args
+            .first()
+            .ok_or_else(|| CqlError::Invalid(format!("{fn_lower}() requires a column argument")))
+            .and_then(extract_column_name)?;
+        let src_idx = all_col_names
+            .iter()
+            .position(|n| *n == col_name)
+            .ok_or_else(|| {
+                CqlError::Invalid(format!("unknown column in {fn_lower}(): {col_name}"))
+            })?;
+        let col_type = all_col_types[src_idx].clone();
+        let acc = match fn_lower.as_str() {
+            "sum" => StreamingAggAcc::SumAvg {
+                is_avg: false,
+                sum: 0.0,
+                n: 0,
+                src_idx,
+                col_type,
+            },
+            "avg" => StreamingAggAcc::SumAvg {
+                is_avg: true,
+                sum: 0.0,
+                n: 0,
+                src_idx,
+                col_type,
+            },
+            "min" => StreamingAggAcc::MinMax {
+                is_max: false,
+                acc: 0.0,
+                seen: false,
+                src_idx,
+                col_type,
+            },
+            "max" => StreamingAggAcc::MinMax {
+                is_max: true,
+                acc: 0.0,
+                seen: false,
+                src_idx,
+                col_type,
+            },
+            other => {
+                return Err(CqlError::Invalid(format!(
+                    "streaming aggregate: unsupported function {other}"
+                )))
+            }
+        };
+        accs.push(acc);
+    }
+    Ok(accs)
+}
+
+/// Fold a builtin scalar aggregate over an uncapped partition stream, returning
+/// the single aggregate result row.
+///
+/// This is the streaming-aggregate counterpart to
+/// [`count_rows_from_partition_stream`]: partitions move through the row builder
+/// one at a time (move-only, no per-row clone of payloads), each row is tested
+/// against the query's WHERE predicates, and matched rows update O(1)
+/// accumulators. There is **no server-side row cap** — the result is exact over
+/// the whole table, and memory is independent of the scanned row count.
+async fn stream_builtin_aggregates(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    mut accs: Vec<StreamingAggAcc>,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<Vec<Option<CqlValue>>, CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                for acc in accs.iter_mut() {
+                    acc.observe(&row);
+                }
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(accs.iter().map(StreamingAggAcc::finish).collect())
+}
+
 /// Resume cursor decoded from the wire `paging_state` for a streaming scan.
 ///
 /// `partition_key` / `clustering_key` are the raw serialized bytes of the last
@@ -4621,6 +4870,59 @@ async fn route_select_user_table(
                             .await?;
                             streamed_paging_state = Some(page.next_paging_state);
                             page.rows
+                        } else if !count_only_select && builtin_scalar_aggregate_stream_shape(s) {
+                            // Streaming scalar aggregate (SUM/MIN/MAX/AVG, and
+                            // COUNT when mixed with them) over a full ALLOW
+                            // FILTERING scan with no user LIMIT. This shape folds
+                            // in O(1) accumulator state per aggregate column, so
+                            // there is NO server-side row cap: the result is exact
+                            // over the whole table and memory is independent of the
+                            // scanned row count. (The previous path capped this at
+                            // DEFAULT_RANGE_READ_LIMIT and then fail-loud'd, so
+                            // `SELECT SUM(v) FROM t` over >10k rows was refused
+                            // entirely.) ORDER BY / DISTINCT keep the bounded path
+                            // below until spill-to-disk lands (step 5).
+                            let accs = build_streaming_agg_accumulators(
+                                s,
+                                &all_col_names,
+                                &all_col_types,
+                            )?;
+                            let stream = state
+                                .write_path
+                                .load()
+                                .range_read_stream_all_with(
+                                    &table_id,
+                                    0,
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?;
+                            let agg_row = stream_builtin_aggregates(
+                                stream,
+                                accs,
+                                PartitionRowContext {
+                                    all_col_names: &all_col_names,
+                                    all_col_types: &all_col_types,
+                                    pk_indices: &pk_indices,
+                                    ck_indices: &ck_indices,
+                                    storage_to_table: &storage_to_table,
+                                },
+                                SelectPredicateContext {
+                                    statement: s,
+                                    table_meta,
+                                    keyspace: ks,
+                                    state,
+                                },
+                            )
+                            .await?;
+                            return Ok(SelectRawResult {
+                                column_names: col_names.to_vec(),
+                                column_types: col_types.to_vec(),
+                                rows: vec![agg_row],
+                                keyspace: ks.to_string(),
+                                table: s.table.clone(),
+                                paging_state: None,
+                            });
                         } else {
                             let scan_bound = if s.order_by.is_empty()
                                 && s.ann_of.is_none()
@@ -4748,13 +5050,27 @@ async fn route_select_user_table(
                                 // User-supplied LIMIT (or page size) provided the
                                 // bound: returning exactly the requested rows is
                                 // intentional and correct, so no truncation check.
-                                Some(
-                                    state
-                                        .write_path
-                                        .load()
-                                        .range_read_limited_rows(&table_id, bound, row_limit)
-                                        .await?,
-                                )
+                                //
+                                // Stream at most `bound` partitions rather than
+                                // materializing a `Vec<Partition>` via
+                                // `range_read_limited_rows`: the storage layer
+                                // fail-louds a Vec-materializing read whose bound
+                                // exceeds its OOM guard, so a user `LIMIT` larger
+                                // than that guard (e.g. `LIMIT 20000`) must stream.
+                                // Memory is bounded by the user's chosen `bound`;
+                                // the result is bounded ONLY by the query's LIMIT.
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                projected_stream = Some(Box::pin(stream.take(bound)));
+                                None
                             } else if row_limit > 0 {
                                 // Complex shape (ORDER BY / DISTINCT / aggregate /
                                 // function projection) over a full ALLOW FILTERING
@@ -17176,6 +17492,208 @@ mod tests {
              partition key, not a server-capped {} window",
             ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
         );
+    }
+
+    // ── Step 2: remove the DEFAULT_RANGE_READ_LIMIT result cap for the
+    //           O(1)-streamable shapes. RED tests below assert that a result
+    //           bigger than the 10_000 magic cap comes back complete (no cap,
+    //           no fail-loud) for: (a) a simple `WHERE … ALLOW FILTERING` scan,
+    //           (b) a streaming scalar aggregate (SUM), (c) `SELECT DISTINCT
+    //           <partition key>`. Spec: specs/proposed/streaming-range-reads-no-cap.md
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// (a) A simple coordinated `WHERE … ALLOW FILTERING` scan over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must return EVERY matching row, bounded
+    /// only by paging — never truncated to a server-side 10_000 window.
+    #[tokio::test]
+    async fn allow_filtering_scan_returns_all_rows_past_10k() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // `v = id * 10`, so `v >= 0` matches every row. Walk every page with the
+        // default page size; the union must be the whole table with no cap.
+        let (rows, _pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT * FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+            None,
+        )
+        .await;
+        let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n as usize,
+            "ALLOW FILTERING scan over {n} rows must return every row, not a \
+             server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// A user `LIMIT N` greater than `DEFAULT_RANGE_READ_LIMIT` must return N
+    /// rows — the query's own LIMIT is the ONLY bound. Previously
+    /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
+    /// large user LIMIT below what the client asked for.
+    #[tokio::test]
+    async fn user_limit_above_10k_returns_all_requested_rows() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let cql = format!("SELECT * FROM pageks.t LIMIT {n}");
+        let (rows, _pages) = collect_all_pages(&state, &auth, &ks, &cql, None).await;
+        let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n as usize,
+            "LIMIT {n} must return {n} distinct rows, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// (b) A streaming scalar aggregate (`SUM`) over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must be EXACT — computed over the whole
+    /// table, not over a clipped 10_000-row window (and not fail-loud).
+    #[tokio::test]
+    async fn sum_aggregate_is_exact_past_10k() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // v = i * 10 for i in 0..n  →  SUM(v) = 10 * (n-1) * n / 2.
+        let expected: i64 = (0..n).map(|i| i * 10).sum();
+
+        let select = match crate::parser::parse("SELECT SUM(v) FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            res.rows.len(),
+            1,
+            "SUM must return exactly one aggregate row"
+        );
+        // int column widens to Bigint in SUM (Cassandra semantics).
+        let got = match &res.rows[0][0] {
+            Some(CqlValue::Bigint(x)) => *x,
+            Some(CqlValue::Int(x)) => *x as i64,
+            other => panic!("expected numeric SUM, got {other:?}"),
+        };
+        assert_eq!(
+            got,
+            expected,
+            "SUM(v) over {n} rows must be exact ({expected}), not summed over a \
+             capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// (c) `SELECT DISTINCT <partition key>` over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` partitions must return every distinct
+    /// partition key (token-ordered scan visits each partition once). This is
+    /// the non-projected DISTINCT arm reached when the projection ordinal path
+    /// is not taken; it must stream uncapped like the projected arm.
+    #[tokio::test]
+    async fn distinct_partition_key_returns_all_rows_past_10k_non_projected() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let select = match crate::parser::parse("SELECT DISTINCT id FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            res.rows.len(),
+            n as usize,
+            "SELECT DISTINCT id over {n} partitions must return every distinct \
+             partition key, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// Streaming-aggregate correctness on a small table: SUM/MIN/MAX/AVG/COUNT
+    /// folded over the uncapped partition stream must match the exact expected
+    /// values, honoring a WHERE filter and skipping NULL source cells. Guards the
+    /// O(1) streaming accumulators used by the >10k exactness fix.
+    #[tokio::test]
+    async fn streaming_aggregates_are_correct_with_where_and_nulls() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE agg WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE agg.t (id int PRIMARY KEY, g int, v int)",
+            // g=1 group: v = 10, 20, 30 ; plus a NULL-v row that must be skipped.
+            "INSERT INTO agg.t (id, g, v) VALUES (1, 1, 10)",
+            "INSERT INTO agg.t (id, g, v) VALUES (2, 1, 20)",
+            "INSERT INTO agg.t (id, g, v) VALUES (3, 1, 30)",
+            "INSERT INTO agg.t (id, g) VALUES (4, 1)",
+            // g=2 group: excluded by WHERE g = 1.
+            "INSERT INTO agg.t (id, g, v) VALUES (5, 2, 999)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let select = match crate::parser::parse(
+            "SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM agg.t WHERE g = 1 ALLOW FILTERING",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx2 = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx2, &select).await.unwrap();
+        assert_eq!(res.rows.len(), 1, "aggregate must return exactly one row");
+        let row = &res.rows[0];
+        // COUNT(*) counts all matched rows (including the NULL-v row) = 4.
+        assert_eq!(row[0], Some(CqlValue::Bigint(4)), "COUNT(*)");
+        // SUM/MIN/MAX/AVG skip the NULL v; over {10,20,30}.
+        let as_i64 = |c: &Option<CqlValue>| match c {
+            Some(CqlValue::Bigint(x)) => *x,
+            Some(CqlValue::Int(x)) => *x as i64,
+            other => panic!("expected numeric agg, got {other:?}"),
+        };
+        assert_eq!(as_i64(&row[1]), 60, "SUM(v)");
+        assert_eq!(as_i64(&row[2]), 10, "MIN(v)");
+        assert_eq!(as_i64(&row[3]), 30, "MAX(v)");
+        assert_eq!(as_i64(&row[4]), 20, "AVG(v) = 60/3");
+    }
+
+    /// Guard: an unbounded `ORDER BY` (no LIMIT) over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must stay BOUNDED — it fails loud rather
+    /// than materializing the whole table into an in-memory global sort. Its cap
+    /// intentionally remains until spill-to-disk lands (step 5). This test locks
+    /// in that step 2 does NOT accidentally uncap the accumulating sort shape.
+    #[tokio::test]
+    async fn order_by_no_limit_stays_bounded_past_10k() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // ORDER BY on a non-clustering column with no LIMIT is the arbitrary
+        // global-sort shape that needs spill; until then it must fail loud.
+        let select = match crate::parser::parse("SELECT * FROM pageks.t ORDER BY v").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        match route_select_raw(&state, &ctx, &select).await {
+            Err(CqlError::Invalid(_)) => {}
+            Err(other) => panic!("expected a bounded-shape Invalid error, got {other:?}"),
+            Ok(res) => panic!(
+                "unbounded ORDER BY over a >10k table must fail loud (bounded), not \
+                 return {} rows from a whole-table in-memory sort",
+                res.rows.len()
+            ),
+        }
     }
 
     #[tokio::test]

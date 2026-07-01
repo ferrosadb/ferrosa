@@ -1625,7 +1625,13 @@ impl ClusterCoordinator {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<Partition>> {
-        let limit = limit.clamp(1, crate::write_path::DEFAULT_RANGE_READ_LIMIT);
+        // `limit` is the caller's own bound (a user `LIMIT N`, or the
+        // `DEFAULT_RANGE_READ_LIMIT + 1` probe of the truncation-detecting
+        // checked reader) — NOT a server-side result cap. Do not re-clamp it to
+        // 10_000: a user `LIMIT 20000` must return up to 20000 rows. Memory is
+        // bounded by the caller's chosen `limit`. Floor at 1 (a 0-limit bounded
+        // read is meaningless).
+        let limit = limit.max(1);
 
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
