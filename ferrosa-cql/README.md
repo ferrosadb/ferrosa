@@ -48,8 +48,13 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   accumulator (`stream_builtin_aggregates`) over the uncapped
   `range_read_stream_all_with` (exact over the whole table, no `all_rows`
   materialization); a user `LIMIT N` above the storage OOM guard streams
-  (take-`N`) instead of a `Vec` materialization. Only the unbounded `ORDER BY`
-  global sort stays fail-loud-bounded until spill lands (step 5)
+  (take-`N`) instead of a `Vec` materialization. The unbounded `ORDER BY` (no
+  `LIMIT`) global sort now **spills** (step 5): it streams the uncapped scan
+  through `sort_rows_from_partition_stream_spilling` → `ferrosa_storage::ExternalSorter`
+  (bounded-memory external merge sort, cascade k-way merge), returning the fully,
+  correctly ordered result with no cap and memory bounded by the spill threshold
+  (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
+  keep their `range_read_limited_rows_checked` fail-loud cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,

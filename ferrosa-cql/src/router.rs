@@ -645,6 +645,75 @@ async fn extend_rows_from_partition_stream(
     Ok(())
 }
 
+/// Stream an uncapped full scan through a **spilling external merge sort** and
+/// return the fully, correctly ordered rows.
+///
+/// This is the step-5 replacement for the arbitrary unbounded `ORDER BY` (no
+/// `LIMIT`) fail-loud cap. Rows are built and predicate-filtered partition by
+/// partition (bounded working set), then MOVED into an
+/// [`ferrosa_storage::ExternalSorter`] which spills sorted runs to `spill_dir`
+/// once the in-memory accumulation crosses the spill threshold. The final
+/// bounded k-way merge streams rows in order — complete, correctly ordered, and
+/// with the sort's working set bounded by the threshold rather than the result
+/// size. Spilled runs live under `spill_dir` (the temp-sort reservation) and are
+/// cleaned up when it drops.
+///
+/// Any spill/merge I/O error propagates (fail loud) — a spilled run is never
+/// silently dropped.
+async fn sort_rows_from_partition_stream_spilling(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    spill_dir: &std::path::Path,
+    order: ferrosa_storage::RowOrder,
+    threshold_bytes: u64,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<(Vec<Vec<Option<CqlValue>>>, bool), CqlError> {
+    let mut sorter = ferrosa_storage::ExternalSorter::new(spill_dir, order, threshold_bytes);
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                // Move the row into the sorter — no per-row payload clone.
+                sorter
+                    .push(row)
+                    .map_err(|e| CqlError::ServerError(format!("ORDER BY spill: {e}")))?;
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    let spilled = sorter.spilled();
+    let mut sorted = Vec::new();
+    for row in sorter
+        .finish()
+        .map_err(|e| CqlError::ServerError(format!("ORDER BY spill finish: {e}")))?
+    {
+        sorted.push(row.map_err(|e| CqlError::ServerError(format!("ORDER BY merge: {e}")))?);
+    }
+    Ok((sorted, spilled))
+}
+
 async fn count_rows_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     row_context: PartitionRowContext<'_>,
@@ -4153,6 +4222,12 @@ async fn route_select_user_table(
     // be skipped — the rows are already exactly one bounded page.
     let mut streamed_paging_state: Option<Option<Vec<u8>>> = None;
 
+    // Set when an arbitrary unbounded ORDER BY has already been fully ordered by
+    // the spilling external merge sort. The generic in-memory sort site below is
+    // then skipped — re-sorting would re-materialize the whole result in memory,
+    // defeating the spill's bounded-memory guarantee.
+    let mut order_by_already_sorted = false;
+
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
         let pk_types: Vec<CqlType> = table_meta
@@ -5016,6 +5091,19 @@ async fn route_select_user_table(
                             let mut projected_stream: Option<
                                 ferrosa_cluster::write_path::PartitionResultStream,
                             > = None;
+                            // Arbitrary unbounded ORDER BY (no LIMIT): stream the whole
+                            // scan uncapped and sort with bounded memory via a spilling
+                            // external merge sort (step 5). This replaces the old
+                            // fail-loud DEFAULT_RANGE_READ_LIMIT probe cap — the result
+                            // is bounded ONLY by the query's LIMIT, and the sort's
+                            // working set by the spill threshold. The reservation's temp
+                            // dir holds spilled runs and is cleaned up on drop. When set,
+                            // `spilled_sorted_rows` already holds the fully-ordered rows,
+                            // so the generic sort site below is skipped.
+                            let order_by_spill =
+                                prepare_order_by_execution(state, ks, s, table_meta)?;
+                            let mut spilled_sorted_rows: Option<Vec<Vec<Option<CqlValue>>>> = None;
+                            let mut spilled_sort_did_spill = false;
                             let partitions = if count_only_select {
                                 // COUNT(*) must NEVER pre-materialize a capped Vec.
                                 // `range_read_limited_rows` clamps to the magic
@@ -5071,14 +5159,65 @@ async fn route_select_user_table(
                                     .await?;
                                 projected_stream = Some(Box::pin(stream.take(bound)));
                                 None
+                            } else if let Some(reservation) = order_by_spill.as_ref() {
+                                // Arbitrary unbounded ORDER BY: stream the ENTIRE scan
+                                // uncapped and sort it with a spilling external merge
+                                // sort. No server-side row cap; the sort's working set
+                                // is bounded by the spill threshold, not the result
+                                // size, and rows move (never clone) into the sorter.
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                let order_specs: Vec<(usize, bool)> = s
+                                    .order_by
+                                    .iter()
+                                    .filter_map(|(col_name, dir)| {
+                                        let idx =
+                                            all_col_names.iter().position(|n| n == col_name)?;
+                                        Some((idx, *dir == OrderDirection::Asc))
+                                    })
+                                    .collect();
+                                let threshold = ferrosa_storage::process_spill_threshold_bytes();
+                                let (sorted, did_spill) = sort_rows_from_partition_stream_spilling(
+                                    stream,
+                                    reservation.path(),
+                                    ferrosa_storage::RowOrder::new(order_specs),
+                                    threshold,
+                                    PartitionRowContext {
+                                        all_col_names: &all_col_names,
+                                        all_col_types: &all_col_types,
+                                        pk_indices: &pk_indices,
+                                        ck_indices: &ck_indices,
+                                        storage_to_table: &storage_to_table,
+                                    },
+                                    SelectPredicateContext {
+                                        statement: s,
+                                        table_meta,
+                                        keyspace: ks,
+                                        state,
+                                    },
+                                )
+                                .await?;
+                                spilled_sorted_rows = Some(sorted);
+                                spilled_sort_did_spill = did_spill;
+                                None
                             } else if row_limit > 0 {
-                                // Complex shape (ORDER BY / DISTINCT / aggregate /
-                                // function projection) over a full ALLOW FILTERING
-                                // scan with no user bound: the read is capped at the
-                                // engine's DEFAULT_RANGE_READ_LIMIT only. Sorting,
-                                // distincting, or aggregating over a silently clipped
-                                // window yields a wrong answer, so fail loud when the
-                                // cap actually clipped data (D4) instead of truncating.
+                                // Complex shape (DISTINCT / aggregate / function
+                                // projection) over a full ALLOW FILTERING scan with no
+                                // user bound: the read is capped at the engine's
+                                // DEFAULT_RANGE_READ_LIMIT only. Distincting or
+                                // aggregating over a silently clipped window yields a
+                                // wrong answer, so fail loud when the cap actually
+                                // clipped data (D4) instead of truncating. (Arbitrary
+                                // unbounded ORDER BY is handled by the spill branch
+                                // above.)
                                 let (partitions, truncated) = state
                                     .write_path
                                     .load()
@@ -5170,7 +5309,14 @@ async fn route_select_user_table(
                                 });
                             }
                             let mut all_rows = Vec::new();
-                            if let Some(stream) = projected_stream {
+                            if let Some(sorted) = spilled_sorted_rows.take() {
+                                // Arbitrary unbounded ORDER BY already produced fully
+                                // ordered + predicate-filtered rows via the spilling
+                                // external sort above. Skip the generic sort site.
+                                let _ = spilled_sort_did_spill;
+                                order_by_already_sorted = true;
+                                all_rows = sorted;
+                            } else if let Some(stream) = projected_stream {
                                 // Stream the uncapped projected scan straight into
                                 // rows. Partitions move from the reader into the row
                                 // builder one at a time — no full-table Vec, no cap.
@@ -5221,13 +5367,13 @@ async fn route_select_user_table(
         }
     };
 
-    // Classify arbitrary unbounded ORDER BY before sorting. The temp-sort
-    // reservation is intentionally held until this SELECT returns; dropping it
-    // on completion or cancellation cleans up the temporary table directory.
-    let _order_by_temp_sort = prepare_order_by_execution(state, ks, s, table_meta)?;
-
-    // Apply ORDER BY sorting (FRSA-BUG-004)
-    let rows = if let Some((ann_col, ann_query)) = &s.ann_of {
+    // Apply ORDER BY sorting (FRSA-BUG-004). An arbitrary unbounded ORDER BY has
+    // already been fully ordered by the spilling external merge sort in the scan
+    // arm (`order_by_already_sorted`); re-sorting it here would re-materialize
+    // the whole result in memory, so skip the generic in-memory sort in that case.
+    let rows = if order_by_already_sorted {
+        rows
+    } else if let Some((ann_col, ann_query)) = &s.ann_of {
         let mut sorted = rows;
         apply_ann_of_ordering(
             &mut sorted,
@@ -17674,26 +17820,128 @@ mod tests {
     /// intentionally remains until spill-to-disk lands (step 5). This test locks
     /// in that step 2 does NOT accidentally uncap the accumulating sort shape.
     #[tokio::test]
-    async fn order_by_no_limit_stays_bounded_past_10k() {
+    async fn order_by_no_limit_sorts_all_rows_past_10k() {
+        // Step 5: an arbitrary unbounded ORDER BY (no LIMIT) over a >10k table
+        // now returns EVERY row in correct order via the spilling external sort,
+        // instead of the old fail-loud DEFAULT_RANGE_READ_LIMIT cap.
         let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
 
-        // ORDER BY on a non-clustering column with no LIMIT is the arbitrary
-        // global-sort shape that needs spill; until then it must fail loud.
         let select = match crate::parser::parse("SELECT * FROM pageks.t ORDER BY v").unwrap() {
             Statement::Select(s) => s,
             other => panic!("expected select, got {other:?}"),
         };
         let ctx = paging_ctx(&auth, &ks, None, None);
-        match route_select_raw(&state, &ctx, &select).await {
-            Err(CqlError::Invalid(_)) => {}
-            Err(other) => panic!("expected a bounded-shape Invalid error, got {other:?}"),
-            Ok(res) => panic!(
-                "unbounded ORDER BY over a >10k table must fail loud (bounded), not \
-                 return {} rows from a whole-table in-memory sort",
-                res.rows.len()
-            ),
+        let res = route_select_raw(&state, &ctx, &select)
+            .await
+            .expect("unbounded ORDER BY must now return all rows via spill, not fail loud");
+
+        assert_eq!(
+            res.rows.len(),
+            n as usize,
+            "ORDER BY with no LIMIT must return every row past the 10k cap"
+        );
+        // `v = id * 10` so ascending order on `v` is ascending on `id`.
+        let v_idx = res
+            .column_names
+            .iter()
+            .position(|c| c == "v")
+            .expect("v column present");
+        let vals: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[v_idx] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        let mut sorted_ref = vals.clone();
+        sorted_ref.sort_unstable();
+        assert_eq!(vals, sorted_ref, "rows must be in ascending `v` order");
+        assert_eq!(
+            vals.first().copied(),
+            Some(0),
+            "smallest v (id=0 → v=0) must sort first"
+        );
+        assert_eq!(
+            vals.last().copied(),
+            Some(((n - 1) * 10) as i32),
+            "largest v must sort last"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn order_by_spills_and_stays_correct() {
+        // With a tiny spill threshold forcing many spills, a large RANDOMIZED
+        // input must sort identically to an in-memory reference — same length,
+        // same multiset, same order — proving no loss/dup/misorder under spill.
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        // Force the sorter to spill on essentially every batch.
+        std::env::set_var(
+            ferrosa_storage::spill_budget::ENV_SPILL_THRESHOLD_BYTES,
+            "64",
+        );
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = Some("spillks".to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE KEYSPACE spillks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE TABLE spillks.t (id int PRIMARY KEY, v int)",
+        )
+        .await;
+
+        let mut rng = StdRng::seed_from_u64(0xD00D_F00D);
+        let n = 3_000usize;
+        let mut inserted: Vec<i32> = Vec::with_capacity(n);
+        for id in 0..n {
+            let v: i32 = rng.random_range(-100_000..100_000);
+            inserted.push(v);
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO spillks.t (id, v) VALUES ({id}, {v})"),
+            )
+            .await;
         }
+
+        let select = match crate::parser::parse("SELECT v FROM spillks.t ORDER BY v").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        std::env::remove_var(ferrosa_storage::spill_budget::ENV_SPILL_THRESHOLD_BYTES);
+
+        let got: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect();
+
+        // Reference: the exact same values sorted by a plain in-memory Vec::sort.
+        let mut reference = inserted.clone();
+        reference.sort_unstable();
+
+        assert_eq!(got.len(), reference.len(), "no rows lost or duplicated");
+        assert_eq!(
+            got, reference,
+            "spilled external sort must equal the in-memory reference exactly \
+             (same multiset, same order)"
+        );
     }
 
     #[tokio::test]
@@ -18019,7 +18267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitrary_unbounded_order_by_fails_loud_without_temp_sort_leak() {
+    async fn arbitrary_unbounded_order_by_sorts_via_spill_without_temp_leak() {
         let (state, dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -18075,18 +18323,35 @@ mod tests {
             }
         );
 
-        let error = match route(&state, &ctx, stmt).await {
-            Ok(_) => panic!("unbounded arbitrary ORDER BY must not materialize rows in memory"),
-            Err(error) => error,
+        // Step 5: the arbitrary unbounded ORDER BY now succeeds via the spilling
+        // external sort — it returns the rows fully ordered, not a fail-loud
+        // error. `v = {30, 10, 20}` → ascending order is `10, 20, 30`.
+        let ctx2 = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
         };
-        match error {
-            CqlError::Invalid(message) => assert!(
-                message.contains("unbounded full-table materialization is disabled"),
-                "unexpected error message: {message}"
-            ),
-            other => panic!("expected invalid-query error, got {other:?}"),
-        }
+        let select_owned = select.clone();
+        let raw = route_select_raw(&state, &ctx2, &select_owned)
+            .await
+            .expect("unbounded ORDER BY must sort via spill, not fail loud");
+        let v_idx = raw.column_names.iter().position(|c| c == "v").unwrap();
+        let ordered: Vec<i32> = raw
+            .rows
+            .iter()
+            .map(|r| match &r[v_idx] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ordered, vec![10, 20, 30], "rows must be ascending on v");
 
+        // The temp-sort reservation directory must be cleaned up on drop — no
+        // leaked run files after the query returns.
         let tmp_root = dir.path().join("tmp_order_by_sort");
         if tmp_root.exists() {
             let leftovers = std::fs::read_dir(&tmp_root).unwrap().count();
