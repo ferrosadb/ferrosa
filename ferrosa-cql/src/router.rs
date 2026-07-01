@@ -883,7 +883,7 @@ fn builtin_scalar_aggregate_stream_shape(s: &SelectStatement) -> bool {
 /// Build the per-column streaming accumulators for a
 /// [`builtin_scalar_aggregate_stream_shape`] query. Returns `None` when a column
 /// references an unknown source column (caller falls back to the error path).
-fn build_streaming_agg_accumulators(
+fn build_agg_accumulators(
     s: &SelectStatement,
     all_col_names: &[String],
     all_col_types: &[CqlType],
@@ -961,7 +961,7 @@ fn build_streaming_agg_accumulators(
 /// against the query's WHERE predicates, and matched rows update O(1)
 /// accumulators. There is **no server-side row cap** — the result is exact over
 /// the whole table, and memory is independent of the scanned row count.
-async fn stream_builtin_aggregates(
+async fn fold_builtin_aggregates(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     mut accs: Vec<StreamingAggAcc>,
     row_context: PartitionRowContext<'_>,
@@ -4957,11 +4957,7 @@ async fn route_select_user_table(
                             // `SELECT SUM(v) FROM t` over >10k rows was refused
                             // entirely.) ORDER BY / DISTINCT keep the bounded path
                             // below until spill-to-disk lands (step 5).
-                            let accs = build_streaming_agg_accumulators(
-                                s,
-                                &all_col_names,
-                                &all_col_types,
-                            )?;
+                            let accs = build_agg_accumulators(s, &all_col_names, &all_col_types)?;
                             let stream = state
                                 .write_path
                                 .load()
@@ -4972,7 +4968,7 @@ async fn route_select_user_table(
                                     &table_strategy,
                                 )
                                 .await?;
-                            let agg_row = stream_builtin_aggregates(
+                            let agg_row = fold_builtin_aggregates(
                                 stream,
                                 accs,
                                 PartitionRowContext {
