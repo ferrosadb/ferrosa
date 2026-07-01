@@ -249,7 +249,7 @@ impl ExternalSorter {
     /// - **No spill occurred**: the buffer is sorted in place and returned — the
     ///   pure in-memory fast path (bounded, since it never crossed threshold).
     /// - **Spills occurred**: the final buffer is spilled too, then the runs are
-    ///   **cascade-merged down to at most [`MERGE_FANIN`] runs** before the final
+    ///   **cascade-merged down to at most `MERGE_FANIN` runs** before the final
     ///   k-way merge. This caps peak open readers (and heap size) at `MERGE_FANIN`
     ///   regardless of how many runs (i.e. how large the result) — so the sort's
     ///   working set is bounded independent of the row count.
@@ -268,7 +268,7 @@ impl ExternalSorter {
         Ok(SortedRows::Merged(merger))
     }
 
-    /// Repeatedly merge groups of at most [`MERGE_FANIN`] runs into single larger
+    /// Repeatedly merge groups of at most `MERGE_FANIN` runs into single larger
     /// runs until the total run count is `<= MERGE_FANIN`. Each pass opens at
     /// most `MERGE_FANIN` readers at once, so peak memory during reduction is
     /// `O(MERGE_FANIN)`, not `O(runs)`.
