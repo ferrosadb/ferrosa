@@ -41,11 +41,15 @@ real backlog is structural and security-shaped.
     partitions) instead of hitting the Vec-materialization cap. `SELECT DISTINCT
     <partition key>` and simple `WHERE … ALLOW FILTERING` scans were already
     uncapped (step 1 / paged-filter path).
-  - **Still bounded (fail-loud) until step 5 (spill-to-disk):** an unbounded
-    `ORDER BY` (no `LIMIT`) global sort — it keeps the truncation-detecting cap
-    (`range_read_limited_rows_checked`) rather than materializing the whole
-    table. (`GROUP BY` is not yet parsed, so high-cardinality group state is
-    N/A.) Remaining spec steps: ORDER BY/GROUP BY spill, RAM-budget reader.
+  - Step 5 (landed): the unbounded `ORDER BY` (no `LIMIT`) global sort now
+    **spills** instead of fail-loud-refusing. The router streams the uncapped
+    scan through `sort_rows_from_partition_stream_spilling` →
+    `ferrosa_storage::ExternalSorter` (bounded-memory external merge sort with
+    cascade k-way merge; RAM-budget reader + 50%-default spill threshold in
+    `ferrosa_storage::spill_budget`). Complete, correctly ordered, memory bounded
+    by the threshold, no cap other than the query's `LIMIT`. `DISTINCT`/aggregate/
+    function-projection keep their `range_read_limited_rows_checked` fail-loud cap.
+    Remaining: per-group spill when `GROUP BY` lands (deferred; not yet parsed).
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and

@@ -1,6 +1,41 @@
 # Streaming range reads — remove the server-side result cap
 
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
+**Steps 1–2 and Step 5 (final) landed.**
+
+**Step 5 (landed).** The last accumulating shape — an arbitrary unbounded
+`ORDER BY` (no `LIMIT`) global sort — no longer fail-loud-refuses past the
+`DEFAULT_RANGE_READ_LIMIT` probe cap. It now streams the uncapped scan
+(`range_read_stream_all_with`) through a **spilling external merge sort** and
+returns the fully, correctly ordered result. Bounded memory (the spill
+threshold), complete + correctly ordered, disk I/O for large sorts, no cap other
+than the query's own `LIMIT`.
+
+- **RAM budget + spill threshold** (`ferrosa-storage/src/spill_budget.rs`):
+  detects the process budget (cgroup v2 `memory.max` → cgroup v1
+  `memory.limit_in_bytes` → `/proc/meminfo` `MemTotal`; `"max"`/near-`i64::MAX`
+  sentinels → unlimited → system total; unknown host → 1 GiB floor). Detection is
+  injectable (`BudgetSources`) and cached once; the threshold defaults to **50%**
+  of the budget, tunable via `FERROSA_RANGE_SPILL_THRESHOLD_PCT` (default 50) or
+  the absolute `FERROSA_RANGE_SPILL_THRESHOLD_BYTES` override (read fresh per call
+  so operators/tests can retune without a restart).
+- **External merge sort** (`ferrosa-storage/src/external_sort.rs`): rows are
+  MOVED (never cloned) into an accumulation buffer; when the buffer crosses the
+  threshold it is sorted and spilled to a run file (length-prefixed serde_json)
+  and cleared; `finish()` **cascade-merges** runs in fixed fan-in
+  (`MERGE_FANIN = 64`) passes down to `<= MERGE_FANIN` runs, then does a bounded
+  k-way merge (min-heap holding one row per run). Peak working set is
+  `O(MERGE_FANIN)` + one buffer — **independent of the row count**. Every spill/
+  merge I/O error propagates (fail loud); a truncated run is a hard error, never a
+  silent early stop. Runs live under the `TempSortTableReservation` dir and are
+  cleaned up on drop.
+- **Router wiring** (`ferrosa-cql/src/router.rs`): the arbitrary-unbounded-ORDER-BY
+  arm streams the uncapped scan through `sort_rows_from_partition_stream_spilling`
+  (build rows + predicate-filter per partition → push into `ExternalSorter`), then
+  the generic in-memory sort site is skipped (`order_by_already_sorted`).
+  `DISTINCT`/aggregate/function-projection keep their `range_read_limited_rows_checked`
+  fail-loud cap (unchanged).
+
 **Steps 1–2 landed.**
 
 **Step 2 (landed).** The `DEFAULT_RANGE_READ_LIMIT` (10_000) **result cap** is removed
@@ -19,12 +54,11 @@ for the O(1)-streamable shapes; each is bounded ONLY by the query's own `LIMIT`:
 - **`SELECT DISTINCT <partition key>`** and simple **`WHERE … ALLOW FILTERING`** scans were
   already uncapped (step 1 projected stream / paged-filter path); step-2 tests lock this in.
 
-**Still bounded (fail-loud) until step 5 (spill-to-disk):** an unbounded `ORDER BY` (no
-`LIMIT`) global sort keeps the truncation-detecting cap
-(`range_read_limited_rows_checked`, still using `DEFAULT_RANGE_READ_LIMIT` as its probe
-bound) rather than materializing the whole table for an in-memory sort. `GROUP BY` is not
+**Spilled (step 5, landed):** an unbounded `ORDER BY` (no `LIMIT`) global sort now streams
+the uncapped scan through the spilling external merge sort (above) instead of the
+truncation-detecting `range_read_limited_rows_checked` cap. `GROUP BY` is not
 yet parsed in the CQL AST, so high-cardinality group state is N/A (no cap to remove;
-add per-group spill when `GROUP BY` lands, with step 5). The legacy non-streaming
+add per-group spill when `GROUP BY` lands — deferred). The legacy non-streaming
 coordinated RPC (`FERROSA_BULK_STREAMING_RANGE_READ=0`, a documented degraded opt-out) and
 the raft `RangeReadHandler` keep their per-replica cap intentionally.
 
@@ -32,8 +66,10 @@ Step-2 tests (all RED→GREEN or bounded-guard): `router.rs`
 `sum_aggregate_is_exact_past_10k` (RED→GREEN), `user_limit_above_10k_returns_all_requested_rows`
 (RED→GREEN), `streaming_aggregates_are_correct_with_where_and_nulls`,
 `allow_filtering_scan_returns_all_rows_past_10k`,
-`distinct_partition_key_returns_all_rows_past_10k_non_projected`,
-`order_by_no_limit_stays_bounded_past_10k` (bounded guard); cluster
+`distinct_partition_key_returns_all_rows_past_10k_non_projected`; the step-2
+bounded guard `order_by_no_limit_stays_bounded_past_10k` was replaced in step 5 by
+`order_by_no_limit_sorts_all_rows_past_10k` (spill, all rows) +
+`order_by_spills_and_stays_correct` (randomized vs in-memory reference); cluster
 `range_scan_streaming_memory_bound.rs` covers the memory-bound + >10k data-completeness at
 the coordinated `range_read_stream_all_with` layer.
 
@@ -82,8 +118,8 @@ Safety comes from bounding **memory**, not result count:
 | User `LIMIT N` (> OOM guard) | ~~clamped to 10k (Vec)~~ | **done (step 2)** — `range_read_stream_all_with().take(N)` |
 | `DISTINCT <partition key>` | capped at 10k | **done (step 1)** — token-ordered scan visits each partition once, no dedup buffer |
 | Projected scan (subset of columns) | `range_read_projected(.., scan_bound)` capped | **done (step 1)** — `range_read_projected_stream_all_with` (`write_path.rs:619`) |
-| `GROUP BY` (high cardinality) | N/A — not parsed in the AST yet | add per-group accumulator + spill when `GROUP BY` lands (step 5) |
-| `ORDER BY` (no `LIMIT`, arbitrary) | capped + fail-loud | **still fail-loud-bounded** until step 5 spillable temp-sort |
+| `GROUP BY` (high cardinality) | N/A — not parsed in the AST yet | add per-group accumulator + spill when `GROUP BY` lands (deferred; not step 5) |
+| `ORDER BY` (no `LIMIT`, arbitrary) | ~~capped + fail-loud~~ | **done (step 5)** — spilling external merge sort (`ExternalSorter` + cascade k-way merge); complete, correctly ordered, memory bounded by the spill threshold, no cap |
 | `ORDER BY … LIMIT N` / clustering-order | bounded | bounded top-N heap (size N), no spill |
 | ANN | top-`K` | bounded heap of size `K` (query-specified) |
 
@@ -107,10 +143,12 @@ size* (memory bound), never a result-count cap.
 5. Aggregates (`SUM`/`AVG`) over >10k rows are exact (not over a 10k window).
 6. No `clone` of row payloads on the hot path (move-only); buffers are fixed-capacity `VecDeque`.
 
-## Memory budget + spill threshold (decided)
+## Memory budget + spill threshold (implemented in step 5)
 
-There is no configured-RAM reader yet (only per-feature env budgets like
-`FERROSA_RRD_RING_MEMORY_BUDGET_BYTES`). Add one:
+Implemented as `ferrosa-storage/src/spill_budget.rs` (see Step 5 above). The
+design below is realized: detection order cgroup v2 → cgroup v1 → system total →
+1 GiB floor, injectable + cached; threshold 50% default with `_PCT`/`_BYTES`
+overrides read fresh per call.
 
 - **Detect the RAM budget**: cgroup v2 `memory.max` (then cgroup v1
   `memory.limit_in_bytes`), falling back to system total (`sysinfo`/`/proc/meminfo`).
