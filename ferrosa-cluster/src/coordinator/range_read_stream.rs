@@ -308,6 +308,59 @@ async fn apply_per_partition_row_limit(
     }
 }
 
+/// Apply a partition-COUNT cap to a MERGED fragment stream (the output of
+/// `run_fragment_merge_nway`), forwarding every fragment of the first
+/// `partition_limit` distinct partition keys and then stopping.
+///
+/// A partition arrives as a contiguous run of fragments sharing one `key`; this
+/// counts a partition when its FIRST fragment is seen (key change) and forwards
+/// ALL of its fragments — so a wide partition split across fragments is never
+/// truncated mid-partition. Once `partition_limit` distinct keys have been
+/// forwarded in full, the remaining upstream is dropped.
+///
+/// This is the projected-scan counterpart to the non-projected `.take(bound)`
+/// the CQL layer applies to the whole-partition stream: `partition_limit` is a
+/// PAGE bound (over-fetch is fine — the CQL row-level LIMIT enforces the exact
+/// result), NOT a server-side result cap. `partition_limit == 0` is treated as
+/// "no cap" and forwards everything unchanged (the whole scan continues to the
+/// next page via the paging cursor).
+async fn apply_partition_count_limit(
+    mut in_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    partition_limit: usize,
+    out_tx: mpsc::Sender<crate::error::Result<Partition>>,
+) {
+    let mut cur_key: Option<ferrosa_common::DecoratedKey> = None;
+    let mut seen: usize = 0;
+    while let Some(item) = in_rx.recv().await {
+        let p = match item {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = out_tx.send(Err(e)).await;
+                return;
+            }
+        };
+        if partition_limit == 0 {
+            if out_tx.send(Ok(p)).await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if cur_key.as_ref() != Some(&p.key) {
+            // A new distinct partition begins. If we have already forwarded the
+            // full bound, stop before emitting any of this next partition's
+            // fragments — dropping `in_rx` cancels the upstream producer.
+            if seen >= partition_limit {
+                return;
+            }
+            cur_key = Some(p.key.clone());
+            seen += 1;
+        }
+        if out_tx.send(Ok(p)).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Map a streaming-fragment failure to the error surfaced to the client.
 ///
 /// t_4b94ab56: a remote replica's fragment stream closing or going idle before
@@ -1246,14 +1299,22 @@ impl ClusterCoordinator {
             cl,
             replication_factor,
             None,
+            None,
         )
         .await
     }
 
+    /// Projection-aware full-scan streaming range read, optionally bounded to the
+    /// first `partition_limit` distinct partitions (a paged fetch / `SELECT
+    /// <cols> ... LIMIT N`). `partition_limit` is a PAGE bound applied as a
+    /// streaming partition-count stage over the merged output — over-fetch is
+    /// safe (the CQL row-level LIMIT enforces the exact result), never a
+    /// server-side result cap. `None` streams the whole scan.
     pub async fn coordinate_range_read_projected_stream_all_with(
         &self,
         table_id: &TableId,
         wanted: Vec<u16>,
+        partition_limit: Option<usize>,
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
@@ -1263,6 +1324,7 @@ impl ClusterCoordinator {
             cl,
             replication_factor,
             Some(wanted),
+            partition_limit,
         )
         .await
     }
@@ -1401,6 +1463,40 @@ impl ClusterCoordinator {
             .await
     }
 
+    /// Wrap a merged partition stream with the partition-COUNT page bound when
+    /// `partition_limit` is `Some(k)` and `k > 0`. The wrapper forwards every
+    /// fragment of the first `k` distinct partitions and then stops the upstream
+    /// (see [`apply_partition_count_limit`]). `None`/`Some(0)` returns the stream
+    /// unchanged. Over-fetch is safe — the exact result bound is the CQL LIMIT.
+    fn wrap_partition_count_limit(
+        stream: ClusterPartitionStream,
+        partition_limit: Option<usize>,
+    ) -> ClusterPartitionStream {
+        match partition_limit {
+            Some(limit) if limit > 0 => {
+                let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+                TaskPool::current("range-read-partition-count-cap").spawn(async move {
+                    let mut in_stream = stream;
+                    let (in_tx, in_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+                    // Bridge the input Stream into an mpsc for the cap stage.
+                    let feeder = async move {
+                        while let Some(item) = in_stream.next().await {
+                            if in_tx.send(item).await.is_err() {
+                                return;
+                            }
+                        }
+                    };
+                    let capper = apply_partition_count_limit(in_rx, limit, out_tx);
+                    futures::future::join(feeder, capper).await;
+                });
+                Box::pin(futures::stream::unfold(out_rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                }))
+            }
+            _ => stream,
+        }
+    }
+
     async fn coordinate_range_read_stream_all_with_projection(
         &self,
         table_id: &TableId,
@@ -1408,6 +1504,7 @@ impl ClusterCoordinator {
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
         projected_regular_ordinals: Option<Vec<u16>>,
+        partition_limit: Option<usize>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
@@ -1489,10 +1586,10 @@ impl ClusterCoordinator {
             } else {
                 merge_rx
             };
-            let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+            let stream = Box::pin(futures::stream::unfold(out_rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
-            });
-            return Ok(Box::pin(stream));
+            }));
+            return Ok(Self::wrap_partition_count_limit(stream, partition_limit));
         }
 
         if expected_done == 0 {
@@ -1538,7 +1635,7 @@ impl ClusterCoordinator {
                     },
                 )),
             };
-            return Ok(stream);
+            return Ok(Self::wrap_partition_count_limit(stream, partition_limit));
         }
 
         let request_id = self.next_stream_request_id();
@@ -1597,10 +1694,10 @@ impl ClusterCoordinator {
             .await;
         });
 
-        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+        let stream = Box::pin(futures::stream::unfold(out_rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
-        });
-        Ok(Box::pin(stream))
+        }));
+        Ok(Self::wrap_partition_count_limit(stream, partition_limit))
     }
 
     /// ADR-020 streaming range-read entry point.
