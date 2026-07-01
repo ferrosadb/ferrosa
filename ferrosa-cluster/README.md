@@ -93,6 +93,15 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
   still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
   degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  A **projected** coordinated scan (`SELECT <cols> FROM t`) carrying a
+  `partition_limit` (every paged fetch, and `SELECT <cols> ... LIMIT N`) threads
+  that bound through the coordinated scatter-gather + N-way merge as a streaming
+  partition-count PAGE stage (`apply_partition_count_limit`, t_fed055cb) —
+  forwarding every fragment of the first `k` distinct partitions then cancelling
+  the upstream — instead of the former fail-loud refusal. It is a page bound, not
+  a result cap (over-fetch is safe; the CQL row-level `LIMIT`/paging_state
+  enforces exactness), so paging continues to the next page rather than
+  truncating; memory stays bounded and rows move (never clone) on the hot path.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 

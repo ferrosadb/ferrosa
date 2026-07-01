@@ -50,6 +50,15 @@ real backlog is structural and security-shaped.
     by the threshold, no cap other than the query's `LIMIT`. `DISTINCT`/aggregate/
     function-projection keep their `range_read_limited_rows_checked` fail-loud cap.
     Remaining: per-group spill when `GROUP BY` lands (deferred; not yet parsed).
+  - Coordinated projected partition-limit (landed, t_fed055cb): on the **cluster**
+    fan-out a projected scan (`SELECT <cols> FROM t`) carrying a `partition_limit`
+    (every paged fetch, and `SELECT <cols> ... LIMIT N`) used to fail-loud
+    (`projected cluster range scan with partition_limit is not implemented`). It
+    now threads the bound through the coordinated scatter-gather + N-way merge as
+    a streaming partition-count PAGE stage (`apply_partition_count_limit` in
+    `ferrosa-cluster`), returning all requested rows. It is a page bound, not a
+    result cap: over-fetch is safe (the row-level `LIMIT`/paging_state enforces
+    exactness) so paging continues to the next page rather than truncating.
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and
