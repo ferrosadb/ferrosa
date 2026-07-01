@@ -102,6 +102,18 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   a result cap (over-fetch is safe; the CQL row-level `LIMIT`/paging_state
   enforces exactness), so paging continues to the next page rather than
   truncating; memory stays bounded and rows move (never clone) on the hot path.
+  **Paged multi-replica scans cancel abandoned remote producers** (t_3fc6be3c):
+  every fanned-out replica stream is tracked as `(host_id, request_id)` and a
+  `RemoteStreamCancelGuard` rides the merged output stream. When the CQL paging
+  collector fills a page and DROPS the stream (every page but the last), the guard
+  fires `RangeReadStreamCancel` to each replica so its in-flight
+  `handle_stream_request` producer stops between batches — otherwise
+  `pages × replicas` uncancelled full-table scans pile up on `Lane::Bulk` and
+  starve heartbeats until the driver declares the connection defunct (the
+  multi-page projected scan HANG on RF>1). `MsgType::RangeReadStreamCancel` is now
+  registered to the request handler (it was previously wired on the receiver but
+  never sent nor routed). The single-node (`expected_done == 0`) fan-out has no
+  remote producers, so only the multi-replica path needed this.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
