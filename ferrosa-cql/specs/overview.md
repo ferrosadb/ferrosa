@@ -80,11 +80,35 @@ column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
-it resolves the matching partition keys through the cluster write path
+it resolves the matching row-granular doc keys through the cluster write path
 (`WritePath::fulltext_search`) — which scatter-gathers across every node's local
-FTI and unions the keys — then fetches and post-filters those partitions. A
-coordinator-local index lookup previously made `fts_match` non-deterministic on a
-cluster (BUG-F-007); standalone/pair still resolve locally.
+FTI and unions the keys — then point-reads the distinct matched partitions in
+deterministic (partition-key byte) order, retains only the rows whose FULL
+primary key matched (t_da51e20c), and post-filters. A coordinator-local index
+lookup previously made `fts_match` non-deterministic on a cluster (BUG-F-007);
+standalone/pair still resolve locally.
+
+The arm's coordinator memory is bounded (t_ee98faa0 — a broad `fts_match` over
+a large table previously accumulated every matching row before applying LIMIT
+and OOM-killed a live node): with a LIMIT, the fetch loop stops point-reading
+as soon as `limit` rows survive the post-filter (peak ≈ limit rows + one
+partition); with no LIMIT, it builds one page per response (client `page_size`
+or the default scan page size) and returns a `PagingState` continuation
+(partition-granular cursor), so the complete result is delivered across pages
+while the coordinator holds ≈ one page + one partition. Results are never
+truncated server-side — bounded only by the query's own LIMIT.
+
+Layer 2 (t_ee98faa0, replica side): with a LIMIT the arm pushes the
+query-derived `k` down the write path (`fulltext_search(.., Some(k))`), so
+every replica holds a bounded top-k working set and the unioned hit set is
+O(replicas × k) — the previous O(matches) hit-set residual now applies only to
+no-LIMIT statements, whose complete match set is genuinely required. If
+post-filtering (non-fts predicates + row-granular key retain) exhausts the
+bounded hit set before `limit` rows survive, the arm escalates geometrically
+(k → 4k → …) and re-runs; it stops as soon as the union is provably complete
+(union smaller than the requested k means no replica truncated). Peak memory
+is O(final k) — derived from the query's LIMIT and the actual post-filter
+selectivity, never a server constant.
 
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 

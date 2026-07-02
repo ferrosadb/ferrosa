@@ -55,28 +55,12 @@ reason = "t_15417b35: degraded IndexScanWithFilter/SingleIndex arm call sites; r
 owner = "storage"
 expires = "2026-09-30"
 
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "with-capacity-limit"
-reason = "t_15417b35: Vec::with_capacity(limit) in read_local_range_stream_limited_rows window collection; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-09-30"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "stream-returns-vec"
-symbol = "read_local_range_stream_limited_rows"
-reason = "t_15417b35: stream-named fn still materializes a Vec<Partition>; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-09-30"
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "returns-vec-partition-or-row"
-symbol = "read_local_range_stream_limited_rows"
-reason = "t_15417b35: read_local_range_stream_limited_rows returns Vec<Partition>; removed by SELECT-arm fix."
-owner = "storage"
-expires = "2026-09-30"
+# NOTE (t_ee98faa0 / t_3fc6be3c, consume-path bounded-streaming refactor):
+# `read_local_range_stream_limited_rows` and `dedup_by_token` were DELETED — the
+# limited-rows coordinator now drinks the bounded token-deduped N-way merge
+# stream instead of reading a local Vec + accumulating remote partitions. Their
+# former allow entries (with-capacity-limit / stream-returns-vec /
+# returns-vec-partition-or-row) are removed with the symbols.
 
 # ---------------------------------------------------------------------------
 # Group 2 — pre-existing materialization predating the guard (epic t_110dd8a5)
@@ -85,19 +69,20 @@ expires = "2026-09-30"
 # ---------------------------------------------------------------------------
 
 # -- ferrosa-cluster coordinator: range read / index read materialization ----
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
-rule = "returns-vec-partition-or-row"
-symbol = "dedup_by_token"
-reason = "t_110dd8a5: dedup helper over an already-bounded window; migrate with the streaming range-read rework."
-owner = "storage"
-expires = "2026-12-31"
-
+# `coordinate_range_read_stream_limited_rows` returns a `Vec<Partition>` bounded
+# by the CALLER's own `limit` (a user `LIMIT N` / page probe) — NOT the whole
+# table. Post the consume-path bounded-streaming refactor (t_ee98faa0/t_3fc6be3c)
+# it drinks the bounded token-deduped N-way merge stream and folds `<= limit`
+# whole partitions; the accumulation is O(limit result), never O(table). These
+# three entries cover the `Vec`-returning signature (stream-returns-vec /
+# returns-vec-partition-or-row) and the bounded stream-drain fold
+# (stream-push-accumulation) inherent to that signature. Retire when the callers
+# (t_480c91fe) are migrated to page-by-page streaming and the fn is deleted.
 [[allow]]
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "stream-returns-vec"
 symbol = "coordinate_range_read_stream_limited_rows"
-reason = "t_110dd8a5: streaming coordinator still returns a materialized Vec window; tracked for the streaming rework."
+reason = "t_110dd8a5/t_480c91fe: limited-rows coordinator returns a Vec bounded by the caller's own LIMIT; drains the bounded N-way merge stream, folds <= limit partitions. Retire when callers stream page-by-page."
 owner = "storage"
 expires = "2026-12-31"
 
@@ -105,7 +90,15 @@ expires = "2026-12-31"
 path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
 rule = "returns-vec-partition-or-row"
 symbol = "coordinate_range_read_stream_limited_rows"
-reason = "t_110dd8a5: streaming coordinator window return; tracked for the streaming rework."
+reason = "t_110dd8a5/t_480c91fe: limited-rows coordinator Vec<Partition> return, bounded by the caller's own LIMIT (not the table). Retire when callers stream page-by-page."
+owner = "storage"
+expires = "2026-12-31"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "stream-push-accumulation"
+symbol = "coordinate_range_read_stream_limited_rows"
+reason = "t_110dd8a5/t_480c91fe: the fold that reconstructs <= limit WHOLE partitions from the bounded merge stream's fragments necessarily pushes into the Vec<Partition> return; accumulation is O(limit result), NOT O(table). Retire when callers stream page-by-page and this Vec-returning fn is deleted."
 owner = "storage"
 expires = "2026-12-31"
 

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-07-01
 ---
 
 # ferrosa-cluster — Roadmap
@@ -78,9 +78,40 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   (Direct/Pair → local, Cluster → fan-out). The CQL router now routes the FTI
   lookup through the write path. In-process 2-node fan-out + dedup test in
   `coordinator/read.rs`.
+- **Replica-side `fts_match` memory bound (t_ee98faa0 layer 2).** After the
+  coordinator-side fix, one broad `fts_match('memory') LIMIT 10` still
+  OOM-killed all three 2 GiB replicas at once inside each replica's
+  `fulltext_search`. The query-derived `LIMIT k` is now pushed down end-to-end
+  (`WritePath::fulltext_search(.., limit)` →
+  `coordinate_fulltext_search(.., limit)` →
+  `FulltextSearchRequestPayload.limit` → engine top-k / streaming sidecar
+  search in `ferrosa-storage`/`ferrosa-index`), so each replica holds O(k) and
+  the union is ≤ replicas × k keys. The CQL router escalates k geometrically
+  when post-filtering exhausts the bounded hit set (completeness preserved —
+  no server-side caps). NOTE: `FulltextSearchRequestPayload` gained a bincode
+  field — internode wire change; upgrade all nodes together.
 
 ## Now (highest value)
 
+- **Bound coordinator-side range-scan memory (`t_3fc6be3c` / `t_ee98faa0`).**
+  Root CONFIRMED: `coordinator::stream_consumer::consume_range_stream` accumulates
+  EVERY partition from EVERY replica into `StreamConsumeOutcome.partitions`, and
+  `coordinator::range_read_stream::coordinate_range_read_stream_limited_rows` then
+  `all_partitions.extend(outcome.partitions)` — peak = O(result). This is what
+  OOM-killed the coordinator on the live `fts_match` content scan and multi-page
+  projected scans, at the intentional 2 GiB cap. The replica *producer*
+  (`handle_stream_request` → chunked `emit_chunk`) and the coordinator's *Stream*
+  API (`range_read_stream_all_with`) are already bounded; the `Vec<Partition>`-
+  returning consume path is not. A faithful in-process RED that drives the REAL
+  wire serialization + `consume_range_stream` (peak grows with N; producer stays
+  flat) is committed in
+  `tests/replica_scan_serialization_memory_bound.rs`, plus a gated fly.io
+  multi-node harness (`deploy/fly-stream-scan/`, feature `live-infra-tests` +
+  `FERROSA_TEST_FLY`). FIX (pending, cross-crate): convert `consume_range_stream`
+  + `coordinate_range_read_stream_limited_rows` to yield partitions through a
+  bounded channel and rewire `WritePath::range_read` callers (the CQL
+  SELECT/ALLOW-FILTERING/FTS-content-scan surface) to consume the stream
+  partition-at-a-time. NEVER raise the 2 GiB cap — bounded memory is the fix.
 - **Build the external Jepsen harness (FMEA CL-1).** `ferrosa-jepsen` is designed
   and approved (`specs/todo/jepsen-e2e-test-plan.md`) but not built. It is the only
   thing that converts "Accord/Raft is *tested*" into "*validated under real
