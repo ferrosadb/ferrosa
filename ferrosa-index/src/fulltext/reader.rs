@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::builder::{FullTextIndex, Posting, TermEntry, FTI_MAGIC, FTI_VERSION};
 use super::query::{parse_fts_query, FtsQuery};
 use super::scoring::{bm25_score, Bm25Params};
+use super::topk::TopK;
 
 /// A scored search result from a full-text query.
 #[derive(Debug, Clone)]
@@ -31,6 +32,15 @@ impl FullTextIndexReader {
     pub fn open(bytes: Vec<u8>) -> Result<Self, String> {
         let fti = deserialize_fti(&bytes)?;
         Ok(Self { index: fti })
+    }
+
+    /// Wrap an already-built in-memory [`FullTextIndex`] directly.
+    ///
+    /// Avoids the `serialize_fti` → `deserialize_fti` round trip that the
+    /// transient memtable / sidecar-less-SSTable search paths used to pay
+    /// (3× the indexed text held at once — t_ee98faa0 layer 2).
+    pub fn from_index(index: FullTextIndex) -> Self {
+        Self { index }
     }
 
     /// Total number of documents in this index.
@@ -58,13 +68,13 @@ impl FullTextIndexReader {
     /// Results are sorted by descending BM25 score. Deduplication by
     /// partition key is applied: the maximum score for any key wins.
     pub fn search(&self, query: &FtsQuery) -> Vec<FtsHit> {
-        let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
+        let mut score_map: HashMap<&[u8], f64> = HashMap::new();
         self.eval_query(query, &mut score_map);
 
         let mut hits: Vec<FtsHit> = score_map
             .into_iter()
             .map(|(pk, score)| FtsHit {
-                partition_key: pk,
+                partition_key: pk.to_vec(),
                 score,
             })
             .collect();
@@ -86,9 +96,144 @@ impl FullTextIndexReader {
         Ok(self.search(&parsed))
     }
 
-    // ── Private query evaluation ──────────────────────────────────────────────
+    /// Execute a parsed [`FtsQuery`] keeping only the `k` best-scoring hits,
+    /// with per-search memory bounded by the QUERY-derived `k` — never
+    /// score-everything-then-rank (t_ee98faa0 layer 2).
+    ///
+    /// Matching semantics are identical to [`Self::search`]; only the amount
+    /// of state held at once differs:
+    ///   * `Term` — streams the term's postings through a bounded top-k heap:
+    ///     O(k) additional memory, independent of the matching-doc count.
+    ///   * `MultiTerm` / `Phrase` — drives the smallest posting list and
+    ///     intersects against per-term key maps that BORROW from the index
+    ///     (no key clones); the owned result set is O(k).
+    ///   * Other shapes (`And`/`Or`/`Not`/`Prefix`) — borrow-based evaluation
+    ///     (no key clones) followed by bounded top-k selection; the owned
+    ///     result set is O(k), the transient borrowed map is O(matching docs)
+    ///     of pointers.
+    pub fn search_top_k(&self, query: &FtsQuery, k: usize) -> Vec<FtsHit> {
+        if k == 0 {
+            return vec![];
+        }
+        let mut topk = TopK::new(k);
+        match query {
+            FtsQuery::Term(term) => self.stream_term_top_k(term, &mut topk),
+            FtsQuery::MultiTerm(terms) | FtsQuery::Phrase(terms) => {
+                self.stream_conjunction_top_k(terms, &mut topk);
+            }
+            other => {
+                // Compound shapes reuse the exact evaluator; keys stay
+                // borrowed (pointer-sized) until the k winners are cloned.
+                let mut scores: HashMap<&[u8], f64> = HashMap::new();
+                self.eval_query(other, &mut scores);
+                for (pk, score) in scores {
+                    topk.push(pk, score);
+                }
+            }
+        }
+        topk.into_hits()
+    }
 
-    fn eval_query(&self, query: &FtsQuery, scores: &mut HashMap<Vec<u8>, f64>) {
+    /// Stream a single term's postings through the bounded top-k heap:
+    /// O(k) additional memory, independent of the matching-doc count. A
+    /// posting list holds one posting per document, so no dedup map is needed.
+    fn stream_term_top_k(&self, term: &str, topk: &mut TopK) {
+        let Some(entry) = self.index.terms.get(term) else {
+            return;
+        };
+        let params = Bm25Params::default();
+        let n = self.index.doc_count as u64;
+        let df = entry.doc_freq as u64;
+        let avgdl = self.index.avgdl();
+        for posting in &entry.postings {
+            let s = bm25_score(posting.term_freq, df, n, posting.doc_len, avgdl, &params);
+            topk.push(&posting.partition_key, s);
+        }
+    }
+
+    /// Bounded conjunction (`MultiTerm`/`Phrase`): drive the smallest posting
+    /// list, intersect against the other terms' postings via key maps that
+    /// BORROW from the index (no key clones), sum the per-term BM25 scores —
+    /// identical semantics to the map-based evaluator — and retain only the
+    /// top-k. Owned memory is O(k); the transient borrowed maps are
+    /// pointer-sized per posting of the non-driver terms.
+    fn stream_conjunction_top_k(&self, terms: &[String], topk: &mut TopK) {
+        if terms.is_empty() {
+            return;
+        }
+        let mut entries: Vec<&TermEntry> = Vec::with_capacity(terms.len());
+        for term in terms {
+            match self.index.terms.get(term) {
+                Some(e) => entries.push(e),
+                // Conjunction: a missing term means nothing matches.
+                None => return,
+            }
+        }
+        let driver_idx = (0..entries.len())
+            .min_by_key(|&i| entries[i].postings.len())
+            .expect("non-empty terms");
+
+        // Borrowed key → posting maps for every non-driver DISTINCT entry.
+        let mut other_maps: Vec<(usize, HashMap<&[u8], &Posting>)> = Vec::new();
+        for (i, entry) in entries.iter().enumerate() {
+            if i == driver_idx {
+                continue;
+            }
+            let map: HashMap<&[u8], &Posting> = entry
+                .postings
+                .iter()
+                .map(|p| (p.partition_key.as_slice(), p))
+                .collect();
+            other_maps.push((i, map));
+        }
+
+        let params = Bm25Params::default();
+        let n = self.index.doc_count as u64;
+        let avgdl = self.index.avgdl();
+        'postings: for posting in &entries[driver_idx].postings {
+            let key = posting.partition_key.as_slice();
+            let mut score = bm25_score(
+                posting.term_freq,
+                entries[driver_idx].doc_freq as u64,
+                n,
+                posting.doc_len,
+                avgdl,
+                &params,
+            );
+            for (i, map) in &other_maps {
+                let Some(other) = map.get(key) else {
+                    continue 'postings; // must contain ALL terms
+                };
+                score += bm25_score(
+                    other.term_freq,
+                    entries[*i].doc_freq as u64,
+                    n,
+                    other.doc_len,
+                    avgdl,
+                    &params,
+                );
+            }
+            topk.push(key, score);
+        }
+    }
+
+    /// Parse `query` then run [`Self::search_top_k`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the query string fails to parse.
+    pub fn search_top_k_str(&self, query: &str, k: usize) -> Result<Vec<FtsHit>, String> {
+        let parsed = parse_fts_query(query)?;
+        Ok(self.search_top_k(&parsed, k))
+    }
+
+    // ── Private query evaluation ──────────────────────────────────────────────
+    //
+    // Score maps BORROW their doc keys from the index (t_ee98faa0 layer 2):
+    // evaluation never clones a doc key, so transient state is pointer-sized
+    // per matched doc. Owned keys are produced only for the final hits.
+
+    fn eval_query<'a>(&'a self, query: &FtsQuery, scores: &mut HashMap<&'a [u8], f64>) {
         match query {
             FtsQuery::Term(term) => self.score_term(term, scores),
             FtsQuery::MultiTerm(terms) => {
@@ -97,10 +242,10 @@ impl FullTextIndexReader {
                 if terms.is_empty() {
                     return;
                 }
-                let mut first_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                let mut first_scores: HashMap<&[u8], f64> = HashMap::new();
                 self.score_term(&terms[0], &mut first_scores);
                 for term in &terms[1..] {
-                    let mut term_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                    let mut term_scores: HashMap<&[u8], f64> = HashMap::new();
                     self.score_term(term, &mut term_scores);
                     // Keep only partition keys present in both sets.
                     first_scores.retain(|pk, _| term_scores.contains_key(pk));
@@ -123,9 +268,9 @@ impl FullTextIndexReader {
                 if words.is_empty() {
                     return;
                 }
-                let mut candidates: Option<HashMap<Vec<u8>, f64>> = None;
+                let mut candidates: Option<HashMap<&[u8], f64>> = None;
                 for word in words {
-                    let mut word_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                    let mut word_scores: HashMap<&[u8], f64> = HashMap::new();
                     self.score_term(word, &mut word_scores);
                     match candidates.take() {
                         None => candidates = Some(word_scores),
@@ -148,14 +293,14 @@ impl FullTextIndexReader {
                 }
             }
             FtsQuery::And(left, right) => {
-                let mut left_scores: HashMap<Vec<u8>, f64> = HashMap::new();
-                let mut right_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                let mut left_scores: HashMap<&[u8], f64> = HashMap::new();
+                let mut right_scores: HashMap<&[u8], f64> = HashMap::new();
                 self.eval_query(left, &mut left_scores);
                 self.eval_query(right, &mut right_scores);
                 // Intersection: only keys present in both.
                 for (pk, ls) in &left_scores {
                     if let Some(rs) = right_scores.get(pk) {
-                        let entry = scores.entry(pk.clone()).or_insert(0.0);
+                        let entry = scores.entry(pk).or_insert(0.0);
                         *entry = entry.max(ls + rs);
                     }
                 }
@@ -169,15 +314,15 @@ impl FullTextIndexReader {
             }
             FtsQuery::Not(inner) => {
                 // NOT: collect all documents, then remove those matching inner.
-                let mut all_scores: HashMap<Vec<u8>, f64> = HashMap::new();
+                let mut all_scores: HashMap<&[u8], f64> = HashMap::new();
                 for entry in self.index.terms.values() {
                     for posting in &entry.postings {
                         all_scores
-                            .entry(posting.partition_key.clone())
+                            .entry(posting.partition_key.as_slice())
                             .or_insert(1.0);
                     }
                 }
-                let mut excluded: HashMap<Vec<u8>, f64> = HashMap::new();
+                let mut excluded: HashMap<&[u8], f64> = HashMap::new();
                 self.eval_query(inner, &mut excluded);
                 for pk in excluded.keys() {
                     all_scores.remove(pk);
@@ -193,7 +338,7 @@ impl FullTextIndexReader {
     const MAX_WILDCARD_EXPANSION: usize = 10_000;
 
     /// Evaluate a prefix wildcard query, expanding to matching terms with a cap.
-    fn eval_prefix(&self, prefix: &str, scores: &mut HashMap<Vec<u8>, f64>) {
+    fn eval_prefix<'a>(&'a self, prefix: &str, scores: &mut HashMap<&'a [u8], f64>) {
         // Collect matching terms and their doc frequencies.
         let mut matching: Vec<(&str, u32)> = self
             .index
@@ -216,7 +361,7 @@ impl FullTextIndexReader {
     }
 
     /// Score all postings for a single term using BM25.
-    fn score_term(&self, term: &str, scores: &mut HashMap<Vec<u8>, f64>) {
+    fn score_term<'a>(&'a self, term: &str, scores: &mut HashMap<&'a [u8], f64>) {
         let entry = match self.index.terms.get(term) {
             Some(e) => e,
             None => return,
@@ -228,7 +373,9 @@ impl FullTextIndexReader {
 
         for posting in &entry.postings {
             let s = bm25_score(posting.term_freq, df, n, posting.doc_len, avgdl, &params);
-            let entry_score = scores.entry(posting.partition_key.clone()).or_insert(0.0);
+            let entry_score = scores
+                .entry(posting.partition_key.as_slice())
+                .or_insert(0.0);
             *entry_score += s;
         }
     }

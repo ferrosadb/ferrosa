@@ -11,6 +11,14 @@
 //! These tests drive the real TCP server using raw CQL frames so they validate
 //! the full codec + connection state machine, not just unit parsers.
 
+// This integration test uses `ferrosa_cql::test_util::standalone_for_test`, which
+// is `#[cfg(any(test, feature = "test-util"))]`. An integration test builds the
+// library WITHOUT `cfg(test)`, so the module only exists when the `test-util`
+// feature is enabled. Gate the whole file on the feature so builds/clippy without
+// it (e.g. CI's `clippy --all-targets`) don't fail to resolve the module. The
+// `Test + Coverage` job enables `test-util`, so the test still runs there.
+#![cfg(feature = "test-util")]
+
 use std::time::Duration;
 
 use bytes::{Buf, BufMut, BytesMut};

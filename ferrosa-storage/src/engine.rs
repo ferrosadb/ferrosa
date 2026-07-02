@@ -745,6 +745,16 @@ fn eager_index_build_job(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only observability: FTI sidecar files consulted by
+    /// `fulltext_search` on this thread. Lets tests assert STRUCTURALLY that a
+    /// query against one index never touches another index's sidecars — incl.
+    /// orphaned/dangling registrations (t_ee98faa0 layer 2, suspect 2).
+    pub(crate) static FTS_SIDECAR_FILES_CONSULTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Top-level storage engine.
 ///
 /// One instance per node. Manages multiple tables, each with its own
@@ -5985,12 +5995,29 @@ impl StorageEngine {
     /// Truncates a table: clears the memtable and drops all SSTable references.
     ///
     /// Full-text search across all FTI sidecar files for a table+index.
+    ///
+    /// `limit` is the QUERY-derived bound (the statement's `LIMIT k`, pushed
+    /// down by the coordinator — never a server-side cap): when `Some(k)`,
+    /// every per-source search keeps a bounded top-k working set and the
+    /// merged result is truncated to the k best-scoring doc keys, so
+    /// replica-side memory is O(k), independent of the matching-doc count
+    /// (t_ee98faa0 layer 2 — a broad `fts_match` used to materialize every
+    /// matching doc key on every replica at once and OOM the node). When
+    /// `None` the COMPLETE match set is returned (no server-side truncation);
+    /// per-sidecar streaming still bounds transient memory.
+    ///
+    /// Only sidecars named `{gen}-FTI-{index_name}.db` — the single index the
+    /// query names — are consulted; unrelated or orphaned index registrations
+    /// are never touched on this path (pinned by
+    /// `fts_search_touches_only_queried_index_sidecars`).
     pub fn fulltext_search(
         &self,
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<Vec<u8>>> {
+        use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
         use std::collections::{HashMap, HashSet};
 
@@ -6019,21 +6046,61 @@ impl StorageEngine {
             }
         }
 
+        if !self.tables.read().contains_key(table_id) {
+            return Ok(vec![]);
+        }
+        // Parse once, up front: an invalid query fails loudly before any
+        // sidecar/scan work instead of erroring only when a sidecar exists.
+        let parsed = parse_fts_query(query).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
+        })?;
+
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
+        let merge_hits = |score_map: &mut HashMap<Vec<u8>, f64>, hits: Vec<(Vec<u8>, f64)>| {
+            for (partition_key, score) in hits {
+                let entry = score_map.entry(partition_key).or_insert(f64::MIN);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        };
+
         {
             let tables = self.tables.read();
             let Some(state) = tables.get(table_id) else {
                 return Ok(vec![]);
             };
-            for (partition_key, score) in state.store.fulltext_memtable_search(index_name, query)? {
-                let entry = score_map.entry(partition_key).or_insert(0.0);
-                if score > *entry {
-                    *entry = score;
-                }
-            }
+            merge_hits(
+                &mut score_map,
+                state
+                    .store
+                    .fulltext_memtable_search(index_name, query, limit)?,
+            );
         }
 
         for fti_path in fti_files {
+            #[cfg(test)]
+            FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(c.get() + 1));
+            // Single-term queries (the live-OOM shape) stream postings straight
+            // off the sidecar file with a bounded top-k working set — the whole
+            // index is never read or deserialized into memory.
+            if let ferrosa_index::fulltext::query::FtsQuery::Term(term) = &parsed {
+                match ferrosa_index::fulltext::stream::scan_term_top_k(&fti_path, term, limit) {
+                    Ok(hits) => {
+                        merge_hits(
+                            &mut score_map,
+                            hits.into_iter()
+                                .map(|h| (h.partition_key, h.score))
+                                .collect(),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}");
+                        continue;
+                    }
+                }
+            }
             let bytes = match std::fs::read(&fti_path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -6048,20 +6115,16 @@ impl StorageEngine {
                     continue;
                 }
             };
-            let hits = match reader.search_str(query) {
-                Ok(h) => h,
-                Err(e) => {
-                    return Err(ferrosa_common::Error::InvalidFormat(format!(
-                        "fts_match query error: {e}"
-                    )));
-                }
+            let hits = match limit {
+                Some(k) => reader.search_top_k(&parsed, k),
+                None => reader.search(&parsed),
             };
-            for hit in hits {
-                let entry = score_map.entry(hit.partition_key).or_insert(0.0);
-                if hit.score > *entry {
-                    *entry = hit.score;
-                }
-            }
+            merge_hits(
+                &mut score_map,
+                hits.into_iter()
+                    .map(|h| (h.partition_key, h.score))
+                    .collect(),
+            );
         }
 
         // Fallback: scan any LIVE SSTable whose on-disk FTI sidecar is missing
@@ -6070,21 +6133,23 @@ impl StorageEngine {
         {
             let tables = self.tables.read();
             if let Some(state) = tables.get(table_id) {
-                for (partition_key, score) in state.store.fulltext_sstable_scan_missing_sidecar(
-                    index_name,
-                    query,
-                    &covered_gens,
-                )? {
-                    let entry = score_map.entry(partition_key).or_insert(0.0);
-                    if score > *entry {
-                        *entry = score;
-                    }
-                }
+                merge_hits(
+                    &mut score_map,
+                    state.store.fulltext_sstable_scan_missing_sidecar(
+                        index_name,
+                        query,
+                        &covered_gens,
+                        limit,
+                    )?,
+                );
             }
         }
 
         let mut results: Vec<(Vec<u8>, f64)> = score_map.into_iter().collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(k) = limit {
+            results.truncate(k);
+        }
         Ok(results.into_iter().map(|(pk, _)| pk).collect())
     }
 
@@ -18858,6 +18923,90 @@ mod tests {
         );
     }
 
+    /// t_ee98faa0 layer 2, suspect 2 (orphaned `fts_probe_*` registrations):
+    /// a query against ONE full-text index must consult ONLY that index's
+    /// sidecars — never another index's sidecar files in the same table dir,
+    /// and never a dangling `system_schema.indexes` registration whose table
+    /// was dropped. The dangling row itself is skipped loudly at reload time
+    /// (boot), not touched on the query path.
+    #[test]
+    fn fts_search_touches_only_queried_index_sidecars() {
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_a", 0).unwrap();
+
+        engine
+            .write(
+                &tid,
+                &make_key("r1"),
+                make_row(b"memory snippet content", 1000),
+                1000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // An ORPHANED sidecar for a different index in the SAME table dir
+        // (e.g. left behind by a dropped probe index). If the query path
+        // touched it, the counter below would over-count.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let mut orphan_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+        orphan_builder.add_document(b"orphan-doc".to_vec(), "memory orphan text");
+        std::fs::write(
+            table_dir.join("gen-orphan-FTI-fts_probe_orphan.db"),
+            orphan_builder.finish().unwrap(),
+        )
+        .unwrap();
+
+        // A DANGLING system_schema.indexes registration: its table was
+        // dropped, so column resolution fails. Reload must skip it (loudly)
+        // and it must never be consulted at query time.
+        let dangling = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "test_ks".to_string(),
+            table: "fts_probe_dropped".to_string(),
+            name: "fts_probe_dangling".to_string(),
+            index_type: ferrosa_index::IndexType::FullText,
+            target_columns: vec!["context_snippet".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let row = persistence::index_to_rows(&dangling);
+        engine
+            .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+            .unwrap();
+        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(
+            restored, 0,
+            "the dangling registration must be skipped, not restored"
+        );
+
+        // The query against idx_a: exactly ONE sidecar (idx_a's) consulted.
+        FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(0));
+        let hits = engine
+            .fulltext_search(&tid, "idx_a", "memory", Some(10))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the indexed row must match");
+        let consulted = FTS_SIDECAR_FILES_CONSULTED.with(|c| c.get());
+        assert_eq!(
+            consulted, 1,
+            "a query against idx_a must consult ONLY idx_a's sidecar — \
+             {consulted} files were consulted (orphaned index registrations/\
+             sidecars must never be touched on the query path)"
+        );
+
+        // The orphan doc must never leak into idx_a's results.
+        assert!(
+            !hits.contains(&b"orphan-doc".to_vec()),
+            "orphan sidecar content must not appear in idx_a results"
+        );
+    }
+
     // ── FT-018: FTI sidecar created on flush ─────────────────────────────────
 
     /// Verifies that flushing a table with a fulltext index produces an FTI
@@ -18952,7 +19101,9 @@ mod tests {
             engine.flush(&indexes_tid).unwrap();
 
             // Sanity: fts_match works before the restart.
-            let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+            let hits = engine
+                .fulltext_search(&tid, "idx_body", "rust", None)
+                .unwrap();
             assert!(!hits.is_empty(), "fts_match must work before reopen");
         }
 
@@ -18963,7 +19114,9 @@ mod tests {
         engine.reload_indexes_from_system_schema().unwrap();
 
         // The bug: fts_match must still return the row after restart.
-        let hits = engine.fulltext_search(&tid, "idx_body", "rust").unwrap();
+        let hits = engine
+            .fulltext_search(&tid, "idx_body", "rust", None)
+            .unwrap();
         assert!(
             !hits.is_empty(),
             "fts_match must return the indexed row after an engine reopen"
@@ -19000,7 +19153,7 @@ mod tests {
 
         // Query for rows with BOTH "distributed" AND "database".
         let results = engine
-            .fulltext_search(&tid, "idx_body", "distributed AND database")
+            .fulltext_search(&tid, "idx_body", "distributed AND database", None)
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
@@ -19040,7 +19193,7 @@ mod tests {
             .unwrap();
 
         let results = engine
-            .fulltext_search(&tid, "idx_body", "ferrosaftsfresh")
+            .fulltext_search(&tid, "idx_body", "ferrosaftsfresh", None)
             .unwrap();
         let result_keys: Vec<String> = results
             .iter()
@@ -19156,7 +19309,9 @@ mod tests {
         }
 
         // Before compaction: the probe is found via the per-gen FTI sidecars.
-        let before = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let before = engine
+            .fulltext_search(&tid, "idx_body", PROBE, None)
+            .unwrap();
         assert_eq!(
             before.len(),
             1,
@@ -19168,7 +19323,9 @@ mod tests {
         engine.poll_compactions().await;
 
         // After compaction the probe MUST still be found.
-        let after = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let after = engine
+            .fulltext_search(&tid, "idx_body", PROBE, None)
+            .unwrap();
         let keys: Vec<String> = after
             .iter()
             .filter_map(|dk| {
@@ -19219,7 +19376,7 @@ mod tests {
         // Sanity: found via the freshly written FTI sidecar.
         assert_eq!(
             engine
-                .fulltext_search(&tid, "idx_body", PROBE)
+                .fulltext_search(&tid, "idx_body", PROBE, None)
                 .unwrap()
                 .len(),
             1,
@@ -19246,7 +19403,9 @@ mod tests {
         );
 
         // The row MUST still be found — a missing sidecar cannot hide a live row.
-        let hits = engine.fulltext_search(&tid, "idx_body", PROBE).unwrap();
+        let hits = engine
+            .fulltext_search(&tid, "idx_body", PROBE, None)
+            .unwrap();
         let keys: Vec<String> = hits
             .iter()
             .filter_map(|dk| {
