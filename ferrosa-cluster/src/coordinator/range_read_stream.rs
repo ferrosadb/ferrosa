@@ -32,8 +32,8 @@ use super::stream_consumer::{consume_range_stream, StreamConsumeError};
 use super::ClusterCoordinator;
 use crate::error::ClusterError;
 use crate::raft::handlers::{
-    partition_from_wire, RangeReadStreamCancelPayload, RangeReadStreamChunkPayload,
-    RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+    partition_from_wire, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
+    RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
 };
 
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
@@ -1154,90 +1154,6 @@ fn build_out_fragment(
 struct RemoteFanout {
     streams: Vec<ClusterPartitionStream>,
     fire_failures: usize,
-    /// Cancel-on-drop guard for the replicas this fan-out fired a request to.
-    /// It MUST ride with the merged output stream so that when the consumer
-    /// (the CQL paging collector) drops the stream mid-scan — every page but
-    /// the last does exactly this — the remote replicas are told to stop.
-    cancel_guard: RemoteStreamCancelGuard,
-}
-
-/// Fires a `RangeReadStreamCancel` to every remote replica a fan-out started a
-/// stream on, when the coordinator abandons the merged output stream.
-///
-/// t_3fc6be3c — WITHOUT this, a paged multi-replica projected scan HANGS. The
-/// CQL paging collector fills one page and drops the merged stream; the
-/// coordinator-side merge + forwarder tasks then die, but the REMOTE replica
-/// producers (`handle_stream_request_with_cancel`) were never notified, so each
-/// keeps scanning the WHOLE table and firing chunk frames back on `Lane::Bulk`.
-/// Every subsequent page fans out to the same replicas again, so `pages ×
-/// replicas` unbounded full-table scans pile up on the Bulk lane, starving the
-/// heartbeat/keepalive traffic sharing the connection until the driver declares
-/// the connection defunct. The single-node (`expected_done == 0`) fan-out has no
-/// remote producers, which is why only the multi-replica path deadlocks.
-///
-/// The cancel is best-effort and fire-and-forget: the remote's request handler
-/// observes the `CancellationToken` between batches and stops (`stream_request_
-/// cancel_stops_reader_within_one_batch`). The route is already unregistered by
-/// the forwarder task; unregistering again here is idempotent and covers the
-/// case where the consumer drops before the forwarder observed channel close.
-struct RemoteStreamCancelGuard {
-    peer_manager: std::sync::Arc<ferrosa_net::peer::PeerManager>,
-    stream_router: std::sync::Arc<ferrosa_net::stream_router::StreamRouter>,
-    /// `(host_id, request_id)` for each replica a request was fired to.
-    fired: Vec<(uuid::Uuid, u32)>,
-}
-
-impl Drop for RemoteStreamCancelGuard {
-    fn drop(&mut self) {
-        if self.fired.is_empty() {
-            return;
-        }
-        let peer_manager = self.peer_manager.clone();
-        let stream_router = self.stream_router.clone();
-        let fired = std::mem::take(&mut self.fired);
-        // Unregister synchronously first so any late chunk immediately returns
-        // `NoRoute` and is discarded — this runs regardless of runtime presence.
-        for (_host, request_id) in &fired {
-            stream_router.unregister(*request_id);
-        }
-        // The cancel fire is async, so spawn a self-contained task. Drop can run
-        // outside a runtime (e.g. a sync test teardown or process shutdown), where
-        // `tokio::spawn` would panic; skip the fire in that case — the routes are
-        // already gone and a runtime-less drop means the process is tearing down,
-        // so the remote scans die with the connections anyway (documented,
-        // observable best-effort cleanup).
-        if tokio::runtime::Handle::try_current().is_err() {
-            tracing::debug!(
-                "streaming range read: cancel-on-drop skipped (no tokio runtime at drop); routes unregistered"
-            );
-            return;
-        }
-        TaskPool::current("range-read-cancel").spawn(async move {
-            for (host_id, request_id) in fired {
-                let payload = RangeReadStreamCancelPayload { request_id };
-                let body = match bincode::serialize(&payload) {
-                    Ok(b) => Bytes::from(b),
-                    Err(e) => {
-                        tracing::warn!(
-                            request_id,
-                            "streaming range read: encode cancel failed: {e}"
-                        );
-                        continue;
-                    }
-                };
-                if let Err(e) = peer_manager
-                    .fire(host_id, Message::RangeReadStreamCancel(body), Lane::Bulk)
-                    .await
-                {
-                    tracing::debug!(
-                        request_id,
-                        peer = %host_id,
-                        "streaming range read: cancel fire failed (replica may already be done): {e}"
-                    );
-                }
-            }
-        });
-    }
 }
 
 impl ClusterCoordinator {
@@ -1250,7 +1166,6 @@ impl ClusterCoordinator {
     ) -> crate::error::Result<RemoteFanout> {
         let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len());
         let mut fire_failures = 0usize;
-        let mut fired: Vec<(uuid::Uuid, u32)> = Vec::with_capacity(remotes.len());
 
         for (host_id, _addr) in remotes {
             let request_id = self.next_stream_request_id();
@@ -1288,10 +1203,6 @@ impl ClusterCoordinator {
                 continue;
             }
 
-            // Record the started stream so the cancel-on-drop guard can abort it
-            // when the coordinator abandons the merged output mid-page.
-            fired.push((*host_id, request_id));
-
             let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
             let router = self.stream_router.clone();
             TaskPool::current("range-read-forward").spawn(async move {
@@ -1305,34 +1216,11 @@ impl ClusterCoordinator {
             streams.push(Box::pin(stream));
         }
 
-        let cancel_guard = RemoteStreamCancelGuard {
-            peer_manager: self.peer_manager.clone(),
-            stream_router: self.stream_router.clone(),
-            fired,
-        };
-
         Ok(RemoteFanout {
             streams,
             fire_failures,
-            cancel_guard,
         })
     }
-}
-
-/// Wrap a merged-output `mpsc::Receiver` in the coordinator's partition stream,
-/// carrying `cancel_guard` in the stream state so it drops — and fires
-/// `RangeReadStreamCancel` to every remote producer — exactly when the consumer
-/// drops the stream (t_3fc6be3c). Ownership of the guard rides the `unfold`
-/// state, so an early page abandon aborts the remote scans instead of leaking
-/// them onto the Bulk lane.
-fn cancel_on_drop_stream(
-    out_rx: mpsc::Receiver<crate::error::Result<Partition>>,
-    cancel_guard: RemoteStreamCancelGuard,
-) -> ClusterPartitionStream {
-    Box::pin(futures::stream::unfold(
-        (out_rx, cancel_guard),
-        |(mut rx, guard)| async move { rx.recv().await.map(|item| (item, (rx, guard))) },
-    ))
 }
 
 /// Drive a token-aware N-way fragment merge of the LOCAL fragmented stream and
@@ -1499,16 +1387,21 @@ impl ClusterCoordinator {
         let storage = self.storage.clone();
         let table_id = table_id.clone();
         let start = start.cloned();
-        let RemoteFanout {
-            streams,
-            cancel_guard,
-            ..
-        } = fanout;
         TaskPool::current("range-read-merge-nway-paged").spawn(async move {
-            merge_local_and_remotes_fragmented(storage, table_id, wanted, start, streams, out_tx)
-                .await;
+            merge_local_and_remotes_fragmented(
+                storage,
+                table_id,
+                wanted,
+                start,
+                fanout.streams,
+                out_tx,
+            )
+            .await;
         });
-        Ok(cancel_on_drop_stream(out_rx, cancel_guard))
+        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
     }
 
     /// Resume-capable streaming range scan with an inclusive lower-bound key.
@@ -1667,12 +1560,6 @@ impl ClusterCoordinator {
                 );
             }
 
-            let RemoteFanout {
-                streams,
-                cancel_guard,
-                ..
-            } = fanout;
-
             // N-way merge -> merge_rx.
             let (merge_tx, merge_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
             let storage = self.storage.clone();
@@ -1683,7 +1570,7 @@ impl ClusterCoordinator {
                     merge_table_id,
                     projected_regular_ordinals,
                     None,
-                    streams,
+                    fanout.streams,
                     merge_tx,
                 )
                 .await;
@@ -1699,12 +1586,9 @@ impl ClusterCoordinator {
             } else {
                 merge_rx
             };
-            // Carry the cancel-on-drop guard with the stream so abandoning any
-            // page fires `RangeReadStreamCancel` to the remote producers
-            // (t_3fc6be3c). The `wrap_partition_count_limit` feeder owns and
-            // drops the guard-carrying stream on cancel, so the guard fires
-            // through the wrapper too.
-            let stream = cancel_on_drop_stream(out_rx, cancel_guard);
+            let stream = Box::pin(futures::stream::unfold(out_rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            }));
             return Ok(Self::wrap_partition_count_limit(stream, partition_limit));
         }
 

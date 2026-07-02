@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: fmea
-last_updated: 2026-07-01
+last_updated: 2026-06-19
 ---
 
 # ferrosa-cluster — FMEA / Known Issues
@@ -26,7 +26,6 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 | CL-11 | **Multi-DC Accord apply reorder-buffer stall.** Cross-DC `AccordApply` entries buffer by HLC; if writes outrun the `max_skew` watermark (default 200 ms), the buffer grows past `REORDER_BUFFER_ALARM_DEPTH = 100`. | Cross-DC apply latency rises; buffer pressure under clock skew | 5 | 3 | 4 | 60 | Alarm metric on buffer depth; applied-txn ledger dedupes; GC bounds memory. Cross-DC paths are newest and least battle-tested (ADR-015). |
 | CL-12 | **Bincode Raft-log wire fragility.** `RaftOp` variant reordering silently corrupts the persisted log. | A careless enum edit bricks log replay across a rolling upgrade | 9 | 1 | 5 | 45 | `raft_op_variant_tag_stability` test pins discriminants; recovery tooling `ferrosa-ctl raft log-inspect`/`log-truncate`; legacy format auto-migrated on load. |
 | CL-13 | **Degraded pair read rejection (fixed).** `transition_to_degraded()` previously replaced `WritePath` with `Unavailable`, blocking both writes AND reads. The `WritePath` is also the read path. `is_cql_ready()` returned `true` for `DegradedPair` (intending stale reads), but the read methods on `Unavailable` returned errors. | After primary failure, follower could not serve reads of replicated data until operator promotion — violating the pair-mode design rule that reads work without promotion. | 8 | 4 | 5 | 160 | **Fixed:** `DegradedPair(Arc<PairCoordinator>)` variant preserves `local_storage()` for reads while rejecting writes. Regression test `degraded_pair_serves_stale_reads` verifies the `WritePath` variant after peer loss. |
-| CL-14 | **Paged multi-replica range scan leaked uncancelled remote producers (fixed).** t_3fc6be3c. On RF>1 a multi-page projected scan (`SELECT <col>` paged) fans out per-replica streaming range-read producers. When the CQL paging collector filled a page and DROPPED the merged stream (every page but the last), the coordinator killed its own merge/forwarder tasks but never told the REMOTE replicas to stop — `RangeReadStreamCancel` was written on both sides but the coordinator never SENT it and the request handler never REGISTERED its MsgType. Each abandoned producer ran a full-table scan and fired chunks back on `Lane::Bulk`; `pages × replicas` of them piled up. | Bulk-lane saturation starved the connection's heartbeat traffic → driver declares `Connection defunct by heartbeat` → the multi-page scan HANGS on RF>1 (data intact, no OOM). Single-node (`expected_done == 0`) fan-out has no remote producers, so it was unaffected. | 8 | 6 | 6 | 288 | **Fixed:** `RemoteStreamCancelGuard` rides the merged output stream (both the `paged_multi_replica_stream` and the `expected_done>1` arm) and fires `RangeReadStreamCancel` to every `(host_id, request_id)` on drop; `MsgType::RangeReadStreamCancel` is now registered to the request handler. Regression: `range_scan_multi_replica_paging.rs` drives a real 3-node loopback (`expected_done == 2`) — one test asserts abandoned producers are cancelled, one pages a real scan to completion (union == full keyset, no gaps/dupes, terminates under a hard timeout). |
 
 ## Top risks to act on
 

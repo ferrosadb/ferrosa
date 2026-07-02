@@ -1059,18 +1059,8 @@ impl ModeController {
             sink_factory,
             STREAMING_CHUNK_PARTITIONS,
         ));
-        self.registry.register(
-            MsgType::RangeReadStreamRequest,
-            stream_request_handler.clone(),
-        );
-        // The SAME handler also serves RangeReadStreamCancel: it owns the
-        // per-request `CancellationToken` map, so a coordinator that abandons a
-        // paged multi-replica scan (t_3fc6be3c) can fire `RangeReadStreamCancel`
-        // and have the in-flight producer stop between batches. Without this
-        // registration the cancel frame arrives with no handler and is dropped,
-        // leaking the remote scan onto the Bulk lane.
         self.registry
-            .register(MsgType::RangeReadStreamCancel, stream_request_handler);
+            .register(MsgType::RangeReadStreamRequest, stream_request_handler);
 
         // Coordinator side: routes inbound chunk/heartbeat/done
         // frames through the coordinator's shared StreamRouter so
