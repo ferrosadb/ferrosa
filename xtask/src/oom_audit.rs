@@ -48,6 +48,7 @@ pub mod rule {
     pub const CLONE_IN_SCAN_CLOSURE: &str = "clone-in-scan-closure";
     pub const COPIES_ROW_DATA_ARG: &str = "copies-row-data-arg";
     pub const COPY_DERIVE_LARGE_TYPE: &str = "copy-derive-large-type";
+    pub const SERVER_SIDE_RESULT_CAP: &str = "server-side-result-cap";
     pub const EXPIRED_ALLOW: &str = "expired-allow-entry";
 }
 
@@ -886,6 +887,47 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
             }
         }
 
+        // Rule 10: server-side result caps at call sites. The only legitimate
+        // result bound derives from the inbound query (limit/page/fetch);
+        // hardcoded literals (any magnitude) and consts cap results and mask
+        // materialization that should stream. `take(1)` (single-element
+        // accessor) is exempt.
+        if method == "take" || method == "truncate" {
+            if let Some(cap) = node.args.first().and_then(result_cap_arg) {
+                self.push_with_symbol(
+                    line,
+                    rule::SERVER_SIDE_RESULT_CAP,
+                    format!(
+                        "`.{method}({cap})` imposes a server-side result bound not derived from \
+                         the query's LIMIT/paging (caps mask materialization that should stream)"
+                    ),
+                    &cap,
+                );
+            }
+        }
+        if method == "clamp" || method == "min" {
+            let bound_arg = if method == "clamp" {
+                node.args.iter().nth(1)
+            } else {
+                node.args.first()
+            };
+            let recv_is_bound = receiver_trailing_ident(&node.receiver)
+                .is_some_and(|r| is_query_bound_receiver(&r));
+            if recv_is_bound {
+                if let Some(cap) = bound_arg.and_then(result_cap_arg) {
+                    self.push_with_symbol(
+                        line,
+                        rule::SERVER_SIDE_RESULT_CAP,
+                        format!(
+                            "`.{method}(.., {cap})` clamps a query-derived bound to a server-side \
+                             cap (results must be bounded only by the query's LIMIT/paging)"
+                        ),
+                        &cap,
+                    );
+                }
+            }
+        }
+
         // Rule 8 (method form): `buf.extend_from_slice(&rows)` clones every
         // element of a row-data slice into the buffer.
         if method == "extend_from_slice" {
@@ -928,6 +970,24 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
             }
         }
         syn::visit::visit_local(self, node);
+    }
+
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        // Rule 10: a result-count cap CONSTANT is a materialization confession
+        // — the code needs a ceiling precisely because something accumulates.
+        if int_literal_value(&node.expr).is_some() && is_result_cap_name(&node.ident.to_string()) {
+            let name = node.ident.to_string();
+            self.push_with_symbol(
+                node.ident.span().start().line,
+                rule::SERVER_SIDE_RESULT_CAP,
+                format!(
+                    "const `{name}` is a server-side result-count cap; results must be bounded \
+                     only by the inbound query's LIMIT/paging (stream instead of capping)"
+                ),
+                &name,
+            );
+        }
+        syn::visit::visit_item_const(self, node);
     }
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
@@ -1018,6 +1078,118 @@ fn block_has_push(block: &syn::Block) -> bool {
     let mut f = PushFinder { found: false };
     f.visit_block(block);
     f.found
+}
+
+/// Name fragments identifying MEMORY/shape/time bounds — the DESIRED kind of
+/// bound (bytes, frames, chunks, retries, timeouts…) — never result caps.
+const MEMORY_SHAPE_EXEMPT: &[&str] = &[
+    "BYTE",
+    "SIZE",
+    "FANIN",
+    "FRAME",
+    "CHUNK",
+    "BUFFER",
+    "CAPACITY",
+    "RETR",
+    "TIMEOUT",
+    "_MS",
+    "SECS",
+    "DEPTH",
+    "CONN",
+    "POOL",
+    "THREAD",
+    "LANE",
+    "INFLIGHT",
+    "WINDOW",
+    "CONCURRENCY",
+    "BACKOFF",
+    "INTERVAL",
+    "ATTEMPT",
+    // cache sizes are bounded-memory design, not result caps
+    "CACHE",
+    // *_LEN bounds the length of one value (bytes/chars), not a result count
+    "LEN",
+];
+
+fn is_memory_shape_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    MEMORY_SHAPE_EXEMPT.iter().any(|e| up.contains(e))
+}
+
+/// True if a const NAME denotes a server-side RESULT-COUNT cap: cap-ish
+/// (`LIMIT`/`CAP`/`MAX`) + a result unit (rows/partitions/…), and not a
+/// memory/shape/time bound.
+fn is_result_cap_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    if !(up.contains("LIMIT") || up.contains("CAP") || up.contains("MAX")) {
+        return false;
+    }
+    if is_memory_shape_name(name) {
+        return false;
+    }
+    const RESULT_UNITS: &[&str] = &[
+        "ROW",
+        "PARTITION",
+        "RESULT",
+        "READ",
+        "SCAN",
+        "RANGE",
+        "MATCH",
+        "KEY",
+        "CANDIDATE",
+        "ENTRY",
+        "DOC",
+        "HIT",
+        "RECORD",
+    ];
+    RESULT_UNITS.iter().any(|u| up.contains(u))
+}
+
+/// True for a `SCREAMING_SNAKE_CASE` ident (a const reference).
+fn is_screaming_const_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Integer value of a literal expression (`10_000` → 10000), if it is one.
+fn int_literal_value(expr: &syn::Expr) -> Option<u64> {
+    if let syn::Expr::Lit(l) = expr {
+        if let syn::Lit::Int(i) = &l.lit {
+            return i.base10_parse().ok();
+        }
+    }
+    None
+}
+
+/// If a bound argument is NOT derived from the inbound query, return a display
+/// name — that's a server-side result cap, whatever its magnitude.
+///
+/// Flags: ANY integer literal except `1` (`take(1)` is the single-element
+/// accessor idiom, equivalent to `.next()`), and any `SCREAMING_CASE` const
+/// that is not a memory/shape bound. Lowercase idents (`limit`, `page_size`,
+/// `fetch_size`, a local) are treated as query-derived and exempt — hardcoded
+/// caps hiding in locals are caught at their const declaration instead.
+fn result_cap_arg(expr: &syn::Expr) -> Option<String> {
+    if let Some(v) = int_literal_value(expr) {
+        return (v != 1).then(|| v.to_string());
+    }
+    if let syn::Expr::Path(p) = expr {
+        if let Some(seg) = p.path.segments.last() {
+            let name = seg.ident.to_string();
+            if is_screaming_const_name(&name) && !is_memory_shape_name(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// True if a `clamp`/`min` receiver looks like a query-derived result bound
+/// (`limit.min(CAP)`) — the shape that silently caps user results.
+fn is_query_bound_receiver(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("limit") || lower.contains("count") || lower.contains("rows") || lower == "n"
 }
 
 /// True if `attrs` contains `#[derive(.., Copy, ..)]`.
@@ -1892,6 +2064,128 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == rule::COPIES_ROW_DATA_ARG),
             "byte-buffer extends must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 10: server-side-result-cap --------------------------------------
+    #[test]
+    fn rule_result_cap_fires_on_cap_named_int_consts() {
+        // A result-count cap constant is a materialization confession: results
+        // must be bounded only by the inbound CQL LIMIT / paging.
+        let src = r#"
+            const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
+            pub const MAX_SCAN_PARTITIONS: usize = 5000;
+            const FTS_MATCH_CAP: usize = 512;
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP)
+            .count();
+        assert_eq!(count, 3, "row/partition/match count caps fire: {f:?}");
+        assert!(f.iter().any(|x| x.symbol == "DEFAULT_RANGE_READ_LIMIT"));
+    }
+
+    #[test]
+    fn rule_result_cap_does_not_fire_on_memory_or_shape_bounds() {
+        // Memory bounds (bytes/frames/chunks/buffers) and structural constants
+        // are the DESIRED kind of bound — never flag them.
+        let src = r#"
+            const MAX_FRAME_BYTES: usize = 16777216;
+            const CHUNK_SIZE_LIMIT: usize = 4096;
+            const MERGE_FANIN: usize = 64;
+            const MAX_RETRIES: usize = 5;
+            const WRITE_TIMEOUT_MS: u64 = 30000;
+            const LANE_CAPACITY: usize = 256;
+            const MAX_INFLIGHT_BYTES: usize = 33554432;
+            const DEFAULT_READER_CACHE_CAP: usize = 128;
+            const MAX_KEY_LEN: usize = 65535;
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "memory/shape/retry bounds must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_fires_on_clamp_min_to_cap() {
+        // Magnitude is irrelevant — min(500) caps results exactly like a
+        // 10k const. Only query-derived bounds are legitimate.
+        let src = r#"
+            fn f(limit: usize) -> usize {
+                let effective_limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
+                let capped = limit.min(MAX_SCAN_ROWS);
+                let small = limit.min(500);
+                effective_limit + capped + small
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP)
+            .count();
+        assert_eq!(
+            count, 3,
+            "clamping a user limit to a server cap fires: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_does_not_fire_on_legit_clamp_min() {
+        let src = r#"
+            fn f(limit: usize, items: &[u8], concurrency: usize) -> usize {
+                let a = limit.min(items.len());
+                let b = concurrency.clamp(1, MAX_RETRIES);
+                a + b
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "min(len) and non-result clamps must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_fires_on_any_hardcoded_take_truncate() {
+        // Generic: ANY hardcoded count caps results — 50 and 2 are as
+        // illegitimate as 10_000. Cap-named consts fire too.
+        let src = r#"
+            fn f(rows: Vec<R>) {
+                let v: Vec<R> = rows.into_iter().take(10000).collect();
+                let s: Vec<R> = rows.into_iter().take(50).collect();
+                let mut w = rows;
+                w.truncate(2);
+                let c = rows.iter().take(SOME_SERVER_CAP).count();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP)
+            .count();
+        assert_eq!(
+            count, 4,
+            "hardcoded take/truncate of any magnitude fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_result_cap_does_not_fire_on_small_take_or_query_limit() {
+        let src = r#"
+            fn f(rows: Vec<R>, limit: usize) {
+                let first = rows.iter().take(1).count();
+                let user: Vec<R> = rows.into_iter().take(limit).collect();
+                let mut w = user;
+                w.truncate(limit);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::SERVER_SIDE_RESULT_CAP),
+            "take(1)/take(limit)/truncate(limit) must not fire — the query's own \
+             limit is the ONLY legitimate result bound: {f:?}"
         );
     }
 
