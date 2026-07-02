@@ -43,15 +43,7 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   The `DEFAULT_RANGE_READ_LIMIT` (10_000) result cap is removed for the
   O(1)-streamable full-scan shapes, which are bounded only by the query's own
   `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
-  <partition-key column>`, `SELECT <cols> FROM t`) stream through
-  `range_read_projected_stream_all_with`. On the coordinated **cluster** path a
-  projected scan carrying a `partition_limit` (every paged fetch — the driver's
-  fetch_size becomes a per-page partition_limit — and `SELECT <cols> ... LIMIT
-  N`) now threads that bound through the coordinated scatter-gather + N-way merge
-  as a streaming partition-count PAGE stage (t_fed055cb), instead of the former
-  fail-loud refusal; over-fetch is safe because the exact result is enforced by
-  the query's own row-level `LIMIT`/paging_state, and paging continues to the
-  next page rather than truncating;
+  <partition-key column>`) stream through `range_read_projected_stream_all_with`;
   scalar aggregates (`SUM`/`MIN`/`MAX`/`AVG`) fold through an O(1) streaming
   accumulator (`stream_builtin_aggregates`) over the uncapped
   `range_read_stream_all_with` (exact over the whole table, no `all_rows`

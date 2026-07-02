@@ -657,19 +657,15 @@ impl WritePath {
                 ))
             }
             Self::Cluster(coordinator) => {
-                // A projected coordinated scan carrying a `partition_limit` (every
-                // paged scan — the driver's fetch_size becomes a per-page
-                // partition_limit — and `SELECT <cols> ... LIMIT N`) threads the
-                // bound through the coordinated scatter-gather + N-way merge as a
-                // streaming partition-count page stage. It is a PAGE bound, not a
-                // server-side result cap: over-fetch is safe (the CQL row-level
-                // LIMIT / paging_state enforces the exact result), so paging
-                // continues to the next page rather than truncating.
+                if partition_limit.is_some() {
+                    return Err(crate::error::ClusterError::Internal(
+                        "projected cluster range scan with partition_limit is not implemented; refusing to return partial results".into(),
+                    ));
+                }
                 coordinator
                     .coordinate_range_read_projected_stream_all_with(
                         table_id,
                         wanted,
-                        partition_limit,
                         cl,
                         strategy.replication_factor(),
                     )
