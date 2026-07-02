@@ -15,6 +15,7 @@
 //! consume.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -33,7 +34,9 @@ use crate::error::ClusterError;
 use crate::raft::handlers::{
     partition_from_wire, RangeReadStreamCancelPayload, RangeReadStreamChunkPayload,
     RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+    StreamResumePositionWire,
 };
+use crate::write_path::ScanResume;
 
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
 /// heartbeat. A producer that stops sending entirely for longer
@@ -57,6 +60,29 @@ const STREAM_RECEIVER_BUFFER: usize = 32;
 /// still amortizing the per-message frame overhead. Tunable later
 /// via NetConfig.
 pub const STREAMING_CHUNK_PARTITIONS: usize = 64;
+
+/// Producer flow-control window: chunk frames per stream request
+/// (t_a0f922a3 mode 2). The remote producer fires chunks with no per-frame
+/// acknowledgement, so everything it emits beyond what the consumer has
+/// drained sits in the coordinator's bounded route buffer
+/// ([`STREAM_RECEIVER_BUFFER`]). Without a window, any scan larger than the
+/// buffer overflows it the moment the consumer is slower than the wire —
+/// `StreamRouter::route` then FAIL-LOUD-closes the route and the query dies
+/// with a retryable ReadTimeout that drivers retry forever (the live
+/// `SELECT id FROM vfix.nums` paged scan blocked >14 min).
+///
+/// The producer stops after this many chunks and reports a resume position
+/// in its Done; the coordinator's per-replica forwarder fires a continuation
+/// request only after the consumer has drained the window. Un-drained frames
+/// per stream are therefore ≤ `STREAM_WINDOW_CHUNKS` + 1 (Done) + a few
+/// heartbeats (which are lossy on a full buffer), comfortably under
+/// [`STREAM_RECEIVER_BUFFER`].
+const STREAM_WINDOW_CHUNKS: u32 = 16;
+
+const _: () = assert!(
+    (STREAM_WINDOW_CHUNKS as usize) + 1 < STREAM_RECEIVER_BUFFER,
+    "a full producer window plus its Done must fit in the route buffer"
+);
 
 pub type ClusterPartitionStream =
     Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
@@ -282,16 +308,21 @@ fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition>
     Err(cluster_err)
 }
 
-/// How a per-replica forwarder task ended. Anything other than `Completed`
-/// means the REMOTE producer may still be streaming — the coordinator must
-/// fire a `RangeReadStreamCancel` so the replica stops between batches instead
+/// How a per-replica forwarder task ended. `Abandoned`/`Failed` mean the
+/// REMOTE producer may still be streaming — the coordinator must fire a
+/// `RangeReadStreamCancel` so the replica stops between batches instead
 /// of scanning the whole table into `Lane::Bulk` for nobody (t_3fc6be3c: the
 /// uncancelled `pages × replicas` producers starved live streams into
 /// heartbeat-defunct connections and OOM-killed replicas).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardOutcome {
     /// The stream terminated normally (every expected `Done` delivered).
-    Completed,
+    /// `resume` is `Some` when the producer stopped at its flow-control
+    /// window with more data remaining — the caller continues the logical
+    /// stream by firing a fresh request from that position.
+    Completed {
+        resume: Option<StreamResumePositionWire>,
+    },
     /// The consumer dropped the merged stream mid-flight (a paged read fills
     /// its page and abandons the rest — every page but the last does this).
     Abandoned,
@@ -323,10 +354,11 @@ async fn forward_remote_range_stream_inner(
 ) -> Result<ForwardOutcome, StreamConsumeError> {
     let mut watchdog = IdleTimeoutWatchdog::new(receiver, STREAMING_IDLE_TIMEOUT);
     let mut delivered_done = 0usize;
+    let mut resume: Option<StreamResumePositionWire> = None;
 
     loop {
         if delivered_done >= expected_done {
-            return Ok(ForwardOutcome::Completed);
+            return Ok(ForwardOutcome::Completed { resume });
         }
 
         // Notice consumer abandonment PROMPTLY — even when the producer is
@@ -393,6 +425,7 @@ async fn forward_remote_range_stream_inner(
                     );
                     return Err(StreamConsumeError::TruncatedReplica { request_id });
                 }
+                resume = done.resume;
                 delivered_done += 1;
             }
             other => {
@@ -409,7 +442,7 @@ async fn merge_local_and_single_remote_stream(
     table_id: TableId,
     row_limit: usize,
     projected_regular_ordinals: Option<Vec<u16>>,
-    remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    remote: ClusterPartitionStream,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
     // `row_limit > 0` only for `LIMIT N` queries with partition-key
@@ -424,7 +457,7 @@ async fn merge_local_and_single_remote_stream(
             table_id,
             row_limit,
             projected_regular_ordinals,
-            remote_rx,
+            remote,
             out_tx,
         )
         .await;
@@ -434,7 +467,7 @@ async fn merge_local_and_single_remote_stream(
         storage,
         table_id,
         projected_regular_ordinals,
-        remote_rx,
+        remote,
         out_tx,
     )
     .await;
@@ -448,7 +481,7 @@ async fn merge_local_and_single_remote_whole(
     table_id: TableId,
     row_limit: usize,
     projected_regular_ordinals: Option<Vec<u16>>,
-    mut remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    mut remote_stream: ClusterPartitionStream,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
     let mut local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals
@@ -466,7 +499,7 @@ async fn merge_local_and_single_remote_whole(
         )
     };
     let mut local_next = local_stream.next().await;
-    let mut remote_next = remote_rx.recv().await;
+    let mut remote_next = remote_stream.next().await;
 
     loop {
         match (local_next.take(), remote_next.take()) {
@@ -497,7 +530,7 @@ async fn merge_local_and_single_remote_whole(
                 {
                     return;
                 }
-                remote_next = remote_rx.recv().await;
+                remote_next = remote_stream.next().await;
             }
             (Some(Ok(local)), Some(Ok(remote))) => {
                 let local_token = local.key.token.0;
@@ -521,7 +554,7 @@ async fn merge_local_and_single_remote_whole(
                         return;
                     }
                     local_next = Some(Ok(local));
-                    remote_next = remote_rx.recv().await;
+                    remote_next = remote_stream.next().await;
                 } else {
                     let merged = ferrosa_storage::merge::merge_partitions(vec![local, remote]);
                     if out_tx
@@ -532,7 +565,7 @@ async fn merge_local_and_single_remote_whole(
                         return;
                     }
                     local_next = local_stream.next().await;
-                    remote_next = remote_rx.recv().await;
+                    remote_next = remote_stream.next().await;
                 }
             }
         }
@@ -741,7 +774,7 @@ async fn merge_local_and_single_remote_fragmented(
     storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
     table_id: TableId,
     projected_regular_ordinals: Option<Vec<u16>>,
-    remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    remote_stream: ClusterPartitionStream,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
     let local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals {
@@ -758,7 +791,7 @@ async fn merge_local_and_single_remote_fragmented(
         )
     };
     let local = FragmentCursor::new(local_stream);
-    let remote = FragmentCursor::new(ReceiverStream { rx: remote_rx });
+    let remote = FragmentCursor::new(remote_stream);
     let k = super::stream_request_handler::stream_chunk_row_cap();
     run_fragment_merge(local, remote, k, out_tx).await;
 }
@@ -987,22 +1020,6 @@ async fn run_fragment_merge<L, R>(
     run_fragment_merge_nway(vec![local.boxed(), remote.boxed()], k, out_tx).await;
 }
 
-/// Adapter so an `mpsc::Receiver` of partition results drives the same
-/// `Stream`-based cursor as the local engine stream.
-struct ReceiverStream {
-    rx: mpsc::Receiver<crate::error::Result<Partition>>,
-}
-
-impl futures::Stream for ReceiverStream {
-    type Item = Result<Partition, ClusterError>;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
 /// Build one output fragment, draining `out_rows`. The FIRST fragment of a
 /// token carries the merged header (`deletion` + `static_row`); subsequent
 /// fragments carry `LIVE` / `None` so the CQL bridge never double-applies
@@ -1050,75 +1067,216 @@ struct RemoteFanout {
     fire_failures: usize,
 }
 
-impl ClusterCoordinator {
-    async fn fan_out_remote_fragment_streams(
+/// Per-replica windowed continuation forwarder (t_a0f922a3 mode 2).
+///
+/// One logical replica stream is a SEQUENCE of bounded window requests: each
+/// request asks the producer for at most `window_chunks` chunk frames; the
+/// producer's Done carries a resume position when more data remains, and the
+/// next request is fired only after the consumer has drained the previous
+/// window (the forward loop below returns when the window's Done arrives, and
+/// every chunk it forwards goes through the bounded, consumer-paced
+/// `remote_tx`). Un-drained frames at the route can therefore never exceed
+/// one window — the fail-loud `ChannelFull` route close cannot fire on a slow
+/// consumer, no matter how large the scan is. Memory stays bounded and no
+/// server-side result cap is involved.
+struct WindowedReplicaForwarder {
+    router: Arc<ferrosa_net::stream_router::StreamRouter>,
+    peers: Arc<ferrosa_net::peer::PeerManager>,
+    next_request_id: Arc<std::sync::atomic::AtomicU32>,
+    host_id: uuid::Uuid,
+    keyspace: String,
+    table: String,
+    wanted: Option<Vec<u16>>,
+    window_chunks: u32,
+}
+
+impl WindowedReplicaForwarder {
+    fn encode_request(
         &self,
-        table_id: &TableId,
-        remotes: &[(uuid::Uuid, String)],
-        projected_regular_ordinals: Option<&[u16]>,
-        start_key: Option<&ferrosa_common::key::DecoratedKey>,
-    ) -> crate::error::Result<RemoteFanout> {
-        let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len());
-        let mut fire_failures = 0usize;
-
-        for (host_id, _addr) in remotes {
-            let request_id = self.next_stream_request_id();
-            let receiver = self
-                .stream_router
-                .register(request_id, STREAM_RECEIVER_BUFFER);
-
-            let req_payload = RangeReadStreamRequestPayload {
-                request_id,
-                keyspace: table_id.keyspace.clone(),
-                table: table_id.table.clone(),
-                projected_regular_ordinals: projected_regular_ordinals.map(|w| w.to_vec()),
-                start_key: start_key.map(|k| k.key.as_bytes().to_vec()),
-            };
-            let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
+        request_id: u32,
+        start_key: Option<Vec<u8>>,
+        start_clustering: Option<Vec<u8>>,
+    ) -> crate::error::Result<Bytes> {
+        let req_payload = RangeReadStreamRequestPayload {
+            request_id,
+            keyspace: self.keyspace.clone(),
+            table: self.table.clone(),
+            projected_regular_ordinals: self.wanted.clone(),
+            start_key,
+            start_clustering,
+            max_chunks: self.window_chunks,
+        };
+        bincode::serialize(&req_payload)
+            .map(Bytes::from)
+            .map_err(|e| {
                 ClusterError::Internal(format!("streaming range read: encode request: {e}"))
-            })?);
+            })
+    }
 
-            if let Err(e) = self
-                .peer_manager
-                .fire(
-                    *host_id,
-                    Message::RangeReadStreamRequest(req_body),
-                    Lane::Bulk,
-                )
-                .await
-            {
-                tracing::warn!(
-                    request_id,
-                    peer = %host_id,
-                    "streaming range read: failed to fire request: {e}"
-                );
-                self.stream_router.unregister(request_id);
-                fire_failures += 1;
-                continue;
-            }
+    /// Drive the logical stream across window continuations. `request_id` /
+    /// `receiver` belong to the already-fired FIRST window.
+    async fn run(
+        self,
+        mut request_id: u32,
+        mut receiver: mpsc::Receiver<Message>,
+        remote_tx: mpsc::Sender<crate::error::Result<Partition>>,
+    ) {
+        loop {
+            let outcome =
+                forward_remote_range_stream(receiver, request_id, 1, remote_tx.clone()).await;
+            self.router.unregister(request_id);
 
-            let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
-            let router = self.stream_router.clone();
-            let peer_manager = self.peer_manager.clone();
-            let peer_host = *host_id;
-            TaskPool::current("range-read-forward").spawn(async move {
-                let outcome = forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
-                router.unregister(request_id);
+            let resume = match outcome {
+                ForwardOutcome::Completed { resume: None } => return, // scan complete
+                ForwardOutcome::Completed {
+                    resume: Some(resume),
+                } => resume,
                 // Anything but a clean Done means the remote producer may
                 // still be streaming for nobody — tell it to stop. Fired from
                 // THIS live async task (not a Drop guard: the reverted
                 // 3ec30240 guard never actually sent a cancel on the live
                 // cluster), so the fire is a plain awaited call that either
                 // succeeds or logs loudly.
-                if outcome != ForwardOutcome::Completed {
-                    fire_stream_cancel(&peer_manager, peer_host, request_id, outcome).await;
+                other => {
+                    fire_stream_cancel(&self.peers, self.host_id, request_id, other).await;
+                    return;
                 }
-            });
+            };
 
-            let stream = futures::stream::unfold(remote_rx, |mut rx| async move {
-                rx.recv().await.map(|item| (item, rx))
-            });
-            streams.push(Box::pin(stream));
+            // Window boundary. Don't fire a continuation the consumer will
+            // never read (a paged read abandons the stream between pages).
+            if remote_tx.is_closed() {
+                return;
+            }
+
+            request_id = self
+                .next_request_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            receiver = self.router.register(request_id, STREAM_RECEIVER_BUFFER);
+            let body = match self.encode_request(
+                request_id,
+                Some(resume.partition_key),
+                Some(resume.clustering),
+            ) {
+                Ok(body) => body,
+                Err(e) => {
+                    self.router.unregister(request_id);
+                    let _ = remote_tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            if let Err(e) = self
+                .peers
+                .fire(
+                    self.host_id,
+                    Message::RangeReadStreamRequest(body),
+                    Lane::Bulk,
+                )
+                .await
+            {
+                // A continuation fire failure mid-scan is a hard, loud error:
+                // the consumer already holds a prefix, so silently ending the
+                // stream here would return PARTIAL data as success.
+                self.router.unregister(request_id);
+                let _ = remote_tx
+                    .send(Err(ClusterError::Internal(format!(
+                        "streaming range read: window continuation fire to {} failed: {e}",
+                        self.host_id
+                    ))))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+impl ClusterCoordinator {
+    /// Fire the first window of one replica's fragment stream and spawn its
+    /// windowed continuation forwarder. Returns the bounded, consumer-paced
+    /// partition stream for that replica, or `Err` when the initial fire
+    /// fails (the caller counts fan-out failures).
+    async fn spawn_replica_fragment_stream(
+        &self,
+        table_id: &TableId,
+        host_id: uuid::Uuid,
+        projected_regular_ordinals: Option<&[u16]>,
+        resume: Option<&ScanResume>,
+        window_chunks: u32,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let request_id = self.next_stream_request_id();
+        let receiver = self
+            .stream_router
+            .register(request_id, STREAM_RECEIVER_BUFFER);
+
+        let forwarder = WindowedReplicaForwarder {
+            router: self.stream_router.clone(),
+            peers: self.peer_manager.clone(),
+            next_request_id: self.next_request_id.clone(),
+            host_id,
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            wanted: projected_regular_ordinals.map(|w| w.to_vec()),
+            window_chunks,
+        };
+        let body = forwarder
+            .encode_request(
+                request_id,
+                resume.map(|r| r.key.key.as_bytes().to_vec()),
+                resume.and_then(|r| r.clustering.clone()),
+            )
+            .inspect_err(|_| self.stream_router.unregister(request_id))?;
+        if let Err(e) = self
+            .peer_manager
+            .fire(host_id, Message::RangeReadStreamRequest(body), Lane::Bulk)
+            .await
+        {
+            self.stream_router.unregister(request_id);
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: failed to fire request to {host_id}: {e}"
+            )));
+        }
+
+        let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        TaskPool::current("range-read-forward").spawn(async move {
+            forwarder.run(request_id, receiver, remote_tx).await;
+        });
+
+        let stream = futures::stream::unfold(remote_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
+    }
+
+    async fn fan_out_remote_fragment_streams(
+        &self,
+        table_id: &TableId,
+        remotes: &[(uuid::Uuid, String)],
+        projected_regular_ordinals: Option<&[u16]>,
+        resume: Option<&ScanResume>,
+    ) -> crate::error::Result<RemoteFanout> {
+        let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len());
+        let mut fire_failures = 0usize;
+
+        for (host_id, _addr) in remotes {
+            match self
+                .spawn_replica_fragment_stream(
+                    table_id,
+                    *host_id,
+                    projected_regular_ordinals,
+                    resume,
+                    STREAM_WINDOW_CHUNKS,
+                )
+                .await
+            {
+                Ok(stream) => streams.push(stream),
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %host_id,
+                        "streaming range read: failed to fire request: {e}"
+                    );
+                    fire_failures += 1;
+                }
+            }
         }
 
         Ok(RemoteFanout {
@@ -1176,18 +1334,20 @@ async fn fire_stream_cancel(
 
 /// Drive a token-aware N-way fragment merge of the LOCAL fragmented stream and
 /// one or more REMOTE replica fragment streams, emitting `<= k`-row fragments
-/// into `out_tx`. The local stream is start-bounded by `start` (the resume
-/// cursor); the remote streams are already start-bounded at their producers.
-/// Resident set is `O(num_sources + k)` — every cursor holds at most one peeked
-/// fragment and the merge buffers at most `k` output rows.
+/// into `out_tx`. The local stream is resume-bounded by `resume` (partition
+/// key + within-partition clustering skip); the remote streams are already
+/// resume-bounded at their producers. Resident set is `O(num_sources + k)` —
+/// every cursor holds at most one peeked fragment and the merge buffers at
+/// most `k` output rows.
 async fn merge_local_and_remotes_fragmented(
     storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
     table_id: TableId,
     projected_regular_ordinals: Option<Vec<u16>>,
-    start: Option<ferrosa_common::key::DecoratedKey>,
+    resume: Option<ScanResume>,
     remote_streams: Vec<ClusterPartitionStream>,
     out_tx: mpsc::Sender<crate::error::Result<Partition>>,
 ) {
+    let start = resume.as_ref().map(|r| r.key.clone());
     let local_stream: ClusterPartitionStream = if let Some(wanted) = projected_regular_ordinals {
         Box::pin(
             storage
@@ -1201,6 +1361,7 @@ async fn merge_local_and_remotes_fragmented(
                 .map(|item| item.map_err(ClusterError::Storage)),
         )
     };
+    let local_stream = crate::write_path::resume_filtered_stream(local_stream, resume.as_ref());
 
     let mut cursors: Vec<FragmentCursor<BoxedFragmentStream>> =
         Vec::with_capacity(1 + remote_streams.len());
@@ -1295,20 +1456,20 @@ impl ClusterCoordinator {
         all_remotes.into_iter().take(cl_remote_count).collect()
     }
 
-    /// Drive the local-start-bounded fragmented stream + the CL-selected remote
-    /// replica fragment streams (each start-bounded at its producer) through the
-    /// token-aware N-way merge, returning the merged partition stream. Shared by
-    /// the paged (`*_stream_from`) variants. `start` is the inclusive resume
-    /// cursor (`None` on the first page).
+    /// Drive the local resume-bounded fragmented stream + the CL-selected
+    /// remote replica fragment streams (each resume-bounded at its producer)
+    /// through the token-aware N-way merge, returning the merged partition
+    /// stream. Shared by the paged (`*_stream_from`) variants. `resume` is the
+    /// page resume position (`None` on the first page).
     async fn paged_multi_replica_stream(
         &self,
         table_id: &TableId,
         wanted: Option<Vec<u16>>,
-        start: Option<&ferrosa_common::key::DecoratedKey>,
+        resume: Option<&ScanResume>,
         remotes: &[(uuid::Uuid, String)],
     ) -> crate::error::Result<ClusterPartitionStream> {
         let fanout = self
-            .fan_out_remote_fragment_streams(table_id, remotes, wanted.as_deref(), start)
+            .fan_out_remote_fragment_streams(table_id, remotes, wanted.as_deref(), resume)
             .await?;
         if fanout.streams.is_empty() {
             return Err(ClusterError::Internal(format!(
@@ -1328,13 +1489,13 @@ impl ClusterCoordinator {
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
         let storage = self.storage.clone();
         let table_id = table_id.clone();
-        let start = start.cloned();
+        let resume = resume.cloned();
         TaskPool::current("range-read-merge-nway-paged").spawn(async move {
             merge_local_and_remotes_fragmented(
                 storage,
                 table_id,
                 wanted,
-                start,
+                resume,
                 fanout.streams,
                 out_tx,
             )
@@ -1346,62 +1507,64 @@ impl ClusterCoordinator {
         Ok(Box::pin(stream))
     }
 
-    /// Resume-capable streaming range scan with an inclusive lower-bound key.
+    /// Resume-capable streaming range scan.
     ///
     /// Backs `WritePath::range_read_stream_all_from` (the coordinator-side
     /// paging cursor). The local-only fan-out shape (CL=ONE with the keyspace RF
     /// spanning the ring) streams the local fragmented iterator directly; a
-    /// multi-replica shape fans out a start-bounded fragment stream to each
+    /// multi-replica shape fans out a resume-bounded fragment stream to each
     /// CL-selected replica and merges them with the local stream through the
     /// token-aware N-way fragment merge (`run_fragment_merge_nway`). The
-    /// resume cursor (`start`) is shipped to every replica so a resumed page
-    /// never re-streams the already-emitted prefix; the CQL paging collector
-    /// applies the exact skip-≤-last semantics on top, so the merged page is
-    /// gap- and duplicate-free even mid-wide-partition.
+    /// resume position is shipped to every replica so a resumed page never
+    /// re-streams the already-emitted prefix (including mid-wide-partition);
+    /// the CQL paging collector applies the exact skip-≤-last semantics on
+    /// top, so the merged page is gap- and duplicate-free.
     pub async fn coordinate_range_read_stream_from(
         &self,
         table_id: &TableId,
-        start: Option<&ferrosa_common::key::DecoratedKey>,
+        resume: Option<&ScanResume>,
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let remotes = self.range_read_remotes(cl, replication_factor);
 
         if remotes.is_empty() {
-            return Ok(Box::pin(
+            let stream: ClusterPartitionStream = Box::pin(
                 self.storage
-                    .range_iter_fragmented(table_id, start, None)
+                    .range_iter_fragmented(table_id, resume.map(|r| &r.key), None)
                     .map(|item| item.map_err(ClusterError::Storage)),
-            ));
+            );
+            return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
 
-        self.paged_multi_replica_stream(table_id, None, start, &remotes)
+        self.paged_multi_replica_stream(table_id, None, resume, &remotes)
             .await
     }
 
     /// Projection-aware resume-capable streaming range scan. See
     /// [`Self::coordinate_range_read_stream_from`]; serves the multi-replica
-    /// shape via the same start-bounded N-way fragment merge, byte-skipping
+    /// shape via the same resume-bounded N-way fragment merge, byte-skipping
     /// unprojected cells at every replica.
     pub async fn coordinate_range_read_projected_stream_from(
         &self,
         table_id: &TableId,
         wanted: Vec<u16>,
-        start: Option<&ferrosa_common::key::DecoratedKey>,
+        resume: Option<&ScanResume>,
         cl: crate::consistency::ConsistencyLevel,
         replication_factor: usize,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let remotes = self.range_read_remotes(cl, replication_factor);
 
         if remotes.is_empty() {
-            return Ok(Box::pin(
+            let stream: ClusterPartitionStream = Box::pin(
                 self.storage
-                    .range_iter_projected_fragmented(table_id, wanted, start, None)
+                    .range_iter_projected_fragmented(table_id, wanted, resume.map(|r| &r.key), None)
                     .map(|item| item.map_err(ClusterError::Storage)),
-            ));
+            );
+            return Ok(crate::write_path::resume_filtered_stream(stream, resume));
         }
 
-        self.paged_multi_replica_stream(table_id, Some(wanted), start, &remotes)
+        self.paged_multi_replica_stream(table_id, Some(wanted), resume, &remotes)
             .await
     }
 
@@ -1545,46 +1708,33 @@ impl ClusterCoordinator {
             return Ok(stream);
         }
 
-        let request_id = self.next_stream_request_id();
-        let receiver = self
-            .stream_router
-            .register(request_id, STREAM_RECEIVER_BUFFER);
-
-        let req_payload = RangeReadStreamRequestPayload {
-            request_id,
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            projected_regular_ordinals: projected_regular_ordinals.clone(),
-            start_key: None,
-        };
-        let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
-            ClusterError::Internal(format!("streaming range read: encode request: {e}"))
-        })?);
-
         let (host_id, _addr) = remotes.first().ok_or_else(|| {
             ClusterError::Internal("streaming range read: missing remote replica".into())
         })?;
-        if let Err(e) = self
-            .peer_manager
-            .fire(
+        // Windowed continuation applies to the unbounded fragment-merged shape
+        // (`row_limit == 0`). The `row_limit > 0` shape targets bounded
+        // specific partitions (LIMIT with partition-key equality), whose
+        // result fits well inside one window — keep it unwindowed so the
+        // whole-partition merge sees the legacy single-request fragmenting.
+        let window_chunks = if row_limit == 0 {
+            STREAM_WINDOW_CHUNKS
+        } else {
+            0
+        };
+        let remote_stream = self
+            .spawn_replica_fragment_stream(
+                table_id,
                 *host_id,
-                Message::RangeReadStreamRequest(req_body),
-                Lane::Bulk,
+                projected_regular_ordinals.as_deref(),
+                None,
+                window_chunks,
             )
             .await
-        {
-            self.stream_router.unregister(request_id);
-            return Err(ClusterError::Internal(format!(
-                "streaming range read: remote replica fire failed ({host_id}): {e}"
-            )));
-        }
-
-        let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
-        let router = self.stream_router.clone();
-        TaskPool::current("range-read-forward").spawn(async move {
-            forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
-            router.unregister(request_id);
-        });
+            .map_err(|e| {
+                ClusterError::Internal(format!(
+                    "streaming range read: remote replica fire failed ({host_id}): {e}"
+                ))
+            })?;
 
         let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
         let storage = self.storage.clone();
@@ -1595,7 +1745,7 @@ impl ClusterCoordinator {
                 table_id,
                 row_limit,
                 projected_regular_ordinals,
-                remote_rx,
+                remote_stream,
                 out_tx,
             )
             .await;
@@ -1757,6 +1907,7 @@ mod tests {
             request_id: 42,
             total_chunks: 0,
             truncated: true,
+            resume: None,
         };
         frame_tx
             .send(Message::RangeReadStreamDone(bytes::Bytes::from(

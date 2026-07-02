@@ -114,6 +114,32 @@ impl StreamRouter {
         }
     }
 
+    /// Route an ADVISORY frame: identical to [`Self::route`], except a full
+    /// buffer silently DROPS the frame and KEEPS the route alive (`Ok(())`).
+    ///
+    /// Only for frames whose loss cannot corrupt the stream — heartbeats. A
+    /// heartbeat only refreshes the consumer's idle watchdog; when the buffer
+    /// is full the consumer already has undrained data frames, so it is not
+    /// idle and dropping the keep-alive is harmless. Closing the route
+    /// instead (the data-frame behavior, which protects against silently
+    /// dropped DATA) would kill a healthy stream just because the consumer
+    /// paused mid-window while a heartbeat was in flight.
+    pub fn route_lossy(&self, request_id: u32, msg: Message) -> Result<(), RouteError> {
+        let mut routes = self.routes.lock().expect("stream router mutex poisoned");
+        let Some(sender) = routes.get(&request_id) else {
+            return Err(RouteError::NoRoute(request_id));
+        };
+        match sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                routes.remove(&request_id);
+                Err(RouteError::ChannelClosed(request_id))
+            }
+            // Advisory frame + full buffer: drop the frame, keep the route.
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        }
+    }
+
     /// True when a receiver is currently registered for `request_id`.
     ///
     /// Callers use this as the liveness predicate for per-request companion
@@ -225,6 +251,33 @@ mod tests {
         assert_eq!(rx.recv().await, Some(chunk(1)));
         assert_eq!(rx.recv().await, Some(chunk(2)));
         assert_eq!(rx.recv().await, None);
+    }
+
+    /// Advisory frames (heartbeats) must be DROPPED on a full buffer while
+    /// the route stays alive — an undrained buffer means the consumer is
+    /// mid-window, not stuck, and closing the route there would kill a
+    /// healthy windowed stream (t_a0f922a3).
+    #[tokio::test]
+    async fn route_lossy_drops_frame_on_full_buffer_and_keeps_route() {
+        let router = StreamRouter::new();
+        let mut rx = router.register(31, 2);
+
+        router.route(31, chunk(1)).unwrap();
+        router.route(31, chunk(2)).unwrap();
+
+        // Full buffer: the advisory frame is dropped, the route survives.
+        router
+            .route_lossy(31, chunk(0xAB))
+            .expect("lossy route on a full buffer must succeed by dropping");
+        assert_eq!(router.len(), 1, "route must remain registered");
+
+        // Draining shows only the data frames — the advisory one was dropped.
+        assert_eq!(rx.recv().await, Some(chunk(1)));
+        assert_eq!(rx.recv().await, Some(chunk(2)));
+
+        // The route still works for subsequent frames.
+        router.route(31, chunk(3)).unwrap();
+        assert_eq!(rx.recv().await, Some(chunk(3)));
     }
 
     /// `is_registered` tracks the route lifecycle: false before register,

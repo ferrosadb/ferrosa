@@ -127,6 +127,22 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   nobody; the producer-side handler is registered for the Cancel MsgType.
   Harness: `tests/range_scan_multi_replica_paging.rs` (real 3-node loopback,
   RF=3/CL=ALL, counter-asserted).
+  **Flow control (t_a0f922a3):** internode range streams are WINDOWED — each
+  `RangeReadStreamRequest` carries `max_chunks` (`STREAM_WINDOW_CHUNKS = 16`,
+  provably < the 32-slot route buffer); the producer stops at the window and
+  reports a `(partition_key, clustering)` resume position in its Done, and the
+  coordinator's `WindowedReplicaForwarder` fires the continuation only after
+  the consumer drains the window. Without this, any scan larger than the
+  buffer overflowed the route (`ChannelFull` → fail-loud close → retryable
+  ReadTimeout that drivers retry forever — the live 15k-partition paged-scan
+  "stall"). Heartbeats route lossily (`StreamRouter::route_lossy`) so a
+  keep-alive can never close a healthy mid-window route. Paged scans resume
+  WITHIN a partition end-to-end: `write_path::ScanResume { key, clustering }`
+  ships the cursor's clustering position to every producer
+  (`start_clustering` on the wire; `resume_filtered_stream` locally), so a
+  wide partition spanning pages never re-streams its delivered prefix.
+  **Wire note:** the request/Done payload field additions are a bincode wire
+  change — upgrade all nodes together (mixed versions fail decode loudly).
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 

@@ -74,7 +74,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   route liveness as the lifecycle predicate for callers' per-request companion
   state (ferrosa-cluster's stream seq tracking keys create/drop off it: ids are
   monotonic and never reused, and a route is always registered before its
-  request fires, so "no route" is terminal for that id).
+  request fires, so "no route" is terminal for that id). Data frames route
+  fail-loud (`route` closes the route on a full buffer so a dropped chunk can
+  never become a silent partial result); advisory frames route lossily
+  (`route_lossy` drops the frame on a full buffer and KEEPS the route —
+  heartbeats must never kill a healthy mid-window stream, t_a0f922a3).
 - **Failure detection + skew** (`peer`, `skew`) — per-peer RTT and clock-skew
   tracking derived from heartbeats; the Accord protocol consumes `SkewMax`.
 - **Discovery** (`discovery`) — `SeedDiscovery` over a `Discovery` trait.

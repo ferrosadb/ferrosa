@@ -75,7 +75,18 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the
   MD5 of the query text, weight-bounded.
 - **Pagination** (`paging.rs`) — opaque `paging_state` cursor (pk + ck +
-  remaining-in-partition flag) for CQL v5 paging.
+  remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Paged full-table
+  scans resume WITHIN a wide partition (t_a0f922a3): the router decodes the
+  cursor into `ferrosa_cluster::write_path::ScanResume { key, clustering }` so
+  every producer (local iterator and each remote replica) skips the delivered
+  prefix instead of re-streaming it, and the streaming collectors
+  (`collect_page_from_partition_stream` / `collect_filtered_page_...`) apply
+  the same skip-≤-last as an idempotent second layer. Page-advance +
+  exact-union tests (hard per-page timeouts — a stall or cycling cursor FAILS,
+  never hangs): `wide_partition_spanning_pages_terminates_exactly`,
+  `mixed_wide_and_narrow_partitions_page_exactly`,
+  `wide_partition_multi_text_clustering_pages_exactly_after_flush`,
+  `many_small_partitions_pk_projection_pages_without_stalling`.
 - **LWT / transactions** (`accord_router.rs`, `transaction_keys.rs`,
   `transaction_limits.rs`) — routing decision (Accord in cluster mode, local in
   standalone), `IF [NOT] EXISTS` / `IF <cond>` CAS semantics with the `[applied]`
