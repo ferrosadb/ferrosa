@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-07-01
+last_updated: 2026-06-19
 ---
 
 # ferrosa-cluster — Roadmap
@@ -10,17 +10,6 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code deprecation markers,
 reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
-
-- **Paged multi-replica range scan no longer hangs (t_3fc6be3c, CL-14).** On RF>1
-  a multi-page projected scan abandoned each page's fanned-out replica producers
-  without cancelling them, so `pages × replicas` uncancelled full-table scans
-  saturated `Lane::Bulk` and starved heartbeats (`Connection defunct by
-  heartbeat`). A `RemoteStreamCancelGuard` now rides the merged output stream and
-  fires `RangeReadStreamCancel` to every replica on drop; `MsgType::
-  RangeReadStreamCancel` is registered to the request handler (previously written
-  on both sides but never sent nor routed). Reproduced + regression-guarded by
-  `tests/range_scan_multi_replica_paging.rs` (real 3-node loopback,
-  `expected_done == 2`).
 
 - **Multi-key Accord — additive V2 wire foundation + `new_multi` API (Phase 1).**
   Multi-key (multi-partition) transactions will travel on new
