@@ -83,7 +83,7 @@ jobs:
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost \
-            /usr/local/lib/node_modules /usr/share/swift || true
+            /usr/share/swift || true
           sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
       - name: Build AssemblyScript UDF toolchain bundle
@@ -481,7 +481,7 @@ jobs:
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost \
-            /usr/local/lib/node_modules /usr/share/swift || true
+            /usr/share/swift || true
           df -h /
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
