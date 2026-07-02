@@ -47,3 +47,9 @@ default = []
 # gate has been removed. The leadership-transfer (W3.13) gate remains until that
 # engine wire-up's acceptance tests land.
 sprint-03-engine-transfer = []
+# Live multi-node infrastructure tests (fly.io streaming-scan memory harness).
+# Off by default so the merge-blocking CI lane never provisions machines / bills.
+# Enable with `--features live-infra-tests` PLUS `FERROSA_TEST_FLY=1`; with the
+# feature on and the env unset (or flyctl missing) the test panics loudly with
+# setup instructions rather than silently passing (repo test policy).
+live-infra-tests = []

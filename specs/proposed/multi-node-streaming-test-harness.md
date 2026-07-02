@@ -101,6 +101,54 @@ hanging the run.
 4. Implement Part C; iterate until Part B is fully green on fly.
 5. Un-revert the cluster arm; re-validate on fly; only then consider #237 merge.
 
+## Progress — root confirmed, faithful RED + fly scaffold landed (2026-07-01)
+
+**Root of the OOM is CONFIRMED and pinned by an in-process test that drives the
+REAL wire serialization (not a parked producer):**
+
+- The replica **producer** (`coordinator::stream_request_handler::handle_stream_request`
+  → chunked `emit_chunk` → `partition_to_wire` → bincode) is already bounded: it
+  streams `chunk_size`/row-cap frames and awaits each `send` (backpressure via the
+  lane actor's bounded mpsc + `reserve().await`).
+- The coordinator's **Stream** API (`coordinate_range_read_stream_all_with`) is
+  already bounded (guarded by `tests/range_scan_streaming_memory_bound.rs`).
+- The **unbounded** path is the coordinator's `Vec<Partition>`-returning consume:
+  `coordinator::stream_consumer::consume_range_stream` accumulates EVERY partition
+  from EVERY replica into `StreamConsumeOutcome.partitions`, and
+  `coordinator::range_read_stream::coordinate_range_read_stream_limited_rows` then
+  does `all_partitions.extend(outcome.partitions)`. Peak = O(result). This is the
+  path `WritePath::range_read` / the CQL SELECT-ALLOW-FILTERING / `fts_match`
+  content-scan callers use — the single-query FTS OOM (`t_ee98faa0`) and the
+  multi-page projected scan OOM (`t_3fc6be3c`) share it.
+
+**Landed on `feat/stream-range-reads-no-cap`:**
+
+- `ferrosa-cluster/tests/replica_scan_serialization_memory_bound.rs` — faithful
+  RED: pipes the real producer's real bincode `RangeReadStream*` frames through a
+  real bounded mpsc into the real `consume_range_stream`, and measures peak
+  additional heap. Measured (row=4 KiB): consume peak **26 MB @ N=750 → 76 MB @
+  N=12000** (grows with N, blows a 32 MiB in-flight budget) while the producer
+  stays **flat at ~23 MB** regardless of N. Pinned as a characterization test
+  (asserts the bug is present) so CI stays green; the fix FLIPS the two
+  assertions to `< budget` / `< small*3` and renames to `..._is_bounded`.
+- `deploy/fly-stream-scan/` — Part A scaffold: `provision.sh` / `seed.sh` /
+  `probe.sh` (Part B cases 0–6, each under a hard wall-clock timeout + per-node
+  2 GiB RSS assertion) / `teardown.sh` (fail-loud) / `run-all.sh` (dry-run by
+  default; `--i-will-pay` to bill). `README.md` documents manual invocation.
+  **Nothing runs `flyctl deploy` automatically.**
+- `ferrosa-cluster/tests/fly_stream_scan_live.rs` — gated live entry behind
+  feature `live-infra-tests` + `FERROSA_TEST_FLY=1`; panics loudly with setup
+  instructions when the feature is on but the env/`flyctl` is missing (no false
+  pass). Shells out to `run-all.sh --i-will-pay`.
+
+**STOP taken (scope guard):** the fix (Part C.2) — converting `consume_range_stream`
++ `coordinate_range_read_stream_limited_rows` from `Vec<Partition>`-returning
+accumulators to bounded-channel partition-at-a-time streams, and rewiring every
+`WritePath::range_read` consumer (the CQL SELECT/ALLOW-FILTERING/FTS-content-scan
+surface, `write_path.rs:791`) to consume the stream — is a cross-crate refactor
+beyond a focused step. The faithful RED that proves the unbounded growth is
+committed; the fix is the next unit of work. The 2 GiB cap is NEVER raised.
+
 ## The memory cap is intentional — never raise it
 
 The 2 GB node `mem_limit` is a **deliberate forcing function**: it makes any
