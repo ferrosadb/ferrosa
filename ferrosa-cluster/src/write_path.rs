@@ -864,6 +864,47 @@ impl WritePath {
         }
     }
 
+    /// KEYED secondary-index read (t_430c4188): consult the index for
+    /// `index_key` restricted to the partition `key`.
+    ///
+    /// - `Direct` / `Pair`: local `read_by_index_in_partition`.
+    /// - `Cluster`: routes to the PARTITION'S replicas under `strategy` (normal
+    ///   keyed routing) — never the global scatter-gather of
+    ///   [`index_read`](Self::index_read).
+    /// - `Unavailable`: returns error.
+    ///
+    /// Per-node work is O(rows matching the indexed value), never O(partition
+    /// rows) — this is what serves `WHERE <full partition key> AND
+    /// <indexed_col> = ?` without a full-partition filtering scan.
+    pub async fn index_read_in_partition(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+        strategy: &ReplicationStrategy,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        match self {
+            Self::Direct(engine) => engine
+                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .read_by_index_in_partition(table_id, index_name, index_key, key.key.as_bytes())
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_index_read_in_partition(
+                        table_id, key, index_name, index_key, strategy,
+                    )
+                    .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "keyed index read unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
     /// Full-text (`fts_match`) index lookup, returning matching partition keys.
     ///
     /// In standalone/pair mode this hits local storage. In cluster mode the

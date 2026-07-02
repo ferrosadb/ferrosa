@@ -35,8 +35,8 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
     partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
-    IndexReadRequestPayload, IndexReadResponsePayload, RangeReadRequestPayload,
-    RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
+    IndexReadInPartitionRequestPayload, IndexReadRequestPayload, IndexReadResponsePayload,
+    RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
 };
 use crate::raft::IndexNodeStatus;
 
@@ -1609,6 +1609,182 @@ impl ClusterCoordinator {
         Ok(deduped)
     }
 
+    /// KEYED secondary-index read (t_430c4188): consult the index for
+    /// `index_key` restricted to the partition `key`, contacting ONLY that
+    /// partition's replicas under `strategy` — never a global scatter-gather.
+    ///
+    /// Each contacted replica runs `read_by_index_in_partition` locally
+    /// (postings keyed to the partition, then point-reads of only the matching
+    /// rows), so per-replica work is O(rows matching the value), never
+    /// O(partition rows). Results from the replicas are merged per token, the
+    /// same union semantics as [`coordinate_index_read`] but over the replica
+    /// set instead of the whole ring. Partial replica failures degrade to a
+    /// partial union (logged); an all-replicas-failed result errors.
+    pub async fn coordinate_index_read_in_partition(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+        let ring = self.ring.load();
+        let replica_ids = ring.replicas_for_strategy(key.token.0, strategy);
+        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = replica_ids
+            .iter()
+            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
+            .collect();
+        drop(ring);
+
+        if nodes.is_empty() {
+            return Err(ClusterError::Internal(format!(
+                "keyed index read: no replicas resolved for token {}",
+                key.token.0
+            )));
+        }
+
+        let req_payload = IndexReadInPartitionRequestPayload {
+            keyspace: table_id.keyspace.clone(),
+            table: table_id.table.clone(),
+            index_name: index_name.to_string(),
+            index_key: index_key.0.clone(),
+            partition_key: key.key.as_bytes().to_vec(),
+        };
+        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
+
+        let local_id = self.local_node_id;
+        let storage = self.storage.clone();
+        let table_id_clone = table_id.clone();
+        let index_name_owned = index_name.to_string();
+        let index_key_clone = index_key.clone();
+        let partition_key_bytes = key.key.as_bytes().to_vec();
+        let total_nodes = nodes.len();
+
+        let mut futs: FuturesUnordered<_> = nodes
+            .into_iter()
+            .map(|(node_id, remote)| {
+                let storage = storage.clone();
+                let table_id = table_id_clone.clone();
+                let index_name = index_name_owned.clone();
+                let index_key = index_key_clone.clone();
+                let partition_key = partition_key_bytes.clone();
+                let req_body = req_body.clone();
+                let coordinator = self;
+
+                async move {
+                    if node_id == local_id {
+                        storage
+                            .read_by_index_in_partition(
+                                &table_id,
+                                &index_name,
+                                &index_key,
+                                &partition_key,
+                            )
+                            .map_err(ClusterError::Storage)
+                    } else {
+                        let (hid, addr) = remote.ok_or_else(|| {
+                            ClusterError::Internal(format!(
+                                "keyed index read: node {node_id} has no host_id"
+                            ))
+                        })?;
+
+                        let resp = coordinator
+                            .send_remote_with_reconnect_timeout(
+                                hid,
+                                &addr,
+                                Message::IndexReadInPartitionRequest(req_body),
+                                Lane::Bulk,
+                                Self::BULK_READ_TIMEOUT,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ClusterError::Internal(format!(
+                                    "keyed index read from node {node_id} ({hid}) via {addr}: {e}"
+                                ))
+                            })?;
+
+                        match resp {
+                            Message::IndexReadInPartitionResponse(b) => {
+                                let payload = bincode::deserialize::<IndexReadResponsePayload>(&b)
+                                    .map_err(|e| {
+                                        ClusterError::Internal(format!(
+                                            "keyed index read: failed to decode response \
+                                                 from node {node_id} ({hid}): {e}"
+                                        ))
+                                    })?;
+                                Ok(payload
+                                    .partitions
+                                    .into_iter()
+                                    .map(partition_from_wire)
+                                    .collect())
+                            }
+                            other => Err(ClusterError::Internal(format!(
+                                "keyed index read: unexpected response {:?} from node \
+                                 {node_id} ({hid})",
+                                other.msg_type()
+                            ))),
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
+        let mut first_error: Option<ClusterError> = None;
+        let mut failed_nodes = 0usize;
+
+        while let Some(result) = futs.next().await {
+            match result {
+                Ok(batch) => all_partitions.extend(batch),
+                Err(e) => {
+                    tracing::error!("coordinate_index_read_in_partition: {e}");
+                    failed_nodes += 1;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        if let Some(ref err) = first_error {
+            if failed_nodes == total_nodes {
+                tracing::error!(
+                    failed_nodes,
+                    "coordinate_index_read_in_partition: all replicas failed, returning error"
+                );
+                return Err(first_error.unwrap());
+            }
+            tracing::warn!(
+                failed_nodes,
+                partitions_received = all_partitions.len(),
+                %err,
+                "coordinate_index_read_in_partition: {failed_nodes} replica(s) failed, \
+                 returning partial results from {remaining} replica(s)",
+                remaining = total_nodes - failed_nodes,
+            );
+        }
+
+        // Merge per token (all results are the same partition; replicas may
+        // each return the same rows).
+        let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
+        for p in all_partitions {
+            by_token.entry(p.key.token.0).or_default().push(p);
+        }
+
+        let deduped: Vec<ferrosa_sstable::types::Partition> = by_token
+            .into_values()
+            .map(|group| {
+                if group.len() == 1 {
+                    group.into_iter().next().unwrap()
+                } else {
+                    ferrosa_storage::merge::merge_partitions(group)
+                }
+            })
+            .collect();
+
+        Ok(deduped)
+    }
+
     /// Fan out a full-text (`fts_match`) lookup to every node and union the
     /// matching partition keys.
     ///
@@ -3059,6 +3235,201 @@ mod tests {
         );
 
         server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    struct StaticIndexReadInPartitionHandler {
+        partition: Partition,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for StaticIndexReadInPartitionHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::IndexReadInPartitionRequest(_) = msg else {
+                return None;
+            };
+            let payload = IndexReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+            };
+            Some(Message::IndexReadInPartitionResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
+    /// t_430c4188: the KEYED index read must contact only the partition's
+    /// replicas (normal keyed routing), never scatter-gather the whole ring.
+    ///
+    /// Ring: node 2 owns the key's token (RF=1 replica) and serves the real
+    /// partition; node 3 is a live non-replica that would serve a POISON
+    /// partition with a different token. If the keyed read degenerated to a
+    /// global scatter-gather, the poison partition would leak into the result.
+    #[tokio::test]
+    async fn coordinate_index_read_in_partition_contacts_only_replicas() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key(); // Token(42)
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(888)],
+        };
+        let poison = Partition {
+            key: DecoratedKey {
+                token: Token(99_999),
+                key: PartitionKey::new(vec![9, 9, 9]),
+            },
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(777)],
+        };
+
+        let (replica_server, replica_addr, replica_host_id) = start_rpc_server(
+            MsgType::IndexReadInPartitionRequest,
+            Arc::new(StaticIndexReadInPartitionHandler {
+                partition: partition.clone(),
+            }),
+        )
+        .await;
+        let (other_server, other_addr, other_host_id) = start_rpc_server(
+            MsgType::IndexReadInPartitionRequest,
+            Arc::new(StaticIndexReadInPartitionHandler {
+                partition: poison.clone(),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut replica_node = make_node(&replica_addr.to_string());
+        replica_node.host_id = replica_host_id;
+        let mut other_node = make_node(&other_addr.to_string());
+        other_node.host_id = other_host_id;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(2u64, replica_node);
+        ring.add_node(3u64, other_node);
+        // Key token 42: clockwise owner is node 2 (token 42); node 3 owns a
+        // far-away range, so with RF=1 it is NOT a replica of the key.
+        ring.assign_tokens(2u64, &[42]);
+        ring.assign_tokens(3u64, &[1_000_000]);
+
+        let coordinator =
+            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
+            replication_factor: 1,
+        };
+        let partitions = coordinator
+            .coordinate_index_read_in_partition(
+                &table_id,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                &strategy,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            partitions.len(),
+            1,
+            "keyed index read must return exactly the replica's partition"
+        );
+        assert_eq!(
+            partitions[0].key.token.0, 42,
+            "result must be the keyed partition from the replica"
+        );
+        assert!(
+            partitions.iter().all(|p| p.key.token.0 != 99_999),
+            "a non-replica node's data must never appear: the keyed read \
+             degenerated to a global scatter-gather"
+        );
+
+        replica_server
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
+        other_server
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
+    }
+
+    /// The real inbound handler decodes the payload, restricts the consult to
+    /// the requested partition, and answers with only that partition's
+    /// matching rows.
+    #[tokio::test]
+    async fn index_read_in_partition_handler_serves_partition_restricted_rows() {
+        use crate::raft::handlers::{
+            IndexReadInPartitionHandler, IndexReadInPartitionRequestPayload,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        // Register with a secondary index on the val column (position 0).
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        storage
+            .register_table_with_indexes(schema, vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let k1 = DecoratedKey::new(PartitionKey::new(b"pk1".to_vec()));
+        let k2 = DecoratedKey::new(PartitionKey::new(b"pk2".to_vec()));
+        storage.write(&table_id, &k1, test_row(10), 10).unwrap();
+        storage.write(&table_id, &k2, test_row(11), 11).unwrap();
+
+        let handler = IndexReadInPartitionHandler::new(storage);
+        let req = IndexReadInPartitionRequestPayload {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            index_name: "val_idx".to_string(),
+            index_key: b"hello".to_vec(),
+            partition_key: b"pk1".to_vec(),
+        };
+        let resp = handler
+            .handle(
+                (Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap()),
+                Message::IndexReadInPartitionRequest(Bytes::from(
+                    bincode::serialize(&req).unwrap(),
+                )),
+            )
+            .await
+            .expect("handler must answer");
+
+        let Message::IndexReadInPartitionResponse(b) = resp else {
+            panic!("expected IndexReadInPartitionResponse, got {resp:?}");
+        };
+        let payload: IndexReadResponsePayload = bincode::deserialize(&b).unwrap();
+        let partitions: Vec<Partition> = payload
+            .partitions
+            .into_iter()
+            .map(partition_from_wire)
+            .collect();
+        assert_eq!(partitions.len(), 1, "only the pk1 match must be returned");
+        assert_eq!(
+            partitions[0].key.key.as_bytes(),
+            b"pk1",
+            "the pk2 match for the same value must be excluded"
+        );
     }
 
     #[tokio::test]

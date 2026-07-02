@@ -1321,6 +1321,86 @@ impl RpcHandler for IndexReadHandler {
     }
 }
 
+/// Payload for a remote KEYED index-read request (t_430c4188): a secondary
+/// index lookup restricted to one partition, sent only to that partition's
+/// replicas — never a global scatter-gather.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexReadInPartitionRequestPayload {
+    pub keyspace: String,
+    pub table: String,
+    pub index_name: String,
+    pub index_key: Vec<u8>,
+    /// Raw partition key bytes the postings are restricted to.
+    pub partition_key: Vec<u8>,
+}
+
+/// Handles inbound `IndexReadInPartitionRequest` RPCs from remote coordinators.
+///
+/// Runs `read_by_index_in_partition` on local storage and returns the matching
+/// rows (as single-row partitions) for the requested partition only.
+pub struct IndexReadInPartitionHandler {
+    storage: Arc<StorageEngine>,
+}
+
+impl IndexReadInPartitionHandler {
+    pub fn new(storage: Arc<StorageEngine>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for IndexReadInPartitionHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let bytes = match msg {
+            Message::IndexReadInPartitionRequest(b) => b,
+            _ => return None,
+        };
+
+        let req: IndexReadInPartitionRequestPayload = bincode::deserialize(&bytes)
+            .map_err(|e| {
+                tracing::warn!("IndexReadInPartitionHandler: failed to deserialize request: {e}");
+                e
+            })
+            .ok()?;
+
+        let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
+        let index_key = IndexKey(req.index_key);
+
+        let partitions = match self.storage.read_by_index_in_partition(
+            &table_id,
+            &req.index_name,
+            &index_key,
+            &req.partition_key,
+        ) {
+            Ok(ps) => ps,
+            Err(e) => {
+                tracing::warn!(
+                    "IndexReadInPartitionHandler: read_by_index_in_partition failed: {e}"
+                );
+                vec![]
+            }
+        };
+
+        let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
+        let payload = IndexReadResponsePayload {
+            partitions: wire_partitions,
+        };
+
+        let resp_bytes = match bincode::serialize(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("IndexReadInPartitionHandler: failed to serialize response: {e}");
+                bincode::serialize(&IndexReadResponsePayload { partitions: vec![] })
+                    .unwrap_or_default()
+            }
+        };
+
+        Some(Message::IndexReadInPartitionResponse(Bytes::from(
+            resp_bytes,
+        )))
+    }
+}
+
 /// Payload for a remote full-text search request (fts_match lookup on one node).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FulltextSearchRequestPayload {

@@ -64,6 +64,16 @@ digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newe
 copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
 to a healthy replica and enqueues a background anti-entropy refill.
 
+**Keyed index read (t_430c4188).** `coordinate_index_read_in_partition`
+serves `WHERE <full partition key> AND <indexed_col> = ?`: it resolves the
+partition's replicas from the ring under the keyspace strategy and sends each an
+`IndexReadInPartitionRequest` (`0x66`/`0x67`); the replica consults its
+secondary index restricted to that partition and point-reads only the matching
+rows (O(matching rows), never O(partition rows)). Results merge per token;
+partial replica failures degrade to a partial union (logged); all-replicas-failed
+errors. Exposed as `WritePath::index_read_in_partition` (Direct/Pair resolve
+locally). Unlike `coordinate_index_read`, this never fans out to the whole ring.
+
 **Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
 index lookup out to every node — its hits span all token ranges (there is no
 partition key) — running each node's local FTI via a `FulltextSearchRequest` RPC
