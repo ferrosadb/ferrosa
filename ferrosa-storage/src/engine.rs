@@ -5966,7 +5966,7 @@ impl StorageEngine {
             // off the sidecar file with a bounded top-k working set — the whole
             // index is never read or deserialized into memory.
             if let ferrosa_index::fulltext::query::FtsQuery::Term(term) = &parsed {
-                match ferrosa_index::fulltext::stream::stream_search_term(&fti_path, term, limit) {
+                match ferrosa_index::fulltext::stream::scan_term_top_k(&fti_path, term, limit) {
                     Ok(hits) => {
                         merge_hits(
                             &mut score_map,
