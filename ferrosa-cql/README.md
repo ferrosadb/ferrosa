@@ -56,6 +56,16 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
   keep their `range_read_limited_rows_checked` fail-loud cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
+- **Scan planner** (`planner.rs`) — rule-based `ScanPlan` selection for SELECT:
+  `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
+  indexed residual `=` predicate — t_430c4188: keyed secondary-index consult
+  restricted to the partition, O(matching rows) instead of O(partition rows),
+  routed to the partition's replicas, no ALLOW FILTERING needed),
+  `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` (global index
+  scatter-gathers), `VectorAnn` / `GeoIndex` / `FullTextIndex` (dedicated
+  branches), `FullScan`. `EXPLAIN SELECT …` renders the same plan the router
+  executes. `CREATE INDEX` on a CLUSTERING column wires the storage engine's
+  clustering-component build path (previously a silent schema-only no-op).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
