@@ -11671,6 +11671,74 @@ mod tests {
         }
     }
 
+    /// t_a0f922a3 "also verify": right after a node restart, a live paged
+    /// scan over a COUNT-verified 15k-row table returned ZERO rows instantly.
+    /// The paged CQL scan is backed by `range_iter_fragmented` (with an
+    /// optional resume key), so pin here that a REOPENED engine whose data is
+    /// entirely SSTable-backed streams every row through that iterator —
+    /// both from the table start and from a mid-table resume key. A silent
+    /// empty (or short) stream on cold SSTable-backed state is the live bug
+    /// shape; it must fail this test, never return an empty page as success.
+    #[tokio::test]
+    async fn reopened_engine_fragmented_scan_returns_all_sstable_backed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        let n = 500usize;
+
+        // Phase 1: seed n single-row partitions, flush, drop the engine.
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..n {
+                let pk = make_key(&format!("restart-{i:05}"));
+                engine
+                    .write(&tid, &pk, make_row(format!("v{i}").as_bytes(), 1), 1)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        // Phase 2: reopen cold and page through the fragmented iterator.
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        use futures::StreamExt;
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut stream = engine.range_iter_fragmented(&tid, None, None);
+        while let Some(item) = stream.next().await {
+            let p = item.expect("fragmented scan after reopen must not error");
+            if !p.rows.is_empty() {
+                keys.push(p.key.key.as_bytes().to_vec());
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            n,
+            "reopened SSTable-backed fragmented scan must stream every \
+             partition — an instant-empty result is the t_a0f922a3 restart bug"
+        );
+
+        // Resume from the middle (token order): the suffix must be exact.
+        let mid = keys[n / 2].clone();
+        let resume = DecoratedKey::new(PartitionKey::new(mid));
+        let mut resumed: Vec<Vec<u8>> = Vec::new();
+        let mut stream = engine.range_iter_fragmented(&tid, Some(&resume), None);
+        while let Some(item) = stream.next().await {
+            let p = item.expect("resumed fragmented scan after reopen must not error");
+            if !p.rows.is_empty() {
+                resumed.push(p.key.key.as_bytes().to_vec());
+            }
+        }
+        assert_eq!(
+            resumed,
+            keys[n / 2..].to_vec(),
+            "a resumed scan after reopen must return exactly the suffix from \
+             the resume key (inclusive), in the same token order"
+        );
+    }
+
     /// Helper: build CompositeType PK for entity_store.
     fn make_entity_store_pk(tenant: [u8; 16], session: [u8; 16]) -> DecoratedKey {
         let mut pk = Vec::new();

@@ -46,6 +46,70 @@ pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
 pub type PartitionResultStream =
     Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
 
+/// Resume position for a paged streaming scan (t_a0f922a3).
+///
+/// `key` is the partition the previous page stopped in (INCLUSIVE lower
+/// bound). `clustering`, when `Some`, is the raw clustering bytes of the last
+/// row already delivered in that partition: every producer (local iterator
+/// wrapper and each remote replica) drops rows of `key`'s partition whose
+/// clustering is `<=` it, so a resumed page of a WIDE partition re-streams
+/// neither over the wire nor into the merge. The CQL paging collector still
+/// applies the same skip on top (idempotent — both sides compare the same raw
+/// clustering bytes), so an off-by-one can never drop or duplicate rows.
+#[derive(Debug, Clone)]
+pub struct ScanResume {
+    pub key: DecoratedKey,
+    pub clustering: Option<Vec<u8>>,
+}
+
+/// Apply the within-partition resume filter to one streamed fragment: drop
+/// every row of the resume partition whose clustering bytes are `<=` the
+/// resume clustering. Fragments of other partitions pass through untouched.
+/// Returns `None` when the filtered fragment carries neither rows nor header
+/// state (nothing left to deliver).
+pub fn filter_resumed_fragment(
+    mut partition: Partition,
+    resume_key: &[u8],
+    resume_clustering: &[u8],
+) -> Option<Partition> {
+    if partition.key.key.as_bytes() != resume_key {
+        return Some(partition);
+    }
+    partition
+        .rows
+        .retain(|row| row.clustering.as_slice() > resume_clustering);
+    let carries_header = partition.static_row.is_some()
+        || partition.deletion != ferrosa_sstable::types::DeletionTime::LIVE;
+    if partition.rows.is_empty() && !carries_header {
+        return None;
+    }
+    Some(partition)
+}
+
+/// Wrap a fragmented partition stream with the within-partition resume skip
+/// (see [`filter_resumed_fragment`]). No-op when the resume carries no
+/// clustering position.
+pub(crate) fn resume_filtered_stream(
+    stream: PartitionResultStream,
+    resume: Option<&ScanResume>,
+) -> PartitionResultStream {
+    let Some(resume) = resume else { return stream };
+    let Some(clustering) = resume.clustering.clone() else {
+        return stream;
+    };
+    let key = resume.key.key.as_bytes().to_vec();
+    Box::pin(stream.filter_map(move |item| {
+        let key = key.clone();
+        let clustering = clustering.clone();
+        async move {
+            match item {
+                Ok(p) => filter_resumed_fragment(p, &key, &clustering).map(Ok),
+                Err(e) => Some(Err(e)),
+            }
+        }
+    }))
+}
+
 fn local_range_stream(
     engine: Arc<StorageEngine>,
     table_id: &TableId,
@@ -62,31 +126,32 @@ fn local_range_stream(
 }
 
 /// Fragmented (intra-partition streaming) range stream with an optional
-/// inclusive lower-bound key. Used by the coordinator-side paging cursor to
-/// resume an unbounded `SELECT *` scan at the last partition key without
-/// materializing the whole table. `row_limit == 0` (the unbounded scan shape)
-/// is the only caller, so wide partitions stream as bounded fragments.
+/// resume position. Used by the coordinator-side paging cursor to resume an
+/// unbounded `SELECT *` scan at the last partition key (and, for a wide
+/// partition, the last delivered clustering position) without materializing
+/// the whole table. `row_limit == 0` (the unbounded scan shape) is the only
+/// caller, so wide partitions stream as bounded fragments.
 fn local_range_stream_from(
     engine: Arc<StorageEngine>,
     table_id: &TableId,
-    start: Option<&DecoratedKey>,
+    resume: Option<&ScanResume>,
 ) -> PartitionResultStream {
     let stream = engine
-        .range_iter_fragmented(table_id, start, None)
+        .range_iter_fragmented(table_id, resume.map(|r| &r.key), None)
         .map(|item| item.map_err(crate::error::ClusterError::Storage));
-    Box::pin(stream)
+    resume_filtered_stream(Box::pin(stream), resume)
 }
 
 fn local_projected_range_stream_from(
     engine: Arc<StorageEngine>,
     table_id: &TableId,
     wanted: Vec<u16>,
-    start: Option<&DecoratedKey>,
+    resume: Option<&ScanResume>,
 ) -> PartitionResultStream {
     let stream = engine
-        .range_iter_projected_fragmented(table_id, wanted, start, None)
+        .range_iter_projected_fragmented(table_id, wanted, resume.map(|r| &r.key), None)
         .map(|item| item.map_err(crate::error::ClusterError::Storage));
-    Box::pin(stream)
+    resume_filtered_stream(Box::pin(stream), resume)
 }
 
 fn local_projected_range_stream(
@@ -510,32 +575,34 @@ impl WritePath {
         }
     }
 
-    /// Stream every partition starting at an inclusive lower-bound key, using
-    /// the fragmented (intra-partition streaming) iterators.
+    /// Stream every partition starting at a resume position, using the
+    /// fragmented (intra-partition streaming) iterators.
     ///
     /// This backs the coordinator-side paging cursor for unbounded `SELECT *`
-    /// scans: the previous page's continuation token is decoded into a `start`
-    /// key, the scan resumes there, and the consumer drops rows already emitted
-    /// within that partition. `start == None` is the first page.
+    /// scans: the previous page's continuation token is decoded into a
+    /// [`ScanResume`] — the last partition key (inclusive) plus the last
+    /// delivered clustering position within it — the scan resumes there, and
+    /// every producer drops the already-emitted prefix of that partition.
+    /// `resume == None` is the first page.
     ///
     /// In cluster mode the local-only fan-out (CL=ONE with the keyspace RF
     /// spanning the ring) streams the local fragmented iterator directly; a
-    /// multi-replica shape fans out a start-bounded fragment stream to each
+    /// multi-replica shape fans out a resume-bounded fragment stream to each
     /// CL-selected replica and merges them with the local stream through the
-    /// coordinator's token-aware N-way fragment merge. The resume key is shipped
-    /// to every replica so a resumed page never re-streams the already-emitted
-    /// prefix.
+    /// coordinator's token-aware N-way fragment merge. The resume position is
+    /// shipped to every replica so a resumed page never re-streams the
+    /// already-emitted prefix over the wire — including mid-wide-partition.
     pub async fn range_read_stream_all_from(
         &self,
         table_id: &TableId,
-        start: Option<&DecoratedKey>,
+        resume: Option<&ScanResume>,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> crate::error::Result<PartitionResultStream> {
         match self {
-            Self::Direct(engine) => Ok(local_range_stream_from(engine.clone(), table_id, start)),
+            Self::Direct(engine) => Ok(local_range_stream_from(engine.clone(), table_id, resume)),
             Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(
-                local_range_stream_from(coordinator.local_storage().clone(), table_id, start),
+                local_range_stream_from(coordinator.local_storage().clone(), table_id, resume),
             ),
             Self::Cluster(coordinator) => {
                 if !coordinator.streaming_range_reads {
@@ -546,7 +613,7 @@ impl WritePath {
                 coordinator
                     .coordinate_range_read_stream_from(
                         table_id,
-                        start,
+                        resume,
                         cl,
                         strategy.replication_factor(),
                     )
@@ -558,15 +625,15 @@ impl WritePath {
         }
     }
 
-    /// Projection-aware resume-capable streaming range read with an inclusive
-    /// lower-bound key. Mirrors [`Self::range_read_stream_all_from`] for the
-    /// `SELECT col1, col2 FROM t` (no WHERE) paged scan shape, byte-skipping
-    /// unprojected cells in the SSTable layer.
+    /// Projection-aware resume-capable streaming range read. Mirrors
+    /// [`Self::range_read_stream_all_from`] for the `SELECT col1, col2 FROM t`
+    /// (no WHERE) paged scan shape, byte-skipping unprojected cells in the
+    /// SSTable layer.
     pub async fn range_read_projected_stream_all_from(
         &self,
         table_id: &TableId,
         wanted: Vec<u16>,
-        start: Option<&DecoratedKey>,
+        resume: Option<&ScanResume>,
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> crate::error::Result<PartitionResultStream> {
@@ -575,14 +642,14 @@ impl WritePath {
                 engine.clone(),
                 table_id,
                 wanted,
-                start,
+                resume,
             )),
             Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
                 Ok(local_projected_range_stream_from(
                     coordinator.local_storage().clone(),
                     table_id,
                     wanted,
-                    start,
+                    resume,
                 ))
             }
             Self::Cluster(coordinator) => {
@@ -595,7 +662,7 @@ impl WritePath {
                     .coordinate_range_read_projected_stream_from(
                         table_id,
                         wanted,
-                        start,
+                        resume,
                         cl,
                         strategy.replication_factor(),
                     )

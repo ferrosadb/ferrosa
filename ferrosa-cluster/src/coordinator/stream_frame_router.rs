@@ -353,6 +353,26 @@ impl RpcHandler for StreamFrameRouter {
                 }
                 return None;
             }
+            Message::RangeReadStreamHeartbeat(bytes) => {
+                // Heartbeats are ADVISORY keep-alives: on a full consumer
+                // buffer they are dropped, never allowed to close the route —
+                // an undrained buffer means the consumer is mid-window, not
+                // idle, and losing a keep-alive there is harmless while
+                // closing the route would kill a healthy windowed stream.
+                match self
+                    .router
+                    .route_lossy(request_id, Message::RangeReadStreamHeartbeat(bytes))
+                {
+                    Ok(()) | Err(RouteError::NoRoute(_)) => {}
+                    Err(RouteError::ChannelClosed(id)) => {
+                        self.clear_request_state(id);
+                    }
+                    Err(RouteError::ChannelFull(_)) => {
+                        unreachable!("route_lossy never reports ChannelFull")
+                    }
+                }
+                None
+            }
             other => {
                 self.route_frame(request_id, msg_type, other);
                 None
@@ -418,6 +438,7 @@ mod tests {
             request_id: id,
             total_chunks,
             truncated: false,
+            resume: None,
         };
         Message::RangeReadStreamDone(Bytes::from(bincode::serialize(&payload).unwrap()))
     }

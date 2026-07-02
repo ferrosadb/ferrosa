@@ -69,6 +69,11 @@ use ferrosa_net::rpc::server::RpcServer;
 
 const KS: &str = "test_ks";
 const TBL: &str = "test_tbl";
+/// Clustered table for the wide-partition paging tests. Registered with a
+/// real clustering column — the SSTable serialization header takes its
+/// clustering component list from the schema, so rows written with clustering
+/// bytes against a clustering-less schema would silently lose them on flush.
+const TBL_WIDE: &str = "test_wide";
 
 struct NoopListener;
 impl PeerEventListener for NoopListener {
@@ -122,6 +127,22 @@ fn engine(dir: &std::path::Path) -> Arc<StorageEngine> {
         extensions: Default::default(),
     };
     engine.register_table(schema).unwrap();
+    let wide_schema = TableSchema {
+        keyspace: KS.to_string(),
+        table: TBL_WIDE.to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![ColumnDefinition {
+            name: "ck".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        }],
+        static_columns: vec![],
+        regular_columns: vec![ColumnDefinition {
+            name: "v0".to_string(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        }],
+        extensions: Default::default(),
+    };
+    engine.register_table(wide_schema).unwrap();
     engine
 }
 
@@ -439,6 +460,329 @@ fn multi_replica_paged_projected_scan_cancels_abandoned_producers() {
     });
 }
 
+/// One clustered row for the wide-partition tests: clustering bytes are
+/// byte-ordered (`ck-%06d`), matching the storage layer's raw-byte clustering
+/// order, with one projected cell.
+fn wide_row(j: usize) -> Row {
+    Row {
+        clustering: format!("ck-{j:06}").into_bytes(),
+        cells: vec![(0, CellValue::live(format!("v-{j}").into_bytes(), 1000))],
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+    }
+}
+
+/// Seed `pks.len()` WIDE partitions of `rows_per` clustered rows each, then
+/// flush so the scan is SSTable-backed (the live `typed_edges` shape: a
+/// handful of huge partitions).
+fn seed_wide(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
+    let table_id = TableId::new(KS, TBL_WIDE);
+    for pk in pks {
+        let dk = DecoratedKey::new(PartitionKey::new(pk.as_bytes().to_vec()));
+        for j in 0..rows_per {
+            engine.write(&table_id, &dk, wide_row(j), 1000).unwrap();
+        }
+    }
+    engine.flush(&table_id).unwrap();
+}
+
+/// Fully-wired 3-node loopback cluster (coordinator + 2 storage replicas) for
+/// paged-scan tests. Every node is seeded identically via `seed` (RF=3 —
+/// every replica owns the whole ring).
+struct LoopbackCluster {
+    wp: WritePath,
+    frame_router: Arc<StreamFrameRouter>,
+    srv2: Arc<RpcServer>,
+    srv3: Arc<RpcServer>,
+    coord_srv: Arc<RpcServer>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+impl LoopbackCluster {
+    async fn shutdown(self) {
+        self.srv2.shutdown(Duration::from_millis(50)).await;
+        self.srv3.shutdown(Duration::from_millis(50)).await;
+        self.coord_srv.shutdown(Duration::from_millis(50)).await;
+    }
+}
+
+async fn build_loopback_cluster(seed: &dyn Fn(&StorageEngine)) -> LoopbackCluster {
+    let dir_local = tempfile::tempdir().unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let dir3 = tempfile::tempdir().unwrap();
+
+    let storage = engine(dir_local.path());
+    seed(&storage);
+
+    let coord_id = uuid::Uuid::new_v4();
+    let r2_id = uuid::Uuid::new_v4();
+    let r3_id = uuid::Uuid::new_v4();
+
+    let (srv2, addr2, back2) = spawn_storage_replica_seeded(r2_id, dir2.path(), seed).await;
+    let (srv3, addr3, back3) = spawn_storage_replica_seeded(r3_id, dir3.path(), seed).await;
+
+    let mut ring = TokenRing::new();
+    ring.add_node(1, ring_node(coord_id, "127.0.0.1:1"));
+    ring.add_node(2, ring_node(r2_id, &addr2.to_string()));
+    ring.add_node(3, ring_node(r3_id, &addr3.to_string()));
+    ring.assign_tokens(1, &[i64::MIN]);
+    ring.assign_tokens(2, &[0]);
+    ring.assign_tokens(3, &[i64::MAX]);
+
+    let peers = Arc::new(PeerManager::new(
+        Arc::new(net_config()),
+        coord_id,
+        Arc::new(NoopListener),
+    ));
+    peers.ensure_peer(r2_id, &addr2.to_string()).await.unwrap();
+    peers.ensure_peer(r3_id, &addr3.to_string()).await.unwrap();
+
+    let coordinator = Arc::new(ClusterCoordinator::new(
+        Arc::new(ArcSwap::from_pointee(ring)),
+        peers,
+        1,
+        storage,
+        3,
+        ConsistencyLevel::All,
+    ));
+
+    let frame_router = Arc::new(StreamFrameRouter::new(coordinator.stream_router()));
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(MsgType::RangeReadStreamChunk, frame_router.clone());
+    registry.register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+    registry.register(MsgType::RangeReadStreamDone, frame_router.clone());
+    let coord_srv = Arc::new(RpcServer::new(net_config(), coord_id, registry));
+    let coord_addr = coord_srv.start_and_get_addr().await.unwrap();
+    back2
+        .ensure_peer(coord_id, &coord_addr.to_string())
+        .await
+        .unwrap();
+    back3
+        .ensure_peer(coord_id, &coord_addr.to_string())
+        .await
+        .unwrap();
+
+    LoopbackCluster {
+        wp: WritePath::cluster(coordinator),
+        frame_router,
+        srv2,
+        srv3,
+        coord_srv,
+        _dirs: vec![dir_local, dir2, dir3],
+    }
+}
+
+/// Page a coordinated projected scan to completion using EXACTLY the CQL
+/// collector's cursor semantics (`collect_page_from_partition_stream`):
+///
+/// * a page collects up to `page_rows` clustered ROWS (not partitions);
+/// * the continuation cursor is `(partition key bytes, clustering bytes)` of
+///   the last accepted row, taken only when one MORE row proves a
+///   continuation is needed;
+/// * resume re-opens the scan at the cursor's partition key (INCLUSIVE lower
+///   bound) and skips rows in that partition whose clustering is `<=` the
+///   cursor clustering.
+///
+/// Returns every accepted `(pk, clustering)` in delivery order. Hard
+/// timeouts: a stalled pull or a non-terminating cursor FAILS the test.
+async fn page_rows_like_cql_collector(
+    wp: &WritePath,
+    table_id: &TableId,
+    strategy: &ReplicationStrategy,
+    page_rows: usize,
+    max_pages: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut cursor: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut pages = 0usize;
+
+    loop {
+        pages += 1;
+        assert!(
+            pages <= max_pages,
+            "paged scan did not terminate within {max_pages} pages — the \
+             paging cursor is cycling instead of advancing (t_a0f922a3 mode 1); \
+             delivered {} rows so far",
+            out.len()
+        );
+
+        let start = cursor
+            .as_ref()
+            .map(|(pk, ck)| ferrosa_cluster::write_path::ScanResume {
+                key: DecoratedKey::new(PartitionKey::new(pk.clone())),
+                clustering: Some(ck.clone()),
+            });
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            wp.range_read_projected_stream_all_from(
+                table_id,
+                vec![0],
+                start.as_ref(),
+                ConsistencyLevel::All,
+                strategy,
+            ),
+        )
+        .await
+        .expect("opening a page stream must not hang (t_a0f922a3 mode 2)")
+        .expect("multi-replica projected paged scan must not refuse");
+
+        let mut accepted = 0usize;
+        let mut more = false;
+        let mut page_cursor: Option<(Vec<u8>, Vec<u8>)> = None;
+        'page: loop {
+            let Some(item) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+                .await
+                .expect(
+                    "a page pull must not hang — a stall is never acceptable (t_a0f922a3 mode 2)",
+                )
+            else {
+                break; // stream exhausted — final page
+            };
+            let p = item.expect("partition");
+            let pk = p.key.key.as_bytes().to_vec();
+            for row in p.rows {
+                // Skip rows already returned on a previous page (the cursor
+                // partition is re-entered at partition start on resume).
+                if let Some((cpk, cck)) = cursor.as_ref() {
+                    if &pk == cpk && row.clustering.as_slice() <= cck.as_slice() {
+                        continue;
+                    }
+                }
+                if accepted == page_rows {
+                    more = true;
+                    break 'page;
+                }
+                out.push((pk.clone(), row.clustering.clone()));
+                page_cursor = Some((pk.clone(), row.clustering));
+                accepted += 1;
+            }
+        }
+        drop(stream); // abandon the fan-out exactly like the CQL collector
+
+        if !more {
+            return out;
+        }
+        cursor = page_cursor;
+    }
+}
+
+/// t_a0f922a3 mode 1 (CYCLE) on the REAL multi-replica path: wide partitions
+/// spanning multiple pages must page to completion with an exact union. The
+/// live 3-node cluster looped forever over ~10% of `typed_edges` (page starts
+/// repeating with period ~3, `has_more_pages` never false) — a handful of
+/// huge partitions, RF=3, paged projected scan.
+#[test]
+fn multi_replica_wide_partition_paged_scan_terminates_exactly() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        const ROWS_PER: usize = 4_000;
+        const PAGE_ROWS: usize = 1_500;
+        let pks: [&str; 3] = ["wpk-a", "wpk-b", "wpk-c"];
+
+        let cluster = build_loopback_cluster(&|storage| seed_wide(storage, &pks, ROWS_PER)).await;
+        let table_id = TableId::new(KS, TBL_WIDE);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+
+        let total = pks.len() * ROWS_PER;
+        let max_pages = total.div_ceil(PAGE_ROWS) + 2;
+        let delivered =
+            page_rows_like_cql_collector(&cluster.wp, &table_id, &strategy, PAGE_ROWS, max_pages)
+                .await;
+
+        let expected: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> = pks
+            .iter()
+            .flat_map(|pk| {
+                (0..ROWS_PER).map(|j| (pk.as_bytes().to_vec(), format!("ck-{j:06}").into_bytes()))
+            })
+            .collect();
+        let got: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> =
+            delivered.iter().cloned().collect();
+        assert_eq!(
+            got.len(),
+            delivered.len(),
+            "paged multi-replica wide-partition scan emitted duplicate rows"
+        );
+        assert_eq!(
+            got,
+            expected,
+            "paged multi-replica wide-partition scan must deliver every row \
+             exactly once (no gaps, no dupes); got {} of {}",
+            got.len(),
+            total
+        );
+
+        assert_eq!(
+            cluster.frame_router.route_closures(),
+            0,
+            "paging must not phantom-close stream routes (t_dc729b1d)"
+        );
+
+        cluster.shutdown().await;
+    });
+}
+
+/// t_a0f922a3 mode 2 (STALL) on the REAL multi-replica path: MANY SMALL
+/// partitions (the live `vfix.nums` shape — 15k single-row partitions), a
+/// no-LIMIT paged projected scan. Live, page 1 never returned (client
+/// blocked over 14 min, zero route closes). Every pull runs under a hard
+/// timeout so a stall FAILS; the union must be exact.
+#[test]
+fn multi_replica_many_small_partitions_paged_scan_completes() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        const N: usize = 15_000;
+        const PAGE_ROWS: usize = 5_000;
+
+        let cluster = build_loopback_cluster(&|storage| seed_local(storage, N)).await;
+        let table_id = TableId::new(KS, TBL);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+
+        let max_pages = N.div_ceil(PAGE_ROWS) + 2;
+        let delivered =
+            page_rows_like_cql_collector(&cluster.wp, &table_id, &strategy, PAGE_ROWS, max_pages)
+                .await;
+
+        let expected: std::collections::BTreeSet<Vec<u8>> =
+            (0..N).map(|i| format!("pk-{i:08}").into_bytes()).collect();
+        let got: std::collections::BTreeSet<Vec<u8>> =
+            delivered.iter().map(|(pk, _)| pk.clone()).collect();
+        assert_eq!(
+            got.len(),
+            delivered.len(),
+            "paged multi-replica small-partition scan emitted duplicate rows"
+        );
+        assert_eq!(
+            got,
+            expected,
+            "paged multi-replica small-partition scan must deliver every \
+             partition exactly once; got {} of {N}",
+            got.len()
+        );
+
+        assert_eq!(
+            cluster.frame_router.route_closures(),
+            0,
+            "paging must not phantom-close stream routes (t_dc729b1d)"
+        );
+
+        cluster.shutdown().await;
+    });
+}
+
 /// A replica node whose streaming range-read handler is backed by a REAL
 /// `StorageEngine` seeded with the full dataset (the production
 /// `StreamRangeReader for Arc<StorageEngine>` impl). Returns the server, its
@@ -448,8 +792,18 @@ async fn spawn_storage_replica(
     dir: &std::path::Path,
     n: usize,
 ) -> (Arc<RpcServer>, std::net::SocketAddr, Arc<PeerManager>) {
+    spawn_storage_replica_seeded(host_id, dir, &|storage| seed_local(storage, n)).await
+}
+
+/// [`spawn_storage_replica`] with an arbitrary seeding function, so tests can
+/// seed wide (multi-row) partitions and not just the single-row keyset.
+async fn spawn_storage_replica_seeded(
+    host_id: uuid::Uuid,
+    dir: &std::path::Path,
+    seed: &dyn Fn(&StorageEngine),
+) -> (Arc<RpcServer>, std::net::SocketAddr, Arc<PeerManager>) {
     let storage = engine(dir);
-    seed_local(&storage, n);
+    seed(&storage);
     let back = Arc::new(PeerManager::new(
         Arc::new(net_config()),
         host_id,
@@ -567,11 +921,17 @@ fn multi_replica_paged_projected_scan_returns_all_rows_across_pages() {
                 pages += 1;
                 assert!(pages <= N + 5, "paging did not terminate (runaway pages)");
 
+                let resume = start_key
+                    .as_ref()
+                    .map(|k| ferrosa_cluster::write_path::ScanResume {
+                        key: k.clone(),
+                        clustering: None,
+                    });
                 let mut stream = wp
                     .range_read_projected_stream_all_from(
                         &table_id,
                         vec![0],
-                        start_key.as_ref(),
+                        resume.as_ref(),
                         ConsistencyLevel::All,
                         &strategy,
                     )

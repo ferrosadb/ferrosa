@@ -218,6 +218,14 @@ pub async fn handle_stream_request_with_cancel<R, S>(
     let mut batch_rows: usize = 0;
     let mut total_chunks_emitted: u32 = 0;
     let mut any_decode_error = false;
+    // Position after the last emitted row: (partition key, clustering of the
+    // last row in that partition emitted so far). Reported in `Done.resume`
+    // when the producer stops at its `max_chunks` window so the coordinator
+    // can continue the stream exactly one row past the boundary.
+    let mut last_pos: Option<(Vec<u8>, Vec<u8>)> = None;
+    // Flow-control window (t_a0f922a3 mode 2): `0` = unbounded.
+    let max_chunks = req.max_chunks;
+    let mut window_exhausted = false;
 
     'pull: loop {
         tokio::select! {
@@ -232,13 +240,41 @@ pub async fn handle_stream_request_with_cancel<R, S>(
             }
             next = stream.next() => match next {
                 Some(Ok(partition)) => {
+                    let partition = match resume_filter_rows(partition, &start_key, &req) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     batch_rows = batch_rows.saturating_add(partition.rows.len());
+                    let pk_bytes = partition.key.key.as_bytes();
+                    match partition.rows.last() {
+                        Some(last_row) => {
+                            last_pos = Some((pk_bytes.to_vec(), last_row.clustering.clone()));
+                        }
+                        None => {
+                            // Row-less fragment (header-only / fully suppressed):
+                            // keep the previous row position if it is in the same
+                            // partition; otherwise advance to (pk, []) so a window
+                            // continuation cannot rewind before this partition.
+                            if last_pos.as_ref().is_none_or(|(pk, _)| pk != pk_bytes) {
+                                last_pos = Some((pk_bytes.to_vec(), Vec::new()));
+                            }
+                        }
+                    }
                     batch.push(partition);
                     if batch.len() >= chunk_size || batch_rows >= row_chunk_cap {
                         emit_chunk(&req, &mut batch, chunk_seq, sink).await;
                         batch_rows = 0;
                         chunk_seq = chunk_seq.saturating_add(1);
                         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
+                        if max_chunks > 0 && total_chunks_emitted >= max_chunks {
+                            // Window filled: stop scanning and report the resume
+                            // position. The coordinator fires a continuation
+                            // request once its consumer drains this window, so
+                            // un-drained frames per stream never exceed
+                            // `max_chunks` + 1 (Done) at the receiver.
+                            window_exhausted = true;
+                            break 'pull;
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -272,16 +308,46 @@ pub async fn handle_stream_request_with_cancel<R, S>(
         total_chunks_emitted = total_chunks_emitted.saturating_add(1);
     }
 
-    // Terminator.
+    // Terminator. `resume` is set only when the window stopped the scan with
+    // (potentially) more data remaining; a continuation that finds nothing
+    // more terminates with `resume: None` on its own Done.
+    let resume = if window_exhausted {
+        let (partition_key, clustering) = last_pos.unwrap_or_default();
+        Some(crate::raft::handlers::StreamResumePositionWire {
+            partition_key,
+            clustering,
+        })
+    } else {
+        None
+    };
     let done = RangeReadStreamDonePayload {
         request_id: req.request_id,
         total_chunks: total_chunks_emitted,
         truncated: any_decode_error,
+        resume,
     };
     let bytes =
         bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
     sink.send(Message::RangeReadStreamDone(Bytes::from(bytes)))
         .await;
+}
+
+/// Apply the within-partition resume filter (t_a0f922a3 mode 1): when the
+/// request carries `start_key` + `start_clustering`, drop every row of the
+/// start partition whose clustering bytes are `<=` the resume clustering —
+/// those rows were already delivered before the resume point. Fragments of
+/// other partitions pass through untouched. Returns `None` when the filtered
+/// fragment carries neither rows nor header state (nothing to ship).
+fn resume_filter_rows(
+    partition: Partition,
+    start_key: &Option<ferrosa_common::key::DecoratedKey>,
+    req: &RangeReadStreamRequestPayload,
+) -> Option<Partition> {
+    let (Some(resume_ck), Some(start)) = (req.start_clustering.as_deref(), start_key.as_ref())
+    else {
+        return Some(partition);
+    };
+    crate::write_path::filter_resumed_fragment(partition, start.key.as_bytes(), resume_ck)
 }
 
 /// Build a `RangeReadStreamChunk` from `batch`, send it via `sink`,
@@ -316,6 +382,7 @@ async fn send_truncated_done<S: ChunkSink>(req: &RangeReadStreamRequestPayload, 
         request_id: req.request_id,
         total_chunks: 0,
         truncated: true,
+        resume: None,
     };
     let bytes =
         bincode::serialize(&done).expect("RangeReadStreamDonePayload serialization is infallible");
@@ -501,6 +568,8 @@ mod tests {
             table: "tbl".into(),
             projected_regular_ordinals: None,
             start_key: None,
+            start_clustering: None,
+            max_chunks: 0,
         }
     }
 
@@ -560,6 +629,139 @@ mod tests {
             Some(Some(b"resume-key".to_vec())),
             "handler must forward the wire start_key to the reader as the range lower bound"
         );
+    }
+
+    fn clustered_row(ck: &[u8]) -> ferrosa_sstable::types::Row {
+        ferrosa_sstable::types::Row {
+            clustering: ck.to_vec(),
+            cells: vec![],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+        }
+    }
+
+    fn clustered_partition(pk: &[u8], cks: &[&[u8]]) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: cks.iter().map(|ck| clustered_row(ck)).collect(),
+        }
+    }
+
+    fn decode_chunk(frame: &Message) -> RangeReadStreamChunkPayload {
+        let Message::RangeReadStreamChunk(b) = frame else {
+            panic!("expected chunk frame, got {frame:?}");
+        };
+        bincode::deserialize(b).unwrap()
+    }
+
+    fn decode_done(frame: &Message) -> RangeReadStreamDonePayload {
+        let Message::RangeReadStreamDone(b) = frame else {
+            panic!("expected Done frame, got {frame:?}");
+        };
+        bincode::deserialize(b).unwrap()
+    }
+
+    /// t_a0f922a3 mode 2: `max_chunks` caps the frames one request may emit.
+    /// 10 single-row partitions at chunk_size=1 with a window of 3 must emit
+    /// EXACTLY 3 chunks and a non-truncated Done whose `resume` carries the
+    /// position after the last emitted row — the producer must never
+    /// fire-hose the remaining 7 partitions into the coordinator's bounded
+    /// route buffer.
+    #[tokio::test]
+    async fn window_stops_after_max_chunks_and_reports_resume() {
+        let partitions: Vec<Partition> = (1u8..=10)
+            .map(|tag| clustered_partition(&[tag], &[b"ck-x"]))
+            .collect();
+        let reader = StaticReader { partitions };
+        let sink = VecSink::new();
+        let mut request = req(21);
+        request.max_chunks = 3;
+
+        handle_stream_request(request, Arc::new(reader), &sink, 1).await;
+
+        let frames = sink.take();
+        assert_eq!(
+            frames.len(),
+            4,
+            "3 window chunks + 1 Done — the window must stop the scan"
+        );
+        let done = decode_done(&frames[3]);
+        assert_eq!(done.total_chunks, 3);
+        assert!(!done.truncated, "a window stop is not a failure");
+        let resume = done
+            .resume
+            .expect("window stop with data remaining must report a resume position");
+        assert_eq!(resume.partition_key, vec![3u8]);
+        assert_eq!(resume.clustering, b"ck-x".to_vec());
+    }
+
+    /// A scan that finishes WITHIN its window terminates with `resume: None`
+    /// — the continuation loop must stop, not spin.
+    #[tokio::test]
+    async fn window_larger_than_scan_completes_without_resume() {
+        let partitions: Vec<Partition> = (1u8..=2)
+            .map(|tag| clustered_partition(&[tag], &[b"ck"]))
+            .collect();
+        let reader = StaticReader { partitions };
+        let sink = VecSink::new();
+        let mut request = req(22);
+        request.max_chunks = 16;
+
+        handle_stream_request(request, Arc::new(reader), &sink, 1).await;
+
+        let frames = sink.take();
+        let done = decode_done(frames.last().expect("terminator"));
+        assert!(
+            done.resume.is_none(),
+            "a completed scan must not report a resume position"
+        );
+    }
+
+    /// t_a0f922a3 mode 1: `start_clustering` resumes WITHIN the start
+    /// partition — rows with clustering `<=` the resume position must not be
+    /// re-streamed, rows after it must all arrive, and other partitions are
+    /// untouched.
+    #[tokio::test]
+    async fn start_clustering_skips_delivered_prefix_of_start_partition() {
+        let reader = StaticReader {
+            partitions: vec![
+                clustered_partition(b"A", &[b"ck-1", b"ck-2", b"ck-3", b"ck-4"]),
+                clustered_partition(b"B", &[b"ck-1"]),
+            ],
+        };
+        let sink = VecSink::new();
+        let mut request = req(23);
+        request.start_key = Some(b"A".to_vec());
+        request.start_clustering = Some(b"ck-2".to_vec());
+
+        handle_stream_request(request, Arc::new(reader), &sink, 8).await;
+
+        let frames = sink.take();
+        let chunk = decode_chunk(&frames[0]);
+        let rows_by_partition: Vec<(Vec<u8>, Vec<Vec<u8>>)> = chunk
+            .partitions
+            .iter()
+            .map(|p| {
+                (
+                    p.key_bytes.clone(),
+                    p.rows.iter().map(|r| r.clustering.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows_by_partition,
+            vec![
+                (b"A".to_vec(), vec![b"ck-3".to_vec(), b"ck-4".to_vec()]),
+                (b"B".to_vec(), vec![b"ck-1".to_vec()]),
+            ],
+            "the start partition must resume strictly after the delivered \
+             prefix; later partitions must stream whole"
+        );
+        let done = decode_done(frames.last().expect("terminator"));
+        assert!(!done.truncated);
+        assert!(done.resume.is_none());
     }
 
     /// Test reader that always fails at open time — exercises the
