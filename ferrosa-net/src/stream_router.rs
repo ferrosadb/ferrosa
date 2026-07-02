@@ -114,6 +114,26 @@ impl StreamRouter {
         }
     }
 
+    /// True when a receiver is currently registered for `request_id`.
+    ///
+    /// Callers use this as the liveness predicate for per-request companion
+    /// state (e.g. the coordinator's stream sequence tracking): request_ids
+    /// are allocated monotonically and never reused within a process, and a
+    /// route is always registered BEFORE the request is fired, so "no route"
+    /// is terminal — a frame arriving for an unregistered id can only be a
+    /// straggler for a request that already finished, was abandoned, or was
+    /// closed on an error.
+    ///
+    /// Note: an entry whose receiver was dropped without `unregister` still
+    /// counts as registered until the next `route` call removes it; callers
+    /// observe the `ChannelClosed` on that route and tear down then.
+    pub fn is_registered(&self, request_id: u32) -> bool {
+        self.routes
+            .lock()
+            .expect("stream router mutex poisoned")
+            .contains_key(&request_id)
+    }
+
     /// Explicitly remove the registration for `request_id`. The
     /// receiver observes channel close on its next `recv`. Idempotent
     /// — removing a non-existent id is a no-op.
@@ -205,6 +225,22 @@ mod tests {
         assert_eq!(rx.recv().await, Some(chunk(1)));
         assert_eq!(rx.recv().await, Some(chunk(2)));
         assert_eq!(rx.recv().await, None);
+    }
+
+    /// `is_registered` tracks the route lifecycle: false before register,
+    /// true while registered (even with the receiver alive-but-idle), false
+    /// after unregister. Companion per-request state (the coordinator's seq
+    /// tracking) keys its create/drop decisions off this predicate.
+    #[tokio::test]
+    async fn is_registered_follows_register_unregister_lifecycle() {
+        let router = StreamRouter::new();
+        assert!(!router.is_registered(21), "unknown id is not registered");
+
+        let _rx = router.register(21, 4);
+        assert!(router.is_registered(21), "registered id reports live");
+
+        router.unregister(21);
+        assert!(!router.is_registered(21), "unregistered id is terminal");
     }
 
     #[tokio::test]
