@@ -36,7 +36,7 @@
 //! under hard timeouts (a regression FAILS instead of wedging CI).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -74,6 +74,23 @@ const TBL: &str = "test_tbl";
 /// clustering component list from the schema, so rows written with clustering
 /// bytes against a clustering-less schema would silently lose them on flush.
 const TBL_WIDE: &str = "test_wide";
+
+/// File-level serialization guard. Two tests in this binary mutate the process-
+/// global `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT` env var to force a small
+/// fragment (and thus many stream windows). Cargo runs integration-test fns
+/// concurrently on threads in ONE process, so an env mutation in one test would
+/// corrupt the fragment size another test reads mid-scan. Every test in this
+/// file acquires this lock first, so they run serially and no test observes
+/// another's env mutation. (These are heavy loopback-cluster tests; serial
+/// execution is acceptable.) Poisoning is recovered — a panicking test still
+/// releases a usable lock for the next.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial_guard() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct NoopListener;
 impl PeerEventListener for NoopListener {
@@ -317,6 +334,7 @@ async fn wait_live_zero(live: &AtomicUsize) -> bool {
 
 #[test]
 fn multi_replica_paged_projected_scan_cancels_abandoned_producers() {
+    let _serial = serial_guard();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -572,6 +590,83 @@ async fn build_loopback_cluster(seed: &dyn Fn(&StorageEngine)) -> LoopbackCluste
     }
 }
 
+/// Like [`build_loopback_cluster`] but seeds each of the three replicas
+/// (coordinator-local, node2, node3) with a DIFFERENT partition subset — the
+/// production topology where a replica's local storage holds only its owned
+/// token ranges, NOT the whole keyset. The N-way merge must genuinely UNION
+/// across all three sources for the scan to be complete; a source dropping out
+/// mid-scan (a window-continuation that closes without a terminating Done) then
+/// deletes that source's remaining rows from the result — the silent partial.
+async fn build_loopback_cluster_split(
+    seed_local_fn: &dyn Fn(&StorageEngine),
+    seed_n2: &dyn Fn(&StorageEngine),
+    seed_n3: &dyn Fn(&StorageEngine),
+) -> LoopbackCluster {
+    let dir_local = tempfile::tempdir().unwrap();
+    let dir2 = tempfile::tempdir().unwrap();
+    let dir3 = tempfile::tempdir().unwrap();
+
+    let storage = engine(dir_local.path());
+    seed_local_fn(&storage);
+
+    let coord_id = uuid::Uuid::new_v4();
+    let r2_id = uuid::Uuid::new_v4();
+    let r3_id = uuid::Uuid::new_v4();
+
+    let (srv2, addr2, back2) = spawn_storage_replica_seeded(r2_id, dir2.path(), seed_n2).await;
+    let (srv3, addr3, back3) = spawn_storage_replica_seeded(r3_id, dir3.path(), seed_n3).await;
+
+    let mut ring = TokenRing::new();
+    ring.add_node(1, ring_node(coord_id, "127.0.0.1:1"));
+    ring.add_node(2, ring_node(r2_id, &addr2.to_string()));
+    ring.add_node(3, ring_node(r3_id, &addr3.to_string()));
+    ring.assign_tokens(1, &[i64::MIN]);
+    ring.assign_tokens(2, &[0]);
+    ring.assign_tokens(3, &[i64::MAX]);
+
+    let peers = Arc::new(PeerManager::new(
+        Arc::new(net_config()),
+        coord_id,
+        Arc::new(NoopListener),
+    ));
+    peers.ensure_peer(r2_id, &addr2.to_string()).await.unwrap();
+    peers.ensure_peer(r3_id, &addr3.to_string()).await.unwrap();
+
+    let coordinator = Arc::new(ClusterCoordinator::new(
+        Arc::new(ArcSwap::from_pointee(ring)),
+        peers,
+        1,
+        storage,
+        3,
+        ConsistencyLevel::All,
+    ));
+
+    let frame_router = Arc::new(StreamFrameRouter::new(coordinator.stream_router()));
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(MsgType::RangeReadStreamChunk, frame_router.clone());
+    registry.register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
+    registry.register(MsgType::RangeReadStreamDone, frame_router.clone());
+    let coord_srv = Arc::new(RpcServer::new(net_config(), coord_id, registry));
+    let coord_addr = coord_srv.start_and_get_addr().await.unwrap();
+    back2
+        .ensure_peer(coord_id, &coord_addr.to_string())
+        .await
+        .unwrap();
+    back3
+        .ensure_peer(coord_id, &coord_addr.to_string())
+        .await
+        .unwrap();
+
+    LoopbackCluster {
+        wp: WritePath::cluster(coordinator),
+        frame_router,
+        srv2,
+        srv3,
+        coord_srv,
+        _dirs: vec![dir_local, dir2, dir3],
+    }
+}
+
 /// Page a coordinated projected scan to completion using EXACTLY the CQL
 /// collector's cursor semantics (`collect_page_from_partition_stream`):
 ///
@@ -673,6 +768,7 @@ async fn page_rows_like_cql_collector(
 /// huge partitions, RF=3, paged projected scan.
 #[test]
 fn multi_replica_wide_partition_paged_scan_terminates_exactly() {
+    let _serial = serial_guard();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -735,6 +831,7 @@ fn multi_replica_wide_partition_paged_scan_terminates_exactly() {
 /// timeout so a stall FAILS; the union must be exact.
 #[test]
 fn multi_replica_many_small_partitions_paged_scan_completes() {
+    let _serial = serial_guard();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -781,6 +878,220 @@ fn multi_replica_many_small_partitions_paged_scan_completes() {
 
         cluster.shutdown().await;
     });
+}
+
+/// t_a0f922a3 bug #2 (SILENT PARTIAL / data loss) on the REAL multi-replica
+/// path, reproduced by forcing MANY windows PER PAGE.
+///
+/// The live `typed_edges` failure (COUNT=50807 intact) returned only 21160
+/// rows with `has_more_pages=FALSE` — the scan finished ~one big partition /
+/// token range then STOPPED, reporting complete. The prior harness tests all
+/// use the DEFAULT 4096-row fragment cap, so `STREAM_WINDOW_CHUNKS=16` windows
+/// each cover ~64k rows — a whole page fits in ONE window and the
+/// `WindowedReplicaForwarder` continuation loop barely runs. The live cluster
+/// had wide partitions and small effective windows, so the producer's
+/// per-window stream closed at partition/window boundaries MANY times per page.
+///
+/// This test pins `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT=1` so every row is its
+/// own chunk: a 16-chunk window covers only ~16 rows, forcing ~250 window
+/// continuations across a 4000-row wide partition — the exact regime where a
+/// producer stream closing without a terminating Done silently truncates the
+/// scan. The union MUST be exact and `has_more` MUST stay true until true
+/// exhaustion; a premature short page is silent data loss.
+#[test]
+fn multi_replica_many_windows_per_page_scan_is_not_silently_truncated() {
+    // Serialize against every other test in this binary before mutating the
+    // process-global fragment-size env var (cargo runs test fns concurrently
+    // in one process).
+    let _serial = serial_guard();
+    // Force tiny windows: 1 row per fragment ⇒ 1 row per chunk ⇒ a 16-chunk
+    // window is ~16 rows, so a wide partition spans hundreds of windows and the
+    // continuation loop is exercised heavily.
+    std::env::set_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT", "1");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        const ROWS_PER: usize = 4_000;
+        const PAGE_ROWS: usize = 1_500;
+        // Distinct partition keys land on DIFFERENT tokens, so the paged scan
+        // crosses partition boundaries mid-page and mid-window — the live shape.
+        let pks: [&str; 3] = ["wpk-a", "wpk-b", "wpk-c"];
+
+        let cluster = build_loopback_cluster(&|storage| seed_wide(storage, &pks, ROWS_PER)).await;
+        let table_id = TableId::new(KS, TBL_WIDE);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+
+        let total = pks.len() * ROWS_PER;
+        let max_pages = total.div_ceil(PAGE_ROWS) + 2;
+        let delivered =
+            page_rows_like_cql_collector(&cluster.wp, &table_id, &strategy, PAGE_ROWS, max_pages)
+                .await;
+
+        let expected: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> = pks
+            .iter()
+            .flat_map(|pk| {
+                (0..ROWS_PER).map(|j| (pk.as_bytes().to_vec(), format!("ck-{j:06}").into_bytes()))
+            })
+            .collect();
+        let got: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> =
+            delivered.iter().cloned().collect();
+        assert_eq!(
+            got.len(),
+            delivered.len(),
+            "paged scan emitted duplicate rows across many-window pages"
+        );
+        assert_eq!(
+            got,
+            expected,
+            "MANY-WINDOWS-PER-PAGE multi-replica scan silently truncated: \
+             delivered {} of {} rows. A window-boundary producer close that is \
+             read as scan-complete is silent data loss (t_a0f922a3 bug #2).",
+            got.len(),
+            total
+        );
+
+        assert_eq!(
+            cluster.frame_router.route_closures(),
+            0,
+            "many-window paging must not phantom-close stream routes (t_dc729b1d)"
+        );
+
+        cluster.shutdown().await;
+    });
+
+    std::env::remove_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT");
+}
+
+/// Seed a chosen subset of wide partitions on one replica. Models the live
+/// topology where a replica's local storage holds only some partitions.
+fn seed_wide_pks(engine: &StorageEngine, pks: &[&str], rows_per: usize) {
+    seed_wide(engine, pks, rows_per);
+}
+
+/// t_a0f922a3 bug #2 (SILENT PARTIAL / data loss) with DISJOINT per-replica
+/// data AND many windows per page — the true live topology.
+///
+/// Each replica's local storage holds a DIFFERENT subset of the wide
+/// partitions (not the whole keyset), so the N-way merge must UNION across all
+/// three sources. With `FERROSA_RANGE_READ_ROWS_PER_FRAGMENT=1` a 16-chunk
+/// window spans ~16 rows, so every wide partition crosses hundreds of window
+/// boundaries per source. If ANY source's windowed continuation closes its
+/// stream without a terminating Done (or the coordinator reads such a close as
+/// "this replica is exhausted"), that source's remaining partitions vanish from
+/// the result and the scan reports has_more=false — exactly the live
+/// `COUNT=50807 but scan returns 21160, has_more=FALSE` signature.
+///
+/// The union MUST equal every seeded row across all replicas.
+#[test]
+fn multi_replica_disjoint_data_many_windows_scan_unions_completely() {
+    let _serial = serial_guard();
+    std::env::set_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT", "1");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    ferrosa_cluster::coordinator::range_read_stream::forwarder_diag::reset();
+
+    rt.block_on(async move {
+        const ROWS_PER: usize = 3_000;
+        const PAGE_ROWS: usize = 900;
+        // Disjoint partition subsets per replica: local holds one BIG partition
+        // (the live "one big partition" that the scan reached before stopping),
+        // node2 + node3 each hold two further wide partitions. No replica holds
+        // the whole keyset, so completeness depends on every source streaming to
+        // true exhaustion across all its window boundaries.
+        let local_pks: [&str; 1] = ["wpk-local-big"];
+        let n2_pks: [&str; 2] = ["wpk-n2-a", "wpk-n2-b"];
+        let n3_pks: [&str; 2] = ["wpk-n3-a", "wpk-n3-b"];
+
+        let cluster = build_loopback_cluster_split(
+            &|s| seed_wide_pks(s, &local_pks, ROWS_PER),
+            &|s| seed_wide_pks(s, &n2_pks, ROWS_PER),
+            &|s| seed_wide_pks(s, &n3_pks, ROWS_PER),
+        )
+        .await;
+        let table_id = TableId::new(KS, TBL_WIDE);
+        let strategy = ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+
+        let all_pks: Vec<&str> = local_pks
+            .iter()
+            .chain(n2_pks.iter())
+            .chain(n3_pks.iter())
+            .copied()
+            .collect();
+        let total = all_pks.len() * ROWS_PER;
+        let max_pages = total.div_ceil(PAGE_ROWS) + 4;
+        let delivered =
+            page_rows_like_cql_collector(&cluster.wp, &table_id, &strategy, PAGE_ROWS, max_pages)
+                .await;
+
+        let expected: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> = all_pks
+            .iter()
+            .flat_map(|pk| {
+                (0..ROWS_PER).map(|j| (pk.as_bytes().to_vec(), format!("ck-{j:06}").into_bytes()))
+            })
+            .collect();
+        let got: std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> =
+            delivered.iter().cloned().collect();
+        assert_eq!(
+            got.len(),
+            delivered.len(),
+            "disjoint-data many-window scan emitted duplicate rows"
+        );
+        assert_eq!(
+            got,
+            expected,
+            "DISJOINT-DATA multi-replica scan SILENTLY TRUNCATED: delivered {} \
+             of {} rows with has_more=false. A source dropping out at a window \
+             boundary (stream closed without a terminating Done, read as \
+             replica-exhausted) is silent data loss (t_a0f922a3 bug #2).",
+            got.len(),
+            total
+        );
+
+        assert_eq!(
+            cluster.frame_router.route_closures(),
+            0,
+            "disjoint-data paging must not phantom-close stream routes"
+        );
+
+        // The regime must actually exercise many window continuations (tiny
+        // fragments ⇒ 16-chunk windows span ~16 rows over 3000-row partitions),
+        // otherwise this test proves nothing about the continuation path.
+        assert!(
+            ferrosa_cluster::coordinator::range_read_stream::forwarder_diag::continuations_fired()
+                > 0,
+            "the many-window regime must fire window continuations, else the \
+             silent-partial path is not under test"
+        );
+
+        cluster.shutdown().await;
+    });
+
+    // A loud replica error that could not be delivered to the consumer on a
+    // full-drain scan is the silent-partial signature — it must never happen
+    // when the scan pages to true completion.
+    assert_eq!(
+        ferrosa_cluster::coordinator::range_read_stream::forwarder_diag::error_send_dropped(),
+        0,
+        "a per-replica forwarder produced a loud error that was DISCARDED because \
+         the merged output was gone — a replica's failure vanished and the scan \
+         could look complete while rows remained (t_a0f922a3 bug #2)"
+    );
+
+    std::env::remove_var("FERROSA_RANGE_READ_ROWS_PER_FRAGMENT");
 }
 
 /// A replica node whose streaming range-read handler is backed by a REAL
@@ -837,6 +1148,7 @@ async fn spawn_storage_replica_seeded(
 /// page leaves in-flight straggler chunks behind.
 #[test]
 fn multi_replica_paged_projected_scan_returns_all_rows_across_pages() {
+    let _serial = serial_guard();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

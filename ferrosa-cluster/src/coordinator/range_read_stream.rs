@@ -84,6 +84,44 @@ const _: () = assert!(
     "a full producer window plus its Done must fit in the route buffer"
 );
 
+/// Diagnostic counters for the windowed multi-replica forwarder. A steady-state
+/// non-zero `forwarder_error_send_dropped` or `forwarder_abandoned_with_resume`
+/// on a healthy full-drain scan is the signature of the silent-partial bug
+/// (t_a0f922a3 bug #2): a source dropped out mid-scan and its failure was not
+/// delivered to the consumer, so the scan looked complete while rows remained.
+///
+/// Always compiled (not test-gated) so a live deploy can assert on them via the
+/// same counters an integration harness reads.
+pub mod forwarder_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static ERROR_SEND_DROPPED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CONTINUATIONS_FIRED: AtomicU64 = AtomicU64::new(0);
+
+    /// Count of times a per-replica forwarder produced a loud error
+    /// (idle timeout / closed-before-Done / decode) but could NOT deliver it to
+    /// the consumer because the merged output was already gone. Each such event
+    /// is a place a scan could silently look complete while a replica had more
+    /// data — it MUST stay 0 on a full-drain scan.
+    pub fn error_send_dropped() -> u64 {
+        ERROR_SEND_DROPPED.load(Ordering::Relaxed)
+    }
+
+    /// Count of window continuations fired across all replica forwarders. Used
+    /// by tests to prove the many-window regime is actually exercised.
+    pub fn continuations_fired() -> u64 {
+        CONTINUATIONS_FIRED.load(Ordering::Relaxed)
+    }
+
+    /// Reset both counters. Test-only entry point (a live deploy reads
+    /// monotonic counters); kept un-gated so integration tests in a separate
+    /// crate can call it.
+    pub fn reset() {
+        ERROR_SEND_DROPPED.store(0, Ordering::Relaxed);
+        CONTINUATIONS_FIRED.store(0, Ordering::Relaxed);
+    }
+}
+
 pub type ClusterPartitionStream =
     Pin<Box<dyn Stream<Item = crate::error::Result<Partition>> + Send>>;
 
@@ -340,7 +378,15 @@ async fn forward_remote_range_stream(
     match forward_remote_range_stream_inner(receiver, request_id, expected_done, tx.clone()).await {
         Ok(outcome) => outcome,
         Err(err) => {
-            let _ = tx.send(next_remote_error(err)).await;
+            if tx.send(next_remote_error(err)).await.is_err() {
+                // The consumer already dropped the merged output, so this loud
+                // error was discarded. If the consumer abandoned deliberately
+                // (paged read filled its page) this is benign; on a full drain
+                // it means a replica's failure vanished — the silent-partial
+                // signature. Counted so tests + live metrics can catch it.
+                forwarder_diag::ERROR_SEND_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             ForwardOutcome::Failed
         }
     }
@@ -1088,6 +1134,15 @@ struct WindowedReplicaForwarder {
     table: String,
     wanted: Option<Vec<u16>>,
     window_chunks: u32,
+    /// Set true ONLY when this replica's logical stream ends for a reason that
+    /// makes a silent `remote_tx` close SAFE for the merge to read as "this
+    /// source is done": either the producer signalled genuine exhaustion
+    /// (`Completed { resume: None }`) or the consumer deliberately abandoned the
+    /// merged output (a paged read filled its page). Any OTHER termination
+    /// leaves this false, and the source's stream wrapper turns the resulting
+    /// channel close into a LOUD error rather than letting the merge conclude
+    /// the scan is complete while rows may remain (t_a0f922a3 bug #2, fail-loud).
+    clean_end: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WindowedReplicaForwarder {
@@ -1127,28 +1182,55 @@ impl WindowedReplicaForwarder {
             self.router.unregister(request_id);
 
             let resume = match outcome {
-                ForwardOutcome::Completed { resume: None } => return, // scan complete
+                // The ONLY clean end-of-this-replica signal: the producer's Done
+                // carried no resume position, so this replica's local range is
+                // genuinely exhausted. Mark the clean-end flag so the source's
+                // stream wrapper lets the merge read the coming `remote_tx` close
+                // as "this source is done".
+                ForwardOutcome::Completed { resume: None } => {
+                    self.clean_end
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return; // scan complete for this replica
+                }
                 ForwardOutcome::Completed {
                     resume: Some(resume),
                 } => resume,
-                // Anything but a clean Done means the remote producer may
-                // still be streaming for nobody — tell it to stop. Fired from
-                // THIS live async task (not a Drop guard: the reverted
-                // 3ec30240 guard never actually sent a cancel on the live
-                // cluster), so the fire is a plain awaited call that either
-                // succeeds or logs loudly.
-                other => {
-                    fire_stream_cancel(&self.peers, self.host_id, request_id, other).await;
+                // Failed: `forward_remote_range_stream` already delivered a loud
+                // error to the consumer (or discarded + counted it because the
+                // consumer had already gone). Either way the consumer saw the
+                // failure or is not waiting; the close is NOT a clean end, so
+                // leave `clean_end` false — the wrapper's fallback error only
+                // fires if no error reached the consumer. Cancel the producer.
+                ForwardOutcome::Failed => {
+                    fire_stream_cancel(&self.peers, self.host_id, request_id, outcome).await;
+                    return;
+                }
+                // Abandoned: the consumer dropped the merged output on purpose (a
+                // paged read filled its page). Completeness of THIS scan is no
+                // longer the source's concern — mark clean-end so the wrapper
+                // does not manufacture a spurious error, then cancel the
+                // producer.
+                ForwardOutcome::Abandoned => {
+                    self.clean_end
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    fire_stream_cancel(&self.peers, self.host_id, request_id, outcome).await;
                     return;
                 }
             };
 
-            // Window boundary. Don't fire a continuation the consumer will
-            // never read (a paged read abandons the stream between pages).
+            // Window boundary with data still remaining (`resume: Some`). If the
+            // consumer has dropped the merged output the continuation would be
+            // read by nobody — deliberate abandon, mark clean-end and return.
+            // Otherwise we MUST fire the continuation: silently ending here would
+            // close `remote_tx` with data remaining, and the merge would read
+            // that as genuine exhaustion — a silent partial (t_a0f922a3 bug #2).
             if remote_tx.is_closed() {
+                self.clean_end
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return;
             }
 
+            forwarder_diag::CONTINUATIONS_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             request_id = self
                 .next_request_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1190,6 +1272,47 @@ impl WindowedReplicaForwarder {
     }
 }
 
+/// Wrap a per-replica forwarder's `remote_rx` so the N-way merge can only read a
+/// stream end as "this source is exhausted" when the forwarder set `clean_end`.
+///
+/// The merge concludes the whole scan is complete once every source's stream
+/// ends. A source stream ends when its `remote_tx` (all clones) drop. The
+/// forwarder sets `clean_end` exactly at the terminations where a silent close
+/// is CORRECT (producer signalled genuine exhaustion, or the consumer
+/// deliberately abandoned the page). Any OTHER close — a panicked forwarder
+/// task, or a future refactor that drops `remote_tx` without either delivering
+/// an error or setting the flag — would otherwise vanish into a silent partial.
+/// Here it becomes ONE final loud, retryable error so the scan FAILS loudly
+/// (t_a0f922a3 bug #2 / fail-loud rule). A forwarder that already delivered its
+/// own error item before dropping `remote_tx` (the `Failed` path) is unaffected:
+/// the merge sees that error first and this fallback never runs.
+fn clean_end_guarded_stream(
+    remote_rx: mpsc::Receiver<crate::error::Result<Partition>>,
+    clean_end: Arc<std::sync::atomic::AtomicBool>,
+    host_id: uuid::Uuid,
+) -> impl Stream<Item = crate::error::Result<Partition>> + Send {
+    futures::stream::unfold(
+        (remote_rx, clean_end, host_id, false),
+        |(mut rx, clean_end, host_id, emitted_error)| async move {
+            if emitted_error {
+                return None;
+            }
+            match rx.recv().await {
+                Some(item) => Some((item, (rx, clean_end, host_id, false))),
+                None if clean_end.load(std::sync::atomic::Ordering::Acquire) => None,
+                None => {
+                    let err = Err(ClusterError::Internal(format!(
+                        "streaming range read: replica {host_id} forwarder ended without a \
+                         clean terminal signal — failing the scan loudly rather than \
+                         returning a silent partial (t_a0f922a3 bug #2)"
+                    )));
+                    Some((err, (rx, clean_end, host_id, true)))
+                }
+            }
+        },
+    )
+}
+
 impl ClusterCoordinator {
     /// Fire the first window of one replica's fragment stream and spawn its
     /// windowed continuation forwarder. Returns the bounded, consumer-paced
@@ -1208,6 +1331,7 @@ impl ClusterCoordinator {
             .stream_router
             .register(request_id, STREAM_RECEIVER_BUFFER);
 
+        let clean_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let forwarder = WindowedReplicaForwarder {
             router: self.stream_router.clone(),
             peers: self.peer_manager.clone(),
@@ -1217,6 +1341,7 @@ impl ClusterCoordinator {
             table: table_id.table.clone(),
             wanted: projected_regular_ordinals.map(|w| w.to_vec()),
             window_chunks,
+            clean_end: clean_end.clone(),
         };
         let body = forwarder
             .encode_request(
@@ -1241,10 +1366,12 @@ impl ClusterCoordinator {
             forwarder.run(request_id, receiver, remote_tx).await;
         });
 
-        let stream = futures::stream::unfold(remote_rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        Ok(Box::pin(stream))
+        // Fail-loud terminal guard (t_a0f922a3 bug #2): the N-way merge treats a
+        // source's stream ending as "this replica is exhausted". That inference
+        // is only safe when the forwarder ended for a clean reason (`clean_end`).
+        Ok(Box::pin(clean_end_guarded_stream(
+            remote_rx, clean_end, host_id,
+        )))
     }
 
     async fn fan_out_remote_fragment_streams(
@@ -1921,6 +2048,75 @@ mod tests {
         assert!(
             result.is_err(),
             "truncated Done must fail the remote stream instead of being accepted as success"
+        );
+    }
+
+    /// t_a0f922a3 bug #2 (fail-loud guarantee): a per-replica source stream
+    /// whose forwarder drops `remote_tx` WITHOUT setting `clean_end` (a panicked
+    /// forwarder, or any close that neither delivered an error nor signalled
+    /// exhaustion) must surface a LOUD error to the merge — never a silent end
+    /// that the merge would read as "this replica is exhausted" (silent partial).
+    #[tokio::test]
+    async fn unclean_forwarder_close_yields_loud_error_not_silent_exhaustion() {
+        let (tx, rx) = mpsc::channel::<crate::error::Result<Partition>>(4);
+        let clean_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host = uuid::Uuid::new_v4();
+
+        // One real partition, then drop the sender WITHOUT setting clean_end —
+        // models the forwarder task ending unexpectedly mid-scan.
+        tx.send(Ok(Partition {
+            key: dk(b"alpha"),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(1, b"v", 1)],
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut stream = Box::pin(clean_end_guarded_stream(rx, clean_end, host));
+        let first = stream.next().await.expect("first item");
+        assert!(first.is_ok(), "the real partition must pass through");
+        let terminal = stream
+            .next()
+            .await
+            .expect("an unclean close must yield a terminal item, not None");
+        assert!(
+            matches!(terminal, Err(ClusterError::Internal(_))),
+            "an unclean forwarder close must be a LOUD error, not silent exhaustion"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "after the one loud error the stream must end"
+        );
+    }
+
+    /// The mirror of the above: a forwarder that ended cleanly (`clean_end`
+    /// set) must close the source stream SILENTLY (`None`) so the merge reads it
+    /// as genuine exhaustion — no spurious error on a healthy scan.
+    #[tokio::test]
+    async fn clean_forwarder_close_ends_stream_without_error() {
+        let (tx, rx) = mpsc::channel::<crate::error::Result<Partition>>(4);
+        let clean_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host = uuid::Uuid::new_v4();
+
+        tx.send(Ok(Partition {
+            key: dk(b"alpha"),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(1, b"v", 1)],
+        }))
+        .await
+        .unwrap();
+        // Genuine exhaustion: set the flag before dropping the sender.
+        clean_end.store(true, std::sync::atomic::Ordering::Release);
+        drop(tx);
+
+        let mut stream = Box::pin(clean_end_guarded_stream(rx, clean_end, host));
+        assert!(stream.next().await.expect("first item").is_ok());
+        assert!(
+            stream.next().await.is_none(),
+            "a clean forwarder close must end the stream silently (genuine exhaustion)"
         );
     }
 

@@ -11,6 +11,23 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Paged-scan fail-loud completion contract (t_a0f922a3 bug #2).** The N-way
+  merge concludes a scan complete once every source stream ends; that inference
+  ("channel closed ⇒ replica exhausted") is only sound when the per-replica
+  `WindowedReplicaForwarder` closed cleanly. Added a `clean_end` flag set only at
+  genuine exhaustion (`Completed { resume: None }`) or a deliberate consumer
+  abandon, and wrapped every source stream in `clean_end_guarded_stream`: a close
+  WITHOUT that flag now emits one loud, retryable `Internal` error instead of a
+  silent `None`, so an unexpected forwarder end (panic / future refactor) fails
+  the scan loudly rather than returning a silent partial with `has_more = false`.
+  Observability: `forwarder_diag::{error_send_dropped, continuations_fired}`.
+  Tests: `range_read_stream` unit guard tests +
+  `range_scan_multi_replica_paging` disjoint-data / many-windows-per-page
+  harness. **Note:** the exact live 21160-of-50807 truncation did NOT reproduce
+  in-process (fresh-data scans page complete); the guard closes the
+  silent-complete class structurally. Live RF=3 re-validation on the real
+  `typed_edges` shape is the remaining confirmation step.
+
 - **Paged multi-replica stream lifecycle (t_dc729b1d / t_3fc6be3c, CL-14).**
   Fixed the phantom `expected_seq=0 observed_seq=5` gap-close on every abandoned
   page (seq-state creation now gated on route liveness; no-state+no-route is a
