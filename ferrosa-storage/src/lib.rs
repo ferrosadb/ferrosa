@@ -21,6 +21,7 @@ pub mod commitlog;
 pub mod compaction;
 pub mod data_store;
 pub mod engine;
+pub mod external_sort;
 pub mod flush;
 pub mod index;
 pub mod manifest;
@@ -36,6 +37,7 @@ pub mod reader_pool;
 pub mod restore;
 pub mod self_heal;
 pub mod snapshot;
+pub mod spill_budget;
 pub mod store;
 pub mod subscription_observer;
 #[cfg(feature = "test-generators")]
@@ -60,6 +62,7 @@ pub use engine::{
     TempSortTableReservation, TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
     FILTER_PREDICATE_OPTION_KEY,
 };
+pub use external_sort::{ExternalSorter, RowOrder, SortedRows};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};
 pub use manifest::{load_schema_snapshot, save_schema_snapshot, Manifest};
 pub use memtable::eager_index::{EagerIndexBuilder, FlushCompleteEvent};
@@ -69,6 +72,7 @@ pub use memtable::skiplist::SkipListMemtable;
 pub use memtable::Memtable;
 pub use merge::merge_partitions;
 pub use observer::{ObserverConfig, ObserverMode, WriteObserver};
+pub use spill_budget::{process_spill_threshold_bytes, spill_threshold_bytes};
 pub use store::{TableStore, VectorIndexMethod};
 pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,

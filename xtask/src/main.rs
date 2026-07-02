@@ -16,12 +16,16 @@ use anyhow::Context;
 
 use oom_audit::{audit_paths, expired_allow_findings, Allowlist, Finding, DEFAULT_TODAY};
 
-/// Crates whose `src/` dirs are scanned (blueprint §3 Layer 1).
+/// Crates whose `src/` dirs are scanned (blueprint §3 Layer 1). `ferrosa-net`
+/// and `ferrosa-index` carry the streaming pipeline (lane frames, scan/FTS
+/// hits) — clones there defeat move streaming the same as in the core four.
 const AUDIT_CRATES: &[&str] = &[
     "ferrosa-cql",
     "ferrosa-cluster",
     "ferrosa-storage",
     "ferrosa-row-bridge",
+    "ferrosa-net",
+    "ferrosa-index",
 ];
 
 const ALLOW_FILE: &str = "specs/p0-oom-guard/oom-audit-allow.toml";
@@ -53,10 +57,12 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Parse `--enforce` and `--today YYYY-MM-DD` from the subcommand args.
-fn parse_audit_args(args: &[String]) -> anyhow::Result<(bool, String)> {
+/// Parse `--enforce`, `--today YYYY-MM-DD` and `--root <path>` from the
+/// subcommand args. `--root` audits another checkout (defaults to this repo).
+fn parse_audit_args(args: &[String]) -> anyhow::Result<(bool, String, Option<PathBuf>)> {
     let mut enforce = false;
     let mut today = DEFAULT_TODAY.to_string();
+    let mut root_override = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -68,11 +74,17 @@ fn parse_audit_args(args: &[String]) -> anyhow::Result<(bool, String)> {
                     .context("--today requires a YYYY-MM-DD argument")?
                     .clone();
             }
+            "--root" => {
+                i += 1;
+                root_override = Some(PathBuf::from(
+                    args.get(i).context("--root requires a path argument")?,
+                ));
+            }
             other => anyhow::bail!("p0-oom-audit: unexpected argument `{other}`"),
         }
         i += 1;
     }
-    Ok((enforce, today))
+    Ok((enforce, today, root_override))
 }
 
 /// Repo root: the workspace dir this binary was built in (cargo sets CARGO_MANIFEST_DIR
@@ -85,8 +97,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn p0_oom_audit(args: &[String]) -> anyhow::Result<ExitCode> {
-    let (enforce, today) = parse_audit_args(args)?;
-    let root = repo_root();
+    let (enforce, today, root_override) = parse_audit_args(args)?;
+    let root = root_override.unwrap_or_else(repo_root);
 
     let allow_path = root.join(ALLOW_FILE);
     let allow = Allowlist::load(&allow_path)

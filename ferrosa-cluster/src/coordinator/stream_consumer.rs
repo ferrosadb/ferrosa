@@ -19,6 +19,7 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use ferrosa_net::codec::MsgType;
 use ferrosa_net::idle_timeout::IdleTimeoutWatchdog;
@@ -30,6 +31,53 @@ use crate::raft::handlers::{
     partition_from_wire, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
     RangeReadStreamHeartbeatPayload,
 };
+
+/// Where a streaming consumer pushes each decoded partition as it
+/// arrives, one at a time, in arrival order.
+///
+/// The consumer NEVER buffers the whole scan: it decodes one chunk,
+/// moves its partitions into the sink (awaiting each — the sink is a
+/// back-pressure point), then drops the chunk. A sink that forwards
+/// onward through a bounded channel (`ChannelPartitionSink`) or drops
+/// after accounting keeps the consumer's resident set at `O(chunk)`
+/// rather than `O(result)`, which is what bounds coordinator memory on
+/// a full-table scan at the intentional node RAM cap
+/// (`t_ee98faa0` / `t_3fc6be3c`).
+///
+/// Returning `false` from [`PartitionSink::accept`] signals the
+/// downstream is done (e.g. a `LIMIT` was satisfied) and the consumer
+/// should stop forwarding — the remaining stream is drained without
+/// forwarding so the producer sees the channel close / cancel.
+#[async_trait]
+pub trait PartitionSink: Send {
+    /// Accept one partition (moved, never cloned). Return `false` to
+    /// request early stop.
+    async fn accept(&mut self, partition: Partition) -> bool;
+}
+
+/// A [`PartitionSink`] that forwards each partition through a bounded
+/// `mpsc::Sender`. The bounded channel provides back-pressure: when the
+/// downstream consumer is slow the `send().await` blocks, so the
+/// upstream stream cannot run unboundedly ahead — resident memory stays
+/// `O(channel capacity)`.
+pub struct ChannelPartitionSink {
+    tx: mpsc::Sender<Partition>,
+}
+
+impl ChannelPartitionSink {
+    pub fn new(tx: mpsc::Sender<Partition>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl PartitionSink for ChannelPartitionSink {
+    async fn accept(&mut self, partition: Partition) -> bool {
+        // A closed receiver means the downstream stopped (LIMIT met or
+        // dropped) — stop forwarding.
+        self.tx.send(partition).await.is_ok()
+    }
+}
 
 /// What the consumer collected once every replica's stream
 /// terminated cleanly.
@@ -96,10 +144,68 @@ pub async fn consume_range_stream(
     expected_done: usize,
     request_id: u32,
 ) -> Result<StreamConsumeOutcome, StreamConsumeError> {
+    // Legacy Vec-accumulating shape: express it in terms of the bounded
+    // streaming consumer with an accumulating sink. Callers on the
+    // OOM-prone full-scan path use `consume_range_stream_into` with a
+    // bounded forwarding sink instead so their resident set is
+    // `O(chunk)`, not `O(result)` (`t_ee98faa0` / `t_3fc6be3c`). This
+    // wrapper survives only for point-bounded callers and the
+    // characterization tests.
+    let mut sink = VecPartitionSink {
+        partitions: Vec::new(),
+    };
+    let total_chunks =
+        consume_range_stream_into(receiver, idle_timeout, expected_done, request_id, &mut sink)
+            .await?;
+    Ok(StreamConsumeOutcome {
+        partitions: sink.partitions,
+        total_chunks,
+        any_truncated: false,
+    })
+}
+
+/// A [`PartitionSink`] that accumulates every partition into a `Vec`.
+/// This reintroduces `O(result)` resident memory, so it is used ONLY by
+/// the legacy [`consume_range_stream`] wrapper (point-bounded callers /
+/// tests). The full-scan path uses a bounded forwarding sink.
+struct VecPartitionSink {
+    partitions: Vec<Partition>,
+}
+
+#[async_trait]
+impl PartitionSink for VecPartitionSink {
+    async fn accept(&mut self, partition: Partition) -> bool {
+        self.partitions.push(partition);
+        true
+    }
+}
+
+/// Bounded streaming consumer for a multi-replica range-read response.
+///
+/// Identical framing/heartbeat/Done/straggler semantics to
+/// [`consume_range_stream`], but every decoded partition is MOVED into
+/// `sink` one at a time and then dropped — the consumer never holds more
+/// than one chunk's partitions resident. When `sink` forwards through a
+/// bounded channel ([`ChannelPartitionSink`]) each `accept().await` is a
+/// back-pressure point, so a slow downstream stalls the upstream rather
+/// than letting frames pile up. Returns the total chunk-frame count
+/// observed across every replica (telemetry).
+///
+/// If the sink returns `false` (downstream satisfied / dropped), the
+/// consumer stops forwarding and drains the rest of the stream without
+/// buffering so the routing table / producer terminate cleanly.
+pub async fn consume_range_stream_into<S: PartitionSink + ?Sized>(
+    receiver: mpsc::Receiver<Message>,
+    idle_timeout: Duration,
+    expected_done: usize,
+    request_id: u32,
+    sink: &mut S,
+) -> Result<u32, StreamConsumeError> {
     let mut watchdog = IdleTimeoutWatchdog::new(receiver, idle_timeout);
-    let mut outcome = StreamConsumeOutcome::default();
+    let mut total_chunks: u32 = 0;
     let mut observed_chunks_per_replica: u32 = 0;
     let mut delivered_done = 0usize;
+    let mut sink_open = true;
 
     loop {
         if delivered_done >= expected_done {
@@ -109,8 +215,15 @@ pub async fn consume_range_stream(
             // after the Done was routed but before this loop saw
             // them. Bounded by a short grace period; long-tail
             // chunks beyond the window are lost (logged at debug).
-            drain_stragglers(&mut watchdog, &mut outcome, request_id).await;
-            return Ok(outcome);
+            total_chunks = drain_stragglers(
+                &mut watchdog,
+                request_id,
+                sink,
+                &mut sink_open,
+                total_chunks,
+            )
+            .await;
+            return Ok(total_chunks);
         }
 
         let next = watchdog
@@ -134,11 +247,18 @@ pub async fn consume_range_stream(
         match frame {
             Message::RangeReadStreamChunk(bytes) => {
                 let chunk = decode_chunk(request_id, bytes)?;
-                outcome.total_chunks = outcome.total_chunks.saturating_add(1);
+                total_chunks = total_chunks.saturating_add(1);
                 observed_chunks_per_replica = observed_chunks_per_replica.saturating_add(1);
-                outcome
-                    .partitions
-                    .extend(chunk.partitions.into_iter().map(partition_from_wire));
+                // Move each partition into the sink one at a time; the
+                // chunk's payload is dropped as we go, so resident
+                // memory stays `O(chunk)`, not `O(result)`.
+                for partition in chunk.partitions.into_iter().map(partition_from_wire) {
+                    if sink_open && !sink.accept(partition).await {
+                        // Downstream satisfied/dropped — stop forwarding
+                        // but keep draining frames so Done still arrives.
+                        sink_open = false;
+                    }
+                }
             }
             Message::RangeReadStreamHeartbeat(bytes) => {
                 // Drop the payload after a successful decode — we
@@ -187,11 +307,13 @@ pub async fn consume_range_stream(
 /// Done dispatches on the server side (typically sub-millisecond).
 const STRAGGLER_DRAIN: Duration = Duration::from_millis(200);
 
-async fn drain_stragglers(
+async fn drain_stragglers<S: PartitionSink + ?Sized>(
     watchdog: &mut IdleTimeoutWatchdog<Message>,
-    outcome: &mut StreamConsumeOutcome,
     request_id: u32,
-) {
+    sink: &mut S,
+    sink_open: &mut bool,
+    mut total_chunks: u32,
+) -> u32 {
     let deadline = tokio::time::Instant::now() + STRAGGLER_DRAIN;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -207,10 +329,12 @@ async fn drain_stragglers(
         match next {
             Message::RangeReadStreamChunk(bytes) => match decode_chunk(request_id, bytes) {
                 Ok(chunk) => {
-                    outcome.total_chunks = outcome.total_chunks.saturating_add(1);
-                    outcome
-                        .partitions
-                        .extend(chunk.partitions.into_iter().map(partition_from_wire));
+                    total_chunks = total_chunks.saturating_add(1);
+                    for partition in chunk.partitions.into_iter().map(partition_from_wire) {
+                        if *sink_open && !sink.accept(partition).await {
+                            *sink_open = false;
+                        }
+                    }
                 }
                 Err(e) => tracing::debug!(?e, "straggler chunk decode failed"),
             },
@@ -219,6 +343,7 @@ async fn drain_stragglers(
             other => tracing::debug!(?other, "straggler frame of unexpected type; dropped"),
         }
     }
+    total_chunks
 }
 
 fn decode_chunk(

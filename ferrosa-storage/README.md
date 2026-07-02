@@ -69,11 +69,23 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at
   debug). Pre-existing orphans are never GC'd automatically — clean up with
   `DROP INDEX IF EXISTS`.
-- **Full-text search** (`fulltext_search`) — searches the memtable FTI + each
-  per-SSTable `-FTI-{index}.db` sidecar, and **falls back to scanning any live
-  SSTable whose sidecar is transiently missing** (the async index-rebuild window
-  after compaction), so a stable row is never dropped from `fts_match`
-  (BUG-F-007 / t_0455c0a1).
+- **Full-text search** (`fulltext_search(table, index, query, limit)`) —
+  searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
+  **falls back to scanning any live SSTable whose sidecar is transiently
+  missing** (the async index-rebuild window after compaction), so a stable row
+  is never dropped from `fts_match` (BUG-F-007 / t_0455c0a1). Memory is
+  bounded (t_ee98faa0 layer 2 — a broad `fts_match` used to OOM every
+  replica): `limit` is the QUERY-derived `LIMIT k` pushed down by the
+  coordinator (never a server cap) and bounds every per-source working set to
+  a top-k; single-term queries stream postings straight off the sidecar file
+  (`ferrosa_index::fulltext::stream`) without reading or deserializing the
+  whole index; transient memtable/fallback FTIs are queried in place (no
+  serialize→deserialize round trip) and built per-SSTable, not across all
+  uncovered SSTables at once. Only the queried index's sidecars are consulted
+  — orphaned registrations are never touched on the query path. Guarded by
+  `tests/fulltext_replica_memory_bound.rs` (allocator-tracked peak: O(k),
+  independent of matching-doc count) and
+  `engine::tests::fts_search_touches_only_queried_index_sidecars`.
 - **Snapshot / PITR** (`snapshot/`, `restore/`, `commitlog/archiver.rs`) —
   S3 snapshot manager, commit-log archiving, restore manager with validation.
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
@@ -90,6 +102,21 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   WASM aggregate execution, materialization queues.
 - **Virtual tables / observability** (`virtual_tables.rs`, `metrics.rs`) —
   `system_observability.storage_stats`, `system_views.secondary_indexes`.
+- **RAM budget + spill threshold** (`spill_budget.rs`) — detects the process
+  memory budget (cgroup v2 `memory.max` → cgroup v1 `memory.limit_in_bytes` →
+  `/proc/meminfo` `MemTotal` → 1 GiB floor; `"max"`/near-`i64::MAX` sentinels are
+  treated as unlimited). Detection is injectable (`BudgetSources`) and cached; the
+  spill threshold defaults to 50% of the budget, tunable via
+  `FERROSA_RANGE_SPILL_THRESHOLD_PCT` / `FERROSA_RANGE_SPILL_THRESHOLD_BYTES`
+  (`process_spill_threshold_bytes`).
+- **External merge sort** (`external_sort.rs`) — bounded-memory spilling sort of
+  CQL result rows (`Vec<Option<CqlValue>>`) for the unbounded `ORDER BY` (no
+  `LIMIT`) shape. `ExternalSorter` moves rows into a buffer, spills sorted runs to
+  disk (length-prefixed serde_json) once the threshold is crossed, then
+  cascade-merges runs in fixed fan-in passes (`MERGE_FANIN = 64`) into a final
+  bounded k-way merge (`SortedRows`, `RowOrder`). Peak working set is
+  `O(MERGE_FANIN)` — independent of the row count. Spill/merge I/O errors fail
+  loud; runs live under the `TempSortTableReservation` dir (cleaned up on drop).
 
 ## Public API (key entry points)
 
@@ -101,6 +128,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 | Maintenance | `flush`, `flush_if_needed`, `flush_all`, `poll_compactions`, `truncate`, `sync_sstables_to_s3` |
 | Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `list/delete_snapshot_with_store` |
 | Abstraction | `DataStore` / `LocalDataStore` (the `Arc<dyn DataStore>` boundary) |
+| Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation` |
 | Config types | `CommitLogConfig`, `SyncStrategyConfig`, `CompactionConfig`, `ObjectStoreConfig`, `Mutation`, `TableId` |
 
 ## Dependencies

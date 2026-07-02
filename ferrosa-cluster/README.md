@@ -83,13 +83,31 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   matching keys, since full-text hits span all token ranges; BUG-F-007). FTI
   scatter-gather is partial-failure tolerant: if at least one node completes, the
   union is returned even when it is empty, so a transient remote stream failure
-  does not turn a valid no-hit search into a user-visible error.
+  does not turn a valid no-hit search into a user-visible error. The
+  query-derived `LIMIT k` is pushed down to every replica
+  (`FulltextSearchRequestPayload.limit`, t_ee98faa0 layer 2) so each holds a
+  bounded top-k working set and the union is at most `replicas x k` keys;
+  `limit: None` (no-LIMIT statement) requests the complete match set — never a
+  server-side cap.
 - `coordinator/cl_routing.rs` — W8.4 learner-aware routing (voter-only quorums,
   leader-only serial, cross-DC Accord routing).
 - `coordinator/batch.rs` — 3-phase logged batchlog (write → fan out → delete only
   on full success) with replay task; `DEFAULT_BATCH_CONCURRENCY = 32`.
 - `coordinator/{range_read_stream,stream_*}.rs` — ADR-020 streaming range reads
   (default; legacy capped path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
+  `DEFAULT_RANGE_READ_LIMIT` (10_000) is **not** a result cap on streamable
+  shapes: `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
+  honor the caller's own bound (a user `LIMIT N`) uncapped; the const now only
+  bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
+  still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
+  degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
+  `consume_range_stream_into` MOVE each decoded partition into a sink one at a
+  time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`
+  drinks the token-deduped N-way merge stream and folds `<= limit` whole
+  partitions — never accumulating `O(result)` (the `t_ee98faa0` / `t_3fc6be3c`
+  OOM). The legacy `Vec`-accumulating `consume_range_stream` is a thin wrapper
+  (`VecPartitionSink`) kept for point-bounded callers / the e2e tests.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
@@ -190,6 +208,16 @@ Notable integration suites: `failure_mode_matrix` (44), `raft_election_storm`
 (36), `leader_snapshot_push` (31), `accord_lwt_concurrent` (21),
 `accord_nemesis` (15), `correctness` (11), `cluster_formation` (10). All run on
 deterministic in-process harnesses unless gated behind `live-infra-tests`.
+
+Range-scan memory boundedness is guarded by two allocator-tracking suites:
+`range_scan_streaming_memory_bound` (the coordinator **Stream** API is O(1) in N)
+and `replica_scan_serialization_memory_bound` (drives the REAL wire serialization
++ `consume_range_stream_into`; a two-phase measurement isolates the consumer's
+resident set from producer/storage noise and asserts it is `O(chunk)`,
+INDEPENDENT of N — the `t_3fc6be3c`/`t_ee98faa0` bounded-consume proof — plus the
+producer/backpressure bounds). The gated multi-node live confirmation is `fly_stream_scan_live` (feature
+`live-infra-tests` + `FERROSA_TEST_FLY=1`), which drives
+`deploy/fly-stream-scan/`; it panics loudly on missing infra rather than passing.
 
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep

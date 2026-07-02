@@ -604,6 +604,116 @@ async fn extend_rows_from_partitions(
     }
 }
 
+/// Drain a projected partition stream into `all_rows`, moving each partition
+/// through the row builder one at a time.
+///
+/// Unlike [`extend_rows_from_partitions`], this never materializes the whole
+/// scan into a `Vec<Partition>` first: in-flight memory is `O(num_sources)`
+/// partitions plus the accumulated result rows, and there is no server-side
+/// result cap — the scan is bounded only by the query's own LIMIT (already
+/// pushed into the producer as a partition stop) and the row-level predicate
+/// filter applied by the caller.
+async fn extend_rows_from_partition_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    all_rows: &mut Vec<Vec<Option<CqlValue>>>,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    pk_indices: &[usize],
+    ck_indices: &[usize],
+    storage_to_table: &[usize],
+) -> Result<(), CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut prows = bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            all_col_names,
+            all_col_types,
+            pk_indices,
+            ck_indices,
+            storage_to_table,
+        );
+        all_rows.append(&mut prows);
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+/// Stream an uncapped full scan through a **spilling external merge sort** and
+/// return the fully, correctly ordered rows.
+///
+/// This is the step-5 replacement for the arbitrary unbounded `ORDER BY` (no
+/// `LIMIT`) fail-loud cap. Rows are built and predicate-filtered partition by
+/// partition (bounded working set), then MOVED into an
+/// [`ferrosa_storage::ExternalSorter`] which spills sorted runs to `spill_dir`
+/// once the in-memory accumulation crosses the spill threshold. The final
+/// bounded k-way merge streams rows in order — complete, correctly ordered, and
+/// with the sort's working set bounded by the threshold rather than the result
+/// size. Spilled runs live under `spill_dir` (the temp-sort reservation) and are
+/// cleaned up when it drops.
+///
+/// Any spill/merge I/O error propagates (fail loud) — a spilled run is never
+/// silently dropped.
+async fn sort_rows_from_partition_stream_spilling(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    spill_dir: &std::path::Path,
+    order: ferrosa_storage::RowOrder,
+    threshold_bytes: u64,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<(Vec<Vec<Option<CqlValue>>>, bool), CqlError> {
+    let mut sorter = ferrosa_storage::ExternalSorter::new(spill_dir, order, threshold_bytes);
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                // Move the row into the sorter — no per-row payload clone.
+                sorter
+                    .push(row)
+                    .map_err(|e| CqlError::ServerError(format!("ORDER BY spill: {e}")))?;
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    let spilled = sorter.spilled();
+    let mut sorted = Vec::new();
+    for row in sorter
+        .finish()
+        .map_err(|e| CqlError::ServerError(format!("ORDER BY spill finish: {e}")))?
+    {
+        sorted.push(row.map_err(|e| CqlError::ServerError(format!("ORDER BY merge: {e}")))?);
+    }
+    Ok((sorted, spilled))
+}
+
 async fn count_rows_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     row_context: PartitionRowContext<'_>,
@@ -642,6 +752,255 @@ async fn count_rows_from_partition_stream(
         }
     }
     Ok(count)
+}
+
+/// Per-column streaming aggregate accumulator for a builtin scalar aggregate
+/// (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`) folded over a partition stream.
+///
+/// Holds O(1) state per aggregate column (never the scanned rows), so a
+/// `SELECT SUM(v) FROM t` over an arbitrarily large table computes the exact
+/// answer with bounded memory — no server-side row cap. `COUNT(*)`/`COUNT(col)`
+/// count matched rows; `SUM`/`AVG` keep a running `f64` sum + non-NULL count;
+/// `MIN`/`MAX` keep the running extremum. NULL source cells are skipped (matching
+/// [`compute_builtin_aggregate`]).
+enum StreamingAggAcc {
+    /// COUNT(*) or COUNT(col): number of matched rows (Cassandra `COUNT` counts
+    /// rows, not non-NULL values, for `COUNT(*)`). `count_non_null` is only used
+    /// when the argument is a specific column.
+    Count { count: i64 },
+    /// SUM / AVG: running sum and count of non-NULL numeric values.
+    SumAvg {
+        is_avg: bool,
+        sum: f64,
+        n: u64,
+        src_idx: usize,
+        col_type: CqlType,
+    },
+    /// MIN / MAX: running extremum of non-NULL numeric values.
+    MinMax {
+        is_max: bool,
+        acc: f64,
+        seen: bool,
+        src_idx: usize,
+        col_type: CqlType,
+    },
+}
+
+impl StreamingAggAcc {
+    /// Fold one matched row into the accumulator.
+    fn observe(&mut self, row: &[Option<CqlValue>]) {
+        match self {
+            StreamingAggAcc::Count { count } => {
+                *count += 1;
+            }
+            StreamingAggAcc::SumAvg {
+                sum, n, src_idx, ..
+            } => {
+                if let Some(v) = row.get(*src_idx).and_then(|c| c.as_ref()) {
+                    if let Some(f) = cql_value_to_f64(v) {
+                        *sum += f;
+                        *n += 1;
+                    }
+                }
+            }
+            StreamingAggAcc::MinMax {
+                is_max,
+                acc,
+                seen,
+                src_idx,
+                ..
+            } => {
+                if let Some(v) = row.get(*src_idx).and_then(|c| c.as_ref()) {
+                    if let Some(f) = cql_value_to_f64(v) {
+                        if *is_max {
+                            *acc = if *seen { acc.max(f) } else { f };
+                        } else {
+                            *acc = if *seen { acc.min(f) } else { f };
+                        }
+                        *seen = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Materialize the final aggregate cell.
+    fn finish(&self) -> Option<CqlValue> {
+        match self {
+            StreamingAggAcc::Count { count } => Some(CqlValue::Bigint(*count)),
+            StreamingAggAcc::SumAvg {
+                is_avg,
+                sum,
+                n,
+                col_type,
+                ..
+            } => {
+                if *n == 0 {
+                    return Some(CqlValue::Null);
+                }
+                let val = if *is_avg { *sum / *n as f64 } else { *sum };
+                Some(f64_to_cql_aggregate(val, col_type))
+            }
+            StreamingAggAcc::MinMax {
+                acc,
+                seen,
+                col_type,
+                ..
+            } => {
+                if !*seen {
+                    return Some(CqlValue::Null);
+                }
+                Some(f64_to_cql_aggregate(*acc, col_type))
+            }
+        }
+    }
+}
+
+/// True when `s` is a full-scan **builtin scalar aggregate** query that can be
+/// computed by an O(1) streaming fold: every projected column is a builtin
+/// aggregate function (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), and there is no
+/// `ORDER BY`, `ANN`, or `DISTINCT` that would require materializing/sorting the
+/// scanned rows. (`GROUP BY` is not yet parsed, so per-group state is N/A.)
+///
+/// UDAs are excluded because they are `FunctionCall`s whose name is not a
+/// builtin aggregate — they keep the existing bounded path until spill lands.
+fn builtin_scalar_aggregate_stream_shape(s: &SelectStatement) -> bool {
+    if !s.order_by.is_empty() || s.ann_of.is_some() || s.distinct {
+        return false;
+    }
+    if s.columns.is_empty() {
+        return false;
+    }
+    s.columns.iter().all(|c| match c {
+        SelectColumn::FunctionCall { name, .. } => {
+            let n = name.to_lowercase();
+            matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max")
+        }
+        _ => false,
+    })
+}
+
+/// Build the per-column streaming accumulators for a
+/// [`builtin_scalar_aggregate_stream_shape`] query. Returns `None` when a column
+/// references an unknown source column (caller falls back to the error path).
+fn build_agg_accumulators(
+    s: &SelectStatement,
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+) -> Result<Vec<StreamingAggAcc>, CqlError> {
+    let mut accs = Vec::with_capacity(s.columns.len());
+    for sc in &s.columns {
+        let SelectColumn::FunctionCall { name, args, .. } = sc else {
+            return Err(CqlError::Invalid(
+                "streaming aggregate: non-aggregate column in aggregate projection".into(),
+            ));
+        };
+        let fn_lower = name.to_lowercase();
+        if fn_lower == "count" {
+            accs.push(StreamingAggAcc::Count { count: 0 });
+            continue;
+        }
+        // SUM/AVG/MIN/MAX need a numeric source column.
+        let col_name = args
+            .first()
+            .ok_or_else(|| CqlError::Invalid(format!("{fn_lower}() requires a column argument")))
+            .and_then(extract_column_name)?;
+        let src_idx = all_col_names
+            .iter()
+            .position(|n| *n == col_name)
+            .ok_or_else(|| {
+                CqlError::Invalid(format!("unknown column in {fn_lower}(): {col_name}"))
+            })?;
+        let col_type = all_col_types[src_idx].clone();
+        let acc = match fn_lower.as_str() {
+            "sum" => StreamingAggAcc::SumAvg {
+                is_avg: false,
+                sum: 0.0,
+                n: 0,
+                src_idx,
+                col_type,
+            },
+            "avg" => StreamingAggAcc::SumAvg {
+                is_avg: true,
+                sum: 0.0,
+                n: 0,
+                src_idx,
+                col_type,
+            },
+            "min" => StreamingAggAcc::MinMax {
+                is_max: false,
+                acc: 0.0,
+                seen: false,
+                src_idx,
+                col_type,
+            },
+            "max" => StreamingAggAcc::MinMax {
+                is_max: true,
+                acc: 0.0,
+                seen: false,
+                src_idx,
+                col_type,
+            },
+            other => {
+                return Err(CqlError::Invalid(format!(
+                    "streaming aggregate: unsupported function {other}"
+                )))
+            }
+        };
+        accs.push(acc);
+    }
+    Ok(accs)
+}
+
+/// Fold a builtin scalar aggregate over an uncapped partition stream, returning
+/// the single aggregate result row.
+///
+/// This is the streaming-aggregate counterpart to
+/// [`count_rows_from_partition_stream`]: partitions move through the row builder
+/// one at a time (move-only, no per-row clone of payloads), each row is tested
+/// against the query's WHERE predicates, and matched rows update O(1)
+/// accumulators. There is **no server-side row cap** — the result is exact over
+/// the whole table, and memory is independent of the scanned row count.
+async fn fold_builtin_aggregates(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    mut accs: Vec<StreamingAggAcc>,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<Vec<Option<CqlValue>>, CqlError> {
+    let mut processed_partitions = 0usize;
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                for acc in accs.iter_mut() {
+                    acc.observe(&row);
+                }
+            }
+        }
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(accs.iter().map(StreamingAggAcc::finish).collect())
 }
 
 /// Resume cursor decoded from the wire `paging_state` for a streaming scan.
@@ -3609,6 +3968,16 @@ async fn route_geo_select(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only observability: partition point-reads performed by the
+    /// `fts_match` arm on this thread. Lets tests assert STRUCTURALLY that the
+    /// fetch loop early-exits at the LIMIT bound (t_ee98faa0) instead of
+    /// point-reading every matched partition. `#[tokio::test]` uses a
+    /// current-thread runtime, so the arm's increments land on the test thread.
+    static FTS_MATCH_PARTITION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -3707,79 +4076,195 @@ async fn route_select_user_table(
             .index_usage_tracker
             .record(ks, &s.table, index_name, "FullText");
 
-        // Route the FTI lookup through the write path so it scatter-gathers
-        // across the cluster. `fts_match` carries no partition key, so its hits
-        // span all token ranges; a coordinator-local lookup returned 0/1
-        // depending on which node served the query (BUG-F-007 / t_0d08aa43).
-        // Standalone/pair still resolves locally via the same call.
-        let matching_pks = state
-            .write_path
-            .load()
-            .fulltext_search(&table_id, index_name, fts_query)
-            .await
-            .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
+        let fts_limit = s
+            .limit
+            .as_ref()
+            .and_then(|l| l.as_literal())
+            .map(|n| n.max(0) as usize);
+        let fts_page_size = ctx
+            .paging
+            .page_size
+            .and_then(|ps| (ps > 0).then_some(ps as usize))
+            .unwrap_or_else(crate::paging::default_scan_page_size);
+        // Resume cursor (no-LIMIT paged mode only): partition-granular — every
+        // partition whose key is <= the cursor key was fully delivered on a
+        // previous page. A LIMIT query is answered in a single response (bounded
+        // by the limit itself), so it never consults or emits a cursor.
+        let fts_resume = if fts_limit.is_none() {
+            StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?
+        } else {
+            None
+        };
 
-        // `matching_pks` are full-key document ids (partition + clustering), one
-        // per matching ROW. Read each distinct partition once, keep ONLY the rows
-        // whose full key actually matched — so non-matching clustering rows in a
-        // matched partition don't leak (t_da51e20c) — then post-filter.
-        let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
-        let mut seen_partitions = std::collections::HashSet::new();
-        let mut fts_rows = Vec::new();
-        for doc_key in &matched {
-            let Some(pk) = ferrosa_index::fulltext::keys::doc_key_partition(doc_key) else {
-                // Legacy/malformed id (e.g. a sidecar built before row-granular
-                // keys, pending rebuild) — skip rather than misread.
-                continue;
-            };
-            if !seen_partitions.insert(pk.to_vec()) {
-                continue; // partition already read
-            }
-            let decorated =
-                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
-            if let Some(mut partition) = state
+        // Memory bounds for this arm (t_ee98faa0 — a broad `fts_match` over a
+        // large table OOM-killed live nodes, first at the coordinator, then
+        // layer 2 inside every replica's `fulltext_search`):
+        //   * LIMIT k — the bound is pushed down to every replica
+        //     (`fulltext_search(.., Some(requested))`), so each holds a bounded
+        //     top-k working set and the unioned hit set is O(replicas × k).
+        //     Post-filter key exhaustion is handled by GEOMETRIC ESCALATION
+        //     (below) — never by a server-side cap.
+        //   * no LIMIT — the complete match set is legitimately required
+        //     (`limit=None` down the stack); ROW memory is still bounded by
+        //     building one page per response with a `PagingState` continuation.
+        // The result is NEVER truncated server-side: it is bounded only by the
+        // query's own LIMIT (or delivered completely across pages).
+        //
+        // Escalation loop: start with `requested = k`. If the post-filter
+        // (non-fts predicates + row-granular doc-key retain) drops enough rows
+        // that fewer than `limit` survive AND the replica hit set may have been
+        // truncated (union size >= requested implies SOME replica may have hit
+        // its bound; union < requested proves every replica returned its
+        // complete local set), retry with `requested × 4`. Terminates because
+        // `requested` grows geometrically and once it exceeds every replica's
+        // local match count the union is provably complete. Peak memory is
+        // O(final requested) — derived from the query's LIMIT and the actual
+        // post-filter selectivity, not a server constant.
+        let mut requested: Option<usize> = fts_limit;
+        let (fts_rows, fts_paging_state) = loop {
+            // Route the FTI lookup through the write path so it scatter-gathers
+            // across the cluster. `fts_match` carries no partition key, so its
+            // hits span all token ranges; a coordinator-local lookup returned
+            // 0/1 depending on which node served the query (BUG-F-007 /
+            // t_0d08aa43). Standalone/pair still resolves locally via the same
+            // call.
+            let matching_pks = state
                 .write_path
                 .load()
-                .read(&table_id, &decorated)
+                .fulltext_search(&table_id, index_name, fts_query, requested)
                 .await
-                .map_err(|e| CqlError::ServerError(format!("{e}")))?
-            {
-                // Keep only the rows whose full key is in the FTS match set.
-                partition.rows.retain(|row| {
-                    matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
-                        pk,
-                        &row.clustering,
-                    ))
-                });
-                let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                    &partition,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
-                );
-                // Post-filter: apply remaining (non-fts_match) WHERE predicates.
-                filter_rows_by_select_predicates(
-                    &mut prows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-                fts_rows.append(&mut prows);
-            }
-        }
+                .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
 
-        // Apply LIMIT if specified.
-        let fts_rows: Vec<Vec<Option<CqlValue>>> =
-            if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
-                fts_rows.into_iter().take(limit as usize).collect()
-            } else {
-                fts_rows
+            // Complete ⇔ no replica can have truncated its local hit set: a
+            // replica truncates only when its local matches exceed `requested`,
+            // in which case it returns exactly `requested` keys and the union
+            // has at least that many.
+            let hit_set_complete = match requested {
+                None => true,
+                Some(r) => matching_pks.len() < r,
             };
+
+            // `matching_pks` are full-key document ids (partition +
+            // clustering), one per matching ROW. Read each distinct partition
+            // once, keep ONLY the rows whose full key actually matched — so
+            // non-matching clustering rows in a matched partition don't leak
+            // (t_da51e20c) — then post-filter.
+            let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+
+            // Distinct matched partitions in a DETERMINISTIC order (raw
+            // partition-key bytes). CQL promises no ordering for this arm, but
+            // the HashSet's arbitrary iteration order previously decided WHICH
+            // rows a LIMIT kept; sorting makes the LIMIT early-exit and the
+            // page continuation cursor reproducible. Legacy/malformed ids
+            // (e.g. a sidecar built before row-granular keys, pending rebuild)
+            // are skipped rather than misread.
+            let mut fts_partitions: Vec<Vec<u8>> = matched
+                .iter()
+                .filter_map(|doc_key| {
+                    ferrosa_index::fulltext::keys::doc_key_partition(doc_key).map(<[u8]>::to_vec)
+                })
+                .collect();
+            fts_partitions.sort_unstable();
+            fts_partitions.dedup();
+
+            let pending: Vec<&Vec<u8>> = fts_partitions
+                .iter()
+                .filter(|pk| {
+                    fts_resume
+                        .as_ref()
+                        .is_none_or(|cur| pk.as_slice() > cur.partition_key.as_slice())
+                })
+                .collect();
+
+            let mut fts_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+            let mut fts_paging_state: Option<Vec<u8>> = None;
+            for (idx, pk) in pending.iter().enumerate() {
+                #[cfg(test)]
+                FTS_MATCH_PARTITION_READS.with(|c| c.set(c.get() + 1));
+                let decorated = ferrosa_common::DecoratedKey::new(
+                    ferrosa_common::PartitionKey::new(pk.to_vec()),
+                );
+                if let Some(mut partition) = state
+                    .write_path
+                    .load()
+                    .read(&table_id, &decorated)
+                    .await
+                    .map_err(|e| CqlError::ServerError(format!("{e}")))?
+                {
+                    // Keep only the rows whose full key is in the FTS match set.
+                    partition.rows.retain(|row| {
+                        matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk,
+                            &row.clustering,
+                        ))
+                    });
+                    let mut prows = bridge::partition_to_rows_with_storage_mapping(
+                        &partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    );
+                    // Post-filter: apply remaining (non-fts_match) WHERE predicates.
+                    filter_rows_by_select_predicates(
+                        &mut prows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+                    fts_rows.append(&mut prows);
+                }
+                if let Some(limit) = fts_limit {
+                    // Only rows SURVIVING the post-filter count toward LIMIT; a
+                    // partition whose rows were all dropped keeps the loop reading.
+                    if fts_rows.len() >= limit {
+                        fts_rows.truncate(limit);
+                        break;
+                    }
+                } else if fts_rows.len() >= fts_page_size {
+                    // Page complete. Partition-granular continuation: resume after
+                    // the last fully-delivered partition. A page may exceed
+                    // page_size by the tail of one wide partition (page_size is a
+                    // hint per the CQL protocol spec); the coordinator's resident
+                    // set stays ≈ one page + one partition.
+                    if idx + 1 < pending.len() {
+                        fts_paging_state = Some(
+                            crate::paging::PagingState {
+                                partition_key: (*pk).clone(),
+                                clustering_key: Vec::new(),
+                                remaining_in_partition: false,
+                            }
+                            .encode(),
+                        );
+                    }
+                    break;
+                }
+            }
+
+            match fts_limit {
+                Some(limit) if fts_rows.len() < limit && !hit_set_complete => {
+                    // Post-filtering exhausted the bounded hit set before the
+                    // LIMIT was satisfied and more matches may exist — escalate.
+                    let next = requested.unwrap_or(limit).max(1).saturating_mul(4);
+                    tracing::debug!(
+                        keyspace = ks,
+                        table = %s.table,
+                        limit,
+                        rows_surviving = fts_rows.len(),
+                        requested = ?requested,
+                        next_requested = next,
+                        "fts_match: post-filter exhausted the bounded hit set — escalating"
+                    );
+                    requested = Some(next);
+                }
+                _ => break (fts_rows, fts_paging_state),
+            }
+        };
+
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
         return Ok(SelectRawResult {
@@ -3788,7 +4273,7 @@ async fn route_select_user_table(
             rows: selected_rows,
             keyspace: ks.to_string(),
             table: s.table.clone(),
-            paging_state: None,
+            paging_state: fts_paging_state,
         });
     }
 
@@ -3862,6 +4347,12 @@ async fn route_select_user_table(
     // `None` for the final page) means the generic `apply_pagination` tail must
     // be skipped — the rows are already exactly one bounded page.
     let mut streamed_paging_state: Option<Option<Vec<u8>>> = None;
+
+    // Set when an arbitrary unbounded ORDER BY has already been fully ordered by
+    // the spilling external merge sort. The generic in-memory sort site below is
+    // then skipped — re-sorting would re-materialize the whole result in memory,
+    // defeating the spill's bounded-memory guarantee.
+    let mut order_by_already_sorted = false;
 
     let rows = if let Ok(pk_values) = pk_result {
         // PK present — single partition lookup
@@ -4580,6 +5071,55 @@ async fn route_select_user_table(
                             .await?;
                             streamed_paging_state = Some(page.next_paging_state);
                             page.rows
+                        } else if !count_only_select && builtin_scalar_aggregate_stream_shape(s) {
+                            // Streaming scalar aggregate (SUM/MIN/MAX/AVG, and
+                            // COUNT when mixed with them) over a full ALLOW
+                            // FILTERING scan with no user LIMIT. This shape folds
+                            // in O(1) accumulator state per aggregate column, so
+                            // there is NO server-side row cap: the result is exact
+                            // over the whole table and memory is independent of the
+                            // scanned row count. (The previous path capped this at
+                            // DEFAULT_RANGE_READ_LIMIT and then fail-loud'd, so
+                            // `SELECT SUM(v) FROM t` over >10k rows was refused
+                            // entirely.) ORDER BY / DISTINCT keep the bounded path
+                            // below until spill-to-disk lands (step 5).
+                            let accs = build_agg_accumulators(s, &all_col_names, &all_col_types)?;
+                            let stream = state
+                                .write_path
+                                .load()
+                                .range_read_stream_all_with(
+                                    &table_id,
+                                    0,
+                                    ctx.consistency,
+                                    &table_strategy,
+                                )
+                                .await?;
+                            let agg_row = fold_builtin_aggregates(
+                                stream,
+                                accs,
+                                PartitionRowContext {
+                                    all_col_names: &all_col_names,
+                                    all_col_types: &all_col_types,
+                                    pk_indices: &pk_indices,
+                                    ck_indices: &ck_indices,
+                                    storage_to_table: &storage_to_table,
+                                },
+                                SelectPredicateContext {
+                                    statement: s,
+                                    table_meta,
+                                    keyspace: ks,
+                                    state,
+                                },
+                            )
+                            .await?;
+                            return Ok(SelectRawResult {
+                                column_names: col_names.to_vec(),
+                                column_types: col_types.to_vec(),
+                                rows: vec![agg_row],
+                                keyspace: ks.to_string(),
+                                table: s.table.clone(),
+                                paging_state: None,
+                            });
                         } else {
                             let scan_bound = if s.order_by.is_empty()
                                 && s.ann_of.is_none()
@@ -4659,6 +5199,33 @@ async fn route_select_user_table(
                             } else {
                                 None
                             };
+                            // Projected full-scan stream. When the query only needs
+                            // a subset of regular cells (e.g. `SELECT DISTINCT
+                            // <partition-key column>`), route through the streaming,
+                            // *uncapped* projection variant instead of materializing
+                            // a `Vec<Partition>`. The result is bounded only by the
+                            // query's own LIMIT — there is NO server-side row cap —
+                            // and memory stays bounded because the stream pages
+                            // internally (O(num_sources) partitions resident, rows
+                            // moved through). On a real cluster this also performs the
+                            // proper coordinated scatter-gather, which the local
+                            // `Vec`-returning path did not.
+                            let mut projected_stream: Option<
+                                ferrosa_cluster::write_path::PartitionResultStream,
+                            > = None;
+                            // Arbitrary unbounded ORDER BY (no LIMIT): stream the whole
+                            // scan uncapped and sort with bounded memory via a spilling
+                            // external merge sort (step 5). This replaces the old
+                            // fail-loud DEFAULT_RANGE_READ_LIMIT probe cap — the result
+                            // is bounded ONLY by the query's LIMIT, and the sort's
+                            // working set by the spill threshold. The reservation's temp
+                            // dir holds spilled runs and is cleaned up on drop. When set,
+                            // `spilled_sorted_rows` already holds the fully-ordered rows,
+                            // so the generic sort site below is skipped.
+                            let order_by_spill =
+                                prepare_order_by_execution(state, ks, s, table_meta)?;
+                            let mut spilled_sorted_rows: Option<Vec<Vec<Option<CqlValue>>>> = None;
+                            let mut spilled_sort_did_spill = false;
                             let partitions = if count_only_select {
                                 // COUNT(*) must NEVER pre-materialize a capped Vec.
                                 // `range_read_limited_rows` clamps to the magic
@@ -4673,33 +5240,106 @@ async fn route_select_user_table(
                             } else if let Some(wanted) = projection_wanted {
                                 // Push partition-count cap down to the merger so
                                 // `LIMIT N` stops the scan after N partitions
-                                // rather than walking every SSTable.
-                                Some(
+                                // rather than walking every SSTable. The stream is
+                                // consumed below directly into `all_rows`.
+                                projected_stream = Some(
                                     state
                                         .write_path
                                         .load()
-                                        .range_read_projected(&table_id, wanted, scan_bound)
+                                        .range_read_projected_stream_all_with(
+                                            &table_id,
+                                            wanted,
+                                            scan_bound,
+                                            ctx.consistency,
+                                            &table_strategy,
+                                        )
                                         .await?,
-                                )
+                                );
+                                None
                             } else if let Some(bound) = scan_bound {
                                 // User-supplied LIMIT (or page size) provided the
                                 // bound: returning exactly the requested rows is
                                 // intentional and correct, so no truncation check.
-                                Some(
-                                    state
-                                        .write_path
-                                        .load()
-                                        .range_read_limited_rows(&table_id, bound, row_limit)
-                                        .await?,
+                                //
+                                // Stream at most `bound` partitions rather than
+                                // materializing a `Vec<Partition>` via
+                                // `range_read_limited_rows`: the storage layer
+                                // fail-louds a Vec-materializing read whose bound
+                                // exceeds its OOM guard, so a user `LIMIT` larger
+                                // than that guard (e.g. `LIMIT 20000`) must stream.
+                                // Memory is bounded by the user's chosen `bound`;
+                                // the result is bounded ONLY by the query's LIMIT.
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                projected_stream = Some(Box::pin(stream.take(bound)));
+                                None
+                            } else if let Some(reservation) = order_by_spill.as_ref() {
+                                // Arbitrary unbounded ORDER BY: stream the ENTIRE scan
+                                // uncapped and sort it with a spilling external merge
+                                // sort. No server-side row cap; the sort's working set
+                                // is bounded by the spill threshold, not the result
+                                // size, and rows move (never clone) into the sorter.
+                                let stream = state
+                                    .write_path
+                                    .load()
+                                    .range_read_stream_all_with(
+                                        &table_id,
+                                        row_limit,
+                                        ctx.consistency,
+                                        &table_strategy,
+                                    )
+                                    .await?;
+                                let order_specs: Vec<(usize, bool)> = s
+                                    .order_by
+                                    .iter()
+                                    .filter_map(|(col_name, dir)| {
+                                        let idx =
+                                            all_col_names.iter().position(|n| n == col_name)?;
+                                        Some((idx, *dir == OrderDirection::Asc))
+                                    })
+                                    .collect();
+                                let threshold = ferrosa_storage::process_spill_threshold_bytes();
+                                let (sorted, did_spill) = sort_rows_from_partition_stream_spilling(
+                                    stream,
+                                    reservation.path(),
+                                    ferrosa_storage::RowOrder::new(order_specs),
+                                    threshold,
+                                    PartitionRowContext {
+                                        all_col_names: &all_col_names,
+                                        all_col_types: &all_col_types,
+                                        pk_indices: &pk_indices,
+                                        ck_indices: &ck_indices,
+                                        storage_to_table: &storage_to_table,
+                                    },
+                                    SelectPredicateContext {
+                                        statement: s,
+                                        table_meta,
+                                        keyspace: ks,
+                                        state,
+                                    },
                                 )
+                                .await?;
+                                spilled_sorted_rows = Some(sorted);
+                                spilled_sort_did_spill = did_spill;
+                                None
                             } else if row_limit > 0 {
-                                // Complex shape (ORDER BY / DISTINCT / aggregate /
-                                // function projection) over a full ALLOW FILTERING
-                                // scan with no user bound: the read is capped at the
-                                // engine's DEFAULT_RANGE_READ_LIMIT only. Sorting,
-                                // distincting, or aggregating over a silently clipped
-                                // window yields a wrong answer, so fail loud when the
-                                // cap actually clipped data (D4) instead of truncating.
+                                // Complex shape (DISTINCT / aggregate / function
+                                // projection) over a full ALLOW FILTERING scan with no
+                                // user bound: the read is capped at the engine's
+                                // DEFAULT_RANGE_READ_LIMIT only. Distincting or
+                                // aggregating over a silently clipped window yields a
+                                // wrong answer, so fail loud when the cap actually
+                                // clipped data (D4) instead of truncating. (Arbitrary
+                                // unbounded ORDER BY is handled by the spill branch
+                                // above.)
                                 let (partitions, truncated) = state
                                     .write_path
                                     .load()
@@ -4791,7 +5431,28 @@ async fn route_select_user_table(
                                 });
                             }
                             let mut all_rows = Vec::new();
-                            if let Some(partitions) = partitions.as_ref() {
+                            if let Some(sorted) = spilled_sorted_rows.take() {
+                                // Arbitrary unbounded ORDER BY already produced fully
+                                // ordered + predicate-filtered rows via the spilling
+                                // external sort above. Skip the generic sort site.
+                                let _ = spilled_sort_did_spill;
+                                order_by_already_sorted = true;
+                                all_rows = sorted;
+                            } else if let Some(stream) = projected_stream {
+                                // Stream the uncapped projected scan straight into
+                                // rows. Partitions move from the reader into the row
+                                // builder one at a time — no full-table Vec, no cap.
+                                extend_rows_from_partition_stream(
+                                    stream,
+                                    &mut all_rows,
+                                    &all_col_names,
+                                    &all_col_types,
+                                    &pk_indices,
+                                    &ck_indices,
+                                    &storage_to_table,
+                                )
+                                .await?;
+                            } else if let Some(partitions) = partitions.as_ref() {
                                 extend_rows_from_partitions(
                                     partitions,
                                     &mut all_rows,
@@ -4828,13 +5489,13 @@ async fn route_select_user_table(
         }
     };
 
-    // Classify arbitrary unbounded ORDER BY before sorting. The temp-sort
-    // reservation is intentionally held until this SELECT returns; dropping it
-    // on completion or cancellation cleans up the temporary table directory.
-    let _order_by_temp_sort = prepare_order_by_execution(state, ks, s, table_meta)?;
-
-    // Apply ORDER BY sorting (FRSA-BUG-004)
-    let rows = if let Some((ann_col, ann_query)) = &s.ann_of {
+    // Apply ORDER BY sorting (FRSA-BUG-004). An arbitrary unbounded ORDER BY has
+    // already been fully ordered by the spilling external merge sort in the scan
+    // arm (`order_by_already_sorted`); re-sorting it here would re-materialize
+    // the whole result in memory, so skip the generic in-memory sort in that case.
+    let rows = if order_by_already_sorted {
+        rows
+    } else if let Some((ann_col, ann_query)) = &s.ann_of {
         let mut sorted = rows;
         apply_ann_of_ordering(
             &mut sorted,
@@ -17013,6 +17674,398 @@ mod tests {
         );
     }
 
+    /// Regression: a projected full-scan (here `SELECT DISTINCT` over a
+    /// partition-key column) MUST return every distinct partition even when the
+    /// table has more than `DEFAULT_RANGE_READ_LIMIT` (10_000) partitions.
+    ///
+    /// The projected arm now routes through the streaming, uncapped
+    /// `range_read_projected_stream_all_with` variant: there is NO server-side
+    /// result cap — only the query's own LIMIT bounds the result — and the scan
+    /// streams partitions instead of materializing a full `Vec<Partition>`, so
+    /// memory stays bounded regardless of result size. All 10_500 distinct
+    /// values must come back.
+    ///
+    /// Spec: specs/proposed/streaming-range-reads-no-cap.md (step 1).
+    #[tokio::test]
+    async fn select_distinct_partition_key_returns_all_partitions_past_10k() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE distinct_big WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE TABLE distinct_big.t (tenant_id int PRIMARY KEY, v text)")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Insert >10k distinct partitions, flushing periodically so the rows
+        // spread across many token-interleaved SSTables plus the active memtable
+        // (the LSM state that exercises the multi-run merge).
+        let total = ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT + 500;
+        let table_id = ferrosa_storage::TableId::new("distinct_big", "t");
+        for i in 0..total {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO distinct_big.t (tenant_id, v) VALUES ({i}, 'v{i}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if i % 2000 == 1999 {
+                state.engine.flush(&table_id).unwrap();
+            }
+        }
+        state.engine.flush(&table_id).unwrap();
+
+        // No LIMIT, default paging: DISTINCT with no page size returns the full
+        // deduplicated result set in a single buffer.
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT DISTINCT tenant_id FROM distinct_big.t").unwrap(),
+        )
+        .await
+        .unwrap();
+        let row_count = match &result {
+            RouteResult::Result(b) => extract_row_count(b) as usize,
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            row_count,
+            total,
+            "SELECT DISTINCT over {total} partitions must return every distinct \
+             partition key, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    // ── Step 2: remove the DEFAULT_RANGE_READ_LIMIT result cap for the
+    //           O(1)-streamable shapes. RED tests below assert that a result
+    //           bigger than the 10_000 magic cap comes back complete (no cap,
+    //           no fail-loud) for: (a) a simple `WHERE … ALLOW FILTERING` scan,
+    //           (b) a streaming scalar aggregate (SUM), (c) `SELECT DISTINCT
+    //           <partition key>`. Spec: specs/proposed/streaming-range-reads-no-cap.md
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// (a) A simple coordinated `WHERE … ALLOW FILTERING` scan over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must return EVERY matching row, bounded
+    /// only by paging — never truncated to a server-side 10_000 window.
+    #[tokio::test]
+    async fn allow_filtering_scan_returns_all_rows_past_10k() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // `v = id * 10`, so `v >= 0` matches every row. Walk every page with the
+        // default page size; the union must be the whole table with no cap.
+        let (rows, _pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT * FROM pageks.t WHERE v >= 0 ALLOW FILTERING",
+            None,
+        )
+        .await;
+        let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n as usize,
+            "ALLOW FILTERING scan over {n} rows must return every row, not a \
+             server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// A user `LIMIT N` greater than `DEFAULT_RANGE_READ_LIMIT` must return N
+    /// rows — the query's own LIMIT is the ONLY bound. Previously
+    /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
+    /// large user LIMIT below what the client asked for.
+    #[tokio::test]
+    async fn user_limit_above_10k_returns_all_requested_rows() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let cql = format!("SELECT * FROM pageks.t LIMIT {n}");
+        let (rows, _pages) = collect_all_pages(&state, &auth, &ks, &cql, None).await;
+        let mut ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            n as usize,
+            "LIMIT {n} must return {n} distinct rows, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// (b) A streaming scalar aggregate (`SUM`) over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must be EXACT — computed over the whole
+    /// table, not over a clipped 10_000-row window (and not fail-loud).
+    #[tokio::test]
+    async fn sum_aggregate_is_exact_past_10k() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // v = i * 10 for i in 0..n  →  SUM(v) = 10 * (n-1) * n / 2.
+        let expected: i64 = (0..n).map(|i| i * 10).sum();
+
+        let select = match crate::parser::parse("SELECT SUM(v) FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            res.rows.len(),
+            1,
+            "SUM must return exactly one aggregate row"
+        );
+        // int column widens to Bigint in SUM (Cassandra semantics).
+        let got = match &res.rows[0][0] {
+            Some(CqlValue::Bigint(x)) => *x,
+            Some(CqlValue::Int(x)) => *x as i64,
+            other => panic!("expected numeric SUM, got {other:?}"),
+        };
+        assert_eq!(
+            got,
+            expected,
+            "SUM(v) over {n} rows must be exact ({expected}), not summed over a \
+             capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// (c) `SELECT DISTINCT <partition key>` over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` partitions must return every distinct
+    /// partition key (token-ordered scan visits each partition once). This is
+    /// the non-projected DISTINCT arm reached when the projection ordinal path
+    /// is not taken; it must stream uncapped like the projected arm.
+    #[tokio::test]
+    async fn distinct_partition_key_returns_all_rows_past_10k_non_projected() {
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let select = match crate::parser::parse("SELECT DISTINCT id FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            res.rows.len(),
+            n as usize,
+            "SELECT DISTINCT id over {n} partitions must return every distinct \
+             partition key, not a server-capped {} window",
+            ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT
+        );
+    }
+
+    /// Streaming-aggregate correctness on a small table: SUM/MIN/MAX/AVG/COUNT
+    /// folded over the uncapped partition stream must match the exact expected
+    /// values, honoring a WHERE filter and skipping NULL source cells. Guards the
+    /// O(1) streaming accumulators used by the >10k exactness fix.
+    #[tokio::test]
+    async fn streaming_aggregates_are_correct_with_where_and_nulls() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE agg WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE agg.t (id int PRIMARY KEY, g int, v int)",
+            // g=1 group: v = 10, 20, 30 ; plus a NULL-v row that must be skipped.
+            "INSERT INTO agg.t (id, g, v) VALUES (1, 1, 10)",
+            "INSERT INTO agg.t (id, g, v) VALUES (2, 1, 20)",
+            "INSERT INTO agg.t (id, g, v) VALUES (3, 1, 30)",
+            "INSERT INTO agg.t (id, g) VALUES (4, 1)",
+            // g=2 group: excluded by WHERE g = 1.
+            "INSERT INTO agg.t (id, g, v) VALUES (5, 2, 999)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let select = match crate::parser::parse(
+            "SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM agg.t WHERE g = 1 ALLOW FILTERING",
+        )
+        .unwrap()
+        {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx2 = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx2, &select).await.unwrap();
+        assert_eq!(res.rows.len(), 1, "aggregate must return exactly one row");
+        let row = &res.rows[0];
+        // COUNT(*) counts all matched rows (including the NULL-v row) = 4.
+        assert_eq!(row[0], Some(CqlValue::Bigint(4)), "COUNT(*)");
+        // SUM/MIN/MAX/AVG skip the NULL v; over {10,20,30}.
+        let as_i64 = |c: &Option<CqlValue>| match c {
+            Some(CqlValue::Bigint(x)) => *x,
+            Some(CqlValue::Int(x)) => *x as i64,
+            other => panic!("expected numeric agg, got {other:?}"),
+        };
+        assert_eq!(as_i64(&row[1]), 60, "SUM(v)");
+        assert_eq!(as_i64(&row[2]), 10, "MIN(v)");
+        assert_eq!(as_i64(&row[3]), 30, "MAX(v)");
+        assert_eq!(as_i64(&row[4]), 20, "AVG(v) = 60/3");
+    }
+
+    /// Guard: an unbounded `ORDER BY` (no LIMIT) over more than
+    /// `DEFAULT_RANGE_READ_LIMIT` rows must stay BOUNDED — it fails loud rather
+    /// than materializing the whole table into an in-memory global sort. Its cap
+    /// intentionally remains until spill-to-disk lands (step 5). This test locks
+    /// in that step 2 does NOT accidentally uncap the accumulating sort shape.
+    #[tokio::test]
+    async fn order_by_no_limit_sorts_all_rows_past_10k() {
+        // Step 5: an arbitrary unbounded ORDER BY (no LIMIT) over a >10k table
+        // now returns EVERY row in correct order via the spilling external sort,
+        // instead of the old fail-loud DEFAULT_RANGE_READ_LIMIT cap.
+        let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        let select = match crate::parser::parse("SELECT * FROM pageks.t ORDER BY v").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select)
+            .await
+            .expect("unbounded ORDER BY must now return all rows via spill, not fail loud");
+
+        assert_eq!(
+            res.rows.len(),
+            n as usize,
+            "ORDER BY with no LIMIT must return every row past the 10k cap"
+        );
+        // `v = id * 10` so ascending order on `v` is ascending on `id`.
+        let v_idx = res
+            .column_names
+            .iter()
+            .position(|c| c == "v")
+            .expect("v column present");
+        let vals: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[v_idx] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        let mut sorted_ref = vals.clone();
+        sorted_ref.sort_unstable();
+        assert_eq!(vals, sorted_ref, "rows must be in ascending `v` order");
+        assert_eq!(
+            vals.first().copied(),
+            Some(0),
+            "smallest v (id=0 → v=0) must sort first"
+        );
+        assert_eq!(
+            vals.last().copied(),
+            Some(((n - 1) * 10) as i32),
+            "largest v must sort last"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn order_by_spills_and_stays_correct() {
+        // With a tiny spill threshold forcing many spills, a large RANDOMIZED
+        // input must sort identically to an in-memory reference — same length,
+        // same multiset, same order — proving no loss/dup/misorder under spill.
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        // Force the sorter to spill on essentially every batch.
+        std::env::set_var(
+            ferrosa_storage::spill_budget::ENV_SPILL_THRESHOLD_BYTES,
+            "64",
+        );
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = Some("spillks".to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE KEYSPACE spillks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE TABLE spillks.t (id int PRIMARY KEY, v int)",
+        )
+        .await;
+
+        let mut rng = StdRng::seed_from_u64(0xD00D_F00D);
+        let n = 3_000usize;
+        let mut inserted: Vec<i32> = Vec::with_capacity(n);
+        for id in 0..n {
+            let v: i32 = rng.random_range(-100_000..100_000);
+            inserted.push(v);
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO spillks.t (id, v) VALUES ({id}, {v})"),
+            )
+            .await;
+        }
+
+        let select = match crate::parser::parse("SELECT v FROM spillks.t ORDER BY v").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        std::env::remove_var(ferrosa_storage::spill_budget::ENV_SPILL_THRESHOLD_BYTES);
+
+        let got: Vec<i32> = res
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int, got {other:?}"),
+            })
+            .collect();
+
+        // Reference: the exact same values sorted by a plain in-memory Vec::sort.
+        let mut reference = inserted.clone();
+        reference.sort_unstable();
+
+        assert_eq!(got.len(), reference.len(), "no rows lost or duplicated");
+        assert_eq!(
+            got, reference,
+            "spilled external sort must equal the in-memory reference exactly \
+             (same multiset, same order)"
+        );
+    }
+
     #[tokio::test]
     async fn composite_clustering_text_predicate_matches_exact_pk_lookup() {
         let (state, _dir) = setup();
@@ -17336,7 +18389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arbitrary_unbounded_order_by_fails_loud_without_temp_sort_leak() {
+    async fn arbitrary_unbounded_order_by_sorts_via_spill_without_temp_leak() {
         let (state, dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -17392,18 +18445,35 @@ mod tests {
             }
         );
 
-        let error = match route(&state, &ctx, stmt).await {
-            Ok(_) => panic!("unbounded arbitrary ORDER BY must not materialize rows in memory"),
-            Err(error) => error,
+        // Step 5: the arbitrary unbounded ORDER BY now succeeds via the spilling
+        // external sort — it returns the rows fully ordered, not a fail-loud
+        // error. `v = {30, 10, 20}` → ascending order is `10, 20, 30`.
+        let ctx2 = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
         };
-        match error {
-            CqlError::Invalid(message) => assert!(
-                message.contains("unbounded full-table materialization is disabled"),
-                "unexpected error message: {message}"
-            ),
-            other => panic!("expected invalid-query error, got {other:?}"),
-        }
+        let select_owned = select.clone();
+        let raw = route_select_raw(&state, &ctx2, &select_owned)
+            .await
+            .expect("unbounded ORDER BY must sort via spill, not fail loud");
+        let v_idx = raw.column_names.iter().position(|c| c == "v").unwrap();
+        let ordered: Vec<i32> = raw
+            .rows
+            .iter()
+            .map(|r| match &r[v_idx] {
+                Some(CqlValue::Int(x)) => *x,
+                other => panic!("expected int v, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ordered, vec![10, 20, 30], "rows must be ascending on v");
 
+        // The temp-sort reservation directory must be cleaned up on drop — no
+        // leaked run files after the query returns.
         let tmp_root = dir.path().join("tmp_order_by_sort");
         if tmp_root.exists() {
             let leftovers = std::fs::read_dir(&tmp_root).unwrap().count();
@@ -18375,12 +19445,11 @@ mod tests {
     /// The end-to-end test above uses fts_match with NO partition-key predicate;
     /// this exercises the PK-predicate + fts_match combination (entity_store
     /// shape: partition key + clustering key + fts on a regular column).
-    // KNOWN BUG (unfixed): with PK predicates present, fts_match is matched at
-    // PARTITION granularity and the post-filter skips re-applying it per-row
-    // (evaluate_where_predicates_skips_fts_match_clauses), so a matched
-    // partition leaks rows that don't contain the term. Reproduced here;
-    // ignored until the per-row fts re-evaluation / row-granular FTI lands.
-    #[ignore = "known bug: fts_match dropped to partition granularity when PK predicates present"]
+    // Fixed by the row-granular FTI doc keys (t_da51e20c): the arm now retains
+    // only the rows whose FULL primary key matched, so a matched partition no
+    // longer leaks clustering rows that don't contain the term even when PK
+    // predicates are present. (Was `#[ignore]`d while matching was
+    // partition-granular; un-ignored once the fix made it pass — t_8686dd3c.)
     #[tokio::test]
     async fn fts_match_with_pk_predicates_returns_matches() {
         let (state, _dir) = setup();
@@ -18477,6 +19546,321 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Run a SELECT through the user-table planner directly, returning the raw
+    /// (un-encoded) result so fts tests can inspect rows AND the paging cursor.
+    async fn fts_select_raw(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        ks: &str,
+        cql: &str,
+    ) -> SelectRawResult {
+        let stmt = crate::parser::parse(cql).unwrap();
+        let Statement::Select(s) = stmt else {
+            panic!("expected a SELECT statement: {cql}");
+        };
+        route_select_user_table(state, ctx, ks, &s)
+            .await
+            .unwrap_or_else(|e| panic!("{cql}: {e:?}"))
+    }
+
+    /// Seed `ks.docs` with `n` single-row partitions whose bodies all match
+    /// `token`, plus a `flag` column (0 for ids <= `zero_flag_upto`, else 1),
+    /// then flush so the FTI sidecar exists.
+    async fn seed_fts_docs(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        ks: &str,
+        token: &str,
+        n: i32,
+        zero_flag_upto: i32,
+    ) {
+        for cql in [
+            format!(
+                "CREATE KEYSPACE {ks} WITH REPLICATION = \
+                 {{'class': 'SimpleStrategy', 'replication_factor': '1'}}"
+            ),
+            format!("CREATE TABLE {ks}.docs (id int PRIMARY KEY, body text, flag int)"),
+            format!("CREATE INDEX docs_fts ON {ks}.docs (body) USING 'fulltext'"),
+        ] {
+            let stmt = crate::parser::parse(&cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        for id in 1..=n {
+            let flag = if id <= zero_flag_upto { 0 } else { 1 };
+            let cql = format!(
+                "INSERT INTO {ks}.docs (id, body, flag) VALUES ({id}, 'doc {token} number', {flag})"
+            );
+            let stmt = crate::parser::parse(&cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new(ks, "docs"))
+            .unwrap();
+    }
+
+    fn fts_row_ids(raw: &SelectRawResult) -> Vec<i32> {
+        raw.rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(Some(CqlValue::Int(id))) => *id,
+                other => panic!("expected int id cell, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Coordinator memory bound for `fts_match` (t_ee98faa0): with a LIMIT, the
+    /// arm must stop point-reading matched partitions as soon as `limit` rows
+    /// survive — accumulation ≈ limit rows + one partition, NOT O(matches).
+    /// The read counter asserts the early exit structurally (deterministic, no
+    /// allocator tracking): 10 matching partitions, LIMIT 3 → exactly 3 reads.
+    #[tokio::test]
+    async fn fts_match_limit_stops_partition_reads_at_limit() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_lim", "boundterm", 10, 0).await;
+
+        FTS_MATCH_PARTITION_READS.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_lim",
+            "SELECT id FROM fts_lim.docs WHERE body = fts_match('boundterm') LIMIT 3",
+        )
+        .await;
+        let reads = FTS_MATCH_PARTITION_READS.with(|c| c.get());
+
+        assert_eq!(raw.rows.len(), 3, "LIMIT 3 must return exactly 3 rows");
+        assert_eq!(
+            reads, 3,
+            "the fts_match fetch loop must stop point-reading once LIMIT rows \
+             survive; {reads} partition reads for LIMIT 3 means it materialized \
+             the whole match set (the t_ee98faa0 OOM shape)"
+        );
+        assert!(
+            raw.paging_state.is_none(),
+            "a satisfied LIMIT needs no continuation"
+        );
+        // Deterministic iteration (sorted partition-key bytes): int PKs 1..=10
+        // serialize big-endian, so LIMIT 3 keeps ids 1,2,3.
+        assert_eq!(fts_row_ids(&raw), vec![1, 2, 3]);
+    }
+
+    /// LIMIT counts only rows that SURVIVE the post-filter: rows dropped by
+    /// non-fts predicates must not count toward LIMIT. With the replica-side
+    /// bound pushed down (t_ee98faa0 layer 2) the hit set arrives as the k
+    /// best doc keys, so exhausting it via the post-filter triggers GEOMETRIC
+    /// ESCALATION (k → 4k) rather than a wrong short result:
+    ///   * round 1 (requested=2): keys {1,2}, both flag=0 → dropped → 2 reads;
+    ///   * round 2 (requested=8): keys {1..8}, reads 1..=5 (3 dropped + 2
+    ///     kept) then stops at the LIMIT bound → 5 reads.
+    #[tokio::test]
+    async fn fts_match_limit_post_filtered_rows_do_not_count_toward_limit() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_pf", "filterterm", 10, 3).await;
+
+        FTS_MATCH_PARTITION_READS.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_pf",
+            "SELECT id FROM fts_pf.docs WHERE body = fts_match('filterterm') \
+             AND flag = 1 LIMIT 2 ALLOW FILTERING",
+        )
+        .await;
+        let reads = FTS_MATCH_PARTITION_READS.with(|c| c.get());
+
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![4, 5],
+            "post-filter drops ids 1..=3 (flag=0); LIMIT 2 keeps the next two"
+        );
+        assert_eq!(
+            reads,
+            2 + 5,
+            "dropped rows must trigger escalation + further reads (round 1: \
+             2 dropped; round 2: 3 dropped + 2 kept), and the loop must still \
+             stop at the LIMIT bound"
+        );
+    }
+
+    /// Escalation completeness (t_ee98faa0 layer 2): when the post-filter can
+    /// drop MOST of the bounded hit set, the arm must keep escalating the
+    /// pushed-down k until either LIMIT rows survive or the hit set is
+    /// provably complete — the result must NEVER be short while more matches
+    /// exist. 30 matching rows, only the last 5 survive `flag = 1`; LIMIT 4
+    /// must return 4 rows even though requested starts at 4 « 25 dropped.
+    #[tokio::test]
+    async fn fts_match_limit_escalates_until_limit_survives_post_filter() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        // ids 1..=25 flag=0 (dropped by the post-filter), ids 26..=30 flag=1.
+        seed_fts_docs(&state, &ctx, "fts_esc", "escterm", 30, 25).await;
+
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_esc",
+            "SELECT id FROM fts_esc.docs WHERE body = fts_match('escterm') \
+             AND flag = 1 LIMIT 4 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![26, 27, 28, 29],
+            "escalation must widen the pushed-down k (4 → 16 → 64) until \
+             LIMIT rows survive the post-filter — a short result here means \
+             the replica bound silently truncated the query"
+        );
+
+        // And when FEWER than LIMIT rows survive in the WHOLE table, the
+        // (complete) short result is correct — escalation must terminate.
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_esc",
+            "SELECT id FROM fts_esc.docs WHERE body = fts_match('escterm') \
+             AND flag = 1 LIMIT 100 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![26, 27, 28, 29, 30],
+            "when the complete surviving set is smaller than LIMIT, exactly \
+             that set must be returned (and the escalation loop must stop)"
+        );
+    }
+
+    /// No LIMIT: the full result is legitimate, so the arm must bound MEMORY,
+    /// not the result — build one page per response (client page_size) with a
+    /// `PagingState` continuation. 7 matching partitions @ page_size 3 →
+    /// pages of 3/3/1 whose union is ALL matching rows, in deterministic
+    /// (partition-key byte) order, with no duplicates and no truncation.
+    #[tokio::test]
+    async fn fts_match_no_limit_pages_bound_accumulation() {
+        let (state, _dir) = setup();
+        let base_ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &base_ctx, "fts_pg", "pageterm", 7, 0).await;
+
+        let mut collected: Vec<i32> = Vec::new();
+        let mut page_sizes: Vec<usize> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        loop {
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams {
+                    page_size: Some(3),
+                    paging_state: paging_state.take(),
+                },
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            let raw = fts_select_raw(
+                &state,
+                &ctx,
+                "fts_pg",
+                "SELECT id FROM fts_pg.docs WHERE body = fts_match('pageterm')",
+            )
+            .await;
+            page_sizes.push(raw.rows.len());
+            assert!(
+                raw.rows.len() <= 3,
+                "a page must hold at most page_size rows for single-row \
+                 partitions; got {} (unbounded accumulation)",
+                raw.rows.len()
+            );
+            collected.extend(fts_row_ids(&raw));
+            match raw.paging_state {
+                Some(cursor) => paging_state = Some(cursor),
+                None => break,
+            }
+            assert!(page_sizes.len() <= 7, "paging must terminate");
+        }
+
+        assert_eq!(page_sizes, vec![3, 3, 1], "7 rows @ page_size 3 → 3/3/1");
+        assert_eq!(
+            collected,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the union of all pages must be ALL matching rows — no gaps, no \
+             duplicates, no server-side truncation"
+        );
+    }
+
+    /// No LIMIT and no client page_size: every matching row is returned (the
+    /// result is bounded only by the query's own LIMIT — never a server cap).
+    /// Small result → a single page under the default scan page size, no cursor.
+    #[tokio::test]
+    async fn fts_match_no_limit_returns_all_matching_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_all", "allterm", 7, 0).await;
+
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_all",
+            "SELECT id FROM fts_all.docs WHERE body = fts_match('allterm')",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "no LIMIT → all matching rows"
+        );
+        assert!(
+            raw.paging_state.is_none(),
+            "result under the default page size needs no continuation"
+        );
     }
 
     /// Phonetic index: equality on regular column (not part of PK) matches
@@ -20163,7 +21547,7 @@ mod tests {
 
         // Search for "programming" — rows 1 and 2 contain it.
         let results = engine
-            .fulltext_search(&table_id, "body", "programming")
+            .fulltext_search(&table_id, "body", "programming", None)
             .unwrap();
 
         assert_eq!(
@@ -20187,7 +21571,7 @@ mod tests {
 
         // "scripting" only appears in row3 — verify single match.
         let results3 = engine
-            .fulltext_search(&table_id, "body", "scripting")
+            .fulltext_search(&table_id, "body", "scripting", None)
             .unwrap();
         assert_eq!(
             results3.len(),

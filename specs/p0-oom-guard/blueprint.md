@@ -70,13 +70,35 @@ flowchart TD
 
 ### Layer 1 — Static AST audit (`cargo xtask p0-oom-audit`)
 New `xtask` crate (none exists today). Uses `syn` over `ferrosa-cql`,
-`ferrosa-cluster`, `ferrosa-storage`, `ferrosa-row-bridge`. Fails on:
+`ferrosa-cluster`, `ferrosa-storage`, `ferrosa-row-bridge`, `ferrosa-net`,
+`ferrosa-index` (the last two carry the streaming pipeline: lane frames and
+scan/FTS hit paths). Fails on:
 - a fn whose name contains `stream` returning `Vec<T>`/`Result<Vec<T>>`/Vec-alias;
 - production returns of `Vec<Partition>`/`Vec<Row>` not whitelisted;
 - `Vec::with_capacity(limit)` where `limit` derives from paging/query/user input;
 - `while let Some(x) = stream.next().await { vec.push(x?) }` accumulation;
 - CQL broad-scan call sites invoking `range_read_limited_rows` / `coordinate_*_limited_rows` unwhitelisted.
 Whitelist: `specs/p0-oom-guard/oom-audit-allow.toml` (reason/bound/owner/expiry).
+
+**Move-based-streaming Clone/Copy rules (2026-07 extension).** The original
+`clone-on-row-data` matched only literal `partition/rows/cells` receivers; six
+confirmed blind spots (`.cloned()` adapters, closure-param clones, renamed
+bindings, `extend_from_slice`, UFCS `::clone`, accessor receivers) are closed by:
+- `clone-on-row-data` (broadened): `.clone()/.to_vec()/.to_owned()` on row-data
+  receivers — by NAME (incl. `chunk`/`fragment`, through `&`/`*`/parens and
+  accessor methods) or by TYPE (any ident the fn binds to
+  `Partition`/`Row`/`Cell`/`CellValue`, incl. behind `&`/`Vec`/`Option`/`Box`/
+  `Arc`/slice — closes the renamed-binding gap);
+- `cloned-stream-elements`: `.cloned()`/`.copied()` iterator adapters over a
+  row-data or `stream`/`range_iter` chain (per-element copy of the whole
+  stream); chains ending `.next()` are exempt (Option accessor, one element);
+- `clone-in-scan-closure`: a copy of the closure param inside
+  `map/filter/filter_map/…` over a row-data chain (`rows.iter().map(|r| r.clone())`);
+- `copies-row-data-arg`: arg-position copies — `extend_from_slice(&rows)`,
+  `Vec::from(&rows)`, UFCS `Partition::clone(&p)` / `Clone::clone(&partition)`;
+- `copy-derive-large-type`: `derive(Copy)` on a struct with an array field
+  ≥ 64 bytes or ≥ 12 fields (every implicit copy is a hidden bulk memmove).
+`--root <path>` audits another checkout (e.g. a feature-branch worktree).
 
 ### Layer 2 — Behavioral gates
 - **Unit (in repo, PR #230):** `ferrosa-cluster/tests/range_scan_streaming_memory_bound.rs`
