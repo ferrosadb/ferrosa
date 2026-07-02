@@ -1617,7 +1617,7 @@ impl ClusterCoordinator {
     /// (postings keyed to the partition, then point-reads of only the matching
     /// rows), so per-replica work is O(rows matching the value), never
     /// O(partition rows). Results from the replicas are merged per token, the
-    /// same union semantics as [`coordinate_index_read`] but over the replica
+    /// same union semantics as `coordinate_index_read` but over the replica
     /// set instead of the whole ring. Partial replica failures degrade to a
     /// partial union (logged); an all-replicas-failed result errors.
     pub async fn coordinate_index_read_in_partition(
