@@ -729,6 +729,7 @@ fn eager_index_build_job(
     sstable_id: String,
     index_name: &str,
     column_position: usize,
+    clustering_source: Option<crate::index::ClusteringComponentRef>,
 ) -> crate::index::IndexBuildJob {
     crate::index::IndexBuildJob {
         sstable_id,
@@ -741,6 +742,7 @@ fn eager_index_build_job(
         priority: crate::index::BuildPriority::High,
         enqueued_at: std::time::Instant::now(),
         column_position,
+        clustering_source,
         filter_predicate: None,
     }
 }
@@ -3345,6 +3347,34 @@ impl StorageEngine {
         // ordinal (generic single-column indexes target one column).
         let target_col = target.split(", ").next().unwrap_or(&target);
         let Some(column_position) = self.regular_column_position(&table_id, target_col) else {
+            // Not a regular column: it may be a CLUSTERING column index
+            // (t_430c4188), re-registered through its own path so restart does
+            // not silently drop it.
+            if let Some(component) = self.clustering_column_position(&table_id, target_col) {
+                if matches!(
+                    index_type,
+                    ferrosa_index::IndexType::Filtered | ferrosa_index::IndexType::FullText
+                ) {
+                    tracing::warn!(
+                        keyspace,
+                        table,
+                        index_name,
+                        target_col,
+                        kind,
+                        "clustering-column index reload supports scalar index kinds only — skipping"
+                    );
+                    return Ok(false);
+                }
+                self.add_clustering_index(&table_id, &index_name, component, index_type)?;
+                tracing::info!(
+                    keyspace,
+                    table,
+                    index_name,
+                    kind,
+                    "re-registered persisted clustering-column index after restart"
+                );
+                return Ok(true);
+            }
             // Debug, not warn: this is the per-orphan case (dangling
             // registration from a pre-cascade DROP TABLE) that used to churn
             // one warn per orphan on every boot. The caller emits one summary
@@ -3406,6 +3436,7 @@ impl StorageEngine {
                             priority: crate::index::BuildPriority::Initial,
                             enqueued_at: std::time::Instant::now(),
                             column_position,
+                            clustering_source: None,
                             filter_predicate: None,
                         };
                         if let Err(e) = scheduler.submit(job) {
@@ -3449,6 +3480,19 @@ impl StorageEngine {
         state
             .schema
             .regular_columns
+            .iter()
+            .position(|c| c.name == column_name)
+    }
+
+    /// Position of `column_name` within a registered table's CLUSTERING
+    /// columns (the clustering-key component index), for clustering-column
+    /// secondary indexes (t_430c4188).
+    fn clustering_column_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
+        let tables = self.tables.read();
+        let state = tables.get(table_id)?;
+        state
+            .schema
+            .clustering_columns
             .iter()
             .position(|c| c.name == column_name)
     }
@@ -3515,10 +3559,70 @@ impl StorageEngine {
                     priority: crate::index::BuildPriority::Initial,
                     enqueued_at: std::time::Instant::now(),
                     column_position,
+                    clustering_source: None,
                     filter_predicate: filter_predicate.clone(),
                 };
                 if let Err(e) = scheduler.submit(job) {
                     tracing::error!(%e, "engine: failed to submit index backfill");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Registers a secondary index on a CLUSTERING column (t_430c4188).
+    ///
+    /// A clustering column's value is not a row cell — it lives inside the
+    /// composite clustering-key bytes — so [`add_index`](Self::add_index)
+    /// cannot index it (this is why `CREATE INDEX` on a clustering column used
+    /// to be a silent no-op at the storage layer). Future writes extract the
+    /// value from the clustering key at `clustering_component`; backfill jobs
+    /// for existing SSTables carry a [`ClusteringComponentRef`] so the sidecar
+    /// build does the same.
+    pub fn add_clustering_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        clustering_component: usize,
+        index_type: ferrosa_index::IndexType,
+    ) -> ferrosa_common::Result<()> {
+        self.index_tracker
+            .register_index(table_id.keyspace(), table_id.table(), index_name);
+
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state
+            .store
+            .add_clustering_index(index_name.to_string(), clustering_component, index_type);
+
+        // Submit rebuild jobs for all existing SSTables so pre-existing data
+        // is backfilled from its clustering-key components.
+        if let Some(ref scheduler) = self.index_scheduler {
+            let ck_total = state.store.clustering_column_count();
+            let sstable_ids = state.store.sstable_generation_ids();
+            for sst_id in sstable_ids {
+                let job = crate::index::IndexBuildJob {
+                    sstable_id: sst_id,
+                    index_name: index_name.to_string(),
+                    index_type,
+                    table: (
+                        table_id.keyspace().to_string(),
+                        table_id.table().to_string(),
+                    ),
+                    priority: crate::index::BuildPriority::Initial,
+                    enqueued_at: std::time::Instant::now(),
+                    column_position: clustering_component,
+                    clustering_source: Some(crate::index::ClusteringComponentRef {
+                        component: clustering_component,
+                        total: ck_total,
+                    }),
+                    filter_predicate: None,
+                };
+                if let Err(e) = scheduler.submit(job) {
+                    tracing::error!(%e, "engine: failed to submit clustering index backfill");
                 }
             }
         }
@@ -5972,6 +6076,34 @@ impl StorageEngine {
         }
     }
 
+    /// Query by secondary index restricted to ONE partition (t_430c4188).
+    ///
+    /// Delegates to [`TableStore::read_by_index_in_partition`], which keeps
+    /// only the postings for `partition_key` and point-reads exactly those
+    /// rows — O(matching rows in the partition), never O(partition rows).
+    ///
+    /// Unlike [`read_by_index`](Self::read_by_index) this fails loud on an
+    /// unregistered table: the keyed CQL path only reaches here after schema
+    /// validation, so a missing table is an internal inconsistency, not an
+    /// empty result.
+    pub fn read_by_index_in_partition(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        partition_key: &[u8],
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state
+                .store
+                .read_by_index_in_partition(index_name, key, partition_key),
+            None => Err(ferrosa_common::Error::InvalidData(format!(
+                "read_by_index_in_partition: table {table_id:?} not registered"
+            ))),
+        }
+    }
+
     /// Query a geo (cell-id) secondary index by inclusive `[start, end]` cell-id
     /// ranges across the memtable index and SSTable sidecars.
     ///
@@ -6579,11 +6711,30 @@ impl StorageEngine {
             // 0-1 entries in steady state by ensuring sidecar indexes are current.
             if let Some(ref scheduler) = self.index_scheduler {
                 let gen = state.store.last_flush_generation();
-                for (index_name, col_pos) in state.store.indexed_columns() {
+                let ck_total = state.store.clustering_column_count();
+                let index_sources = state
+                    .store
+                    .indexed_columns()
+                    .iter()
+                    .map(|(name, pos)| (name.clone(), *pos, None))
+                    .chain(state.store.indexed_clustering_columns().iter().map(
+                        |(name, component)| {
+                            (
+                                name.clone(),
+                                *component,
+                                Some(crate::index::ClusteringComponentRef {
+                                    component: *component,
+                                    total: ck_total,
+                                }),
+                            )
+                        },
+                    ))
+                    .collect::<Vec<_>>();
+                for (index_name, col_pos, clustering_source) in index_sources {
                     let tracker_state = self.index_tracker.get_state(
                         table_id.keyspace(),
                         table_id.table(),
-                        index_name,
+                        &index_name,
                     );
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
@@ -6592,8 +6743,9 @@ impl StorageEngine {
                                 &state.store,
                                 table_id,
                                 format!("{gen}"),
-                                index_name,
-                                *col_pos,
+                                &index_name,
+                                col_pos,
+                                clustering_source,
                             );
                             let _ = scheduler.submit(job);
                         }
@@ -6846,9 +6998,31 @@ impl StorageEngine {
                                 output.id.clone(),
                                 index_name,
                                 *col_pos,
+                                None,
                             );
                             if let Err(e) = scheduler.submit(job) {
                                 tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
+                            }
+                        }
+                        // Clustering-column indexes (t_430c4188): the compacted
+                        // output needs its sidecar rebuilt from clustering-key
+                        // components, or the index would silently lose all
+                        // entries for compacted data.
+                        let ck_total = state.store.clustering_column_count();
+                        for (index_name, component) in state.store.indexed_clustering_columns() {
+                            let job = eager_index_build_job(
+                                &state.store,
+                                table_id,
+                                output.id.clone(),
+                                index_name,
+                                *component,
+                                Some(crate::index::ClusteringComponentRef {
+                                    component: *component,
+                                    total: ck_total,
+                                }),
+                            );
+                            if let Err(e) = scheduler.submit(job) {
+                                tracing::error!(%e, %index_name, "compaction: failed to submit clustering index rebuild");
                             }
                         }
                     }
@@ -15048,6 +15222,181 @@ mod tests {
         }
     }
 
+    // ── read_by_index_in_partition (t_430c4188) ──────────────────────────────
+    //
+    // Keyed secondary-index consult: postings for the indexed value are
+    // restricted to ONE specified partition, so a full-partition-key +
+    // indexed-column query does O(matching rows) work instead of scanning
+    // O(partition rows).
+
+    fn row_ck(ck: i32, value: &[u8], ts: i64) -> Row {
+        Row {
+            clustering: ck.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }
+    }
+
+    #[test]
+    fn read_by_index_in_partition_returns_only_target_partition_rows() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine
+            .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+
+        // p1 gets an "alice" row that is FLUSHED (sidecar index) and one that
+        // stays in the memtable index, so the keyed consult must merge both
+        // index layers. p1 also holds non-matching rows, and p2 holds a
+        // matching row that must NOT leak into the p1 result.
+        engine
+            .write(&tid, &make_key("p1"), row_ck(1, b"alice", 1000), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("p2"), row_ck(1, b"alice", 1001), 1001)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("p1"), row_ck(2, b"bob", 1002), 1002)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("p1"), row_ck(3, b"alice", 1003), 1003)
+            .unwrap();
+
+        let hits = engine
+            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p1")
+            .unwrap();
+
+        assert!(
+            hits.iter().all(|p| p.key.key.as_bytes() == b"p1"),
+            "keyed consult must never return rows from other partitions"
+        );
+        let mut cks: Vec<Vec<u8>> = hits
+            .iter()
+            .flat_map(|p| p.rows.iter().map(|r| r.clustering.clone()))
+            .collect();
+        cks.sort();
+        assert_eq!(
+            cks,
+            vec![1_i32.to_be_bytes().to_vec(), 3_i32.to_be_bytes().to_vec()],
+            "keyed consult must return exactly the matching rows (memtable + sidecar)"
+        );
+
+        // Sanity: the GLOBAL consult still sees p2, proving the keyed variant
+        // actually restricted the postings rather than the data being absent.
+        let global = engine
+            .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
+            .unwrap();
+        assert!(
+            global.iter().any(|p| p.key.key.as_bytes() == b"p2"),
+            "global consult should see the p2 match"
+        );
+    }
+
+    #[test]
+    fn read_by_index_in_partition_no_matches_is_empty_not_error() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine
+            .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+        engine
+            .write(&tid, &make_key("p1"), row_ck(1, b"alice", 1000), 1000)
+            .unwrap();
+
+        // Value exists but not in the requested partition.
+        let hits = engine
+            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"alice".to_vec()), b"p9")
+            .unwrap();
+        assert!(hits.is_empty(), "no matches in partition → empty result");
+
+        // Value absent everywhere.
+        let hits = engine
+            .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"nobody".to_vec()), b"p1")
+            .unwrap();
+        assert!(hits.is_empty(), "absent value → empty result");
+
+        // Unknown table fails loud (mirrors read_by_index).
+        let err = engine.read_by_index_in_partition(
+            &TableId::new("nope", "nope"),
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            b"p1",
+        );
+        assert!(err.is_err(), "unknown table must be an error, not empty");
+    }
+
+    /// Clustering-column secondary index (t_430c4188): values are extracted
+    /// from the composite clustering-key bytes on write, survive the
+    /// memtable→sidecar flush drain, and serve both the global and the keyed
+    /// (in-partition) consult.
+    #[test]
+    fn clustering_column_index_indexes_ck_values_across_flush() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_clustering_index(&tid, "ck_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        // test_schema has ONE clustering column (ck: int, big-endian bytes).
+        // Two rows with ck=7 in different partitions + one non-matching row.
+        engine
+            .write(&tid, &make_key("p1"), row_ck(7, b"a", 1000), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("p2"), row_ck(7, b"b", 1001), 1001)
+            .unwrap();
+        engine.flush(&tid).unwrap(); // ck=7 entries now live in the SIDECAR
+        engine
+            .write(&tid, &make_key("p1"), row_ck(9, b"c", 1002), 1002)
+            .unwrap(); // ck=9 stays in the MEMTABLE index
+
+        let key7 = IndexKey(7_i32.to_be_bytes().to_vec());
+
+        // Global consult sees both partitions (sidecar layer).
+        let global = engine.read_by_index(&tid, "ck_idx", &key7).unwrap();
+        let mut pks: Vec<Vec<u8>> = global
+            .iter()
+            .map(|p| p.key.key.as_bytes().to_vec())
+            .collect();
+        pks.sort();
+        assert_eq!(
+            pks,
+            vec![b"p1".to_vec(), b"p2".to_vec()],
+            "clustering index must serve flushed (sidecar) entries globally"
+        );
+
+        // Keyed consult restricted to p1 returns only p1's ck=7 row.
+        let keyed = engine
+            .read_by_index_in_partition(&tid, "ck_idx", &key7, b"p1")
+            .unwrap();
+        assert_eq!(keyed.len(), 1, "one matching row in p1");
+        assert_eq!(keyed[0].key.key.as_bytes(), b"p1");
+        assert_eq!(keyed[0].rows[0].clustering, 7_i32.to_be_bytes().to_vec());
+
+        // Memtable layer: the post-flush ck=9 write is indexed too.
+        let key9 = IndexKey(9_i32.to_be_bytes().to_vec());
+        let keyed9 = engine
+            .read_by_index_in_partition(&tid, "ck_idx", &key9, b"p1")
+            .unwrap();
+        assert_eq!(keyed9.len(), 1, "memtable-resident clustering entry found");
+        assert_eq!(keyed9[0].rows[0].clustering, 9_i32.to_be_bytes().to_vec());
+    }
+
     /// Geo schema: a `places` table whose `location` column is a
     /// `frozen<tuple<double,double>>` indexed with `IndexType::Geo`.
     fn geo_schema() -> TableSchema {
@@ -17895,6 +18244,7 @@ mod tests {
             "compacted-1".to_string(),
             "val_phonetic_idx",
             0,
+            None,
         );
         assert_eq!(
             job.index_type,
@@ -17913,6 +18263,7 @@ mod tests {
             "compacted-1".to_string(),
             "unknown_idx",
             0,
+            None,
         );
         assert_eq!(
             btree_job.index_type,

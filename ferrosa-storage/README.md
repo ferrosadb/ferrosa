@@ -122,9 +122,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 
 | Area | Items |
 |------|-------|
-| Engine | `StorageEngine`, `StorageEngineConfig`, `new`/`open`, `register_table[_with_indexes]`, `shutdown` |
+| Engine | `StorageEngine`, `StorageEngineConfig`, `new`/`open`, `register_table[_with_indexes]`, `add_index[_with_predicate]`, `add_clustering_index` (clustering-column indexes, t_430c4188), `shutdown` |
 | Write | `write`, `batch_write`, `write_atomic_batch`, `apply_batch`, `begin_batch`/`BatchTxn`/`BatchOp`, `replay_mutations` |
-| Read | `read`, `read_range`, `read_token_range[_bounded]`, `range_iter[_projected|_fragmented]`, `count_range`, `read_by_index`, `ann_search`, `fulltext_search`, `walk_token_range[_for_digest]` |
+| Read | `read`, `read_range`, `read_token_range[_bounded]`, `range_iter[_projected|_fragmented]`, `count_range`, `read_by_index`, `read_by_index_in_partition` (keyed consult restricted to one partition, t_430c4188), `ann_search`, `fulltext_search`, `walk_token_range[_for_digest]` |
 | Maintenance | `flush`, `flush_if_needed`, `flush_all`, `poll_compactions`, `truncate`, `sync_sstables_to_s3` |
 | Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `list/delete_snapshot_with_store` |
 | Abstraction | `DataStore` / `LocalDataStore` (the `Arc<dyn DataStore>` boundary) |
@@ -140,6 +140,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `TableSchema`, `Result`/`Error`, cell/clustering validation.
 - **`ferrosa-index`** — secondary index builders (BTree/Hash/FullText/Vector),
   FTI sidecar merge.
+- **`ferrosa-row-bridge`** — `decode_clustering` for clustering-column
+  secondary indexes (t_430c4188): the write path and sidecar builds split a
+  row's composite clustering-key bytes to extract the indexed component.
 - **`ferrosa-schema`** — table/keyspace metadata and system schema persistence.
 - **`ferrosa-sstable`** — `Partition`, `Row`, `SSTableReader`/`SSTableWriter`,
   BTI format I/O.

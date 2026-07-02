@@ -2616,6 +2616,7 @@ dependencies = [
  "ferrosa-cdc",
  "ferrosa-common",
  "ferrosa-index",
+ "ferrosa-row-bridge",
  "ferrosa-schema",
  "ferrosa-sstable",
  "ferrosa-storage",
