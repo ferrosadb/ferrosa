@@ -253,9 +253,12 @@ fn cluster_full_scan_peak_is_independent_of_partition_count() {
     );
 }
 
-// NOTE: the data-loss half of this bug — `range_read_limited_rows` silently
-// truncating at DEFAULT_RANGE_READ_LIMIT (10_000) on the SELECT degraded scan
-// arm — is intentionally NOT tested here. Its regression test ships with the
-// follow-up PR that removes the cap from scan paths (forge task t_a243e406),
-// where it goes green. Adding it now would be a known-failing test (this repo's
-// CI runs #[ignore] tests in the cluster-gated job).
+// NOTE: this test also covers the data-completeness (no-cap) half of the bug:
+// `cluster_scan_peak` asserts `count == n` at N=12_000 (PAST the 10_000
+// DEFAULT_RANGE_READ_LIMIT), so the coordinated `range_read_stream_all_with`
+// scan returns EVERY partition rather than a server-capped 10_000 window. The
+// CQL-level exactness for the streamable shapes (SUM/MIN/MAX/AVG streaming
+// aggregate, `SELECT DISTINCT <pk>`, `WHERE … ALLOW FILTERING`) is guarded by
+// the router `*_past_10k` tests in ferrosa-cql. The remaining accumulating
+// shape — an unbounded `ORDER BY` global sort — is intentionally still bounded
+// (fail-loud) until spill-to-disk lands (streaming-range-reads spec, step 5).

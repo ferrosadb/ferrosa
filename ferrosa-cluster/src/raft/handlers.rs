@@ -1328,6 +1328,11 @@ pub struct FulltextSearchRequestPayload {
     pub table: String,
     pub index_name: String,
     pub query: String,
+    /// Query-derived `LIMIT k` pushed down to the replica so its search holds
+    /// a bounded top-k working set instead of every matching doc key
+    /// (t_ee98faa0 layer 2). `None` = the statement had no LIMIT and the
+    /// complete match set is required — never a server-side cap.
+    pub limit: Option<u64>,
 }
 
 /// Payload for a remote full-text search response: the matching partition keys
@@ -1370,17 +1375,18 @@ impl RpcHandler for FulltextSearchHandler {
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
 
-        let matching_keys =
-            match self
-                .storage
-                .fulltext_search(&table_id, &req.index_name, &req.query)
-            {
-                Ok(keys) => keys,
-                Err(e) => {
-                    tracing::warn!("FulltextSearchHandler: fulltext_search failed: {e}");
-                    vec![]
-                }
-            };
+        let matching_keys = match self.storage.fulltext_search(
+            &table_id,
+            &req.index_name,
+            &req.query,
+            req.limit.map(|k| k as usize),
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!("FulltextSearchHandler: fulltext_search failed: {e}");
+                vec![]
+            }
+        };
 
         let payload = FulltextSearchResponsePayload { matching_keys };
         let resp_bytes = match bincode::serialize(&payload) {

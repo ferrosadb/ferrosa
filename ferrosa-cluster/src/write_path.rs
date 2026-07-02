@@ -22,8 +22,25 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::PairCoordinator;
 use crate::ring::strategy::ReplicationStrategy;
 
-/// Default upper bound for unordered range reads when the caller does not
-/// provide a tighter page/limit bound.
+/// Default partition bound for the two range-read shapes that still need a
+/// hard bound — NOT a result cap on the streamable shapes.
+///
+/// After the streaming-range-reads work (spec: `streaming-range-reads-no-cap`),
+/// the O(1)-streamable shapes (simple `WHERE … ALLOW FILTERING` scans, streaming
+/// scalar aggregates, `SELECT DISTINCT <partition key>`, and any user `LIMIT N`)
+/// are bounded ONLY by the query's own `LIMIT` — never by this constant. The
+/// two remaining users of this bound are:
+///
+/// 1. `range_read_limited_rows_checked` — the truncation-detecting probe for the
+///    still-accumulating complex shapes (`ORDER BY` global sort / function
+///    projection) that must fail loud rather than compute a wrong answer over a
+///    clipped window, until spill-to-disk lands (spec step 5).
+/// 2. The legacy non-streaming coordinated range RPC selected by
+///    `FERROSA_BULK_STREAMING_RANGE_READ=0` (a documented, degraded
+///    mixed-version-upgrade opt-out), where it caps per-replica partitions.
+///
+/// It is NOT applied as a result cap on `range_read_limited_rows` (a user/page
+/// bound) nor on the streaming `*_stream_all_*` scans.
 pub const DEFAULT_RANGE_READ_LIMIT: usize = 10_000;
 
 pub type PartitionResultStream =
@@ -714,8 +731,11 @@ impl WritePath {
     ///
     /// This lets CQL `LIMIT` and protocol page-size produce the first page
     /// promptly instead of materializing the full default scan window before
-    /// applying row-level bounds. The hard cap remains
-    /// `DEFAULT_RANGE_READ_LIMIT`; callers cannot request more through this API.
+    /// applying row-level bounds. `limit` is the caller's OWN bound and is no
+    /// longer re-clamped to `DEFAULT_RANGE_READ_LIMIT`; the storage layer's
+    /// Vec-materialization OOM guard fail-louds if a caller asks this
+    /// `Vec`-returning API for more than it can safely materialize, so large
+    /// user `LIMIT`s route through the streaming scan instead.
     pub async fn range_read_limited(
         &self,
         table_id: &TableId,
@@ -734,7 +754,15 @@ impl WritePath {
         limit: usize,
         row_limit: usize,
     ) -> crate::error::Result<Vec<Partition>> {
-        let limit = limit.clamp(1, DEFAULT_RANGE_READ_LIMIT);
+        // The `limit` here is the caller's OWN bound — a user `LIMIT N` or the
+        // protocol page size — so it must NOT be re-clamped to a server-side
+        // `DEFAULT_RANGE_READ_LIMIT` result cap. A user asking for `LIMIT 20000`
+        // must receive up to 20000 rows; memory is bounded by the caller's
+        // chosen `limit`, not a magic 10_000. `limit == 0` is meaningless for a
+        // bounded read, so floor it at 1. (The truncation-detecting
+        // `range_read_limited_rows_checked` keeps its own bound for the
+        // still-accumulating complex shapes until spill lands — step 5.)
+        let limit = limit.max(1);
         self.range_read_partitions_inner(table_id, limit, row_limit)
             .await
     }
@@ -842,23 +870,29 @@ impl WritePath {
     /// coordinator fans out to every node and unions the matching keys, because
     /// `fts_match` carries no partition key and its hits span all token ranges —
     /// a coordinator-local lookup made the result non-deterministic (BUG-F-007).
+    ///
+    /// `limit` is the query-derived `LIMIT k` pushed down to every replica so
+    /// each holds a bounded top-k working set instead of every matching doc
+    /// key (t_ee98faa0 layer 2). `None` = complete match set (no-LIMIT
+    /// statement) — never a server-side cap.
     pub async fn fulltext_search(
         &self,
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         match self {
             Self::Direct(engine) => engine
-                .fulltext_search(table_id, index_name, query)
+                .fulltext_search(table_id, index_name, query, limit)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
-                .fulltext_search(table_id, index_name, query)
+                .fulltext_search(table_id, index_name, query, limit)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Cluster(coordinator) => {
                 coordinator
-                    .coordinate_fulltext_search(table_id, index_name, query)
+                    .coordinate_fulltext_search(table_id, index_name, query, limit)
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(

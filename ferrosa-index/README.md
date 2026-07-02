@@ -66,9 +66,32 @@ vector search has a different query shape and result/capability model):
 Inverted-index pipeline for `column = fts_match(query)`: `analyzer` (Standard /
 Simple / Keyword + stemmer), `builder` (`FullTextIndexBuilder` → bytes),
 `reader` (`FullTextIndexReader`, BM25-scored queries returning `FtsHit`),
-`query` (query-string → `FtsQuery` tree), `scoring` (BM25), and `merge`
-(compaction-time merge of two FTI byte buffers). Does **not** implement the root
-`IndexFactory` traits — it has its own byte-buffer build/open API.
+`query` (query-string → `FtsQuery` tree), `scoring` (BM25), `merge`
+(compaction-time merge of two FTI byte buffers), `stream` (bounded-memory
+single-term search straight off an on-disk FTI sidecar), and `topk` (bounded
+top-k hit selection). Does **not** implement the root `IndexFactory` traits —
+it has its own byte-buffer build/open API.
+
+Memory model (t_ee98faa0 layer 2 — the replica-side `fts_match` OOM):
+
+- `reader.search_top_k[_str](query, k)` — `LIMIT k` searches hold O(k) owned
+  memory instead of score-everything-then-rank. `Term` streams postings
+  through a bounded heap; `MultiTerm`/`Phrase` drive the smallest posting
+  list against borrowed key maps; compound shapes (`And`/`Or`/`Not`/`Prefix`)
+  reuse the exact evaluator with borrowed (pointer-sized) keys and clone only
+  the k winners. Matching semantics are identical to `search`; `k` is always
+  query-derived — never a server cap.
+- `reader.search(query)` (no LIMIT) returns the complete match set; its
+  evaluation maps borrow doc keys from the index (no per-doc key clones).
+- `stream::stream_search_term(path, term, limit)` — single-term sidecar
+  search that never reads or deserializes the whole index file: it walks the
+  sorted term dictionary through a `BufReader`, skips other terms' postings,
+  and scores the one matching posting list (bounded top-k when `limit` is
+  set). Guarded by `tests/fulltext_topk_memory_bound.rs` (allocator-tracked
+  peak: O(k), independent of matching-doc count).
+- `FullTextIndexReader::from_index(fti)` wraps an in-memory index without a
+  serialize→deserialize round trip (used by the transient memtable / fallback
+  scans in `ferrosa-storage`).
 
 ### 4. Geospatial — the `geo` library (Phase 1, pure functions)
 
