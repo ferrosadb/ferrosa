@@ -56,7 +56,7 @@ pub use compaction::{
 };
 pub use data_store::{DataStore, LocalDataStore};
 pub use engine::{
-    BatchOp, BatchTxn, PersistedIndexRow, StorageEngine, StorageEngineConfig,
+    BatchOp, BatchTxn, IndexReloadOutcome, PersistedIndexRow, StorageEngine, StorageEngineConfig,
     TempSortTableReservation, TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
     FILTER_PREDICATE_OPTION_KEY,
 };

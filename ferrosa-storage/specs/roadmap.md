@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-07-01
 ---
 
 # ferrosa-storage — Roadmap
@@ -51,6 +51,25 @@ open work lives in specs and the items below.
   HVQ contract); current vector sidecars are whole-blob.
 - **Grace-period GC + orphan sweep.** Confirm superseded-SSTable deletion grace
   and a periodic sweep of unreferenced S3 objects are bounded and observable.
+- **Index reload read-cap pagination (t_1ec2e3fc).** `reload_indexes_from_system_schema`
+  and `read_persisted_indexes` cap the `system_schema.indexes` scan at 10k rows
+  and warn on truncation. The DROP TABLE cascade (t_ae06e925, landed) stops the
+  table growing with orphans, but a legitimately huge index population still
+  needs pagination instead of a cap.
+
+## Recently landed
+
+- **DROP TABLE index-tombstone cascade (t_ae06e925, 2026-07-01).**
+  `unregister_table` — the choke point for every DDL route (Direct, pair,
+  cluster/Raft, and DROP KEYSPACE per-table) — tombstones the dropped table's
+  `system_schema.indexes` registrations (`write_index_tombstones_for_table`)
+  and sweeps its `IndexStateTracker` entries.
+  `reload_indexes_from_system_schema` now returns
+  `IndexReloadOutcome { restored, skipped }` and reports unresolvable rows via
+  one summary warn + the `ferrosa_storage_index_reload_skipped_rows_total`
+  counter (per-orphan detail demoted to debug). Pre-existing orphans are not
+  GC'd automatically (a table can be mid-registration at boot); clean up
+  manually with `DROP INDEX IF EXISTS`.
 
 ## Non-goals
 
