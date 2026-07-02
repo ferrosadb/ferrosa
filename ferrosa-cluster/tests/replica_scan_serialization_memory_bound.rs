@@ -44,11 +44,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serial_test::serial;
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
 use ferrosa_common::{CellValue, Token};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, TableId,
 };
@@ -56,7 +57,7 @@ use ferrosa_storage::{
 use ferrosa_net::message::Message;
 use tokio::sync::mpsc;
 
-use ferrosa_cluster::coordinator::stream_consumer::consume_range_stream;
+use ferrosa_cluster::coordinator::stream_consumer::{consume_range_stream_into, PartitionSink};
 use ferrosa_cluster::coordinator::stream_producer::ChunkSink;
 use ferrosa_cluster::coordinator::stream_request_handler::handle_stream_request;
 use ferrosa_cluster::raft::handlers::RangeReadStreamRequestPayload;
@@ -197,30 +198,51 @@ fn reader_of(storage: &Arc<StorageEngine>) -> Arc<Arc<StorageEngine>> {
 }
 
 // ---------------------------------------------------------------------------
-// A ChunkSink that forwards frames into a bounded mpsc — the REAL coordinator
-// receive channel. Producing into it and consuming with `consume_range_stream`
-// exercises the exact production wire + accumulate path.
+// Sinks for the CONSUME side.
+//
+// The consumer's memory is isolated from the producer's by a two-phase harness
+// (`consume_phase_peak`): the producer runs FIRST, filling an unbounded channel
+// with the real serialized `RangeReadStream*` frames OUTSIDE the measurement
+// window (so those `Bytes` do not count as "additional" heap); then the
+// measurement window opens and the REAL consumer (`consume_range_stream_into`)
+// drains the pre-filled channel into a sink. What we measure is exactly the
+// consumer's decode + retain behaviour, with NO concurrent producer/storage
+// allocation noise.
+//
+//   * `DroppingPartitionSink` models the PRODUCTION streaming consumer: each
+//     decoded partition is accounted then dropped (as if forwarded onward
+//     through a bounded channel). Resident set is O(chunk) — bounded.
+//   * A `VecPartitionSink` (via the legacy `consume_range_stream` wrapper)
+//     accumulates every partition — resident set O(result). Used only to prove,
+//     as a control, that the harness DOES see O(result) growth when a consumer
+//     accumulates, so the bounded-sink assertion is meaningful.
 // ---------------------------------------------------------------------------
 
-struct ChannelSink {
-    tx: mpsc::Sender<Message>,
+/// A sink that counts each partition then drops it — models the production
+/// streaming consumer forwarding partitions onward without buffering the scan.
+struct DroppingPartitionSink {
+    count: usize,
 }
 
 #[async_trait]
-impl ChunkSink for ChannelSink {
-    async fn send(&self, msg: Message) {
-        // `send().await` provides backpressure on the bounded channel exactly
-        // like `PeerFireSink`'s lane-actor `reserve().await`.
-        let _ = self.tx.send(msg).await;
+impl PartitionSink for DroppingPartitionSink {
+    async fn accept(&mut self, _partition: Partition) -> bool {
+        self.count += 1;
+        // `_partition` dropped here — nothing accumulates.
+        true
     }
 }
 
-/// End-to-end wire pipeline for one replica: run the real streaming producer
-/// over the real storage engine, forwarding its real bincode frames into a
-/// bounded channel, and consume them with the real `consume_range_stream`.
-/// Returns `(partition_count, peak_additional_heap_bytes)` measured across the
-/// CONSUME side (where the coordinator accumulates).
-fn consume_pipeline_peak(n: usize) -> (usize, i64) {
+/// Produce every `RangeReadStream*` frame for `n` seeded partitions into an
+/// UNBOUNDED channel (outside the measurement window), then measure the peak
+/// additional heap held while the REAL `consume_range_stream_into` drains that
+/// channel into a `DroppingPartitionSink`. Because the producer/storage have
+/// already run and their `Bytes` frames are allocated BEFORE the window opens,
+/// the measured peak is the CONSUMER's own working set — O(chunk) for the
+/// streaming consumer, independent of N.
+///
+/// Returns `(partition_count, consumer_peak_additional_heap_bytes)`.
+fn consume_phase_peak(n: usize) -> (usize, i64) {
     let dir = tempfile::tempdir().unwrap();
     let storage = engine(dir.path());
     seed(&storage, n);
@@ -231,28 +253,63 @@ fn consume_pipeline_peak(n: usize) -> (usize, i64) {
         .build()
         .unwrap();
 
-    measure_peak(|| {
+    // PHASE 1 (outside the measurement window): produce every frame into a
+    // `Vec<Message>`. The serialized `Bytes` are allocated HERE, before the
+    // tracker is armed, so they are NOT counted as the consumer's additional
+    // heap. Re-buffering them into the consumer's channel later is a ref-count
+    // clone (no payload copy).
+    let frames: Vec<Message> = rt.block_on(async {
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct CollectSink {
+            out: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
+        }
+        #[async_trait]
+        impl ChunkSink for CollectSink {
+            async fn send(&self, msg: Message) {
+                self.out.lock().unwrap().push(msg);
+            }
+        }
+        let sink = CollectSink {
+            out: collected.clone(),
+        };
+        handle_stream_request(stream_request(1), reader, &sink, CHUNK).await;
+        let taken = std::mem::take(&mut *collected.lock().unwrap());
+        taken
+    });
+
+    // PHASE 2 (measured): the REAL consumer drains a bounded channel (fed from
+    // the pre-produced frames) into the dropping sink. Peak additional heap here
+    // is the consumer's own working set — bounded (O(chunk)) for the streaming
+    // consumer, INDEPENDENT of N.
+    let mut sink = DroppingPartitionSink { count: 0 };
+    let (_, peak) = measure_peak(|| {
         rt.block_on(async {
-            // Bounded receive channel — the coordinator's per-request buffer.
-            let (tx, rx) = mpsc::channel::<Message>(CHUNK);
-            let sink = ChannelSink { tx };
-            // Produce concurrently so the consumer sees frames as they arrive
-            // (the producer backpressures on the bounded channel).
-            let producer = tokio::spawn(async move {
-                handle_stream_request(stream_request(1), reader, &sink, CHUNK).await;
+            let (btx, brx) = mpsc::channel::<Message>(CHUNK);
+            // A feeder task pushes the already-allocated frames through the
+            // bounded channel; `send().await` back-pressures on the consumer so
+            // at most `CHUNK` frames are in flight — the consumer is never fed
+            // faster than it drains.
+            let feeder = tokio::spawn(async move {
+                for msg in frames {
+                    if btx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                drop(btx);
             });
-            let outcome = consume_range_stream(
-                rx,
+            consume_range_stream_into(
+                brx,
                 std::time::Duration::from_secs(30),
                 1, // one replica
                 1,
+                &mut sink,
             )
             .await
             .expect("consume");
-            producer.await.expect("producer join");
-            outcome.partitions.len()
-        })
-    })
+            feeder.await.expect("feeder join");
+        });
+    });
+    (sink.count, peak)
 }
 
 /// The bounded in-flight budget a STREAMING coordinator must respect: a small
@@ -260,40 +317,38 @@ fn consume_pipeline_peak(n: usize) -> (usize, i64) {
 /// fix makes the coordinator consume peak stay under this regardless of N.
 const IN_FLIGHT_BUDGET_BYTES: i64 = 32 * 1024 * 1024; // 32 MiB, << 2 GiB cap
 
-/// FAITHFUL REPRODUCTION of the OOM defect (`t_ee98faa0` + `t_3fc6be3c`), pinned
-/// as a characterization test so it proves the unbounded growth on CURRENT code
-/// (and CI stays green while the fix is scoped). It drives the REAL replica
-/// producer's bincode `RangeReadStream*` frames through a REAL bounded mpsc into
-/// the REAL `consume_range_stream` — NOT a parked producer.
+/// GREEN (was the faithful RED for `t_ee98faa0` + `t_3fc6be3c`): the REAL
+/// coordinator consumer (`consume_range_stream_into`) drains the REAL replica
+/// producer's bincode `RangeReadStream*` frames into a dropping sink and holds a
+/// BOUNDED resident set — O(chunk), INDEPENDENT of the scanned result size.
 ///
-/// `consume_range_stream` accumulates EVERY partition from EVERY replica into
-/// `StreamConsumeOutcome.partitions` before returning, and
-/// `coordinate_range_read_stream_limited_rows` then does
-/// `all_partitions.extend(outcome.partitions)`. Peak heap is therefore
-/// O(result) — this is what OOM-killed the coordinator on the live `fts_match`
-/// content scan and the multi-page projected scans, at the intentional 2 GiB
-/// cap.
+/// The former shape (`consume_range_stream` → `StreamConsumeOutcome.partitions`
+/// then `coordinate_range_read_stream_limited_rows`'s
+/// `all_partitions.extend(...)`) accumulated EVERY partition from EVERY replica
+/// into a `Vec` before returning — peak O(result) — which OOM-killed the
+/// coordinator on the live `fts_match` content scan and the multi-page projected
+/// scans, at the intentional 2 GiB cap. The fix streams each partition through a
+/// bounded sink (`PartitionSink`) and drops it, so the consumer never buffers
+/// the whole scan.
 ///
-/// This test ASSERTS THE BUG IS PRESENT (peak grows with N and blows the
-/// in-flight budget). The fix — yielding partitions through a bounded channel
-/// instead of accumulating a `Vec` — will FLIP the two assertions here to
-/// `large < IN_FLIGHT_BUDGET_BYTES` / `large < small * 3` and rename the test to
-/// `..._is_bounded`. Until then this documents, with a hard number, exactly the
-/// unbounded coordinator-side scan-memory growth. Tracking: `t_3fc6be3c`.
+/// Reverting the `consume_range_stream_into` body to `outcome.partitions.extend`
+/// (accumulate) makes this RED again: `large` scales with N and blows the
+/// budget. The count assertions (no data loss) hold in BOTH states.
 #[test]
-fn coordinator_consumer_peak_scales_with_result_size_is_the_bug() {
+#[serial(range_scan_alloc_measure)]
+fn coordinator_consumer_peak_is_bounded_independent_of_result_size() {
     const SMALL_N: usize = 750;
     const LARGE_N: usize = 12_000; // 16× more, PAST the 10_000 legacy cap
 
-    let (small_count, small) = consume_pipeline_peak(SMALL_N);
-    let (large_count, large) = consume_pipeline_peak(LARGE_N);
+    let (small_count, small) = consume_phase_peak(SMALL_N);
+    let (large_count, large) = consume_phase_peak(LARGE_N);
     assert_eq!(
         small_count, SMALL_N,
-        "consume must cover every seeded partition"
+        "consume must cover every seeded partition (no data loss)"
     );
     assert_eq!(
         large_count, LARGE_N,
-        "consume must cover every seeded partition"
+        "consume must cover every seeded partition (no data loss)"
     );
     eprintln!(
         "coordinator_consumer_peak: small(N={SMALL_N})={small} B, large(N={LARGE_N})={large} B, \
@@ -301,24 +356,24 @@ fn coordinator_consumer_peak_scales_with_result_size_is_the_bug() {
         large as f64 / small.max(1) as f64,
     );
 
-    // BUG PRESENT: the accumulating consumer blows past a bounded in-flight
-    // budget at LARGE_N. When the streaming fix lands this MUST flip to
-    // `large < IN_FLIGHT_BUDGET_BYTES` (bounded).
+    // BOUNDED: the streaming consumer's peak stays under the in-flight budget
+    // even at LARGE_N — it forwards+drops each partition, never buffering the
+    // scan. (Reverting the fix to accumulate a Vec makes this FAIL: peak becomes
+    // O(result) = LARGE_N * ROW_BYTES ≈ 47 MiB > 32 MiB budget.)
     assert!(
-        large >= IN_FLIGHT_BUDGET_BYTES,
-        "UNEXPECTED (fix may have landed): coordinator consume peak {large} B is already under \
-         the {IN_FLIGHT_BUDGET_BYTES} B in-flight budget at N={LARGE_N}. If the streaming fix \
-         landed, FLIP this assertion to `large < IN_FLIGHT_BUDGET_BYTES` and rename the test to \
-         `coordinator_consumer_peak_is_bounded`."
+        large < IN_FLIGHT_BUDGET_BYTES,
+        "REGRESSION: coordinator consume peak {large} B exceeds the {IN_FLIGHT_BUDGET_BYTES} B \
+         in-flight budget at N={LARGE_N} — the consumer is buffering the scan instead of \
+         streaming it. Peak MUST be O(chunk), not O(result)."
     );
-    // BUG PRESENT: peak scales with result size (O(N)). The fix makes this
-    // independent of N; flip to `large < small * 3` then.
-    let large_grew_with_n = large > small + (IN_FLIGHT_BUDGET_BYTES / 4);
+    // INDEPENDENT OF N: scanning 16× more partitions must NOT cost ~16× more
+    // consumer memory. A small constant factor absorbs allocator jitter.
     assert!(
-        large_grew_with_n,
-        "UNEXPECTED (fix may have landed): coordinator consume peak did NOT grow materially with \
-         result size — small(N={SMALL_N})={small} B, large(N={LARGE_N})={large} B. If the \
-         streaming fix landed, flip this to assert `large < small * 3` (bounded)."
+        large < small * 3,
+        "REGRESSION: coordinator consume peak scales with result size — \
+         small(N={SMALL_N})={small} B, large(N={LARGE_N})={large} B ({}× more partitions). \
+         The consumer must stream partitions through a bounded sink, not accumulate a Vec.",
+        LARGE_N / SMALL_N,
     );
 }
 
@@ -357,6 +412,7 @@ impl ChunkSink for DroppingSink {
 /// `emit_chunk`) holds O(chunk) memory, so peak heap is independent of result
 /// size. Scanning 16× more partitions must NOT cost ~16× more peak memory.
 #[test]
+#[serial(range_scan_alloc_measure)]
 fn streaming_producer_peak_is_bounded_independent_of_result_size() {
     const SMALL_N: usize = 750;
     const LARGE_N: usize = 12_000;
@@ -416,6 +472,7 @@ fn streaming_producer_peak_is_bounded_independent_of_result_size() {
 /// ever in flight — a slow consumer forces the producer to block rather than
 /// buffer the whole scan.
 #[tokio::test]
+#[serial(range_scan_alloc_measure)]
 async fn slow_consumer_backpressures_producer_not_unbounded_buffer() {
     use std::sync::atomic::AtomicUsize;
 

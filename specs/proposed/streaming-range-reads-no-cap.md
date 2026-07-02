@@ -3,6 +3,51 @@
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
 **Steps 1–2 and Step 5 (final) landed.**
 
+## Progress — consume-path bounded-streaming refactor (`t_ee98faa0` + `t_3fc6be3c`)
+
+**Landed.** The last Vec-accumulating consume path — `consume_range_stream`'s
+`StreamConsumeOutcome.partitions` accumulation, drained by
+`coordinate_range_read_stream_limited_rows`'s `all_partitions.extend(...)` +
+`dedup_by_token` — is removed. Peak was `O(result)`; at the intentional 2 GiB
+node cap this OOM-killed the coordinator on the live `fts_match` content scan and
+multi-page projected scans.
+
+- **Bounded streaming consumer** (`ferrosa-cluster/src/coordinator/stream_consumer.rs`):
+  new `PartitionSink` trait + `consume_range_stream_into(..)` MOVE each decoded
+  partition into the sink one at a time and drop it, so the consumer's resident
+  set is `O(chunk)`, not `O(result)`. `ChannelPartitionSink` forwards through a
+  bounded `mpsc` (back-pressure). The legacy `consume_range_stream` (Vec) is now a
+  thin wrapper over the streaming consumer with an accumulating `VecPartitionSink`,
+  kept only for point-bounded callers / tests. Straggler draining and the
+  Done/heartbeat/truncated semantics are unchanged.
+- **Limited-rows coordinator rewired** (`range_read_stream.rs`,
+  `coordinate_range_read_stream_limited_rows`): no longer reads a local Vec + runs
+  the accumulating `consume_range_stream` + extends + `dedup_by_token`. It drinks
+  the already-bounded, token-deduped, `<= k`-row-fragment N-way merge stream
+  (`coordinate_range_read_stream_all_with_projection`, the same path uncapped
+  `SELECT *` uses) and folds consecutive same-key fragments into at most `limit`
+  WHOLE partitions. Peak resident set is `O(k + caller's own limit)` — never the
+  whole table. `row_limit` is applied by the stream. Dead helpers
+  `read_local_range_stream_limited_rows` and `dedup_by_token` removed.
+- **Memory-bound test flipped RED→GREEN**
+  (`ferrosa-cluster/tests/replica_scan_serialization_memory_bound.rs`): the
+  consumer test now drives the REAL producer frames into
+  `consume_range_stream_into` under a two-phase measurement (produce OUTSIDE the
+  window, measure ONLY the consume phase) that isolates the consumer's resident
+  set from producer/storage allocation noise. Result: consumer peak
+  ~284 KiB @ N=750 vs ~291 KiB @ N=12 000 — **ratio 1.02**, flat and independent
+  of N, far under the 32 MiB in-flight budget, with counts == N (no data loss).
+  Reverting the consumer to accumulate a Vec makes it RED (peak → `O(result)`).
+
+**Deferred consumers still materializing** (bounded by the caller's own
+`limit`/page — not the OOM path, but not yet streaming): the CQL `PartitionKeyLookup`
+fallback and empty-index fallback (`router.rs` `range_read_with`), and the SPARQL /
+graph executors' `write_path.range_read(..)` callers, still collect the streamed
+partitions into a `Vec` at the WritePath boundary. These call `range_read_stream_all_with`
+under the hood (bounded producer) but materialize the whole result; convert them
+to page-by-page streaming consumers in a follow-up.
+
+
 **Step 5 (landed).** The last accumulating shape — an arbitrary unbounded
 `ORDER BY` (no `LIMIT`) global sort — no longer fail-loud-refuses past the
 `DEFAULT_RANGE_READ_LIMIT` probe cap. It now streams the uncapped scan

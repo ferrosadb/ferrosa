@@ -14,7 +14,6 @@
 //! partition with no further chunks or heartbeats) abort the
 //! consume.
 
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ use ferrosa_storage::TableId;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
-use super::stream_consumer::{consume_range_stream, StreamConsumeError};
+use super::stream_consumer::StreamConsumeError;
 use super::ClusterCoordinator;
 use crate::error::ClusterError;
 use crate::raft::handlers::{
@@ -165,84 +164,6 @@ fn remote_count_for_cl(
         // conservative full fan-out so we never under-read.
         _ => remote_count,
     }
-}
-
-/// Deduplicate partitions by token — multiple replicas (RF=N) each
-/// return a copy of every partition they own; without this, COUNT(*)
-/// and full-table scans return N× the real partition count. Mirrors
-/// the dedup loop at the end of `coordinate_range_read_limited_rows`
-/// in `read.rs` so the streaming and legacy paths return the same
-/// shape to the CQL layer.
-fn dedup_by_token(partitions: Vec<Partition>) -> Vec<Partition> {
-    let mut by_token: BTreeMap<i64, Vec<Partition>> = BTreeMap::new();
-    for p in partitions {
-        by_token.entry(p.key.token.0).or_default().push(p);
-    }
-    by_token
-        .into_values()
-        .map(|group| {
-            if group.len() == 1 {
-                group.into_iter().next().unwrap()
-            } else {
-                ferrosa_storage::merge::merge_partitions(group)
-            }
-        })
-        .collect()
-}
-
-/// Read a bounded local range from the storage engine for the streaming
-/// coordinator.
-///
-/// Two paths, both kept off the async worker thread:
-///
-/// * `row_limit > 0` (capped, partition-key-equality scans) materializes a
-///   bounded window via [`StorageEngine::read_range_limited_rows`], which is a
-///   SYNCHRONOUS scan that opens SSTable readers and decodes partitions inline
-///   (`std::fs`, S3 rehydration, a `std::sync::Mutex` guard). It is offloaded to
-///   a blocking thread via [`TaskPool::spawn_blocking`] — mirroring
-///   `read_local_partition` in `read.rs` — so it never parks an async worker
-///   (raft heartbeat, CQL keepalive). A `JoinError` is mapped to a loud
-///   `Storage` error rather than swallowed as a missing/empty range.
-/// * `row_limit == 0` (unbounded) pulls from [`StorageEngine::range_iter`],
-///   whose producer already runs the blocking merge on a `TaskPool` blocking
-///   thread and delivers partitions over an `mpsc` channel; `stream.next()` only
-///   awaits `rx.recv()`, so this path is already cooperative and is left as-is.
-async fn read_local_range_stream_limited_rows(
-    storage: &std::sync::Arc<ferrosa_storage::StorageEngine>,
-    table_id: &TableId,
-    limit: usize,
-    row_limit: usize,
-) -> ferrosa_common::Result<Vec<Partition>> {
-    if row_limit > 0 {
-        let storage = std::sync::Arc::clone(storage);
-        let table_id = table_id.clone();
-        return TaskPool::current("coordinator-local-range-read")
-            .spawn_blocking(move || {
-                storage.read_range_limited_rows(&table_id, None, None, limit, row_limit)
-            })
-            .await
-            .map_err(|e| {
-                ferrosa_common::Error::Io(std::io::Error::other(format!(
-                    "local range read task failed: {e}"
-                )))
-            })?;
-    }
-
-    let mut stream = storage.range_iter(table_id, None, None);
-    let mut partitions = Vec::with_capacity(limit);
-
-    while partitions.len() < limit {
-        let Some(next) = stream.next().await else {
-            break;
-        };
-        let mut partition = next?;
-        if row_limit > 0 {
-            partition.rows.truncate(row_limit);
-        }
-        partitions.push(partition);
-    }
-
-    Ok(partitions)
 }
 
 fn apply_row_limit(mut partition: Partition, row_limit: usize) -> Partition {
@@ -1633,146 +1554,64 @@ impl ClusterCoordinator {
         // read is meaningless).
         let limit = limit.max(1);
 
-        let ring = self.ring.load();
-        let node_ids = ring.node_ids();
-        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
-            .iter()
-            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
-            .collect();
-        drop(ring);
-
-        let local_id = self.local_node_id;
-        let node_count = nodes.len();
-        let all_remotes: Vec<(uuid::Uuid, String)> = nodes
-            .iter()
-            .filter(|(id, _)| *id != local_id)
-            .filter_map(|(_, host)| host.clone())
-            .collect();
-
-        // CL-aware fan-out. The local replica counts as one
-        // satisfied response, so we only need to contact
-        // additional remotes when the configured consistency
-        // demands more than one response AND the local node
-        // doesn't already own every token range.
+        // BOUNDED-STREAMING CONSUME PATH (`t_ee98faa0` / `t_3fc6be3c`).
         //
-        // RF=cluster_size case (every node owns every partition,
-        // typical for the test cluster): CL=ONE / LOCAL_ONE is
-        // satisfied entirely by the local read.
-        // RF<cluster_size case: token-ownership-aware fan-out is
-        // required for correctness — we conservatively fall back
-        // to the full fan-out for those tables until the proper
-        // per-token-range query path lands.
-        let cl_remote_count = remote_count_for_cl(
-            self.default_cl,
-            self.default_rf,
-            node_count,
-            all_remotes.len(),
-        );
-        let remotes: Vec<(uuid::Uuid, String)> =
-            all_remotes.into_iter().take(cl_remote_count).collect();
-        let expected_done = remotes.len();
+        // The former shape accumulated EVERY partition from EVERY replica into a
+        // `Vec` (the legacy Vec-accumulating consumer's `StreamConsumeOutcome`
+        // partitions), then extended a local-read Vec with them and deduped by
+        // token — peak `O(result)`, which OOM-killed the coordinator at the
+        // intentional node RAM cap.
+        //
+        // Route through the already-bounded, token-deduped, `<= k`-row-fragment
+        // N-way merge stream (`coordinate_range_read_stream_all_with_projection`,
+        // the same path the uncapped `SELECT *` uses) and collect AT MOST `limit`
+        // whole partitions. Fragments of one partition key arrive consecutively,
+        // so we fold them into the current partition and only start a new one on
+        // a key change. Peak resident set is `O(k + partitions in flight)` from
+        // the bounded merge, plus the caller's OWN `limit` result — never the
+        // whole table. `row_limit` (per-partition row cap for PK-equality
+        // `LIMIT N` shapes) is applied by the stream itself.
+        let mut stream = self
+            .coordinate_range_read_stream_all_with_projection(
+                table_id,
+                row_limit,
+                self.default_cl,
+                self.default_rf,
+                None,
+            )
+            .await?;
 
-        // Local read goes direct — no internode hop.
-        let mut all_partitions =
-            match read_local_range_stream_limited_rows(&self.storage, table_id, limit, row_limit)
-                .await
-            {
-                Ok(ps) => ps,
-                Err(e) => return Err(ClusterError::Storage(e)),
-            };
-
-        // No remote replicas → done after the local read.
-        if expected_done == 0 {
-            return Ok(dedup_by_token(all_partitions));
-        }
-
-        let request_id = self.next_stream_request_id();
-        let receiver = self
-            .stream_router
-            .register(request_id, STREAM_RECEIVER_BUFFER);
-
-        // Fire RangeReadStreamRequest to every remote replica.
-        let req_payload = RangeReadStreamRequestPayload {
-            request_id,
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            projected_regular_ordinals: None,
-            start_key: None,
-        };
-        let req_body = Bytes::from(bincode::serialize(&req_payload).map_err(|e| {
-            ClusterError::Internal(format!("streaming range read: encode request: {e}"))
-        })?);
-
-        let mut fire_failures: Vec<(uuid::Uuid, String)> = Vec::new();
-        for (host_id, _addr) in &remotes {
-            if let Err(e) = self
-                .peer_manager
-                .fire(
-                    *host_id,
-                    Message::RangeReadStreamRequest(req_body.clone()),
-                    Lane::Bulk,
-                )
-                .await
-            {
-                tracing::warn!(
-                    request_id,
-                    peer = %host_id,
-                    "streaming range read: failed to fire request: {e}"
-                );
-                fire_failures.push((*host_id, e.to_string()));
-            }
-        }
-
-        // If every fire failed, no Done will ever arrive — bail out
-        // immediately rather than hanging on the watchdog.
-        if fire_failures.len() == expected_done {
-            self.stream_router.unregister(request_id);
-            return Err(ClusterError::Internal(format!(
-                "streaming range read: every replica fire failed ({fire_failures:?})"
-            )));
-        }
-
-        // Consume only the replicas we successfully fired to.
-        let live_remote_count = expected_done - fire_failures.len();
-        let consume_result = consume_range_stream(
-            receiver,
-            STREAMING_IDLE_TIMEOUT,
-            live_remote_count,
-            request_id,
-        )
-        .await;
-
-        // Always unregister so the routing table doesn't leak.
-        self.stream_router.unregister(request_id);
-
-        match consume_result {
-            Ok(outcome) => {
-                all_partitions.extend(outcome.partitions);
-                if !fire_failures.is_empty() {
-                    tracing::warn!(
-                        request_id,
-                        failed = fire_failures.len(),
-                        succeeded = live_remote_count,
-                        "streaming range read: partial — some replicas could not be reached"
-                    );
+        let mut out: Vec<Partition> = Vec::new();
+        while let Some(item) = stream.next().await {
+            let fragment = item?;
+            match out.last_mut() {
+                // Same partition key as the previous fragment: fold its rows in
+                // (the header rode the first fragment; later fragments carry
+                // `LIVE`/`None`). Folding is always allowed — even at
+                // `out.len() == limit` — so the last (limit-th) partition is
+                // never truncated mid-partition when its fragments span the
+                // `limit` boundary. This reconstructs the whole partition without
+                // ever buffering more than the bounded merge already holds.
+                Some(last) if last.key == fragment.key => {
+                    last.rows.extend(fragment.rows);
                 }
-                Ok(dedup_by_token(all_partitions))
+                // New partition key. If we already hold `limit` WHOLE
+                // partitions, the previous one is complete (a key change proves
+                // it), so stop before starting the (limit+1)-th.
+                _ => {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(fragment);
+                }
             }
-            Err(StreamConsumeError::IdleTimeout { idle_timeout, .. }) => {
-                Err(ClusterError::Internal(format!(
-                    "streaming range read: idle timeout after {idle_timeout:?}"
-                )))
-            }
-            Err(StreamConsumeError::ChannelClosedBeforeDone {
-                delivered_done,
-                expected_done,
-            }) => Err(ClusterError::Internal(format!(
-                "streaming range read: channel closed after {delivered_done}/{expected_done} Done frames"
-            ))),
-            Err(e) => Err(ClusterError::Internal(format!(
-                "streaming range read: {e:?}"
-            ))),
         }
+
+        // We stopped at `limit` distinct partitions (or end-of-stream); the
+        // merge stream is deduped by token already, so no post-dedup is needed.
+        // Dropping `stream` here closes the bounded receiver, which cancels /
+        // back-pressures the still-running producers.
+        Ok(out)
     }
 }
 
@@ -2506,41 +2345,51 @@ mod tests {
         assert_eq!(remote_count_for_cl(CL::All, 3, 5, 4), 4);
     }
 
+    /// The `..._limited_rows` (Vec-returning) coordinator MUST NOT accumulate
+    /// every partition from every replica via the Vec-accumulating
+    /// `consume_range_stream` before returning (that was the `O(result)` OOM,
+    /// `t_ee98faa0` / `t_3fc6be3c`). It must drink the bounded, token-deduped
+    /// N-way merge stream and collect only up to the caller's own `limit`.
     #[test]
-    fn coordinate_streaming_range_read_does_not_call_vec_local_read() {
+    fn coordinate_streaming_limited_rows_does_not_accumulate_via_consume_range_stream() {
         let source = include_str!("range_read_stream.rs");
-        let body = source
+        let raw_body = source
             .split("pub async fn coordinate_range_read_stream_limited_rows")
             .nth(1)
             .and_then(|rest| rest.split("#[cfg(test)]").next())
             .expect("streaming coordinator body must be present");
+        // Strip `//` line comments so a doc/inline comment that *names* the old
+        // anti-pattern (to explain what was removed) does not trip the CODE
+        // invariants below.
+        let body: String = raw_body
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
 
         assert!(
-            !body.contains("read_local_range_limited_rows"),
-            "streaming range coordinator must not call the Vec-returning local read helper: {body}"
+            !body.contains("consume_range_stream("),
+            "the limited-rows coordinator must NOT call the Vec-accumulating consume_range_stream \
+             (that accumulates O(result) partitions before returning): {body}"
         );
         assert!(
-            body.contains("read_local_range_stream_limited_rows"),
-            "streaming range coordinator must route local reads through the bounded streaming helper: {body}"
+            !body.contains("all_partitions.extend"),
+            "the limited-rows coordinator must NOT accumulate local + remote partitions in a Vec \
+             before returning — it must stream through the bounded merge: {body}"
         );
-        let helper = source
-            .split("async fn read_local_range_stream_limited_rows")
-            .nth(1)
-            .and_then(|rest| rest.split("impl ClusterCoordinator").next())
-            .expect("streaming local read helper must be present");
         assert!(
-            helper.contains("range_iter") && helper.contains("while partitions.len() < limit"),
-            "streaming local read helper must pull from range_iter under the requested limit: {helper}"
+            body.contains("coordinate_range_read_stream_all_with_projection"),
+            "the limited-rows coordinator must route through the bounded, token-deduped N-way \
+             merge stream, then collect at most `limit` partitions: {body}"
         );
-        // The capped (row_limit > 0) branch materializes a bounded window via the
-        // SYNCHRONOUS `read_range_limited_rows` scan; it must be offloaded to a
-        // blocking thread so a large local range read cannot park the async
-        // worker (and stall the CQL connection keepalive). See the runtime
-        // responsiveness test in `read.rs`.
         assert!(
-            helper.contains("spawn_blocking") && helper.contains("read_range_limited_rows"),
-            "capped streaming local read must offload the synchronous range scan via \
-             spawn_blocking, not run it inline on the async worker: {helper}"
+            body.contains("stream.next().await"),
+            "the limited-rows coordinator must pull the merge stream one partition at a time \
+             (bounded resident set), not materialize it: {body}"
         );
     }
 

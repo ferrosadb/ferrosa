@@ -93,6 +93,13 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
   still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
   degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
+  `consume_range_stream_into` MOVE each decoded partition into a sink one at a
+  time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`
+  drinks the token-deduped N-way merge stream and folds `<= limit` whole
+  partitions — never accumulating `O(result)` (the `t_ee98faa0` / `t_3fc6be3c`
+  OOM). The legacy `Vec`-accumulating `consume_range_stream` is a thin wrapper
+  (`VecPartitionSink`) kept for point-bounded callers / the e2e tests.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
@@ -197,9 +204,10 @@ deterministic in-process harnesses unless gated behind `live-infra-tests`.
 Range-scan memory boundedness is guarded by two allocator-tracking suites:
 `range_scan_streaming_memory_bound` (the coordinator **Stream** API is O(1) in N)
 and `replica_scan_serialization_memory_bound` (drives the REAL wire serialization
-+ `consume_range_stream`; pins the coordinator-side `Vec<Partition>`-consume
-O(result) growth — `t_3fc6be3c`/`t_ee98faa0` — plus the producer/backpressure
-bounds). The gated multi-node live confirmation is `fly_stream_scan_live` (feature
++ `consume_range_stream_into`; a two-phase measurement isolates the consumer's
+resident set from producer/storage noise and asserts it is `O(chunk)`,
+INDEPENDENT of N — the `t_3fc6be3c`/`t_ee98faa0` bounded-consume proof — plus the
+producer/backpressure bounds). The gated multi-node live confirmation is `fly_stream_scan_live` (feature
 `live-infra-tests` + `FERROSA_TEST_FLY=1`), which drives
 `deploy/fly-stream-scan/`; it panics loudly on missing infra rather than passing.
 
