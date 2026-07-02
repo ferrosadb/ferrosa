@@ -733,3 +733,93 @@ rule = "with-capacity-limit"
 reason = "decoded peer COUNT is bounded by cluster membership size, not a row/paging cap."
 owner = "bkearns"
 expires = "2027-07-01"
+
+# ---------------------------------------------------------------------------
+# Group 4 — server-side-result-cap (2026-07 sweep). The principle: results are
+# bounded ONLY by the inbound query's LIMIT/paging; every server-side cap is a
+# materialization confession. Genuine caps carry SHORT expiry + a forge task;
+# by-design/pre-alloc bounds are documented.
+# ---------------------------------------------------------------------------
+
+# The P0 DEFAULT_RANGE_READ_LIMIT family — removed by the streaming epic.
+[[allow]]
+path = "ferrosa-cluster/src/write_path.rs"
+rule = "server-side-result-cap"
+reason = "t_15417b35/t_480c91fe: DEFAULT_RANGE_READ_LIMIT const + clamps, removed as the SELECT-arm/callers stream."
+owner = "bkearns"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "server-side-result-cap"
+symbol = "DEFAULT_RANGE_READ_LIMIT"
+reason = "t_15417b35/t_480c91fe: legacy coordinated read clamp, removed as callers stream."
+owner = "bkearns"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/range_read_stream.rs"
+rule = "server-side-result-cap"
+symbol = "DEFAULT_RANGE_READ_LIMIT"
+reason = "t_15417b35/t_480c91fe: legacy limited-rows clamp, removed as callers stream."
+owner = "bkearns"
+expires = "2026-09-30"
+
+[[allow]]
+path = "ferrosa-cluster/src/raft/handlers.rs"
+rule = "server-side-result-cap"
+symbol = "DEFAULT_RANGE_READ_LIMIT"
+reason = "documented intentional per-replica cap on the legacy non-streaming RPC (FERROSA_BULK_STREAMING_RANGE_READ=0 opt-out); retire with the legacy path (t_15417b35)."
+owner = "bkearns"
+expires = "2026-09-30"
+
+# Genuine caps with tracked removal tasks.
+[[allow]]
+path = "ferrosa-storage/src/store.rs"
+rule = "server-side-result-cap"
+reason = "t_1f2485ef: INDEX_RESULT_CAP + RANGE_READ_MATERIALIZATION_CAP fail-loud refusal caps; stream instead."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-index/src/fulltext/reader.rs"
+rule = "server-side-result-cap"
+reason = "t_83f5226d: MAX_WILDCARD_EXPANSION silently truncates matching terms — incomplete FTS results; stream or fail loud."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-storage/src/engine.rs"
+rule = "server-side-result-cap"
+reason = "t_1ec2e3fc: MAX_{INDEXES,TYPES,FUNCTIONS}_TO_READ silently truncate system-schema listings past 10k; stream or fail loud."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/controller/bootstrap/bootstrap_stream.rs"
+rule = "server-side-result-cap"
+reason = "t_1ec2e3fc: BOUNDED_ROW_FALLBACK_LIMIT is documented as a fallback-SELECTION bound (not truncation); verify refusal past limit with a test, then stream the fallback."
+owner = "bkearns"
+expires = "2026-10-01"
+
+# By-design bounds (not result caps in context).
+[[allow]]
+path = "ferrosa-storage/src/accord/entries.rs"
+rule = "server-side-result-cap"
+reason = "count.min(4096) bounds the with_capacity PRE-ALLOCATION only (untrusted wire count); the loop still reads all `count` entries — a memory-safety guard, not a result cap."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-storage/src/accord/sidecar.rs"
+rule = "server-side-result-cap"
+reason = "count.min(4096) bounds the with_capacity PRE-ALLOCATION only; loop reads all entries — memory-safety guard, not a result cap."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-index/src/phonetic/caverphone.rs"
+rule = "server-side-result-cap"
+reason = "truncate(10) is the Caverphone ALGORITHM's fixed code length (a value's length, not a result count)."
+owner = "bkearns"
+expires = "2027-07-01"
