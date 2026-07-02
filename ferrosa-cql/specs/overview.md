@@ -49,7 +49,7 @@ same encode/decode without depending on this large crate.
 | `ast` | ~0.9k | Statement/expression AST |
 | `types` | ~0.6k | 16-bit CQL type system, codec re-export |
 | `transaction_keys` / `transaction_limits` | ~1.0k | Accord partition-key extraction, per-connection txn limits |
-| `planner` | ~0.6k | Scan planning |
+| `planner` | ~0.8k | Scan planning: `PartitionKeyLookup` / `PartitionIndexLookup` (keyed index consult for full-PK + indexed residual, t_430c4188) / `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` / `FullScan` |
 | `error` / `paging` / `duration` / `session` / `topology` / `event` / `observability` / `prepared` | — | Error type + `From<RowBridgeError>`, paging cursor, duration type, session, topology policy, EVENT, metrics, prepared cache |
 | `virtual_tables/` | ~4.5k | `system_observability.*` runtime introspection tables |
 
@@ -74,7 +74,12 @@ and applies through `SessionCore`'s write path / `StorageEngine`. LWT statements
 
 **Read (SELECT).** Same front half; `router::route_select` resolves the table,
 plans the scan (`planner`, ORDER BY classification), reads `Partition`s from
-storage, decomposes them to rows via the re-exported
+storage. `WHERE <full partition key> AND <indexed_col> = ?` (t_430c4188) is a
+KEYED index consult: `WritePath::index_read_in_partition` routes to the
+partition's replicas, each consults its secondary index restricted to that
+partition, and only the matching rows are point-read — O(matching rows), never
+O(partition rows), with an EXPLAIN plan of `PartitionIndexLookup`. The router
+then decomposes partitions to rows via the re-exported
 `partition_to_rows_with_storage_mapping` (tombstone/TTL skipping, storage→table
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
