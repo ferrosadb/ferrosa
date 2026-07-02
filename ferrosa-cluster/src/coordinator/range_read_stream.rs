@@ -31,8 +31,8 @@ use super::stream_consumer::StreamConsumeError;
 use super::ClusterCoordinator;
 use crate::error::ClusterError;
 use crate::raft::handlers::{
-    partition_from_wire, RangeReadStreamChunkPayload, RangeReadStreamDonePayload,
-    RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
+    partition_from_wire, RangeReadStreamCancelPayload, RangeReadStreamChunkPayload,
+    RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
 };
 
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
@@ -282,16 +282,36 @@ fn next_remote_error(err: StreamConsumeError) -> crate::error::Result<Partition>
     Err(cluster_err)
 }
 
+/// How a per-replica forwarder task ended. Anything other than `Completed`
+/// means the REMOTE producer may still be streaming — the coordinator must
+/// fire a `RangeReadStreamCancel` so the replica stops between batches instead
+/// of scanning the whole table into `Lane::Bulk` for nobody (t_3fc6be3c: the
+/// uncancelled `pages × replicas` producers starved live streams into
+/// heartbeat-defunct connections and OOM-killed replicas).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardOutcome {
+    /// The stream terminated normally (every expected `Done` delivered).
+    Completed,
+    /// The consumer dropped the merged stream mid-flight (a paged read fills
+    /// its page and abandons the rest — every page but the last does this).
+    Abandoned,
+    /// The stream failed (idle timeout, route closed, decode error); the
+    /// error was forwarded to the consumer as a loud, retryable failure.
+    Failed,
+}
+
 async fn forward_remote_range_stream(
     receiver: mpsc::Receiver<Message>,
     request_id: u32,
     expected_done: usize,
     tx: mpsc::Sender<crate::error::Result<Partition>>,
-) {
-    if let Err(err) =
-        forward_remote_range_stream_inner(receiver, request_id, expected_done, tx.clone()).await
-    {
-        let _ = tx.send(next_remote_error(err)).await;
+) -> ForwardOutcome {
+    match forward_remote_range_stream_inner(receiver, request_id, expected_done, tx.clone()).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.send(next_remote_error(err)).await;
+            ForwardOutcome::Failed
+        }
     }
 }
 
@@ -300,22 +320,28 @@ async fn forward_remote_range_stream_inner(
     request_id: u32,
     expected_done: usize,
     tx: mpsc::Sender<crate::error::Result<Partition>>,
-) -> Result<(), StreamConsumeError> {
+) -> Result<ForwardOutcome, StreamConsumeError> {
     let mut watchdog = IdleTimeoutWatchdog::new(receiver, STREAMING_IDLE_TIMEOUT);
     let mut delivered_done = 0usize;
 
     loop {
         if delivered_done >= expected_done {
-            return Ok(());
+            return Ok(ForwardOutcome::Completed);
         }
 
-        let next = watchdog
-            .next()
-            .await
-            .map_err(|elapsed| StreamConsumeError::IdleTimeout {
-                request_id,
-                idle_timeout: elapsed.idle_timeout,
-            })?;
+        // Notice consumer abandonment PROMPTLY — even when the producer is
+        // between chunks and nothing is arriving — so the caller can cancel
+        // the remote producer instead of waiting for the next frame (or the
+        // 30 s idle timeout) to observe the closed channel.
+        let next = tokio::select! {
+            biased;
+            _ = tx.closed() => return Ok(ForwardOutcome::Abandoned),
+            next = watchdog.next() => next,
+        };
+        let next = next.map_err(|elapsed| StreamConsumeError::IdleTimeout {
+            request_id,
+            idle_timeout: elapsed.idle_timeout,
+        })?;
 
         let frame = match next {
             Some(msg) => msg,
@@ -339,7 +365,7 @@ async fn forward_remote_range_stream_inner(
                     })?;
                 for partition in chunk.partitions.into_iter().map(partition_from_wire) {
                     if tx.send(Ok(partition)).await.is_err() {
-                        return Ok(());
+                        return Ok(ForwardOutcome::Abandoned);
                     }
                 }
             }
@@ -1073,9 +1099,20 @@ impl ClusterCoordinator {
 
             let (remote_tx, remote_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
             let router = self.stream_router.clone();
+            let peer_manager = self.peer_manager.clone();
+            let peer_host = *host_id;
             TaskPool::current("range-read-forward").spawn(async move {
-                forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
+                let outcome = forward_remote_range_stream(receiver, request_id, 1, remote_tx).await;
                 router.unregister(request_id);
+                // Anything but a clean Done means the remote producer may
+                // still be streaming for nobody — tell it to stop. Fired from
+                // THIS live async task (not a Drop guard: the reverted
+                // 3ec30240 guard never actually sent a cancel on the live
+                // cluster), so the fire is a plain awaited call that either
+                // succeeds or logs loudly.
+                if outcome != ForwardOutcome::Completed {
+                    fire_stream_cancel(&peer_manager, peer_host, request_id, outcome).await;
+                }
             });
 
             let stream = futures::stream::unfold(remote_rx, |mut rx| async move {
@@ -1088,6 +1125,52 @@ impl ClusterCoordinator {
             streams,
             fire_failures,
         })
+    }
+}
+
+/// Fire a best-effort `RangeReadStreamCancel` for `request_id` to `host_id`.
+///
+/// t_3fc6be3c — without this, a consumer that abandons a coordinated stream
+/// mid-flight (every paged read does, on every page but the last) leaves the
+/// remote producer scanning the WHOLE remaining table and firing chunks onto
+/// `Lane::Bulk` for nobody; `pages × replicas` of those starved live streams
+/// (heartbeat-defunct connections) and OOM-killed replicas. The producer's
+/// request handler observes the `CancellationToken` between batches and stops
+/// within one chunk.
+///
+/// Logged at info on success so a live deploy can verify cancels are actually
+/// flowing (the reverted Drop-guard approach silently sent zero), and at warn
+/// on failure — the producer then streams until Done or connection teardown,
+/// which is degraded-but-visible, never silent.
+async fn fire_stream_cancel(
+    peers: &ferrosa_net::peer::PeerManager,
+    host_id: uuid::Uuid,
+    request_id: u32,
+    outcome: ForwardOutcome,
+) {
+    let payload = RangeReadStreamCancelPayload { request_id };
+    let body = bincode::serialize(&payload)
+        .expect("RangeReadStreamCancelPayload serialization is infallible");
+    match peers
+        .fire(
+            host_id,
+            Message::RangeReadStreamCancel(Bytes::from(body)),
+            Lane::Bulk,
+        )
+        .await
+    {
+        Ok(()) => tracing::info!(
+            request_id,
+            peer = %host_id,
+            ?outcome,
+            "streaming range read: stream ended without Done; fired RangeReadStreamCancel to stop the remote producer"
+        ),
+        Err(e) => tracing::warn!(
+            request_id,
+            peer = %host_id,
+            ?outcome,
+            "streaming range read: cancel fire failed — remote producer keeps streaming until Done or disconnect: {e}"
+        ),
     }
 }
 
