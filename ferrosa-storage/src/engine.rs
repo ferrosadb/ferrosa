@@ -17712,8 +17712,21 @@ mod tests {
         }
 
         let config = StorageEngineConfig::test_config(dir.path());
-        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
         engine.register_system_tables().unwrap();
+        // Replay the pending commit-log mutations (the registration AND the
+        // cascade tombstones). Without this replay the reopened store is empty
+        // and `skipped == 0` holds VACUOUSLY — the pre-fix engine (registration
+        // surviving, no tombstone) would pass too. With replay, a missing
+        // cascade leaves an orphaned live row and `skipped` counts it (the
+        // sibling `reload_counts_skipped_orphan_rows_...` test proves the
+        // counter detects exactly that shape).
+        assert!(
+            !pending.is_empty(),
+            "expected pending commit-log mutations to replay; an empty replay \
+             set would make this test vacuous"
+        );
+        engine.replay_mutations(pending).unwrap();
 
         let outcome = engine.reload_indexes_from_system_schema().unwrap();
         assert_eq!(
