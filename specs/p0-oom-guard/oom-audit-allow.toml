@@ -535,3 +535,200 @@ rule = "clone-on-row-data"
 reason = "t_110dd8a5 (clone-on-row-data): storage store row clones predating the move-based guard; migrate with the streaming engine API."
 owner = "storage"
 expires = "2026-12-31"
+
+# ---------------------------------------------------------------------------
+# Group 3 — extended Clone/Copy rules (cloned-stream-elements /
+# clone-in-scan-closure / copies-row-data-arg / broadened clone-on-row-data),
+# 2026-07 sweep. Two sub-groups:
+#   (a) genuine move-opportunities, tracked in forge t_6068a9af / t_87042a74 —
+#       SHORT expiry 2026-10-01: fix or renew, the audit fails loud otherwise.
+#   (b) inherent-by-design copies (retained-source reads, serialization
+#       boundaries, test fixtures) — documented, long expiry.
+# ---------------------------------------------------------------------------
+
+# (a) t_6068a9af — bulk-transfer paths clone every row before wire serialization.
+[[allow]]
+path = "ferrosa-cluster/src/controller/cluster.rs"
+rule = "cloned-stream-elements"
+symbol = "partition"
+reason = "t_6068a9af: snapshot send builds RowWire from cloned rows; fix = From<&Row>."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/controller/membership.rs"
+rule = "cloned-stream-elements"
+symbol = "partition"
+reason = "t_6068a9af: membership transfer builds RowWire from cloned rows; fix = From<&Row>."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/rebalance.rs"
+rule = "cloned-stream-elements"
+symbol = "partition"
+reason = "t_6068a9af: rebalance transfer builds RowWire from cloned rows; fix = From<&Row>."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/repair/rpc.rs"
+rule = "cloned-stream-elements"
+symbol = "chunk"
+reason = "t_6068a9af: repair send clones each partition for partition_to_wire; fix = borrow variant."
+owner = "bkearns"
+expires = "2026-10-01"
+
+# (a) t_87042a74 — repair leaf/hinted-replay/IVF-build per-element clones.
+[[allow]]
+path = "ferrosa-cluster/src/repair/mod.rs"
+rule = "cloned-stream-elements"
+symbol = "parts_"
+reason = "t_87042a74: Merkle repair clones Vec<Partition> subsets per divergent leaf; use borrows/indices."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/read.rs"
+rule = "cloned-stream-elements"
+symbol = "mutation"
+reason = "t_87042a74: hinted replay clones mutation rows per stale host (bounded per mutation); move on last use."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-index/src/vector/quantized/ivf.rs"
+rule = "clone-in-scan-closure"
+symbol = "vector"
+reason = "t_87042a74: IVF centroid seeding clones every vector to sort; sort indices instead."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-index/src/vector/quantized/ivf.rs"
+rule = "cloned-stream-elements"
+reason = "t_87042a74: IVF build .copied() over candidate vectors; review with the sort-by-index fix."
+owner = "bkearns"
+expires = "2026-10-01"
+
+# (a) t_480c91fe — CQL result building clones one CELL per row from borrowed
+# partitions; goes away when the callers stream page-by-page with moved rows.
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "cloned-stream-elements"
+symbol = "row"
+reason = "t_480c91fe: per-row single-cell Option clone while rows are borrowed; retire with page-by-page move streaming."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/router.rs"
+rule = "clone-in-scan-closure"
+symbol = "v"
+reason = "t_480c91fe: per-row single-cell clone in and_then while rows are borrowed; retire with move streaming."
+owner = "bkearns"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/accord_router.rs"
+rule = "cloned-stream-elements"
+symbol = "row"
+reason = "t_480c91fe: LWT condition eval clones one cell per condition from a borrowed row."
+owner = "bkearns"
+expires = "2026-10-01"
+
+# (b) inherent-by-design: retained-source reads must hand out owned copies.
+[[allow]]
+path = "ferrosa-storage/src/store.rs"
+rule = "cloned-stream-elements"
+symbol = "partition"
+reason = "point/limited read returns owned rows from a partition the store retains; bounded by clustering match / row_limit."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-storage/src/memtable/mem_index.rs"
+rule = "clone-on-row-data"
+symbol = "value"
+reason = "memtable index retains owned CellValue keys; insert/read must copy (single cell values, bounded)."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-storage/src/memtable/sharded.rs"
+rule = "copies-row-data-arg"
+symbol = "arc"
+reason = "memtable snapshot materializes Partition from Arc for flush; bounded by the flush threshold."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/hints/segment.rs"
+rule = "copies-row-data-arg"
+symbol = "row"
+reason = "hint segment encodes record bytes into the frame buffer — byte-level serialization, not a row-object clone."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/raft/handlers.rs"
+rule = "cloned-stream-elements"
+symbol = "static_row"
+reason = "zero-or-one static row cloned per partition for wire encoding — negligible, documented at the site."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-storage/src/engine.rs"
+rule = "clone-in-scan-closure"
+symbol = "bytes"
+reason = "single-cell accessor returns owned bytes of one column value — not a per-row scan copy."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-index/src/geo/rtree.rs"
+rule = "clone-on-row-data"
+symbol = "chunk"
+reason = "R-tree bulk-load chunks are Vec<usize> indices, not row payloads."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-index/src/vector/quantized/ivf_staged.rs"
+rule = "clone-on-row-data"
+symbol = "chunk"
+reason = "staged IVF chunks are index slices, not row payloads."
+owner = "bkearns"
+expires = "2027-07-01"
+
+# (b) tooling / test fixtures living under src/.
+[[allow]]
+path = "ferrosa-storage/src/test_support.rs"
+rule = "clone-on-row-data"
+symbol = "base"
+reason = "test-support fixture derives replica variants from a base partition — test-only code."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-cluster/src/coordinator/streaming_e2e_tests.rs"
+rule = "cloned-stream-elements"
+reason = "in-crate e2e test stub clones fixture partitions to build a stream — test-only code."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-storage/src/compaction/validator/soak.rs"
+rule = "cloned-stream-elements"
+reason = "soak validator tooling flattens fixture groups; not a production read path."
+owner = "bkearns"
+expires = "2027-07-01"
+
+# (b) newly-scoped ferrosa-net: peer-list capacity is bounded by cluster size.
+[[allow]]
+path = "ferrosa-net/src/message.rs"
+rule = "with-capacity-limit"
+reason = "decoded peer COUNT is bounded by cluster membership size, not a row/paging cap."
+owner = "bkearns"
+expires = "2027-07-01"
