@@ -101,6 +101,16 @@ hanging the run.
 4. Implement Part C; iterate until Part B is fully green on fly.
 5. Un-revert the cluster arm; re-validate on fly; only then consider #237 merge.
 
+## The memory cap is intentional — never raise it
+
+The 2 GB node `mem_limit` is a **deliberate forcing function**: it makes any
+unbounded allocation OOM *early and loudly* instead of hiding behind slack RAM
+until it blows up at production scale. **Do not raise it** (not on fly, not on
+fmem-dev). The FTS/paged-scan OOMs are the cap working as designed. The pass
+condition for every case here is **"completes under the real cap"** — bounded
+memory is the fix; more RAM is not. (Any doc/task that lists "raise the mem_limit"
+as a mitigation is wrong and should be struck.)
+
 ## Non-goals
 
 - Not on the user's live fmem-dev cluster.
