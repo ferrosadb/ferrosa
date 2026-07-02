@@ -44,6 +44,10 @@ pub mod rule {
     pub const MATERIALIZING_RANGE_READ_CALL_SITE: &str = "materializing-range-read-call-site";
     pub const CQLVALUE_ROW_ACCUMULATION: &str = "cqlvalue-row-accumulation";
     pub const CLONE_ON_ROW_DATA: &str = "clone-on-row-data";
+    pub const CLONED_STREAM_ELEMENTS: &str = "cloned-stream-elements";
+    pub const CLONE_IN_SCAN_CLOSURE: &str = "clone-in-scan-closure";
+    pub const COPIES_ROW_DATA_ARG: &str = "copies-row-data-arg";
+    pub const COPY_DERIVE_LARGE_TYPE: &str = "copy-derive-large-type";
     pub const EXPIRED_ALLOW: &str = "expired-allow-entry";
 }
 
@@ -279,15 +283,57 @@ fn collect_turbofish_partition_or_row(node: &syn::ExprMethodCall) -> Option<Stri
 
 /// Receiver idents whose per-element `.clone()`/`.to_vec()`/`.to_owned()` we flag
 /// as a row-data copy on a scan path (rule: clone-on-row-data). Case-insensitive.
-const ROW_DATA_IDENTS: &[&str] = &["partition", "partitions", "row", "rows", "cell", "cells"];
+/// `chunk`/`fragment` are the shapes row data takes in the streaming pipeline
+/// (net frames, coordinator merge) — copying them defeats move streaming the
+/// same way copying a partition does.
+const ROW_DATA_IDENTS: &[&str] = &[
+    "partition",
+    "partitions",
+    "row",
+    "rows",
+    "cell",
+    "cells",
+    "chunk",
+    "chunks",
+    "frag",
+    "frags",
+    "fragment",
+    "fragments",
+];
+
+/// Type idents that carry row data. A local/param declared with one of these
+/// (possibly behind `&`/`Vec`/`Option`/`Box`/`Arc`/slice) is row data no matter
+/// what the binding is called — this closes the renamed-binding blind spot
+/// (`let part = partition; part.clone()`).
+const ROW_DATA_TYPE_IDENTS: &[&str] = &["Partition", "Row", "Cell", "CellValue"];
 
 /// Copying method names that materialize a clone of row data.
 fn is_copying_method(method: &str) -> bool {
     method == "clone" || method == "to_vec" || method == "to_owned"
 }
 
-/// Trailing ident of a receiver expression: a bare ident, or the field name of a
-/// field access (`self.rows` -> `rows`, `rows` -> `rows`). None otherwise.
+/// Iterator adapters that take a closure over the stream's elements. A clone of
+/// the closure param inside one of these is a per-element copy of the stream.
+fn is_element_closure_adapter(method: &str) -> bool {
+    matches!(
+        method,
+        "map"
+            | "filter"
+            | "filter_map"
+            | "flat_map"
+            | "for_each"
+            | "inspect"
+            | "fold"
+            | "scan"
+            | "take_while"
+            | "skip_while"
+            | "and_then"
+    )
+}
+
+/// Trailing ident of a receiver expression, looking through `&`/`*`/parens:
+/// a bare ident, the field name of a field access (`self.rows` -> `rows`), or
+/// the method name of an accessor call (`holder.rows()` -> `rows`).
 fn receiver_trailing_ident(expr: &syn::Expr) -> Option<String> {
     match expr {
         syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
@@ -295,7 +341,57 @@ fn receiver_trailing_ident(expr: &syn::Expr) -> Option<String> {
             syn::Member::Named(id) => Some(id.to_string()),
             syn::Member::Unnamed(_) => None,
         },
+        syn::Expr::MethodCall(mc) => Some(mc.method.to_string()),
+        syn::Expr::Reference(r) => receiver_trailing_ident(&r.expr),
+        syn::Expr::Paren(p) => receiver_trailing_ident(&p.expr),
+        syn::Expr::Group(g) => receiver_trailing_ident(&g.expr),
+        syn::Expr::Unary(u) => receiver_trailing_ident(&u.expr),
+        syn::Expr::Await(a) => receiver_trailing_ident(&a.base),
+        syn::Expr::Try(t) => receiver_trailing_ident(&t.expr),
         _ => None,
+    }
+}
+
+/// Every named link in a method-call chain: root idents, field names, and
+/// method names, looking through `&`/`*`/parens/`.await`/`?`.
+/// `holder.rows().iter()` -> ["holder", "rows", "iter"].
+fn chain_idents(expr: &syn::Expr) -> Vec<String> {
+    let mut idents = Vec::new();
+    collect_chain_idents(expr, &mut idents);
+    idents
+}
+
+fn collect_chain_idents(expr: &syn::Expr, out: &mut Vec<String>) {
+    match expr {
+        syn::Expr::MethodCall(mc) => {
+            collect_chain_idents(&mc.receiver, out);
+            out.push(mc.method.to_string());
+        }
+        syn::Expr::Path(p) => {
+            if let Some(seg) = p.path.segments.last() {
+                out.push(seg.ident.to_string());
+            }
+        }
+        syn::Expr::Field(f) => {
+            collect_chain_idents(&f.base, out);
+            if let syn::Member::Named(id) = &f.member {
+                out.push(id.to_string());
+            }
+        }
+        syn::Expr::Call(c) => {
+            if let syn::Expr::Path(p) = &*c.func {
+                if let Some(seg) = p.path.segments.last() {
+                    out.push(seg.ident.to_string());
+                }
+            }
+        }
+        syn::Expr::Reference(r) => collect_chain_idents(&r.expr, out),
+        syn::Expr::Paren(p) => collect_chain_idents(&p.expr, out),
+        syn::Expr::Group(g) => collect_chain_idents(&g.expr, out),
+        syn::Expr::Unary(u) => collect_chain_idents(&u.expr, out),
+        syn::Expr::Await(a) => collect_chain_idents(&a.base, out),
+        syn::Expr::Try(t) => collect_chain_idents(&t.expr, out),
+        _ => {}
     }
 }
 
@@ -303,6 +399,53 @@ fn receiver_trailing_ident(expr: &syn::Expr) -> Option<String> {
 fn is_row_data_ident(ident: &str) -> bool {
     let lower = ident.to_ascii_lowercase();
     ROW_DATA_IDENTS.contains(&lower.as_str())
+}
+
+/// True if `ty` is (or wraps) a row-data type: `Partition`, `&[Row]`,
+/// `Vec<Cell>`, `Option<Box<Partition>>`, …
+fn is_row_data_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(r) => is_row_data_type(&r.elem),
+        syn::Type::Paren(p) => is_row_data_type(&p.elem),
+        syn::Type::Slice(s) => is_row_data_type(&s.elem),
+        syn::Type::Array(a) => is_row_data_type(&a.elem),
+        syn::Type::Path(tp) => {
+            let Some(seg) = tp.path.segments.last() else {
+                return false;
+            };
+            let name = seg.ident.to_string();
+            if ROW_DATA_TYPE_IDENTS.contains(&name.as_str()) {
+                return true;
+            }
+            // Wrapper types: recurse into the single meaningful generic arg.
+            if matches!(
+                name.as_str(),
+                "Vec" | "Option" | "Box" | "Arc" | "Rc" | "Cow"
+            ) {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    return args.args.iter().any(
+                        |a| matches!(a, syn::GenericArgument::Type(t) if is_row_data_type(t)),
+                    );
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// All idents bound by a pattern (`|r|`, `|(k, v)|`, `|Foo { a, .. }|`).
+fn pat_idents(pat: &syn::Pat, out: &mut Vec<String>) {
+    match pat {
+        syn::Pat::Ident(pi) => out.push(pi.ident.to_string()),
+        syn::Pat::Type(pt) => pat_idents(&pt.pat, out),
+        syn::Pat::Tuple(t) => t.elems.iter().for_each(|p| pat_idents(p, out)),
+        syn::Pat::TupleStruct(ts) => ts.elems.iter().for_each(|p| pat_idents(p, out)),
+        syn::Pat::Struct(ps) => ps.fields.iter().for_each(|f| pat_idents(&f.pat, out)),
+        syn::Pat::Reference(r) => pat_idents(&r.pat, out),
+        syn::Pat::Paren(p) => pat_idents(&p.pat, out),
+        _ => {}
+    }
 }
 
 /// True if `expr` (or any subexpression) references a streaming source: a call
@@ -368,6 +511,9 @@ struct Auditor<'a> {
     findings: Vec<Finding>,
     /// Name of the fn currently being visited (for symbol attribution).
     current_fn: String,
+    /// Idents bound to a row-data TYPE in the current fn (params + typed
+    /// locals) — row data regardless of what the binding is called.
+    row_typed: std::collections::HashSet<String>,
 }
 
 impl<'a> Auditor<'a> {
@@ -376,6 +522,41 @@ impl<'a> Auditor<'a> {
             path,
             findings: Vec::new(),
             current_fn: String::new(),
+            row_typed: std::collections::HashSet::new(),
+        }
+    }
+
+    /// True if this receiver/arg ident is row data: by name, or by the type it
+    /// was bound with in the current fn.
+    fn is_row_data(&self, ident: &str) -> bool {
+        is_row_data_ident(ident) || self.row_typed.contains(ident)
+    }
+
+    /// True if any named link of a method-call chain is row data, or the chain
+    /// draws from a streaming source. Used for the per-ELEMENT rules (6/7), so
+    /// a chain ending in `.next()` is excluded: `.cloned()`/closures after
+    /// `.next()` touch ONE `Option` element, not every element of the stream.
+    fn chain_is_row_data(&self, expr: &syn::Expr) -> bool {
+        let ids = chain_idents(expr);
+        if ids.last().map(String::as_str) == Some("next") {
+            return false;
+        }
+        ids.iter().any(|id| self.is_row_data(id))
+            || ids
+                .iter()
+                .any(|id| id.contains("stream") || id == "range_iter")
+    }
+
+    /// Collect row-typed param idents from a fn signature into `row_typed`.
+    fn collect_row_typed_params(&mut self, sig: &syn::Signature) {
+        for input in &sig.inputs {
+            if let syn::FnArg::Typed(pt) = input {
+                if is_row_data_type(&pt.ty) {
+                    let mut ids = Vec::new();
+                    pat_idents(&pt.pat, &mut ids);
+                    self.row_typed.extend(ids);
+                }
+            }
         }
     }
 
@@ -471,6 +652,40 @@ impl<'a> Auditor<'a> {
                 "read_range(None, None, ..) is an unbounded full-table range read".to_string(),
             );
         }
+
+        // Rule 8 (UFCS form): `Partition::clone(&p)` / `Clone::clone(&partition)`
+        // — the explicit-path spelling of a row-data clone.
+        if last == Some("clone") {
+            let type_seg_is_row = segs
+                .iter()
+                .any(|s| ROW_DATA_TYPE_IDENTS.contains(&s.as_str()));
+            let arg_ident = node.args.first().and_then(receiver_trailing_ident);
+            let arg_is_row = arg_ident.as_deref().is_some_and(|id| self.is_row_data(id));
+            if type_seg_is_row || arg_is_row {
+                let sym = arg_ident.unwrap_or_else(|| segs.join("::"));
+                self.push_with_symbol(
+                    node.span().start().line,
+                    rule::COPIES_ROW_DATA_ARG,
+                    "UFCS `::clone(..)` of row data copies the whole value (prefer move)"
+                        .to_string(),
+                    &sym,
+                );
+            }
+        }
+
+        // Rule 8 (Vec::from form): `Vec::from(&rows)` clones every element.
+        if last == Some("from") && segs.iter().any(|s| s == "Vec") {
+            if let Some(id) = node.args.first().and_then(receiver_trailing_ident) {
+                if self.is_row_data(&id) {
+                    self.push_with_symbol(
+                        node.span().start().line,
+                        rule::COPIES_ROW_DATA_ARG,
+                        format!("`Vec::from({id})` clones every row-data element (prefer move)"),
+                        &id,
+                    );
+                }
+            }
+        }
     }
 
     /// Typed-binding rules (rule 1 collect-to-typed-Vec, rule 4 CqlValue matrix).
@@ -502,19 +717,54 @@ fn expr_is_collect_call(expr: &syn::Expr) -> bool {
     matches!(expr, syn::Expr::MethodCall(mc) if mc.method == "collect")
 }
 
+/// Copy sites of a closure param inside a closure body: `(line, param, method)`
+/// for every `.clone()/.to_vec()/.to_owned()` whose receiver is one of `params`.
+fn closure_param_copy_sites(body: &syn::Expr, params: &[String]) -> Vec<(usize, String, String)> {
+    struct ParamCloneFinder<'p> {
+        params: &'p [String],
+        hits: Vec<(usize, String, String)>,
+    }
+    impl<'ast> Visit<'ast> for ParamCloneFinder<'_> {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let method = node.method.to_string();
+            if is_copying_method(&method) {
+                if let Some(recv) = receiver_trailing_ident(&node.receiver) {
+                    if self.params.contains(&recv) {
+                        self.hits
+                            .push((node.method.span().start().line, recv, method));
+                    }
+                }
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+    }
+    let mut f = ParamCloneFinder {
+        params,
+        hits: Vec::new(),
+    };
+    f.visit_expr(body);
+    f.hits
+}
+
 impl<'ast> Visit<'ast> for Auditor<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         let prev = std::mem::replace(&mut self.current_fn, node.sig.ident.to_string());
+        let prev_typed = std::mem::take(&mut self.row_typed);
+        self.collect_row_typed_params(&node.sig);
         self.check_signature(&node.sig);
         syn::visit::visit_item_fn(self, node);
         self.current_fn = prev;
+        self.row_typed = prev_typed;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         let prev = std::mem::replace(&mut self.current_fn, node.sig.ident.to_string());
+        let prev_typed = std::mem::take(&mut self.row_typed);
+        self.collect_row_typed_params(&node.sig);
         self.check_signature(&node.sig);
         syn::visit::visit_impl_item_fn(self, node);
         self.current_fn = prev;
+        self.row_typed = prev_typed;
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -577,15 +827,81 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
 
         // Rule 5: per-element clone of row data (move-based guard). The receiver
         // ident is the symbol so site-specific clones can be allowlisted.
+        // Matches by NAME (partition/rows/chunk/…) or by TYPE (any ident the
+        // current fn bound to a row-data type — closes the renamed-binding gap).
         if is_copying_method(&method) {
             if let Some(recv) = receiver_trailing_ident(&node.receiver) {
-                if is_row_data_ident(&recv) {
+                if self.is_row_data(&recv) {
                     self.push_with_symbol(
                         line,
                         rule::CLONE_ON_ROW_DATA,
                         format!("`{recv}.{method}()` copies row data on a scan path (prefer move)"),
                         &recv,
                     );
+                }
+            }
+        }
+
+        // Rule 6: `.cloned()` / `.copied()` iterator adapters over row data or
+        // a streaming source — clones EVERY element of the stream.
+        if (method == "cloned" || method == "copied") && self.chain_is_row_data(&node.receiver) {
+            let sym = chain_idents(&node.receiver)
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            self.push_with_symbol(
+                line,
+                rule::CLONED_STREAM_ELEMENTS,
+                format!(
+                    "`.{method}()` copies every element of a row-data/stream chain (prefer \
+                     into_iter()/move)"
+                ),
+                &sym,
+            );
+        }
+
+        // Rule 7: clone of the closure param inside an iterator adapter over
+        // row data (`rows.iter().map(|r| r.clone())`) — a per-element copy.
+        if is_element_closure_adapter(&method) && self.chain_is_row_data(&node.receiver) {
+            for arg in &node.args {
+                let syn::Expr::Closure(cl) = arg else {
+                    continue;
+                };
+                let mut params = Vec::new();
+                for p in &cl.inputs {
+                    pat_idents(p, &mut params);
+                }
+                let clones = closure_param_copy_sites(&cl.body, &params);
+                for (cline, param, cmethod) in clones {
+                    self.push_with_symbol(
+                        cline,
+                        rule::CLONE_IN_SCAN_CLOSURE,
+                        format!(
+                            "`|{param}| .. {param}.{cmethod}()` inside `.{method}()` copies each \
+                             streamed element (prefer move)"
+                        ),
+                        &param,
+                    );
+                }
+            }
+        }
+
+        // Rule 8 (method form): `buf.extend_from_slice(&rows)` clones every
+        // element of a row-data slice into the buffer.
+        if method == "extend_from_slice" {
+            if let Some(arg) = node.args.first() {
+                if let Some(id) = receiver_trailing_ident(arg) {
+                    if self.is_row_data(&id) {
+                        self.push_with_symbol(
+                            line,
+                            rule::COPIES_ROW_DATA_ARG,
+                            format!(
+                                "`extend_from_slice({id})` clones every row-data element (prefer \
+                                 extend(drain)/append/move)"
+                            ),
+                            &id,
+                        );
+                    }
                 }
             }
         }
@@ -603,8 +919,32 @@ impl<'ast> Visit<'ast> for Auditor<'_> {
         if let syn::Pat::Type(pt) = &node.pat {
             let init = node.init.as_ref().map(|i| &*i.expr);
             self.check_typed_binding(&pt.ty, init, node.let_token.span().start().line);
+            // Track row-typed locals so later clones of them are flagged even
+            // under a non-row name (`let renamed: Partition = ..`).
+            if is_row_data_type(&pt.ty) {
+                let mut ids = Vec::new();
+                pat_idents(&pt.pat, &mut ids);
+                self.row_typed.extend(ids);
+            }
         }
         syn::visit::visit_local(self, node);
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        // Rule 9: `derive(Copy)` on a large type makes every implicit copy a
+        // hidden memmove — large payloads should move or be borrowed.
+        if derives_copy(&node.attrs) && struct_is_large(&node.fields) {
+            self.push_with_symbol(
+                node.ident.span().start().line,
+                rule::COPY_DERIVE_LARGE_TYPE,
+                format!(
+                    "`derive(Copy)` on large struct `{}` makes every use an implicit bulk copy",
+                    node.ident
+                ),
+                &node.ident.to_string(),
+            );
+        }
+        syn::visit::visit_item_struct(self, node);
     }
 
     fn visit_field(&mut self, node: &'ast syn::Field) {
@@ -678,6 +1018,56 @@ fn block_has_push(block: &syn::Block) -> bool {
     let mut f = PushFinder { found: false };
     f.visit_block(block);
     f.found
+}
+
+/// True if `attrs` contains `#[derive(.., Copy, ..)]`.
+fn derives_copy(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("derive") && {
+            let mut hit = false;
+            let _ = a.parse_nested_meta(|m| {
+                if m.path.is_ident("Copy") {
+                    hit = true;
+                }
+                Ok(())
+            });
+            hit
+        }
+    })
+}
+
+/// Array length above which a Copy type's implicit copies count as bulk moves.
+const COPY_LARGE_ARRAY_LEN: u64 = 64;
+/// Field count above which a Copy struct is considered large.
+const COPY_LARGE_FIELD_COUNT: usize = 12;
+
+/// True if the struct is "large" for Copy purposes: an array field with a
+/// literal length >= `COPY_LARGE_ARRAY_LEN`, or >= `COPY_LARGE_FIELD_COUNT`
+/// fields. Best-effort: non-literal array lengths are not evaluated.
+fn struct_is_large(fields: &syn::Fields) -> bool {
+    if fields.len() >= COPY_LARGE_FIELD_COUNT {
+        return true;
+    }
+    fields.iter().any(|f| type_has_large_array(&f.ty))
+}
+
+fn type_has_large_array(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Array(a) => {
+            if let syn::Expr::Lit(l) = &a.len {
+                if let syn::Lit::Int(i) = &l.lit {
+                    if i.base10_parse::<u64>()
+                        .is_ok_and(|n| n >= COPY_LARGE_ARRAY_LEN)
+                    {
+                        return true;
+                    }
+                }
+            }
+            type_has_large_array(&a.elem)
+        }
+        syn::Type::Paren(p) => type_has_large_array(&p.elem),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1645,284 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == rule::CLONE_ON_ROW_DATA),
             "non-row-data receivers must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 5 hardening: receiver shapes the ident rule used to miss ------
+    #[test]
+    fn rule_clone_on_row_data_fires_through_ref_deref_paren_receivers() {
+        let src = r#"
+            fn a(rows: R, partition: P) {
+                let _x = (&rows).to_vec();
+                let _y = (*partition).clone();
+                let _z = ((rows)).to_owned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 3, "&/*/paren-wrapped row receivers fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_clone_on_row_data_fires_on_method_call_receiver() {
+        let src = r#"
+            fn a(holder: H) {
+                let _x = holder.rows().to_vec();
+                let _y = holder.partitions().clone();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 2, "accessor-method row receivers fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_clone_on_row_data_fires_on_row_typed_renamed_binding() {
+        // The renamed-binding blind spot: receiver ident is NOT in the row-data
+        // set, but its declared type is a row type (param or typed local).
+        let src = r#"
+            fn a(p: &Partition, source: Row) {
+                let q = p.clone();
+                let renamed: Partition = make();
+                let r = renamed.clone();
+                let s = source.to_owned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 3, "row-typed p/renamed/source all fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_clone_on_row_data_typed_tracking_is_per_fn() {
+        // `p` is Partition-typed in `a` but not in `b` — no bleed-over.
+        let src = r#"
+            fn a(p: &Partition) { let _ = p.clone(); }
+            fn b(p: &Config) { let _ = p.clone(); }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 1, "only the Partition-typed fn fires: {f:?}");
+    }
+
+    #[test]
+    fn rule_clone_on_row_data_fires_on_scan_shape_idents() {
+        // chunk/fragment move through the streaming pipeline; copying them
+        // defeats move-based streaming just like copying a partition.
+        let src = r#"
+            fn a(chunk: C, fragment: F) {
+                let _x = chunk.clone();
+                let _y = fragment.to_owned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_ON_ROW_DATA)
+            .count();
+        assert_eq!(count, 2, "chunk/fragment copies fire: {f:?}");
+    }
+
+    // -- Rule 6: cloned-stream-elements (.cloned()/.copied() adapters) ------
+    #[test]
+    fn rule_cloned_stream_elements_fires_on_iter_cloned_over_row_data() {
+        let src = r#"
+            fn a(rows: Vec<R>, partitions: Vec<P>) {
+                let v = rows.iter().cloned();
+                let w = partitions.iter().copied();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONED_STREAM_ELEMENTS)
+            .count();
+        assert_eq!(
+            count, 2,
+            "iter().cloned()/copied() over row data fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_fires_on_stream_source_chain() {
+        let src = r#"
+            fn a(s: S) {
+                let v = partition_stream(s).cloned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            ".cloned() on a stream-source chain fires: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_does_not_fire_on_option_next_chains() {
+        // `.next().cloned()` copies ONE element out of an Option — that is an
+        // accessor, not a per-element stream copy.
+        let src = r#"
+            fn a(rows: Vec<R>) {
+                let one = rows.iter().next().cloned();
+                let key = self.entries.keys().next().copied();
+                let g = groups.values().next().cloned();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "Option-after-next chains must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_cloned_stream_elements_does_not_fire_on_small_config_data() {
+        let src = r#"
+            fn a(names: Vec<String>, ports: Vec<u16>) {
+                let v = names.iter().cloned();
+                let w = ports.iter().copied();
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONED_STREAM_ELEMENTS),
+            "non-row, non-stream receivers must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 7: clone-in-scan-closure (`.map(|r| r.clone())`) --------------
+    #[test]
+    fn rule_clone_in_scan_closure_fires_on_map_clone_over_row_data() {
+        let src = r#"
+            fn a(rows: Vec<R>) {
+                let v = rows.iter().map(|r| r.clone());
+                let w = rows.iter().filter_map(|x| Some(x.to_vec()));
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::CLONE_IN_SCAN_CLOSURE)
+            .count();
+        assert_eq!(count, 2, "closure-param clones over row data fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_clone_in_scan_closure_does_not_fire_off_row_chains() {
+        let src = r#"
+            fn a(configs: Vec<C>) {
+                let v = configs.iter().map(|c| c.clone());
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONE_IN_SCAN_CLOSURE),
+            "closures over non-row chains must not fire: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_clone_in_scan_closure_only_flags_the_closure_param() {
+        // `other.clone()` inside the closure is NOT the streamed element.
+        let src = r#"
+            fn a(rows: Vec<R>, other: O) {
+                let v = rows.iter().map(|r| (r.id, other.clone()));
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::CLONE_IN_SCAN_CLOSURE),
+            "captured non-param clones must not fire this rule: {f:?}"
+        );
+    }
+
+    // -- Rule 8: copies-row-data-arg (arg-position copies) -------------------
+    #[test]
+    fn rule_copies_row_data_arg_fires_on_extend_from_slice() {
+        let src = r#"
+            fn a(buf: &mut Vec<R>, rows: &[R]) {
+                buf.extend_from_slice(rows);
+                buf.extend_from_slice(&rows);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
+            .count();
+        assert_eq!(count, 2, "extend_from_slice(rows) clones every row: {f:?}");
+    }
+
+    #[test]
+    fn rule_copies_row_data_arg_fires_on_ufcs_clone() {
+        let src = r#"
+            fn a(p: &P, partition: &Q) {
+                let x = Partition::clone(p);
+                let y = Clone::clone(partition);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let count = f
+            .iter()
+            .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
+            .count();
+        assert_eq!(count, 2, "UFCS clones of row data fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_copies_row_data_arg_does_not_fire_on_byte_buffers() {
+        let src = r#"
+            fn a(out: &mut Vec<u8>, header: &[u8]) {
+                out.extend_from_slice(header);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::COPIES_ROW_DATA_ARG),
+            "byte-buffer extends must not fire: {f:?}"
+        );
+    }
+
+    // -- Rule 9: copy-derive-large-type --------------------------------------
+    #[test]
+    fn rule_copy_derive_large_type_fires_on_big_array_struct() {
+        let src = r#"
+            #[derive(Clone, Copy)]
+            struct Big { data: [u8; 4096] }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            f.iter().any(|x| x.rule == rule::COPY_DERIVE_LARGE_TYPE),
+            "derive(Copy) on a 4096-byte array struct fires: {f:?}"
+        );
+    }
+
+    #[test]
+    fn rule_copy_derive_large_type_does_not_fire_on_small_types() {
+        let src = r#"
+            #[derive(Clone, Copy)]
+            struct Token(u64);
+            #[derive(Copy, Clone)]
+            struct Pair { a: u64, b: u64 }
+            #[derive(Clone)]
+            struct BigButNotCopy { data: [u8; 4096] }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::COPY_DERIVE_LARGE_TYPE),
+            "small Copy types and non-Copy big types must not fire: {f:?}"
         );
     }
 }
