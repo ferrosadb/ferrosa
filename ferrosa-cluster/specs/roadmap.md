@@ -78,6 +78,18 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   (Direct/Pair → local, Cluster → fan-out). The CQL router now routes the FTI
   lookup through the write path. In-process 2-node fan-out + dedup test in
   `coordinator/read.rs`.
+- **Replica-side `fts_match` memory bound (t_ee98faa0 layer 2).** After the
+  coordinator-side fix, one broad `fts_match('memory') LIMIT 10` still
+  OOM-killed all three 2 GiB replicas at once inside each replica's
+  `fulltext_search`. The query-derived `LIMIT k` is now pushed down end-to-end
+  (`WritePath::fulltext_search(.., limit)` →
+  `coordinate_fulltext_search(.., limit)` →
+  `FulltextSearchRequestPayload.limit` → engine top-k / streaming sidecar
+  search in `ferrosa-storage`/`ferrosa-index`), so each replica holds O(k) and
+  the union is ≤ replicas × k keys. The CQL router escalates k geometrically
+  when post-filtering exhausts the bounded hit set (completeness preserved —
+  no server-side caps). NOTE: `FulltextSearchRequestPayload` gained a bincode
+  field — internode wire change; upgrade all nodes together.
 
 ## Now (highest value)
 

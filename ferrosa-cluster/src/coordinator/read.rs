@@ -1618,11 +1618,17 @@ impl ClusterCoordinator {
     /// (BUG-F-007). Querying every node and de-duplicating the keys makes the
     /// result coordinator-independent. Partial failures degrade to a partial
     /// union (logged); only an all-nodes-failed-and-empty result errors.
+    ///
+    /// `limit` is the query-derived `LIMIT k`, pushed down so every replica
+    /// holds a bounded top-k working set (t_ee98faa0 layer 2); the union is
+    /// then at most `replicas × k` keys. `None` requests the complete match
+    /// set (no-LIMIT statements) — never a server-side cap.
     pub async fn coordinate_fulltext_search(
         &self,
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
@@ -1637,6 +1643,7 @@ impl ClusterCoordinator {
             table: table_id.table.clone(),
             index_name: index_name.to_string(),
             query: query.to_string(),
+            limit: limit.map(|k| k as u64),
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
 
@@ -1660,7 +1667,7 @@ impl ClusterCoordinator {
                 async move {
                     if node_id == local_id {
                         storage
-                            .fulltext_search(&table_id, &index_name, &query)
+                            .fulltext_search(&table_id, &index_name, &query, limit)
                             .map_err(ClusterError::Storage)
                     } else {
                         let (hid, addr) = remote.ok_or_else(|| {
@@ -2187,7 +2194,7 @@ mod tests {
         // the remote returns the SAME bytes — exercising real dedup — instead of a
         // hand-rolled partition key that would no longer match.
         let local_keys = storage
-            .fulltext_search(&table_id, "val_fti", "hello")
+            .fulltext_search(&table_id, "val_fti", "hello", None)
             .unwrap();
         assert_eq!(local_keys.len(), 1, "local node should have one FTI hit");
         let shared_key = local_keys[0].clone();
@@ -2230,7 +2237,7 @@ mod tests {
         );
 
         let mut keys = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "hello")
+            .coordinate_fulltext_search(&table_id, "val_fti", "hello", None)
             .await
             .unwrap();
         keys.sort();
@@ -2287,7 +2294,7 @@ mod tests {
         );
 
         let keys = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token")
+            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token", None)
             .await
             .expect("one successful empty FTI shard should degrade remote failure to empty union");
 

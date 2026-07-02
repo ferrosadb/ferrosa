@@ -77,13 +77,105 @@ coordinator-side pre-LIMIT accumulation.
   (t_8686dd3c) now passes (fixed by the row-granular doc keys) and was
   un-ignored.
 - **Known bounded residual** — the FTS hit-set (`matched`) is O(matches) SMALL
-  doc keys (keys, not rows), accepted for now.
+  doc keys (keys, not rows) — for LIMIT queries this residual was ELIMINATED by
+  layer 2 below (now O(replicas × k)); it remains only for no-LIMIT statements,
+  whose complete match set is semantically required.
 - **Tests** (`router.rs`, RED→GREEN via a test-only per-thread partition-read
   counter): `fts_match_limit_stops_partition_reads_at_limit` (10 matches,
   LIMIT 3 → exactly 3 reads), `fts_match_limit_post_filtered_rows_do_not_count_toward_limit`
   (dropped rows trigger further reads, exact LIMIT), `fts_match_no_limit_pages_bound_accumulation`
   (pages 3/3/1, union = all rows, no dups), `fts_match_no_limit_returns_all_matching_rows`
   (no server-side truncation).
+
+## Progress — `fts_match` REPLICA-side search bounded (`t_ee98faa0` layer 2)
+
+**Landed.** The coordinator fix above was verified correct but
+live-insufficient: one broad
+`SELECT entity_id FROM agent_memory.entity_store WHERE context_snippet = fts_match('memory') LIMIT 10 ALLOW FILTERING`
+still **OOM-killed ALL THREE 2 GiB-capped nodes simultaneously** — the kill
+moved inside each replica's `StorageEngine::fulltext_search`.
+
+**Confirmed allocation roots** (traced CQL fts arm → `WritePath::fulltext_search`
+→ `coordinate_fulltext_search` → `FulltextSearchHandler` → engine →
+`ferrosa-index` reader; measured with allocator-tracked RED tests):
+
+1. **Suspect 1 CONFIRMED — score-everything-then-rank, multiplied.** Per
+   sidecar: `std::fs::read` of the WHOLE FTI file, then
+   `FullTextIndexReader::open` deserializing EVERY term + posting (O(index)),
+   then `search()` cloning every matching doc key into an owned score map +
+   sorted `Vec<FtsHit>` (O(matches)); then the ENGINE unioned all hits into
+   another owned map + sorted Vec (O(matches) again); then the full key set
+   was bincode-serialized into the internode response. Measured: reader
+   search peak 574 KB @ 4k matching docs → 9.19 MB @ 64k (ratio 16.00);
+   engine search peak 2.82 MB @ 2k → 45.1 MB @ 32k (ratio 16.02) — pure O(N),
+   which at `entity_store` scale is the 2 GiB kill. Adjacent multipliers with
+   the same shape: the transient memtable FTI and the missing-sidecar
+   fallback FTI were built, `serialize_fti`'d, and re-`open`'d — 3× the
+   indexed text held at once — and the fallback used ONE builder across ALL
+   uncovered SSTables.
+2. **Suspect 2 REFUTED for the query path.** The
+   `cannot resolve index target column … table unregistered` churn for
+   orphaned `fts_probe_*` registrations comes from the BOOT-time
+   `reload_indexes_from_system_schema` (`ferrosa/src/main.rs`), re-emitted on
+   every OOM restart — reload skips each dangling row before any index work.
+   The query path only ever opens `{gen}-FTI-{queried_index}.db` sidecars.
+   Pinned by `fts_search_touches_only_queried_index_sidecars` (engine test +
+   per-thread sidecar-consulted counter). The dangling-registration
+   DROP-TABLE bug itself is captured separately on the forge board.
+
+**Fix (query-derived bound pushed down end-to-end; no server caps):**
+
+- `ferrosa-index`: `FullTextIndexReader::search_top_k[_str]` (bounded top-k,
+  borrow-based evaluation — owned memory O(k)); `fulltext::stream::
+  stream_search_term` (single-term search straight off the sidecar file via
+  `BufReader` + sorted-dictionary early-exit — never reads/deserializes the
+  whole index); `fulltext::topk::TopK` (min-heap, ties prefer the smaller key
+  to match the arm's deterministic order); `from_index` (no
+  serialize→deserialize round trip).
+- `ferrosa-storage`: `fulltext_search(table, index, query, limit)` — Term
+  queries stream off each sidecar; other shapes deserialize but select
+  top-k; memtable + missing-sidecar transient FTIs are queried in place and
+  built PER SSTable (peak = one SSTable's indexed column, was 3× ALL of
+  them).
+- `ferrosa-cluster`: `limit` threaded through `WritePath::fulltext_search`,
+  `coordinate_fulltext_search`, and `FulltextSearchRequestPayload.limit`
+  (**bincode wire change — upgrade all nodes together**). Union ≤ replicas × k.
+- `ferrosa-cql`: the fts arm passes `LIMIT k` down; when post-filtering
+  exhausts the bounded hit set before `limit` rows survive it escalates
+  geometrically (k → 4k → …) and re-runs, stopping when the union is provably
+  complete (union < requested ⇒ no replica truncated). Completeness is
+  preserved; peak is O(final k), a function of the query's LIMIT and actual
+  post-filter selectivity.
+
+**RED→GREEN evidence** (allocator-tracked, index/rows built OUTSIDE the
+measurement window, hard budgets so a blow-up FAILS instead of OOM-ing):
+
+- `ferrosa-index/tests/fulltext_topk_memory_bound.rs`: RED 574,350 B @ 4k →
+  9,189,390 B @ 64k matching docs (ratio 16.00, budget 256 KiB blown 35×);
+  GREEN 798 B @ 4k → 798 B @ 64k (ratio 1.00). Semantics guard: top-k scores
+  identical to the unbounded search's first k.
+- `ferrosa-storage/tests/fulltext_replica_memory_bound.rs` (real engine +
+  real on-disk sidecar): RED 2,816,131 B @ 2k → 45,122,211 B @ 32k (ratio
+  16.02, budget 1 MiB blown 43×); GREEN 9,450 B @ 2k → 9,450 B @ 32k (ratio
+  1.00). Plus `no_limit_search_still_returns_complete_match_set` (no
+  server-side truncation).
+- Router: `fts_match_limit_escalates_until_limit_survives_post_filter`
+  (25/30 rows post-filtered away, LIMIT 4 starts at k=4 and still returns 4
+  rows; short-complete results terminate the loop).
+
+**Remaining bounded residuals** (documented, not the live OOM shape):
+
+- No-LIMIT `fts_match`: the complete O(matches) doc-key set is returned
+  (semantically required); non-key memory is bounded (streaming term search /
+  borrow-based eval). Truly streaming doc-key delivery would need a chunked
+  fulltext RPC — deferred.
+- Non-`Term` query shapes (`AND`/`OR`/`NOT`/prefix/phrase) against a sidecar
+  still deserialize that one sidecar's index (O(one sidecar)) before the
+  bounded top-k selection; per-file, dropped between files. A term-subset
+  streaming loader would remove this — deferred.
+- The missing-sidecar fallback scan builds a transient FTI over ONE
+  SSTable's indexed column at a time (repair-window path; inherent to
+  "sidecar missing, must scan").
 
 **Deferred consumers still materializing** (bounded by the caller's own
 `limit`/page — not the OOM path, but not yet streaming): the CQL `PartitionKeyLookup`

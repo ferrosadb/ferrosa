@@ -96,8 +96,19 @@ partition); with no LIMIT, it builds one page per response (client `page_size`
 or the default scan page size) and returns a `PagingState` continuation
 (partition-granular cursor), so the complete result is delivered across pages
 while the coordinator holds ≈ one page + one partition. Results are never
-truncated server-side — bounded only by the query's own LIMIT. Known bounded
-residual: the FTS hit-set itself is O(matches) small doc keys (keys, not rows).
+truncated server-side — bounded only by the query's own LIMIT.
+
+Layer 2 (t_ee98faa0, replica side): with a LIMIT the arm pushes the
+query-derived `k` down the write path (`fulltext_search(.., Some(k))`), so
+every replica holds a bounded top-k working set and the unioned hit set is
+O(replicas × k) — the previous O(matches) hit-set residual now applies only to
+no-LIMIT statements, whose complete match set is genuinely required. If
+post-filtering (non-fts predicates + row-granular key retain) exhausts the
+bounded hit set before `limit` rows survive, the arm escalates geometrically
+(k → 4k → …) and re-runs; it stops as soon as the union is provably complete
+(union smaller than the requested k means no replica truncated). Peak memory
+is O(final k) — derived from the query's LIMIT and the actual post-filter
+selectivity, never a server constant.
 
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 

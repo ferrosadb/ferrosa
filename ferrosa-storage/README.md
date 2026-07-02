@@ -60,11 +60,23 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
-- **Full-text search** (`fulltext_search`) — searches the memtable FTI + each
-  per-SSTable `-FTI-{index}.db` sidecar, and **falls back to scanning any live
-  SSTable whose sidecar is transiently missing** (the async index-rebuild window
-  after compaction), so a stable row is never dropped from `fts_match`
-  (BUG-F-007 / t_0455c0a1).
+- **Full-text search** (`fulltext_search(table, index, query, limit)`) —
+  searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
+  **falls back to scanning any live SSTable whose sidecar is transiently
+  missing** (the async index-rebuild window after compaction), so a stable row
+  is never dropped from `fts_match` (BUG-F-007 / t_0455c0a1). Memory is
+  bounded (t_ee98faa0 layer 2 — a broad `fts_match` used to OOM every
+  replica): `limit` is the QUERY-derived `LIMIT k` pushed down by the
+  coordinator (never a server cap) and bounds every per-source working set to
+  a top-k; single-term queries stream postings straight off the sidecar file
+  (`ferrosa_index::fulltext::stream`) without reading or deserializing the
+  whole index; transient memtable/fallback FTIs are queried in place (no
+  serialize→deserialize round trip) and built per-SSTable, not across all
+  uncovered SSTables at once. Only the queried index's sidecars are consulted
+  — orphaned registrations are never touched on the query path. Guarded by
+  `tests/fulltext_replica_memory_bound.rs` (allocator-tracked peak: O(k),
+  independent of matching-doc count) and
+  `engine::tests::fts_search_touches_only_queried_index_sidecars`.
 - **Snapshot / PITR** (`snapshot/`, `restore/`, `commitlog/archiver.rs`) —
   S3 snapshot manager, commit-log archiving, restore manager with validation.
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows

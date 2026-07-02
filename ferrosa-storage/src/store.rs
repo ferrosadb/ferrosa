@@ -4437,12 +4437,18 @@ impl<F: FlushTarget> TableStore<F> {
     /// transient FTI over the current memtable snapshots and runs the same query
     /// evaluator used by sidecar readers so fresh rows and flushed rows follow
     /// the same matching semantics.
+    ///
+    /// `limit` is the query-derived `LIMIT k` bound: when `Some(k)` only the k
+    /// best-scoring hits are retained (bounded top-k, t_ee98faa0 layer 2). The
+    /// transient index is queried in place — it is never serialized and
+    /// re-deserialized (that round trip used to hold 3× the indexed text).
     pub fn fulltext_memtable_search(
         &self,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
-        use ferrosa_index::fulltext::builder::{serialize_fti, FullTextIndexBuilder};
+        use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
@@ -4497,15 +4503,12 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(vec![]);
         }
 
-        let bytes = serialize_fti(&fti).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("fts_match memtable index error: {e}"))
-        })?;
-        let reader = FullTextIndexReader::open(bytes).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("fts_match memtable index error: {e}"))
-        })?;
-
-        Ok(reader
-            .search(&parsed_query)
+        let reader = FullTextIndexReader::from_index(fti);
+        let hits = match limit {
+            Some(k) => reader.search_top_k(&parsed_query, k),
+            None => reader.search(&parsed_query),
+        };
+        Ok(hits
             .into_iter()
             .map(|hit| (hit.partition_key, hit.score))
             .collect())
@@ -4524,13 +4527,21 @@ impl<F: FlushTarget> TableStore<F> {
     /// (BUG-F-007 / t_0455c0a1). We build a transient FTI over each such
     /// SSTable's indexed column and run the same query, so a stable row is never
     /// transiently dropped from full-text search.
+    ///
+    /// Memory bounds (t_ee98faa0 layer 2): one transient FTI is built PER
+    /// sidecar-less SSTable (not one across all of them) and queried in place
+    /// (never serialized + re-deserialized — that combination used to hold 3×
+    /// the total indexed text of every uncovered SSTable at once). Peak is
+    /// O(one SSTable's indexed column); with a query-derived `limit` the
+    /// retained hits are additionally bounded top-k per SSTable.
     pub fn fulltext_sstable_scan_missing_sidecar(
         &self,
         index_name: &str,
         query: &str,
         covered_gens: &std::collections::HashSet<String>,
+        limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
-        use ferrosa_index::fulltext::builder::{serialize_fti, FullTextIndexBuilder};
+        use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
@@ -4549,8 +4560,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         let schema = self.schema.load();
         let guard = self.view.load();
-        let mut builder = FullTextIndexBuilder::new();
-        let mut any_docs = false;
+        let mut out: Vec<(Vec<u8>, f64)> = Vec::new();
         for desc in guard.sstables.iter() {
             // SSTables with a sidecar are already covered by the engine's direct
             // sidecar search; only scan the ones that are (transiently) missing.
@@ -4572,6 +4582,10 @@ impl<F: FlushTarget> TableStore<F> {
                     continue;
                 }
             };
+            // One transient FTI per SSTable, dropped before the next one is
+            // scanned — peak stays O(this SSTable's indexed column), not
+            // O(every uncovered SSTable at once).
+            let mut builder = FullTextIndexBuilder::new();
             loop {
                 match iter.next_partition() {
                     Ok(Some(mut p)) => {
@@ -4596,7 +4610,6 @@ impl<F: FlushTarget> TableStore<F> {
                                     &row.clustering,
                                 );
                                 builder.add_document(doc_key, text.trim());
-                                any_docs = true;
                             }
                         }
                     }
@@ -4607,27 +4620,21 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
             }
+            let fti = builder.build();
+            if fti.doc_count == 0 {
+                continue;
+            }
+            // Query the transient index in place — no serialize/deserialize
+            // round trip (that used to hold 3× the indexed text at once).
+            let reader = FullTextIndexReader::from_index(fti);
+            let hits = match limit {
+                Some(k) => reader.search_top_k(&parsed_query, k),
+                None => reader.search(&parsed_query),
+            };
+            out.extend(hits.into_iter().map(|hit| (hit.partition_key, hit.score)));
         }
         drop(guard);
-
-        if !any_docs {
-            return Ok(vec![]);
-        }
-        let fti = builder.build();
-        if fti.doc_count == 0 {
-            return Ok(vec![]);
-        }
-        let bytes = serialize_fti(&fti).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("fts_match sstable index error: {e}"))
-        })?;
-        let reader = FullTextIndexReader::open(bytes).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("fts_match sstable index error: {e}"))
-        })?;
-        Ok(reader
-            .search(&parsed_query)
-            .into_iter()
-            .map(|hit| (hit.partition_key, hit.score))
-            .collect())
+        Ok(out)
     }
 
     /// Register a full-text index for this table.
