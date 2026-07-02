@@ -4303,6 +4303,111 @@ mod tests {
         )));
     }
 
+    /// DROP TABLE through the Raft apply route must cascade tombstones over
+    /// the dropped table's dogfooded `system_schema.indexes` registrations
+    /// (forge t_ae06e925). Before the fix, only DROP INDEX tombstoned its row;
+    /// DROP TABLE left every registration dangling, so each node boot's
+    /// `reload_indexes_from_system_schema` warned per orphan forever and
+    /// `system_schema.indexes` grew unboundedly (observed live: dozens of
+    /// orphaned `fts_probe_*` FullText registrations on the fmem-dev cluster).
+    /// An index on a *different* table must survive the cascade.
+    #[tokio::test]
+    async fn drop_table_tombstones_persisted_index_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let schema = test_schema_instance();
+        let mut sm = FerrosStateMachine::with_side_effects(Arc::new(schema), Arc::clone(&engine));
+
+        let mk_index = |table: &str, name: &str, ty: ferrosa_index::IndexType| IndexMetadata {
+            keyspace: "idxks".into(),
+            table: table.into(),
+            name: name.into(),
+            index_type: ty,
+            target_columns: vec!["value".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        let entries = vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("idxks"))),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("idxks", "tbl"))),
+            ),
+            make_entry(
+                1,
+                3,
+                RaftOp::CreateTable(Box::new(simple_table("idxks", "other_tbl"))),
+            ),
+            make_entry(
+                1,
+                4,
+                RaftOp::CreateIndex(mk_index(
+                    "tbl",
+                    "fts_probe_idx",
+                    ferrosa_index::IndexType::FullText,
+                )),
+            ),
+            make_entry(
+                1,
+                5,
+                RaftOp::CreateIndex(mk_index(
+                    "tbl",
+                    "value_btree_idx",
+                    ferrosa_index::IndexType::BTree,
+                )),
+            ),
+            make_entry(
+                1,
+                6,
+                RaftOp::CreateIndex(mk_index(
+                    "other_tbl",
+                    "survivor_idx",
+                    ferrosa_index::IndexType::BTree,
+                )),
+            ),
+        ];
+        sm.apply(entries).await.unwrap();
+
+        let live = engine.read_persisted_indexes().unwrap();
+        assert_eq!(
+            live.len(),
+            3,
+            "all three index registrations must be dogfooded before the drop: {live:?}"
+        );
+
+        sm.apply(vec![make_entry(
+            1,
+            7,
+            RaftOp::DropTable {
+                keyspace: "idxks".into(),
+                table: "tbl".into(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let remaining = engine.read_persisted_indexes().unwrap();
+        let dangling: Vec<_> = remaining
+            .iter()
+            .filter(|r| r.keyspace_name == "idxks" && r.table_name == "tbl")
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "DROP TABLE must tombstone every system_schema.indexes registration \
+             for the dropped table; dangling rows: {dangling:?}"
+        );
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the index on the surviving table must not be tombstoned: {remaining:?}"
+        );
+        assert_eq!(remaining[0].index_name, "survivor_idx");
+    }
+
     #[test]
     fn leave_node_cleans_node_from_index_state_map() {
         let mut sm = FerrosStateMachine::new();

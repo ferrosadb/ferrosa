@@ -317,6 +317,7 @@ static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static RANGE_READ_TRUNCATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INDEX_RELOAD_SKIPPED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -464,6 +465,25 @@ pub fn inc_range_read_truncated() {
 /// loud rather than truncating, since startup.
 pub fn range_read_truncated_total() -> u64 {
     RANGE_READ_TRUNCATED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record `n` persisted `system_schema.indexes` rows skipped as unresolvable
+/// during an index reload (`reload_indexes_from_system_schema`).
+///
+/// A non-zero steady-state value means the cluster carries dangling index
+/// registrations — typically debris from a DROP TABLE that predates the
+/// tombstone cascade (forge t_ae06e925). The debris is visible here instead of
+/// as per-orphan boot warns; clean it up with `DROP INDEX IF EXISTS` per
+/// orphan (no automatic GC: a table can legitimately be mid-registration at
+/// boot).
+pub fn add_index_reload_skipped(n: u64) {
+    INDEX_RELOAD_SKIPPED_ROWS_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Total unresolvable `system_schema.indexes` rows skipped by index reloads
+/// since startup. See [`add_index_reload_skipped`].
+pub fn index_reload_skipped_rows_total() -> u64 {
+    INDEX_RELOAD_SKIPPED_ROWS_TOTAL.load(Ordering::Relaxed)
 }
 
 pub fn observe_compaction_completed(
@@ -923,6 +943,14 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_range_read_truncated_total {}\n",
         RANGE_READ_TRUNCATED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_index_reload_skipped_rows_total Unresolvable system_schema.indexes rows skipped during index reload (dangling registrations; clean up with DROP INDEX IF EXISTS).\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_index_reload_skipped_rows_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_index_reload_skipped_rows_total {}\n",
+        INDEX_RELOAD_SKIPPED_ROWS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP ferrosa_storage_read_limited_rows_total Partition read_limited_rows calls.\n",

@@ -941,6 +941,21 @@ pub struct PersistedIndexRow {
     pub options: String,
 }
 
+/// Result of [`StorageEngine::reload_indexes_from_system_schema`].
+///
+/// `restored` counts re-registered indexes; `skipped` counts rows that could
+/// not be resolved (tombstone-shadowed rows never reach the reload, so a
+/// non-zero `skipped` in steady state means dangling registrations — see
+/// `ferrosa_storage_index_reload_skipped_rows_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexReloadOutcome {
+    /// Indexes successfully re-registered on their tables.
+    pub restored: usize,
+    /// Rows skipped as unresolvable (unknown kind, missing target column,
+    /// unregistered table, vector needing its dedicated rebuild path).
+    pub skipped: usize,
+}
+
 /// A decoded row of the persisted `system_schema.types` table.
 ///
 /// Returned by [`StorageEngine::read_persisted_types`] so both the CQL router
@@ -2926,6 +2941,40 @@ impl StorageEngine {
         self.tables.write().remove(table_id);
         self.remove_time_series_consolidator(table_id);
 
+        // Drop live in-memory index state for the table. The per-index maps
+        // (indexed_columns, fulltext_indexes, sidecar readers) live inside the
+        // removed `TableState`; the engine-wide `IndexStateTracker` is keyed
+        // separately and must be swept explicitly or DROP TABLE leaves ghost
+        // entries in `system.index_build_status`.
+        let removed_tracked = self
+            .index_tracker
+            .remove_table_indexes(table_id.keyspace(), table_id.table());
+        if removed_tracked > 0 {
+            tracing::info!(
+                table = %table_id,
+                removed_tracked,
+                "removed index tracker entries on DROP TABLE"
+            );
+        }
+
+        // Cascade DROP TABLE over the dogfooded `system_schema.indexes` rows
+        // (forge t_ae06e925). Only DROP INDEX used to tombstone its row, so
+        // every registration survived DROP TABLE as a dangling orphan: each
+        // node boot warned per orphan and the table grew unboundedly. Every
+        // DDL route (Direct, pair, cluster/Raft, DROP KEYSPACE per-table)
+        // funnels through this method, so this is the single cascade point.
+        // A failure is loud but does not abort the unregister — the reload
+        // skipped-rows metric surfaces any debris it leaves behind.
+        if let Err(e) = self.write_index_tombstones_for_table(table_id.keyspace(), table_id.table())
+        {
+            tracing::error!(
+                table = %table_id,
+                %e,
+                "DROP TABLE: failed to tombstone system_schema.indexes registrations — \
+                 dangling rows will show up in ferrosa_storage_index_reload_skipped_rows_total"
+            );
+        }
+
         // Delete local SSTable directory so DROP+CREATE starts empty.
         let table_dir = self
             .config
@@ -3013,14 +3062,16 @@ impl StorageEngine {
     ///
     /// Must run *after* `system_schema.indexes` and the user tables are
     /// registered (boot order: `register_system_tables` → local schema restore →
-    /// this). Returns the number of indexes re-registered. Rows that can't be
-    /// resolved (unknown kind, missing target column, unregistered table) are
-    /// logged and skipped rather than aborting the whole reload.
-    pub fn reload_indexes_from_system_schema(&self) -> ferrosa_common::Result<usize> {
+    /// this). Rows that can't be resolved (unknown kind, missing target
+    /// column, unregistered table) are counted as `skipped` and reported via
+    /// one summary warn plus the
+    /// `ferrosa_storage_index_reload_skipped_rows_total` metric — per-row
+    /// detail stays at debug level — rather than aborting the whole reload.
+    pub fn reload_indexes_from_system_schema(&self) -> ferrosa_common::Result<IndexReloadOutcome> {
         let indexes_tid = TableId::new("system_schema", "indexes");
         if !self.tables.read().contains_key(&indexes_tid) {
             // Table not registered (no dogfooded schema yet) — nothing to do.
-            return Ok(0);
+            return Ok(IndexReloadOutcome::default());
         }
 
         // Full scan of system_schema.indexes. This table holds one row per
@@ -3031,13 +3082,25 @@ impl StorageEngine {
         let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_RELOAD)?;
 
         let mut restored = 0usize;
+        let mut skipped = 0usize;
         let mut rows_seen = 0usize;
         for partition in &partitions {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 rows_seen += 1;
+                // A row fully shadowed by a DROP INDEX / DROP TABLE tombstone
+                // surfaces from the merge with its cells suppressed and the
+                // row-level deletion set. That is a *normal* deleted
+                // registration — not an unresolvable orphan — so it must not
+                // count toward `skipped` (or every past drop would inflate
+                // the dangling-registration metric forever).
+                if row.cells.is_empty() && !row.deletion.is_live() {
+                    continue;
+                }
                 if self.reload_one_index(&keyspace, row)? {
                     restored += 1;
+                } else {
+                    skipped += 1;
                 }
             }
         }
@@ -3048,7 +3111,24 @@ impl StorageEngine {
                 "system_schema.indexes reload hit the read cap — some indexes may not have been restored"
             );
         }
-        Ok(restored)
+        if skipped > 0 {
+            // One summary warn instead of a warn per orphan — dangling
+            // registrations (DROP TABLE debris predating the tombstone
+            // cascade, forge t_ae06e925) previously churned boot logs with
+            // one warn each. Per-row detail is at debug level; the counter
+            // makes dirty clusters visible in metrics. No automatic GC:
+            // a table can legitimately be mid-registration at boot — clean
+            // orphans manually with `DROP INDEX IF EXISTS`.
+            crate::metrics::add_index_reload_skipped(skipped as u64);
+            tracing::warn!(
+                skipped,
+                restored,
+                "system_schema.indexes reload skipped unresolvable rows (likely dangling \
+                 registrations from a pre-cascade DROP TABLE; per-row detail at debug level; \
+                 clean up with DROP INDEX IF EXISTS)"
+            );
+        }
+        Ok(IndexReloadOutcome { restored, skipped })
     }
 
     /// Reads every live row of the persisted `system_schema.indexes` table and
@@ -3172,6 +3252,40 @@ impl StorageEngine {
         self.write(&tid, &key, row, ts)
     }
 
+    /// Tombstones every live `system_schema.indexes` row registered on
+    /// `(keyspace, table)` — the DROP TABLE cascade (forge t_ae06e925).
+    ///
+    /// Reuses [`Self::write_index_tombstone`] per row, so the tombstone uses
+    /// the exact composite-clustering encoding the create path wrote. Reads
+    /// only *live* rows, so a repeat call is an inexpensive no-op. Returns the
+    /// number of registrations tombstoned. Called by
+    /// [`Self::unregister_table`]; also usable directly to clean pre-existing
+    /// orphans left by drops that predate the cascade.
+    pub fn write_index_tombstones_for_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<usize> {
+        let rows = self.read_persisted_indexes()?;
+        let mut removed = 0usize;
+        for row in rows
+            .iter()
+            .filter(|r| r.keyspace_name == keyspace && r.table_name == table)
+        {
+            self.write_index_tombstone(keyspace, table, &row.index_name)?;
+            removed += 1;
+        }
+        if removed > 0 {
+            tracing::info!(
+                keyspace,
+                table,
+                removed,
+                "DROP TABLE: tombstoned system_schema.indexes registrations"
+            );
+        }
+        Ok(removed)
+    }
+
     /// Re-registers a single index from a decoded `system_schema.indexes` row.
     ///
     /// Returns `Ok(true)` when the index was re-registered, `Ok(false)` when the
@@ -3231,7 +3345,12 @@ impl StorageEngine {
         // ordinal (generic single-column indexes target one column).
         let target_col = target.split(", ").next().unwrap_or(&target);
         let Some(column_position) = self.regular_column_position(&table_id, target_col) else {
-            tracing::warn!(
+            // Debug, not warn: this is the per-orphan case (dangling
+            // registration from a pre-cascade DROP TABLE) that used to churn
+            // one warn per orphan on every boot. The caller emits one summary
+            // warn with the skipped count and bumps
+            // `ferrosa_storage_index_reload_skipped_rows_total`.
+            tracing::debug!(
                 keyspace,
                 table,
                 index_name,
@@ -17429,9 +17548,9 @@ mod tests {
             "index must be absent before reconstruction — proves the test exercises the fix"
         );
 
-        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
         assert_eq!(
-            restored, 1,
+            outcome.restored, 1,
             "exactly one persisted index should be restored"
         );
 
@@ -17439,6 +17558,303 @@ mod tests {
             engine.index_type_for_test(&user_tid, "idx_val_phonetic"),
             Some(IndexType::Phonetic),
             "index must survive restart AND keep its real Phonetic type, not the BTree default"
+        );
+    }
+
+    /// Builds a `system_schema.indexes` registration row exactly as the DDL
+    /// write path does, for the DROP TABLE cascade tests.
+    fn persist_index_row(
+        engine: &StorageEngine,
+        keyspace: &str,
+        table: &str,
+        name: &str,
+        index_type: ferrosa_index::IndexType,
+    ) {
+        let meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            name: name.to_string(),
+            index_type,
+            target_columns: vec!["val".to_string()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let row = ferrosa_schema::system::persistence::index_to_rows(&meta);
+        engine
+            .write(
+                &TableId::new("system_schema", "indexes"),
+                &row.key,
+                row.row,
+                now_micros_for_test(),
+            )
+            .unwrap();
+    }
+
+    /// DROP TABLE cascade (forge t_ae06e925): `unregister_table` — the engine
+    /// entry point every DDL route (Direct, pair, cluster/Raft) funnels
+    /// through — must tombstone every live `system_schema.indexes` row
+    /// registered on the dropped table — mixed kinds included — while leaving
+    /// other tables' registrations untouched, and must drop the table's
+    /// entries from the live `IndexStateTracker`.
+    #[test]
+    fn drop_table_index_tombstone_cascade_removes_all_rows() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "fts_probe_idx",
+            IndexType::FullText,
+        );
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_btree_idx",
+            IndexType::BTree,
+        );
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "other_table",
+            "survivor_idx",
+            IndexType::BTree,
+        );
+        engine
+            .index_tracker()
+            .register_index("test_ks", "test_table", "fts_probe_idx");
+        engine
+            .index_tracker()
+            .register_index("test_ks", "test_table", "val_btree_idx");
+        engine
+            .index_tracker()
+            .register_index("test_ks", "other_table", "survivor_idx");
+
+        assert_eq!(engine.read_persisted_indexes().unwrap().len(), 3);
+
+        engine
+            .unregister_table(&TableId::new("test_ks", "test_table"))
+            .unwrap();
+
+        let remaining = engine.read_persisted_indexes().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the other table's registration survives: {remaining:?}"
+        );
+        assert_eq!(remaining[0].index_name, "survivor_idx");
+
+        // Live in-memory tracker state for the dropped table is gone too.
+        assert!(
+            !engine
+                .index_tracker()
+                .remove_index("test_ks", "test_table", "fts_probe_idx"),
+            "tracker entry for the dropped table's index must already be removed"
+        );
+        assert!(
+            engine
+                .index_tracker()
+                .remove_index("test_ks", "other_table", "survivor_idx"),
+            "tracker entry for the surviving table must be untouched"
+        );
+
+        // Idempotent: a direct second cascade finds nothing live.
+        assert_eq!(
+            engine
+                .write_index_tombstones_for_table("test_ks", "test_table")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Reload observability (forge t_ae06e925): rows that cannot be resolved
+    /// (orphaned registrations from a pre-fix DROP TABLE) are *counted* — one
+    /// summary warn + a metric instead of a per-orphan warn — and the cascade
+    /// clears them so the next reload reports zero skipped.
+    #[test]
+    fn reload_counts_skipped_orphan_rows_and_cascade_clears_them() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+
+        // One resolvable index on the registered table, two orphans on a
+        // table that no longer exists (simulating pre-fix DROP TABLE debris).
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        persist_index_row(
+            &engine,
+            "ghost_ks",
+            "ghost_table",
+            "fts_probe_1",
+            IndexType::FullText,
+        );
+        persist_index_row(
+            &engine,
+            "ghost_ks",
+            "ghost_table",
+            "fts_probe_2",
+            IndexType::FullText,
+        );
+
+        let metric_before = crate::metrics::index_reload_skipped_rows_total();
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(outcome.restored, 1, "the resolvable index is restored");
+        assert_eq!(
+            outcome.skipped, 2,
+            "both orphaned registrations are counted as skipped"
+        );
+        assert!(
+            crate::metrics::index_reload_skipped_rows_total() >= metric_before + 2,
+            "the skipped-rows metric must expose orphan debris"
+        );
+
+        // The DROP TABLE cascade clears the orphans; the next reload is clean.
+        assert_eq!(
+            engine
+                .write_index_tombstones_for_table("ghost_ks", "ghost_table")
+                .unwrap(),
+            2
+        );
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(outcome.skipped, 0, "no orphans remain after the cascade");
+        assert_eq!(outcome.restored, 1);
+    }
+
+    /// The live fmem-dev scenario end-to-end (forge t_ae06e925): CREATE
+    /// indexes → DROP TABLE → engine restart. The reload after the restart
+    /// must report zero skipped rows (before the cascade, every registration
+    /// survived as an orphan and warned on every boot) — proving the cascade
+    /// tombstones are durable through commit-log replay, not memtable-only.
+    #[test]
+    fn reload_after_drop_table_and_restart_reports_zero_skipped() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_system_tables().unwrap();
+
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "fts_probe_1",
+                IndexType::FullText,
+            );
+            persist_index_row(
+                &engine,
+                "test_ks",
+                "test_table",
+                "fts_probe_2",
+                IndexType::FullText,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+
+            // DROP TABLE via the engine choke point every DDL route uses.
+            engine
+                .unregister_table(&TableId::new("test_ks", "test_table"))
+                .unwrap();
+            // No flush of system_schema.indexes: the tombstones must survive
+            // the restart via commit-log replay.
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+        // Replay the pending commit-log mutations (the registration AND the
+        // cascade tombstones). Without this replay the reopened store is empty
+        // and `skipped == 0` holds VACUOUSLY — the pre-fix engine (registration
+        // surviving, no tombstone) would pass too. With replay, a missing
+        // cascade leaves an orphaned live row and `skipped` counts it (the
+        // sibling `reload_counts_skipped_orphan_rows_...` test proves the
+        // counter detects exactly that shape).
+        assert!(
+            !pending.is_empty(),
+            "expected pending commit-log mutations to replay; an empty replay \
+             set would make this test vacuous"
+        );
+        engine.replay_mutations(pending).unwrap();
+
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(
+            outcome.skipped, 0,
+            "no orphaned registrations may survive DROP TABLE + restart"
+        );
+        assert_eq!(outcome.restored, 0);
+        assert!(
+            engine.read_persisted_indexes().unwrap().is_empty(),
+            "system_schema.indexes must hold no live rows for the dropped table"
+        );
+    }
+
+    /// Recreate edge (forge t_ae06e925): after the DROP TABLE cascade
+    /// tombstones a registration, re-persisting a same-named registration
+    /// with fresh timestamps must be live — the older tombstone cannot shadow
+    /// the new row (row-deletion suppression keeps cells with
+    /// `timestamp >= marked_for_delete_at`).
+    #[test]
+    fn recreated_same_named_index_after_cascade_is_live() {
+        use ferrosa_index::IndexType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::BTree,
+        );
+        assert_eq!(
+            engine
+                .write_index_tombstones_for_table("test_ks", "test_table")
+                .unwrap(),
+            1
+        );
+        assert!(engine.read_persisted_indexes().unwrap().is_empty());
+
+        // Fresh registration strictly after the tombstone's wall-clock stamp.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        persist_index_row(
+            &engine,
+            "test_ks",
+            "test_table",
+            "val_idx",
+            IndexType::Phonetic,
+        );
+
+        let rows = engine.read_persisted_indexes().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "recreated same-named registration must be live: {rows:?}"
+        );
+        assert_eq!(rows[0].index_name, "val_idx");
+        assert_eq!(
+            rows[0].kind, "phonetic",
+            "the NEW registration's kind wins, not the pre-drop one"
         );
     }
 
@@ -17588,8 +18004,8 @@ mod tests {
         let (engine, _pending) = StorageEngine::open(config, None).unwrap();
         engine.register_system_tables().unwrap();
 
-        let restored = engine.reload_indexes_from_system_schema().unwrap();
-        assert_eq!(restored, 1, "the filtered index should be restored");
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        assert_eq!(outcome.restored, 1, "the filtered index should be restored");
 
         assert_eq!(
             engine.index_type_for_test(&user_tid, "name_active_idx"),
@@ -18564,10 +18980,14 @@ mod tests {
         engine
             .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
             .unwrap();
-        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
         assert_eq!(
-            restored, 0,
+            outcome.restored, 0,
             "the dangling registration must be skipped, not restored"
+        );
+        assert_eq!(
+            outcome.skipped, 1,
+            "the dangling registration must be COUNTED as skipped (observability)"
         );
 
         // The query against idx_a: exactly ONE sidecar (idx_a's) consulted.

@@ -133,6 +133,17 @@ impl IndexStateTracker {
         });
     }
 
+    /// Removes every tracked index on `(keyspace, table)` — the DROP TABLE
+    /// cascade counterpart of per-index [`remove_index`](Self::remove_index).
+    ///
+    /// Returns the number of entries removed.
+    pub fn remove_table_indexes(&self, keyspace: &str, table: &str) -> usize {
+        let mut states = self.states.write();
+        let before = states.len();
+        states.retain(|(ks, tbl, _), _| !(ks == keyspace && tbl == table));
+        before - states.len()
+    }
+
     /// Removes an index from tracking.
     ///
     /// Returns `true` if the index was present and removed.
@@ -280,6 +291,27 @@ mod tests {
         let tracker = IndexStateTracker::new();
         assert!(tracker.all_states().is_empty());
         assert!(tracker.get_state("ks", "tbl", "idx").is_none());
+    }
+
+    /// DROP TABLE cascade: `remove_table_indexes` sweeps every entry keyed on
+    /// the dropped `(keyspace, table)` and only those (forge t_ae06e925).
+    #[test]
+    fn remove_table_indexes_sweeps_only_that_table() {
+        let tracker = IndexStateTracker::new();
+        tracker.register_index("ks", "tbl", "idx_a");
+        tracker.register_index("ks", "tbl", "idx_b");
+        tracker.register_index("ks", "other", "idx_c");
+        tracker.register_index("ks2", "tbl", "idx_d");
+
+        assert_eq!(tracker.remove_table_indexes("ks", "tbl"), 2);
+
+        assert!(tracker.get_state("ks", "tbl", "idx_a").is_none());
+        assert!(tracker.get_state("ks", "tbl", "idx_b").is_none());
+        assert!(tracker.get_state("ks", "other", "idx_c").is_some());
+        assert!(tracker.get_state("ks2", "tbl", "idx_d").is_some());
+
+        // Idempotent: nothing left to remove.
+        assert_eq!(tracker.remove_table_indexes("ks", "tbl"), 0);
     }
 
     #[test]
