@@ -11,6 +11,18 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Paged multi-replica stream lifecycle (t_dc729b1d / t_3fc6be3c, CL-14).**
+  Fixed the phantom `expected_seq=0 observed_seq=5` gap-close on every abandoned
+  page (seq-state creation now gated on route liveness; no-state+no-route is a
+  terminal straggler and drops silently; genuine gaps on live routes still close
+  loudly, counted by `StreamFrameRouter::route_closures()`), and the coordinator
+  now actually FIRES `RangeReadStreamCancel` from the per-replica forwarder task
+  whenever a stream ends without Done (consumer abandoned a page / errored), with
+  the Cancel MsgType registered on the producer side. Counter-asserted 3-node
+  loopback harness: `tests/range_scan_multi_replica_paging.rs`.
+  **Follow-up before closing:** live RF=3 validation on fmem-dev (viz WS run +
+  15k-row 3-page `SELECT id`) — the reverted predecessor (3ec30240, Drop-guard
+  cancel) passed in-process tests but sent zero cancels live.
 - **Multi-key Accord — additive V2 wire foundation + `new_multi` API (Phase 1).**
   Multi-key (multi-partition) transactions will travel on new
   `AccordPreAcceptV2`/`AccordApplyV2` message codes (bincode is not

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-07-01
 executive_summary: >
   The internode transport for ferrosa: a custom framed TCP wire protocol with a
   44-byte header, a PSK-HMAC handshake, three priority lanes (Raft/Data/Bulk) per
@@ -44,7 +44,7 @@ that is wrong — see `Cargo.toml` and `src/task_pool.rs`.)
 | `rpc/client` | `RpcClient`: outbound connection, frame reader/writer loops, bandwidth metrics |
 | `rpc/handler` | `HandlerRegistry` (`MsgType`→handler, dynamic), `RpcHandler` trait, `PingHandler` |
 | `tls` | rustls (ring) `TlsAcceptor`/`TlsConnector` from PEM paths; `require_tls` enforcement |
-| `stream_router` | Per-`request_id` dispatch for multi-message streaming RPCs |
+| `stream_router` | Per-`request_id` dispatch for multi-message streaming RPCs; `is_registered` route-liveness predicate for callers' per-request state |
 | `idle_timeout` | Producer-quiet watchdog for streaming consumers (heartbeats reset the deadline) |
 | `peer` | Per-peer registry, liveness/heartbeat state |
 | `skew` | Per-peer RTT + clock-skew tracking; feeds Accord `SkewMax` |
