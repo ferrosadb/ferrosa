@@ -1,11 +1,14 @@
 # Pin the exact toolchain so CI is deterministic and doesn't drift with the
-# runner's "stable". 1.96.1 is a patch release over 1.96.0 (linker/codegen
-# fixes, incl. the ld SIGBUS class seen in CI — t_9291a8dd) with no new lints,
-# so pinning is safe mid-release. dtolnay/rust-toolchain reads this file when no
-# explicit toolchain is passed, and it supersedes the action's `targets:` input
-# — so the musl target MUST be declared here or the Static Build (musl) job
-# loses its target (E0463 can't find crate for `core`).
+# runner's "stable". 1.96.1 is a patch over 1.96.0 (linker/codegen fixes, incl.
+# the ld SIGBUS class — t_9291a8dd) with no new lints, so pinning is safe.
+#
+# dtolnay/rust-toolchain reads this file when no explicit toolchain is passed,
+# and it SUPERSEDES the action's `targets:` input — so every cross-compile
+# target CI/examples build MUST be listed here, or the job that needs it fails
+# with E0463 "can't find crate for core":
+#   x86_64/aarch64-unknown-linux-musl  -> Static Build (musl)
+#   wasm32-unknown-unknown             -> WASM UDF examples (Example CQL Scripts)
 [toolchain]
 channel = "1.96.1"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-unknown-linux-musl"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "wasm32-unknown-unknown"]
