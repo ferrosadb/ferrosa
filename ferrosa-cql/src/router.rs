@@ -4076,53 +4076,6 @@ async fn route_select_user_table(
             .index_usage_tracker
             .record(ks, &s.table, index_name, "FullText");
 
-        // Route the FTI lookup through the write path so it scatter-gathers
-        // across the cluster. `fts_match` carries no partition key, so its hits
-        // span all token ranges; a coordinator-local lookup returned 0/1
-        // depending on which node served the query (BUG-F-007 / t_0d08aa43).
-        // Standalone/pair still resolves locally via the same call.
-        let matching_pks = state
-            .write_path
-            .load()
-            .fulltext_search(&table_id, index_name, fts_query)
-            .await
-            .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
-
-        // `matching_pks` are full-key document ids (partition + clustering), one
-        // per matching ROW. Read each distinct partition once, keep ONLY the rows
-        // whose full key actually matched — so non-matching clustering rows in a
-        // matched partition don't leak (t_da51e20c) — then post-filter.
-        //
-        // Coordinator memory bound (t_ee98faa0 — this exact arm OOM-killed a
-        // live node on a broad `fts_match` over a large table): the hit-set
-        // `matched` is O(matches) SMALL keys (doc ids, not rows) — an accepted
-        // residual. ROW accumulation is bounded:
-        //   * LIMIT present — stop point-reading as soon as `limit` rows survive
-        //     the post-filter (peak ≈ limit rows + one partition), and stop
-        //     consulting the remaining matched partitions entirely;
-        //   * no LIMIT — the full result is legitimate, so bound MEMORY, not the
-        //     result: build one page per response (client `page_size`, or the
-        //     default scan page size when the client sends none) and return a
-        //     `PagingState` continuation. Peak ≈ page_size rows + one partition.
-        // The result itself is NEVER truncated server-side: it is bounded only
-        // by the query's own LIMIT (or delivered completely across pages).
-        let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
-
-        // Distinct matched partitions in a DETERMINISTIC order (raw partition-key
-        // bytes). CQL promises no ordering for this arm, but the HashSet's
-        // arbitrary iteration order previously decided WHICH rows a LIMIT kept;
-        // sorting makes the LIMIT early-exit and the page continuation cursor
-        // reproducible. Legacy/malformed ids (e.g. a sidecar built before
-        // row-granular keys, pending rebuild) are skipped rather than misread.
-        let mut fts_partitions: Vec<Vec<u8>> = matched
-            .iter()
-            .filter_map(|doc_key| {
-                ferrosa_index::fulltext::keys::doc_key_partition(doc_key).map(<[u8]>::to_vec)
-            })
-            .collect();
-        fts_partitions.sort_unstable();
-        fts_partitions.dedup();
-
         let fts_limit = s
             .limit
             .as_ref()
@@ -4142,82 +4095,175 @@ async fn route_select_user_table(
         } else {
             None
         };
-        let pending: Vec<&Vec<u8>> = fts_partitions
-            .iter()
-            .filter(|pk| {
-                fts_resume
-                    .as_ref()
-                    .is_none_or(|cur| pk.as_slice() > cur.partition_key.as_slice())
-            })
-            .collect();
 
-        let mut fts_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
-        let mut fts_paging_state: Option<Vec<u8>> = None;
-        for (idx, pk) in pending.iter().enumerate() {
-            #[cfg(test)]
-            FTS_MATCH_PARTITION_READS.with(|c| c.set(c.get() + 1));
-            let decorated =
-                ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
-            if let Some(mut partition) = state
+        // Memory bounds for this arm (t_ee98faa0 — a broad `fts_match` over a
+        // large table OOM-killed live nodes, first at the coordinator, then
+        // layer 2 inside every replica's `fulltext_search`):
+        //   * LIMIT k — the bound is pushed down to every replica
+        //     (`fulltext_search(.., Some(requested))`), so each holds a bounded
+        //     top-k working set and the unioned hit set is O(replicas × k).
+        //     Post-filter key exhaustion is handled by GEOMETRIC ESCALATION
+        //     (below) — never by a server-side cap.
+        //   * no LIMIT — the complete match set is legitimately required
+        //     (`limit=None` down the stack); ROW memory is still bounded by
+        //     building one page per response with a `PagingState` continuation.
+        // The result is NEVER truncated server-side: it is bounded only by the
+        // query's own LIMIT (or delivered completely across pages).
+        //
+        // Escalation loop: start with `requested = k`. If the post-filter
+        // (non-fts predicates + row-granular doc-key retain) drops enough rows
+        // that fewer than `limit` survive AND the replica hit set may have been
+        // truncated (union size >= requested implies SOME replica may have hit
+        // its bound; union < requested proves every replica returned its
+        // complete local set), retry with `requested × 4`. Terminates because
+        // `requested` grows geometrically and once it exceeds every replica's
+        // local match count the union is provably complete. Peak memory is
+        // O(final requested) — derived from the query's LIMIT and the actual
+        // post-filter selectivity, not a server constant.
+        let mut requested: Option<usize> = fts_limit;
+        let (fts_rows, fts_paging_state) = loop {
+            // Route the FTI lookup through the write path so it scatter-gathers
+            // across the cluster. `fts_match` carries no partition key, so its
+            // hits span all token ranges; a coordinator-local lookup returned
+            // 0/1 depending on which node served the query (BUG-F-007 /
+            // t_0d08aa43). Standalone/pair still resolves locally via the same
+            // call.
+            let matching_pks = state
                 .write_path
                 .load()
-                .read(&table_id, &decorated)
+                .fulltext_search(&table_id, index_name, fts_query, requested)
                 .await
-                .map_err(|e| CqlError::ServerError(format!("{e}")))?
-            {
-                // Keep only the rows whose full key is in the FTS match set.
-                partition.rows.retain(|row| {
-                    matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
-                        pk,
-                        &row.clustering,
-                    ))
-                });
-                let mut prows = bridge::partition_to_rows_with_storage_mapping(
-                    &partition,
-                    &all_col_names,
-                    &all_col_types,
-                    &pk_indices,
-                    &ck_indices,
-                    &storage_to_table,
+                .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
+
+            // Complete ⇔ no replica can have truncated its local hit set: a
+            // replica truncates only when its local matches exceed `requested`,
+            // in which case it returns exactly `requested` keys and the union
+            // has at least that many.
+            let hit_set_complete = match requested {
+                None => true,
+                Some(r) => matching_pks.len() < r,
+            };
+
+            // `matching_pks` are full-key document ids (partition +
+            // clustering), one per matching ROW. Read each distinct partition
+            // once, keep ONLY the rows whose full key actually matched — so
+            // non-matching clustering rows in a matched partition don't leak
+            // (t_da51e20c) — then post-filter.
+            let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+
+            // Distinct matched partitions in a DETERMINISTIC order (raw
+            // partition-key bytes). CQL promises no ordering for this arm, but
+            // the HashSet's arbitrary iteration order previously decided WHICH
+            // rows a LIMIT kept; sorting makes the LIMIT early-exit and the
+            // page continuation cursor reproducible. Legacy/malformed ids
+            // (e.g. a sidecar built before row-granular keys, pending rebuild)
+            // are skipped rather than misread.
+            let mut fts_partitions: Vec<Vec<u8>> = matched
+                .iter()
+                .filter_map(|doc_key| {
+                    ferrosa_index::fulltext::keys::doc_key_partition(doc_key).map(<[u8]>::to_vec)
+                })
+                .collect();
+            fts_partitions.sort_unstable();
+            fts_partitions.dedup();
+
+            let pending: Vec<&Vec<u8>> = fts_partitions
+                .iter()
+                .filter(|pk| {
+                    fts_resume
+                        .as_ref()
+                        .is_none_or(|cur| pk.as_slice() > cur.partition_key.as_slice())
+                })
+                .collect();
+
+            let mut fts_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+            let mut fts_paging_state: Option<Vec<u8>> = None;
+            for (idx, pk) in pending.iter().enumerate() {
+                #[cfg(test)]
+                FTS_MATCH_PARTITION_READS.with(|c| c.set(c.get() + 1));
+                let decorated = ferrosa_common::DecoratedKey::new(
+                    ferrosa_common::PartitionKey::new(pk.to_vec()),
                 );
-                // Post-filter: apply remaining (non-fts_match) WHERE predicates.
-                filter_rows_by_select_predicates(
-                    &mut prows,
-                    s,
-                    &all_col_names,
-                    &all_col_types,
-                    table_meta,
-                    ks,
-                    state,
-                )?;
-                fts_rows.append(&mut prows);
-            }
-            if let Some(limit) = fts_limit {
-                // Only rows SURVIVING the post-filter count toward LIMIT; a
-                // partition whose rows were all dropped keeps the loop reading.
-                if fts_rows.len() >= limit {
-                    fts_rows.truncate(limit);
+                if let Some(mut partition) = state
+                    .write_path
+                    .load()
+                    .read(&table_id, &decorated)
+                    .await
+                    .map_err(|e| CqlError::ServerError(format!("{e}")))?
+                {
+                    // Keep only the rows whose full key is in the FTS match set.
+                    partition.rows.retain(|row| {
+                        matched.contains(&ferrosa_index::fulltext::keys::encode_doc_key(
+                            pk,
+                            &row.clustering,
+                        ))
+                    });
+                    let mut prows = bridge::partition_to_rows_with_storage_mapping(
+                        &partition,
+                        &all_col_names,
+                        &all_col_types,
+                        &pk_indices,
+                        &ck_indices,
+                        &storage_to_table,
+                    );
+                    // Post-filter: apply remaining (non-fts_match) WHERE predicates.
+                    filter_rows_by_select_predicates(
+                        &mut prows,
+                        s,
+                        &all_col_names,
+                        &all_col_types,
+                        table_meta,
+                        ks,
+                        state,
+                    )?;
+                    fts_rows.append(&mut prows);
+                }
+                if let Some(limit) = fts_limit {
+                    // Only rows SURVIVING the post-filter count toward LIMIT; a
+                    // partition whose rows were all dropped keeps the loop reading.
+                    if fts_rows.len() >= limit {
+                        fts_rows.truncate(limit);
+                        break;
+                    }
+                } else if fts_rows.len() >= fts_page_size {
+                    // Page complete. Partition-granular continuation: resume after
+                    // the last fully-delivered partition. A page may exceed
+                    // page_size by the tail of one wide partition (page_size is a
+                    // hint per the CQL protocol spec); the coordinator's resident
+                    // set stays ≈ one page + one partition.
+                    if idx + 1 < pending.len() {
+                        fts_paging_state = Some(
+                            crate::paging::PagingState {
+                                partition_key: (*pk).clone(),
+                                clustering_key: Vec::new(),
+                                remaining_in_partition: false,
+                            }
+                            .encode(),
+                        );
+                    }
                     break;
                 }
-            } else if fts_rows.len() >= fts_page_size {
-                // Page complete. Partition-granular continuation: resume after
-                // the last fully-delivered partition. A page may exceed
-                // page_size by the tail of one wide partition (page_size is a
-                // hint per the CQL protocol spec); the coordinator's resident
-                // set stays ≈ one page + one partition.
-                if idx + 1 < pending.len() {
-                    fts_paging_state = Some(
-                        crate::paging::PagingState {
-                            partition_key: (*pk).clone(),
-                            clustering_key: Vec::new(),
-                            remaining_in_partition: false,
-                        }
-                        .encode(),
-                    );
-                }
-                break;
             }
-        }
+
+            match fts_limit {
+                Some(limit) if fts_rows.len() < limit && !hit_set_complete => {
+                    // Post-filtering exhausted the bounded hit set before the
+                    // LIMIT was satisfied and more matches may exist — escalate.
+                    let next = requested.unwrap_or(limit).max(1).saturating_mul(4);
+                    tracing::debug!(
+                        keyspace = ks,
+                        table = %s.table,
+                        limit,
+                        rows_surviving = fts_rows.len(),
+                        requested = ?requested,
+                        next_requested = next,
+                        "fts_match: post-filter exhausted the bounded hit set — escalating"
+                    );
+                    requested = Some(next);
+                }
+                _ => break (fts_rows, fts_paging_state),
+            }
+        };
 
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
@@ -19615,9 +19661,13 @@ mod tests {
     }
 
     /// LIMIT counts only rows that SURVIVE the post-filter: rows dropped by
-    /// non-fts predicates must not count toward LIMIT and must trigger further
-    /// partition reads. ids 1..=3 have flag=0 (dropped), so `LIMIT 2` must read
-    /// partitions 1..=5 and return ids 4,5.
+    /// non-fts predicates must not count toward LIMIT. With the replica-side
+    /// bound pushed down (t_ee98faa0 layer 2) the hit set arrives as the k
+    /// best doc keys, so exhausting it via the post-filter triggers GEOMETRIC
+    /// ESCALATION (k → 4k) rather than a wrong short result:
+    ///   * round 1 (requested=2): keys {1,2}, both flag=0 → dropped → 2 reads;
+    ///   * round 2 (requested=8): keys {1..8}, reads 1..=5 (3 dropped + 2
+    ///     kept) then stops at the LIMIT bound → 5 reads.
     #[tokio::test]
     async fn fts_match_limit_post_filtered_rows_do_not_count_toward_limit() {
         let (state, _dir) = setup();
@@ -19649,9 +19699,66 @@ mod tests {
             "post-filter drops ids 1..=3 (flag=0); LIMIT 2 keeps the next two"
         );
         assert_eq!(
-            reads, 5,
-            "dropped rows must trigger further reads (3 dropped + 2 kept), \
-             and the loop must still stop at the LIMIT bound"
+            reads,
+            2 + 5,
+            "dropped rows must trigger escalation + further reads (round 1: \
+             2 dropped; round 2: 3 dropped + 2 kept), and the loop must still \
+             stop at the LIMIT bound"
+        );
+    }
+
+    /// Escalation completeness (t_ee98faa0 layer 2): when the post-filter can
+    /// drop MOST of the bounded hit set, the arm must keep escalating the
+    /// pushed-down k until either LIMIT rows survive or the hit set is
+    /// provably complete — the result must NEVER be short while more matches
+    /// exist. 30 matching rows, only the last 5 survive `flag = 1`; LIMIT 4
+    /// must return 4 rows even though requested starts at 4 « 25 dropped.
+    #[tokio::test]
+    async fn fts_match_limit_escalates_until_limit_survives_post_filter() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        // ids 1..=25 flag=0 (dropped by the post-filter), ids 26..=30 flag=1.
+        seed_fts_docs(&state, &ctx, "fts_esc", "escterm", 30, 25).await;
+
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_esc",
+            "SELECT id FROM fts_esc.docs WHERE body = fts_match('escterm') \
+             AND flag = 1 LIMIT 4 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![26, 27, 28, 29],
+            "escalation must widen the pushed-down k (4 → 16 → 64) until \
+             LIMIT rows survive the post-filter — a short result here means \
+             the replica bound silently truncated the query"
+        );
+
+        // And when FEWER than LIMIT rows survive in the WHOLE table, the
+        // (complete) short result is correct — escalation must terminate.
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_esc",
+            "SELECT id FROM fts_esc.docs WHERE body = fts_match('escterm') \
+             AND flag = 1 LIMIT 100 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![26, 27, 28, 29, 30],
+            "when the complete surviving set is smaller than LIMIT, exactly \
+             that set must be returned (and the escalation loop must stop)"
         );
     }
 
@@ -21440,7 +21547,7 @@ mod tests {
 
         // Search for "programming" — rows 1 and 2 contain it.
         let results = engine
-            .fulltext_search(&table_id, "body", "programming")
+            .fulltext_search(&table_id, "body", "programming", None)
             .unwrap();
 
         assert_eq!(
@@ -21464,7 +21571,7 @@ mod tests {
 
         // "scripting" only appears in row3 — verify single match.
         let results3 = engine
-            .fulltext_search(&table_id, "body", "scripting")
+            .fulltext_search(&table_id, "body", "scripting", None)
             .unwrap();
         assert_eq!(
             results3.len(),

@@ -54,8 +54,16 @@ real backlog is structural and security-shaped.
     accumulates every matching row before LIMIT (the live `hybrid_search` OOM
     shape). LIMIT early-exits the partition fetch loop (peak ≈ limit rows + one
     partition); no-LIMIT pages with a partition-granular `PagingState` cursor in
-    deterministic partition-key order. Residual: the O(matches) hit-set of small
-    doc keys. See `specs/proposed/streaming-range-reads-no-cap.md`.
+    deterministic partition-key order. See
+    `specs/proposed/streaming-range-reads-no-cap.md`.
+  - `fts_match` replica-side bound (t_ee98faa0 layer 2, landed): the LIMIT `k`
+    is pushed down the write path to every replica (bounded top-k + streaming
+    sidecar search in `ferrosa-index`/`ferrosa-storage`), shrinking the former
+    O(matches) hit-set residual to O(replicas × k) for LIMIT queries. The arm
+    escalates k geometrically when post-filtering exhausts the bounded hit set,
+    stopping once the union is provably complete — completeness preserved, no
+    server-side caps. Residual: no-LIMIT statements still receive the complete
+    O(matches) doc-key set (required by semantics).
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and

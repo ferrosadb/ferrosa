@@ -80,7 +80,12 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   matching keys, since full-text hits span all token ranges; BUG-F-007). FTI
   scatter-gather is partial-failure tolerant: if at least one node completes, the
   union is returned even when it is empty, so a transient remote stream failure
-  does not turn a valid no-hit search into a user-visible error.
+  does not turn a valid no-hit search into a user-visible error. The
+  query-derived `LIMIT k` is pushed down to every replica
+  (`FulltextSearchRequestPayload.limit`, t_ee98faa0 layer 2) so each holds a
+  bounded top-k working set and the union is at most `replicas x k` keys;
+  `limit: None` (no-LIMIT statement) requests the complete match set — never a
+  server-side cap.
 - `coordinator/cl_routing.rs` — W8.4 learner-aware routing (voter-only quorums,
   leader-only serial, cross-DC Accord routing).
 - `coordinator/batch.rs` — 3-phase logged batchlog (write → fan out → delete only

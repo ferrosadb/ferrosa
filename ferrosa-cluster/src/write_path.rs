@@ -870,23 +870,29 @@ impl WritePath {
     /// coordinator fans out to every node and unions the matching keys, because
     /// `fts_match` carries no partition key and its hits span all token ranges —
     /// a coordinator-local lookup made the result non-deterministic (BUG-F-007).
+    ///
+    /// `limit` is the query-derived `LIMIT k` pushed down to every replica so
+    /// each holds a bounded top-k working set instead of every matching doc
+    /// key (t_ee98faa0 layer 2). `None` = complete match set (no-LIMIT
+    /// statement) — never a server-side cap.
     pub async fn fulltext_search(
         &self,
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         match self {
             Self::Direct(engine) => engine
-                .fulltext_search(table_id, index_name, query)
+                .fulltext_search(table_id, index_name, query, limit)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
-                .fulltext_search(table_id, index_name, query)
+                .fulltext_search(table_id, index_name, query, limit)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Cluster(coordinator) => {
                 coordinator
-                    .coordinate_fulltext_search(table_id, index_name, query)
+                    .coordinate_fulltext_search(table_id, index_name, query, limit)
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
