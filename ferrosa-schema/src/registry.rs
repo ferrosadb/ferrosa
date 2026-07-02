@@ -420,6 +420,11 @@ impl Schema {
         let mut snap = (**self.inner.load()).clone();
         snap.tables
             .remove(&(keyspace.to_string(), table.to_string()));
+        // Remove all indexes on the dropped table (mirrors the auth-checked
+        // `drop_table`) — otherwise the pair/cluster DDL routes leave dangling
+        // registry entries for the dropped table (forge t_ae06e925).
+        snap.indexes
+            .retain(|(ks, tbl, _), _| !(ks == keyspace && tbl == table));
         self.inner.store(Arc::new(snap));
         Ok(())
     }
@@ -3040,6 +3045,53 @@ mod tests {
         let schema = test_schema();
         // Drop a table that doesn't exist — should not error
         schema.drop_table_internal("nonexistent", "table").unwrap();
+    }
+
+    /// `drop_table_internal` (the pair/cluster DDL route) must cascade over
+    /// the dropped table's registry index entries, mirroring the auth-checked
+    /// `drop_table` — otherwise DROP TABLE via those routes leaves dangling
+    /// `SchemaSnapshot.indexes` entries (forge t_ae06e925). An index on a
+    /// different table must survive.
+    #[test]
+    fn drop_table_internal_removes_table_indexes() {
+        use ferrosa_index::IndexType;
+
+        let schema = test_schema();
+        let mk_index = |table: &str, name: &str| IndexMetadata {
+            keyspace: "iks".to_string(),
+            table: table.to_string(),
+            name: name.to_string(),
+            index_type: IndexType::BTree,
+            target_columns: vec!["v".to_string()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        };
+        schema
+            .create_index_internal(mk_index("tbl", "dropped_idx"))
+            .unwrap();
+        schema
+            .create_index_internal(mk_index("other_tbl", "survivor_idx"))
+            .unwrap();
+
+        schema.drop_table_internal("iks", "tbl").unwrap();
+
+        let snap = schema.snapshot();
+        assert!(
+            !snap.indexes.contains_key(&(
+                "iks".to_string(),
+                "tbl".to_string(),
+                "dropped_idx".to_string()
+            )),
+            "drop_table_internal must remove the dropped table's index entries"
+        );
+        assert!(
+            snap.indexes.contains_key(&(
+                "iks".to_string(),
+                "other_tbl".to_string(),
+                "survivor_idx".to_string()
+            )),
+            "indexes on other tables must survive"
+        );
     }
 
     #[test]

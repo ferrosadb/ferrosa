@@ -60,6 +60,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
+  Registrations are dogfooded to `system_schema.indexes`; `unregister_table`
+  (the DROP TABLE choke point for every DDL route) cascades tombstones over the
+  dropped table's registrations via `write_index_tombstones_for_table` and
+  sweeps its tracker entries (t_ae06e925). Boot-time
+  `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
+  (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
+  `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at
+  debug). Pre-existing orphans are never GC'd automatically — clean up with
+  `DROP INDEX IF EXISTS`.
 - **Full-text search** (`fulltext_search`) — searches the memtable FTI + each
   per-SSTable `-FTI-{index}.db` sidecar, and **falls back to scanning any live
   SSTable whose sidecar is transiently missing** (the async index-rebuild window

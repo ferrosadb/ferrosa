@@ -21046,6 +21046,87 @@ mod tests {
         assert!(!snap.tables.contains_key(&("dtks".into(), "t".into())));
     }
 
+    /// DROP TABLE on the standalone (Direct) route must cascade tombstones
+    /// over the dropped table's dogfooded `system_schema.indexes` rows (forge
+    /// t_ae06e925) — previously only DROP INDEX tombstoned its row, so every
+    /// registration survived DROP TABLE as a dangling orphan that boot-time
+    /// reload warned about forever. Also guards the recreate edge: recreating
+    /// the same-named table + index after the drop must yield a live
+    /// registration (no stale tombstone shadowing).
+    #[tokio::test]
+    async fn drop_table_tombstones_dogfooded_index_rows_direct() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE dtix WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE dtix.t (k int PRIMARY KEY, v text, w text)",
+            "CREATE TABLE dtix.survivor (k int PRIMARY KEY, v text)",
+            "CREATE INDEX v_idx ON dtix.t (v)",
+            "CREATE INDEX w_fts ON dtix.t (w) USING 'fulltext'",
+            "CREATE INDEX survivor_idx ON dtix.survivor (v)",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+
+        let live = state.engine.read_persisted_indexes().unwrap();
+        assert_eq!(
+            live.len(),
+            3,
+            "all three index registrations must be dogfooded before the drop: {live:?}"
+        );
+
+        let stmt = crate::parser::parse("DROP TABLE dtix.t").unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        let remaining = state.engine.read_persisted_indexes().unwrap();
+        let dangling: Vec<_> = remaining
+            .iter()
+            .filter(|r| r.keyspace_name == "dtix" && r.table_name == "t")
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "Direct DROP TABLE must tombstone every system_schema.indexes \
+             registration for the dropped table; dangling rows: {dangling:?}"
+        );
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the index on the surviving table must not be tombstoned: {remaining:?}"
+        );
+        assert_eq!(remaining[0].index_name, "survivor_idx");
+
+        // Recreate edge: same-named table + index must come back live — the
+        // fresh registration's cell timestamps are >= the drop tombstone's
+        // deletion timestamp, and the merge tie-break keeps cells at ts ==
+        // deletion ts, so nothing shadows the new row.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for cql in [
+            "CREATE TABLE dtix.t (k int PRIMARY KEY, v text, w text)",
+            "CREATE INDEX v_idx ON dtix.t (v)",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt).await.unwrap();
+        }
+        let recreated = state.engine.read_persisted_indexes().unwrap();
+        assert!(
+            recreated.iter().any(|r| r.keyspace_name == "dtix"
+                && r.table_name == "t"
+                && r.index_name == "v_idx"),
+            "recreated same-named index must be live after DROP TABLE cascade \
+             (stale tombstone must not shadow it): {recreated:?}"
+        );
+    }
+
     #[tokio::test]
     async fn drop_table_if_exists_nonexistent_succeeds() {
         let (state, _dir) = setup();
