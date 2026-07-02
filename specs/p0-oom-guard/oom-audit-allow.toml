@@ -540,7 +540,8 @@ expires = "2026-12-31"
 # Group 3 — extended Clone/Copy rules (cloned-stream-elements /
 # clone-in-scan-closure / copies-row-data-arg / broadened clone-on-row-data),
 # 2026-07 sweep. Two sub-groups:
-#   (a) genuine move-opportunities, tracked in forge t_6068a9af / t_87042a74 —
+#   (a) genuine move-opportunities, tracked in forge t_6068a9af / t_87042a74 /
+#       t_27cf714a / t_bc54e3dc (OOM-severity ranked) —
 #       SHORT expiry 2026-10-01: fix or renew, the audit fails loud otherwise.
 #   (b) inherent-by-design copies (retained-source reads, serialization
 #       boundaries, test fixtures) — documented, long expiry.
@@ -592,7 +593,7 @@ expires = "2026-10-01"
 path = "ferrosa-cluster/src/coordinator/read.rs"
 rule = "cloned-stream-elements"
 symbol = "mutation"
-reason = "t_87042a74: hinted replay clones mutation rows per stale host (bounded per mutation); move on last use."
+reason = "t_bc54e3dc: hinted replay clones mutation rows per stale host (bounded per mutation); move on last use."
 owner = "bkearns"
 expires = "2026-10-01"
 
@@ -600,14 +601,14 @@ expires = "2026-10-01"
 path = "ferrosa-index/src/vector/quantized/ivf.rs"
 rule = "clone-in-scan-closure"
 symbol = "vector"
-reason = "t_87042a74: IVF centroid seeding clones every vector to sort; sort indices instead."
+reason = "t_27cf714a: IVF centroid seeding clones every vector to sort; sort indices instead."
 owner = "bkearns"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-index/src/vector/quantized/ivf.rs"
 rule = "cloned-stream-elements"
-reason = "t_87042a74: IVF build .copied() over candidate vectors; review with the sort-by-index fix."
+reason = "t_27cf714a: IVF build .copied() over candidate vectors; review with the sort-by-index fix."
 owner = "bkearns"
 expires = "2026-10-01"
 
