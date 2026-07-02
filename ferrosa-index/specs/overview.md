@@ -39,7 +39,7 @@ the query shapes genuinely differ:
 |---------|-----------|-------|----------|
 | Root secondary | `IndexFactory` / `IndexBuilder` / `IndexReader` (crate root) | B-tree, Hash, Composite, Phonetic, Filtered | Mature |
 | Vector | `vector::IndexFactory` / `IndexReader` / `IndexBuilder` (own copies, own `RowPosition`/`IndexCapability`) | HNSW, IVFFlat, quantized | HNSW/IVFFlat mature; quantized staged path new; Q1 tier experimental |
-| Full-text | `FullTextIndexBuilder` → bytes → `FullTextIndexReader` (byte-buffer, not the root traits) | inverted index + BM25 | Mature |
+| Full-text | `FullTextIndexBuilder` → bytes → `FullTextIndexReader` (byte-buffer, not the root traits); `stream::stream_search_term` for bounded-memory single-term sidecar search; `search_top_k` for query-derived `LIMIT k` bounds (t_ee98faa0 layer 2) | inverted index + BM25 | Mature |
 | Geo | pure functions over a BTree sidecar (no factory) | point index, cover/refine | Phase 1 (point only; polygon paths partial) |
 
 The crate-root `IndexType` enum (BTree / Hash / Composite / Phonetic / Filtered
@@ -59,7 +59,7 @@ bincode tag order is asserted stable (`lib.rs::bincode_index_type_variant_tag_st
 | `vector/hnsw` (~669) | HNSW graph ANN (JSON artifact) |
 | `vector/ivfflat` (~504) | k-means inverted-file ANN (JSON artifact) |
 | `vector/quantized/*` (~2200) | Paged `.qvec` container, scalar codec, deterministic quantized-IVF builder, staged page-budget reader |
-| `fulltext/*` (~2000) | Analyzer, builder, BM25 reader, query parser, scoring, compaction merge |
+| `fulltext/*` (~2600) | Analyzer, builder, BM25 reader (`search` + bounded `search_top_k`), query parser, scoring, compaction merge, streaming sidecar term search (`stream`), bounded top-k selection (`topk`) |
 | `geo/*` (~2300) | Cell-id encode, bbox/radius/k-NN cover, exact refine, R-tree, ST predicates |
 
 ## Data flow

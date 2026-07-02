@@ -40,6 +40,22 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
   plan. Carries the security mitigations (M8 permissions, M12 batch cap).
+  The `DEFAULT_RANGE_READ_LIMIT` (10_000) result cap is removed for the
+  O(1)-streamable full-scan shapes, which are bounded only by the query's own
+  `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
+  <partition-key column>`) stream through `range_read_projected_stream_all_with`;
+  scalar aggregates (`SUM`/`MIN`/`MAX`/`AVG`) fold through an O(1) streaming
+  accumulator (`stream_builtin_aggregates`) over the uncapped
+  `range_read_stream_all_with` (exact over the whole table, no `all_rows`
+  materialization); a user `LIMIT N` above the storage OOM guard streams
+  (take-`N`) instead of a `Vec` materialization. The unbounded `ORDER BY` (no
+  `LIMIT`) global sort now **spills** (step 5): it streams the uncapped scan
+  through `sort_rows_from_partition_stream_spilling` → `ferrosa_storage::ExternalSorter`
+  (bounded-memory external merge sort, cascade k-way merge), returning the fully,
+  correctly ordered result with no cap and memory bounded by the spill threshold
+  (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
+  keep their `range_read_limited_rows_checked` fail-loud cap
+  (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
@@ -126,8 +142,8 @@ SQL-front-end FMEA risk.
 
 ## Tests
 
-~945 in-crate test functions (heaviest: `router.rs` 253, `parser.rs` 158,
-`bridge.rs` 121, `connection.rs` 43) plus integration tests under `tests/`
+~985 in-crate test functions, zero `#[ignore]`d (heaviest: `router.rs` ~280,
+`parser.rs` 158, `bridge.rs` 121, `connection.rs` 43) plus integration tests under `tests/`
 (`handshake`, `auth_integration`, `auth_warn_mode`, `bolt_transaction_state`,
 `cassandra_cql_examples`). The ignored live-cluster test `fts_live_cluster`
 runs in the CI cluster-integration job and asserts native `fts_match` returns a
