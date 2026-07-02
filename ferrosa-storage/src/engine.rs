@@ -3578,7 +3578,7 @@ impl StorageEngine {
     /// cannot index it (this is why `CREATE INDEX` on a clustering column used
     /// to be a silent no-op at the storage layer). Future writes extract the
     /// value from the clustering key at `clustering_component`; backfill jobs
-    /// for existing SSTables carry a [`ClusteringComponentRef`] so the sidecar
+    /// for existing SSTables carry a [`crate::index::ClusteringComponentRef`] so the sidecar
     /// build does the same.
     pub fn add_clustering_index(
         &self,
