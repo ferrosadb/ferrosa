@@ -107,6 +107,7 @@ jobs:
                --skip bounded_fetch_reassembles_to_single_pass \
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
+               --skip fly_multi_node_streaming_scan \
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no

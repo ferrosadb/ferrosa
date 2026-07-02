@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-06-30
 ---
 
 # ferrosa-cql — Roadmap
@@ -27,6 +27,43 @@ real backlog is structural and security-shaped.
 
 ## Next
 
+- **Streaming range reads — remove the server-side result cap**
+  (`specs/proposed/streaming-range-reads-no-cap.md`). Steps 1–2 landed:
+  - Step 1: the *projected* full-scan arm in `router.rs` consumes the uncapped
+    streaming variant `range_read_projected_stream_all_with` (move-only, no
+    `Vec<Partition>` materialization), bounded solely by the query's `LIMIT`.
+  - Step 2: the `DEFAULT_RANGE_READ_LIMIT` (10_000) **result cap** is removed
+    from the O(1)-streamable shapes. `SELECT SUM/MIN/MAX/AVG` over a full scan
+    now folds through an O(1) streaming accumulator
+    (`stream_builtin_aggregates`) over the uncapped
+    `range_read_stream_all_with` — exact over the whole table, no `all_rows`
+    materialization. A user `LIMIT N` above the storage OOM guard streams (take-`N`
+    partitions) instead of hitting the Vec-materialization cap. `SELECT DISTINCT
+    <partition key>` and simple `WHERE … ALLOW FILTERING` scans were already
+    uncapped (step 1 / paged-filter path).
+  - Step 5 (landed): the unbounded `ORDER BY` (no `LIMIT`) global sort now
+    **spills** instead of fail-loud-refusing. The router streams the uncapped
+    scan through `sort_rows_from_partition_stream_spilling` →
+    `ferrosa_storage::ExternalSorter` (bounded-memory external merge sort with
+    cascade k-way merge; RAM-budget reader + 50%-default spill threshold in
+    `ferrosa_storage::spill_budget`). Complete, correctly ordered, memory bounded
+    by the threshold, no cap other than the query's `LIMIT`. `DISTINCT`/aggregate/
+    function-projection keep their `range_read_limited_rows_checked` fail-loud cap.
+    Remaining: per-group spill when `GROUP BY` lands (deferred; not yet parsed).
+  - `fts_match` arm bounded (t_ee98faa0, landed): the full-text branch no longer
+    accumulates every matching row before LIMIT (the live `hybrid_search` OOM
+    shape). LIMIT early-exits the partition fetch loop (peak ≈ limit rows + one
+    partition); no-LIMIT pages with a partition-granular `PagingState` cursor in
+    deterministic partition-key order. See
+    `specs/proposed/streaming-range-reads-no-cap.md`.
+  - `fts_match` replica-side bound (t_ee98faa0 layer 2, landed): the LIMIT `k`
+    is pushed down the write path to every replica (bounded top-k + streaming
+    sidecar search in `ferrosa-index`/`ferrosa-storage`), shrinking the former
+    O(matches) hit-set residual to O(replicas × k) for LIMIT queries. The arm
+    escalates k geometrically when post-filtering exhausts the bounded hit set,
+    stopping once the union is provably complete — completeness preserved, no
+    server-side caps. Residual: no-LIMIT statements still receive the complete
+    O(matches) doc-key set (required by semantics).
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and

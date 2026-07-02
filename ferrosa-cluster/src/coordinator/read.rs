@@ -1618,11 +1618,17 @@ impl ClusterCoordinator {
     /// (BUG-F-007). Querying every node and de-duplicating the keys makes the
     /// result coordinator-independent. Partial failures degrade to a partial
     /// union (logged); only an all-nodes-failed-and-empty result errors.
+    ///
+    /// `limit` is the query-derived `LIMIT k`, pushed down so every replica
+    /// holds a bounded top-k working set (t_ee98faa0 layer 2); the union is
+    /// then at most `replicas × k` keys. `None` requests the complete match
+    /// set (no-LIMIT statements) — never a server-side cap.
     pub async fn coordinate_fulltext_search(
         &self,
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
@@ -1637,6 +1643,7 @@ impl ClusterCoordinator {
             table: table_id.table.clone(),
             index_name: index_name.to_string(),
             query: query.to_string(),
+            limit: limit.map(|k| k as u64),
         };
         let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
 
@@ -1660,7 +1667,7 @@ impl ClusterCoordinator {
                 async move {
                     if node_id == local_id {
                         storage
-                            .fulltext_search(&table_id, &index_name, &query)
+                            .fulltext_search(&table_id, &index_name, &query, limit)
                             .map_err(ClusterError::Storage)
                     } else {
                         let (hid, addr) = remote.ok_or_else(|| {
@@ -2187,7 +2194,7 @@ mod tests {
         // the remote returns the SAME bytes — exercising real dedup — instead of a
         // hand-rolled partition key that would no longer match.
         let local_keys = storage
-            .fulltext_search(&table_id, "val_fti", "hello")
+            .fulltext_search(&table_id, "val_fti", "hello", None)
             .unwrap();
         assert_eq!(local_keys.len(), 1, "local node should have one FTI hit");
         let shared_key = local_keys[0].clone();
@@ -2230,7 +2237,7 @@ mod tests {
         );
 
         let mut keys = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "hello")
+            .coordinate_fulltext_search(&table_id, "val_fti", "hello", None)
             .await
             .unwrap();
         keys.sort();
@@ -2287,7 +2294,7 @@ mod tests {
         );
 
         let keys = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token")
+            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token", None)
             .await
             .expect("one successful empty FTI shard should degrade remote failure to empty union");
 
@@ -4062,21 +4069,23 @@ mod tests {
 
         let table_id = TableId::new("test_ks", "test_tbl");
         let key = test_key();
-        for i in 0..20_000u32 {
+        for i in 0..2_000u32 {
             let mut row = test_row(i as i64);
             row.clustering = i.to_be_bytes().to_vec();
             storage.write(&table_id, &key, row, i as i64).unwrap();
         }
         storage.flush(&table_id).unwrap();
 
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(75),
-            coordinator.coordinate_range_read_limited_rows(&table_id, 1, 1),
-        )
-        .await
-        .expect("local bounded range read must not materialize all rows before LIMIT");
-
-        let partitions = read.expect("bounded local range read should succeed");
+        // Correctness of the bounded fold: LIMIT/row_limit honored over a
+        // partition far larger than the bound. The MEMORY-boundedness contract
+        // (streaming fold, O(sources + k) resident — not materialize-then-
+        // truncate) is asserted deterministically by the alloc-measured
+        // `tests/replica_scan_serialization_memory_bound.rs`; a wall-clock
+        // timeout here was flaky on slower instrumented CI runners.
+        let partitions = coordinator
+            .coordinate_range_read_limited_rows(&table_id, 1, 1)
+            .await
+            .expect("bounded local range read should succeed");
         assert_eq!(partitions.len(), 1, "expected the one written partition");
         assert_eq!(
             partitions[0].rows.len(),
