@@ -68,7 +68,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 - **Streaming support** (`stream_router`, `idle_timeout`) — `StreamRouter`
   dispatches multi-message streaming RPCs keyed by `request_id`; the idle-timeout
   watchdog aborts a consumer only after the producer is quiet for longer than the
-  timeout (heartbeats reset the deadline).
+  timeout (heartbeats reset the deadline). `is_registered(request_id)` exposes
+  route liveness as the lifecycle predicate for callers' per-request companion
+  state (ferrosa-cluster's stream seq tracking keys create/drop off it: ids are
+  monotonic and never reused, and a route is always registered before its
+  request fires, so "no route" is terminal for that id).
 - **Failure detection + skew** (`peer`, `skew`) — per-peer RTT and clock-skew
   tracking derived from heartbeats; the Accord protocol consumes `SkewMax`.
 - **Discovery** (`discovery`) — `SeedDiscovery` over a `Discovery` trait.
