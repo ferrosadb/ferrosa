@@ -194,6 +194,15 @@ Notable integration suites: `failure_mode_matrix` (44), `raft_election_storm`
 `accord_nemesis` (15), `correctness` (11), `cluster_formation` (10). All run on
 deterministic in-process harnesses unless gated behind `live-infra-tests`.
 
+Range-scan memory boundedness is guarded by two allocator-tracking suites:
+`range_scan_streaming_memory_bound` (the coordinator **Stream** API is O(1) in N)
+and `replica_scan_serialization_memory_bound` (drives the REAL wire serialization
++ `consume_range_stream`; pins the coordinator-side `Vec<Partition>`-consume
+O(result) growth — `t_3fc6be3c`/`t_ee98faa0` — plus the producer/backpressure
+bounds). The gated multi-node live confirmation is `fly_stream_scan_live` (feature
+`live-infra-tests` + `FERROSA_TEST_FLY=1`), which drives
+`deploy/fly-stream-scan/`; it panics loudly on missing infra rather than passing.
+
 The multi-node `TestCluster` harness (`tests/common/raft_harness.rs`) runs
 openraft with short timers (50 ms heartbeat, 200–400 ms election). To keep
 election convergence deterministic when `cargo test` runs many runtime-heavy test
