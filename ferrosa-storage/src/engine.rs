@@ -18980,10 +18980,14 @@ mod tests {
         engine
             .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
             .unwrap();
-        let restored = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine.reload_indexes_from_system_schema().unwrap();
         assert_eq!(
-            restored, 0,
+            outcome.restored, 0,
             "the dangling registration must be skipped, not restored"
+        );
+        assert_eq!(
+            outcome.skipped, 1,
+            "the dangling registration must be COUNTED as skipped (observability)"
         );
 
         // The query against idx_a: exactly ONE sidecar (idx_a's) consulted.
