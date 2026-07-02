@@ -44,6 +44,9 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   **CheckQuorum** (`raft_check_quorum_ratio`, default 0.75) per ADR-012.
 - `FerrosStateMachine` / `RaftState` — keyspaces, tables, roles/grants, indexes,
   types, UDFs/UDAs, members, token map, per-node index status, cluster config.
+  `DropTable` apply removes the table's index entries from `RaftState` and, via
+  `engine.unregister_table`, cascades tombstones over the dropped table's
+  `system_schema.indexes` registrations (t_ae06e925).
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst

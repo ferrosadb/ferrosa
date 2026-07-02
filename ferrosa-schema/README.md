@@ -34,7 +34,9 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   `alter_table`, `drop_*`, `create_index`, `create_role`, `create_role_hashed`,
   `alter_role`, `grant`/`revoke`, `grant_role`/`revoke_role`, UDT/UDF/UDA ops)
   **plus** `*_internal` variants that bypass auth/audit for Raft/pair-mode
-  replication. `apply_snapshot` bulk-loads a snapshot (skips system keyspaces).
+  replication. Both `drop_table` and `drop_table_internal` cascade over the
+  dropped table's `SchemaSnapshot.indexes` entries (t_ae06e925).
+  `apply_snapshot` bulk-loads a snapshot (skips system keyspaces).
 - **Auth / RBAC** ([`auth/`](src/auth)) — `AuthContext`, `RoleMetadata`,
   Cassandra-style `Permission` (9 variants) and `Resource` hierarchy
   (`AllKeyspaces > Keyspace > Table`, `AllRoles > Role`),

@@ -1022,9 +1022,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // silently dropped on restart. This runs after system tables (step 3) and
     // user tables (above) are registered so `add_index` can resolve targets.
     match storage.reload_indexes_from_system_schema() {
-        Ok(count) if count > 0 => {
+        // A non-zero `skipped` (dangling registrations) is already warned
+        // about — with a count — inside the reload, and surfaces in the
+        // `ferrosa_storage_index_reload_skipped_rows_total` metric.
+        Ok(outcome) if outcome.restored > 0 => {
             tracing::info!(
-                count,
+                count = outcome.restored,
+                skipped = outcome.skipped,
                 "re-registered persisted secondary indexes after restart"
             )
         }
