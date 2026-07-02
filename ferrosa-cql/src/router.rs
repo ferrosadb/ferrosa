@@ -3968,6 +3968,16 @@ async fn route_geo_select(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only observability: partition point-reads performed by the
+    /// `fts_match` arm on this thread. Lets tests assert STRUCTURALLY that the
+    /// fetch loop early-exits at the LIMIT bound (t_ee98faa0) instead of
+    /// point-reading every matched partition. `#[tokio::test]` uses a
+    /// current-thread runtime, so the arm's increments land on the test thread.
+    static FTS_MATCH_PARTITION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -4082,18 +4092,70 @@ async fn route_select_user_table(
         // per matching ROW. Read each distinct partition once, keep ONLY the rows
         // whose full key actually matched — so non-matching clustering rows in a
         // matched partition don't leak (t_da51e20c) — then post-filter.
+        //
+        // Coordinator memory bound (t_ee98faa0 — this exact arm OOM-killed a
+        // live node on a broad `fts_match` over a large table): the hit-set
+        // `matched` is O(matches) SMALL keys (doc ids, not rows) — an accepted
+        // residual. ROW accumulation is bounded:
+        //   * LIMIT present — stop point-reading as soon as `limit` rows survive
+        //     the post-filter (peak ≈ limit rows + one partition), and stop
+        //     consulting the remaining matched partitions entirely;
+        //   * no LIMIT — the full result is legitimate, so bound MEMORY, not the
+        //     result: build one page per response (client `page_size`, or the
+        //     default scan page size when the client sends none) and return a
+        //     `PagingState` continuation. Peak ≈ page_size rows + one partition.
+        // The result itself is NEVER truncated server-side: it is bounded only
+        // by the query's own LIMIT (or delivered completely across pages).
         let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
-        let mut seen_partitions = std::collections::HashSet::new();
-        let mut fts_rows = Vec::new();
-        for doc_key in &matched {
-            let Some(pk) = ferrosa_index::fulltext::keys::doc_key_partition(doc_key) else {
-                // Legacy/malformed id (e.g. a sidecar built before row-granular
-                // keys, pending rebuild) — skip rather than misread.
-                continue;
-            };
-            if !seen_partitions.insert(pk.to_vec()) {
-                continue; // partition already read
-            }
+
+        // Distinct matched partitions in a DETERMINISTIC order (raw partition-key
+        // bytes). CQL promises no ordering for this arm, but the HashSet's
+        // arbitrary iteration order previously decided WHICH rows a LIMIT kept;
+        // sorting makes the LIMIT early-exit and the page continuation cursor
+        // reproducible. Legacy/malformed ids (e.g. a sidecar built before
+        // row-granular keys, pending rebuild) are skipped rather than misread.
+        let mut fts_partitions: Vec<Vec<u8>> = matched
+            .iter()
+            .filter_map(|doc_key| {
+                ferrosa_index::fulltext::keys::doc_key_partition(doc_key).map(<[u8]>::to_vec)
+            })
+            .collect();
+        fts_partitions.sort_unstable();
+        fts_partitions.dedup();
+
+        let fts_limit = s
+            .limit
+            .as_ref()
+            .and_then(|l| l.as_literal())
+            .map(|n| n.max(0) as usize);
+        let fts_page_size = ctx
+            .paging
+            .page_size
+            .and_then(|ps| (ps > 0).then_some(ps as usize))
+            .unwrap_or_else(crate::paging::default_scan_page_size);
+        // Resume cursor (no-LIMIT paged mode only): partition-granular — every
+        // partition whose key is <= the cursor key was fully delivered on a
+        // previous page. A LIMIT query is answered in a single response (bounded
+        // by the limit itself), so it never consults or emits a cursor.
+        let fts_resume = if fts_limit.is_none() {
+            StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?
+        } else {
+            None
+        };
+        let pending: Vec<&Vec<u8>> = fts_partitions
+            .iter()
+            .filter(|pk| {
+                fts_resume
+                    .as_ref()
+                    .is_none_or(|cur| pk.as_slice() > cur.partition_key.as_slice())
+            })
+            .collect();
+
+        let mut fts_rows: Vec<Vec<Option<CqlValue>>> = Vec::new();
+        let mut fts_paging_state: Option<Vec<u8>> = None;
+        for (idx, pk) in pending.iter().enumerate() {
+            #[cfg(test)]
+            FTS_MATCH_PARTITION_READS.with(|c| c.set(c.get() + 1));
             let decorated =
                 ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(pk.to_vec()));
             if let Some(mut partition) = state
@@ -4130,15 +4192,33 @@ async fn route_select_user_table(
                 )?;
                 fts_rows.append(&mut prows);
             }
+            if let Some(limit) = fts_limit {
+                // Only rows SURVIVING the post-filter count toward LIMIT; a
+                // partition whose rows were all dropped keeps the loop reading.
+                if fts_rows.len() >= limit {
+                    fts_rows.truncate(limit);
+                    break;
+                }
+            } else if fts_rows.len() >= fts_page_size {
+                // Page complete. Partition-granular continuation: resume after
+                // the last fully-delivered partition. A page may exceed
+                // page_size by the tail of one wide partition (page_size is a
+                // hint per the CQL protocol spec); the coordinator's resident
+                // set stays ≈ one page + one partition.
+                if idx + 1 < pending.len() {
+                    fts_paging_state = Some(
+                        crate::paging::PagingState {
+                            partition_key: (*pk).clone(),
+                            clustering_key: Vec::new(),
+                            remaining_in_partition: false,
+                        }
+                        .encode(),
+                    );
+                }
+                break;
+            }
         }
 
-        // Apply LIMIT if specified.
-        let fts_rows: Vec<Vec<Option<CqlValue>>> =
-            if let Some(limit) = s.limit.as_ref().and_then(|l| l.as_literal()) {
-                fts_rows.into_iter().take(limit as usize).collect()
-            } else {
-                fts_rows
-            };
         // Project to selected columns.
         let selected_rows = select_columns(&fts_rows, &all_col_names, &col_names);
         return Ok(SelectRawResult {
@@ -4147,7 +4227,7 @@ async fn route_select_user_table(
             rows: selected_rows,
             keyspace: ks.to_string(),
             table: s.table.clone(),
-            paging_state: None,
+            paging_state: fts_paging_state,
         });
     }
 
@@ -19319,12 +19399,11 @@ mod tests {
     /// The end-to-end test above uses fts_match with NO partition-key predicate;
     /// this exercises the PK-predicate + fts_match combination (entity_store
     /// shape: partition key + clustering key + fts on a regular column).
-    // KNOWN BUG (unfixed): with PK predicates present, fts_match is matched at
-    // PARTITION granularity and the post-filter skips re-applying it per-row
-    // (evaluate_where_predicates_skips_fts_match_clauses), so a matched
-    // partition leaks rows that don't contain the term. Reproduced here;
-    // ignored until the per-row fts re-evaluation / row-granular FTI lands.
-    #[ignore = "known bug: fts_match dropped to partition granularity when PK predicates present"]
+    // Fixed by the row-granular FTI doc keys (t_da51e20c): the arm now retains
+    // only the rows whose FULL primary key matched, so a matched partition no
+    // longer leaks clustering rows that don't contain the term even when PK
+    // predicates are present. (Was `#[ignore]`d while matching was
+    // partition-granular; un-ignored once the fix made it pass — t_8686dd3c.)
     #[tokio::test]
     async fn fts_match_with_pk_predicates_returns_matches() {
         let (state, _dir) = setup();
@@ -19421,6 +19500,260 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    /// Run a SELECT through the user-table planner directly, returning the raw
+    /// (un-encoded) result so fts tests can inspect rows AND the paging cursor.
+    async fn fts_select_raw(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        ks: &str,
+        cql: &str,
+    ) -> SelectRawResult {
+        let stmt = crate::parser::parse(cql).unwrap();
+        let Statement::Select(s) = stmt else {
+            panic!("expected a SELECT statement: {cql}");
+        };
+        route_select_user_table(state, ctx, ks, &s)
+            .await
+            .unwrap_or_else(|e| panic!("{cql}: {e:?}"))
+    }
+
+    /// Seed `ks.docs` with `n` single-row partitions whose bodies all match
+    /// `token`, plus a `flag` column (0 for ids <= `zero_flag_upto`, else 1),
+    /// then flush so the FTI sidecar exists.
+    async fn seed_fts_docs(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        ks: &str,
+        token: &str,
+        n: i32,
+        zero_flag_upto: i32,
+    ) {
+        for cql in [
+            format!(
+                "CREATE KEYSPACE {ks} WITH REPLICATION = \
+                 {{'class': 'SimpleStrategy', 'replication_factor': '1'}}"
+            ),
+            format!("CREATE TABLE {ks}.docs (id int PRIMARY KEY, body text, flag int)"),
+            format!("CREATE INDEX docs_fts ON {ks}.docs (body) USING 'fulltext'"),
+        ] {
+            let stmt = crate::parser::parse(&cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        for id in 1..=n {
+            let flag = if id <= zero_flag_upto { 0 } else { 1 };
+            let cql = format!(
+                "INSERT INTO {ks}.docs (id, body, flag) VALUES ({id}, 'doc {token} number', {flag})"
+            );
+            let stmt = crate::parser::parse(&cql).unwrap();
+            route(state, ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new(ks, "docs"))
+            .unwrap();
+    }
+
+    fn fts_row_ids(raw: &SelectRawResult) -> Vec<i32> {
+        raw.rows
+            .iter()
+            .map(|r| match r.first() {
+                Some(Some(CqlValue::Int(id))) => *id,
+                other => panic!("expected int id cell, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Coordinator memory bound for `fts_match` (t_ee98faa0): with a LIMIT, the
+    /// arm must stop point-reading matched partitions as soon as `limit` rows
+    /// survive — accumulation ≈ limit rows + one partition, NOT O(matches).
+    /// The read counter asserts the early exit structurally (deterministic, no
+    /// allocator tracking): 10 matching partitions, LIMIT 3 → exactly 3 reads.
+    #[tokio::test]
+    async fn fts_match_limit_stops_partition_reads_at_limit() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_lim", "boundterm", 10, 0).await;
+
+        FTS_MATCH_PARTITION_READS.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_lim",
+            "SELECT id FROM fts_lim.docs WHERE body = fts_match('boundterm') LIMIT 3",
+        )
+        .await;
+        let reads = FTS_MATCH_PARTITION_READS.with(|c| c.get());
+
+        assert_eq!(raw.rows.len(), 3, "LIMIT 3 must return exactly 3 rows");
+        assert_eq!(
+            reads, 3,
+            "the fts_match fetch loop must stop point-reading once LIMIT rows \
+             survive; {reads} partition reads for LIMIT 3 means it materialized \
+             the whole match set (the t_ee98faa0 OOM shape)"
+        );
+        assert!(
+            raw.paging_state.is_none(),
+            "a satisfied LIMIT needs no continuation"
+        );
+        // Deterministic iteration (sorted partition-key bytes): int PKs 1..=10
+        // serialize big-endian, so LIMIT 3 keeps ids 1,2,3.
+        assert_eq!(fts_row_ids(&raw), vec![1, 2, 3]);
+    }
+
+    /// LIMIT counts only rows that SURVIVE the post-filter: rows dropped by
+    /// non-fts predicates must not count toward LIMIT and must trigger further
+    /// partition reads. ids 1..=3 have flag=0 (dropped), so `LIMIT 2` must read
+    /// partitions 1..=5 and return ids 4,5.
+    #[tokio::test]
+    async fn fts_match_limit_post_filtered_rows_do_not_count_toward_limit() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_pf", "filterterm", 10, 3).await;
+
+        FTS_MATCH_PARTITION_READS.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_pf",
+            "SELECT id FROM fts_pf.docs WHERE body = fts_match('filterterm') \
+             AND flag = 1 LIMIT 2 ALLOW FILTERING",
+        )
+        .await;
+        let reads = FTS_MATCH_PARTITION_READS.with(|c| c.get());
+
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![4, 5],
+            "post-filter drops ids 1..=3 (flag=0); LIMIT 2 keeps the next two"
+        );
+        assert_eq!(
+            reads, 5,
+            "dropped rows must trigger further reads (3 dropped + 2 kept), \
+             and the loop must still stop at the LIMIT bound"
+        );
+    }
+
+    /// No LIMIT: the full result is legitimate, so the arm must bound MEMORY,
+    /// not the result — build one page per response (client page_size) with a
+    /// `PagingState` continuation. 7 matching partitions @ page_size 3 →
+    /// pages of 3/3/1 whose union is ALL matching rows, in deterministic
+    /// (partition-key byte) order, with no duplicates and no truncation.
+    #[tokio::test]
+    async fn fts_match_no_limit_pages_bound_accumulation() {
+        let (state, _dir) = setup();
+        let base_ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &base_ctx, "fts_pg", "pageterm", 7, 0).await;
+
+        let mut collected: Vec<i32> = Vec::new();
+        let mut page_sizes: Vec<usize> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        loop {
+            let ctx = RequestContext {
+                auth: &dev_auth(),
+                current_keyspace: &None,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging: crate::paging::PagingParams {
+                    page_size: Some(3),
+                    paging_state: paging_state.take(),
+                },
+                client_address: String::new(),
+                protocol_version: 4,
+            };
+            let raw = fts_select_raw(
+                &state,
+                &ctx,
+                "fts_pg",
+                "SELECT id FROM fts_pg.docs WHERE body = fts_match('pageterm')",
+            )
+            .await;
+            page_sizes.push(raw.rows.len());
+            assert!(
+                raw.rows.len() <= 3,
+                "a page must hold at most page_size rows for single-row \
+                 partitions; got {} (unbounded accumulation)",
+                raw.rows.len()
+            );
+            collected.extend(fts_row_ids(&raw));
+            match raw.paging_state {
+                Some(cursor) => paging_state = Some(cursor),
+                None => break,
+            }
+            assert!(page_sizes.len() <= 7, "paging must terminate");
+        }
+
+        assert_eq!(page_sizes, vec![3, 3, 1], "7 rows @ page_size 3 → 3/3/1");
+        assert_eq!(
+            collected,
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "the union of all pages must be ALL matching rows — no gaps, no \
+             duplicates, no server-side truncation"
+        );
+    }
+
+    /// No LIMIT and no client page_size: every matching row is returned (the
+    /// result is bounded only by the query's own LIMIT — never a server cap).
+    /// Small result → a single page under the default scan page size, no cursor.
+    #[tokio::test]
+    async fn fts_match_no_limit_returns_all_matching_rows() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        seed_fts_docs(&state, &ctx, "fts_all", "allterm", 7, 0).await;
+
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_all",
+            "SELECT id FROM fts_all.docs WHERE body = fts_match('allterm')",
+        )
+        .await;
+        assert_eq!(
+            fts_row_ids(&raw),
+            vec![1, 2, 3, 4, 5, 6, 7],
+            "no LIMIT → all matching rows"
+        );
+        assert!(
+            raw.paging_state.is_none(),
+            "result under the default page size needs no continuation"
+        );
     }
 
     /// Phonetic index: equality on regular column (not part of PK) matches
