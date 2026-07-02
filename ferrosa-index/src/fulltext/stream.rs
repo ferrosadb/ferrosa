@@ -10,7 +10,7 @@
 //! [`super::builder`] for the layout) through a [`std::io::BufReader`]
 //! instead:
 //!
-//! * [`stream_search_term`] — single-term search (the live-OOM query shape).
+//! * [`scan_term_top_k`] — single-term search (the live-OOM query shape).
 //!   Postings of the one matching term are scored as they are decoded and fed
 //!   into a bounded top-k heap when the query carries a `LIMIT k`; peak
 //!   additional memory is O(k), independent of the index or matching-doc
@@ -39,7 +39,7 @@ use super::topk::TopK;
 /// # Errors
 ///
 /// Returns `Err` on I/O failure or a malformed/truncated FTI file.
-pub fn stream_search_term(
+pub fn scan_term_top_k(
     path: &Path,
     term: &str,
     limit: Option<usize>,
@@ -221,7 +221,7 @@ mod tests {
 
         let reader = FullTextIndexReader::open(std::fs::read(&path).unwrap()).unwrap();
         let expected = reader.search_str("memory").unwrap();
-        let streamed = stream_search_term(&path, "memory", None).unwrap();
+        let streamed = scan_term_top_k(&path, "memory", None).unwrap();
 
         assert_eq!(streamed.len(), expected.len(), "same match set size");
         let expected_keys: std::collections::HashSet<_> =
@@ -257,7 +257,7 @@ mod tests {
 
         let reader = FullTextIndexReader::open(std::fs::read(&path).unwrap()).unwrap();
         let full = reader.search_str("memory").unwrap();
-        let top5 = stream_search_term(&path, "memory", Some(5)).unwrap();
+        let top5 = scan_term_top_k(&path, "memory", Some(5)).unwrap();
 
         assert_eq!(top5.len(), 5);
         for (a, b) in top5.iter().zip(full.iter().take(5)) {
@@ -270,19 +270,15 @@ mod tests {
     fn stream_term_absent_term_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_fti(dir.path(), &[(b"pk1", "hello world")]);
-        assert!(stream_search_term(&path, "zzz", Some(10))
-            .unwrap()
-            .is_empty());
-        assert!(stream_search_term(&path, "aaa", None).unwrap().is_empty());
+        assert!(scan_term_top_k(&path, "zzz", Some(10)).unwrap().is_empty());
+        assert!(scan_term_top_k(&path, "aaa", None).unwrap().is_empty());
     }
 
     #[test]
     fn stream_term_limit_zero_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_fti(dir.path(), &[(b"pk1", "hello world")]);
-        assert!(stream_search_term(&path, "hello", Some(0))
-            .unwrap()
-            .is_empty());
+        assert!(scan_term_top_k(&path, "hello", Some(0)).unwrap().is_empty());
     }
 
     #[test]
@@ -292,7 +288,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         let cut = dir.path().join("cut.db");
         std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
-        assert!(stream_search_term(&cut, "hello", Some(10)).is_err());
+        assert!(scan_term_top_k(&cut, "hello", Some(10)).is_err());
     }
 
     #[test]
@@ -300,6 +296,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.db");
         std::fs::write(&path, b"XXXX0000000000000000").unwrap();
-        assert!(stream_search_term(&path, "hello", Some(10)).is_err());
+        assert!(scan_term_top_k(&path, "hello", Some(10)).is_err());
     }
 }
