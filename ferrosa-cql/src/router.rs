@@ -25626,6 +25626,94 @@ mod tests {
         }
     }
 
+    /// Encode a CQL v5 `<query_parameters>` section carrying `page_size`
+    /// (fetch_size) and, when present, an echoed `paging_state` — exactly the
+    /// bytes the python/gocql driver puts on the wire for a paged SELECT. No
+    /// bound values (a scan has none).
+    fn wire_query_params(page_size: i32, paging_state: Option<&[u8]>) -> Vec<u8> {
+        // flags: 0x04 (PAGE_SIZE) [+ 0x08 (WITH_PAGING_STATE) when echoing].
+        let mut flags: u32 = 0x04;
+        if paging_state.is_some() {
+            flags |= 0x08;
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&flags.to_be_bytes()); // v5: 4-byte flags
+        buf.extend_from_slice(&page_size.to_be_bytes()); // [int] page_size
+        if let Some(ps) = paging_state {
+            buf.extend_from_slice(&(ps.len() as i32).to_be_bytes()); // [bytes] len
+            buf.extend_from_slice(ps); // paging_state bytes
+        }
+        buf
+    }
+
+    /// Live-fidelity page walk: unlike [`walk_pages`], this NEVER constructs
+    /// `ctx.paging` by hand. It serializes the client's fetch_size + echoed
+    /// cursor into a real wire `<query_parameters>` payload and re-derives
+    /// `PagingParams` via the SAME decoder the live QUERY handler uses
+    /// ([`crate::connection::decode_query_paging`]). This is the exact bridge
+    /// the 3 prior "in-process-green" fixes bypassed: they populated
+    /// `PagingParams` directly, so they never observed that the wire path
+    /// dropped page_size/paging_state (t_a0f922a3 LIVE). With the wire decode
+    /// reverted, page 2 == page 1 and this walk cycles until the `max_pages`
+    /// cap FAILS it — the exact live signature.
+    async fn walk_pages_via_wire(
+        state: &SharedState,
+        auth: &AuthContext,
+        ks: &Option<String>,
+        select_cql: &str,
+        page_size: i32,
+        max_pages: usize,
+    ) -> Vec<Vec<Vec<Option<CqlValue>>>> {
+        let select = match crate::parser::parse(select_cql).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let mut pages: Vec<Vec<Vec<Option<CqlValue>>>> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        loop {
+            // Round-trip the paging controls through the wire codec.
+            let wire = wire_query_params(page_size, paging_state.as_deref());
+            let paging = crate::connection::decode_query_paging(&wire, 5)
+                .expect("wire query-parameters must decode");
+            let ctx = RequestContext {
+                auth,
+                current_keyspace: ks,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging,
+                client_address: String::new(),
+                protocol_version: 5,
+            };
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                route_select_raw(state, &ctx, &select),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("page {} did not return within 120s", pages.len()))
+            .unwrap();
+            assert!(
+                res.rows.len() <= page_size as usize,
+                "page {} returned {} rows, exceeds wire fetch_size {page_size} — \
+                 the wire page_size was DROPPED (t_a0f922a3: fetch_size=2000 → 5000 rows)",
+                pages.len(),
+                res.rows.len()
+            );
+            if !res.rows.is_empty() {
+                pages.push(res.rows);
+            }
+            match res.paging_state {
+                Some(ns) => paging_state = Some(ns),
+                None => return pages,
+            }
+            assert!(
+                pages.len() <= max_pages,
+                "paged scan did not terminate within {max_pages} pages — the wire \
+                 paging cursor is being dropped, so every page re-serves page 1 \
+                 (t_a0f922a3 LIVE: has_more stuck True forever)"
+            );
+        }
+    }
+
     /// Extract `(pk, ck)` ints from a row given the projected column indices.
     fn row_pk_ck(row: &[Option<CqlValue>], pk_idx: usize, ck_idx: usize) -> (i32, i32) {
         let int_at = |i: usize| match row[i] {
@@ -25774,6 +25862,73 @@ mod tests {
             10,
         )
         .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+    }
+
+    /// t_a0f922a3 LIVE (the bug 3 prior in-process-green fixes missed): the
+    /// EXACT live shape and transport. `SELECT pk, ck FROM vcyc.edges`
+    /// (3 partitions × 5000 clustering rows), driven with the python driver's
+    /// `fetch_size=2000` and the echoed cursor round-tripped through the REAL
+    /// wire `<query_parameters>` codec — NOT a hand-built `ctx.paging`.
+    ///
+    /// Live evidence reproduced here as assertions:
+    ///  * page 1 returned 5000 rows for fetch_size=2000 → page_size was NOT
+    ///    applied (the server default leaked through). `walk_pages_via_wire`
+    ///    fails the moment a page exceeds the wire fetch_size.
+    ///  * pages 2,3,4 were byte-identical to page 1 (same rows, same cursor) →
+    ///    the echoed paging_state was ignored and the scan re-served partition 1
+    ///    from ck=0 forever. `assert_paged_traversal_exact` fails on a
+    ///    non-advancing page, and the `max_pages` cap fails a cycling loop.
+    ///
+    /// Revert-to-confirm: revert the wire decode in `connection.rs` (back to
+    /// `PagingParams::default()`) and this test fails with a cycling cursor /
+    /// oversized page — while the older `walk_pages` (hand-built `ctx.paging`)
+    /// tests keep passing, which is precisely why the live failure slipped past.
+    #[tokio::test]
+    async fn live_wire_paged_scan_advances_and_terminates_exactly() {
+        let rows_per: i64 = 5_000;
+        let page_size: i32 = 2_000; // python driver default-style fetch_size
+        let (state, _dir, auth, ks) =
+            setup_clustered_scan_table("vcyc", &[1, 2, 3], rows_per).await;
+
+        let expected: std::collections::BTreeSet<(i32, i32)> = [1, 2, 3]
+            .into_iter()
+            .flat_map(|pk| (0..rows_per as i32).map(move |ck| (pk, ck)))
+            .collect();
+        assert_eq!(expected.len(), 15_000, "fixture must be exactly 15k rows");
+
+        // The exact projected live query, over the wire codec. A generous page
+        // cap: ceil(15000/2000) = 8 pages; a cycling cursor blows past it.
+        let pages = walk_pages_via_wire(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM vcyc.wide",
+            page_size,
+            50,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+        // And the same after flushing to SSTable (the live cycle was observed
+        // on flushed data; a post-restart node returned an instant empty page).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("vcyc", "wide"))
+            .expect("flush vcyc.edges to SSTable");
+        let pages = walk_pages_via_wire(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM vcyc.wide",
+            page_size,
+            50,
+        )
+        .await;
+        assert!(
+            !pages.is_empty(),
+            "SSTable-backed wire-paged scan returned an instant EMPTY result"
+        );
         assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
     }
 
