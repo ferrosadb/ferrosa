@@ -1602,9 +1602,14 @@ async fn handle_query(
         }
     };
 
-    // Parse bound values from the QUERY frame (if present) and substitute
-    // into the statement. cdrs-tokio sends query_with_values which includes
-    // values in the QUERY frame alongside bind markers in the query text.
+    // Parse the QUERY frame's <query_parameters> section: bound values AND the
+    // pagination controls (page_size / paging_state). cdrs-tokio sends
+    // query_with_values which includes values in the QUERY frame alongside bind
+    // markers in the query text; the python/gocql drivers send fetch_size +
+    // paging_state here for a paged SELECT. t_a0f922a3 (LIVE): this section used
+    // to decode ONLY values and drop page_size/paging_state, so a paged scan
+    // re-served page 1 forever and ignored the client's fetch_size.
+    let mut paging = crate::paging::PagingParams::default();
     if cursor.remaining() > 0 {
         let (table_ks, table_name) = extract_keyspace_table(&stmt, current_keyspace);
         let (bound_columns, _result_columns) =
@@ -1621,16 +1626,26 @@ async fn handle_query(
             table_keyspace: table_ks,
             table_name,
         };
-        stmt = match substitute_bound_values(&temp_plan, cursor, protocol_version) {
-            Ok(s) => s,
-            Err(e) => {
-                return HandleResult::Reply(Opcode::Error, e.encode_body());
-            }
-        };
+        let (bound_terms, parsed_paging) =
+            match decode_query_params(&temp_plan, cursor, protocol_version) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    return HandleResult::Reply(Opcode::Error, e.encode_body());
+                }
+            };
+        paging = parsed_paging;
+        stmt = substitute_bound_terms(&temp_plan, bound_terms.as_deref());
     }
 
     // Build an auth context for routing (use a default if auth was disabled).
-    let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
+    let ctx = build_request_context(
+        auth_context,
+        current_keyspace,
+        cl,
+        peer,
+        protocol_version,
+        paging,
+    );
 
     // Transaction control + in-transaction DML buffering (BEGIN/COMMIT over
     // Accord). The per-connection buffer is locked only for the duration of the
@@ -1899,17 +1914,26 @@ async fn handle_execute(
         }
     };
 
-    // Parse bound values from the EXECUTE frame. Common prepared INSERTs can
-    // route directly from the cached plan and bound terms; complex statements
-    // fall back to the generic AST substitution path.
-    let bound_terms = match decode_bound_values(&plan, cursor, protocol_version) {
-        Ok(terms) => terms,
+    // Parse bound values AND pagination controls from the EXECUTE frame. Common
+    // prepared INSERTs can route directly from the cached plan and bound terms;
+    // complex statements fall back to the generic AST substitution path.
+    // t_a0f922a3 (LIVE): a paged prepared SELECT sends fetch_size / paging_state
+    // in this same section — decoding only values dropped them, wedging paging.
+    let (bound_terms, paging) = match decode_query_params(&plan, cursor, protocol_version) {
+        Ok(parsed) => parsed,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
         }
     };
 
-    let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
+    let ctx = build_request_context(
+        auth_context,
+        current_keyspace,
+        cl,
+        peer,
+        protocol_version,
+        paging,
+    );
 
     if let Some(bound_terms) = bound_terms.as_ref() {
         let fast_result = match &plan.statement {
@@ -2082,9 +2106,16 @@ async fn handle_batch(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Route each statement.
+    // Route each statement. BATCH is write-only — no pagination applies.
     for stmt in statements {
-        let ctx = build_request_context(auth_context, current_keyspace, cl, peer, protocol_version);
+        let ctx = build_request_context(
+            auth_context,
+            current_keyspace,
+            cl,
+            peer,
+            protocol_version,
+            crate::paging::PagingParams::default(),
+        );
         match crate::router::route(state, &ctx, stmt).await {
             Ok(RouteResult::SetKeyspace(ks, _)) => {
                 *current_keyspace = Some(ks);
@@ -2116,6 +2147,7 @@ fn build_request_context<'a>(
     consistency: ferrosa_cluster::consistency::ConsistencyLevel,
     peer: std::net::SocketAddr,
     protocol_version: u8,
+    paging: crate::paging::PagingParams,
 ) -> RequestContext<'a> {
     // If auth was disabled, we need a default auth context.
     if auth_context.is_none() {
@@ -2130,7 +2162,7 @@ fn build_request_context<'a>(
         current_keyspace,
         consistency,
         serial_consistency: None,
-        paging: crate::paging::PagingParams::default(),
+        paging,
         client_address: peer.to_string(),
         protocol_version,
     }
@@ -2731,6 +2763,11 @@ fn raw_bytes_to_term(cql_type: &CqlType, bytes: &[u8]) -> Term {
 /// The cursor should be positioned after the consistency level bytes.
 /// CQL v5 EXECUTE frame layout after consistency:
 ///   `[int flags][short n_values]([int len][bytes value])*`
+///
+/// Test-only: the live QUERY/EXECUTE handlers use [`decode_query_params`], which
+/// also decodes the pagination controls. This helper isolates value
+/// substitution for the value-binding regression tests below.
+#[cfg(test)]
 fn substitute_bound_values(
     plan: &PreparedPlan,
     cursor: &[u8],
@@ -2748,6 +2785,7 @@ fn substitute_bound_terms(plan: &PreparedPlan, bound_terms: Option<&[Term]>) -> 
     substitute_in_statement(&plan.statement, bound_terms, &mut substitution_idx)
 }
 
+#[cfg(test)]
 fn decode_bound_values(
     plan: &PreparedPlan,
     mut cursor: &[u8],
@@ -2775,15 +2813,158 @@ fn decode_bound_values(
         return Ok(None);
     }
 
-    // Parse [short n_values]
+    // Parse [short n_values]([int len][bytes])*.
     // Per CQL v4 spec 4.1.4, values come first after flags, before
     // optional fields (page_size, paging_state, etc.).
+    Ok(Some(decode_values_section(plan, &mut cursor)?))
+}
+
+/// CQL native-protocol query-parameters flag bits (§4.1.4). Shared by QUERY and
+/// EXECUTE. Only the ones we act on are named.
+const QP_FLAG_VALUES: u32 = 0x0001;
+const QP_FLAG_PAGE_SIZE: u32 = 0x0004;
+const QP_FLAG_WITH_PAGING_STATE: u32 = 0x0008;
+const QP_FLAG_WITH_SERIAL_CONSISTENCY: u32 = 0x0010;
+const QP_FLAG_WITH_DEFAULT_TIMESTAMP: u32 = 0x0020;
+
+/// Decode the full QUERY/EXECUTE `<query_parameters>` section (§4.1.4),
+/// returning both the bound values (if the VALUES flag is set) and the
+/// pagination controls (`page_size` from flag 0x04, `paging_state` from flag
+/// 0x08).
+///
+/// t_a0f922a3 (LIVE): the previous wire handlers only decoded VALUES and built
+/// `PagingParams::default()`, so a driver's `fetch_size` / echoed cursor never
+/// reached the router — the paged scan re-served page 1 forever and applied the
+/// server default page instead of the client's `fetch_size`. The optional
+/// fields are laid out in a FIXED order after the values section (page_size,
+/// paging_state, serial_consistency, default_timestamp, keyspace, now_in_secs);
+/// each is present only if its flag bit is set, so we must walk them in order
+/// even for the fields we ignore, or a trailing field misaligns the read.
+pub(crate) fn decode_query_params(
+    plan: &PreparedPlan,
+    cursor: &[u8],
+    protocol_version: u8,
+) -> Result<(Option<Vec<Term>>, crate::paging::PagingParams), CqlError> {
+    let mut c = cursor;
+
+    // <flags>: [int] in v5+, [byte] in v3/v4.
+    let flags = if protocol_version >= 0x05 {
+        if c.remaining() < 4 {
+            return Ok((None, crate::paging::PagingParams::default()));
+        }
+        c.get_u32()
+    } else {
+        if c.remaining() < 1 {
+            return Ok((None, crate::paging::PagingParams::default()));
+        }
+        c.get_u8() as u32
+    };
+
+    // <values>: consumed first so the optional fields that follow stay aligned.
+    let bound_terms = if (flags & QP_FLAG_VALUES) != 0 {
+        Some(decode_values_section(plan, &mut c)?)
+    } else {
+        None
+    };
+
+    // <page_size>: [int].
+    let page_size = if (flags & QP_FLAG_PAGE_SIZE) != 0 {
+        if c.remaining() < 4 {
+            return Err(CqlError::Protocol(
+                "query parameters: truncated page_size".into(),
+            ));
+        }
+        Some(c.get_i32())
+    } else {
+        None
+    };
+
+    // <paging_state>: [bytes] — [int len] then `len` bytes (len < 0 = null).
+    let paging_state = if (flags & QP_FLAG_WITH_PAGING_STATE) != 0 {
+        if c.remaining() < 4 {
+            return Err(CqlError::Protocol(
+                "query parameters: truncated paging_state length".into(),
+            ));
+        }
+        let len = c.get_i32();
+        if len < 0 {
+            None
+        } else {
+            let len = len as usize;
+            if c.remaining() < len {
+                return Err(CqlError::Protocol(
+                    "query parameters: truncated paging_state bytes".into(),
+                ));
+            }
+            let bytes = c[..len].to_vec();
+            c.advance(len);
+            Some(bytes)
+        }
+    } else {
+        None
+    };
+
+    // We do not consume serial_consistency / default_timestamp here — they are
+    // the LAST optional fields we could touch and nothing after them is read,
+    // so ignoring their trailing bytes is safe. Named only to document the wire
+    // order for a future reader who adds a field after paging_state.
+    let _ = (
+        QP_FLAG_WITH_SERIAL_CONSISTENCY,
+        QP_FLAG_WITH_DEFAULT_TIMESTAMP,
+    );
+
+    Ok((
+        bound_terms,
+        crate::paging::PagingParams {
+            page_size,
+            paging_state,
+        },
+    ))
+}
+
+/// Decode ONLY the pagination controls (`page_size` / `paging_state`) from a
+/// QUERY `<query_parameters>` section for a statement with no bind values (the
+/// paged-`SELECT` scan shape). Shares [`decode_query_params`] so the live wire
+/// decode and the paged-scan round-trip tests exercise the exact same parser —
+/// closing the fidelity gap where prior fixes populated `PagingParams` by hand
+/// and so never caught that the wire path dropped it (t_a0f922a3).
+///
+/// Test-only: the live handlers call [`decode_query_params`] directly (they
+/// already hold a `PreparedPlan`); this convenience wrapper exists for the
+/// paged-scan round-trip tests, which have no plan.
+#[cfg(test)]
+pub(crate) fn decode_query_paging(
+    cursor: &[u8],
+    protocol_version: u8,
+) -> Result<crate::paging::PagingParams, CqlError> {
+    // An empty plan is sufficient: a paged SELECT scan carries no bind values,
+    // so the VALUES branch (the only consumer of `plan`) is never taken.
+    let empty_plan = PreparedPlan {
+        id: [0u8; 16],
+        query: String::new(),
+        statement: crate::parser::parse("SELECT * FROM s.t").expect("static parse"),
+        keyspace: None,
+        result_columns: Vec::new(),
+        bound_columns: Vec::new(),
+        pk_indexes: Vec::new(),
+        table_keyspace: String::new(),
+        table_name: String::new(),
+    };
+    let (_bound, paging) = decode_query_params(&empty_plan, cursor, protocol_version)?;
+    Ok(paging)
+}
+
+/// Decode the `<values>` sub-section (`[short n]([int len][bytes])*`) starting
+/// at `cursor` (which is positioned right after the flags/VALUES bit). Advances
+/// `cursor` past the consumed bytes so the caller can read the fields that
+/// follow (page_size, paging_state, ...). Shared by the value-binding tests and
+/// [`decode_query_params`].
+fn decode_values_section(plan: &PreparedPlan, cursor: &mut &[u8]) -> Result<Vec<Term>, CqlError> {
     if cursor.remaining() < 2 {
         return Err(CqlError::Protocol("EXECUTE: truncated values count".into()));
     }
     let n_values = cursor.get_u16() as usize;
 
-    // Decode each bound value using the type from bound_columns.
     let mut bound_terms: Vec<Term> = Vec::with_capacity(n_values);
     for i in 0..n_values {
         if cursor.remaining() < 4 {
@@ -2791,7 +2972,6 @@ fn decode_bound_values(
         }
         let val_len = cursor.get_i32();
         if val_len < 0 {
-            // Null value
             bound_terms.push(Term::Null);
         } else {
             let val_len = val_len as usize;
@@ -2801,19 +2981,15 @@ fn decode_bound_values(
             let val_bytes = &cursor[..val_len];
             cursor.advance(val_len);
 
-            // Look up the type for this positional value.
             let cql_type = if i < plan.bound_columns.len() {
                 &plan.bound_columns[i].1
             } else {
-                // More values than bound columns — default to blob.
                 &CqlType::Blob
             };
-
             bound_terms.push(raw_bytes_to_term(cql_type, val_bytes));
         }
     }
-
-    Ok(Some(bound_terms))
+    Ok(bound_terms)
 }
 
 /// Substitute bound values for a single statement inside a BATCH.
@@ -3003,6 +3179,103 @@ mod tests {
     fn ready_prepare_uses_concurrent_request_path() {
         assert!(is_request_opcode(Opcode::Prepare));
         assert!(dispatches_concurrently(Opcode::Prepare));
+    }
+
+    /// t_a0f922a3 LIVE bug — the exact fidelity gap that made 3 prior fixes
+    /// pass locally and fail live: the router's paged-scan arm was correct, but
+    /// the wire QUERY/EXECUTE handler NEVER decoded the `page_size` (flag 0x04)
+    /// or `paging_state` (flag 0x08) query-parameters fields — it built
+    /// `PagingParams::default()`. So the python driver's `fetch_size=2000`
+    /// resolved to the 5000-row default page, and the client-echoed cursor was
+    /// silently dropped: page 2 re-served page 1 forever (has_more stuck True).
+    ///
+    /// This asserts the wire decoder now surfaces BOTH fields from a real
+    /// v5 query-parameters payload. Revert-to-confirm: with the decode reverted
+    /// to `PagingParams::default()`, both assertions fail (page_size None,
+    /// paging_state None) — the live signature.
+    #[test]
+    fn query_params_decode_extracts_page_size_and_paging_state_v5() {
+        // v5 query parameters (§4.1.4):
+        //   [int flags][... values ...][int page_size][bytes paging_state]
+        // flags = 0x04 (page_size) | 0x08 (paging_state), no values.
+        let cursor_state = vec![0xDEu8, 0xAD, 0xBE, 0xEF]; // opaque prior cursor bytes
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(0x04u32 | 0x08u32).to_be_bytes()); // 4-byte flags
+        payload.extend_from_slice(&2000i32.to_be_bytes()); // page_size = fetch_size
+        payload.extend_from_slice(&(cursor_state.len() as i32).to_be_bytes()); // [bytes] len
+        payload.extend_from_slice(&cursor_state); // paging_state bytes
+
+        let plan = make_plan("SELECT pk, ck FROM ks.t", vec![]);
+        let (bound, paging) = decode_query_params(&plan, &payload, 5).unwrap();
+
+        assert!(bound.is_none(), "no VALUES flag set");
+        assert_eq!(
+            paging.page_size,
+            Some(2000),
+            "fetch_size must survive the wire; a None here is the live 5000-default bug"
+        );
+        assert_eq!(
+            paging.paging_state.as_deref(),
+            Some(cursor_state.as_slice()),
+            "the client-echoed cursor must survive the wire; None here re-serves page 1 forever"
+        );
+    }
+
+    /// v4 form uses a 1-byte flags field; the same fields must still decode.
+    #[test]
+    fn query_params_decode_extracts_page_size_and_paging_state_v4() {
+        let cursor_state = vec![1u8, 2, 3];
+        let mut payload = Vec::new();
+        payload.push(0x04 | 0x08); // 1-byte flags: page_size + paging_state
+        payload.extend_from_slice(&500i32.to_be_bytes());
+        payload.extend_from_slice(&(cursor_state.len() as i32).to_be_bytes());
+        payload.extend_from_slice(&cursor_state);
+
+        let plan = make_plan("SELECT pk, ck FROM ks.t", vec![]);
+        let (bound, paging) = decode_query_params(&plan, &payload, 4).unwrap();
+        assert!(bound.is_none());
+        assert_eq!(paging.page_size, Some(500));
+        assert_eq!(
+            paging.paging_state.as_deref(),
+            Some(cursor_state.as_slice())
+        );
+    }
+
+    /// Values + page_size together: the values section is consumed first, then
+    /// page_size — proving cursor alignment across both optional fields.
+    #[test]
+    fn query_params_decode_values_then_page_size() {
+        let plan = make_plan(
+            "INSERT INTO ks.t (id, name) VALUES (?, ?)",
+            vec![("id", CqlType::Int), ("name", CqlType::Varchar)],
+        );
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(0x01u32 | 0x04u32).to_be_bytes()); // VALUES | PAGE_SIZE
+        payload.extend_from_slice(&2u16.to_be_bytes()); // n_values
+        payload.extend_from_slice(&4i32.to_be_bytes());
+        payload.extend_from_slice(&7i32.to_be_bytes());
+        let name = b"alice";
+        payload.extend_from_slice(&(name.len() as i32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.extend_from_slice(&123i32.to_be_bytes()); // page_size
+
+        let (bound, paging) = decode_query_params(&plan, &payload, 5).unwrap();
+        assert!(bound.is_some(), "VALUES flag set");
+        assert_eq!(paging.page_size, Some(123));
+        assert!(paging.paging_state.is_none());
+    }
+
+    /// No paging flags → empty PagingParams (the un-paged SELECT default-page
+    /// path in the router still applies its own bound).
+    #[test]
+    fn query_params_decode_no_paging_flags() {
+        let plan = make_plan("SELECT * FROM ks.t", vec![]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // no flags
+        let (bound, paging) = decode_query_params(&plan, &payload, 5).unwrap();
+        assert!(bound.is_none());
+        assert!(paging.page_size.is_none());
+        assert!(paging.paging_state.is_none());
     }
 
     #[test]
