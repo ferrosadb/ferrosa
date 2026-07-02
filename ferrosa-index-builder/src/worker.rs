@@ -312,6 +312,10 @@ fn build_job(req: &BuildRequest) -> Result<IndexBuildJob, String> {
         priority: parse_priority(&req.priority),
         enqueued_at: Instant::now(),
         column_position: req.column_position,
+        // The remote-build wire protocol has no clustering-column field yet;
+        // clustering-column index jobs are built locally by the engine
+        // (RemoteBackend routes them to its local fallback, t_430c4188).
+        clustering_source: None,
         filter_predicate: req.filter_predicate.clone(),
     })
 }

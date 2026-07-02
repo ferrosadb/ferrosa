@@ -68,6 +68,8 @@ External: `num-bigint`, `uuid`, `tracing`. **Never** depends on `ferrosa-cql`.
 
 - **`ferrosa-cql`** — re-exports the codec + decomposition at their original paths.
 - **`ferrosa-postgres`** — reuses the exact write/read codec for its DML + reads.
+- **`ferrosa-storage`** — uses `decode_clustering` to split composite
+  clustering-key bytes for clustering-column secondary indexes (t_430c4188).
 
 ## Tests
 

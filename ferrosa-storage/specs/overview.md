@@ -33,7 +33,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | Module | Responsibility |
 |--------|----------------|
 | `engine` (`src/engine.rs`, ~18.8k LoC) | `StorageEngine` + `StorageEngineConfig`: composition root; write/read/range/batch API, registration, snapshot/PITR orchestration, maintenance |
-| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush |
+| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush; secondary indexes on regular cells AND clustering-key components (`add_clustering_index`), incl. the partition-keyed consult `read_by_index_in_partition` (t_430c4188) |
 | `memtable/` | `Memtable` trait; `SkipListMemtable` (default), `ShardedBTreeMemtable`; eager-index + vector-index hooks |
 | `commitlog/` | Segmented WAL: `segment` (CAS alloc), `sync` (Batch/Periodic/Group), `reader` (replay), `archiver` (S3/PITR), `cdc`, `checkpoint`, `manifest` |
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
