@@ -50,6 +50,12 @@ real backlog is structural and security-shaped.
     by the threshold, no cap other than the query's `LIMIT`. `DISTINCT`/aggregate/
     function-projection keep their `range_read_limited_rows_checked` fail-loud cap.
     Remaining: per-group spill when `GROUP BY` lands (deferred; not yet parsed).
+  - `fts_match` arm bounded (t_ee98faa0, landed): the full-text branch no longer
+    accumulates every matching row before LIMIT (the live `hybrid_search` OOM
+    shape). LIMIT early-exits the partition fetch loop (peak ≈ limit rows + one
+    partition); no-LIMIT pages with a partition-granular `PagingState` cursor in
+    deterministic partition-key order. Residual: the O(matches) hit-set of small
+    doc keys. See `specs/proposed/streaming-range-reads-no-cap.md`.
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and

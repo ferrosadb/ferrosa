@@ -80,11 +80,24 @@ column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
-it resolves the matching partition keys through the cluster write path
+it resolves the matching row-granular doc keys through the cluster write path
 (`WritePath::fulltext_search`) — which scatter-gathers across every node's local
-FTI and unions the keys — then fetches and post-filters those partitions. A
-coordinator-local index lookup previously made `fts_match` non-deterministic on a
-cluster (BUG-F-007); standalone/pair still resolve locally.
+FTI and unions the keys — then point-reads the distinct matched partitions in
+deterministic (partition-key byte) order, retains only the rows whose FULL
+primary key matched (t_da51e20c), and post-filters. A coordinator-local index
+lookup previously made `fts_match` non-deterministic on a cluster (BUG-F-007);
+standalone/pair still resolve locally.
+
+The arm's coordinator memory is bounded (t_ee98faa0 — a broad `fts_match` over
+a large table previously accumulated every matching row before applying LIMIT
+and OOM-killed a live node): with a LIMIT, the fetch loop stops point-reading
+as soon as `limit` rows survive the post-filter (peak ≈ limit rows + one
+partition); with no LIMIT, it builds one page per response (client `page_size`
+or the default scan page size) and returns a `PagingState` continuation
+(partition-granular cursor), so the complete result is delivered across pages
+while the coordinator holds ≈ one page + one partition. Results are never
+truncated server-side — bounded only by the query's own LIMIT. Known bounded
+residual: the FTS hit-set itself is O(matches) small doc keys (keys, not rows).
 
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 

@@ -39,6 +39,52 @@ multi-page projected scans.
   of N, far under the 32 MiB in-flight budget, with counts == N (no data loss).
   Reverting the consumer to accumulate a Vec makes it RED (peak → `O(result)`).
 
+## Progress — `fts_match` arm coordinator accumulation bounded (`t_ee98faa0`)
+
+**Landed.** The `where_has_fts_match` arm in `ferrosa-cql/src/router.rs` — the
+exact query shape that OOM-killed the live cluster
+(`… context_snippet = fts_match(<terms>)` over a large `entity_store` via
+ferrosa-memory `hybrid_search`) — no longer materializes every matching row
+before applying LIMIT. Previously it point-read each matched partition, appended
+every surviving row into an unbounded `fts_rows` Vec, and applied `take(limit)`
+only AFTER the loop: peak = O(matched rows × row size). (The consume-path fix
+above did NOT cover this arm — it point-reads via `write_path.read`, not the
+range-scan stream.) ferrosa-memory's `hybrid_search` DOES send a LIMIT
+(`LIMIT {k}` with k = `source_limit` clamp ≤ 50 for entity content;
+≤ 512 entity-name / ≤ 4096 BM25-segment candidates), so the live OOM was pure
+coordinator-side pre-LIMIT accumulation.
+
+- **LIMIT present** — the fetch loop stops point-reading as soon as `limit` rows
+  SURVIVE the post-filter (`fts_rows.truncate(limit)` + break; rows dropped by
+  non-fts predicates don't count and keep the loop reading). Peak ≈ limit rows +
+  one partition; remaining matched partitions are never consulted.
+- **No LIMIT** — the full result is legitimate, so MEMORY is bounded, not the
+  result: the arm builds one page per response (client `page_size`, or
+  `default_scan_page_size` when the client sends none — same policy as the
+  unbounded-`SELECT *` streaming fix) and returns a partition-granular
+  `PagingState` continuation (resume strictly after the last fully-delivered
+  partition key). Pages may exceed `page_size` by the tail of one wide partition
+  (`page_size` is a hint per the CQL spec). Peak ≈ one page + one partition.
+- **Determinism** — matched partitions are visited in sorted partition-key-byte
+  order. CQL promises no ordering for this arm, but the previous
+  `HashSet` iteration order silently decided WHICH rows a LIMIT kept
+  (observed: `[1, 4, 5, 3, 2, 7, 6]`); the sort makes LIMIT early-exit and page
+  cursors reproducible.
+- **Semantics preserved** — row retention by FULL doc key (t_da51e20c), the
+  legacy-doc-key skip, and post-filter predicates are unchanged; results are
+  never truncated server-side (bounded only by the query's own LIMIT). The
+  previously-`#[ignore]`d `fts_match_with_pk_predicates_returns_matches`
+  (t_8686dd3c) now passes (fixed by the row-granular doc keys) and was
+  un-ignored.
+- **Known bounded residual** — the FTS hit-set (`matched`) is O(matches) SMALL
+  doc keys (keys, not rows), accepted for now.
+- **Tests** (`router.rs`, RED→GREEN via a test-only per-thread partition-read
+  counter): `fts_match_limit_stops_partition_reads_at_limit` (10 matches,
+  LIMIT 3 → exactly 3 reads), `fts_match_limit_post_filtered_rows_do_not_count_toward_limit`
+  (dropped rows trigger further reads, exact LIMIT), `fts_match_no_limit_pages_bound_accumulation`
+  (pages 3/3/1, union = all rows, no dups), `fts_match_no_limit_returns_all_matching_rows`
+  (no server-side truncation).
+
 **Deferred consumers still materializing** (bounded by the caller's own
 `limit`/page — not the OOM path, but not yet streaming): the CQL `PartitionKeyLookup`
 fallback and empty-index fallback (`router.rs` `range_read_with`), and the SPARQL /
