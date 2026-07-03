@@ -123,8 +123,8 @@ pub(crate) fn resume_filtered_stream(
                 if let Some(ref last) = last_clustering {
                     if row.clustering.as_slice() < last.as_slice() {
                         let hx = |b: &[u8]| {
-                            b.iter()
-                                .take(24)
+                            b[..b.len().min(24)]
+                                .iter()
                                 .map(|x| format!("{x:02x}"))
                                 .collect::<String>()
                         };
