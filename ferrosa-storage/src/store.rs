@@ -4237,6 +4237,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// Deduplicates by `(partition_key, clustering_key)` so that the same
     /// row appearing in both memtable and sidecar indexes is returned once.
     pub fn read_by_index(&self, index_name: &str, key: &IndexKey) -> Result<Vec<Partition>> {
+        if !self.secondary_index_declared(index_name) {
+            return Ok(Vec::new());
+        }
+
         let guard = self.view.load();
 
         // Per-type read dispatch: encode the raw query term into the index's
@@ -4337,6 +4341,10 @@ impl<F: FlushTarget> TableStore<F> {
         key: &IndexKey,
         partition_key: &[u8],
     ) -> Result<Vec<Partition>> {
+        if !self.secondary_index_declared(index_name) {
+            return Ok(Vec::new());
+        }
+
         let guard = self.view.load();
 
         // Same per-type key encoding as `read_by_index` (see there for why a
@@ -4433,6 +4441,10 @@ impl<F: FlushTarget> TableStore<F> {
         index_name: &str,
         ranges: &[(u64, u64)],
     ) -> Result<Vec<Partition>> {
+        if !self.secondary_index_declared(index_name) {
+            return Ok(Vec::new());
+        }
+
         let guard = self.view.load();
 
         let mut positions: Vec<RowPosition> = Vec::new();
@@ -4543,6 +4555,54 @@ impl<F: FlushTarget> TableStore<F> {
         self.view.store(Arc::new(new_view));
     }
 
+    /// Removes a declared secondary index from every live store layer.
+    ///
+    /// This is the storage-side inverse of [`add_index`](Self::add_index) /
+    /// [`add_clustering_index`](Self::add_clustering_index): future writes no
+    /// longer update a memtable index, reads no longer consult active or
+    /// sidecar state for the name, and vector-index metadata is unwired too.
+    /// Persisted sidecar files/readers are left as inert orphan artifacts; the
+    /// declaration metadata and read guards stop naming them immediately.
+    pub fn remove_index(&mut self, index_name: &str) -> bool {
+        let before_regular = self.indexed_columns.len();
+        self.indexed_columns.retain(|(name, _)| name != index_name);
+        let before_clustering = self.indexed_clustering_columns.len();
+        self.indexed_clustering_columns
+            .retain(|(name, _)| name != index_name);
+        let mut removed = before_regular != self.indexed_columns.len()
+            || before_clustering != self.indexed_clustering_columns.len();
+
+        removed |= self.index_types.remove(index_name).is_some();
+        removed |= self.index_filter_predicates.remove(index_name).is_some();
+        removed |= self.vector_index_methods.remove(index_name).is_some();
+        let before_vector_configs = self.vector_index_configs.len();
+        self.vector_index_configs
+            .retain(|cfg| cfg.index_name != index_name);
+        removed |= before_vector_configs != self.vector_index_configs.len();
+        removed |= self.vector_index_scopes.lock().remove(index_name).is_some();
+
+        let current = self.view.load();
+        let mut new_indexes = (*current.indexes).clone();
+        removed |= new_indexes.remove(index_name).is_some();
+
+        let mut new_vector_indexes = (*current.vector_indexes).clone();
+        removed |= new_vector_indexes.remove(index_name).is_some();
+
+        let new_view = StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::new(new_indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::new(new_vector_indexes),
+        };
+        new_view.check_invariants("remove_index");
+        self.view.store(Arc::new(new_view));
+
+        removed
+    }
+
     /// Dynamically adds a secondary index on a CLUSTERING column
     /// (t_430c4188). Future writes extract the indexed value from the row's
     /// composite clustering-key bytes at `clustering_component` — a
@@ -4593,6 +4653,18 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn get_memtable_index(&self, name: &str) -> Option<Arc<MemtableIndex>> {
         let guard = self.view.load();
         guard.indexes.get(name).cloned()
+    }
+
+    fn secondary_index_declared(&self, index_name: &str) -> bool {
+        self.index_types.contains_key(index_name)
+            || self
+                .indexed_columns
+                .iter()
+                .any(|(name, _)| name == index_name)
+            || self
+                .indexed_clustering_columns
+                .iter()
+                .any(|(name, _)| name == index_name)
     }
 
     /// Returns the current secondary index declarations.
@@ -5737,6 +5809,102 @@ mod tests {
             store.index_type_for("emb_idx"),
             IndexType::Vector,
             "a vector index is no longer mis-stamped as BTree"
+        );
+    }
+
+    #[test]
+    fn remove_index_unwires_future_index_reads() {
+        let mut store = test_store();
+        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+
+        let before_drop = store
+            .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+            .unwrap();
+        assert_eq!(before_drop.len(), 1);
+
+        assert!(
+            store.remove_index("val_idx"),
+            "declared index state should be removed"
+        );
+        assert!(store.indexed_columns().is_empty());
+
+        let after_drop = store
+            .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+            .unwrap();
+        assert!(
+            after_drop.is_empty(),
+            "dropped index must not consult stale memtable index state"
+        );
+        assert!(
+            !store.remove_index("val_idx"),
+            "second removal is idempotent and reports no state removed"
+        );
+    }
+
+    #[test]
+    fn remove_index_unwires_flushed_sidecar_reads() {
+        let mut store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".to_string(), 0_usize)],
+        );
+        store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
+        store.flush().unwrap();
+
+        assert_eq!(
+            store
+                .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "sanity check: flushed sidecar serves the declared index"
+        );
+
+        assert!(store.remove_index("val_idx"));
+        assert!(
+            store
+                .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+                .unwrap()
+                .is_empty(),
+            "dropped index must not consult stale sidecar readers"
+        );
+        assert!(
+            !store.remove_index("val_idx"),
+            "orphan sidecar readers must not make removal non-idempotent"
+        );
+    }
+
+    #[test]
+    fn remove_index_unwires_clustering_and_vector_metadata() {
+        let mut store = test_store();
+        store.add_clustering_index("ck_idx".to_string(), 0, IndexType::BTree);
+        store.add_quantized_vector_index(VectorIndexConfig {
+            index_name: "vec_idx".to_string(),
+            column_position: 0,
+            m: 8,
+            ef_construction: 16,
+            metric: DistanceMetric::L2,
+        });
+
+        assert_eq!(store.indexed_clustering_columns().len(), 1);
+        assert_eq!(
+            store.vector_index_method("vec_idx"),
+            VectorIndexMethod::QuantizedIvf
+        );
+
+        assert!(store.remove_index("ck_idx"));
+        assert!(store.indexed_clustering_columns().is_empty());
+
+        assert!(store.remove_index("vec_idx"));
+        assert_eq!(
+            store.vector_index_method("vec_idx"),
+            VectorIndexMethod::Hnsw,
+            "dropped vector index falls back to the default method"
         );
     }
 

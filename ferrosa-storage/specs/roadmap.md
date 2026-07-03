@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: roadmap
-last_updated: 2026-07-01
+last_updated: 2026-07-03
 ---
 
 # ferrosa-storage — Roadmap
@@ -59,6 +59,19 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **DROP INDEX live-state cleanup + index build path fixes (2026-07-03).**
+  `StorageEngine::drop_index` now unwires declared indexes from the live
+  `TableStore` and `IndexStateTracker` in Direct, pair, and Raft DDL paths,
+  and remains idempotent when only tracker state exists locally. Re-registering
+  an already loaded table now merges missing regular secondary-index
+  declarations so sidecars loaded during `schema.json` boot preload remain
+  visible to declared index reads.
+  Keyed partition-index reads trust an empty consult only when the local storage
+  tracker is authoritative and reports the index current with no pending SSTable
+  backfill; otherwise they keep the bounded partition fallback. The local index
+  backend also resolves engine table-dir SSTables under
+  `sstables/<keyspace>.<table>` and writes generated sidecars beside those table
+  SSTables.
 - **DROP TABLE index-tombstone cascade (t_ae06e925, 2026-07-01).**
   `unregister_table` — the choke point for every DDL route (Direct, pair,
   cluster/Raft, and DROP KEYSPACE per-table) — tombstones the dropped table's

@@ -46,7 +46,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   types, UDFs/UDAs, members, token map, per-node index status, cluster config.
   `DropTable` apply removes the table's index entries from `RaftState` and, via
   `engine.unregister_table`, cascades tombstones over the dropped table's
-  `system_schema.indexes` registrations (t_ae06e925).
+  `system_schema.indexes` registrations (t_ae06e925). `DropIndex` apply now
+  also calls `engine.drop_index`, so live memtable/vector index state, sidecar
+  read guards, and `IndexStateTracker` entries are removed on the applying node
+  immediately.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
@@ -98,7 +101,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 - `coordinator/batch.rs` — 3-phase logged batchlog (write → fan out → delete only
   on full success) with replay task; `DEFAULT_BATCH_CONCURRENCY = 32`.
 - `coordinator/{range_read_stream,stream_*}.rs` — ADR-020 streaming range reads
-  (default; legacy capped path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
+  and projected streaming scans; the old Vec-returning
+  `WritePath::range_read_projected` wrapper has been removed, so projected
+  scans use `range_read_projected_stream_all_*` directly (default; legacy capped
+  path behind `FERROSA_BULK_STREAMING_RANGE_READ=0`).
   `DEFAULT_RANGE_READ_LIMIT` (10_000) is **not** a result cap on streamable
   shapes: `range_read_limited_rows` and `coordinate_range_read_stream_limited_rows`
   honor the caller's own bound (a user `LIMIT N`) uncapped; the const now only

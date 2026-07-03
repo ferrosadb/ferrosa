@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-06-30
+last_updated: 2026-07-03
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -33,7 +33,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | Module | Responsibility |
 |--------|----------------|
 | `engine` (`src/engine.rs`, ~18.8k LoC) | `StorageEngine` + `StorageEngineConfig`: composition root; write/read/range/batch API, registration, snapshot/PITR orchestration, maintenance |
-| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush; secondary indexes on regular cells AND clustering-key components (`add_clustering_index`), incl. the partition-keyed consult `read_by_index_in_partition` (t_430c4188) |
+| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush; secondary indexes on regular cells AND clustering-key components (`add_clustering_index`), live index removal (`remove_index`), incl. the partition-keyed consult `read_by_index_in_partition` (t_430c4188) |
 | `memtable/` | `Memtable` trait; `SkipListMemtable` (default), `ShardedBTreeMemtable`; eager-index + vector-index hooks |
 | `commitlog/` | Segmented WAL: `segment` (CAS alloc), `sync` (Batch/Periodic/Group), `reader` (replay), `archiver` (S3/PITR), `cdc`, `checkpoint`, `manifest` |
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
@@ -41,7 +41,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | `compaction/` | `CompactionExecutor`, STCS + UCS strategies, `CompactionGate`, validator (oracle + differential) |
 | `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay across flat and generation-dir SSTable layouts |
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
-| `index/` | Index state tracker, build scheduler, local/remote/off backends, artifact manifest, virtual table |
+| `index/` | Index state tracker (registered/pending/current completeness), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR) |
 | `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector |
 | `accord/` | Per-shard conflict index + protocol log for Accord transactions |
