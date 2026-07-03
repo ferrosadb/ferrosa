@@ -1678,6 +1678,33 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 });
                 // Advance this cursor's head.
                 let next = self.next_cursor_row(i)?;
+                // FAIL LOUD: a source MUST yield its partition's rows in strictly
+                // increasing clustering order — the streaming k-way merge relies
+                // on it. A legacy/corrupt SSTable that stores rows out of order
+                // would otherwise make the merge non-monotonic; a downstream
+                // paged-scan resume filter (`clustering > cursor`) then SILENTLY
+                // drops every row of this source that trails the misplaced row.
+                // Refuse to serve a silent partial: error with a clear, actionable
+                // message (compaction rewrites the SSTable in sorted order).
+                if let Some(ref next_row) = next {
+                    if next_row.clustering.as_slice() < ck.as_slice() {
+                        let hx = |b: &[u8]| {
+                            b.iter()
+                                .take(24)
+                                .map(|x| format!("{x:02x}"))
+                                .collect::<String>()
+                        };
+                        return Err(Error::InvalidData(format!(
+                            "range merge: a source yielded rows out of clustering order within \
+                             one partition (prev={} > next={}). The SSTable's rows are not \
+                             sorted (legacy or corrupt file); a streaming merge cannot serve it \
+                             correctly and would silently drop the trailing rows. Compact this \
+                             table to rewrite the SSTable in sorted order.",
+                            hx(&ck),
+                            hx(&next_row.clustering)
+                        )));
+                    }
+                }
                 if let Some(a) = self.active.as_mut() {
                     a.heads[i] = next;
                 }
@@ -1964,6 +1991,102 @@ mod tests {
             out.push(p);
         }
         out
+    }
+
+    /// RED (t_a0f922a3 Bug B): a single wide partition whose rows are split
+    /// across two SSTables that OVERLAP (same partition key -> not
+    /// token-disjoint -> placed in two separate runs) must be emitted by
+    /// `next_fragment` as one MONOTONIC merged row stream — identical to what
+    /// `next_merged_partition` produces. If the fragment path concatenates the
+    /// runs instead of k-way merging them, the stream is non-monotonic and a
+    /// downstream paged-scan resume filter (`clustering > cursor`) drops the
+    /// second run entirely (the live typed_edges half-drop).
+    #[test]
+    fn next_fragment_merges_same_partition_across_overlapping_runs_monotonically() {
+        let key = b"P".as_slice();
+        let mk = |clusterings: &[i32]| Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: clusterings
+                .iter()
+                .map(|&c| row(c, 0, b"v", c as i64))
+                .collect(),
+        };
+        // sstable A holds even clusterings, B holds odd — both for the SAME key.
+        let a = std::sync::Arc::new(reader_from_partitions(&[mk(&[0, 2, 4, 6, 8])]));
+        let b = std::sync::Arc::new(reader_from_partitions(&[mk(&[1, 3, 5, 7, 9])]));
+        let readers = vec![a, b];
+
+        // Truth: whole-partition merge is monotonic 0..=9.
+        let mut mm =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let merged = mm.next_merged_partition().unwrap().unwrap();
+        let merged_cks: Vec<i32> = merged
+            .rows
+            .iter()
+            .map(|r| i32::from_be_bytes(r.clustering[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(merged_cks, (0..=9).collect::<Vec<_>>());
+
+        // Fragment path must match, in monotonic order, across the two runs.
+        let mut m =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut cks: Vec<i32> = Vec::new();
+        while let Some(frag) = m.next_fragment(2).unwrap() {
+            for r in &frag.rows {
+                cks.push(i32::from_be_bytes(r.clustering[..4].try_into().unwrap()));
+            }
+        }
+        assert_eq!(
+            cks,
+            (0..=9).collect::<Vec<_>>(),
+            "next_fragment must k-way merge the two runs into one monotonic stream, got {cks:?}"
+        );
+    }
+
+    /// RED->GREEN (t_a0f922a3 Bug B): a legacy/corrupt SSTable storing a
+    /// partition's rows OUT of clustering order must make the streaming merge
+    /// FAIL LOUD, not silently drop the trailing rows. Before the guard, the
+    /// paged-scan resume filter dropped every row trailing the misplaced one
+    /// (~half the live typed_edges big partition) with no error.
+    #[test]
+    fn next_fragment_fails_loud_on_out_of_order_sstable_rows() {
+        let key = b"P".as_slice();
+        // clustering 5 misplaced to the FRONT, rest sorted — the exact live
+        // typed_edges shape (one row ahead of its sorted position). The writer
+        // preserves row order, so the on-disk SSTable is non-monotonic.
+        let p = Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: [5, 0, 1, 2, 3, 4]
+                .iter()
+                .map(|&c| row(c, 0, b"v", c as i64))
+                .collect(),
+        };
+        let a = std::sync::Arc::new(reader_from_partitions(&[p]));
+        let readers = vec![a];
+        let mut m =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut err = None;
+        loop {
+            match m.next_fragment(2) {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect(
+            "next_fragment MUST fail loud on out-of-order SSTable rows, not silently drop them",
+        );
+        assert!(
+            format!("{err}").contains("out of clustering order"),
+            "unexpected error variant: {err}"
+        );
     }
 
     /// MEMORY-BOUND (RED before the fix): one partition with N rows must
