@@ -126,6 +126,8 @@ async fn end_to_end_single_replica_streams_all_partitions() {
         table: "tbl".into(),
         projected_regular_ordinals: None,
         start_key: None,
+        start_clustering: None,
+        max_chunks: 0,
     };
 
     // Producer runs concurrently with the consumer. In production
@@ -165,6 +167,8 @@ async fn end_to_end_two_replicas_aggregates_both_streams() {
         table: "tbl".into(),
         projected_regular_ordinals: None,
         start_key: None,
+        start_clustering: None,
+        max_chunks: 0,
     };
 
     let from_a: PeerId = (Uuid::from_u128(1), "127.0.0.1:7001".parse().unwrap());

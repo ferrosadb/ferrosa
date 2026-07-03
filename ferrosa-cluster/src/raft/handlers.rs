@@ -1181,6 +1181,42 @@ pub struct RangeReadStreamRequestPayload {
     /// predate this field (they decode it as `None`).
     #[serde(default)]
     pub start_key: Option<Vec<u8>>,
+    /// Within-partition resume position, paired with `start_key`: when
+    /// `Some(ck)`, the handler starts the scan AT `start_key` (inclusive) but
+    /// drops every row in that partition whose clustering bytes are `<= ck`,
+    /// so a resumed page of a WIDE partition does not re-stream the
+    /// already-delivered prefix over the wire (t_a0f922a3 mode 1). Ignored
+    /// when `start_key` is `None`.
+    ///
+    /// **bincode wire change** — upgrade all nodes together (same contract as
+    /// `FulltextSearchRequestPayload.limit`); a mixed-version peer fails the
+    /// decode loudly (truncated Done), never silently misreads.
+    #[serde(default)]
+    pub start_clustering: Option<Vec<u8>>,
+    /// Producer flow-control window (t_a0f922a3 mode 2). `0` = unbounded
+    /// (legacy behavior). When `> 0`, the handler stops after emitting this
+    /// many chunk frames and terminates with a `Done` whose
+    /// [`RangeReadStreamDonePayload::resume`] carries the position after the
+    /// last emitted row; the coordinator re-requests from there once its
+    /// consumer has drained the window. This bounds the number of un-drained
+    /// frames per stream at the coordinator to `max_chunks` (+1 Done), which
+    /// MUST be ≤ the coordinator's route buffer — without it the producer
+    /// fire-hoses the whole scan, overflows the bounded route, and the
+    /// fail-loud route close surfaces as a retryable ReadTimeout that live
+    /// drivers retry forever (the observed >14 min paged-scan stall).
+    #[serde(default)]
+    pub max_chunks: u32,
+}
+
+/// Position after the last row a windowed stream emitted: the partition key
+/// plus the raw clustering bytes of the last emitted row in it. A
+/// continuation request sets `start_key = partition_key` and
+/// `start_clustering = clustering` so the producer resumes exactly one row
+/// past the window boundary — no re-emit, no skip, even mid-wide-partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamResumePositionWire {
+    pub partition_key: Vec<u8>,
+    pub clustering: Vec<u8>,
 }
 
 /// Handler → coordinator: one batch of partitions belonging to a
@@ -1227,6 +1263,14 @@ pub struct RangeReadStreamDonePayload {
     pub request_id: u32,
     pub total_chunks: u32,
     pub truncated: bool,
+    /// `Some` when the producer stopped at its
+    /// [`RangeReadStreamRequestPayload::max_chunks`] window with data still
+    /// remaining: the coordinator continues the logical stream by firing a
+    /// fresh request resuming after this position. `None` means the scan is
+    /// complete (or `truncated` reports a failure). **bincode wire change** —
+    /// upgrade all nodes together.
+    #[serde(default)]
+    pub resume: Option<StreamResumePositionWire>,
 }
 
 /// Coordinator → handler: abort a stream in-flight.
@@ -2159,6 +2203,8 @@ mod tests {
             table: "entity_store".into(),
             projected_regular_ordinals: None,
             start_key: Some(b"resume-here".to_vec()),
+            start_clustering: Some(b"resume-ck".to_vec()),
+            max_chunks: 16,
         };
         let encoded = bincode::serialize(&req).expect("encode request");
         let decoded: RangeReadStreamRequestPayload =
@@ -2197,6 +2243,10 @@ mod tests {
             request_id: 7,
             total_chunks: 12,
             truncated: false,
+            resume: Some(StreamResumePositionWire {
+                partition_key: b"pk".to_vec(),
+                clustering: b"ck".to_vec(),
+            }),
         };
         let encoded = bincode::serialize(&done).expect("encode done");
         let decoded: RangeReadStreamDonePayload =

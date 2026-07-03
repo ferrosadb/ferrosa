@@ -65,11 +65,12 @@ sequenceDiagram
     participant Br as bridge (row-bridge re-export)
     participant Res as result encoder
 
-    Drv->>Codec: QUERY/EXECUTE frame bytes
+    Drv->>Codec: QUERY/EXECUTE frame bytes (+ fetch_size/paging_state)
     Codec->>Conn: CqlFrame
     Conn->>Par: CQL text
     Par-->>Conn: Statement::Select (AST)
-    Conn->>Rt: route(state, ctx, stmt)
+    Conn->>Conn: decode_query_params → PagingParams<br/>(page_size flag 0x04, paging_state flag 0x08)
+    Conn->>Rt: route(state, ctx{paging}, stmt)
     Rt->>Rt: check_permission (M8)
     Rt->>Pl: classify scan + ORDER BY plan
     Pl-->>Rt: ScanPlan (inline or spillable temp-sort)
@@ -84,8 +85,19 @@ sequenceDiagram
 ```
 
 When more rows remain, `result.rs` attaches an opaque `paging::PagingState`
-cursor (pk + ck + remaining flag). NOTE: that cursor is currently unsigned —
-FMEA CQL-2.
+cursor (pk + ck + remaining flag).
+
+**Ingress decode (t_a0f922a3 LIVE):** the client's `fetch_size` and echoed
+cursor arrive in the QUERY/EXECUTE `<query_parameters>` section, decoded by
+`connection::decode_query_params` in FIXED wire order (flags → values →
+`page_size` (0x04) → `paging_state` (0x08)) and threaded onto `ctx.paging`.
+The router's paged-scan arm and the coordinator's resume path were already
+correct; the LIVE failure was that these two wire fields were never parsed —
+the handlers built `PagingParams::default()`, so a paged `SELECT` re-served
+page 1 forever and ignored `fetch_size`. Router-level tests that hand-built
+`ctx.paging` passed while the live wire path was broken, which is why the
+regression must be pinned through the real codec
+(`live_wire_paged_scan_advances_and_terminates_exactly`).
 
 ## Bridge re-export relationship (D10)
 

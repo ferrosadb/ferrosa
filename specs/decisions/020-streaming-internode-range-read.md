@@ -271,6 +271,64 @@ The same shape generalizes to `IndexReadRequest` (also currently a
 single-response RPC) and `RangeWriteRequest` (the inverse direction
 for bulk imports). Those follow as separate ADRs once this one lands.
 
+## Windowed continuation + fail-loud terminal contract (t_a0f922a3)
+
+The paged multi-replica scan layers **flow control** and a **fail-loud
+completion contract** on top of the base streaming RPC. Both are
+correctness-critical: a violation silently truncates a full-table scan
+(data loss), which is strictly worse than a crash.
+
+**Windowed continuation (flow control).** A `RangeReadStreamRequest`
+carries `max_chunks`: the producer stops after that many chunk frames and
+reports the position after its last emitted row in
+`RangeReadStreamDonePayload.resume`. The coordinator's
+`WindowedReplicaForwarder` fires the next window (a fresh `request_id`,
+resumed at that position) only after its consumer drains the previous one.
+Un-drained frames per stream never exceed one window, so the bounded route
+buffer cannot overflow no matter how large the scan is — no server-side
+result cap, bounded memory. A `Done` with `resume: None` means the
+producer's local range is genuinely exhausted.
+
+**Fail-loud terminal contract (t_a0f922a3 bug #2).** The N-way merge
+concludes the whole scan is complete once *every* source's stream ends. A
+source stream ends when its per-replica `remote_tx` drops. That inference
+— "channel closed ⇒ replica exhausted" — is only sound when the forwarder
+closed for a reason that makes a silent close *correct*:
+
+- the producer signalled genuine exhaustion (`Completed { resume: None }`), or
+- the consumer *deliberately* abandoned the merged output (a paged read
+  filled its page).
+
+The forwarder sets a per-source `clean_end` flag at exactly those two
+terminations (and at the window-boundary `remote_tx.is_closed()` abandon).
+Every source stream is wrapped by `clean_end_guarded_stream`: if the
+channel closes **without** `clean_end` set — a panicked forwarder task, or
+any future refactor that drops `remote_tx` without delivering an error or
+signalling exhaustion — the wrapper emits one final **loud, retryable
+`Internal` error** instead of a silent `None`. The scan then fails loudly
+(and drivers retry the idempotent range read) rather than returning a
+partial result with `has_more = false`. A forwarder that already delivered
+its own error item (the `Failed` path) is unaffected: the merge sees that
+error first and the fallback never fires.
+
+Observability: `forwarder_diag::{error_send_dropped, continuations_fired}`
+are process-global counters. `error_send_dropped` counts loud replica
+errors that could not be delivered because the merged output was already
+gone — benign under a deliberate page abandon, but a non-zero value on a
+full-drain scan is the silent-partial signature and is asserted on by the
+`range_scan_multi_replica_paging` harness.
+
+**Not reproduced in-process.** The `range_scan_multi_replica_paging`
+harness drives the exact live shape — 3-node loopback cluster, RF=3,
+CL=ALL, disjoint per-replica data, wide partitions, and
+`FERROSA_RANGE_READ_ROWS_PER_FRAGMENT=1` to force ~hundreds of window
+continuations per page — and pages to an **exact** union every time, with
+`error_send_dropped == 0` and `route_closures == 0`. The live 21160-of-50807
+truncation did not reproduce in-process, consistent with the historical
+observation that fresh-data reproductions all page complete; the fail-loud
+guard closes the class of silent-complete structurally rather than by
+matching the exact (environmental/timing) live trigger.
+
 ## Alternatives considered
 
 - **Just bump the timeout** (PR #41). Stopgap: hides the symptom at

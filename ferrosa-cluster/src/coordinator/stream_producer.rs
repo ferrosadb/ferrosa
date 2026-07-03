@@ -101,6 +101,7 @@ pub async fn stream_range_response<S: ChunkSink>(
 
     let done = RangeReadStreamDonePayload {
         request_id: req.request_id,
+        resume: None,
         total_chunks: seq,
         truncated,
     };
@@ -176,6 +177,8 @@ mod tests {
             table: "tbl".into(),
             projected_regular_ordinals: None,
             start_key: None,
+            start_clustering: None,
+            max_chunks: 0,
         }
     }
 
