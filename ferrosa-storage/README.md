@@ -95,8 +95,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   dropped table's registrations via `write_index_tombstones_for_table` and
   sweeps its tracker entries (t_ae06e925). `StorageEngine::drop_index` is the
   DROP INDEX choke point for live storage state: it removes the table store's
-  memtable/sidecar/vector metadata and the tracker entry immediately, before
-  restart. Boot-time
+  memtable/vector metadata, sidecar read guards, and the tracker entry
+  immediately, before restart; tracker cleanup is still idempotent when the
+  table is not registered in this engine process. Boot-time
   `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
   (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
   `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at

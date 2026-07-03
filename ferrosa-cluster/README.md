@@ -47,8 +47,9 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   `DropTable` apply removes the table's index entries from `RaftState` and, via
   `engine.unregister_table`, cascades tombstones over the dropped table's
   `system_schema.indexes` registrations (t_ae06e925). `DropIndex` apply now
-  also calls `engine.drop_index`, so live memtable/sidecar/vector index state and
-  `IndexStateTracker` entries are removed on the applying node immediately.
+  also calls `engine.drop_index`, so live memtable/vector index state, sidecar
+  read guards, and `IndexStateTracker` entries are removed on the applying node
+  immediately.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst

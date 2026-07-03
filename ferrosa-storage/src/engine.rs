@@ -3516,16 +3516,17 @@ impl StorageEngine {
     /// Removes a secondary index from live storage state.
     ///
     /// Schema/system-table persistence is owned by the DDL layer; this method
-    /// only unwires the engine-side structures that otherwise keep serving a
-    /// dropped index until restart: the table store's memtable/sidecar/vector
-    /// maps and the engine-wide [`crate::index::IndexStateTracker`].
+    /// only unwires the engine-side structures that otherwise keep serving or
+    /// tracking a dropped index until restart: the table store's live index
+    /// maps, sidecar read guards, vector metadata, and the engine-wide
+    /// [`crate::index::IndexStateTracker`]. If the table is not registered in
+    /// this engine process, tracker cleanup still runs and the operation is a
+    /// no-op for table-local state.
     pub fn drop_index(&self, table_id: &TableId, index_name: &str) -> ferrosa_common::Result<bool> {
         let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-
-        let removed_store_state = state.store.remove_index(index_name);
+        let removed_store_state = tables
+            .get_mut(table_id)
+            .is_some_and(|state| state.store.remove_index(index_name));
         let removed_tracker_state =
             self.index_tracker
                 .remove_index(table_id.keyspace(), table_id.table(), index_name);
@@ -18148,6 +18149,33 @@ mod tests {
         assert!(
             !engine.drop_index(&table_id, "val_idx").unwrap(),
             "second cleanup is idempotent"
+        );
+    }
+
+    #[test]
+    fn drop_index_clears_tracker_when_table_is_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = TableId::new("test_ks", "missing_table");
+        engine
+            .index_tracker()
+            .register_index("test_ks", "missing_table", "val_idx");
+
+        assert!(
+            engine.drop_index(&table_id, "val_idx").unwrap(),
+            "tracker-only cleanup should report state removed"
+        );
+        assert!(
+            engine
+                .index_tracker()
+                .get_state("test_ks", "missing_table", "val_idx")
+                .is_none(),
+            "tracker state must be removed even when table-local state is absent"
+        );
+        assert!(
+            !engine.drop_index(&table_id, "val_idx").unwrap(),
+            "second tracker-only cleanup is idempotent"
         );
     }
 

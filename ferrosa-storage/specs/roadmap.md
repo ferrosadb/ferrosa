@@ -61,7 +61,8 @@ open work lives in specs and the items below.
 
 - **DROP INDEX live-state cleanup + index build path fixes (2026-07-03).**
   `StorageEngine::drop_index` now unwires declared indexes from the live
-  `TableStore` and `IndexStateTracker` in Direct, pair, and Raft DDL paths.
+  `TableStore` and `IndexStateTracker` in Direct, pair, and Raft DDL paths,
+  and remains idempotent when only tracker state exists locally.
   Keyed partition-index reads trust an empty consult only when the local storage
   tracker is authoritative and reports the index current with no pending SSTable
   backfill; otherwise they keep the bounded partition fallback. The local index
