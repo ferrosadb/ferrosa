@@ -82,6 +82,7 @@ pub fn write_sstable(
         min_timestamp: 1,
         max_timestamp: 1_000_000,
         partition_count: sorted.len() as u64,
+        legacy_format: false,
     }
 }
 
@@ -288,6 +289,7 @@ mod tests {
                 min_timestamp: 1,
                 max_timestamp: 1_000_000,
                 partition_count: sorted.len() as u64,
+                legacy_format: false,
             });
         }
         metas

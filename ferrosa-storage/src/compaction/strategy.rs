@@ -5,7 +5,7 @@
 //! (within a configurable ratio of the bucket median) and triggers
 //! compaction when a bucket reaches `min_threshold`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ferrosa_common::schema::TableSchema;
 
@@ -200,6 +200,42 @@ impl CompactionStrategy for SizeTieredStrategy {
     }
 }
 
+/// Rewrite tasks for legacy-format SSTables, independent of the size-tier
+/// strategy (t_a0f922a3).
+///
+/// A legacy Cassandra-format SSTable (`legacy_format == true`: key bounds do
+/// not decode as byte-comparable) stores a wide partition's rows in an order
+/// the streaming fragment read path mis-handles — the paged scan silently
+/// under-delivers. Size-tiered/UCS bucketing groups by SIZE, so a lone legacy
+/// file sits in its own tier and is NEVER selected, leaving the mis-sorted data
+/// on disk indefinitely. This selects every legacy-format file for a rewrite
+/// regardless of tier: compacting through `merge::merge_partitions` re-sorts
+/// each partition and writes byte-comparable output, permanently fixing the
+/// on-disk order. One task carries all legacy inputs (>= 1; the executor
+/// rewrites a single input). Self-terminating: once rewritten, no legacy files
+/// remain and no further task is produced.
+pub fn legacy_rewrite_tasks(
+    sstables: &[SSTableMetadata],
+    schema: &TableSchema,
+    table_id: &TableId,
+    output_dir: &Path,
+) -> Vec<CompactionTask> {
+    let inputs: Vec<SSTableMetadata> = sstables
+        .iter()
+        .filter(|s| s.legacy_format)
+        .cloned()
+        .collect();
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    vec![CompactionTask {
+        inputs,
+        output_dir: output_dir.join(table_id.to_string()),
+        schema: schema.clone(),
+        table_id: table_id.clone(),
+    }]
+}
+
 /// Computes the median size of a bucket of SSTables.
 fn bucket_median(bucket: &[&SSTableMetadata]) -> f64 {
     if bucket.is_empty() {
@@ -230,6 +266,7 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
             partition_count: 10,
+            legacy_format: false,
         }
     }
 
@@ -258,6 +295,81 @@ mod tests {
 
     fn test_table_id() -> crate::TableId {
         crate::TableId::new("test_ks", "test_table")
+    }
+
+    fn make_legacy(id: &str, size: u64) -> SSTableMetadata {
+        SSTableMetadata {
+            legacy_format: true,
+            ..make_metadata(id, size)
+        }
+    }
+
+    /// A lone legacy-format SSTable sits in its own size tier, so the size-tiered
+    /// strategy never selects it — but it MUST still be scheduled for a rewrite,
+    /// or its mis-sorted rows silently break paged reads forever (t_a0f922a3).
+    #[test]
+    fn lone_legacy_sstable_scheduled_for_rewrite_regardless_of_tier() {
+        let strategy = SizeTieredStrategy::new(test_config());
+        // One legacy file at a unique size, plus a healthy same-size bucket that
+        // does NOT include it. STCS emits a task for the healthy bucket only.
+        let sstables = vec![
+            make_legacy("legacy", 830_000),
+            make_metadata("a", 1000),
+            make_metadata("b", 1100),
+            make_metadata("c", 900),
+            make_metadata("d", 1050),
+        ];
+        let stcs = strategy.select(&sstables, &test_table_schema(), &test_table_id());
+        assert!(
+            stcs.iter()
+                .all(|t| t.inputs.iter().all(|i| i.id != "legacy")),
+            "size-tiered strategy must NOT pull the lone legacy file into a size bucket"
+        );
+
+        let rewrite = legacy_rewrite_tasks(
+            &sstables,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+        );
+        assert_eq!(rewrite.len(), 1, "one rewrite task for the legacy file");
+        assert_eq!(rewrite[0].inputs.len(), 1);
+        assert_eq!(rewrite[0].inputs[0].id, "legacy");
+    }
+
+    #[test]
+    fn no_legacy_files_produce_no_rewrite_task() {
+        let sstables = vec![make_metadata("a", 1000), make_metadata("b", 2000)];
+        let rewrite = legacy_rewrite_tasks(
+            &sstables,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+        );
+        assert!(rewrite.is_empty(), "no legacy files → no rewrite task");
+    }
+
+    #[test]
+    fn multiple_legacy_files_grouped_into_one_rewrite_task() {
+        let sstables = vec![
+            make_legacy("l1", 800_000),
+            make_metadata("healthy", 1000),
+            make_legacy("l2", 300_000),
+        ];
+        let rewrite = legacy_rewrite_tasks(
+            &sstables,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+        );
+        assert_eq!(rewrite.len(), 1);
+        let mut ids: Vec<&str> = rewrite[0].inputs.iter().map(|i| i.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["l1", "l2"],
+            "only legacy inputs, healthy excluded"
+        );
     }
 
     #[test]

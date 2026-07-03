@@ -5469,6 +5469,16 @@ impl<F: FlushTarget> TableStore<F> {
                 let min_token = desc.min_token;
                 let max_token = desc.max_token;
 
+                // Legacy-format detection: a Cassandra-format SSTable whose key
+                // bounds do not decode as byte-comparable stores rows in an order
+                // the streaming read path mis-handles (t_a0f922a3). Flag it so the
+                // strategy schedules a format-rewrite regardless of size tier.
+                let legacy_format = ferrosa_sstable::byte_comparable::decode(
+                    sst.smallest_key_bytes(),
+                )
+                .is_err()
+                    || ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes()).is_err();
+
                 Some(crate::compaction::metadata::SSTableMetadata {
                     id: id.clone(),
                     path: sstable_path,
@@ -5478,6 +5488,7 @@ impl<F: FlushTarget> TableStore<F> {
                     min_timestamp: header.min_timestamp,
                     max_timestamp: header.max_timestamp,
                     partition_count: sst.key_count(),
+                    legacy_format,
                 })
             })
             .collect()
