@@ -189,6 +189,7 @@ mod tests {
             min_timestamp: 0,
             max_timestamp: 0,
             partition_count: 1,
+            legacy_format: false,
         }
     }
 

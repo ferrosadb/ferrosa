@@ -62,32 +62,64 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
         all_rows.extend(source.rows);
     }
 
-    // Sort all rows by clustering key
-    all_rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
-
-    // Merge rows with the same clustering key using pop/merge/push pattern
-    let mut merged_rows: Vec<Row> = Vec::new();
-    for row in all_rows {
-        if merged_rows
-            .last()
-            .is_some_and(|last| last.clustering == row.clustering)
-        {
-            let prev = merged_rows.pop().unwrap();
-            merged_rows.push(merge_rows(prev, row));
-        } else {
-            merged_rows.push(row);
-        }
-    }
+    sort_and_fold_rows(&mut all_rows);
 
     let mut result = Partition {
         key: result_key,
         deletion: result_deletion,
         static_row: result_static_row,
-        rows: merged_rows,
+        rows: all_rows,
     };
 
     apply_deletions(&mut result);
     result
+}
+
+/// Sort rows by clustering key IN PLACE and fold same-clustering rows via
+/// cell-level LWW (`pop/merge/push`). `sort_by` is stable, so equal-clustering
+/// rows keep their input order before folding. Operates on `&mut Vec<Row>` (no
+/// `Vec<Row>` return) so it does not read as a read-path materialization site.
+/// Shared by [`merge_partitions`] (multi source) and
+/// [`ensure_partition_rows_sorted`] (single-source compaction rewrite) so the
+/// two paths produce identical row order.
+fn sort_and_fold_rows(rows: &mut Vec<Row>) {
+    rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+    // Fold adjacent same-clustering rows by rebuilding into the same Vec.
+    let sorted = std::mem::take(rows);
+    for row in sorted {
+        if rows
+            .last()
+            .is_some_and(|last| last.clustering == row.clustering)
+        {
+            let prev = rows.pop().unwrap();
+            rows.push(merge_rows(prev, row));
+        } else {
+            rows.push(row);
+        }
+    }
+}
+
+/// Guarantee a partition's rows are in clustering order, sorting + folding
+/// duplicates only if they are not already.
+///
+/// A compaction is a REWRITE: its output must be monotonic. But
+/// [`merge_partitions`] returns a single-source partition (`sources.len() == 1`)
+/// in its on-disk order — and a legacy Cassandra-format SSTable can store a
+/// wide partition's rows OUT of clustering order (t_a0f922a3). Without this,
+/// such a partition would be rewritten with byte-comparable bounds
+/// (`legacy_format = false`) yet keep its non-monotonic rows, and never be
+/// re-selected. Compaction calls this on every merged partition; the
+/// `is_sorted_by` guard makes it a cheap O(n) check (no reorder) for the common
+/// already-sorted case — including every multi-source `merge_partitions` output,
+/// which is already sorted.
+pub fn ensure_partition_rows_sorted(partition: &mut Partition) {
+    if partition
+        .rows
+        .is_sorted_by(|a, b| a.clustering <= b.clustering)
+    {
+        return;
+    }
+    sort_and_fold_rows(&mut partition.rows);
 }
 
 /// Merge two rows with the same clustering key using cell-level LWW.
@@ -237,6 +269,59 @@ mod tests {
             static_row: None,
             rows,
         }
+    }
+
+    /// t_a0f922a3: `merge_partitions` leaves a single-source partition in its
+    /// on-disk order (a legacy SSTable can store rows non-monotonically).
+    /// `ensure_partition_rows_sorted` re-sorts it so a compaction rewrite emits
+    /// monotonic output, and is a no-op for already-sorted rows.
+    #[test]
+    fn ensure_partition_rows_sorted_fixes_misordered_single_source() {
+        // Rows out of clustering order (c5 misplaced to the front), exactly the
+        // legacy-SSTable shape. merge_partitions of this single source keeps the
+        // bad order:
+        let misordered = make_partition(
+            "k1",
+            vec![
+                make_row_with_clustering(b"c5", vec![make_cell(0, b"v", 5)], 5),
+                make_row_with_clustering(b"c1", vec![make_cell(0, b"v", 1)], 1),
+                make_row_with_clustering(b"c2", vec![make_cell(0, b"v", 2)], 2),
+                make_row_with_clustering(b"c3", vec![make_cell(0, b"v", 3)], 3),
+                make_row_with_clustering(b"c4", vec![make_cell(0, b"v", 4)], 4),
+            ],
+        );
+        let mut merged = merge_partitions(vec![misordered]);
+        let before: Vec<Vec<u8>> = merged.rows.iter().map(|r| r.clustering.clone()).collect();
+        assert_eq!(
+            before,
+            vec![
+                b"c5".to_vec(),
+                b"c1".to_vec(),
+                b"c2".to_vec(),
+                b"c3".to_vec(),
+                b"c4".to_vec()
+            ],
+            "precondition: merge_partitions leaves the single source unsorted"
+        );
+
+        ensure_partition_rows_sorted(&mut merged);
+        let after: Vec<Vec<u8>> = merged.rows.iter().map(|r| r.clustering.clone()).collect();
+        assert_eq!(
+            after,
+            vec![
+                b"c1".to_vec(),
+                b"c2".to_vec(),
+                b"c3".to_vec(),
+                b"c4".to_vec(),
+                b"c5".to_vec()
+            ],
+            "ensure_partition_rows_sorted must produce strictly increasing clustering order"
+        );
+
+        // Idempotent: a second call changes nothing.
+        ensure_partition_rows_sorted(&mut merged);
+        let again: Vec<Vec<u8>> = merged.rows.iter().map(|r| r.clustering.clone()).collect();
+        assert_eq!(again, after, "re-sorting already-sorted rows is a no-op");
     }
 
     #[test]

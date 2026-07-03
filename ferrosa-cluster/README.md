@@ -141,6 +141,18 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   ships the cursor's clustering position to every producer
   (`start_clustering` on the wire; `resume_filtered_stream` locally), so a
   wide partition spanning pages never re-streams its delivered prefix.
+  **Resume-filter fail-loud (t_a0f922a3):** `resume_filtered_stream` drops rows
+  `<= resume_ck` as the already-delivered prefix, which is correct only if the
+  fragment stream is monotonically ascending in raw clustering. A legacy /
+  mis-sorted SSTable can emit a wide partition as two concatenated ascending
+  runs, whose second run restarts *below* `resume_ck` and would be silently
+  dropped — under-delivering the page with no error. The wrapper now tracks the
+  delivered clustering for the resume partition and **errors** (`Storage /
+  InvalidData`, "compact this table") on any regression instead of returning a
+  silent partial. It is inert on healthy (monotonic) data, adds O(1) state, and
+  does no buffering. The permanent fix is at rest: compaction rewrites such
+  SSTables in sorted, byte-comparable order (`ferrosa-storage` legacy-format
+  rewrite).
   **Wire note:** the request/Done payload field additions are a bincode wire
   change — upgrade all nodes together (mixed versions fail decode loudly).
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk

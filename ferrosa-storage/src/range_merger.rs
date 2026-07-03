@@ -804,19 +804,48 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
 /// Returns runs as `Vec<Vec<Arc<SSTableReader>>>` — each inner Vec
 /// is sorted by token range so concatenation produces sorted
 /// output.
+///
+/// # Correctness — decode-guarded disjointness
+///
+/// Concatenating SSTables into a run is only sound when every
+/// partition key appears in **at most one** member of the run;
+/// otherwise the run's sequential `next_partition` re-emits the same
+/// key from a later member and the merge heap — which sees a run as a
+/// single source — never groups those copies, so `merge_partitions`
+/// never runs and duplicate rows are counted twice (the COUNT(*)
+/// over-count bug on `agent_memory.typed_edges`).
+///
+/// The single-appearance invariant follows from **token-disjoint**
+/// intervals only when every interval is expressed in the *same*
+/// total order as the merge heap (which orders by
+/// [`DecoratedKey`] = token-then-key). SSTables written by different
+/// code paths can store `smallest_key`/`largest_key` in an encoding
+/// that is NOT the byte-comparable form (observed on captured
+/// Cassandra-shaped SSTables whose bounds fail `byte_comparable::decode`).
+/// Comparing those raw bytes against byte-comparable bounds yields a
+/// bogus "disjoint" verdict and fuses overlapping SSTables into one run.
+///
+/// Fix: decode each SSTable's bounds to a [`DecoratedKey`]. Only
+/// SSTables whose **both** bounds decode participate in interval
+/// coloring over decoded (token-ordered) keys; any SSTable whose
+/// bounds do not decode is placed in its own singleton run so it
+/// becomes an independent heap source and the k-way merge groups its
+/// keys correctly.
 pub fn partition_into_disjoint_runs<R: ReadAt + Send + Sync + 'static>(
     sstables: &[Arc<SSTableReader<R>>],
 ) -> Vec<Vec<Arc<SSTableReader<R>>>> {
-    let bounds: Vec<(Vec<u8>, Vec<u8>)> = sstables
+    let bounds: Vec<Option<(DecoratedKey, DecoratedKey)>> = sstables
         .iter()
         .map(|sst| {
-            (
-                sst.smallest_key_bytes().to_vec(),
-                sst.largest_key_bytes().to_vec(),
-            )
+            let lo = ferrosa_sstable::byte_comparable::decode(sst.smallest_key_bytes());
+            let hi = ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes());
+            match (lo, hi) {
+                (Ok(lo), Ok(hi)) => Some((lo, hi)),
+                _ => None,
+            }
         })
         .collect();
-    let runs_of_indices = group_disjoint_runs(&bounds);
+    let runs_of_indices = group_disjoint_runs_by_key(&bounds);
     runs_of_indices
         .into_iter()
         .map(|indices| {
@@ -826,6 +855,60 @@ pub fn partition_into_disjoint_runs<R: ReadAt + Send + Sync + 'static>(
                 .collect()
         })
         .collect()
+}
+
+/// Decode-guarded interval coloring over [`DecoratedKey`] bounds.
+///
+/// Each entry is `Some((smallest, largest))` when the SSTable's
+/// bounds decoded, or `None` when they did not. A `None` interval is
+/// **never** grouped with another SSTable — it becomes its own
+/// singleton run — because we cannot prove key-disjointness for it.
+/// `Some` intervals are grouped by the same greedy interval-coloring
+/// as [`group_disjoint_runs`], but disjointness is tested on decoded
+/// `DecoratedKey`s (token-then-key order — identical to the merge
+/// heap) rather than on possibly-mixed-encoding raw bytes.
+pub fn group_disjoint_runs_by_key(
+    bounds: &[Option<(DecoratedKey, DecoratedKey)>],
+) -> Vec<Vec<usize>> {
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+
+    // Indices whose bounds decoded, sorted by smallest DecoratedKey.
+    let mut decodable: Vec<usize> = (0..bounds.len()).filter(|&i| bounds[i].is_some()).collect();
+    decodable.sort_by(|&a, &b| {
+        let ka = &bounds[a].as_ref().unwrap().0;
+        let kb = &bounds[b].as_ref().unwrap().0;
+        ka.cmp(kb)
+    });
+
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for idx in decodable {
+        let smallest = &bounds[idx].as_ref().unwrap().0;
+        let mut placed = false;
+        for run in &mut runs {
+            let last_idx = *run.last().expect("non-empty run");
+            let last_largest = &bounds[last_idx].as_ref().unwrap().1;
+            if smallest > last_largest {
+                run.push(idx);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            runs.push(vec![idx]);
+        }
+    }
+
+    // Non-decodable SSTables each get their own singleton run so they
+    // remain independent heap sources (key grouping stays correct).
+    for (i, b) in bounds.iter().enumerate() {
+        if b.is_none() {
+            runs.push(vec![i]);
+        }
+    }
+
+    runs
 }
 
 /// Pure interval-coloring on byte-comparable `(smallest, largest)`
@@ -1595,6 +1678,33 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 });
                 // Advance this cursor's head.
                 let next = self.next_cursor_row(i)?;
+                // FAIL LOUD: a source MUST yield its partition's rows in strictly
+                // increasing clustering order — the streaming k-way merge relies
+                // on it. A legacy/corrupt SSTable that stores rows out of order
+                // would otherwise make the merge non-monotonic; a downstream
+                // paged-scan resume filter (`clustering > cursor`) then SILENTLY
+                // drops every row of this source that trails the misplaced row.
+                // Refuse to serve a silent partial: error with a clear, actionable
+                // message (compaction rewrites the SSTable in sorted order).
+                if let Some(ref next_row) = next {
+                    if next_row.clustering.as_slice() < ck.as_slice() {
+                        let hx = |b: &[u8]| {
+                            b[..b.len().min(24)]
+                                .iter()
+                                .map(|x| format!("{x:02x}"))
+                                .collect::<String>()
+                        };
+                        return Err(Error::InvalidData(format!(
+                            "range merge: a source yielded rows out of clustering order within \
+                             one partition (prev={} > next={}). The SSTable's rows are not \
+                             sorted (legacy or corrupt file); a streaming merge cannot serve it \
+                             correctly and would silently drop the trailing rows. Compact this \
+                             table to rewrite the SSTable in sorted order.",
+                            hx(&ck),
+                            hx(&next_row.clustering)
+                        )));
+                    }
+                }
                 if let Some(a) = self.active.as_mut() {
                     a.heads[i] = next;
                 }
@@ -1684,8 +1794,11 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{group_disjoint_runs, merger_for_projected_sources, merger_for_sources};
-    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use super::{
+        group_disjoint_runs, group_disjoint_runs_by_key, merger_for_projected_sources,
+        merger_for_sources,
+    };
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
     use ferrosa_sstable::statistics::SerializationHeader;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
@@ -1878,6 +1991,102 @@ mod tests {
             out.push(p);
         }
         out
+    }
+
+    /// RED (t_a0f922a3 Bug B): a single wide partition whose rows are split
+    /// across two SSTables that OVERLAP (same partition key -> not
+    /// token-disjoint -> placed in two separate runs) must be emitted by
+    /// `next_fragment` as one MONOTONIC merged row stream — identical to what
+    /// `next_merged_partition` produces. If the fragment path concatenates the
+    /// runs instead of k-way merging them, the stream is non-monotonic and a
+    /// downstream paged-scan resume filter (`clustering > cursor`) drops the
+    /// second run entirely (the live typed_edges half-drop).
+    #[test]
+    fn next_fragment_merges_same_partition_across_overlapping_runs_monotonically() {
+        let key = b"P".as_slice();
+        let mk = |clusterings: &[i32]| Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: clusterings
+                .iter()
+                .map(|&c| row(c, 0, b"v", c as i64))
+                .collect(),
+        };
+        // sstable A holds even clusterings, B holds odd — both for the SAME key.
+        let a = std::sync::Arc::new(reader_from_partitions(&[mk(&[0, 2, 4, 6, 8])]));
+        let b = std::sync::Arc::new(reader_from_partitions(&[mk(&[1, 3, 5, 7, 9])]));
+        let readers = vec![a, b];
+
+        // Truth: whole-partition merge is monotonic 0..=9.
+        let mut mm =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let merged = mm.next_merged_partition().unwrap().unwrap();
+        let merged_cks: Vec<i32> = merged
+            .rows
+            .iter()
+            .map(|r| i32::from_be_bytes(r.clustering[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(merged_cks, (0..=9).collect::<Vec<_>>());
+
+        // Fragment path must match, in monotonic order, across the two runs.
+        let mut m =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut cks: Vec<i32> = Vec::new();
+        while let Some(frag) = m.next_fragment(2).unwrap() {
+            for r in &frag.rows {
+                cks.push(i32::from_be_bytes(r.clustering[..4].try_into().unwrap()));
+            }
+        }
+        assert_eq!(
+            cks,
+            (0..=9).collect::<Vec<_>>(),
+            "next_fragment must k-way merge the two runs into one monotonic stream, got {cks:?}"
+        );
+    }
+
+    /// RED->GREEN (t_a0f922a3 Bug B): a legacy/corrupt SSTable storing a
+    /// partition's rows OUT of clustering order must make the streaming merge
+    /// FAIL LOUD, not silently drop the trailing rows. Before the guard, the
+    /// paged-scan resume filter dropped every row trailing the misplaced one
+    /// (~half the live typed_edges big partition) with no error.
+    #[test]
+    fn next_fragment_fails_loud_on_out_of_order_sstable_rows() {
+        let key = b"P".as_slice();
+        // clustering 5 misplaced to the FRONT, rest sorted — the exact live
+        // typed_edges shape (one row ahead of its sorted position). The writer
+        // preserves row order, so the on-disk SSTable is non-monotonic.
+        let p = Partition {
+            key: DecoratedKey::new(PartitionKey::from(key)),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: [5, 0, 1, 2, 3, 4]
+                .iter()
+                .map(|&c| row(c, 0, b"v", c as i64))
+                .collect(),
+        };
+        let a = std::sync::Arc::new(reader_from_partitions(&[p]));
+        let readers = vec![a];
+        let mut m =
+            merger_for_sources(Box::new(std::iter::empty()), None, &readers, None, None).unwrap();
+        let mut err = None;
+        loop {
+            match m.next_fragment(2) {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect(
+            "next_fragment MUST fail loud on out-of-order SSTable rows, not silently drop them",
+        );
+        assert!(
+            format!("{err}").contains("out of clustering order"),
+            "unexpected error variant: {err}"
+        );
     }
 
     /// MEMORY-BOUND (RED before the fix): one partition with N rows must
@@ -2188,6 +2397,63 @@ mod tests {
     fn empty_input_no_runs() {
         let runs = group_disjoint_runs(&[]);
         assert!(runs.is_empty());
+    }
+
+    fn dkey(token: i64, key: &[u8]) -> DecoratedKey {
+        DecoratedKey {
+            token: Token(token),
+            key: PartitionKey::from(key),
+        }
+    }
+
+    /// `group_disjoint_runs_by_key` orders/tests disjointness on decoded
+    /// `DecoratedKey`s (token-then-key). Token-disjoint intervals fuse
+    /// into one run; overlapping ones split.
+    #[test]
+    fn group_by_key_uses_token_order_for_disjointness() {
+        let bounds = vec![
+            Some((dkey(30, b"d"), dkey(40, b"e"))), // [30,40]
+            Some((dkey(10, b"a"), dkey(20, b"b"))), // [10,20] — disjoint, before
+            Some((dkey(15, b"x"), dkey(35, b"y"))), // [15,35] — overlaps both
+        ];
+        let runs = group_disjoint_runs_by_key(&bounds);
+        // Two runs: {1,0} concatenated by token order, {2} on its own.
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert!(runs.contains(&vec![1, 0]), "runs: {runs:?}");
+        assert!(runs.contains(&vec![2]), "runs: {runs:?}");
+    }
+
+    /// Regression for the COUNT(*) over-count root cause: an SSTable
+    /// whose bounds did NOT decode (`None`) must NEVER be concatenated
+    /// into a run with another SSTable — it becomes its own singleton
+    /// run so the merge heap treats it as an independent source and
+    /// still groups its keys with matching keys from other sources.
+    #[test]
+    fn group_by_key_isolates_undecodable_bounds_into_singleton_runs() {
+        let bounds = vec![
+            Some((dkey(10, b"a"), dkey(20, b"b"))), // decodable, [10,20]
+            None,                                   // undecodable bounds
+            Some((dkey(30, b"c"), dkey(40, b"d"))), // decodable, [30,40] — disjoint
+            None,                                   // undecodable bounds
+        ];
+        let runs = group_disjoint_runs_by_key(&bounds);
+        // Decodable disjoint pair fuse into one run; each None is alone.
+        assert!(runs.contains(&vec![0, 2]), "runs: {runs:?}");
+        assert!(runs.contains(&vec![1]), "runs: {runs:?}");
+        assert!(runs.contains(&vec![3]), "runs: {runs:?}");
+        // No run mixes a None-index with any other SSTable.
+        for run in &runs {
+            let has_undecodable = run.iter().any(|&i| bounds[i].is_none());
+            assert!(
+                !has_undecodable || run.len() == 1,
+                "undecodable bounds must be isolated: {run:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_by_key_empty_input_no_runs() {
+        assert!(group_disjoint_runs_by_key(&[]).is_empty());
     }
 
     /// Edge: single SSTable always yields exactly one run with one

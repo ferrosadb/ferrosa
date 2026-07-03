@@ -25,6 +25,37 @@ use ferrosa_schema::Schema;
 /// and `eval_to_timestamp` (extracts unix-millis from a v1 TimeUUID).
 pub(crate) const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
 
+/// Minimum representable CQL `timestamp` value, in Unix-epoch milliseconds.
+///
+/// CQL `timestamp` is a signed 64-bit millisecond count, but a value must
+/// still round-trip through a calendar date on both the server and every
+/// client driver. We bound it to `chrono`'s representable `DateTime<Utc>`
+/// range so a scan can never emit millis that crash a driver's date decode.
+/// Forensic corruption (Bug C) stored a value near `i64` extremes that decodes
+/// to `days=-1917935064` — this bound rejects exactly that class of value at
+/// the write boundary.
+pub(crate) const TIMESTAMP_MIN_MS: i64 = -8_334_601_228_800_000; // chrono MIN_UTC millis
+/// Maximum representable CQL `timestamp` value, in Unix-epoch milliseconds.
+pub(crate) const TIMESTAMP_MAX_MS: i64 = 8_210_266_876_799_999; // chrono MAX_UTC millis
+
+/// Validate a millisecond `timestamp` value at the write boundary.
+///
+/// Fail-loud: a value outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]` is
+/// rejected with a clear error rather than persisted, so it can never become
+/// undecodable on-disk data. Returns the value unchanged when valid.
+pub(crate) fn validate_timestamp_ms(ms: i64) -> Result<i64, CqlError> {
+    if (TIMESTAMP_MIN_MS..=TIMESTAMP_MAX_MS).contains(&ms) {
+        Ok(ms)
+    } else {
+        Err(CqlError::Invalid(format!(
+            "timestamp value {ms} ms is out of the representable range \
+             [{TIMESTAMP_MIN_MS}, {TIMESTAMP_MAX_MS}] (Unix-epoch milliseconds); \
+             refusing to write a timestamp cell that would decode to an \
+             out-of-range date"
+        )))
+    }
+}
+
 /// Generate a v1 TimeUUID containing the current timestamp.
 ///
 /// Returns `CqlValue::Timeuuid` with a version-1 UUID built from the
@@ -91,7 +122,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                     .map_err(|_| CqlError::Invalid("value out of range for tinyint".into()))?;
                 Ok(CqlValue::Tinyint(v))
             }
-            CqlType::Timestamp => Ok(CqlValue::Timestamp(*n)),
+            CqlType::Timestamp => Ok(CqlValue::Timestamp(validate_timestamp_ms(*n)?)),
             CqlType::Counter => Ok(CqlValue::Counter(*n)),
             CqlType::Float => {
                 // CQL allows integer literals for float columns (e.g. INSERT ... VALUES (42))
@@ -187,7 +218,7 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
                         "cannot parse timestamp from string: {s}"
                     )));
                 };
-                Ok(CqlValue::Timestamp(ms))
+                Ok(CqlValue::Timestamp(validate_timestamp_ms(ms)?))
             }
             CqlType::Date => {
                 // Parse ISO date: "2024-01-15"
@@ -247,9 +278,13 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             CqlType::Int if b.len() == 4 => Ok(CqlValue::Int(i32::from_be_bytes(
                 b.as_slice().try_into().unwrap(),
             ))),
-            CqlType::Bigint | CqlType::Timestamp if b.len() == 8 => Ok(CqlValue::Bigint(
-                i64::from_be_bytes(b.as_slice().try_into().unwrap()),
-            )),
+            CqlType::Bigint if b.len() == 8 => Ok(CqlValue::Bigint(i64::from_be_bytes(
+                b.as_slice().try_into().unwrap(),
+            ))),
+            CqlType::Timestamp if b.len() == 8 => {
+                let ms = i64::from_be_bytes(b.as_slice().try_into().unwrap());
+                Ok(CqlValue::Timestamp(validate_timestamp_ms(ms)?))
+            }
             CqlType::Varchar | CqlType::Ascii => {
                 Ok(CqlValue::Text(String::from_utf8_lossy(b).to_string()))
             }
@@ -1412,6 +1447,100 @@ mod tests {
         let val =
             term_to_cql_value(&Term::IntegerLiteral(1710000000), &CqlType::Timestamp).unwrap();
         assert_eq!(val, CqlValue::Timestamp(1710000000));
+    }
+
+    /// Bug C regression: an out-of-range integer literal written into a
+    /// `timestamp` column must be rejected at the write boundary. Before the
+    /// fix, `INSERT ... VALUES (<huge i64>)` was accepted verbatim, producing an
+    /// on-disk cell whose millis decode to a date far outside the representable
+    /// range (observed forensically as days=-1917935064), crashing client
+    /// `SELECT *` decode. A timestamp column must never hold such a value.
+    #[test]
+    fn term_out_of_range_integer_timestamp_is_rejected() {
+        // Value whose /86_400_000 == -1917935064 days — the exact corruption
+        // signature seen on disk. Far outside chrono's representable range.
+        let corrupt_ms: i64 = -1917935064i64 * 86_400_000;
+        let err = term_to_cql_value(&Term::IntegerLiteral(corrupt_ms), &CqlType::Timestamp)
+            .expect_err("out-of-range timestamp integer literal must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("timestamp") && msg.contains("range"),
+            "error should name the timestamp range violation, got: {msg}"
+        );
+
+        // i64::MAX and i64::MIN are the extreme corruption cases.
+        assert!(
+            term_to_cql_value(&Term::IntegerLiteral(i64::MAX), &CqlType::Timestamp).is_err(),
+            "i64::MAX must be rejected as a timestamp"
+        );
+        assert!(
+            term_to_cql_value(&Term::IntegerLiteral(i64::MIN), &CqlType::Timestamp).is_err(),
+            "i64::MIN must be rejected as a timestamp"
+        );
+    }
+
+    /// In-range timestamps (including epoch boundaries and a plausible modern
+    /// millisecond value) must still be accepted after the fix.
+    #[test]
+    fn term_in_range_integer_timestamp_is_accepted() {
+        for ms in [
+            0i64,
+            1_710_000_000_000,
+            -1_000,
+            TIMESTAMP_MIN_MS,
+            TIMESTAMP_MAX_MS,
+        ] {
+            let val = term_to_cql_value(&Term::IntegerLiteral(ms), &CqlType::Timestamp)
+                .unwrap_or_else(|e| panic!("in-range timestamp {ms} rejected: {e:?}"));
+            assert_eq!(val, CqlValue::Timestamp(ms));
+        }
+    }
+
+    /// Bug C regression on the bind-marker path: a prepared-statement bound
+    /// value carrying 8 raw bytes for a `timestamp` column must also be
+    /// range-validated, not decoded verbatim into an unrepresentable value.
+    #[test]
+    fn bound_out_of_range_timestamp_blob_is_rejected() {
+        let corrupt_ms: i64 = -1917935064i64 * 86_400_000;
+        let bytes = corrupt_ms.to_be_bytes().to_vec();
+        let err = term_to_cql_value(&Term::BlobLiteral(bytes), &CqlType::Timestamp)
+            .expect_err("out-of-range bound timestamp blob must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("timestamp") && msg.contains("range"),
+            "error should name the timestamp range violation, got: {msg}"
+        );
+    }
+
+    /// The hardcoded representable-range bounds must track chrono's own
+    /// `DateTime<Utc>` millisecond limits so validation never rejects a value a
+    /// client could legitimately decode, nor accepts one it cannot.
+    #[test]
+    fn timestamp_bounds_match_chrono() {
+        assert_eq!(
+            TIMESTAMP_MIN_MS,
+            chrono::DateTime::<chrono::Utc>::MIN_UTC.timestamp_millis()
+        );
+        assert_eq!(
+            TIMESTAMP_MAX_MS,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()
+        );
+        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS).is_some());
+        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS).is_some());
+        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MIN_MS - 1).is_none());
+        assert!(chrono::DateTime::from_timestamp_millis(TIMESTAMP_MAX_MS + 1).is_none());
+    }
+
+    /// A well-formed bound timestamp blob still decodes.
+    #[test]
+    fn bound_in_range_timestamp_blob_is_accepted() {
+        let ms: i64 = 1_710_000_000_000;
+        let val = term_to_cql_value(
+            &Term::BlobLiteral(ms.to_be_bytes().to_vec()),
+            &CqlType::Timestamp,
+        )
+        .expect("in-range bound timestamp blob must be accepted");
+        assert_eq!(val, CqlValue::Timestamp(ms));
     }
 
     #[test]

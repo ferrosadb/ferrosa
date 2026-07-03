@@ -7560,7 +7560,43 @@ impl StorageEngine {
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);
-        let tasks = strategy.select(&metadata, &state.schema, table_id);
+        let mut tasks = strategy.select(&metadata, &state.schema, table_id);
+        // Independent of the size-tier strategy: legacy-format SSTables (bounds
+        // not byte-comparable) store rows in an order the streaming read path
+        // mis-handles and are never picked by size bucketing, so they linger and
+        // silently break paged reads (t_a0f922a3). Always schedule them for a
+        // format-rewrite so on-disk order is corrected promptly. Exclude any
+        // legacy file the strategy already selected: submitting an overlapping
+        // repair task would make the executor's input-claim skip the WHOLE
+        // repair set, and the strategy task already rewrites those files in
+        // sorted order (compaction re-sorts every output partition).
+        let covered: std::collections::HashSet<&str> = tasks
+            .iter()
+            .flat_map(|t| t.inputs.iter().map(|i| i.id.as_str()))
+            .collect();
+        let uncovered_legacy: Vec<crate::compaction::metadata::SSTableMetadata> = metadata
+            .iter()
+            .filter(|s| s.legacy_format && !covered.contains(s.id.as_str()))
+            .cloned()
+            .collect();
+        let rewrites = crate::compaction::strategy::legacy_rewrite_tasks(
+            &uncovered_legacy,
+            &state.schema,
+            table_id,
+            &self.config.compaction.output_dir,
+            self.config.compaction.max_threshold,
+            self.config.compaction.max_compaction_bytes,
+        );
+        if !rewrites.is_empty() {
+            let legacy_count: usize = rewrites.iter().map(|t| t.inputs.len()).sum();
+            tracing::info!(
+                %table_id,
+                legacy_count,
+                rewrite_tasks = rewrites.len(),
+                "compaction: scheduling legacy-format SSTable rewrite (byte-comparable re-sort)"
+            );
+        }
+        tasks.extend(rewrites);
         for task in tasks {
             if let Err(e) = self.compaction_executor.submit(task) {
                 tracing::error!(%e, %table_id, "storage-engine: compaction submit failed");
@@ -16306,6 +16342,7 @@ mod tests {
             min_timestamp: 0,
             max_timestamp: 0,
             partition_count: 2,
+            legacy_format: false,
         };
         let manifest_plan = crate::compaction::finalize::plan_manifest_update(
             &tid_str,
@@ -16924,6 +16961,7 @@ mod tests {
             min_timestamp: 10,
             max_timestamp: 20,
             partition_count: 1,
+            legacy_format: false,
         }
     }
 
