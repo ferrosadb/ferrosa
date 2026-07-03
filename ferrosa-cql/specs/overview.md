@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-06-27
+last_updated: 2026-07-03
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -79,7 +79,11 @@ KEYED index consult: `WritePath::index_read_in_partition` routes to the
 partition's replicas, each consults its secondary index restricted to that
 partition, and only the matching rows are point-read — O(matching rows), never
 O(partition rows), with an EXPLAIN plan of `PartitionIndexLookup`. The router
-then decomposes partitions to rows via the re-exported
+trusts an empty keyed consult only when the local write path can treat the
+storage `IndexStateTracker` as authoritative and that tracker reports the index
+current with no pending SSTable backfill; clustered reads keep the bounded
+partition fallback so remote replica lag cannot hide matches. The router then
+decomposes partitions to rows via the re-exported
 `partition_to_rows_with_storage_mapping` (tombstone/TTL skipping, storage→table
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).

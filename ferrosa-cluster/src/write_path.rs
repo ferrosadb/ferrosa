@@ -790,56 +790,6 @@ impl WritePath {
         }
     }
 
-    /// Projection-aware range read. Returns partitions whose
-    /// `rows[*].cells` contains only cells whose ordinals are in
-    /// `wanted` — SSTable cells outside the projection are
-    /// byte-skipped via `read_cell_skip`. Used by the CQL fast
-    /// path for `SELECT col1, col2 FROM t` on wide tables (esp.
-    /// embedding vectors).
-    ///
-    /// The caller is expected to have already verified that the
-    /// projection is safe — i.e., no WHERE clause references
-    /// cells outside `wanted` — otherwise predicates would fail
-    /// to evaluate against the trimmed rows. CQL router enforces
-    /// this; raw callers should too.
-    pub async fn range_read_projected(
-        &self,
-        table_id: &TableId,
-        wanted: Vec<u16>,
-        partition_limit: Option<usize>,
-    ) -> crate::error::Result<Vec<Partition>> {
-        use futures::stream::StreamExt;
-        let engine = match self {
-            Self::Direct(engine) => engine.clone(),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
-                coordinator.local_storage().clone()
-            }
-            Self::Cluster(coordinator) => coordinator.storage.clone(),
-            Self::Unavailable => {
-                return Err(crate::error::ClusterError::Internal(
-                    "range_read_projected unavailable: write path is in degraded mode".into(),
-                ));
-            }
-        };
-        // Push `partition_limit` into the producer so the merger
-        // stops emitting after N partitions — without this, the
-        // bounded mpsc buffer means the producer races ahead by
-        // `STREAM_BUFFER` body decodes after the consumer has
-        // already read enough, and on cold cache each of those
-        // wasted body decodes is ~hundreds of ms.
-        let mut stream = engine.range_iter_projected(table_id, wanted, partition_limit, None, None);
-        let cap = partition_limit.unwrap_or(usize::MAX);
-        let mut out = Vec::new();
-        while let Some(item) = stream.next().await {
-            out.push(item.map_err(crate::error::ClusterError::Storage)?);
-            if out.len() >= cap {
-                drop(stream);
-                break;
-            }
-        }
-        Ok(out)
-    }
-
     /// Read up to `limit` partitions for unordered full-scan consumers.
     ///
     /// This lets CQL `LIMIT` and protocol page-size produce the first page
@@ -1448,7 +1398,7 @@ mod tests {
         let projected_body = source
             .split("pub async fn range_read_projected_stream_all_with")
             .nth(1)
-            .and_then(|rest| rest.split("/// Projection-aware range read").next())
+            .and_then(|rest| rest.split("/// Read up to `limit` partitions").next())
             .expect("projected streaming range-read body must be present");
         assert!(
             projected_body.contains("local_projected_range_stream")

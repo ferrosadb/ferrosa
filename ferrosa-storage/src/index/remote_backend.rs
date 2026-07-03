@@ -368,31 +368,19 @@ fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_j
         body["filter_predicate"] = serde_json::to_value(predicate)
             .expect("FilterPredicate serializes to JSON (Vec<u8>/enum/usize)");
     }
+    if let Some(src) = &job.clustering_source {
+        body["clustering_source"] = serde_json::to_value(src)
+            .expect("ClusteringComponentRef serializes to JSON (usize fields)");
+    }
 
     body
 }
 
 impl IndexBuildBackend for RemoteBackend {
     fn build(&self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
-        // Clustering-column index jobs (t_430c4188) are not yet part of the
-        // remote builder protocol (`build_request_body` has no field for
-        // `clustering_source`, and a remote builder would silently build the
-        // WRONG index from `column_position`). Build locally instead — a
-        // designed, visible fallback, never a silent wrong build.
-        if let Some(src) = job.clustering_source {
-            tracing::warn!(
-                sstable_id = %job.sstable_id,
-                index_name = %job.index_name,
-                component = src.component,
-                "remote index builder does not support clustering-column indexes yet; \
-                 building locally"
-            );
-            return self.local_fallback.build(job);
-        }
-
-        // Try each available endpoint. A partial (Filtered) index carries its
-        // predicate in the request body (see `build_request_body`), so the
-        // builder filters at build time — no local-only fallback needed.
+        // Try each available endpoint. Partial (Filtered) and clustering-column
+        // jobs carry their extra build metadata in the request body, so the
+        // remote worker builds the same sidecar the local backend would.
         let n = self.endpoints.len();
         let start = self.next_endpoint.fetch_add(1, Ordering::Relaxed) as usize;
         let mut last_error = String::new();
@@ -635,6 +623,37 @@ mod tests {
         let decoded: FilterPredicate =
             serde_json::from_value(body["filter_predicate"].clone()).unwrap();
         assert_eq!(decoded, predicate);
+    }
+
+    #[test]
+    fn clustering_job_request_body_carries_source() {
+        let resolver = S3PathResolver {
+            bucket: "b".into(),
+            endpoint: "memory://".into(),
+            prefix: "p".into(),
+        };
+        let source = super::super::scheduler::ClusteringComponentRef {
+            component: 1,
+            total: 3,
+        };
+        let job = IndexBuildJob {
+            sstable_id: "gen-9".to_string(),
+            index_name: "ck_idx".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: super::super::scheduler::BuildPriority::Initial,
+            enqueued_at: Instant::now(),
+            column_position: 1,
+            clustering_source: Some(source),
+            filter_predicate: None,
+        };
+
+        let body = build_request_body(&job, &resolver);
+        let decoded: super::super::scheduler::ClusteringComponentRef =
+            serde_json::from_value(body["clustering_source"].clone()).unwrap();
+
+        assert_eq!(decoded, source);
+        assert_eq!(body["column_position"], 1);
     }
 
     /// A non-filtered job carries no `filter_predicate` field (it is omitted, not

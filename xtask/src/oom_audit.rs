@@ -480,10 +480,10 @@ fn contains_stream_source(expr: &syn::Expr) -> bool {
 }
 
 /// Call sites we flag as materializing range reads (rule:
-/// materializing-range-read-call-site): the plain/projected variants, excluding
-/// stream and `_from`/`_limited_rows` siblings.
+/// materializing-range-read-call-site): the plain Vec-returning variant,
+/// excluding stream and `_from`/`_limited_rows` siblings.
 fn is_materializing_range_read_call(method: &str) -> bool {
-    method == "range_read" || method == "range_read_projected"
+    method == "range_read"
 }
 
 /// True if two CONSECUTIVE arguments are both the literal `None` — the
@@ -1716,11 +1716,10 @@ mod tests {
 
     // -- Rule 3: materializing-range-read-call-site ------------------------
     #[test]
-    fn rule_materializing_call_site_fires_on_range_read_and_projected() {
+    fn rule_materializing_call_site_fires_on_range_read() {
         let src = r#"
             fn a(wp: W, table_id: T) {
                 let _x = wp.range_read(&table_id, bound);
-                let _y = wp.range_read_projected(&table_id, wanted, bound);
             }
         "#;
         let f = audit_source("x.rs", src, &no_allow());
@@ -1728,7 +1727,7 @@ mod tests {
             .iter()
             .filter(|x| x.rule == rule::MATERIALIZING_RANGE_READ_CALL_SITE)
             .count();
-        assert_eq!(count, 2, "range_read + range_read_projected fire: {f:?}");
+        assert_eq!(count, 1, "range_read fires: {f:?}");
     }
 
     #[test]

@@ -83,10 +83,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
+  `LocalBackend` resolves SSTable components under the engine layout
+  `<data_dir>/sstables/<keyspace>.<table>` and writes local sidecars beside the
+  table's SSTables; legacy flat test layouts are still accepted. Remote build
+  requests carry filtered predicates and clustering-column source metadata so
+  remote sidecars match local builds. Existing SSTables and flush-time eager
+  builds are marked pending in `IndexStateTracker` before async build
+  submission, giving read planners a real completeness signal.
   Registrations are dogfooded to `system_schema.indexes`; `unregister_table`
   (the DROP TABLE choke point for every DDL route) cascades tombstones over the
   dropped table's registrations via `write_index_tombstones_for_table` and
-  sweeps its tracker entries (t_ae06e925). Boot-time
+  sweeps its tracker entries (t_ae06e925). `StorageEngine::drop_index` is the
+  DROP INDEX choke point for live storage state: it removes the table store's
+  memtable/sidecar/vector metadata and the tracker entry immediately, before
+  restart. Boot-time
   `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
   (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
   `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at

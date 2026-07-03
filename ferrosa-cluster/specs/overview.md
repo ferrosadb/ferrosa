@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-07-03
 executive_summary: >
   The distribution layer that turns single-node ferrosa-storage engines into a
   cluster: Raft metadata consensus (openraft 0.9 fork with PreVote + CheckQuorum),
@@ -64,6 +64,12 @@ digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newe
 copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
 to a healthy replica and enqueues a background anti-entropy refill.
 
+**Range read.** The public write-path range-read surface is streaming-first:
+projected scans use `range_read_projected_stream_all_from` /
+`range_read_projected_stream_all_with`, and the old `Vec<Partition>`-returning
+`range_read_projected` wrapper has been removed so projected scans cannot drift
+back to local-only materialization.
+
 **Keyed index read (t_430c4188).** `coordinate_index_read_in_partition`
 serves `WHERE <full partition key> AND <indexed_col> = ?`: it resolves the
 partition's replicas from the ring under the keyspace strategy and sends each an
@@ -85,7 +91,9 @@ locally). Fixes the coordinator-local non-determinism of BUG-F-007.
 
 **DDL / membership.** Mutations are wrapped as `RaftOp`, proposed via
 `raft.client_write` (forwarded to the leader if needed via `raft_forward`),
-committed, and applied deterministically into `RaftState` on every node.
+committed, and applied deterministically into `RaftState` on every node. DROP
+INDEX also calls `StorageEngine::drop_index` in Direct, pair, and Raft apply
+paths so live `TableStore`/index-tracker state follows the replicated schema.
 
 **Accord transaction.** `AccordCoordinator` runs PreAccept → (fast path or Accept)
 → Commit → Apply across the participating shards, dep-waiting on conflicting
