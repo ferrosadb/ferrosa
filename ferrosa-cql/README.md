@@ -70,6 +70,15 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
   `ferrosa-row-bridge`.
+  **Timestamp bounds validation (Bug C, t_a0f922a3)**: `validate_timestamp_ms`
+  rejects any `timestamp` cell outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]`
+  (chrono `MIN_UTC`/`MAX_UTC` millis) at the **write** boundary — integer-literal,
+  string, and bound 8-byte-blob paths alike — so an out-of-range value can never
+  be persisted into a cell whose date the driver would fail to decode. On the
+  **read** side `cell_to_cql_value` fails loud (`ServerError` naming the offending
+  millis) on an already-corrupt on-disk timestamp instead of emitting an
+  undecodable value that would crash `SELECT *` for the whole partition. See
+  FMEA `CQL-12`.
 - **Result encoding** (`result.rs`, `types.rs`) — CQL RESULT-frame encoder, the
   16-bit type system, and the re-exported `encode_value`/`decode_value` codec.
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the
