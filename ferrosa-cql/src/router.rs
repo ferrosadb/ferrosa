@@ -24185,6 +24185,54 @@ mod tests {
         );
     }
 
+    /// Regression (#147): a full-partition-key ANN SELECT must not leak rows from
+    /// OTHER partitions. `tenant-a/session-1` holds a FAR vector (id 1); a
+    /// different partition `tenant-b/session-1` holds the vector-space EXACT
+    /// match (id 2). An ANN query scoped to `tenant-a/session-1` must return its
+    /// own nearest row (id 1), never the closer cross-partition row (id 2) — the
+    /// global vector index must not out-rank the in-partition row.
+    #[tokio::test]
+    async fn ann_select_with_full_partition_key_stays_in_partition() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE annscope WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE annscope.entities (tenant text, session text, id int, embedding vector<float, 3>, PRIMARY KEY ((tenant, session), id))",
+            "CREATE INDEX entity_embedding_ann ON annscope.entities (embedding) USING 'vector'",
+            "INSERT INTO annscope.entities (tenant, session, id, embedding) VALUES ('tenant-a', 'session-1', 1, [0.0, 1.0, 0.0])",
+            "INSERT INTO annscope.entities (tenant, session, id, embedding) VALUES ('tenant-b', 'session-1', 2, [1.0, 0.0, 0.0])",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT id FROM annscope.entities WHERE tenant = 'tenant-a' AND session = 'session-1' \
+             ORDER BY embedding ANN OF [1.0, 0.0, 0.0] LIMIT 1",
+        )
+        .unwrap();
+        let ids = match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => extract_int_column_values(&b, "id"),
+            _ => panic!("expected Result"),
+        };
+        assert_eq!(
+            ids,
+            vec![1],
+            "ANN scoped to tenant-a/session-1 must return its own row (id 1), not the closer \
+             cross-partition row (id 2): got {ids:?}"
+        );
+    }
+
     // ── CREATE INDEX … USING 'vector' WITH OPTIONS={'method': …} ──────
 
     /// Set up a keyspace + table with a `vector<float, 3>` column, then run the
