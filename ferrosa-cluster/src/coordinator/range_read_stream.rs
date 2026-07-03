@@ -2344,11 +2344,412 @@ mod tests {
         out
     }
 
+    /// Bug B regression over REAL captured typed_edges SSTables (t_paging_cursor).
+    ///
+    /// Loads each of the 3 nodes' real SSTable set, builds one per-node
+    /// `RangeMerger` (= one replica's fragmented producer), drains each into the
+    /// exact `<= k`-row fragment shape the wire delivers, then drives the REAL
+    /// coordinator `run_fragment_merge_nway` PER PAGE with a mid-partition paging
+    /// cursor (skip-≤-last, resume by (partition_key, clustering)) — the exact
+    /// coordinated paged SCAN path. The paged union must equal the whole-scan
+    /// distinct row set (ground truth: 21168 rows, identical on all replicas).
+    ///
+    /// This is the row-scan counterpart to the storage-level COUNT regression
+    /// `store::count_range_metadata_merger_dedups_real_typed_edges_sstables`:
+    /// both the COUNT metadata merger and this row-scan merger were broken by the
+    /// same range-merger run fusion on non-byte-comparable SSTable bounds
+    /// (COUNT over-counted; the paged SCAN over-dropped). Reverting
+    /// `partition_into_disjoint_runs` to the pre-`c8035d37` raw-bytes
+    /// `group_disjoint_runs` makes this test drop genuine rows (demonstrated RED:
+    /// "DROPPED 5 genuine rows"); the shipped decode-guarded
+    /// `group_disjoint_runs_by_key` fixes both.
+    ///
+    /// Live-infra opt-in (Test Policy): captured SSTables are not checked in.
+    /// Enable with `--features live-infra-tests` and point
+    /// `FERROSA_TEST_TYPED_EDGES_DIR` at a directory containing `node1/`,
+    /// `node2/`, `node3/` subdirs of captured `*-Data.db` + siblings (e.g. the
+    /// `repair-tie-divergence` capture). Fails loud when the feature is enabled
+    /// but the fixture is absent — never a silent skip.
+    #[cfg(feature = "live-infra-tests")]
+    #[tokio::test]
+    async fn real_typed_edges_paged_scan_delivers_every_distinct_row() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
+
+        type Rdr = SSTableReader<Vec<u8>>;
+
+        let dir_var = std::env::var("FERROSA_TEST_TYPED_EDGES_DIR").unwrap_or_default();
+        assert!(
+            !dir_var.is_empty(),
+            "FERROSA_TEST_TYPED_EDGES_DIR unset. This live-infra regression needs the captured \
+             agent_memory.typed_edges SSTables. Set FERROSA_TEST_TYPED_EDGES_DIR=<dir containing \
+             node1/ node2/ node3/ subdirs of *-Data.db + sibling components> (e.g. the \
+             repair-tie-divergence capture)."
+        );
+        let base = std::path::PathBuf::from(&dir_var);
+        let node_dirs = ["node1", "node2", "node3"];
+        assert!(
+            base.join("node1").is_dir(),
+            "FERROSA_TEST_TYPED_EDGES_DIR={} must contain node1/ node2/ node3/ capture subdirs",
+            base.display()
+        );
+
+        fn open_node(dir: &std::path::Path) -> Vec<Arc<Rdr>> {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.to_str().map(|s| s.ends_with("-Data.db")).unwrap_or(false))
+                .collect();
+            entries.sort();
+            let mut readers = Vec::new();
+            for path in &entries {
+                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let gen = name.trim_end_matches("-Data.db");
+                let dir_s = dir.to_str().unwrap();
+                let read =
+                    |s: &str| std::fs::read(format!("{dir_s}/{gen}-{s}")).unwrap_or_default();
+                let ci = std::fs::read(format!("{dir_s}/{gen}-CompressionInfo.db")).ok();
+                let comp = SSTableComponents {
+                    data: read("Data.db"),
+                    partitions: read("Partitions.db"),
+                    rows: read("Rows.db"),
+                    filter: read("Filter.db"),
+                    compression_info: ci,
+                    statistics: read("Statistics.db"),
+                };
+                if let Ok(r) = SSTableReader::open(comp) {
+                    readers.push(Arc::new(r));
+                }
+            }
+            assert!(
+                !readers.is_empty(),
+                "no SSTables opened in {}",
+                dir.display()
+            );
+            readers
+        }
+
+        // Drain one node's RangeMerger (bounded by `start`) into `<= k`-row
+        // fragment `Partition`s — the exact shape the remote producer ships and
+        // the local iterator yields.
+        fn node_fragments(
+            readers: &[Arc<Rdr>],
+            start: Option<ferrosa_common::key::DecoratedKey>,
+            k: usize,
+        ) -> Vec<Partition> {
+            let mut merger = ferrosa_storage::range_merger::merger_for_sources(
+                Box::new(std::iter::empty()),
+                None,
+                readers,
+                start,
+                None,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            while let Some(f) = merger.next_fragment(k).unwrap() {
+                out.push(Partition {
+                    key: f.key,
+                    deletion: f.deletion,
+                    static_row: f.static_row,
+                    rows: f.rows,
+                });
+            }
+            out
+        }
+
+        let nodes: Vec<Vec<Arc<Rdr>>> =
+            node_dirs.iter().map(|n| open_node(&base.join(n))).collect();
+
+        // Ground truth: distinct (token, pk, clustering) across all nodes.
+        let mut ground: BTreeSet<(i64, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+        for readers in &nodes {
+            for frag in node_fragments(readers, None, 256) {
+                let tok = frag.key.token.0;
+                let pk = frag.key.key.as_bytes().to_vec();
+                for r in &frag.rows {
+                    ground.insert((tok, pk.clone(), r.clustering.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            ground.len(),
+            21168,
+            "ground-truth distinct rows must be 21168 (forensic capture)"
+        );
+
+        // Coordinated paged scan: per page, build the resume-bounded per-node
+        // fragment streams, drive the REAL run_fragment_merge_nway, apply the
+        // skip-≤-cursor + page bound, advancing an inclusive (pk, clustering)
+        // cursor. Union of all pages must equal ground truth.
+        for &k in &[64usize, 256] {
+            for &page_size in &[250usize, 1000, 7000] {
+                let mut cursor: Option<(ferrosa_common::key::DecoratedKey, Vec<u8>)> = None;
+                let mut seen: BTreeSet<(i64, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+                let mut delivered = 0usize;
+                let max_pages = ground.len() / page_size + 4;
+                let mut pages = 0usize;
+
+                loop {
+                    pages += 1;
+                    assert!(
+                        pages <= max_pages,
+                        "paging did not terminate (k={k}, page_size={page_size})"
+                    );
+
+                    let start_key = cursor.as_ref().map(|(dk, _)| dk.clone());
+                    let sources: Vec<Vec<Partition>> = nodes
+                        .iter()
+                        .map(|r| node_fragments(r, start_key.clone(), k))
+                        .collect();
+                    let emitted = drive_merge_nway(sources, k).await;
+                    let merged = flatten_to_rows(&flatten(emitted));
+
+                    let mut took = 0usize;
+                    for (pk, ck, _row) in merged.into_iter() {
+                        if let Some((cpk, cck)) = cursor.as_ref() {
+                            if (&pk, &ck) <= (cpk, cck) {
+                                continue;
+                            }
+                        }
+                        seen.insert((pk.token.0, pk.key.as_bytes().to_vec(), ck.clone()));
+                        delivered += 1;
+                        cursor = Some((pk, ck));
+                        took += 1;
+                        if took == page_size {
+                            break;
+                        }
+                    }
+                    if took == 0 {
+                        break;
+                    }
+                }
+
+                let missing = ground.difference(&seen).count();
+                assert_eq!(
+                    missing, 0,
+                    "coordinated paged scan (k={k}, page_size={page_size}) DROPPED {missing} genuine rows \
+                     (delivered={delivered}, distinct_seen={}, ground={}) — Bug B",
+                    seen.len(),
+                    ground.len()
+                );
+                assert_eq!(
+                    seen.len(),
+                    ground.len(),
+                    "paged scan distinct rows must equal ground truth (k={k}, page_size={page_size})"
+                );
+            }
+        }
+    }
+
+    /// Bug B repro (t_paging_cursor): a WIDE partition, identical on every
+    /// replica (the typed_edges shape — 21168 rows, the SAME set on all 3
+    /// replicas, re-written across many SSTables), must merge to EXACTLY its
+    /// distinct row set once. Each replica delivers the whole wide partition as
+    /// a long run of `<= k`-row fragments; the coordinator's N-way merge folds
+    /// the identical rows across replicas. If the merge drops genuine rows
+    /// during dedup (Bug B: paged SCAN under-delivers a non-deterministic
+    /// subset), the flattened output has fewer rows than the distinct set.
+    #[tokio::test]
+    async fn nway_merge_wide_partition_identical_on_all_replicas_delivers_every_row() {
+        let key = dk(b"typed_edges_partition");
+        // A single wide partition with many distinct clustering keys, IDENTICAL
+        // on every replica. Use a 2-byte clustering so ordering is by full
+        // byte string, exercising the same clustering comparison as real edges.
+        let n_rows: i32 = 500;
+        let whole = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..n_rows)
+                .map(|c| Row {
+                    clustering: (c as u16).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        ferrosa_common::CellValue::live(format!("e{c}").into_bytes(), 1000),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                })
+                .collect(),
+        };
+
+        // Distinct-row reference: exactly n_rows rows, one per clustering.
+        let reference_rows = n_rows as usize;
+
+        // The producer fragment cap on each replica is INDEPENDENT of how many
+        // replicas we merge. Exercise several k, including k that does not
+        // divide n_rows so fragment boundaries fall at awkward offsets, and
+        // several replica counts (1..=3, matching RF=3).
+        for replicas in [1usize, 2, 3] {
+            for k in [1usize, 2, 3, 7, 64, 500] {
+                let sources: Vec<Vec<Partition>> = (0..replicas)
+                    .map(|_| fragment_partition(&whole, k))
+                    .collect();
+                let emitted = drive_merge_nway(sources, k).await;
+                for f in &emitted {
+                    assert!(
+                        f.rows.len() <= k,
+                        "emitted fragment {} exceeds k={k}",
+                        f.rows.len()
+                    );
+                }
+                let merged = flatten(emitted);
+                let got_rows: usize = merged.iter().map(|p| p.rows.len()).sum();
+                // Rows must be exactly the distinct set — no drops, no dups.
+                assert_eq!(
+                    got_rows, reference_rows,
+                    "wide identical-replica merge (replicas={replicas}, k={k}) delivered {got_rows} rows, expected {reference_rows} (Bug B: dropped genuine rows during dedup)"
+                );
+                // And every clustering key present exactly once, in order.
+                let mut clusterings: Vec<Vec<u8>> = merged
+                    .iter()
+                    .flat_map(|p| p.rows.iter().map(|r| r.clustering.clone()))
+                    .collect();
+                let distinct: std::collections::BTreeSet<Vec<u8>> =
+                    clusterings.iter().cloned().collect();
+                assert_eq!(
+                    clusterings.len(),
+                    distinct.len(),
+                    "duplicate clustering emitted (replicas={replicas}, k={k})"
+                );
+                let sorted = {
+                    let mut c = clusterings.clone();
+                    c.sort();
+                    c
+                };
+                clusterings.dedup();
+                assert_eq!(
+                    clusterings, sorted,
+                    "clusterings not in sorted order (replicas={replicas}, k={k})"
+                );
+            }
+        }
+    }
+
     /// The N-way (multi-replica) fragment merge must reproduce, per token, the
     /// whole-partition `merge_partitions(vec![s0, s1, s2])` result —
     /// byte-identical after flattening — for LWW across THREE replicas,
     /// tombstones, static rows, and disjoint tokens, across several `k`, while
     /// no emitted fragment exceeds `k` rows (bounded memory across all sources).
+    /// Bug B repro #3: a WIDE partition present on every replica but fragmented
+    /// with DIFFERENT k per replica (mirrors the real cluster: each node's
+    /// SSTable layout yields different fragment boundaries), plus header-only
+    /// leading fragments on some replicas. The N-way merge must still deliver
+    /// every distinct row exactly once regardless of how boundaries interleave.
+    #[tokio::test]
+    async fn nway_merge_wide_partition_misaligned_fragment_boundaries_no_drop() {
+        let key = dk(b"typed_edges_partition");
+        let n_rows: i32 = 400;
+        let mk_row = |c: i32, ts: i64| Row {
+            clustering: (c as u16).to_be_bytes().to_vec(),
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(format!("e{c}").into_bytes(), ts),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let whole = |ts: i64| Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: (0..n_rows).map(|c| mk_row(c, ts)).collect(),
+        };
+        // Three replicas, identical row SET, but each fragmented at a DIFFERENT
+        // k so boundaries never line up. The coordinator merge k is yet another
+        // value.
+        for merge_k in [1usize, 2, 3, 7, 64] {
+            let s0 = fragment_partition(&whole(1000), 5);
+            let s1 = fragment_partition(&whole(1000), 8);
+            let s2 = fragment_partition(&whole(1000), 13);
+            let emitted = drive_merge_nway(vec![s0, s1, s2], merge_k).await;
+            for f in &emitted {
+                assert!(
+                    f.rows.len() <= merge_k,
+                    "fragment {} exceeds merge_k={merge_k}",
+                    f.rows.len()
+                );
+            }
+            let merged = flatten(emitted);
+            let total: usize = merged.iter().map(|p| p.rows.len()).sum();
+            assert_eq!(
+                total, n_rows as usize,
+                "misaligned-boundary merge (merge_k={merge_k}) delivered {total} rows, expected {n_rows}"
+            );
+        }
+    }
+
+    /// Bug B repro #2: a WIDE partition whose rows are split into DISJOINT
+    /// subsets across replicas (union = the full distinct set — the "rows
+    /// re-written across N SSTables, no single replica has all rows" shape),
+    /// fragmented at small k. The N-way merge must deliver the UNION exactly
+    /// once. If it drops rows it under-delivers a subset (Bug B).
+    #[tokio::test]
+    async fn nway_merge_wide_partition_disjoint_subsets_delivers_union() {
+        let key = dk(b"typed_edges_partition");
+        let n_rows: i32 = 300;
+        let mk_row = |c: i32| Row {
+            clustering: (c as u16).to_be_bytes().to_vec(),
+            cells: vec![(
+                0,
+                ferrosa_common::CellValue::live(format!("e{c}").into_bytes(), 1000),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        // 3 replicas, each holds rows where c % 3 == replica_idx AND, to model
+        // "re-written across SSTables", each also re-includes a shared overlap
+        // band (c < 30) so the same clustering appears on multiple replicas.
+        for k in [1usize, 2, 3, 5, 7, 64] {
+            let sources: Vec<Vec<Partition>> = (0..3usize)
+                .map(|r| {
+                    let rows: Vec<Row> = (0..n_rows)
+                        .filter(|c| (*c % 3) as usize == r || *c < 30)
+                        .map(mk_row)
+                        .collect();
+                    let whole = Partition {
+                        key: key.clone(),
+                        deletion: DeletionTime::LIVE,
+                        static_row: None,
+                        rows,
+                    };
+                    fragment_partition(&whole, k)
+                })
+                .collect();
+            let emitted = drive_merge_nway(sources, k).await;
+            for f in &emitted {
+                assert!(f.rows.len() <= k, "fragment {} exceeds k={k}", f.rows.len());
+            }
+            let merged = flatten(emitted);
+            let got: std::collections::BTreeSet<Vec<u8>> = merged
+                .iter()
+                .flat_map(|p| p.rows.iter().map(|r| r.clustering.clone()))
+                .collect();
+            let expect: std::collections::BTreeSet<Vec<u8>> = (0..n_rows)
+                .map(|c| (c as u16).to_be_bytes().to_vec())
+                .collect();
+            let total_emitted: usize = merged.iter().map(|p| p.rows.len()).sum();
+            assert_eq!(
+                got,
+                expect,
+                "disjoint-subset merge (k={k}) dropped rows: got {} distinct, expected {}",
+                got.len(),
+                expect.len()
+            );
+            assert_eq!(
+                total_emitted,
+                expect.len(),
+                "disjoint-subset merge (k={k}) emitted {total_emitted} rows (dup or drop), expected {}",
+                expect.len()
+            );
+        }
+    }
+
+    /// The N-way (multi-replica) fragment merge must reproduce, per token, the
+    /// whole-partition `merge_partitions(vec![s0, s1, s2])` result —
     #[tokio::test]
     async fn fragment_nway_replica_merge_equiv_whole_partition_merge() {
         let mut keys = [dk(b"alpha"), dk(b"bravo"), dk(b"charlie"), dk(b"delta")];

@@ -23,10 +23,30 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   Observability: `forwarder_diag::{error_send_dropped, continuations_fired}`.
   Tests: `range_read_stream` unit guard tests +
   `range_scan_multi_replica_paging` disjoint-data / many-windows-per-page
-  harness. **Note:** the exact live 21160-of-50807 truncation did NOT reproduce
-  in-process (fresh-data scans page complete); the guard closes the
-  silent-complete class structurally. Live RF=3 re-validation on the real
-  `typed_edges` shape is the remaining confirmation step.
+  harness. **Note:** the exact live truncation was NOT in the coordinator
+  merge/forwarder at all — see the root cause below.
+
+- **Paged SCAN under-delivered a non-deterministic subset (Bug B, shared root
+  with COUNT over-count / storage FMEA ST-13).** The coordinated paged
+  `SELECT *` of `agent_memory.typed_edges` returned a subset of the 21168 rows
+  (observed 11506 / 21102 across runs) even pinned to a node holding every row.
+  Root cause is NOT in `run_fragment_merge_nway` or the paging cursor (both
+  verified correct over synthetic adversarial inputs AND the real capture): it is
+  the storage range-merger `partition_into_disjoint_runs` fusing overlapping,
+  non-byte-comparable-bounded SSTables into one concatenated run, so the merge
+  heap never grouped shared partition keys and per-key duplicates were mishandled
+  — COUNT over-counted, the row scan over-dropped during dedup. Fixed by the
+  decode-guarded `group_disjoint_runs_by_key` (commit `c8035d37`, which
+  explicitly covers "both the COUNT(*) metadata merger and the row-scan merger").
+  Regression: `range_read_stream::real_typed_edges_paged_scan_delivers_every_distinct_row`
+  drives the REAL `run_fragment_merge_nway` per page with a mid-partition cursor
+  over the captured 3-node SSTables (`live-infra-tests` +
+  `FERROSA_TEST_TYPED_EDGES_DIR`, expects 21168, zero dropped). Reverting the run
+  grouping to the raw-bytes form makes it drop genuine rows (demonstrated RED).
+  Plus synthetic always-on guards
+  (`nway_merge_wide_partition_{identical_on_all_replicas,disjoint_subsets,misaligned_fragment_boundaries}`).
+  Live RF=3 re-validation on the real `typed_edges` shape is the orchestrator's
+  remaining confirmation step.
 
 - **Paged multi-replica stream lifecycle (t_dc729b1d / t_3fc6be3c, CL-14).**
   Fixed the phantom `expected_seq=0 observed_seq=5` gap-close on every abandoned
