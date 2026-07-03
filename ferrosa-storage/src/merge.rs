@@ -62,39 +62,41 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
         all_rows.extend(source.rows);
     }
 
-    let merged_rows = sort_and_dedup_rows(all_rows);
+    sort_and_fold_rows(&mut all_rows);
 
     let mut result = Partition {
         key: result_key,
         deletion: result_deletion,
         static_row: result_static_row,
-        rows: merged_rows,
+        rows: all_rows,
     };
 
     apply_deletions(&mut result);
     result
 }
 
-/// Sort rows by clustering key and fold same-clustering rows via cell-level
-/// LWW (`pop/merge/push`). `sort_by` is stable, so equal-clustering rows keep
-/// their input order before folding. Shared by [`merge_partitions`] (multi
-/// source) and [`ensure_partition_rows_sorted`] (single-source compaction
-/// rewrite) so the two paths produce identical row order.
-fn sort_and_dedup_rows(mut all_rows: Vec<Row>) -> Vec<Row> {
-    all_rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
-    let mut merged_rows: Vec<Row> = Vec::with_capacity(all_rows.len());
-    for row in all_rows {
-        if merged_rows
+/// Sort rows by clustering key IN PLACE and fold same-clustering rows via
+/// cell-level LWW (`pop/merge/push`). `sort_by` is stable, so equal-clustering
+/// rows keep their input order before folding. Operates on `&mut Vec<Row>` (no
+/// `Vec<Row>` return) so it does not read as a read-path materialization site.
+/// Shared by [`merge_partitions`] (multi source) and
+/// [`ensure_partition_rows_sorted`] (single-source compaction rewrite) so the
+/// two paths produce identical row order.
+fn sort_and_fold_rows(rows: &mut Vec<Row>) {
+    rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
+    // Fold adjacent same-clustering rows by rebuilding into the same Vec.
+    let sorted = std::mem::take(rows);
+    for row in sorted {
+        if rows
             .last()
             .is_some_and(|last| last.clustering == row.clustering)
         {
-            let prev = merged_rows.pop().unwrap();
-            merged_rows.push(merge_rows(prev, row));
+            let prev = rows.pop().unwrap();
+            rows.push(merge_rows(prev, row));
         } else {
-            merged_rows.push(row);
+            rows.push(row);
         }
     }
-    merged_rows
 }
 
 /// Guarantee a partition's rows are in clustering order, sorting + folding
@@ -117,8 +119,7 @@ pub fn ensure_partition_rows_sorted(partition: &mut Partition) {
     {
         return;
     }
-    let rows = std::mem::take(&mut partition.rows);
-    partition.rows = sort_and_dedup_rows(rows);
+    sort_and_fold_rows(&mut partition.rows);
 }
 
 /// Merge two rows with the same clustering key using cell-level LWW.

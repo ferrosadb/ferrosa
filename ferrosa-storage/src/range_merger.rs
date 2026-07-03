@@ -1689,8 +1689,8 @@ impl<'a, R: ReadAt> RangeMerger<'a, R> {
                 if let Some(ref next_row) = next {
                     if next_row.clustering.as_slice() < ck.as_slice() {
                         let hx = |b: &[u8]| {
-                            b.iter()
-                                .take(24)
+                            b[..b.len().min(24)]
+                                .iter()
                                 .map(|x| format!("{x:02x}"))
                                 .collect::<String>()
                         };

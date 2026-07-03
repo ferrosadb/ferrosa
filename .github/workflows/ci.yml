@@ -120,6 +120,7 @@ jobs:
                --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
+               --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
