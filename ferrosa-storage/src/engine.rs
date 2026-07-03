@@ -3513,6 +3513,26 @@ impl StorageEngine {
         self.add_index_with_predicate(table_id, index_name, column_position, index_type, None)
     }
 
+    /// Removes a secondary index from live storage state.
+    ///
+    /// Schema/system-table persistence is owned by the DDL layer; this method
+    /// only unwires the engine-side structures that otherwise keep serving a
+    /// dropped index until restart: the table store's memtable/sidecar/vector
+    /// maps and the engine-wide [`crate::index::IndexStateTracker`].
+    pub fn drop_index(&self, table_id: &TableId, index_name: &str) -> ferrosa_common::Result<bool> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+
+        let removed_store_state = state.store.remove_index(index_name);
+        let removed_tracker_state =
+            self.index_tracker
+                .remove_index(table_id.keyspace(), table_id.table(), index_name);
+
+        Ok(removed_store_state || removed_tracker_state)
+    }
+
     /// Registers a secondary index, optionally carrying a partial-index
     /// `FilterPredicate`.
     ///
@@ -3544,10 +3564,19 @@ impl StorageEngine {
             filter_predicate.clone(),
         );
 
-        // Submit rebuild jobs for all existing SSTables.
-        if let Some(ref scheduler) = self.index_scheduler {
-            let sstable_ids = state.store.sstable_generation_ids();
-            for sst_id in sstable_ids {
+        // Submit rebuild jobs for all existing SSTables. Mark them pending
+        // before enqueueing so query planning can distinguish a complete empty
+        // index from an asynchronously backfilled one.
+        let sstable_ids = state.store.sstable_generation_ids();
+        for sst_id in sstable_ids {
+            self.index_tracker.mark_pending(
+                table_id.keyspace(),
+                table_id.table(),
+                index_name,
+                &sst_id,
+                0,
+            );
+            if let Some(ref scheduler) = self.index_scheduler {
                 let job = crate::index::IndexBuildJob {
                     sstable_id: sst_id,
                     index_name: index_name.to_string(),
@@ -3599,11 +3628,19 @@ impl StorageEngine {
             .add_clustering_index(index_name.to_string(), clustering_component, index_type);
 
         // Submit rebuild jobs for all existing SSTables so pre-existing data
-        // is backfilled from its clustering-key components.
-        if let Some(ref scheduler) = self.index_scheduler {
-            let ck_total = state.store.clustering_column_count();
-            let sstable_ids = state.store.sstable_generation_ids();
-            for sst_id in sstable_ids {
+        // is backfilled from its clustering-key components. Mark them pending
+        // first so an empty keyed consult can trust Current only after backfill.
+        let ck_total = state.store.clustering_column_count();
+        let sstable_ids = state.store.sstable_generation_ids();
+        for sst_id in sstable_ids {
+            self.index_tracker.mark_pending(
+                table_id.keyspace(),
+                table_id.table(),
+                index_name,
+                &sst_id,
+                0,
+            );
+            if let Some(ref scheduler) = self.index_scheduler {
                 let job = crate::index::IndexBuildJob {
                     sstable_id: sst_id,
                     index_name: index_name.to_string(),
@@ -6738,11 +6775,19 @@ impl StorageEngine {
                     );
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
-                        if !idx_state.indexed_sstables.contains(&format!("{gen}")) {
+                        let sstable_id = format!("{gen}");
+                        if !idx_state.indexed_sstables.contains(&sstable_id) {
+                            self.index_tracker.mark_pending(
+                                table_id.keyspace(),
+                                table_id.table(),
+                                &index_name,
+                                &sstable_id,
+                                0,
+                            );
                             let job = eager_index_build_job(
                                 &state.store,
                                 table_id,
-                                format!("{gen}"),
+                                sstable_id,
                                 &index_name,
                                 col_pos,
                                 clustering_source,
@@ -7851,6 +7896,13 @@ impl StorageEngine {
     /// Returns the shared index state tracker.
     pub fn index_tracker(&self) -> &Arc<crate::index::IndexStateTracker> {
         &self.index_tracker
+    }
+
+    /// Returns true when the named index is registered and its build tracker
+    /// has no known pending or failed work.
+    pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+        self.index_tracker
+            .is_current(table_id.keyspace(), table_id.table(), index_name)
     }
 
     /// Returns the S3 object store and config, if S3 is configured.
@@ -18043,6 +18095,60 @@ mod tests {
                 now_micros_for_test(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn drop_index_unwires_live_storage_state_before_restart() {
+        use ferrosa_index::{IndexKey, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_index(&table_id, "val_idx", 0, IndexType::BTree)
+            .unwrap();
+
+        let key = make_key("pk");
+        engine
+            .write(&table_id, &key, make_row(b"indexed", 1000), 1000)
+            .unwrap();
+        assert_eq!(
+            engine
+                .read_by_index(&table_id, "val_idx", &IndexKey(b"indexed".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "sanity check: index serves the live row before DROP INDEX"
+        );
+        assert!(engine
+            .index_tracker()
+            .get_state("test_ks", "test_table", "val_idx")
+            .is_some());
+
+        assert!(
+            engine.drop_index(&table_id, "val_idx").unwrap(),
+            "drop_index should report removed live state"
+        );
+        assert!(
+            engine
+                .index_tracker()
+                .get_state("test_ks", "test_table", "val_idx")
+                .is_none(),
+            "tracker state must be removed immediately"
+        );
+        assert!(
+            engine
+                .read_by_index(&table_id, "val_idx", &IndexKey(b"indexed".to_vec()))
+                .unwrap()
+                .is_empty(),
+            "dropped index must not serve stale live index state before restart"
+        );
+        assert!(
+            !engine.drop_index(&table_id, "val_idx").unwrap(),
+            "second cleanup is idempotent"
+        );
     }
 
     /// DROP TABLE cascade (forge t_ae06e925): `unregister_table` — the engine

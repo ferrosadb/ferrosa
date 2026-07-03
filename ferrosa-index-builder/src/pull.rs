@@ -88,6 +88,7 @@ pub async fn run(
                             s3_prefix: sstable_prefix,
                             table: (entry.keyspace.clone(), entry.table.clone()),
                             column_position: *col_pos,
+                            clustering_source: None,
                             priority: "normal".into(),
                             // Pull mode rebuilds btree indexes only; no partial predicate.
                             filter_predicate: None,

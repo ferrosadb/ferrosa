@@ -8,7 +8,7 @@
 //! reading and index building will be wired in a later task.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -37,7 +37,7 @@ pub enum BuildPriority {
 /// value lives inside the row's composite clustering-key bytes. The builder
 /// needs both the component's index and the table's total clustering-column
 /// count to split the composite encoding correctly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ClusteringComponentRef {
     /// Zero-based index of the component within the clustering key.
     pub component: usize,
@@ -130,6 +130,84 @@ impl LocalBackend {
     /// Create a new `LocalBackend` rooted at the given data directory.
     pub fn new(data_dir: PathBuf) -> Self {
         Self { data_dir }
+    }
+}
+
+fn table_path_component(job: &IndexBuildJob) -> String {
+    format!("{}.{}", job.table.0, job.table.1)
+}
+
+fn table_data_dir(data_dir: &Path, job: &IndexBuildJob) -> PathBuf {
+    data_dir.join("sstables").join(table_path_component(job))
+}
+
+fn sstable_component_path(data_dir: &Path, job: &IndexBuildJob, component: &str) -> PathBuf {
+    let gen = &job.sstable_id;
+    let flat = data_dir.join(format!("{gen}-{component}"));
+    if flat.exists() {
+        return flat;
+    }
+
+    let table_dir = table_data_dir(data_dir, job);
+    let nested = table_dir.join(gen).join(format!("{gen}-{component}"));
+    if nested.exists() {
+        return nested;
+    }
+
+    let table_flat = table_dir.join(format!("{gen}-{component}"));
+    if table_flat.exists() {
+        return table_flat;
+    }
+
+    let table_dir_without_sstables = data_dir.join(table_path_component(job));
+    let alternate_nested = table_dir_without_sstables
+        .join(gen)
+        .join(format!("{gen}-{component}"));
+    if alternate_nested.exists() {
+        return alternate_nested;
+    }
+
+    let alternate_flat = table_dir_without_sstables.join(format!("{gen}-{component}"));
+    if alternate_flat.exists() {
+        return alternate_flat;
+    }
+
+    table_flat
+}
+
+fn sidecar_output_dir(data_dir: &Path, job: &IndexBuildJob) -> PathBuf {
+    let gen = &job.sstable_id;
+    let flat_data = data_dir.join(format!("{gen}-Data.db"));
+    if flat_data.exists() {
+        return data_dir.to_path_buf();
+    }
+
+    let table_dir = table_data_dir(data_dir, job);
+    let nested_data = table_dir.join(gen).join(format!("{gen}-Data.db"));
+    if nested_data.exists() {
+        return table_dir.join(gen);
+    }
+
+    let table_flat_data = table_dir.join(format!("{gen}-Data.db"));
+    if table_flat_data.exists() {
+        return table_dir;
+    }
+
+    let alternate_table_dir = data_dir.join(table_path_component(job));
+    let alternate_nested_data = alternate_table_dir.join(gen).join(format!("{gen}-Data.db"));
+    if alternate_nested_data.exists() {
+        return alternate_table_dir.join(gen);
+    }
+
+    let alternate_flat_data = alternate_table_dir.join(format!("{gen}-Data.db"));
+    if alternate_flat_data.exists() {
+        return alternate_table_dir;
+    }
+
+    if table_dir.exists() {
+        table_dir
+    } else {
+        data_dir.to_path_buf()
     }
 }
 
@@ -228,21 +306,25 @@ impl IndexBuildBackend for LocalBackend {
             });
         }
 
-        let gen = &job.sstable_id;
-        let dir = &self.data_dir;
-
         // Open SSTable components.
-        let data = FileReadAt::open(dir.join(format!("{gen}-Data.db")))
+        let data = FileReadAt::open(sstable_component_path(&self.data_dir, job, "Data.db"))
             .map_err(|e| format!("open data: {e}"))?;
-        let partitions_file = FileReadAt::open(dir.join(format!("{gen}-Partitions.db")))
-            .map_err(|e| format!("open partitions: {e}"))?;
-        let rows_file = FileReadAt::open(dir.join(format!("{gen}-Rows.db")))
+        let partitions_file =
+            FileReadAt::open(sstable_component_path(&self.data_dir, job, "Partitions.db"))
+                .map_err(|e| format!("open partitions: {e}"))?;
+        let rows_file = FileReadAt::open(sstable_component_path(&self.data_dir, job, "Rows.db"))
             .map_err(|e| format!("open rows: {e}"))?;
-        let filter = std::fs::read(dir.join(format!("{gen}-Filter.db")))
+        let filter = std::fs::read(sstable_component_path(&self.data_dir, job, "Filter.db"))
             .map_err(|e| format!("read filter: {e}"))?;
-        let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db")))
-            .map_err(|e| format!("read statistics: {e}"))?;
-        let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+        let statistics =
+            std::fs::read(sstable_component_path(&self.data_dir, job, "Statistics.db"))
+                .map_err(|e| format!("read statistics: {e}"))?;
+        let compression_info = std::fs::read(sstable_component_path(
+            &self.data_dir,
+            job,
+            "CompressionInfo.db",
+        ))
+        .ok();
 
         let reader = SSTableReader::open(SSTableComponents {
             data,
@@ -638,7 +720,7 @@ impl IndexBuildScheduler {
                                     if entries.is_empty() {
                                         continue;
                                     }
-                                    let path = data_dir
+                                    let path = sidecar_output_dir(data_dir, &job)
                                         .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
                                     if let Err(e) = SidecarWriter::write(&path, entries) {
                                         tracing::error!(%e, path = %path.display(), "index-build: failed to write sidecar");
@@ -1499,19 +1581,16 @@ mod tests {
         assert_eq!(callback_count.load(Ordering::SeqCst), 0);
     }
 
-    /// Build a single-column SSTable with one UTF-8 text value per partition and
-    /// return its data directory and generation id. The column to index is at
+    /// Build a single-column SSTable with one UTF-8 text value per partition in
+    /// `sstable_dir` and return its generation id. The column to index is at
     /// position 0 (the lone regular column).
-    fn write_text_sstable(values: &[(&[u8], &[u8])]) -> (tempfile::TempDir, String) {
+    fn write_text_sstable_to(sstable_dir: PathBuf, values: &[(&[u8], &[u8])]) -> String {
         use ferrosa_common::cell::CellValue;
         use ferrosa_common::key::{DecoratedKey, PartitionKey};
         use ferrosa_common::schema::{ColumnDefinition, TableSchema};
         use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
         use ferrosa_sstable::writer::SSTableWriter;
         use ferrosa_sstable::WriteOptions;
-
-        let dir = tempfile::tempdir().unwrap();
-        let sstable_dir = dir.path().to_path_buf();
 
         let schema = TableSchema {
             keyspace: "ks".to_string(),
@@ -1560,7 +1639,123 @@ mod tests {
         let flush_target = crate::flush::FileFlushTarget::new(sstable_dir).unwrap();
         let _reader = flush_target.flush(output).unwrap();
         let gen = flush_target.generation();
-        (dir, format!("{gen}"))
+        format!("{gen}")
+    }
+
+    /// Build a single-column SSTable with one UTF-8 text value per partition and
+    /// return its data directory and generation id. The column to index is at
+    /// position 0 (the lone regular column).
+    fn write_text_sstable(values: &[(&[u8], &[u8])]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let gen = write_text_sstable_to(dir.path().to_path_buf(), values);
+        (dir, gen)
+    }
+
+    #[test]
+    fn local_backend_resolves_sstable_under_engine_table_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let table_dir = root.path().join("sstables").join("ks.tbl");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let gen = write_text_sstable_to(table_dir, &[(b"pk1", b"alice")]);
+        let backend = LocalBackend::new(root.path().to_path_buf());
+        let job = IndexBuildJob {
+            sstable_id: gen,
+            index_name: "name_idx".to_string(),
+            index_type: IndexType::BTree,
+            table: ("ks".to_string(), "tbl".to_string()),
+            priority: BuildPriority::Normal,
+            enqueued_at: Instant::now(),
+            column_position: 0,
+            clustering_source: None,
+            filter_predicate: None,
+        };
+
+        let result = backend
+            .build(&job)
+            .expect("engine data_dir root should resolve table SSTable dir");
+        let entries = result
+            .sidecar_entries
+            .get("name_idx")
+            .expect("btree build should produce sidecar entries");
+
+        assert_eq!(entries.len(), 1);
+        let (key, _) = &entries[0];
+        assert_eq!(key.0, b"alice".to_vec());
+    }
+
+    #[test]
+    fn scheduler_writes_sidecars_under_engine_table_dir() {
+        use ferrosa_index::{IndexKey, RowPosition};
+
+        let root = tempfile::tempdir().unwrap();
+        let table_dir = root.path().join("sstables").join("ks.tbl");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let gen = write_text_sstable_to(table_dir.clone(), &[(b"pk1", b"alice")]);
+
+        struct SidecarBackend;
+        impl IndexBuildBackend for SidecarBackend {
+            fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+                let mut sidecar_entries = HashMap::new();
+                sidecar_entries.insert(
+                    job.index_name.clone(),
+                    vec![(
+                        IndexKey(b"alice".to_vec()),
+                        RowPosition {
+                            partition_key: b"pk1".to_vec(),
+                            clustering_key: vec![],
+                        },
+                    )],
+                );
+                Ok(IndexBuildResult {
+                    sstable_id: job.sstable_id.clone(),
+                    index_type: job.index_type,
+                    sidecar_entries,
+                    build_duration: Duration::from_millis(1),
+                    sidecar_written_to_s3: false,
+                    artifact_manifest_entries: Vec::new(),
+                })
+            }
+        }
+
+        let tracker = Arc::new(IndexStateTracker::new());
+        tracker.register_index("ks", "tbl", "name_idx");
+        tracker.mark_pending("ks", "tbl", "name_idx", &gen, 100);
+
+        let scheduler = IndexBuildScheduler::with_backend_and_data_dir(
+            1,
+            Arc::clone(&tracker),
+            Arc::new(SidecarBackend),
+            root.path().to_path_buf(),
+        );
+
+        scheduler
+            .submit(IndexBuildJob {
+                sstable_id: gen.clone(),
+                index_name: "name_idx".to_string(),
+                index_type: IndexType::BTree,
+                table: ("ks".to_string(), "tbl".to_string()),
+                priority: BuildPriority::Normal,
+                enqueued_at: Instant::now(),
+                column_position: 0,
+                clustering_source: None,
+                filter_predicate: None,
+            })
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        scheduler.shutdown();
+
+        let table_sidecar_path = table_dir.join(format!("{gen}-name_idx.sidecar"));
+        let root_sidecar_path = root.path().join(format!("{gen}-name_idx.sidecar"));
+        assert!(
+            table_sidecar_path.exists(),
+            "sidecar should be written beside table SSTables at {}",
+            table_sidecar_path.display()
+        );
+        assert!(
+            !root_sidecar_path.exists(),
+            "sidecar must not be written at the engine data_dir root"
+        );
     }
 
     #[test]

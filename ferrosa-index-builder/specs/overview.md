@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-index-builder
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-07-03
 executive_summary: >
   A standalone HTTP service binary that offloads secondary-index construction
   from the Ferrosa engine. When FERROSA_INDEX_BACKEND=remote, the engine's
@@ -64,6 +64,8 @@ optional `artifact_kind` + `direct_upload` (quantized vectors), S3 coordinates
 (`s3_endpoint` / `s3_bucket` / `s3_prefix`), `table` as a
 `(keyspace, table)` pair, `column_position`, `priority`, and an optional
 `filter_predicate` (`Option&lt;FilterPredicate&gt;`, present only for `filtered`
+builds) plus optional `clustering_source`
+(`Option&lt;ClusteringComponentRef&gt;`, present for clustering-column index
 builds).
 
 `BuildResponse` carries `status` (`"completed"` | `"failed"`), optional `error`,
@@ -80,12 +82,16 @@ and on success either `sidecar_s3_path` + `entries_built` (sidecar builds) or an
    `filter_predicate` is threaded through `build_job` into the `IndexBuildJob`
    so `LocalBackend` filters rows; otherwise the remote sidecar would be an
    UNFILTERED superset — a silent correctness bug.
-3. **Quantized `.qvec` direct-upload fails closed.** `is_quantized_direct_upload`
+3. **A clustering-column build must carry its component source.** The wire
+   `clustering_source` is threaded through `build_job` into `IndexBuildJob` so
+   remote builds use the same clustering-key component extraction as in-process
+   scheduler jobs.
+4. **Quantized `.qvec` direct-upload fails closed.** `is_quantized_direct_upload`
    short-circuits to `status: "failed"` rather than emitting an unvalidated
    artifact the engine cannot publish.
-4. **Remote build == in-process build.** The service wraps the engine's own
+5. **Remote build == in-process build.** The service wraps the engine's own
    `LocalBackend`; it adds no second index encoder.
-5. **`CompressionInfo.db` is optional; every other component is mandatory.** A
+6. **`CompressionInfo.db` is optional; every other component is mandatory.** A
    missing mandatory component fails the job and cleans up the temp dir.
 
 ## Position in the dependency graph
