@@ -3,6 +3,80 @@
 **Status:** proposed (design locked; implementation in `feat/stream-range-reads-no-cap`).
 **Steps 1–2 and Step 5 (final) landed.**
 
+## Progress — paged-scan flow control + within-partition producer resume (`t_a0f922a3`)
+
+**Landed (`fix/paged-scan-cursor`).** Two live failures of the cluster paged
+projected scan (the memory-viz `SELECT src_id, edge_type, dst_id FROM
+typed_edges` cycle and the `SELECT id FROM vfix.nums` page-1 stall):
+
+- **Mode 2 root cause (STALL) — no end-to-end flow control.** The remote
+  producer fired the WHOLE scan as chunk frames with no acknowledgement;
+  everything the consumer hadn't drained sat in the coordinator's bounded
+  per-request route buffer (`STREAM_RECEIVER_BUFFER = 32`). Any multi-replica
+  scan bigger than the buffer overflowed it the moment the consumer was slower
+  than the wire; `StreamRouter::route` then fail-loud-closed the route and the
+  query died with a *retryable* `ReadTimeout` — which drivers/fmem retry
+  forever, presenting live as a >14 min "stall". Reproduced RED by
+  `multi_replica_many_small_partitions_paged_scan_completes` (15 000
+  single-row partitions, RF=3 loopback harness): failed in ~1.4 s with
+  `ReadTimeout { received: 0, required: 1 }`.
+- **Fix: windowed continuation.** `RangeReadStreamRequestPayload.max_chunks`
+  (window, `STREAM_WINDOW_CHUNKS = 16` ≤ buffer) caps the frames one request
+  may emit; the producer stops at the window and reports the position after
+  the last emitted row in `RangeReadStreamDonePayload.resume`; the
+  coordinator's per-replica forwarder (`WindowedReplicaForwarder`) fires the
+  continuation request only after the consumer drained the window (and never
+  when the consumer already abandoned the page). Un-drained frames per stream
+  are ≤ window + Done — `ChannelFull` cannot fire on a slow consumer, memory
+  stays bounded, and there is still **no server-side result cap**. Heartbeats
+  became LOSSY on a full buffer (`StreamRouter::route_lossy`): an advisory
+  keep-alive may be dropped, never allowed to close a healthy route.
+- **Mode 1 (CYCLE) — within-partition resume, producer side.** The
+  coordinator-side cursor (paging_state = partition key + clustering + HMAC —
+  wire format UNCHANGED) already resumed exactly at the CQL collector; but
+  every producer re-streamed the cursor partition FROM ITS START on each page.
+  Now `ScanResume { key, clustering }` threads the clustering position through
+  `WritePath::range_read[_projected]_stream_all_from` →
+  `RangeReadStreamRequestPayload.start_clustering` (and the local iterator
+  wrapper `resume_filtered_stream`), so every producer skips the delivered
+  prefix (`clustering <= resume`) — no re-emit, no skip, no per-page O(prefix)
+  wire cost. The collector's own skip-≤-last remains as an idempotent second
+  layer.
+- **Exactness pinned end-to-end** (all RED-capable, hard timeouts so a stall
+  or cycle FAILS):
+  - `ferrosa-cql` `router.rs`: `wide_partition_spanning_pages_terminates_exactly`
+    (ONE 15k-row partition @ page 5000 → exactly 3 strictly-advancing pages,
+    exact union, memtable AND SSTable-backed, star + projected),
+    `mixed_wide_and_narrow_partitions_page_exactly`,
+    `wide_partition_multi_text_clustering_pages_exactly_after_flush`
+    (length-prefixed multi-text clustering — byte-order vs component-order
+    divergence shape), `many_small_partitions_pk_projection_pages_without_stalling`
+    (15k single-row partitions, pk-only projection).
+  - `ferrosa-cluster` `range_scan_multi_replica_paging.rs`:
+    `multi_replica_wide_partition_paged_scan_terminates_exactly` (3×4 000-row
+    partitions, page 1 500 rows, REAL RF=3 fan-out + the CQL collector's exact
+    cursor semantics), `multi_replica_many_small_partitions_paged_scan_completes`.
+  - `ferrosa-storage` `engine.rs`:
+    `reopened_engine_fragmented_scan_returns_all_sstable_backed_rows`
+    (restart shape: cold reopen → fragmented scan + mid-table resume exact).
+- **Wire note:** `RangeReadStreamRequestPayload` gains `start_clustering` +
+  `max_chunks`; `RangeReadStreamDonePayload` gains `resume`. bincode is not
+  self-describing — **upgrade all nodes together** (same contract as
+  `FulltextSearchRequestPayload.limit`); a mixed-version peer fails the decode
+  loudly (truncated Done → loud coordinator error), never silently misreads.
+  The client-facing `paging_state` format is unchanged and remains opaque to
+  drivers.
+- **Findings that did NOT reproduce in-process** (documented, filed): the
+  live period-3 page cycle could not be reproduced against this stack's
+  single-node or RF=3 loopback paths at live scale with a correctly-registered
+  schema — the only in-repo mechanism found that produces exactly that
+  signature is clustering bytes arriving EMPTY at the collector (cursor can
+  then never advance within a partition), which happens when rows are flushed
+  through a schema registered with no clustering columns (the SSTable
+  serialization header silently drops clustering). Filed for a fail-loud
+  guard. The restart instant-empty also did not reproduce (see the reopen
+  test); filed for live-side verification.
+
 ## Progress — consume-path bounded-streaming refactor (`t_ee98faa0` + `t_3fc6be3c`)
 
 **Landed.** The last Vec-accumulating consume path — `consume_range_stream`'s

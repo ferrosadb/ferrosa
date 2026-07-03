@@ -430,6 +430,7 @@ mod tests {
             request_id: REQ_ID,
             total_chunks,
             truncated,
+            resume: None,
         };
         Message::RangeReadStreamDone(Bytes::from(bincode::serialize(&payload).unwrap()))
     }

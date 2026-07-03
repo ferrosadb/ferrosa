@@ -5111,15 +5111,23 @@ async fn route_select_user_table(
                         let resume = StreamResumeCursor::from_paging_state(
                             ctx.paging.paging_state.as_deref(),
                         )?;
-                        // Resume the scan at the last partition key (inclusive); the
-                        // collector drops rows already emitted within that key.
-                        let start_key = resume.as_ref().map(|cur| {
-                            ferrosa_common::key::DecoratedKey::new(
-                                ferrosa_common::key::PartitionKey::from(
-                                    cur.partition_key.as_slice(),
-                                ),
-                            )
-                        });
+                        // Resume the scan at the last partition key (inclusive) AND
+                        // the last delivered clustering position within it, so every
+                        // producer (local iterator and remote replicas) skips the
+                        // already-emitted prefix of a wide partition instead of
+                        // re-streaming it. The collector's own skip-≤-last remains
+                        // as an idempotent second layer.
+                        let start_key =
+                            resume
+                                .as_ref()
+                                .map(|cur| ferrosa_cluster::write_path::ScanResume {
+                                    key: ferrosa_common::key::DecoratedKey::new(
+                                        ferrosa_common::key::PartitionKey::from(
+                                            cur.partition_key.as_slice(),
+                                        ),
+                                    ),
+                                    clustering: Some(cur.clustering_key.clone()),
+                                });
 
                         // The gate above guarantees `where_clauses.is_empty()`, so a
                         // column projection is always safe here (no predicate reads
@@ -5207,11 +5215,14 @@ async fn route_select_user_table(
                                 ctx.paging.paging_state.as_deref(),
                             )?;
                             let start_key = resume.as_ref().map(|cur| {
-                                ferrosa_common::key::DecoratedKey::new(
-                                    ferrosa_common::key::PartitionKey::from(
-                                        cur.partition_key.as_slice(),
+                                ferrosa_cluster::write_path::ScanResume {
+                                    key: ferrosa_common::key::DecoratedKey::new(
+                                        ferrosa_common::key::PartitionKey::from(
+                                            cur.partition_key.as_slice(),
+                                        ),
                                     ),
-                                )
+                                    clustering: Some(cur.clustering_key.clone()),
+                                }
                             });
                             let stream = state
                                 .write_path
@@ -25562,6 +25573,673 @@ mod tests {
             n as usize,
             "default-paged traversal must still visit every row exactly once"
         );
+    }
+
+    /// Setup: keyspace `ks_name` + a clustered table `ks_name.wide (pk int,
+    /// ck int, v int, PRIMARY KEY (pk, ck))` populated with `rows_per` rows in
+    /// each of the partitions listed in `pks`.
+    async fn setup_clustered_scan_table(
+        ks_name: &str,
+        pks: &[i64],
+        rows_per: i64,
+    ) -> (SharedState, TempDir, AuthContext, Option<String>) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let ks = Some(ks_name.to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            &format!(
+                "CREATE KEYSPACE {ks_name} WITH replication = \
+                 {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+            ),
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            &format!("CREATE TABLE {ks_name}.wide (pk int, ck int, v int, PRIMARY KEY (pk, ck))"),
+        )
+        .await;
+        for &pk in pks {
+            for ck in 0..rows_per {
+                run_ddl(
+                    &state,
+                    &ctx,
+                    &format!(
+                        "INSERT INTO {ks_name}.wide (pk, ck, v) VALUES ({pk}, {ck}, {})",
+                        ck * 10
+                    ),
+                )
+                .await;
+            }
+        }
+        (state, dir, auth, ks)
+    }
+
+    /// Walk every page of `select_cql`, returning the pages individually so
+    /// callers can assert page-advance invariants. Panics loudly if the walk
+    /// exceeds `max_pages` — a cycling cursor must FAIL, never hang.
+    async fn walk_pages(
+        state: &SharedState,
+        auth: &AuthContext,
+        ks: &Option<String>,
+        select_cql: &str,
+        page_size: i32,
+        max_pages: usize,
+    ) -> Vec<Vec<Vec<Option<CqlValue>>>> {
+        let select = match crate::parser::parse(select_cql).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let mut pages: Vec<Vec<Vec<Option<CqlValue>>>> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        loop {
+            let ctx = paging_ctx(auth, ks, Some(page_size), paging_state.clone());
+            // Hard per-page timeout: a stalled page pull must FAIL the test,
+            // never hang it (t_a0f922a3 mode 2 — a paged no-LIMIT scan that
+            // blocks >14 min live is a wedged client, not slowness).
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                route_select_raw(state, &ctx, &select),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "page {} did not return within 120s — the paged scan is \
+                     STALLED (t_a0f922a3 mode 2)",
+                    pages.len()
+                )
+            })
+            .unwrap();
+            assert!(
+                res.rows.len() <= page_size as usize,
+                "page {} returned {} rows, exceeds page_size {page_size}",
+                pages.len(),
+                res.rows.len()
+            );
+            if !res.rows.is_empty() {
+                pages.push(res.rows);
+            }
+            match res.paging_state {
+                Some(ns) => paging_state = Some(ns),
+                None => return pages,
+            }
+            assert!(
+                pages.len() <= max_pages,
+                "paged scan did not terminate within {max_pages} pages — the \
+                 paging cursor is cycling instead of advancing (t_a0f922a3)"
+            );
+        }
+    }
+
+    /// Encode a CQL v5 `<query_parameters>` section carrying `page_size`
+    /// (fetch_size) and, when present, an echoed `paging_state` — exactly the
+    /// bytes the python/gocql driver puts on the wire for a paged SELECT. No
+    /// bound values (a scan has none).
+    fn wire_query_params(page_size: i32, paging_state: Option<&[u8]>) -> Vec<u8> {
+        // flags: 0x04 (PAGE_SIZE) [+ 0x08 (WITH_PAGING_STATE) when echoing].
+        let mut flags: u32 = 0x04;
+        if paging_state.is_some() {
+            flags |= 0x08;
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&flags.to_be_bytes()); // v5: 4-byte flags
+        buf.extend_from_slice(&page_size.to_be_bytes()); // [int] page_size
+        if let Some(ps) = paging_state {
+            buf.extend_from_slice(&(ps.len() as i32).to_be_bytes()); // [bytes] len
+            buf.extend_from_slice(ps); // paging_state bytes
+        }
+        buf
+    }
+
+    /// Live-fidelity page walk: unlike [`walk_pages`], this NEVER constructs
+    /// `ctx.paging` by hand. It serializes the client's fetch_size + echoed
+    /// cursor into a real wire `<query_parameters>` payload and re-derives
+    /// `PagingParams` via the SAME decoder the live QUERY handler uses
+    /// ([`crate::connection::decode_query_paging`]). This is the exact bridge
+    /// the 3 prior "in-process-green" fixes bypassed: they populated
+    /// `PagingParams` directly, so they never observed that the wire path
+    /// dropped page_size/paging_state (t_a0f922a3 LIVE). With the wire decode
+    /// reverted, page 2 == page 1 and this walk cycles until the `max_pages`
+    /// cap FAILS it — the exact live signature.
+    async fn walk_pages_via_wire(
+        state: &SharedState,
+        auth: &AuthContext,
+        ks: &Option<String>,
+        select_cql: &str,
+        page_size: i32,
+        max_pages: usize,
+    ) -> Vec<Vec<Vec<Option<CqlValue>>>> {
+        let select = match crate::parser::parse(select_cql).unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let mut pages: Vec<Vec<Vec<Option<CqlValue>>>> = Vec::new();
+        let mut paging_state: Option<Vec<u8>> = None;
+        loop {
+            // Round-trip the paging controls through the wire codec.
+            let wire = wire_query_params(page_size, paging_state.as_deref());
+            let paging = crate::connection::decode_query_paging(&wire, 5)
+                .expect("wire query-parameters must decode");
+            let ctx = RequestContext {
+                auth,
+                current_keyspace: ks,
+                consistency: ConsistencyLevel::One,
+                serial_consistency: None,
+                paging,
+                client_address: String::new(),
+                protocol_version: 5,
+            };
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                route_select_raw(state, &ctx, &select),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("page {} did not return within 120s", pages.len()))
+            .unwrap();
+            assert!(
+                res.rows.len() <= page_size as usize,
+                "page {} returned {} rows, exceeds wire fetch_size {page_size} — \
+                 the wire page_size was DROPPED (t_a0f922a3: fetch_size=2000 → 5000 rows)",
+                pages.len(),
+                res.rows.len()
+            );
+            if !res.rows.is_empty() {
+                pages.push(res.rows);
+            }
+            match res.paging_state {
+                Some(ns) => paging_state = Some(ns),
+                None => return pages,
+            }
+            assert!(
+                pages.len() <= max_pages,
+                "paged scan did not terminate within {max_pages} pages — the wire \
+                 paging cursor is being dropped, so every page re-serves page 1 \
+                 (t_a0f922a3 LIVE: has_more stuck True forever)"
+            );
+        }
+    }
+
+    /// Extract `(pk, ck)` ints from a row given the projected column indices.
+    fn row_pk_ck(row: &[Option<CqlValue>], pk_idx: usize, ck_idx: usize) -> (i32, i32) {
+        let int_at = |i: usize| match row[i] {
+            Some(CqlValue::Int(v)) => v,
+            ref other => panic!("expected int at column {i}, got {other:?}"),
+        };
+        (int_at(pk_idx), int_at(ck_idx))
+    }
+
+    /// Assert the exactly-once paged-traversal contract over `pages`:
+    /// * pages strictly advance — page N+1's first row is `(pk, ck)`-greater
+    ///   than page N's last row (in the emitted stream order);
+    /// * the union of all pages is EXACTLY `expected` (no gaps, no dupes);
+    /// * the page count matches `ceil(total / page_size)`.
+    fn assert_paged_traversal_exact(
+        pages: &[Vec<Vec<Option<CqlValue>>>],
+        pk_idx: usize,
+        ck_idx: usize,
+        expected: &std::collections::BTreeSet<(i32, i32)>,
+        page_size: usize,
+    ) {
+        let expected_pages = expected.len().div_ceil(page_size);
+        assert_eq!(
+            pages.len(),
+            expected_pages,
+            "page count must be ceil({}/{page_size}) = {expected_pages}",
+            expected.len()
+        );
+
+        // Pages must strictly advance in the stream's own order: a repeated or
+        // rewound page start is the live cycle signature (page 4 == page 1).
+        for w in pages.windows(2) {
+            let prev_last = row_pk_ck(w[0].last().expect("non-empty page"), pk_idx, ck_idx);
+            let next_first = row_pk_ck(w[1].first().expect("non-empty page"), pk_idx, ck_idx);
+            // Same partition: clustering must strictly increase. Different
+            // partition: keys advance in token order which int pk/ck tuples
+            // don't mirror, so only assert non-equality there.
+            if prev_last.0 == next_first.0 {
+                assert!(
+                    next_first.1 > prev_last.1,
+                    "page did not advance within partition pk={}: last ck of \
+                     previous page {} >= first ck of next page {}",
+                    prev_last.0,
+                    prev_last.1,
+                    next_first.1
+                );
+            }
+        }
+
+        let mut seen: Vec<(i32, i32)> = pages
+            .iter()
+            .flatten()
+            .map(|row| row_pk_ck(row, pk_idx, ck_idx))
+            .collect();
+        let delivered = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            delivered,
+            "paged traversal emitted {} duplicate rows",
+            delivered - seen.len()
+        );
+        let seen_set: std::collections::BTreeSet<(i32, i32)> = seen.into_iter().collect();
+        assert_eq!(
+            &seen_set, expected,
+            "paged union must equal the whole row set exactly (no gaps, no dupes)"
+        );
+    }
+
+    /// t_a0f922a3 mode 1 (CYCLE): a single partition WIDER than one page must
+    /// page to completion through the real paging_state round-trip. The live
+    /// 3-node cluster looped forever over ~10% of `typed_edges` because the
+    /// cursor re-entered a wide partition at partition granularity. One
+    /// partition of 15k clustering rows at page_size 5000 must yield exactly
+    /// 3 strictly-advancing pages whose union is the exact row set, and
+    /// has_more must go false.
+    #[tokio::test]
+    async fn wide_partition_spanning_pages_terminates_exactly() {
+        let rows_per: i64 = 15_000;
+        let page_size: i32 = 5_000;
+        let (state, _dir, auth, ks) = setup_clustered_scan_table("widepg", &[1], rows_per).await;
+
+        let expected: std::collections::BTreeSet<(i32, i32)> =
+            (0..rows_per as i32).map(|ck| (1, ck)).collect();
+
+        // Star projection → range_read_stream_all_from.
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT * FROM widepg.wide",
+            page_size,
+            10,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+        // Column-subset projection → range_read_projected_stream_all_from —
+        // the exact live `SELECT src_id, edge_type, dst_id FROM typed_edges`
+        // shape. pk/ck are columns 0/1 of the projection.
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM widepg.wide",
+            page_size,
+            10,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+        // t_a0f922a3 "also verify": the same scan must be exact when the rows
+        // are SSTABLE-backed, not memtable-backed. A live node returned an
+        // instant EMPTY page for a COUNT-verified 15k-row table right after a
+        // restart, and the live cycle was observed on flushed data. An empty
+        // or short union here means the paged path silently loses
+        // SSTable-backed rows.
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("widepg", "wide"))
+            .expect("flush widepg.wide to SSTable");
+
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT * FROM widepg.wide",
+            page_size,
+            10,
+        )
+        .await;
+        assert!(
+            !pages.is_empty(),
+            "SSTable-backed paged scan returned an instant EMPTY result for a \
+             populated table (t_a0f922a3 restart evidence)"
+        );
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM widepg.wide",
+            page_size,
+            10,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+    }
+
+    /// t_a0f922a3 LIVE (the bug 3 prior in-process-green fixes missed): the
+    /// EXACT live shape and transport. `SELECT pk, ck FROM vcyc.edges`
+    /// (3 partitions × 5000 clustering rows), driven with the python driver's
+    /// `fetch_size=2000` and the echoed cursor round-tripped through the REAL
+    /// wire `<query_parameters>` codec — NOT a hand-built `ctx.paging`.
+    ///
+    /// Live evidence reproduced here as assertions:
+    ///  * page 1 returned 5000 rows for fetch_size=2000 → page_size was NOT
+    ///    applied (the server default leaked through). `walk_pages_via_wire`
+    ///    fails the moment a page exceeds the wire fetch_size.
+    ///  * pages 2,3,4 were byte-identical to page 1 (same rows, same cursor) →
+    ///    the echoed paging_state was ignored and the scan re-served partition 1
+    ///    from ck=0 forever. `assert_paged_traversal_exact` fails on a
+    ///    non-advancing page, and the `max_pages` cap fails a cycling loop.
+    ///
+    /// Revert-to-confirm: revert the wire decode in `connection.rs` (back to
+    /// `PagingParams::default()`) and this test fails with a cycling cursor /
+    /// oversized page — while the older `walk_pages` (hand-built `ctx.paging`)
+    /// tests keep passing, which is precisely why the live failure slipped past.
+    #[tokio::test]
+    async fn live_wire_paged_scan_advances_and_terminates_exactly() {
+        let rows_per: i64 = 5_000;
+        let page_size: i32 = 2_000; // python driver default-style fetch_size
+        let (state, _dir, auth, ks) =
+            setup_clustered_scan_table("vcyc", &[1, 2, 3], rows_per).await;
+
+        let expected: std::collections::BTreeSet<(i32, i32)> = [1, 2, 3]
+            .into_iter()
+            .flat_map(|pk| (0..rows_per as i32).map(move |ck| (pk, ck)))
+            .collect();
+        assert_eq!(expected.len(), 15_000, "fixture must be exactly 15k rows");
+
+        // The exact projected live query, over the wire codec. A generous page
+        // cap: ceil(15000/2000) = 8 pages; a cycling cursor blows past it.
+        let pages = walk_pages_via_wire(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM vcyc.wide",
+            page_size,
+            50,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+
+        // And the same after flushing to SSTable (the live cycle was observed
+        // on flushed data; a post-restart node returned an instant empty page).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("vcyc", "wide"))
+            .expect("flush vcyc.edges to SSTable");
+        let pages = walk_pages_via_wire(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM vcyc.wide",
+            page_size,
+            50,
+        )
+        .await;
+        assert!(
+            !pages.is_empty(),
+            "SSTable-backed wire-paged scan returned an instant EMPTY result"
+        );
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
+    }
+
+    /// t_a0f922a3 mode 1, live shape: MULTI-COMPONENT TEXT clustering
+    /// (`typed_edges` is `((tenant, session), edge_type, dst_id)` — text
+    /// components of VARYING lengths, u16-length-prefixed in the encoded
+    /// clustering bytes). The paging cursor compares raw encoded clustering
+    /// bytes, and the SSTable layer decodes/re-encodes the components on
+    /// flush/read — any byte-order or round-trip divergence between the
+    /// memtable and SSTable forms makes the cursor skip or re-emit rows and
+    /// can cycle forever. Walk a wide partition spanning pages, memtable-
+    /// backed then SSTable-backed then MIXED (flushed base + memtable
+    /// updates), asserting the exact union each time.
+    #[tokio::test]
+    async fn wide_partition_multi_text_clustering_pages_exactly_after_flush() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = Some("mck".to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE KEYSPACE mck WITH replication = \
+             {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE TABLE mck.edges (pk int, e text, d text, v int, PRIMARY KEY (pk, e, d))",
+        )
+        .await;
+
+        // Varying-length components so length-prefixed byte order and
+        // component-wise order DIVERGE (e.g. 'b' vs 'aa').
+        let edge_types = ["a", "bb", "c", "dddd", "ee", "supports", "x"];
+        let mut expected: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let n: usize = 4_200;
+        let page_size: i32 = 1_000;
+        for i in 0..n {
+            let e = edge_types[i % edge_types.len()];
+            // Varying-length dst ids: "n-5", "n-55", "n-555", ...
+            let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 1)"),
+            )
+            .await;
+            expected.insert((e.to_string(), d));
+        }
+        assert_eq!(expected.len(), n, "seed rows must be distinct");
+
+        let collect_pairs = |pages: &[Vec<Vec<Option<CqlValue>>>]| {
+            let mut seen: Vec<(String, String)> = pages
+                .iter()
+                .flatten()
+                .map(|row| {
+                    let text_at = |i: usize| match &row[i] {
+                        Some(CqlValue::Text(s)) => s.clone(),
+                        other => panic!("expected text at column {i}, got {other:?}"),
+                    };
+                    (text_at(0), text_at(1))
+                })
+                .collect();
+            let delivered = seen.len();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                delivered,
+                "paged traversal emitted duplicate rows"
+            );
+            seen.into_iter().collect::<std::collections::BTreeSet<_>>()
+        };
+        let max_pages = n.div_ceil(page_size as usize) + 2;
+
+        // Memtable-backed.
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT e, d FROM mck.edges",
+            page_size,
+            max_pages,
+        )
+        .await;
+        assert_eq!(
+            collect_pairs(&pages),
+            expected,
+            "memtable-backed multi-text-ck paged union must be exact"
+        );
+
+        // SSTable-backed.
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("mck", "edges"))
+            .expect("flush mck.edges to SSTable");
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT e, d FROM mck.edges",
+            page_size,
+            max_pages,
+        )
+        .await;
+        assert_eq!(
+            collect_pairs(&pages),
+            expected,
+            "SSTable-backed multi-text-ck paged union must be exact — a \
+             clustering round-trip divergence cycles the cursor (t_a0f922a3)"
+        );
+
+        // Mixed: overwrite a slice of rows so the scan merges SSTable base
+        // rows with newer memtable rows sharing the same clustering.
+        for i in 0..500 {
+            let e = edge_types[i % edge_types.len()];
+            let d = format!("n-{}", "5".repeat(1 + i % 5)) + &format!("-{i}");
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO mck.edges (pk, e, d, v) VALUES (7, '{e}', '{d}', 2)"),
+            )
+            .await;
+        }
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT e, d FROM mck.edges",
+            page_size,
+            max_pages,
+        )
+        .await;
+        assert_eq!(
+            collect_pairs(&pages),
+            expected,
+            "mixed memtable+SSTable multi-text-ck paged union must be exact \
+             (same-clustering rows must fold, not duplicate)"
+        );
+    }
+
+    /// t_a0f922a3 mode 2 (STALL): many SMALL partitions, pk-only projection,
+    /// no LIMIT, fetch_size-paged — the exact live `SELECT id FROM vfix.nums`
+    /// shape (15k single-row partitions) that never returned page 1 on the
+    /// live cluster while COUNT over the same data drained fine. Every page
+    /// pull runs under `walk_pages`' hard timeout, so a stall FAILS loudly.
+    /// The union must be exact and the walk must terminate; data is
+    /// SSTable-backed + memtable mixed like the live table.
+    #[tokio::test]
+    async fn many_small_partitions_pk_projection_pages_without_stalling() {
+        let n: i64 = 15_000;
+        let page_size: i32 = 5_000;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+
+        // Flush the bulk to SSTables (live shape: COUNT-verified flushed data).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("pageks", "t"))
+            .expect("flush pageks.t to SSTable");
+
+        // pk-only projection (id is the whole primary key → wanted == []).
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT id FROM pageks.t",
+            page_size,
+            (n as usize).div_ceil(page_size as usize) + 2,
+        )
+        .await;
+
+        let mut seen: Vec<i32> = pages
+            .iter()
+            .flatten()
+            .map(|row| match row[0] {
+                Some(CqlValue::Int(v)) => v,
+                ref other => panic!("expected int id, got {other:?}"),
+            })
+            .collect();
+        let delivered = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), delivered, "paged scan emitted duplicate rows");
+        assert_eq!(
+            seen.len(),
+            n as usize,
+            "paged pk-projection scan must deliver every partition exactly once"
+        );
+    }
+
+    /// t_a0f922a3 mode 1, multi-partition mix: wide partitions (each spanning
+    /// multiple pages) interleaved by token with single-row partitions. The
+    /// paged union must be exact and the walk must terminate.
+    #[tokio::test]
+    async fn mixed_wide_and_narrow_partitions_page_exactly() {
+        // pks 1..=40: pks 1..=3 are wide (700 rows), the rest single-row.
+        let wide_pks: Vec<i64> = vec![1, 2, 3];
+        let narrow_pks: Vec<i64> = (4..=40).collect();
+        let rows_per_wide: i64 = 700;
+        let page_size: i32 = 250;
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = Some("mixpg".to_string());
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE KEYSPACE mixpg WITH replication = \
+             {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        )
+        .await;
+        run_ddl(
+            &state,
+            &ctx,
+            "CREATE TABLE mixpg.wide (pk int, ck int, v int, PRIMARY KEY (pk, ck))",
+        )
+        .await;
+        let mut expected: std::collections::BTreeSet<(i32, i32)> =
+            std::collections::BTreeSet::new();
+        for &pk in &wide_pks {
+            for ck in 0..rows_per_wide {
+                run_ddl(
+                    &state,
+                    &ctx,
+                    &format!("INSERT INTO mixpg.wide (pk, ck, v) VALUES ({pk}, {ck}, 0)"),
+                )
+                .await;
+                expected.insert((pk as i32, ck as i32));
+            }
+        }
+        // Flush the wide partitions to an SSTable so the scan merges
+        // SSTable-backed wide partitions with memtable-backed narrow ones —
+        // the live table shape (flushed bulk + fresh writes).
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("mixpg", "wide"))
+            .expect("flush mixpg.wide to SSTable");
+        for &pk in &narrow_pks {
+            run_ddl(
+                &state,
+                &ctx,
+                &format!("INSERT INTO mixpg.wide (pk, ck, v) VALUES ({pk}, 0, 0)"),
+            )
+            .await;
+            expected.insert((pk as i32, 0));
+        }
+        let total = expected.len();
+        let max_pages = total.div_ceil(page_size as usize) + 2;
+
+        let pages = walk_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT pk, ck FROM mixpg.wide",
+            page_size,
+            max_pages,
+        )
+        .await;
+        assert_paged_traversal_exact(&pages, 0, 1, &expected, page_size as usize);
     }
 
     #[tokio::test]
