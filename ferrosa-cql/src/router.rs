@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::pair::ddl::DdlOperation;
-use ferrosa_cluster::DdlPath;
+use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
 use ferrosa_schema::{
@@ -212,8 +212,8 @@ fn prepare_order_by_execution(
 /// ADR-020 projection fast path eligibility + ordinal computation.
 ///
 /// Returns `Some(wanted)` if the SELECT statement is safe to route
-/// through `WritePath::range_read_projected`, where `wanted` is the
-/// storage-ordinal Vec of regular columns the projection asks for.
+/// through `WritePath::range_read_projected_stream_all_*`, where `wanted` is
+/// the storage-ordinal Vec of regular columns the projection asks for.
 /// Returns `None` otherwise — the caller falls back to the legacy
 /// `range_read` path.
 ///
@@ -4475,78 +4475,70 @@ async fn route_select_user_table(
             extract_clustering_key_values(&s.where_clauses, table_meta, ks, &state.schema)?
                 .map(|values| bridge::build_clustering_key(&values))
         };
-        let partitions: Vec<ferrosa_sstable::types::Partition> =
-            if let Some(clustering) = exact_clustering {
-                state
-                    .write_path
-                    .load()
-                    .pk_read_clustering_row(
-                        &table_id,
-                        &decorated_key,
-                        &clustering,
-                        ctx.consistency,
-                        &read_strategy,
-                    )
-                    .await?
-                    .into_iter()
-                    .collect()
-            } else if let Some((index_name, index_key)) =
-                keyed_index_consult(state, &snap, ks, s, table_meta)
-            {
-                // Keyed secondary-index consult (t_430c4188): `WHERE <full
-                // partition key> AND <indexed_col> = ?`. Consult the index
-                // restricted to the specified partition and point-read only the
-                // matching rows — O(matching rows), never O(partition rows).
-                // Routing is keyed to the partition's replicas (never the global
-                // index scatter-gather), and no ALLOW FILTERING is required: the
-                // shape is fully keyed.
-                state
-                    .index_usage_tracker
-                    .record(ks, &s.table, &index_name, "PartitionIndexLookup");
-                let consulted = state
-                    .write_path
-                    .load()
-                    .index_read_in_partition(
-                        &table_id,
-                        &decorated_key,
-                        &index_name,
-                        &index_key,
-                        &read_strategy,
-                    )
-                    .await?;
-                if consulted.is_empty() {
-                    // DESIGNED fallback, mirroring the staleness masking of the
-                    // global `SingleIndex` arm (its empty-result fallback rescans
-                    // the table): a secondary index created over pre-existing data
-                    // is backfilled asynchronously, so an empty consult is not yet
-                    // proof of an empty result. Re-verify with a partition-scoped
-                    // read + post-filter — bounded by ONE partition, never the
-                    // whole table — so the keyed path's consistency is never worse
-                    // than the global index path it bypasses.
-                    tracing::debug!(
-                        keyspace = ks,
-                        table = %s.table,
-                        index = %index_name,
-                        "keyed index consult returned no rows; \
-                         re-verifying with a partition-scoped scan"
-                    );
-                    state
-                        .write_path
-                        .load()
-                        .pk_read_limited_rows(
-                            &table_id,
-                            &decorated_key,
-                            ctx.consistency,
-                            &read_strategy,
-                            row_limit,
-                        )
-                        .await?
-                        .into_iter()
-                        .collect()
-                } else {
-                    consulted
-                }
-            } else {
+        let partitions: Vec<ferrosa_sstable::types::Partition> = if let Some(clustering) =
+            exact_clustering
+        {
+            state
+                .write_path
+                .load()
+                .pk_read_clustering_row(
+                    &table_id,
+                    &decorated_key,
+                    &clustering,
+                    ctx.consistency,
+                    &read_strategy,
+                )
+                .await?
+                .into_iter()
+                .collect()
+        } else if let Some((index_name, index_key)) =
+            keyed_index_consult(state, &snap, ks, s, table_meta)
+        {
+            // Keyed secondary-index consult (t_430c4188): `WHERE <full
+            // partition key> AND <indexed_col> = ?`. Consult the index
+            // restricted to the specified partition and point-read only the
+            // matching rows — O(matching rows), never O(partition rows).
+            // Routing is keyed to the partition's replicas (never the global
+            // index scatter-gather), and no ALLOW FILTERING is required: the
+            // shape is fully keyed.
+            state
+                .index_usage_tracker
+                .record(ks, &s.table, &index_name, "PartitionIndexLookup");
+            let consulted = state
+                .write_path
+                .load()
+                .index_read_in_partition(
+                    &table_id,
+                    &decorated_key,
+                    &index_name,
+                    &index_key,
+                    &read_strategy,
+                )
+                .await?;
+            let keyed_index_current = {
+                let write_path = state.write_path.load();
+                let local_tracker_authoritative = matches!(
+                    &**write_path,
+                    WritePath::Direct(_) | WritePath::Pair(_) | WritePath::DegradedPair(_)
+                );
+                local_tracker_authoritative && state.engine.index_is_current(&table_id, &index_name)
+            };
+            if consulted.is_empty() && !keyed_index_current {
+                // DESIGNED fallback, mirroring the staleness masking of the
+                // global `SingleIndex` arm (its empty-result fallback rescans
+                // the table): a secondary index created over pre-existing data
+                // is backfilled asynchronously, so an empty consult is not yet
+                // proof of an empty result. Re-verify with a partition-scoped
+                // read + post-filter — bounded by ONE partition, never the
+                // whole table — so the keyed path's consistency is never worse
+                // than the global index path it bypasses.
+                tracing::debug!(
+                    keyspace = ks,
+                    table = %s.table,
+                    index = %index_name,
+                    "keyed index consult returned no rows; \
+                     re-verifying with a partition-scoped scan"
+                );
                 state
                     .write_path
                     .load()
@@ -4560,7 +4552,24 @@ async fn route_select_user_table(
                     .await?
                     .into_iter()
                     .collect()
-            };
+            } else {
+                consulted
+            }
+        } else {
+            state
+                .write_path
+                .load()
+                .pk_read_limited_rows(
+                    &table_id,
+                    &decorated_key,
+                    ctx.consistency,
+                    &read_strategy,
+                    row_limit,
+                )
+                .await?
+                .into_iter()
+                .collect()
+        };
         let mut pk_rows = Vec::new();
         for partition in &partitions {
             pk_rows.extend(bridge::partition_to_rows_with_storage_mapping(
@@ -5360,10 +5369,10 @@ async fn route_select_user_table(
                             )
                             .unwrap_or(0);
                             // ADR-020 projection fast path. Route through
-                            // range_read_projected whenever the query only needs a subset
-                            // of regular cells, so the SSTable layer byte-skips bulky
-                            // unneeded payloads. Big win on wide tables with bulky cells
-                            // (e.g. entity_store's entity_embedding column).
+                            // range_read_projected_stream_all_* whenever the query only
+                            // needs a subset of regular cells, so the SSTable layer
+                            // byte-skips bulky unneeded payloads. Big win on wide tables
+                            // with bulky cells (e.g. entity_store's entity_embedding column).
                             //
                             // Non-count SELECT requires no WHERE because predicates over
                             // unprojected regular columns would evaluate against NULL.
@@ -9303,6 +9312,10 @@ async fn route_drop_index(
             state
                 .schema
                 .drop_index(ks, &table_name, &s.name, ctx.auth)?;
+            state
+                .engine
+                .drop_index(&TableId::new(ks, &table_name), &s.name)
+                .map_err(|e| CqlError::ServerError(format!("drop index storage cleanup: {e}")))?;
             // Tombstone the dogfooded system_schema.indexes row (cluster/pair
             // paths do this via SystemTableWriter; Direct mode does it here).
             tombstone_index_row_direct(&state.engine, ks, &table_name, &s.name);

@@ -251,6 +251,15 @@ impl IndexStateTracker {
         self.states.read().get(&key).cloned()
     }
 
+    /// Returns true when the index is registered and has no known pending or
+    /// failed build work.
+    pub fn is_current(&self, keyspace: &str, table: &str, index_name: &str) -> bool {
+        self.get_state(keyspace, table, index_name)
+            .is_some_and(|state| {
+                matches!(state.status, IndexStatus::Current) && state.pending_sstables.is_empty()
+            })
+    }
+
     /// Returns the indexed and unindexed SSTable sets for a given index.
     ///
     /// Returns `(indexed, unindexed)` where unindexed is the set of pending
@@ -403,15 +412,39 @@ mod tests {
         let tracker = IndexStateTracker::new();
         tracker.register_index("ks", "tbl", "idx");
         assert_eq!(tracker.all_states().len(), 1);
+        assert!(tracker.is_current("ks", "tbl", "idx"));
 
         let removed = tracker.remove_index("ks", "tbl", "idx");
         assert!(removed);
         assert!(tracker.all_states().is_empty());
         assert!(tracker.get_state("ks", "tbl", "idx").is_none());
+        assert!(!tracker.is_current("ks", "tbl", "idx"));
 
         // Removing again returns false.
         let removed = tracker.remove_index("ks", "tbl", "idx");
         assert!(!removed);
+    }
+
+    #[test]
+    fn is_current_tracks_pending_and_failed_work() {
+        let tracker = IndexStateTracker::new();
+        tracker.register_index("ks", "tbl", "idx");
+        assert!(tracker.is_current("ks", "tbl", "idx"));
+
+        tracker.mark_pending("ks", "tbl", "idx", "sst-1", 1);
+        assert!(!tracker.is_current("ks", "tbl", "idx"));
+
+        tracker.mark_indexed("ks", "tbl", "idx", "sst-1");
+        assert!(tracker.is_current("ks", "tbl", "idx"));
+
+        tracker.mark_failed(
+            "ks",
+            "tbl",
+            "idx",
+            "boom".to_string(),
+            Duration::from_secs(1),
+        );
+        assert!(!tracker.is_current("ks", "tbl", "idx"));
     }
 
     #[test]

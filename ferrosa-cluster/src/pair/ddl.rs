@@ -348,6 +348,9 @@ impl DdlCoordinator {
                 self.schema
                     .drop_index_internal(keyspace, table, index)
                     .map_err(|e| ClusterError::Internal(format!("drop_index: {e}")))?;
+                self.engine
+                    .drop_index(&ferrosa_storage::TableId::new(keyspace, table), index)
+                    .map_err(ClusterError::Storage)?;
                 crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
                     .apply(
                         ferrosa_schema::system::persistence::SystemTableMutation::IndexDropped {

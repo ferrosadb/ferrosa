@@ -341,12 +341,14 @@ paths — used by the **non-projected** complex arm (`range_read_limited_rows_ch
 fail-loud at `router.rs ~4695`) and simple coordinated reads. **Those are the cap sites to
 remove in steps 2+.** (#234, a server-side fail-loud guard, was rejected as the wrong fix.)
 
-Two follow-ups from step 1: (a) `range_read_projected` is now orphaned (no real callers;
-survives only as `pub`) — delete it once streaming is complete; (b) a cluster projected
+One follow-up remains from step 1: a cluster projected
 scan **with** a `scan_bound` (LIMIT/page_size) now fail-louds (`partition_limit`
 unimplemented for the coordinated projected stream) instead of returning local-only
 partial — implement coordinated projected partition-limit if that shape needs cluster
 support.
+
+The orphaned `range_read_projected` wrapper was deleted in the follow-up stacked
+on #244; projected scans now use the streaming write-path methods directly.
 
 ## Principle
 
@@ -374,7 +376,7 @@ Safety comes from bounding **memory**, not result count:
 | Other aggregates (`SUM`/`MIN`/`MAX`/`AVG`) | ~~capped at 10k~~ **was fail-loud refused** | **done (step 2)** — O(1) streaming accumulator (`stream_builtin_aggregates`) |
 | User `LIMIT N` (> OOM guard) | ~~clamped to 10k (Vec)~~ | **done (step 2)** — `range_read_stream_all_with().take(N)` |
 | `DISTINCT <partition key>` | capped at 10k | **done (step 1)** — token-ordered scan visits each partition once, no dedup buffer |
-| Projected scan (subset of columns) | `range_read_projected(.., scan_bound)` capped | **done (step 1)** — `range_read_projected_stream_all_with` (`write_path.rs:619`) |
+| Projected scan (subset of columns) | old `range_read_projected(.., scan_bound)` wrapper deleted | **done (step 1 + #244 follow-up)** — streaming-only `range_read_projected_stream_all_with` |
 | `GROUP BY` (high cardinality) | N/A — not parsed in the AST yet | add per-group accumulator + spill when `GROUP BY` lands (deferred; not step 5) |
 | `ORDER BY` (no `LIMIT`, arbitrary) | ~~capped + fail-loud~~ | **done (step 5)** — spilling external merge sort (`ExternalSorter` + cascade k-way merge); complete, correctly ordered, memory bounded by the spill threshold, no cap |
 | `ORDER BY … LIMIT N` / clustering-order | bounded | bounded top-N heap (size N), no spill |

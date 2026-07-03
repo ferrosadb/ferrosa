@@ -37,6 +37,10 @@ and the `/internal/index/build` route) *is* the interface — see
   fully-encoded `FilterPredicate` on the wire and threads it into the
   `IndexBuildJob`, so the remote sidecar contains exactly the matching rows —
   never an unfiltered sidecar.
+- **Clustering-column index support**: build requests may carry
+  `clustering_source` (`component`, `total`) for indexes on CLUSTERING columns;
+  the worker threads it into `IndexBuildJob` so `LocalBackend` extracts the
+  value from the composite clustering key instead of looking for a row cell.
 - **Fail-closed for quantized vectors**: a `direct_upload` + `hvq_qvec` request
   returns `status: "failed"` with an explicit "not implemented" message rather
   than silently producing an unpublishable artifact.
@@ -87,8 +91,8 @@ builds carry `sidecar_s3_path` + `entries_built`.
   taxonomy and the partial-index predicate carried on the wire).
 - **`ferrosa-sstable`** — SSTable component shapes consumed during a build.
 - **`ferrosa-storage`** — `LocalBackend`, `IndexBuildJob`, `BuildPriority`,
-  `SidecarWriter`, `ArtifactManifestEntry`, `upload::hex_prefix_for` (the actual
-  index-build engine this service wraps).
+  `ClusteringComponentRef`, `SidecarWriter`, `ArtifactManifestEntry`,
+  `upload::hex_prefix_for` (the actual index-build engine this service wraps).
 
 External: `axum`, `tokio`, `object_store` (aws), `reqwest`, `clap`, `serde`,
 `serde_json`, `bytes`, `tracing`.

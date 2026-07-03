@@ -1155,6 +1155,14 @@ impl FerrosStateMachine {
                         tracing::error!(%e, "Raft apply: schema.drop_index_internal failed");
                     }
                 }
+                if let Some(engine) = &self.engine {
+                    if let Err(e) = engine.drop_index(&TableId::new(&keyspace, &table), &index) {
+                        tracing::error!(%e, "Raft apply: engine.drop_index failed — stale index state may remain");
+                        apply_errors.push(ApplyError::Other(format!(
+                            "engine.drop_index({keyspace}.{table}.{index}) failed: {e}"
+                        )));
+                    }
+                }
             }
             RaftOp::IndexStatus {
                 node_id,

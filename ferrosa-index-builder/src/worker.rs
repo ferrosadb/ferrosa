@@ -15,7 +15,9 @@ use object_store::ObjectStore;
 
 use ferrosa_index::IndexType;
 use ferrosa_storage::index::sidecar::SidecarWriter;
-use ferrosa_storage::index::{BuildPriority, IndexBuildBackend, IndexBuildJob, LocalBackend};
+use ferrosa_storage::index::{
+    BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob, LocalBackend,
+};
 
 /// Request sent to the worker pool from the HTTP handler.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -32,6 +34,10 @@ pub struct BuildRequest {
     pub s3_prefix: String,
     pub table: (String, String),
     pub column_position: usize,
+    /// Clustering-key component metadata for indexes on CLUSTERING columns.
+    /// Omitted for regular/static-column indexes.
+    #[serde(default)]
+    pub clustering_source: Option<ClusteringComponentRef>,
     pub priority: String,
     /// Partial-index predicate. `Some` only for a `filtered` index build: the
     /// fully-encoded [`ferrosa_index::FilterPredicate`] (value bytes already in
@@ -298,10 +304,11 @@ impl BuildRequest {
     }
 }
 
-/// Build an [`IndexBuildJob`] from a [`BuildRequest`], carrying the partial
-/// predicate (if any) so a `filtered` build applies it at build time. This is
-/// the single place the wire request is mapped to a job; extracted so the
-/// predicate plumbing is unit-testable without spinning up the HTTP path.
+/// Build an [`IndexBuildJob`] from a [`BuildRequest`], carrying the optional
+/// clustering-key source and partial predicate so remote builds match the local
+/// scheduler semantics. This is the single place the wire request is mapped to
+/// a job; extracted so protocol plumbing is unit-testable without spinning up
+/// the HTTP path.
 fn build_job(req: &BuildRequest) -> Result<IndexBuildJob, String> {
     let index_type = parse_index_type(&req.index_type)?;
     Ok(IndexBuildJob {
@@ -312,10 +319,7 @@ fn build_job(req: &BuildRequest) -> Result<IndexBuildJob, String> {
         priority: parse_priority(&req.priority),
         enqueued_at: Instant::now(),
         column_position: req.column_position,
-        // The remote-build wire protocol has no clustering-column field yet;
-        // clustering-column index jobs are built locally by the engine
-        // (RemoteBackend routes them to its local fallback, t_430c4188).
-        clustering_source: None,
+        clustering_source: req.clustering_source,
         filter_predicate: req.filter_predicate.clone(),
     })
 }
@@ -417,6 +421,37 @@ mod tests {
     }
 
     #[test]
+    fn build_request_threads_clustering_source_into_job() {
+        let json = serde_json::json!({
+            "sstable_id": "gen-9",
+            "index_name": "ck_idx",
+            "index_type": "btree",
+            "s3_endpoint": "memory://",
+            "s3_bucket": "b",
+            "s3_prefix": "p/ks.tbl/gen-9",
+            "table": ["ks", "tbl"],
+            "column_position": 1,
+            "clustering_source": {
+                "component": 1,
+                "total": 3
+            },
+            "priority": "initial",
+        });
+        let req: BuildRequest = serde_json::from_value(json).unwrap();
+        let job = build_job(&req).unwrap();
+
+        assert_eq!(
+            job.clustering_source,
+            Some(ClusteringComponentRef {
+                component: 1,
+                total: 3
+            })
+        );
+        assert_eq!(job.column_position, 1);
+        assert!(matches!(job.priority, BuildPriority::Initial));
+    }
+
+    #[test]
     fn parse_priorities() {
         assert!(matches!(parse_priority("high"), BuildPriority::High));
         assert!(matches!(parse_priority("normal"), BuildPriority::Normal));
@@ -440,6 +475,7 @@ mod tests {
                 s3_prefix: "prod/42/ks.tbl/gen-42".into(),
                 table: ("ks".into(), "tbl".into()),
                 column_position: 0,
+                clustering_source: None,
                 priority: "normal".into(),
                 filter_predicate: None,
             })
