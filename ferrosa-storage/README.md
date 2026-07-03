@@ -117,6 +117,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   bounded k-way merge (`SortedRows`, `RowOrder`). Peak working set is
   `O(MERGE_FANIN)` — independent of the row count. Spill/merge I/O errors fail
   loud; runs live under the `TempSortTableReservation` dir (cleaned up on drop).
+- **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
+  small, token-disjoint SSTables are grouped into concatenated "runs"
+  (`partition_into_disjoint_runs`), one heap source per run instead of one per
+  SSTable. **Correctness invariant:** a run may only concatenate SSTables in
+  which every partition key appears at most once, else the run re-emits a shared
+  key and the heap — seeing one source per run — never routes the duplicates
+  through `merge::merge_partitions`, double-counting rows (the `COUNT(*)`
+  over-count on `agent_memory.typed_edges`, FMEA ST-13). Disjointness is proven
+  by **decoding** each SSTable's partition-index bounds to a `DecoratedKey` and
+  coloring intervals in token order; SSTables whose bounds are not
+  byte-comparable (older/Cassandra-shaped encodings that fail
+  `byte_comparable::decode`) are each isolated into a singleton run so they stay
+  independent heap sources. `count_range` (COUNT(*)) and the row-scan paths share
+  this merger, so both dedup identically.
 
 ## Public API (key entry points)
 

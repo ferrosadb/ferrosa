@@ -5634,6 +5634,69 @@ mod tests {
         .unwrap()
     }
 
+    /// Build an SSTable reader whose Partitions.db smallest/largest key
+    /// bounds are overwritten with `smallest`/`largest` raw bytes,
+    /// leaving the trie + footer intact (bounds are rewritten in place,
+    /// same total length required so the footer's `key_bounds_offset`
+    /// stays valid). Used to reproduce SSTables whose partition-index
+    /// key bounds are NOT in byte-comparable form — the case that made
+    /// `partition_into_disjoint_runs` fuse overlapping SSTables and
+    /// defeat cross-SSTable dedup (COUNT(*) over-count).
+    ///
+    /// The Partitions.db footer (last 24 bytes) is 3 big-endian i64s:
+    /// `key_bounds_offset`, `key_count`, `root_pos`. The bounds section
+    /// at `key_bounds_offset` is two short-length-prefixed byte strings.
+    fn sstable_reader_with_raw_bounds(
+        schema: &TableSchema,
+        partitions: &[Partition],
+        smallest: &[u8],
+        largest: &[u8],
+    ) -> ferrosa_sstable::reader::SSTableReader<Vec<u8>> {
+        let header = crate::flush::build_serialization_header(schema, partitions);
+        let mut writer = ferrosa_sstable::writer::SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                verify_output: false,
+                ..WriteOptions::default()
+            },
+            header,
+        );
+        for partition in partitions {
+            writer.add_partition(partition).unwrap();
+        }
+        let output = writer.finish().unwrap();
+
+        // Rewrite the bounds section in the Partitions.db blob.
+        let mut pidx = output.partitions.clone();
+        let footer_off = pidx.len() - 24;
+        let key_bounds_offset =
+            i64::from_be_bytes(pidx[footer_off..footer_off + 8].try_into().unwrap()) as usize;
+        // Reconstruct the tail (bounds + footer) with new bounds; the
+        // trie prefix [0, key_bounds_offset) is untouched.
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&(smallest.len() as u16).to_be_bytes());
+        tail.extend_from_slice(smallest);
+        tail.extend_from_slice(&(largest.len() as u16).to_be_bytes());
+        tail.extend_from_slice(largest);
+        // Footer with the SAME key_bounds_offset (bounds still start
+        // where they did), preserved key_count + root_pos.
+        tail.extend_from_slice(&(key_bounds_offset as i64).to_be_bytes());
+        tail.extend_from_slice(&pidx[footer_off + 8..footer_off + 16]); // key_count
+        tail.extend_from_slice(&pidx[footer_off + 16..footer_off + 24]); // root_pos
+        pidx.truncate(key_bounds_offset);
+        pidx.extend_from_slice(&tail);
+
+        ferrosa_sstable::reader::SSTableReader::open(ferrosa_sstable::reader::SSTableComponents {
+            data: output.data,
+            partitions: pidx,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        })
+        .unwrap()
+    }
+
     fn test_store() -> TableStore<InMemoryFlushTarget> {
         TableStore::new(
             test_schema(),
@@ -6192,6 +6255,299 @@ mod tests {
             (2 * N) as u64,
             "COUNT(*) over memtable + sstable must equal {}",
             2 * N,
+        );
+    }
+
+    /// Regression for the COUNT(*) OVER-count bug: when the SAME
+    /// primary key (partition key + clustering) is written more than
+    /// once and flushed into separate SSTables, `count_range` must
+    /// count each distinct primary key ONCE — collapsing the
+    /// cross-SSTable duplicates the same way `merge::merge_partitions`
+    /// does for the row-scan path. The observed live symptom on
+    /// `agent_memory.typed_edges` was a per-node inflated count
+    /// (50807 / 27928 / 46066) that scaled with the number of
+    /// SSTables holding a copy of each row, over a data set of exactly
+    /// 21168 distinct rows.
+    #[test]
+    fn count_range_dedups_duplicate_primary_keys_across_sstables() {
+        let store = test_store();
+        // A single partition holding R rows with DISTINCT clustering
+        // keys (mirrors typed_edges: one partition, many clustered
+        // edges). Write + flush the identical set THREE times so the
+        // same (pk + clustering) rows land in three separate SSTables.
+        const R: i32 = 40;
+        const COPIES: usize = 3;
+        for copy in 0..COPIES {
+            for ck in 0..R {
+                // Identical clustering; timestamp varies per copy so
+                // the newest write legitimately wins on LWW — the row
+                // identity (pk+clustering) is unchanged.
+                let ts = 1000 + copy as i64;
+                store
+                    .write(&make_key("p0"), make_row_with_ck(ck, b"v", ts))
+                    .unwrap();
+            }
+            store.flush().unwrap();
+        }
+
+        // The full row-scan path (range_iter) already dedups by
+        // clustering, so it is the ground truth for the distinct count.
+        let scanned: u64 = {
+            let view = store.view.load_full();
+            let sst_readers = store
+                .open_readers_for_key_range(&view.sstables, None, None)
+                .unwrap();
+            let mut merger = crate::range_merger::merger_for_sources(
+                Box::new(std::iter::empty()),
+                None,
+                &sst_readers[..],
+                None,
+                None,
+            )
+            .unwrap();
+            let mut total = 0u64;
+            while let Some(p) = merger.next_merged_partition().unwrap() {
+                total += p.rows.len() as u64;
+                if p.static_row.is_some() {
+                    total += 1;
+                }
+            }
+            total
+        };
+        assert_eq!(
+            scanned, R as u64,
+            "row-scan path must see {R} distinct rows (ground truth)"
+        );
+
+        assert_eq!(
+            store.count_range(None, None).unwrap(),
+            R as u64,
+            "COUNT(*) must count {R} DISTINCT primary keys, not {} \
+             (once per SSTable copy)",
+            R as usize * COPIES,
+        );
+    }
+
+    /// Portable end-to-end reproduction of the COUNT(*) over-count
+    /// ROOT CAUSE: two SSTables that BOTH hold the same partition key
+    /// (with distinct clustering rows), but whose Partitions.db key
+    /// bounds are NOT byte-comparable encoded (they fail
+    /// `byte_comparable::decode`, exactly like the captured
+    /// Cassandra-shaped typed_edges SSTables). The old
+    /// `partition_into_disjoint_runs` compared those raw bounds as
+    /// byte-comparable and, when they mis-ordered as "disjoint", fused
+    /// the two overlapping SSTables into ONE concatenated run — so the
+    /// merge heap saw a single source per key and never called
+    /// `merge::merge_partitions`, double-counting every shared row.
+    ///
+    /// With the decode-guarded run grouping, non-decodable-bounds
+    /// SSTables each become their own heap source, the heap groups the
+    /// shared key across both, and the row set collapses to the true
+    /// distinct count. Both the row-scan and metadata mergers must
+    /// agree.
+    #[test]
+    fn count_range_dedups_when_sstable_bounds_are_not_byte_comparable() {
+        let schema = test_schema();
+
+        // Two SSTables, each holding partition "shared" with the SAME
+        // three clustering keys (ck 1..=3). Distinct clusterings, so
+        // the true distinct row count is 3 — NOT 6.
+        let rows = |ts: i64| {
+            vec![Partition {
+                key: make_key("shared"),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![
+                    make_row_with_ck(1, b"v", ts),
+                    make_row_with_ck(2, b"v", ts),
+                    make_row_with_ck(3, b"v", ts),
+                ],
+            }]
+        };
+        // Non-decodable bounds. byte_comparable encoding begins with a
+        // component/terminator marker; 0xFF-prefixed bytes are rejected
+        // by `decode` ("expected NEXT_COMPONENT at start"). Choose two
+        // raw ranges that a naive byte comparison calls DISJOINT
+        // (a.largest < b.smallest) to force the old fusion bug.
+        let a = sstable_reader_with_raw_bounds(&schema, &rows(1000), &[0xFF, 0x00], &[0xFF, 0x10]);
+        let b = sstable_reader_with_raw_bounds(&schema, &rows(2000), &[0xFF, 0x20], &[0xFF, 0x30]);
+        // Sanity: the bounds really are non-decodable.
+        assert!(
+            ferrosa_sstable::byte_comparable::decode(a.smallest_key_bytes()).is_err(),
+            "test setup: bounds must be non-byte-comparable to hit the bug"
+        );
+
+        let readers: Vec<Arc<ferrosa_sstable::reader::SSTableReader<Vec<u8>>>> =
+            vec![Arc::new(a), Arc::new(b)];
+
+        const EXPECTED: u64 = 3;
+
+        for label in ["row-scan", "metadata"] {
+            let mut merger = if label == "row-scan" {
+                crate::range_merger::merger_for_sources(
+                    Box::new(std::iter::empty()),
+                    None,
+                    &readers[..],
+                    None,
+                    None,
+                )
+                .unwrap()
+            } else {
+                crate::range_merger::merger_for_metadata_sources(
+                    Box::new(std::iter::empty()),
+                    None,
+                    &readers[..],
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let mut total = 0u64;
+            while let Some(p) = merger.next_merged_partition().unwrap() {
+                total += p.rows.len() as u64;
+                if p.static_row.is_some() {
+                    total += 1;
+                }
+            }
+            assert_eq!(
+                total, EXPECTED,
+                "{label} merger must dedup the shared key across both \
+                 non-decodable-bounds SSTables to {EXPECTED}, got {total}"
+            );
+        }
+    }
+
+    /// Faithful reproduction of the live COUNT(*) over-count on
+    /// `agent_memory.typed_edges` using the captured node SSTables
+    /// (13 real files, some compressed, some carrying non-byte-comparable
+    /// partition-index key bounds). Ground truth from direct SSTable
+    /// forensics: exactly 21168 distinct primary keys (partition key +
+    /// 3-column clustering). Both the row-scan merger
+    /// (`merger_for_sources`) and the metadata merger
+    /// (`merger_for_metadata_sources`, the COUNT(*) fast path) must
+    /// collapse cross-SSTable duplicates to that same 21168 — the live
+    /// bug inflated BOTH to ~50807 by fusing overlapping SSTables into a
+    /// single concatenated "run" (their raw bounds failed
+    /// `byte_comparable::decode` and mis-compared as disjoint), so the
+    /// per-key duplicates never reached `merge::merge_partitions`.
+    ///
+    /// Gated: the captured SSTables live outside the repo (they are not
+    /// checked in), so this is a `live-infra-tests` opt-in. Point
+    /// `FERROSA_TEST_TYPED_EDGES_DIR` at a directory of captured
+    /// `*-Data.db` (+ sibling components) to run it. Per the crate test
+    /// policy it `panic!`s with setup instructions when the feature is
+    /// enabled but the fixture is absent — never a silent skip. The
+    /// portable guards for the same fix are
+    /// `count_range_dedups_duplicate_primary_keys_across_sstables`
+    /// (store level) and
+    /// `range_merger::tests::group_by_key_isolates_undecodable_bounds_into_singleton_runs`
+    /// (the run-grouping invariant).
+    #[cfg(feature = "live-infra-tests")]
+    #[test]
+    fn count_range_metadata_merger_dedups_real_typed_edges_sstables() {
+        let dir_var = std::env::var("FERROSA_TEST_TYPED_EDGES_DIR").unwrap_or_default();
+        if dir_var.is_empty() {
+            panic!(
+                "FERROSA_TEST_TYPED_EDGES_DIR unset. This live-infra regression \
+                 needs the captured agent_memory.typed_edges SSTables. Set \
+                 FERROSA_TEST_TYPED_EDGES_DIR=<dir containing *-Data.db + sibling \
+                 components> (e.g. the repair-tie-divergence/node1 capture)."
+            );
+        }
+        let dir = std::path::PathBuf::from(&dir_var);
+        if !dir.exists() {
+            panic!(
+                "FERROSA_TEST_TYPED_EDGES_DIR points at {}, which does not exist",
+                dir.display()
+            );
+        }
+        let dir = dir.as_path();
+
+        // Open every real SSTable in the directory as an in-memory reader.
+        let mut readers: Vec<Arc<ferrosa_sstable::reader::SSTableReader<Vec<u8>>>> = Vec::new();
+        let mut data_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_str().map(|s| s.ends_with("-Data.db")).unwrap_or(false))
+            .collect();
+        data_files.sort();
+        for path in &data_files {
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            let gen = name.trim_end_matches("-Data.db");
+            let read = |suffix: &str| {
+                std::fs::read(dir.join(format!("{gen}-{suffix}"))).unwrap_or_default()
+            };
+            let compression_info =
+                std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+            let reader = ferrosa_sstable::reader::SSTableReader::open(
+                ferrosa_sstable::reader::SSTableComponents {
+                    data: read("Data.db"),
+                    partitions: read("Partitions.db"),
+                    rows: read("Rows.db"),
+                    filter: read("Filter.db"),
+                    compression_info,
+                    statistics: read("Statistics.db"),
+                },
+            )
+            .unwrap();
+            readers.push(Arc::new(reader));
+        }
+        assert!(
+            !readers.is_empty(),
+            "expected captured typed_edges SSTables in {}",
+            dir.display()
+        );
+
+        const EXPECTED_DISTINCT: u64 = 21168;
+
+        // Ground truth: the row-scan merger dedups by clustering.
+        let scanned: u64 = {
+            let mut merger = crate::range_merger::merger_for_sources(
+                Box::new(std::iter::empty()),
+                None,
+                &readers[..],
+                None,
+                None,
+            )
+            .unwrap();
+            let mut total = 0u64;
+            while let Some(p) = merger.next_merged_partition().unwrap() {
+                total += p.rows.len() as u64;
+                if p.static_row.is_some() {
+                    total += 1;
+                }
+            }
+            total
+        };
+        assert_eq!(
+            scanned, EXPECTED_DISTINCT,
+            "row-scan merger must count {EXPECTED_DISTINCT} distinct rows"
+        );
+
+        // The metadata (COUNT(*)) merger must agree.
+        let counted: u64 = {
+            let mut merger = crate::range_merger::merger_for_metadata_sources(
+                Box::new(std::iter::empty()),
+                None,
+                &readers[..],
+                None,
+                None,
+            )
+            .unwrap();
+            let mut total = 0u64;
+            while let Some(p) = merger.next_merged_partition().unwrap() {
+                total += p.rows.len() as u64;
+                if p.static_row.is_some() {
+                    total += 1;
+                }
+            }
+            total
+        };
+        assert_eq!(
+            counted, EXPECTED_DISTINCT,
+            "COUNT(*) metadata merger must dedup cross-SSTable duplicates \
+             to {EXPECTED_DISTINCT}, got {counted}"
         );
     }
 
