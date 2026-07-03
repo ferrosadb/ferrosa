@@ -212,8 +212,8 @@ fn prepare_order_by_execution(
 /// ADR-020 projection fast path eligibility + ordinal computation.
 ///
 /// Returns `Some(wanted)` if the SELECT statement is safe to route
-/// through `WritePath::range_read_projected`, where `wanted` is the
-/// storage-ordinal Vec of regular columns the projection asks for.
+/// through `WritePath::range_read_projected_stream_all_*`, where `wanted` is
+/// the storage-ordinal Vec of regular columns the projection asks for.
 /// Returns `None` otherwise — the caller falls back to the legacy
 /// `range_read` path.
 ///
@@ -5369,10 +5369,10 @@ async fn route_select_user_table(
                             )
                             .unwrap_or(0);
                             // ADR-020 projection fast path. Route through
-                            // range_read_projected whenever the query only needs a subset
-                            // of regular cells, so the SSTable layer byte-skips bulky
-                            // unneeded payloads. Big win on wide tables with bulky cells
-                            // (e.g. entity_store's entity_embedding column).
+                            // range_read_projected_stream_all_* whenever the query only
+                            // needs a subset of regular cells, so the SSTable layer
+                            // byte-skips bulky unneeded payloads. Big win on wide tables
+                            // with bulky cells (e.g. entity_store's entity_embedding column).
                             //
                             // Non-count SELECT requires no WHERE because predicates over
                             // unprojected regular columns would evaluate against NULL.

@@ -715,7 +715,7 @@ impl WritePath {
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
-                "range_read_projected unavailable: write path is in degraded mode".into(),
+                "coordinate_range_read_projected_stream_from unavailable: write path is in degraded mode".into(),
             )),
         }
     }
@@ -785,7 +785,7 @@ impl WritePath {
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
-                "range_read_projected unavailable: write path is in degraded mode".into(),
+                "coordinate_range_read_projected_stream_all_with unavailable: write path is in degraded mode".into(),
             )),
         }
     }
