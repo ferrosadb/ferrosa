@@ -26,6 +26,12 @@ pub struct SSTableMetadata {
     pub max_timestamp: i64,
     /// Number of partitions in this SSTable.
     pub partition_count: u64,
+    /// `true` when this SSTable's key bounds are NOT byte-comparable-decodable
+    /// (legacy Cassandra-format file). Such files store a wide partition's rows
+    /// in an order the streaming fragment read path mis-handles, so they must be
+    /// rewritten (compacted) into byte-comparable order regardless of size tier.
+    /// See `legacy_rewrite_tasks` and t_a0f922a3.
+    pub legacy_format: bool,
 }
 
 /// A compaction task: the set of input SSTables to merge into a single output.

@@ -36,6 +36,29 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `std::thread` workers behind a global `CompactionGate`. STCS (default) and UCS
   (CEP-26 density-based) strategies. A compaction validator (oracle + differential
   checks) gates correctness.
+  **Parallelism auto-tune (t_a0f922a3):** worker count and the concurrent-merge
+  cap now derive from the node's CPU count and configured memory (cgroup v2/v1
+  limit, else system RAM) — at most `cpus`, and at most `memory/2 ÷ 256 MB`
+  concurrent merges (keeping peak compaction memory under half the limit),
+  clamped to 8. Since compaction streams a partition-group at a time (per-task
+  memory ≈ widest partition × inputs, not the whole SSTable), the old fixed cap
+  of 2 was over-conservative. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
+  `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
+  startup.
+  **Legacy-format rewrite (t_a0f922a3):** `SSTableMetadata::legacy_format` flags
+  SSTables whose key bounds are not byte-comparable-decodable (older
+  Cassandra-shaped files that can store a wide partition's rows out of clustering
+  order). `strategy::legacy_rewrite_tasks` schedules these for a rewrite
+  **regardless of size tier** (size bucketing would otherwise leave a lone legacy
+  file unselected indefinitely), chunked by the same `max_threshold` /
+  `max_compaction_bytes` bounds as STCS, one task per chunk; `maybe_compact`
+  excludes files a strategy task already covers to avoid overlapping repairs.
+  **Compaction output is always monotonic:** because `merge::merge_partitions`
+  returns a single-source partition in its on-disk order, the executor runs
+  `merge::ensure_partition_rows_sorted` on every merged partition (a cheap O(n)
+  `is_sorted` check for the already-sorted common case), so even a 1-input legacy
+  rewrite re-sorts each partition — permanently fixing the on-disk order the
+  streaming read path assumes.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes
@@ -117,6 +140,24 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   bounded k-way merge (`SortedRows`, `RowOrder`). Peak working set is
   `O(MERGE_FANIN)` — independent of the row count. Spill/merge I/O errors fail
   loud; runs live under the `TempSortTableReservation` dir (cleaned up on drop).
+- **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
+  small, token-disjoint SSTables are grouped into concatenated "runs"
+  (`partition_into_disjoint_runs`), one heap source per run instead of one per
+  SSTable. **Correctness invariant:** a run may only concatenate SSTables in
+  which every partition key appears at most once, else the run re-emits a shared
+  key and the heap — seeing one source per run — never routes the duplicates
+  through `merge::merge_partitions`, double-counting rows (the `COUNT(*)`
+  over-count on `agent_memory.typed_edges`, FMEA ST-13). Disjointness is proven
+  by **decoding** each SSTable's partition-index bounds to a `DecoratedKey` and
+  coloring intervals in token order; SSTables whose bounds are not
+  byte-comparable (older/Cassandra-shaped encodings that fail
+  `byte_comparable::decode`) are each isolated into a singleton run so they stay
+  independent heap sources. `count_range` (COUNT(*)) and the row-scan paths share
+  this merger, so both dedup identically. The streaming fragment path
+  (`emit_fragment`) additionally **fails loud** if a source yields rows out of
+  clustering order within a partition (a legacy/corrupt SSTable) rather than
+  serving a silent partial — compaction's legacy-format rewrite is the at-rest
+  fix.
 
 ## Public API (key entry points)
 

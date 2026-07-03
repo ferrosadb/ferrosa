@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-06-21
+last_updated: 2026-07-02
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -23,6 +23,7 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 | CQL-9 | Server-side `now()` minting a non-16-byte TimeUUID | TimeUUID-clustered tables wedge at memtable flush (data-loss-class bug) | 9 | 1 | 4 | 36 | **Fixed + documented invariant**: `eval_now()` always returns 16 bytes; guards the prior flush-wedge bug. |
 | CQL-10 | In-flight semaphore (default 128) or per-IP cap rejecting legitimate bursts as `Overloaded` | Spurious `Overloaded` errors under legitimate load spikes | 4 | 3 | 3 | 36 | Tunable via `ServerConfig`; designed backpressure that fails loud rather than queueing unboundedly. |
 | CQL-11 | DataStax Java driver `DROP KEYSPACE` times out during schema-agreement on v5 | The driver closes its control connection after receiving the preceding CREATE INDEX schema-change event (normal metadata refresh). When `DROP KEYSPACE` fires, the broadcast has no active subscriber; the new control connection subscribes ~2 ms too late. A `watch` channel retains the missed event and delivers it to the new forwarder, but the driver does not process it on probe connections. | 5 | 8 | 3 | 120 | **Partial mitigation**: `watch` channel fallback delivers missed events to new control connections. 37/38 DataStax Java v5 smoke tests pass. Full fix likely requires matching Cassandra's schema-version polling behavior or ensuring the event reaches the driver's active control connection before it closes. |
+| CQL-12 | Out-of-range `timestamp` value written verbatim (integer literal or bound 8-byte value) | An i64 outside `chrono`'s representable millisecond range lands in a `timestamp` cell; on read the driver's date decode crashes, breaking `SELECT *` for the whole partition (forensically observed as `days=-1917935064`) | 9 | 2 | 6 | 108 → 18 | **Fixed (Bug C)**: `bridge::validate_timestamp_ms` rejects any timestamp cell outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]` (chrono `MIN_UTC`/`MAX_UTC` millis) at the write boundary for integer-literal, string, and bound-blob paths. Read robustness: `cell_to_cql_value` fails loud (`ServerError` with the offending millis) on already-corrupt on-disk timestamps instead of emitting an undecodable value. Tests: `term_out_of_range_integer_timestamp_is_rejected`, `bound_out_of_range_timestamp_blob_is_rejected`, `timestamp_bounds_match_chrono`, `cell_to_cql_value_rejects_corrupt_timestamp`. |
 
 ## Top risks to act on
 

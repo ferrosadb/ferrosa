@@ -22,20 +22,117 @@ use super::metadata::{CompactionTask, SSTableMetadata};
 /// to the live read path: `(table_id, gen_num)` over `FileReadAt` readers.
 type CompactionReaderPool = SharedReaderPool<ferrosa_sstable::io::FileReadAt>;
 
-/// Default cap on the number of compaction tasks allowed to run their merge
-/// concurrently. Bounds (concurrent tasks × per-task input readers) so
-/// compaction memory cannot grow without limit on a bloated node. Override with
-/// `FERROSA_MAX_CONCURRENT_COMPACTIONS`.
-const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 2;
+/// Conservative peak-memory budget charged to ONE concurrent streaming
+/// compaction. Since compaction merges a partition-group at a time (widest
+/// partition × inputs + reader/writer buffers), not the whole SSTable set, a
+/// few hundred MB is a safe worst case per task. Used to auto-tune the
+/// concurrency cap from the configured memory limit.
+const PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Resolve the configured concurrent-compaction cap (env override, sane
-/// default, never zero).
+/// Hard ceiling on auto-derived worker threads / concurrency, so a very large
+/// host does not spawn an unreasonable number of compaction threads.
+const MAX_AUTO_COMPACTION_PARALLELISM: usize = 8;
+
+/// Fraction (as a divisor) of the configured memory limit that compaction may
+/// budget across all concurrent tasks. `2` = at most half of RAM is charged to
+/// compaction, leaving headroom for the read/write path against the node's
+/// memory limit (e.g. the intentional 2 GB dev forcing function).
+const COMPACTION_MEM_DIVISOR: u64 = 2;
+
+/// Detect the node's configured memory limit in bytes: cgroup v2, then cgroup
+/// v1, then total system RAM. `None` when nothing is detectable (e.g. macOS dev
+/// without cgroups), in which case callers fall back to a CPU-only default.
+fn detected_memory_limit_bytes() -> Option<u64> {
+    // cgroup v2 unified hierarchy.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let t = s.trim();
+        if t != "max" {
+            if let Ok(v) = t.parse::<u64>() {
+                return Some(v);
+            }
+        }
+    }
+    // cgroup v1.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            // v1 encodes "unlimited" as a near-u64::MAX sentinel; ignore it.
+            if v < (1u64 << 62) {
+                return Some(v);
+            }
+        }
+    }
+    // Fall back to total system RAM from /proc/meminfo.
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse::<u64>().ok())
+                {
+                    return Some(kb.saturating_mul(1024));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pure auto-tune: derive the concurrent-compaction cap from CPU count and the
+/// (optional) configured memory limit. Bounded by BOTH resources — never more
+/// than `cpus` (so each concurrent merge can own a worker) and never more than
+/// `memory/2 / per-task-budget` (so peak compaction memory stays under half the
+/// node's limit). Always at least 1. `None` memory → CPU-scaled default of 2.
+fn auto_tuned_max_concurrent(cpus: usize, mem_limit_bytes: Option<u64>) -> usize {
+    let cpu_cap = cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM);
+    let mem_cap = match mem_limit_bytes {
+        Some(mem) => {
+            let budgeted = mem / COMPACTION_MEM_DIVISOR / PER_COMPACTION_MEM_BUDGET_BYTES;
+            (budgeted as usize).clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+        }
+        // No memory signal: keep the historical conservative default.
+        None => 2,
+    };
+    cpu_cap.min(mem_cap).max(1)
+}
+
+/// Pure auto-tune for worker threads: one per CPU, bounded. Extra idle workers
+/// are cheap (they block on `recv`), and having at least as many workers as the
+/// concurrency cap lets every permitted merge run without head-of-line blocking.
+fn auto_tuned_workers(cpus: usize) -> usize {
+    cpus.clamp(1, MAX_AUTO_COMPACTION_PARALLELISM)
+}
+
+fn available_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+}
+
+/// Resolve the concurrent-compaction cap: explicit env override, else auto-tuned
+/// from CPU + configured memory (never zero).
 fn configured_max_concurrent_compactions() -> usize {
-    std::env::var("FERROSA_MAX_CONCURRENT_COMPACTIONS")
+    if let Some(n) = std::env::var("FERROSA_MAX_CONCURRENT_COMPACTIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_CONCURRENT_COMPACTIONS)
+    {
+        return n;
+    }
+    auto_tuned_max_concurrent(available_cpus(), detected_memory_limit_bytes())
+}
+
+/// Resolve the compaction worker-thread count: explicit env override, else
+/// auto-tuned from CPU count (never zero).
+fn configured_compaction_workers() -> usize {
+    if let Some(n) = std::env::var("FERROSA_COMPACTION_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    auto_tuned_workers(available_cpus())
 }
 
 /// A counting semaphore that caps the number of compaction merges running at
@@ -255,20 +352,20 @@ impl CompactionExecutor {
     }
 
     fn build(reader_pool: Option<CompactionReaderPool>) -> Self {
-        let worker_count = std::env::var("FERROSA_COMPACTION_WORKERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(2)
-                    .clamp(1, 4)
-            });
+        let worker_count = configured_compaction_workers();
+        let max_concurrent = configured_max_concurrent_compactions();
+        tracing::info!(
+            worker_count,
+            max_concurrent,
+            cpus = available_cpus(),
+            mem_limit_bytes = detected_memory_limit_bytes().unwrap_or(0),
+            "compaction executor: auto-tuned parallelism (override with \
+             FERROSA_COMPACTION_WORKERS / FERROSA_MAX_CONCURRENT_COMPACTIONS)"
+        );
         let (result_tx, result_rx) = std::sync::mpsc::channel::<CompactionResult>();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
-        let gate = Arc::new(CompactionGate::new(configured_max_concurrent_compactions()));
+        let gate = Arc::new(CompactionGate::new(max_concurrent));
         // `reader_pool` is already an `Arc`, so each worker gets a cheap clone.
         let mut task_txs = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
@@ -817,7 +914,13 @@ impl CompactionExecutor {
             observe_group_width(group.len());
 
             let merge_start = Instant::now();
-            let merged = merge::merge_partitions(group);
+            let mut merged = merge::merge_partitions(group);
+            // Compaction output MUST be monotonic. merge_partitions leaves a
+            // single-source partition in its on-disk order, which for a legacy
+            // SSTable can be non-monotonic (t_a0f922a3) — this rewrites it in
+            // clustering order. Cheap O(n) sorted-check for the common already
+            // -sorted case (all multi-source merges, all modern files).
+            merge::ensure_partition_rows_sorted(&mut merged);
             crate::metrics::observe_compaction_phase(
                 crate::metrics::CompactionPhase::MergePartition,
                 merge_start.elapsed(),
@@ -984,6 +1087,10 @@ impl CompactionExecutor {
                 min_timestamp: header_min_ts,
                 max_timestamp: header_max_ts,
                 partition_count,
+                // Compaction always writes byte-comparable (BTI) output, so the
+                // rewritten SSTable is never legacy-format — this is precisely how
+                // a legacy file gets fixed (t_a0f922a3).
+                legacy_format: false,
             },
             direct_upload,
         })
@@ -1156,6 +1263,7 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
             partition_count: 10,
+            legacy_format: false,
         }
     }
 
@@ -1184,6 +1292,94 @@ mod tests {
             partitions.push(partition);
         }
         partitions
+    }
+
+    /// Open an on-disk SSTable whose component files are `{dir}/{gen}-*.db`.
+    fn open_sstable_reader(
+        dir: &std::path::Path,
+        gen: &str,
+    ) -> ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt> {
+        let openf = |suffix: &str| {
+            ferrosa_sstable::io::FileReadAt::open(dir.join(format!("{gen}-{suffix}"))).unwrap()
+        };
+        ferrosa_sstable::reader::SSTableReader::open(ferrosa_sstable::reader::SSTableComponents {
+            data: openf("Data.db"),
+            partitions: openf("Partitions.db"),
+            rows: openf("Rows.db"),
+            filter: std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap(),
+            compression_info: std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok(),
+            statistics: std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap(),
+        })
+        .unwrap()
+    }
+
+    /// Finding 1 regression (t_a0f922a3): compacting a SINGLE legacy SSTable
+    /// whose rows are stored OUT of clustering order must produce MONOTONIC
+    /// output. `merge_partitions` passes a single source through unchanged, so
+    /// without `ensure_partition_rows_sorted` in the executor the rewrite would
+    /// keep the bad order while stamping byte-comparable bounds — permanently
+    /// non-monotonic and never re-selected.
+    #[test]
+    fn compaction_resorts_single_misordered_legacy_sstable() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let cks = |p: &ferrosa_sstable::types::Partition| -> Vec<i32> {
+            p.rows
+                .iter()
+                .map(|r| i32::from_be_bytes(r.clustering[..4].try_into().unwrap()))
+                .collect()
+        };
+        let row = |n: i32| Row {
+            clustering: n.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(format!("v{n}").into_bytes(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        // One partition, rows physically out of clustering order: 5,1,2,3,4.
+        let misordered = ferrosa_sstable::types::Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"P".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row(5), row(1), row(2), row(3), row(4)],
+        };
+
+        let dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = write_sstable_to_dir(&dir, &[misordered], &schema);
+        meta.legacy_format = true;
+
+        // Precondition: the input SSTable really stores rows out of order.
+        let in_reader = open_sstable_reader(&dir, &meta.id);
+        let input = collect_reader_partitions(&in_reader);
+        assert_eq!(
+            cks(&input[0]),
+            vec![5, 1, 2, 3, 4],
+            "precondition: writer preserves the misordered rows on disk"
+        );
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![meta],
+            output_dir: output_dir.clone(),
+            schema: schema.clone(),
+            table_id: test_table_id(),
+        };
+        let out_meta = CompactionExecutor::execute_task(&task)
+            .expect("single-input legacy compaction must succeed")
+            .metadata;
+
+        let out_reader = open_sstable_reader(&output_dir, &out_meta.id);
+        let output = collect_reader_partitions(&out_reader);
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            cks(&output[0]),
+            vec![1, 2, 3, 4, 5],
+            "compaction MUST rewrite a single misordered legacy SSTable in monotonic order"
+        );
     }
 
     #[test]
@@ -1289,6 +1485,7 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
             partition_count: partitions.len() as u64,
+            legacy_format: false,
         }
     }
 
@@ -1424,6 +1621,7 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
             partition_count: 5,
+            legacy_format: false,
         };
 
         let output_dir = tmp.path().join("output");
@@ -1472,6 +1670,7 @@ mod tests {
             min_timestamp: 1000,
             max_timestamp: 2000,
             partition_count: 3,
+            legacy_format: false,
         };
 
         let output_dir = tmp.path().join("output");
@@ -1963,12 +2162,43 @@ mod tests {
     }
 
     /// `FERROSA_MAX_CONCURRENT_COMPACTIONS` parses to a positive cap and falls
-    /// back to a small default when unset/invalid (memory-bound default).
+    /// back to the resource auto-tune when unset/invalid.
     #[test]
-    fn concurrent_compaction_cap_default_is_small_and_positive() {
-        // Unset path → small default. (Other tests in this process may set the
-        // var; only assert the parsing contract on explicit inputs.)
-        assert_eq!(DEFAULT_MAX_CONCURRENT_COMPACTIONS, 2);
+    fn concurrent_compaction_cap_is_always_positive() {
         assert!(configured_max_concurrent_compactions() >= 1);
+        assert!(configured_compaction_workers() >= 1);
+    }
+
+    /// Auto-tune is bounded by BOTH cpu and memory, and never zero.
+    #[test]
+    fn auto_tuned_concurrency_is_bounded_by_cpu_and_memory() {
+        // 2 GB (the dev forcing function): half of RAM / 256 MB = 4 tasks,
+        // capped by cpus. With ample cpus the memory bound (4) wins.
+        assert_eq!(
+            auto_tuned_max_concurrent(16, Some(2 * 1024 * 1024 * 1024)),
+            4
+        );
+        // Few cpus cap below the memory allowance.
+        assert_eq!(
+            auto_tuned_max_concurrent(2, Some(2 * 1024 * 1024 * 1024)),
+            2
+        );
+        // Tiny memory floors at 1, never zero.
+        assert_eq!(auto_tuned_max_concurrent(8, Some(64 * 1024 * 1024)), 1);
+        // Huge memory is still capped by the parallelism ceiling and cpus.
+        assert_eq!(
+            auto_tuned_max_concurrent(64, Some(256u64 * 1024 * 1024 * 1024)),
+            MAX_AUTO_COMPACTION_PARALLELISM
+        );
+        // No memory signal → historical conservative default of 2 (cpu-capped).
+        assert_eq!(auto_tuned_max_concurrent(8, None), 2);
+        assert_eq!(auto_tuned_max_concurrent(1, None), 1);
+    }
+
+    #[test]
+    fn auto_tuned_workers_track_cpus_within_bounds() {
+        assert_eq!(auto_tuned_workers(1), 1);
+        assert_eq!(auto_tuned_workers(4), 4);
+        assert_eq!(auto_tuned_workers(64), MAX_AUTO_COMPACTION_PARALLELISM);
     }
 }

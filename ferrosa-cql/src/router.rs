@@ -6063,10 +6063,18 @@ fn data_type_to_cql_type(dt: &DataType) -> CqlType {
 
 /// Convert a `CellValue` (raw bytes) to a typed `CqlValue` using the column's `DataType`.
 ///
-/// Returns `None` (CQL null) for tombstones or cells with no value.
-fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<CqlValue> {
-    let bytes = cell.value.as_ref()?;
-    Some(match dt {
+/// Returns `Ok(None)` (CQL null) for tombstones or cells with no value.
+/// Returns `Err` when the stored bytes are self-evidently corrupt (e.g. a
+/// timestamp outside the representable range) so a scan fails loud with
+/// context instead of emitting a value that crashes a client decoder.
+fn cell_to_cql_value(
+    cell: &ferrosa_common::CellValue,
+    dt: &DataType,
+) -> Result<Option<CqlValue>, CqlError> {
+    let Some(bytes) = cell.value.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(match dt {
         DataType::Text => CqlValue::Text(String::from_utf8_lossy(bytes).into_owned()),
         DataType::Int => {
             let arr: [u8; 4] = bytes.as_slice().try_into().unwrap_or([0; 4]);
@@ -6096,12 +6104,24 @@ fn cell_to_cql_value(cell: &ferrosa_common::CellValue, dt: &DataType) -> Option<
         },
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
-            CqlValue::Timestamp(i64::from_be_bytes(arr))
+            let ms = i64::from_be_bytes(arr);
+            // Read robustness (Bug C): an already-corrupt on-disk timestamp
+            // (millis outside chrono's representable range) must fail loud
+            // rather than be emitted to a client that will crash decoding it.
+            crate::bridge::validate_timestamp_ms(ms).map_err(|_| {
+                CqlError::ServerError(format!(
+                    "corrupt timestamp cell: {ms} ms is outside the representable \
+                     range [{}, {}]; on-disk data corruption",
+                    crate::bridge::TIMESTAMP_MIN_MS,
+                    crate::bridge::TIMESTAMP_MAX_MS
+                ))
+            })?;
+            CqlValue::Timestamp(ms)
         }
         DataType::Blob => CqlValue::Blob(bytes.clone()),
         // DataType is #[non_exhaustive]; treat unknown as blob.
         _ => CqlValue::Blob(bytes.clone()),
-    })
+    }))
 }
 
 /// Decode a `list<text>` virtual cell. The bytes were produced by
@@ -6157,31 +6177,42 @@ fn encode_virtual_rows_streaming(
         })
         .collect();
 
-    Ok(result::encode_rows_with_writer(
-        &col_names,
-        &col_types,
-        keyspace,
-        table,
-        |emit| {
-            vtable.visit_rows(predicate, &mut |row| {
-                let cql_row: Vec<Option<CqlValue>> =
-                    row.cells
-                        .iter()
-                        .zip(columns.iter().enumerate())
-                        .map(|(cell, (idx, col))| match vtable.wire_type_for(idx) {
-                            Some(ferrosa_schema::WireType::ListText) => decode_list_text_cell(cell),
-                            Some(ferrosa_schema::WireType::SetText) => decode_list_text_cell(cell)
-                                .map(|value| match value {
-                                    CqlValue::List(items) => CqlValue::Set(items),
-                                    other => other,
-                                }),
-                            None => cell_to_cql_value(cell, &col.data_type),
-                        })
-                        .collect();
-                emit(&cql_row);
-            });
-        },
-    ))
+    // Fail-loud carrier: any corrupt-cell decode (e.g. an out-of-range
+    // timestamp) captured while streaming rows surfaces after the walk instead
+    // of being silently dropped inside the `()`-returning visit callback.
+    let mut decode_err: Option<CqlError> = None;
+    let body = result::encode_rows_with_writer(&col_names, &col_types, keyspace, table, |emit| {
+        vtable.visit_rows(predicate, &mut |row| {
+            if decode_err.is_some() {
+                return;
+            }
+            let mut cql_row: Vec<Option<CqlValue>> = Vec::with_capacity(row.cells.len());
+            for (cell, (idx, col)) in row.cells.iter().zip(columns.iter().enumerate()) {
+                let decoded = match vtable.wire_type_for(idx) {
+                    Some(ferrosa_schema::WireType::ListText) => Ok(decode_list_text_cell(cell)),
+                    Some(ferrosa_schema::WireType::SetText) => {
+                        Ok(decode_list_text_cell(cell).map(|value| match value {
+                            CqlValue::List(items) => CqlValue::Set(items),
+                            other => other,
+                        }))
+                    }
+                    None => cell_to_cql_value(cell, &col.data_type),
+                };
+                match decoded {
+                    Ok(v) => cql_row.push(v),
+                    Err(e) => {
+                        decode_err = Some(e);
+                        return;
+                    }
+                }
+            }
+            emit(&cql_row);
+        });
+    });
+    if let Some(e) = decode_err {
+        return Err(e);
+    }
+    Ok(body)
 }
 
 /// Render a `ComparisonOp` as the operator string recorded in
@@ -15030,6 +15061,32 @@ mod tests {
         assert!(
             matches!(err, CqlError::Invalid(ref message) if message.contains("COMPACT is not supported for ks.t")),
             "expected clear COMPACT unsupported error, got {err:?}"
+        );
+    }
+
+    /// Bug C read robustness: decoding an already-corrupt on-disk timestamp
+    /// cell (millis outside the representable range) must fail loud with
+    /// context, not emit a value that crashes the client's date decoder.
+    #[test]
+    fn cell_to_cql_value_rejects_corrupt_timestamp() {
+        use ferrosa_common::{CellValue, DataType};
+        // The exact forensic corruption signature: decodes to days=-1917935064.
+        let corrupt_ms: i64 = -1917935064i64 * 86_400_000;
+        let cell = CellValue::live(corrupt_ms.to_be_bytes().to_vec(), 0);
+        let err = super::cell_to_cql_value(&cell, &DataType::Timestamp)
+            .expect_err("corrupt timestamp cell must fail loud");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("corrupt timestamp") && msg.contains("range"),
+            "error should name the corruption and range, got: {msg}"
+        );
+
+        // A well-formed on-disk timestamp still decodes.
+        let good_ms: i64 = 1_710_000_000_000;
+        let good = CellValue::live(good_ms.to_be_bytes().to_vec(), 0);
+        assert_eq!(
+            super::cell_to_cql_value(&good, &DataType::Timestamp).unwrap(),
+            Some(CqlValue::Timestamp(good_ms))
         );
     }
 

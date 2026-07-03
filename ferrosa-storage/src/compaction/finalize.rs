@@ -135,6 +135,7 @@ mod tests {
             min_timestamp: 30,
             max_timestamp: 40,
             partition_count: 5,
+            legacy_format: false,
         }
     }
 
