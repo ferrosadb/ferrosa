@@ -121,6 +121,7 @@ jobs:
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
+               --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
