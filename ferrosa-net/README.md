@@ -34,7 +34,9 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   `LegacyPayload` until peers negotiate the Cap'n Proto format.
 - **Message model** (`message`) — the `Message` enum with hand-rolled
   length-prefixed encode/decode for lifecycle, Raft, mutation/read, repair,
-  streaming, pair-mode, batchlog, index (incl. full-text scatter-gather), Accord
+  streaming, pair-mode, batchlog, index (incl. full-text scatter-gather and
+  the keyed `IndexReadInPartition{Request,Response}` `0x66`/`0x67` pair,
+  t_430c4188), Accord
   (incl. the additive multi-key `AccordPreAcceptV2` `0x7B` / `AccordApplyV2` `0x7C`
   codes — bincode is not self-describing, so multi-key transactions get new codes
   rather than extending the single-key payloads), and bootstrap message types

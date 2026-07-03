@@ -1579,7 +1579,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::IndexReadRequest
             | MsgType::IndexReadResponse
             | MsgType::FulltextSearchRequest
-            | MsgType::FulltextSearchResponse,
+            | MsgType::FulltextSearchResponse
+            | MsgType::IndexReadInPartitionRequest
+            | MsgType::IndexReadInPartitionResponse,
         ) => MessageFamily::Index,
         Ok(
             MsgType::AccordPreAccept

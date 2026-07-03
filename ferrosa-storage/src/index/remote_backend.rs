@@ -374,6 +374,22 @@ fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_j
 
 impl IndexBuildBackend for RemoteBackend {
     fn build(&self, job: &IndexBuildJob) -> Result<IndexBuildResult, String> {
+        // Clustering-column index jobs (t_430c4188) are not yet part of the
+        // remote builder protocol (`build_request_body` has no field for
+        // `clustering_source`, and a remote builder would silently build the
+        // WRONG index from `column_position`). Build locally instead — a
+        // designed, visible fallback, never a silent wrong build.
+        if let Some(src) = job.clustering_source {
+            tracing::warn!(
+                sstable_id = %job.sstable_id,
+                index_name = %job.index_name,
+                component = src.component,
+                "remote index builder does not support clustering-column indexes yet; \
+                 building locally"
+            );
+            return self.local_fallback.build(job);
+        }
+
         // Try each available endpoint. A partial (Filtered) index carries its
         // predicate in the request body (see `build_request_body`), so the
         // builder filters at build time — no local-only fallback needed.
@@ -541,6 +557,7 @@ mod tests {
             priority: super::super::scheduler::BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         }
     }
@@ -607,6 +624,7 @@ mod tests {
             priority: super::super::scheduler::BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: Some(predicate.clone()),
         };
 
@@ -636,6 +654,7 @@ mod tests {
             priority: super::super::scheduler::BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
         let body = build_request_body(&job, &resolver);

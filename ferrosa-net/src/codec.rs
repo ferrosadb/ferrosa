@@ -147,6 +147,10 @@ pub enum MsgType {
     // Full-text index scatter-gather (fts_match across every node's local FTI)
     FulltextSearchRequest = 0x64,
     FulltextSearchResponse = 0x65,
+    // Keyed secondary-index consult: postings restricted to one partition,
+    // routed to that partition's replicas only (t_430c4188)
+    IndexReadInPartitionRequest = 0x66,
+    IndexReadInPartitionResponse = 0x67,
     // Accord consensus
     AccordPreAccept = 0x70,
     AccordPreAcceptOK = 0x71,
@@ -272,6 +276,8 @@ impl TryFrom<u8> for MsgType {
             0x63 => Ok(Self::IndexReadResponse),
             0x64 => Ok(Self::FulltextSearchRequest),
             0x65 => Ok(Self::FulltextSearchResponse),
+            0x66 => Ok(Self::IndexReadInPartitionRequest),
+            0x67 => Ok(Self::IndexReadInPartitionResponse),
             0x70 => Ok(Self::AccordPreAccept),
             0x71 => Ok(Self::AccordPreAcceptOK),
             0x72 => Ok(Self::AccordAccept),

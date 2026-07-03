@@ -80,10 +80,28 @@ pub enum ScanPlan {
 ```
 
 - **Planning rules** (v1, rule-based):
-  1. All PK columns in WHERE → `PkLookup`
+  1. All PK columns in WHERE:
+     - exact full-primary-key point lookup (every clustering column `=`-restricted,
+       or no clustering columns) → `PkLookup`
+     - a residual non-PK `=` predicate matches a single-column index →
+       `PartitionIndexLookup` (t_430c4188): the index is consulted restricted to
+       the specified partition and only the matching rows are point-read —
+       O(matching rows), never O(partition rows). Routed to the partition's
+       replicas (keyed routing, never the global scatter-gather); no ALLOW
+       FILTERING required for this fully keyed shape. Empty consults re-verify
+       with a partition-scoped scan (async-backfill staleness masking, mirroring
+       the `SingleIndex` arm's fallback but bounded by one partition).
+     - otherwise → `PkLookup` (partition read + post-filter)
   1. Exactly 1 WHERE column matches a secondary index → `SingleIndex`
   1. 2+ WHERE columns each match a secondary index → `IndexIntersection`
   1. Otherwise → `FullScan` (requires ALLOW FILTERING)
+- **Clustering-column indexes** (t_430c4188): `CREATE INDEX` on a clustering
+  column wires a dedicated build path — the value is extracted from the row's
+  composite clustering-key bytes (write path, flush drain, compaction rebuild,
+  backfill, restart reload) because a clustering value is not a cell. Scalar
+  index kinds only (BTree/Hash/Composite/Phonetic). Before this path existed the
+  index was schema-only: never wired to storage, and reads on it silently
+  degraded to scans.
 - **Future**: Cost-based planner using cardinality estimates from sidecar headers and `IndexCapabilities`
 
 ### 4. EXPLAIN Statement
@@ -98,6 +116,10 @@ pub enum ScanPlan {
 - **Location**: New methods on `StorageEngine` in `ferrosa-storage/src/engine.rs`
 - **Key interfaces**:
   - `read_by_index(table_id, index_name, key) -> Result<Vec<(DecoratedKey, Vec<Row>)>>`
+  - `read_by_index_in_partition(table_id, index_name, key, partition_key)` —
+    keyed consult (t_430c4188): postings are filtered to the specified partition
+    per batch BEFORE retention (memory bounded by in-partition matches), then
+    only those rows are point-read
   - `read_by_index_range(table_id, index_name, start, end) -> Result<Vec<(DecoratedKey, Vec<Row>)>>`
 
 These methods:
