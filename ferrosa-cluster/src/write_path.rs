@@ -89,6 +89,20 @@ pub fn filter_resumed_fragment(
 /// Wrap a fragmented partition stream with the within-partition resume skip
 /// (see [`filter_resumed_fragment`]). No-op when the resume carries no
 /// clustering position.
+///
+/// FAIL LOUD (t_a0f922a3): the resume skip drops rows `<= resume_ck` as the
+/// already-delivered prefix. That is correct ONLY if the fragment stream is
+/// monotonically ascending in raw clustering. A legacy/corrupt or mis-sorted
+/// SSTable emits a wide partition as two concatenated ascending runs; the
+/// second run restarts BELOW `resume_ck`, so this filter would SILENTLY drop
+/// every one of its rows — the paged scan under-delivers ~half the partition
+/// with no error (the exact typed_edges symptom). The storage-side guard in
+/// `range_merger::emit_fragment` only fires on a full read that reaches the
+/// inversion; a paged scan terminates before reaching it, so the drop stays
+/// silent. We therefore detect the non-monotonic delivery HERE, where the drop
+/// happens, and surface it as a loud error (compact the table to fix the
+/// on-disk order) instead of returning a silent partial. Monotonic streams
+/// never trip this, so it is inert in steady state.
 pub(crate) fn resume_filtered_stream(
     stream: PartitionResultStream,
     resume: Option<&ScanResume>,
@@ -98,14 +112,46 @@ pub(crate) fn resume_filtered_stream(
         return stream;
     };
     let key = resume.key.key.as_bytes().to_vec();
-    Box::pin(stream.filter_map(move |item| {
-        let key = key.clone();
-        let clustering = clustering.clone();
-        async move {
-            match item {
-                Ok(p) => filter_resumed_fragment(p, &key, &clustering).map(Ok),
-                Err(e) => Some(Err(e)),
+    // Last raw clustering seen for the resume partition across fragments; used
+    // to detect a regression (non-monotonic delivery) before the resume filter
+    // silently drops the regressed run.
+    let mut last_clustering: Option<Vec<u8>> = None;
+    let checked = stream.map(move |item| {
+        let p = item?;
+        if p.key.key.as_bytes() == key {
+            for row in &p.rows {
+                if let Some(ref last) = last_clustering {
+                    if row.clustering.as_slice() < last.as_slice() {
+                        let hx = |b: &[u8]| {
+                            b.iter()
+                                .take(24)
+                                .map(|x| format!("{x:02x}"))
+                                .collect::<String>()
+                        };
+                        return Err(ClusterError::Storage(ferrosa_common::Error::InvalidData(
+                            format!(
+                                "resumed range scan received a non-monotonic fragment for the \
+                                 resume partition (prev={} > next={}). The SSTable stores this \
+                                 partition's rows out of clustering order (legacy or corrupt \
+                                 file); the resume filter would silently drop the regressed run \
+                                 and under-deliver the page. Compact this table to rewrite the \
+                                 SSTable in sorted order.",
+                                hx(last),
+                                hx(&row.clustering),
+                            ),
+                        )));
+                    }
+                }
+                last_clustering = Some(row.clustering.clone());
             }
+        }
+        Ok(filter_resumed_fragment(p, &key, &clustering))
+    });
+    Box::pin(checked.filter_map(|res| async move {
+        match res {
+            Ok(Some(p)) => Some(Ok(p)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }))
 }
@@ -1522,6 +1568,93 @@ mod tests {
         assert!(
             replicas.iter().all(|r| members.contains(r)),
             "every resolved replica must be a ring member"
+        );
+    }
+
+    // ---- resume-filter fail-loud on non-monotonic delivery (t_a0f922a3) ----
+
+    fn resume_row(clustering: &[u8]) -> Row {
+        Row {
+            clustering: clustering.to_vec(),
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }
+    }
+
+    fn resume_partition(key: &[u8], clusterings: &[&[u8]]) -> Partition {
+        Partition {
+            key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: clusterings.iter().map(|c| resume_row(c)).collect(),
+        }
+    }
+
+    /// A mis-sorted SSTable delivers a wide partition as two concatenated
+    /// ascending runs. On a resumed page the second run restarts BELOW the
+    /// resume clustering; the resume filter would silently drop it and
+    /// under-deliver the page. The stream MUST fail loud instead.
+    #[tokio::test]
+    async fn resume_filtered_stream_fails_loud_on_non_monotonic_resume_partition() {
+        let key = b"P";
+        // run 1: 0x10,0x20,0x30 (all > resume_ck 0x05, kept); then run 2 restarts
+        // at 0x01 (< resume_ck, would be silently dropped) — a regression.
+        let frag1 = resume_partition(key, &[&[0x10], &[0x20], &[0x30]]);
+        let frag2 = resume_partition(key, &[&[0x01], &[0x02]]);
+        let items: Vec<crate::error::Result<Partition>> = vec![Ok(frag1), Ok(frag2)];
+        let stream: PartitionResultStream = Box::pin(futures::stream::iter(items));
+        let resume = ScanResume {
+            key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
+            clustering: Some(vec![0x05]),
+        };
+        let mut out = resume_filtered_stream(stream, Some(&resume));
+        let mut saw_err = false;
+        while let Some(item) = out.next().await {
+            if let Err(e) = item {
+                assert!(
+                    format!("{e}").contains("non-monotonic"),
+                    "unexpected error: {e}"
+                );
+                saw_err = true;
+                break;
+            }
+        }
+        assert!(
+            saw_err,
+            "resume_filtered_stream MUST fail loud on a non-monotonic resume partition, \
+             not silently drop the regressed run"
+        );
+    }
+
+    /// The common case: a monotonic stream whose prefix (`<= resume_ck`) is the
+    /// already-delivered rows. The filter drops the prefix and delivers the
+    /// tail with NO error — the guard is inert in steady state.
+    #[tokio::test]
+    async fn resume_filtered_stream_passes_monotonic_prefix_drop() {
+        let key = b"P";
+        // ascending: 0x01,0x05 are the already-delivered prefix (<= 0x05, dropped);
+        // 0x06,0x07 are new (> 0x05, kept). Strictly monotonic across fragments.
+        let frag1 = resume_partition(key, &[&[0x01], &[0x05]]);
+        let frag2 = resume_partition(key, &[&[0x06], &[0x07]]);
+        let items: Vec<crate::error::Result<Partition>> = vec![Ok(frag1), Ok(frag2)];
+        let stream: PartitionResultStream = Box::pin(futures::stream::iter(items));
+        let resume = ScanResume {
+            key: DecoratedKey::new(PartitionKey::new(key.to_vec())),
+            clustering: Some(vec![0x05]),
+        };
+        let mut out = resume_filtered_stream(stream, Some(&resume));
+        let mut delivered: Vec<u8> = Vec::new();
+        while let Some(item) = out.next().await {
+            let p = item.expect("monotonic prefix drop must not error");
+            for r in &p.rows {
+                delivered.push(r.clustering[0]);
+            }
+        }
+        assert_eq!(
+            delivered,
+            vec![0x06, 0x07],
+            "only rows strictly greater than the resume clustering survive"
         );
     }
 }
