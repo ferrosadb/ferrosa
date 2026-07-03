@@ -2851,7 +2851,9 @@ impl StorageEngine {
     }
 
     /// Internal: create a `TableStore` for a table, loading existing SSTables
-    /// and sidecar files from disk. Idempotent: skips already-registered tables.
+    /// and sidecar files from disk. Idempotent: already-registered tables keep
+    /// their loaded store, but merge any missing index declarations supplied by
+    /// the caller.
     fn register_table_inner(
         &self,
         schema: TableSchema,
@@ -2862,6 +2864,7 @@ impl StorageEngine {
             let tables = self.tables.read();
             if tables.contains_key(&table_id) {
                 drop(tables);
+                self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
                 self.replay_deferred_mutations_for_table(&table_id);
                 return Ok(());
             }
@@ -2896,6 +2899,48 @@ impl StorageEngine {
         }
 
         self.replay_deferred_mutations_for_table(&table_id);
+
+        Ok(())
+    }
+
+    fn merge_index_declarations_for_registered_table(
+        &self,
+        table_id: &TableId,
+        indexed_columns: &[(String, usize)],
+    ) -> ferrosa_common::Result<()> {
+        if indexed_columns.is_empty() {
+            return Ok(());
+        }
+
+        let mut tables = self.tables.write();
+        let Some(state) = tables.get_mut(table_id) else {
+            return Ok(());
+        };
+
+        for (index_name, column_position) in indexed_columns {
+            match state
+                .store
+                .indexed_columns()
+                .iter()
+                .find(|(name, _)| name == index_name)
+                .map(|(_, pos)| *pos)
+            {
+                Some(existing_position) if existing_position == *column_position => {}
+                Some(existing_position) => {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "index {index_name} already registered on {table_id} at column {existing_position}, not {column_position}"
+                    )));
+                }
+                None => state.store.add_index(
+                    index_name.clone(),
+                    *column_position,
+                    ferrosa_index::IndexType::BTree,
+                ),
+            }
+
+            self.index_tracker
+                .register_index(table_id.keyspace(), table_id.table(), index_name);
+        }
 
         Ok(())
     }
