@@ -33,6 +33,7 @@ fn make_metadata(id: &str, size: u64) -> SSTableMetadata {
         min_timestamp: 0,
         max_timestamp: 1000,
         partition_count: 100,
+        legacy_format: false,
     }
 }
 
@@ -210,6 +211,7 @@ fn make_ucs_metadata(id: &str, size: u64, min_tok: i64, max_tok: i64) -> SSTable
         min_timestamp: 0,
         max_timestamp: 1000,
         partition_count: 100,
+        legacy_format: false,
     }
 }
 
