@@ -914,7 +914,13 @@ impl CompactionExecutor {
             observe_group_width(group.len());
 
             let merge_start = Instant::now();
-            let merged = merge::merge_partitions(group);
+            let mut merged = merge::merge_partitions(group);
+            // Compaction output MUST be monotonic. merge_partitions leaves a
+            // single-source partition in its on-disk order, which for a legacy
+            // SSTable can be non-monotonic (t_a0f922a3) — this rewrites it in
+            // clustering order. Cheap O(n) sorted-check for the common already
+            // -sorted case (all multi-source merges, all modern files).
+            merge::ensure_partition_rows_sorted(&mut merged);
             crate::metrics::observe_compaction_phase(
                 crate::metrics::CompactionPhase::MergePartition,
                 merge_start.elapsed(),
@@ -1286,6 +1292,94 @@ mod tests {
             partitions.push(partition);
         }
         partitions
+    }
+
+    /// Open an on-disk SSTable whose component files are `{dir}/{gen}-*.db`.
+    fn open_sstable_reader(
+        dir: &std::path::Path,
+        gen: &str,
+    ) -> ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt> {
+        let openf = |suffix: &str| {
+            ferrosa_sstable::io::FileReadAt::open(dir.join(format!("{gen}-{suffix}"))).unwrap()
+        };
+        ferrosa_sstable::reader::SSTableReader::open(ferrosa_sstable::reader::SSTableComponents {
+            data: openf("Data.db"),
+            partitions: openf("Partitions.db"),
+            rows: openf("Rows.db"),
+            filter: std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap(),
+            compression_info: std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok(),
+            statistics: std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap(),
+        })
+        .unwrap()
+    }
+
+    /// Finding 1 regression (t_a0f922a3): compacting a SINGLE legacy SSTable
+    /// whose rows are stored OUT of clustering order must produce MONOTONIC
+    /// output. `merge_partitions` passes a single source through unchanged, so
+    /// without `ensure_partition_rows_sorted` in the executor the rewrite would
+    /// keep the bad order while stamping byte-comparable bounds — permanently
+    /// non-monotonic and never re-selected.
+    #[test]
+    fn compaction_resorts_single_misordered_legacy_sstable() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let cks = |p: &ferrosa_sstable::types::Partition| -> Vec<i32> {
+            p.rows
+                .iter()
+                .map(|r| i32::from_be_bytes(r.clustering[..4].try_into().unwrap()))
+                .collect()
+        };
+        let row = |n: i32| Row {
+            clustering: n.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(format!("v{n}").into_bytes(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        // One partition, rows physically out of clustering order: 5,1,2,3,4.
+        let misordered = ferrosa_sstable::types::Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"P".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row(5), row(1), row(2), row(3), row(4)],
+        };
+
+        let dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut meta = write_sstable_to_dir(&dir, &[misordered], &schema);
+        meta.legacy_format = true;
+
+        // Precondition: the input SSTable really stores rows out of order.
+        let in_reader = open_sstable_reader(&dir, &meta.id);
+        let input = collect_reader_partitions(&in_reader);
+        assert_eq!(
+            cks(&input[0]),
+            vec![5, 1, 2, 3, 4],
+            "precondition: writer preserves the misordered rows on disk"
+        );
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![meta],
+            output_dir: output_dir.clone(),
+            schema: schema.clone(),
+            table_id: test_table_id(),
+        };
+        let out_meta = CompactionExecutor::execute_task(&task)
+            .expect("single-input legacy compaction must succeed")
+            .metadata;
+
+        let out_reader = open_sstable_reader(&output_dir, &out_meta.id);
+        let output = collect_reader_partitions(&out_reader);
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            cks(&output[0]),
+            vec![1, 2, 3, 4, 5],
+            "compaction MUST rewrite a single misordered legacy SSTable in monotonic order"
+        );
     }
 
     #[test]

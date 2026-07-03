@@ -209,31 +209,56 @@ impl CompactionStrategy for SizeTieredStrategy {
 /// under-delivers. Size-tiered/UCS bucketing groups by SIZE, so a lone legacy
 /// file sits in its own tier and is NEVER selected, leaving the mis-sorted data
 /// on disk indefinitely. This selects every legacy-format file for a rewrite
-/// regardless of tier: compacting through `merge::merge_partitions` re-sorts
-/// each partition and writes byte-comparable output, permanently fixing the
-/// on-disk order. One task carries all legacy inputs (>= 1; the executor
-/// rewrites a single input). Self-terminating: once rewritten, no legacy files
+/// regardless of tier: compaction runs `merge::ensure_partition_rows_sorted` on
+/// every output partition, so even a single-input rewrite re-sorts each
+/// partition and writes byte-comparable, monotonic output.
+///
+/// Chunked by the SAME bounds as the size-tiered strategy (`max_threshold`
+/// files, `max_compaction_bytes` bytes) so a repair never builds one unbounded
+/// mega-task, and each chunk is a SEPARATE task so an input-overlap skip in the
+/// executor drops only that chunk — never the whole repair set. A single legacy
+/// file larger than `max_compaction_bytes` still gets its own task (we never
+/// drop a legacy file). Self-terminating: once rewritten, no legacy files
 /// remain and no further task is produced.
 pub fn legacy_rewrite_tasks(
     sstables: &[SSTableMetadata],
     schema: &TableSchema,
     table_id: &TableId,
     output_dir: &Path,
+    max_threshold: usize,
+    max_compaction_bytes: u64,
 ) -> Vec<CompactionTask> {
-    let inputs: Vec<SSTableMetadata> = sstables
-        .iter()
-        .filter(|s| s.legacy_format)
-        .cloned()
-        .collect();
-    if inputs.is_empty() {
+    let legacy: Vec<&SSTableMetadata> = sstables.iter().filter(|s| s.legacy_format).collect();
+    if legacy.is_empty() {
         return Vec::new();
     }
-    vec![CompactionTask {
+    let file_cap = max_threshold.max(1);
+    let mut tasks = Vec::new();
+    let mut inputs: Vec<SSTableMetadata> = Vec::new();
+    let mut chunk_bytes: u64 = 0;
+    let mk = |inputs: Vec<SSTableMetadata>| CompactionTask {
         inputs,
         output_dir: output_dir.join(table_id.to_string()),
         schema: schema.clone(),
         table_id: table_id.clone(),
-    }]
+    };
+    for sst in legacy {
+        // Close the current chunk before it would exceed either bound — but
+        // only when it already holds a file, so a single oversized legacy file
+        // still gets its own (1-input) rewrite rather than being dropped.
+        let would_exceed = inputs.len() >= file_cap
+            || chunk_bytes.saturating_add(sst.size_bytes) > max_compaction_bytes;
+        if !inputs.is_empty() && would_exceed {
+            tasks.push(mk(std::mem::take(&mut inputs)));
+            chunk_bytes = 0;
+        }
+        chunk_bytes = chunk_bytes.saturating_add(sst.size_bytes);
+        inputs.push((*sst).clone());
+    }
+    if !inputs.is_empty() {
+        tasks.push(mk(inputs));
+    }
+    tasks
 }
 
 /// Computes the median size of a bucket of SSTables.
@@ -331,6 +356,8 @@ mod tests {
             &test_table_schema(),
             &test_table_id(),
             &PathBuf::from("/tmp/compaction"),
+            32,
+            512 * 1024 * 1024,
         );
         assert_eq!(rewrite.len(), 1, "one rewrite task for the legacy file");
         assert_eq!(rewrite[0].inputs.len(), 1);
@@ -345,12 +372,14 @@ mod tests {
             &test_table_schema(),
             &test_table_id(),
             &PathBuf::from("/tmp/compaction"),
+            32,
+            512 * 1024 * 1024,
         );
         assert!(rewrite.is_empty(), "no legacy files → no rewrite task");
     }
 
     #[test]
-    fn multiple_legacy_files_grouped_into_one_rewrite_task() {
+    fn multiple_legacy_files_within_bounds_share_one_task() {
         let sstables = vec![
             make_legacy("l1", 800_000),
             make_metadata("healthy", 1000),
@@ -361,6 +390,8 @@ mod tests {
             &test_table_schema(),
             &test_table_id(),
             &PathBuf::from("/tmp/compaction"),
+            32,
+            512 * 1024 * 1024,
         );
         assert_eq!(rewrite.len(), 1);
         let mut ids: Vec<&str> = rewrite[0].inputs.iter().map(|i| i.id.as_str()).collect();
@@ -370,6 +401,61 @@ mod tests {
             vec!["l1", "l2"],
             "only legacy inputs, healthy excluded"
         );
+    }
+
+    /// Finding 2: legacy rewrites must respect max_threshold / max_compaction_bytes
+    /// and split into SEPARATE tasks, so a repair is never one unbounded mega-task
+    /// and an executor input-overlap skip drops only one chunk.
+    #[test]
+    fn legacy_rewrites_chunk_by_count_and_size_bounds() {
+        // Count bound: max_threshold=2 over 5 legacy files → 3 tasks (2,2,1).
+        let five: Vec<SSTableMetadata> = (0..5)
+            .map(|i| make_legacy(&format!("l{i}"), 1000))
+            .collect();
+        let by_count = legacy_rewrite_tasks(
+            &five,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+            2,
+            512 * 1024 * 1024,
+        );
+        assert_eq!(by_count.len(), 3, "5 files / cap 2 → 3 tasks");
+        assert_eq!(
+            by_count.iter().map(|t| t.inputs.len()).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+
+        // Byte bound: each file 400 bytes, cap 1000 → 2 files/chunk.
+        let four: Vec<SSTableMetadata> =
+            (0..4).map(|i| make_legacy(&format!("b{i}"), 400)).collect();
+        let by_bytes = legacy_rewrite_tasks(
+            &four,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+            32,
+            1000,
+        );
+        assert_eq!(by_bytes.len(), 2, "4×400B / 1000B cap → 2 tasks of 2");
+        assert!(by_bytes.iter().all(|t| t.inputs.len() == 2));
+    }
+
+    /// A single legacy file larger than max_compaction_bytes is never dropped —
+    /// it still gets its own 1-input rewrite task.
+    #[test]
+    fn oversized_lone_legacy_file_still_gets_its_own_task() {
+        let sstables = vec![make_legacy("huge", 2 * 1024 * 1024 * 1024)];
+        let rewrite = legacy_rewrite_tasks(
+            &sstables,
+            &test_table_schema(),
+            &test_table_id(),
+            &PathBuf::from("/tmp/compaction"),
+            32,
+            512 * 1024 * 1024,
+        );
+        assert_eq!(rewrite.len(), 1);
+        assert_eq!(rewrite[0].inputs[0].id, "huge");
     }
 
     #[test]
