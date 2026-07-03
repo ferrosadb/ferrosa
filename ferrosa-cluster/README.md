@@ -108,6 +108,21 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   partitions — never accumulating `O(result)` (the `t_ee98faa0` / `t_3fc6be3c`
   OOM). The legacy `Vec`-accumulating `consume_range_stream` is a thin wrapper
   (`VecPartitionSink`) kept for point-bounded callers / the e2e tests.
+  **Stream lifecycle (t_dc729b1d / t_3fc6be3c):** `StreamFrameRouter` ties chunk
+  seq-state to route liveness — a frame with no seq-state AND no registered
+  route is a terminal straggler (request_ids are monotonic, never reused, and
+  the route is always registered before the request fires) and drops silently
+  instead of fabricating fresh `expected=0` state (the phantom
+  `expected_seq=0 observed_seq=5` gap-close per abandoned page). A genuine gap
+  or reorder on a LIVE route still closes the route loudly, exactly once
+  (`route_closures()` counter — non-zero in steady state means real chunk
+  loss). When a consumer abandons a coordinated stream mid-flight (every paged
+  read does, on every page but the last), the per-replica forwarder task fires
+  `RangeReadStreamCancel` (info-logged) so the remote producer stops between
+  batches instead of streaming the remaining table onto `Lane::Bulk` for
+  nobody; the producer-side handler is registered for the Cancel MsgType.
+  Harness: `tests/range_scan_multi_replica_paging.rs` (real 3-node loopback,
+  RF=3/CL=ALL, counter-asserted).
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
