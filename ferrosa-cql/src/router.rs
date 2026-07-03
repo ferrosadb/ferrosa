@@ -483,6 +483,95 @@ fn safe_partition_key_filter_row_limit(
         .then_some(limit)
 }
 
+/// Resolve the keyed secondary-index consult for a full-partition-key SELECT
+/// (t_430c4188).
+///
+/// Returns `Some((index_name, index_key))` when the planner classifies the
+/// statement as [`ScanPlan::PartitionIndexLookup`] — full partition-key
+/// equality plus a residual `=` predicate on an indexed column, but not an
+/// exact full-primary-key point lookup — AND the indexed predicate's value
+/// term converts to an index key.
+///
+/// Returns `None` otherwise, leaving the caller on the partition read +
+/// post-filter path (byte-identical semantics to the pre-consult router). A
+/// value term that cannot be an index key (e.g. a UDF call, evaluated by the
+/// post-filter instead) is logged and falls back the same way.
+fn keyed_index_consult(
+    state: &SharedState,
+    snap: &ferrosa_schema::SchemaSnapshot,
+    ks: &str,
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> Option<(String, ferrosa_index::IndexKey)> {
+    // Same index-usability gating as the planner dispatch in the no-PK branch:
+    // a partial (Filtered) index is offered only when the query implies its
+    // predicate, so the consult can never serve an incomplete result from it.
+    let usable_indexes: Vec<&IndexMetadata> = snap
+        .indexes
+        .iter()
+        .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+        .map(|(_, meta)| meta)
+        .filter(|meta| {
+            filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+        })
+        .collect();
+    if usable_indexes.is_empty() {
+        return None;
+    }
+    let planner_indexes: Vec<(String, Vec<String>)> = usable_indexes
+        .iter()
+        .map(|meta| (meta.name.clone(), meta.target_columns.clone()))
+        .collect();
+    let filtered_covered_columns = filtered_index_covered_columns(&usable_indexes, table_meta);
+    let ck_columns: Vec<String> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let scan_plan = planner::plan_with_covered(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        &ck_columns,
+        &planner_indexes,
+        &filtered_covered_columns,
+    );
+    let ScanPlan::PartitionIndexLookup {
+        index_name,
+        index_column,
+    } = scan_plan
+    else {
+        return None;
+    };
+
+    let index_wc = s
+        .where_clauses
+        .iter()
+        .find(|wc| !wc.token_fn && wc.column == index_column && wc.op == ComparisonOp::Eq)?;
+    match term_to_index_key(
+        &index_wc.value,
+        &index_column,
+        table_meta,
+        ks,
+        &state.schema,
+    ) {
+        Ok(index_key) => Some((index_name, index_key)),
+        Err(e) => {
+            // Not an indexable literal (e.g. UDF call) — the partition-scan
+            // post-filter evaluates it instead. Visible, designed fallback.
+            tracing::debug!(
+                keyspace = ks,
+                table = %s.table,
+                index = %index_name,
+                column = %index_column,
+                error = %e,
+                "keyed index consult skipped: predicate value is not an index key"
+            );
+            None
+        }
+    }
+}
+
 fn row_matches_select_predicates(
     row: &[Option<CqlValue>],
     s: &SelectStatement,
@@ -3978,6 +4067,18 @@ thread_local! {
     static FTS_MATCH_PARTITION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only observability: rows MATERIALIZED by the full-partition-key
+    /// SELECT branch on this thread, before the residual-predicate post-filter.
+    /// Lets tests assert STRUCTURALLY that `WHERE <full pk> AND <indexed> = ?`
+    /// visits O(matching rows) via the keyed index consult (t_430c4188)
+    /// instead of materializing the whole partition. Deterministic, not
+    /// wall-clock. `#[tokio::test]` uses a current-thread runtime, so the
+    /// increments land on the test thread.
+    static PK_LOOKUP_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 async fn route_select_user_table(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -4374,42 +4475,105 @@ async fn route_select_user_table(
             extract_clustering_key_values(&s.where_clauses, table_meta, ks, &state.schema)?
                 .map(|values| bridge::build_clustering_key(&values))
         };
-        let partition = if let Some(clustering) = exact_clustering {
-            state
-                .write_path
-                .load()
-                .pk_read_clustering_row(
-                    &table_id,
-                    &decorated_key,
-                    &clustering,
-                    ctx.consistency,
-                    &read_strategy,
-                )
-                .await?
-        } else {
-            state
-                .write_path
-                .load()
-                .pk_read_limited_rows(
-                    &table_id,
-                    &decorated_key,
-                    ctx.consistency,
-                    &read_strategy,
-                    row_limit,
-                )
-                .await?
-        };
-        let mut pk_rows = match partition {
-            Some(partition) => bridge::partition_to_rows_with_storage_mapping(
-                &partition,
+        let partitions: Vec<ferrosa_sstable::types::Partition> =
+            if let Some(clustering) = exact_clustering {
+                state
+                    .write_path
+                    .load()
+                    .pk_read_clustering_row(
+                        &table_id,
+                        &decorated_key,
+                        &clustering,
+                        ctx.consistency,
+                        &read_strategy,
+                    )
+                    .await?
+                    .into_iter()
+                    .collect()
+            } else if let Some((index_name, index_key)) =
+                keyed_index_consult(state, &snap, ks, s, table_meta)
+            {
+                // Keyed secondary-index consult (t_430c4188): `WHERE <full
+                // partition key> AND <indexed_col> = ?`. Consult the index
+                // restricted to the specified partition and point-read only the
+                // matching rows — O(matching rows), never O(partition rows).
+                // Routing is keyed to the partition's replicas (never the global
+                // index scatter-gather), and no ALLOW FILTERING is required: the
+                // shape is fully keyed.
+                state
+                    .index_usage_tracker
+                    .record(ks, &s.table, &index_name, "PartitionIndexLookup");
+                let consulted = state
+                    .write_path
+                    .load()
+                    .index_read_in_partition(
+                        &table_id,
+                        &decorated_key,
+                        &index_name,
+                        &index_key,
+                        &read_strategy,
+                    )
+                    .await?;
+                if consulted.is_empty() {
+                    // DESIGNED fallback, mirroring the staleness masking of the
+                    // global `SingleIndex` arm (its empty-result fallback rescans
+                    // the table): a secondary index created over pre-existing data
+                    // is backfilled asynchronously, so an empty consult is not yet
+                    // proof of an empty result. Re-verify with a partition-scoped
+                    // read + post-filter — bounded by ONE partition, never the
+                    // whole table — so the keyed path's consistency is never worse
+                    // than the global index path it bypasses.
+                    tracing::debug!(
+                        keyspace = ks,
+                        table = %s.table,
+                        index = %index_name,
+                        "keyed index consult returned no rows; \
+                         re-verifying with a partition-scoped scan"
+                    );
+                    state
+                        .write_path
+                        .load()
+                        .pk_read_limited_rows(
+                            &table_id,
+                            &decorated_key,
+                            ctx.consistency,
+                            &read_strategy,
+                            row_limit,
+                        )
+                        .await?
+                        .into_iter()
+                        .collect()
+                } else {
+                    consulted
+                }
+            } else {
+                state
+                    .write_path
+                    .load()
+                    .pk_read_limited_rows(
+                        &table_id,
+                        &decorated_key,
+                        ctx.consistency,
+                        &read_strategy,
+                        row_limit,
+                    )
+                    .await?
+                    .into_iter()
+                    .collect()
+            };
+        let mut pk_rows = Vec::new();
+        for partition in &partitions {
+            pk_rows.extend(bridge::partition_to_rows_with_storage_mapping(
+                partition,
                 &all_col_names,
                 &all_col_types,
                 &pk_indices,
                 &ck_indices,
                 &storage_to_table,
-            ),
-            None => vec![],
-        };
+            ));
+        }
+        #[cfg(test)]
+        PK_LOOKUP_ROWS_VISITED.with(|c| c.set(c.get() + pk_rows.len()));
         // Apply clustering key and other non-PK WHERE predicates.
         filter_rows_by_select_predicates(
             &mut pk_rows,
@@ -4470,9 +4634,15 @@ async fn route_select_user_table(
         // itself, so a WHERE predicate on them must not require ALLOW FILTERING.
         let filtered_covered_columns = filtered_index_covered_columns(&usable_indexes, table_meta);
 
+        let ck_columns: Vec<String> = table_meta
+            .clustering_key
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         let scan_plan = planner::plan_with_covered(
             &s.where_clauses,
             &table_meta.partition_key,
+            &ck_columns,
             &planner_indexes,
             &filtered_covered_columns,
         );
@@ -4575,11 +4745,15 @@ async fn route_select_user_table(
                         "internal: full-text plan reached the scalar scan dispatch".into(),
                     ));
                 }
-                ScanPlan::PartitionKeyLookup => {
+                ScanPlan::PartitionKeyLookup | ScanPlan::PartitionIndexLookup { .. } => {
                     // This can happen when extract_pk_values fails (e.g., bind
                     // values that can't be coerced to the PK column type) but
                     // the planner still sees Eq predicates on all PK columns.
-                    // Fall through to a full scan rather than panicking.
+                    // (`PartitionIndexLookup` is normally served by the keyed
+                    // index consult inside the PK-present branch above; it only
+                    // reaches this dispatch under the same failed-extraction
+                    // condition.) Fall through to a full scan rather than
+                    // panicking.
                     let partitions = state
                         .write_path
                         .load()
@@ -6058,9 +6232,15 @@ fn route_explain(
     } else if let Some(fts_plan) = fulltext_explain_plan(&snap, ks, &s) {
         fts_plan
     } else {
+        let ck_columns: Vec<String> = table_meta
+            .clustering_key
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         planner::plan(
             &s.where_clauses,
             &table_meta.partition_key,
+            &ck_columns,
             &planner_indexes,
         )
     };
@@ -8951,6 +9131,69 @@ async fn route_create_index(
                     table = %format!("{ks}.{}", s.table),
                     "router: CREATE INDEX failed to wire index to storage engine"
                 );
+            }
+        } else {
+            // Not a regular/static column. A CLUSTERING column index is wired
+            // through its own path (t_430c4188): the value lives in the
+            // clustering-key bytes, not in a cell, so `storage_column_index`
+            // (correctly) has no ordinal for it. Before this path existed the
+            // index was persisted in schema but NEVER wired to storage — the
+            // planner then offered a permanently-empty index whose reads
+            // degraded to silent full scans.
+            let clustering_component = snap
+                .tables
+                .get(&(ks.to_string(), s.table.clone()))
+                .and_then(|tbl| {
+                    tbl.clustering_key
+                        .iter()
+                        .position(|(name, _)| name == target_col)
+                });
+            match clustering_component {
+                Some(component)
+                    if matches!(
+                        index_type,
+                        IndexType::BTree
+                            | IndexType::Hash
+                            | IndexType::Composite
+                            | IndexType::Phonetic
+                    ) =>
+                {
+                    if let Err(e) = state.engine.add_clustering_index(
+                        &table_id,
+                        &index_name,
+                        component,
+                        index_type,
+                    ) {
+                        tracing::warn!(
+                            %e,
+                            index_name,
+                            table = %format!("{ks}.{}", s.table),
+                            "router: CREATE INDEX failed to wire clustering-column \
+                             index to storage engine"
+                        );
+                    }
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        index_name,
+                        target_col,
+                        ?index_type,
+                        table = %format!("{ks}.{}", s.table),
+                        "router: CREATE INDEX on a clustering column supports scalar \
+                         index kinds only — index registered in schema but NOT wired \
+                         to storage (reads on it will scan)"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        index_name,
+                        target_col,
+                        table = %format!("{ks}.{}", s.table),
+                        "router: CREATE INDEX target is a partition-key or unknown \
+                         column — index registered in schema but NOT wired to storage \
+                         (reads on it will scan)"
+                    );
+                }
             }
         }
     }
@@ -20145,6 +20388,7 @@ mod tests {
     // | IndexType | EXPLAIN plan variant | proving test |
     // |-----------|----------------------|--------------|
     // | BTree     | SingleIndex          | `btree_index_usage_observable_end_to_end` |
+    // | BTree (full-PK keyed, t_430c4188) | PartitionIndexLookup | `typed_edges_reverse_lookup_visits_matching_rows_not_partition` |
     // | Hash      | SingleIndex          | `hash_index_usage_observable_end_to_end` |
     // | Composite | SingleIndex          | `composite_index_usage_observable_end_to_end` |
     // | Phonetic  | SingleIndex          | `phonetic_index_usage_observable_end_to_end` |
@@ -20233,6 +20477,277 @@ mod tests {
         assert_explain_plan(&state, &ctx, q, "SingleIndex").await;
         let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
         assert_eq!(count, 1, "btree index lookup must return exactly 1 row");
+    }
+
+    // ── PartitionIndexLookup: full PK equality + indexed residual (t_430c4188) ──
+    //
+    // The live consumer shape: `SELECT ... FROM agent_memory.typed_edges WHERE
+    // tenant_id=? AND session_id=? AND dst_id=?` with PK ((tenant_id,
+    // session_id), src_id, edge_type, dst_id) and a secondary index on dst_id.
+    // Before the fix this materialized the ENTIRE partition and post-filtered
+    // dst_id (O(partition rows), >300s on large live partitions); the index
+    // was never consulted because the planner short-circuits on full-PK
+    // equality.
+
+    async fn setup_typed_edges(
+        n_filler: usize,
+    ) -> (SharedState, TempDir, AuthContext, Option<String>) {
+        let (state, dir) = setup();
+        let auth = dev_auth();
+        let ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE am WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE am.typed_edges (tenant_id text, session_id text, src_id text, \
+             edge_type text, dst_id text, weight int, \
+             PRIMARY KEY ((tenant_id, session_id), src_id, edge_type, dst_id))",
+            "CREATE INDEX idx_typed_edges_dst ON am.typed_edges (dst_id)",
+        ] {
+            run_ddl(&state, &ctx, cql).await;
+        }
+        // 3 matching edges spread across the clustering range, drowned in
+        // n_filler non-matching edges in the SAME partition.
+        for (src, et) in [
+            ("src-00000", "calls"),
+            ("src-49999", "uses"),
+            ("zzz", "refs"),
+        ] {
+            run_ddl(
+                &state,
+                &ctx,
+                &format!(
+                    "INSERT INTO am.typed_edges (tenant_id, session_id, src_id, edge_type, \
+                     dst_id, weight) VALUES ('t1', 'global', '{src}', '{et}', 'target-entity', 1)"
+                ),
+            )
+            .await;
+        }
+        for i in 0..n_filler {
+            run_ddl(
+                &state,
+                &ctx,
+                &format!(
+                    "INSERT INTO am.typed_edges (tenant_id, session_id, src_id, edge_type, \
+                     dst_id, weight) VALUES ('t1', 'global', 'src-{i:05}', 'calls', 'other-{i:05}', 1)"
+                ),
+            )
+            .await;
+        }
+        (state, dir, auth, ks)
+    }
+
+    /// RED 1 (plan): the full-PK + indexed-residual shape must EXPLAIN as a
+    /// keyed index consult, not a partition scan (and never FullScan).
+    #[tokio::test]
+    async fn full_pk_plus_indexed_residual_explains_partition_index_lookup() {
+        let (state, _dir, auth, ks) = setup_typed_edges(4).await;
+        let ctx = test_ctx(&auth, &ks);
+        assert_explain_plan(
+            &state,
+            &ctx,
+            "SELECT src_id, edge_type FROM am.typed_edges \
+             WHERE tenant_id = 't1' AND session_id = 'global' AND dst_id = 'target-entity'",
+            "PartitionIndexLookup(idx_typed_edges_dst on dst_id)",
+        )
+        .await;
+    }
+
+    /// RED 2 (bounded work — the load-bearing one): with a large partition and
+    /// 3 rows matching the indexed value, the query must MATERIALIZE ~3 rows,
+    /// independent of partition size. Fail-before: visits == partition size
+    /// (verified at 50k filler rows: the pre-fix run scanned the whole
+    /// partition; the assertion bound stays partition-size-independent at the
+    /// CI-friendly filler count used here).
+    ///
+    /// The bound is structural (rows materialized by the PK branch before the
+    /// post-filter, via `PK_LOOKUP_ROWS_VISITED`), not wall-clock.
+    #[tokio::test]
+    async fn typed_edges_reverse_lookup_visits_matching_rows_not_partition() {
+        let n_filler = 4_000;
+        let (state, _dir, auth, ks) = setup_typed_edges(n_filler).await;
+        let ctx = test_ctx(&auth, &ks);
+
+        PK_LOOKUP_ROWS_VISITED.with(|c| c.set(0));
+        let q = "SELECT src_id, edge_type FROM am.typed_edges \
+                 WHERE tenant_id = 't1' AND session_id = 'global' AND dst_id = 'target-entity'";
+        let count = assert_index_hit_and_count(&state, &ctx, q, 1).await;
+        assert_eq!(count, 3, "reverse lookup must return exactly the 3 edges");
+
+        let visited = PK_LOOKUP_ROWS_VISITED.with(|c| c.get());
+        assert!(
+            visited <= 8,
+            "keyed index consult must visit O(matching rows), got {visited} \
+             (partition holds {} rows — a visit count near that means the \
+             partition was scanned)",
+            n_filler + 3
+        );
+
+        // The live consumer (ferrosa-memory forget/blast-radius) sends this
+        // exact shape WITH `ALLOW FILTERING` — the keyed consult must serve
+        // that form too, not just the bare query.
+        PK_LOOKUP_ROWS_VISITED.with(|c| c.set(0));
+        let q_af = format!("{q} ALLOW FILTERING");
+        let count = assert_index_hit_and_count(&state, &ctx, &q_af, 1).await;
+        assert_eq!(count, 3, "ALLOW FILTERING form must return the same edges");
+        let visited_af = PK_LOOKUP_ROWS_VISITED.with(|c| c.get());
+        assert!(
+            visited_af <= 8,
+            "ALLOW FILTERING form must also take the keyed consult, got {visited_af}"
+        );
+    }
+
+    /// The exact consumer shape WITHOUT `ALLOW FILTERING` returns the right
+    /// edges (the plan is fully keyed, so no filtering opt-in is needed).
+    #[tokio::test]
+    async fn typed_edges_reverse_lookup_without_allow_filtering_returns_edges() {
+        let (state, _dir, auth, ks) = setup_typed_edges(64).await;
+        let ctx = test_ctx(&auth, &ks);
+        let stmt = crate::parser::parse(
+            "SELECT src_id, edge_type, dst_id FROM am.typed_edges \
+             WHERE tenant_id = 't1' AND session_id = 'global' AND dst_id = 'target-entity'",
+        )
+        .unwrap();
+        let select = match stmt {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+        let mut got: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let s = |v: &Option<CqlValue>| match v {
+                    Some(CqlValue::Text(t)) => t.clone(),
+                    other => panic!("expected text, got {other:?}"),
+                };
+                (s(&r[0]), s(&r[1]))
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("src-00000".to_string(), "calls".to_string()),
+                ("src-49999".to_string(), "uses".to_string()),
+                ("zzz".to_string(), "refs".to_string()),
+            ],
+            "keyed index consult must return exactly the matching edges"
+        );
+        // Every returned dst_id is the queried one.
+        for r in &res.rows {
+            assert_eq!(
+                r[2],
+                Some(CqlValue::Text("target-entity".to_string())),
+                "returned row must match the indexed predicate"
+            );
+        }
+    }
+
+    /// Differential: on randomized data (multiple matches per clustering
+    /// prefix, matches spanning the clustering range, rows where the indexed
+    /// value is absent, and values present only in OTHER partitions), the
+    /// keyed index consult must return byte-identical rows to the
+    /// ALLOW-FILTERING partition scan on an identical unindexed table.
+    #[tokio::test]
+    async fn partition_index_lookup_differential_vs_filtering_scan() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &ks);
+        for cql in [
+            "CREATE KEYSPACE diffks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            // Indexed table: dst is a REGULAR column so absent values are
+            // representable (a clustering column can never be absent).
+            "CREATE TABLE diffks.idx_t (pk text, ck int, dst text, w int, \
+             PRIMARY KEY (pk, ck))",
+            "CREATE INDEX diff_dst_idx ON diffks.idx_t (dst)",
+            // Scan table: identical shape, NO index → ALLOW FILTERING scan is
+            // the ground truth.
+            "CREATE TABLE diffks.scan_t (pk text, ck int, dst text, w int, \
+             PRIMARY KEY (pk, ck))",
+        ] {
+            run_ddl(&state, &ctx, cql).await;
+        }
+
+        // Deterministic xorshift so failures are reproducible.
+        let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+        let values = ["alpha", "beta", "gamma", "only-elsewhere"];
+        for pk in ["p1", "p2"] {
+            for ck in 0..200 {
+                let roll = next() % 10;
+                // ~20% of rows have NO dst value at all.
+                let dst = match roll {
+                    0 | 1 => None,
+                    2..=4 => Some(values[(next() % 3) as usize]),
+                    // "only-elsewhere" appears only in partition p2, so a p1
+                    // query for it exercises the zero-match path.
+                    _ if pk == "p2" && roll == 9 => Some("only-elsewhere"),
+                    _ => Some(values[(next() % 3) as usize]),
+                };
+                for table in ["idx_t", "scan_t"] {
+                    let cql = match dst {
+                        Some(d) => format!(
+                            "INSERT INTO diffks.{table} (pk, ck, dst, w) \
+                             VALUES ('{pk}', {ck}, '{d}', {ck})"
+                        ),
+                        None => format!(
+                            "INSERT INTO diffks.{table} (pk, ck, w) \
+                             VALUES ('{pk}', {ck}, {ck})"
+                        ),
+                    };
+                    run_ddl(&state, &ctx, &cql).await;
+                }
+            }
+        }
+
+        async fn fetch_sorted(
+            state: &SharedState,
+            ctx: &RequestContext<'_>,
+            cql: &str,
+        ) -> Vec<Vec<Option<CqlValue>>> {
+            let stmt = crate::parser::parse(cql).unwrap();
+            let select = match stmt {
+                Statement::Select(s) => s,
+                other => panic!("expected select, got {other:?}"),
+            };
+            let mut rows = route_select_raw(state, ctx, &select).await.unwrap().rows;
+            rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            rows
+        }
+
+        for pk in ["p1", "p2"] {
+            for v in values {
+                let keyed = fetch_sorted(
+                    &state,
+                    &ctx,
+                    &format!(
+                        "SELECT pk, ck, dst, w FROM diffks.idx_t \
+                         WHERE pk = '{pk}' AND dst = '{v}'"
+                    ),
+                )
+                .await;
+                let scanned = fetch_sorted(
+                    &state,
+                    &ctx,
+                    &format!(
+                        "SELECT pk, ck, dst, w FROM diffks.scan_t \
+                         WHERE pk = '{pk}' AND dst = '{v}' ALLOW FILTERING"
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    keyed, scanned,
+                    "keyed index consult must equal the filtering scan for \
+                     pk={pk} dst={v}"
+                );
+            }
+        }
     }
 
     /// Hash index: `WHERE col = ?` (POINT_LOOKUP) plans `SingleIndex`, returns

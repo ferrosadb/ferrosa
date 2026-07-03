@@ -20,6 +20,21 @@ pub enum ScanPlan {
         index_column: String,
     },
 
+    /// All partition key columns have `=` predicates AND a residual (non-PK)
+    /// `=` predicate matches a single-column secondary index, but the WHERE
+    /// clause is not an exact full-primary-key point lookup.
+    ///
+    /// Served as a KEYED index consult: the secondary index is probed for the
+    /// value and its postings are restricted to the specified partition, then
+    /// only the matching rows are point-read. Work is O(matching rows), never
+    /// O(partition rows), and routing stays keyed to the partition's replicas
+    /// (no global scatter-gather, no ALLOW FILTERING required for the indexed
+    /// predicate).
+    PartitionIndexLookup {
+        index_name: String,
+        index_column: String,
+    },
+
     /// One WHERE column matches a secondary index, but other WHERE columns
     /// are not indexed. Use read_by_index() + post-filter remaining predicates.
     IndexScanWithFilter {
@@ -77,6 +92,10 @@ impl fmt::Display for ScanPlan {
                 index_name,
                 index_column,
             } => write!(f, "SingleIndex({index_name} on {index_column})"),
+            ScanPlan::PartitionIndexLookup {
+                index_name,
+                index_column,
+            } => write!(f, "PartitionIndexLookup({index_name} on {index_column})"),
             ScanPlan::IndexScanWithFilter {
                 index_name,
                 index_column,
@@ -116,10 +135,16 @@ impl fmt::Display for ScanPlan {
 /// # Parameters
 /// - `where_clauses`: predicates from the WHERE clause
 /// - `pk_columns`: ordered list of partition key column names
+/// - `ck_columns`: ordered list of clustering key column names
 /// - `indexes`: available secondary indexes as `(index_name, indexed_columns)` pairs
 ///
 /// # Decision order
-/// 1. All PK columns have `Eq` predicates → `PartitionKeyLookup`
+/// 1. All PK columns have `Eq` predicates:
+///    a. exact full-primary-key point lookup (no clustering columns, or all
+///    of them `Eq`-restricted) → `PartitionKeyLookup`
+///    b. a residual non-PK `Eq` predicate matches a single-column index →
+///    `PartitionIndexLookup` (keyed index consult, O(matching rows))
+///    c. otherwise → `PartitionKeyLookup` (partition read + post-filter)
 /// 2. No WHERE clauses → `FullScan`
 /// 3. Collect all WHERE columns with `Eq` that match a single-column index:
 ///    - 0 matches → `FullScan`
@@ -130,9 +155,10 @@ impl fmt::Display for ScanPlan {
 pub fn plan(
     where_clauses: &[WhereClause],
     pk_columns: &[String],
+    ck_columns: &[String],
     indexes: &[(String, Vec<String>)],
 ) -> ScanPlan {
-    plan_with_covered(where_clauses, pk_columns, indexes, &[])
+    plan_with_covered(where_clauses, pk_columns, ck_columns, indexes, &[])
 }
 
 /// Like [`plan`], but treats `extra_covered` columns as already satisfied by an
@@ -148,6 +174,7 @@ pub fn plan(
 pub fn plan_with_covered(
     where_clauses: &[WhereClause],
     pk_columns: &[String],
+    ck_columns: &[String],
     indexes: &[(String, Vec<String>)],
     extra_covered: &[String],
 ) -> ScanPlan {
@@ -156,6 +183,9 @@ pub fn plan_with_covered(
     let non_token: Vec<&WhereClause> = where_clauses.iter().filter(|wc| !wc.token_fn).collect();
 
     if pk_columns_satisfied(&non_token, pk_columns) {
+        if let Some(plan) = partition_index_lookup(&non_token, pk_columns, ck_columns, indexes) {
+            return plan;
+        }
         return ScanPlan::PartitionKeyLookup;
     }
 
@@ -210,6 +240,54 @@ pub fn plan_with_covered(
     }
 }
 
+/// Decide whether a full-partition-key query should consult a secondary index
+/// for a residual predicate instead of scanning the partition.
+///
+/// Returns `Some(PartitionIndexLookup)` when:
+/// - the query is NOT an exact full-primary-key point lookup (some clustering
+///   column is unrestricted or non-`Eq`), and
+/// - a residual (non-partition-key) `Eq` predicate matches a registered
+///   single-column index.
+///
+/// Returns `None` otherwise, leaving the caller on the `PartitionKeyLookup`
+/// path (point read for exact PK, partition read + post-filter otherwise).
+fn partition_index_lookup(
+    non_token: &[&WhereClause],
+    pk_columns: &[String],
+    ck_columns: &[String],
+    indexes: &[(String, Vec<String>)],
+) -> Option<ScanPlan> {
+    // Exact full-primary-key point lookup: every clustering column is
+    // Eq-restricted (or the table has none). A single-row point read always
+    // beats an index consult.
+    let exact_primary_key = ck_columns.iter().all(|ck_col| {
+        non_token
+            .iter()
+            .any(|wc| wc.column == *ck_col && wc.op == ComparisonOp::Eq)
+    });
+    if exact_primary_key {
+        return None;
+    }
+
+    // First residual (non-partition-key) Eq predicate covered by a
+    // single-column index wins. Remaining residual predicates are post-filtered
+    // on the index-matched rows, which is never worse than post-filtering the
+    // whole partition.
+    non_token
+        .iter()
+        .filter(|wc| wc.op == ComparisonOp::Eq)
+        .filter(|wc| !pk_columns.contains(&wc.column))
+        .find_map(|wc| {
+            indexes
+                .iter()
+                .find(|(_, cols)| cols.len() == 1 && cols[0] == wc.column)
+                .map(|(name, _)| ScanPlan::PartitionIndexLookup {
+                    index_name: name.clone(),
+                    index_column: wc.column.clone(),
+                })
+        })
+}
+
 fn pk_columns_satisfied(where_clauses: &[&WhereClause], pk_columns: &[String]) -> bool {
     pk_columns.iter().all(|pk_col| {
         where_clauses
@@ -236,6 +314,10 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn ck(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     fn idx(name: &str, columns: &[&str]) -> (String, Vec<String>) {
         (
             name.to_string(),
@@ -245,7 +327,107 @@ mod tests {
 
     #[test]
     fn pk_lookup_single_column() {
-        let plan = plan(&[wc("id", ComparisonOp::Eq)], &pk(&["id"]), &[]);
+        let plan = plan(&[wc("id", ComparisonOp::Eq)], &pk(&["id"]), &ck(&[]), &[]);
+        assert_eq!(plan, ScanPlan::PartitionKeyLookup);
+    }
+
+    // ── PartitionIndexLookup: full PK equality + indexed residual ──────────
+    //
+    // The typed_edges shape (t_430c4188): PK ((tenant_id, session_id), src_id,
+    // edge_type, dst_id) with a secondary index on dst_id. `WHERE tenant_id=?
+    // AND session_id=? AND dst_id=?` must consult the index restricted to the
+    // partition, not degrade to a full-partition scan behind
+    // `PartitionKeyLookup`.
+
+    #[test]
+    fn full_pk_plus_indexed_residual_plans_partition_index_lookup() {
+        let plan = plan(
+            &[
+                wc("tenant_id", ComparisonOp::Eq),
+                wc("session_id", ComparisonOp::Eq),
+                wc("dst_id", ComparisonOp::Eq),
+            ],
+            &pk(&["tenant_id", "session_id"]),
+            &ck(&["src_id", "edge_type", "dst_id"]),
+            &[idx("idx_typed_edges_dst", &["dst_id"])],
+        );
+        assert_eq!(
+            plan,
+            ScanPlan::PartitionIndexLookup {
+                index_name: "idx_typed_edges_dst".to_string(),
+                index_column: "dst_id".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn full_pk_plus_indexed_regular_column_plans_partition_index_lookup() {
+        // The indexed residual can be a regular (non-clustering) column too.
+        let plan = plan(
+            &[wc("id", ComparisonOp::Eq), wc("email", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &ck(&["seq"]),
+            &[idx("idx_email", &["email"])],
+        );
+        assert_eq!(
+            plan,
+            ScanPlan::PartitionIndexLookup {
+                index_name: "idx_email".to_string(),
+                index_column: "email".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn exact_full_primary_key_still_plans_pk_lookup_over_index() {
+        // All clustering columns Eq-restricted → exact point read beats any
+        // index consult, even when a restricted column is indexed.
+        let plan = plan(
+            &[
+                wc("tenant_id", ComparisonOp::Eq),
+                wc("session_id", ComparisonOp::Eq),
+                wc("src_id", ComparisonOp::Eq),
+                wc("edge_type", ComparisonOp::Eq),
+                wc("dst_id", ComparisonOp::Eq),
+            ],
+            &pk(&["tenant_id", "session_id"]),
+            &ck(&["src_id", "edge_type", "dst_id"]),
+            &[idx("idx_typed_edges_dst", &["dst_id"])],
+        );
+        assert_eq!(plan, ScanPlan::PartitionKeyLookup);
+    }
+
+    #[test]
+    fn full_pk_with_unindexed_residual_stays_pk_lookup() {
+        // Residual predicate has no index → partition read + post-filter, as
+        // before.
+        let plan = plan(
+            &[
+                wc("tenant_id", ComparisonOp::Eq),
+                wc("session_id", ComparisonOp::Eq),
+                wc("dst_id", ComparisonOp::Eq),
+            ],
+            &pk(&["tenant_id", "session_id"]),
+            &ck(&["src_id", "edge_type", "dst_id"]),
+            &[],
+        );
+        assert_eq!(plan, ScanPlan::PartitionKeyLookup);
+    }
+
+    #[test]
+    fn full_pk_with_non_eq_indexed_residual_stays_pk_lookup() {
+        // A range predicate on the indexed column cannot use the point-lookup
+        // index consult.
+        let plan = plan(
+            &[
+                wc("tenant_id", ComparisonOp::Eq),
+                wc("session_id", ComparisonOp::Eq),
+                wc("dst_id", ComparisonOp::Gt),
+            ],
+            &pk(&["tenant_id", "session_id"]),
+            &ck(&["src_id", "edge_type", "dst_id"]),
+            &[idx("idx_typed_edges_dst", &["dst_id"])],
+        );
         assert_eq!(plan, ScanPlan::PartitionKeyLookup);
     }
 
@@ -254,6 +436,7 @@ mod tests {
         let plan = plan(
             &[wc("ks", ComparisonOp::Eq), wc("id", ComparisonOp::Eq)],
             &pk(&["ks", "id"]),
+            &ck(&[]),
             &[],
         );
         assert_eq!(plan, ScanPlan::PartitionKeyLookup);
@@ -261,13 +444,18 @@ mod tests {
 
     #[test]
     fn pk_incomplete_not_pk_lookup() {
-        let plan = plan(&[wc("ks", ComparisonOp::Eq)], &pk(&["ks", "id"]), &[]);
+        let plan = plan(
+            &[wc("ks", ComparisonOp::Eq)],
+            &pk(&["ks", "id"]),
+            &ck(&[]),
+            &[],
+        );
         assert_ne!(plan, ScanPlan::PartitionKeyLookup);
     }
 
     #[test]
     fn pk_column_with_non_eq_op_not_pk_lookup() {
-        let plan = plan(&[wc("id", ComparisonOp::Gt)], &pk(&["id"]), &[]);
+        let plan = plan(&[wc("id", ComparisonOp::Gt)], &pk(&["id"]), &ck(&[]), &[]);
         assert_ne!(plan, ScanPlan::PartitionKeyLookup);
     }
 
@@ -276,6 +464,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"])],
         );
         assert_eq!(
@@ -293,6 +482,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq), wc("city", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"]), idx("idx_city", &["city"])],
         );
         match &plan {
@@ -308,6 +498,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq), wc("age", ComparisonOp::Gt)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"])],
         );
         assert_eq!(
@@ -329,6 +520,7 @@ mod tests {
                 wc("country", ComparisonOp::Eq),
             ],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"])],
         );
         match &plan {
@@ -349,7 +541,12 @@ mod tests {
 
     #[test]
     fn full_scan_no_indexes() {
-        let plan = plan(&[wc("email", ComparisonOp::Eq)], &pk(&["id"]), &[]);
+        let plan = plan(
+            &[wc("email", ComparisonOp::Eq)],
+            &pk(&["id"]),
+            &ck(&[]),
+            &[],
+        );
         assert_eq!(plan, ScanPlan::FullScan);
     }
 
@@ -370,6 +567,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_city", &["city"])],
         );
         assert_eq!(plan, ScanPlan::FullScan);
@@ -377,7 +575,7 @@ mod tests {
 
     #[test]
     fn full_scan_no_where_clauses() {
-        let plan = plan(&[], &pk(&["id"]), &[idx("idx_email", &["email"])]);
+        let plan = plan(&[], &pk(&["id"]), &ck(&[]), &[idx("idx_email", &["email"])]);
         assert_eq!(plan, ScanPlan::FullScan);
     }
 
@@ -386,6 +584,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Gt)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"])],
         );
         assert_eq!(plan, ScanPlan::FullScan);
@@ -402,6 +601,7 @@ mod tests {
         let plan = plan(
             &[wc("user_id", ComparisonOp::Eq)],
             &pk(&["pk"]),
+            &ck(&[]),
             &[idx("idx_user_id_hash", &["user_id"])],
         );
         assert_eq!(
@@ -421,6 +621,7 @@ mod tests {
         let plan = plan(
             &[wc("user_id", ComparisonOp::Gt)],
             &pk(&["pk"]),
+            &ck(&[]),
             &[idx("idx_user_id_hash", &["user_id"])],
         );
         assert_eq!(plan, ScanPlan::FullScan);
@@ -490,6 +691,7 @@ mod tests {
         let plan = plan(
             &[wc("email", ComparisonOp::Eq), wc("city", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("idx_email", &["email"]), idx("idx_city", &["city"])],
         );
         match &plan {
@@ -509,6 +711,7 @@ mod tests {
                 wc("c", ComparisonOp::Eq),
             ],
             &pk(&["id"]),
+            &ck(&[]),
             &[
                 idx("idx_a", &["a"]),
                 idx("idx_b", &["b"]),
@@ -530,6 +733,7 @@ mod tests {
         let plan = plan_with_covered(
             &[wc("name", ComparisonOp::Eq), wc("status", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[idx("name_active_idx", &["name"])],
             &["status".to_string()],
         );
@@ -550,6 +754,7 @@ mod tests {
         let plan = plan_with_covered(
             &[wc("name", ComparisonOp::Eq)],
             &pk(&["id"]),
+            &ck(&[]),
             &[],
             &["name".to_string()],
         );

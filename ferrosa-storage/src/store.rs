@@ -475,6 +475,11 @@ pub struct TableStore<F: FlushTarget> {
     /// Column position is the index into `Row.cells` by column ordinal
     /// (matching the `u16` tag in each cell tuple).
     indexed_columns: Vec<(String, usize)>,
+    /// Secondary indexes on CLUSTERING columns: `(index_name,
+    /// clustering_component)` pairs (t_430c4188). A clustering column's value
+    /// is not a cell — the write path extracts it from the row's composite
+    /// clustering-key bytes at the given component index.
+    indexed_clustering_columns: Vec<(String, usize)>,
     /// Per-index type, keyed by index name. Threaded from the schema so eager /
     /// backfill / compaction index-build jobs carry the correct `IndexType`
     /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
@@ -531,10 +536,15 @@ fn new_memtable() -> Arc<dyn Memtable> {
 }
 
 /// Build a fresh `HashMap` of empty `MemtableIndex` instances, one per
-/// declared secondary index.
-fn new_indexes(indexed_columns: &[(String, usize)]) -> Arc<HashMap<String, Arc<MemtableIndex>>> {
+/// declared secondary index. `clustering_indexed_columns` carries the
+/// clustering-column indexes (t_430c4188) so a flush swap does not drop them.
+fn new_indexes(
+    indexed_columns: &[(String, usize)],
+    clustering_indexed_columns: &[(String, usize)],
+) -> Arc<HashMap<String, Arc<MemtableIndex>>> {
     let map: HashMap<String, Arc<MemtableIndex>> = indexed_columns
         .iter()
+        .chain(clustering_indexed_columns.iter())
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
     Arc::new(map)
@@ -837,7 +847,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns);
+        let indexes = new_indexes(&indexed_columns, &[]);
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -857,6 +867,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
             indexed_columns,
+            indexed_clustering_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1002,7 +1013,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns);
+        let indexes = new_indexes(&indexed_columns, &[]);
         let sidecar_count = initial_sstables.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1063,6 +1074,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
             indexed_columns,
+            indexed_clustering_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1097,7 +1109,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns);
+        let indexes = new_indexes(&indexed_columns, &[]);
         let sstable_count = descriptors.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1141,6 +1153,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
             indexed_columns,
+            indexed_clustering_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1263,6 +1276,45 @@ impl<F: FlushTarget> TableStore<F> {
                         }
                     }
                     // If value is None (tombstone), skip — no index entry for deletions
+                }
+            }
+        }
+
+        // Clustering-column index maintenance (t_430c4188): a clustering
+        // column's value is not a cell, so it is extracted from the row's
+        // composite clustering-key bytes at the declared component.
+        if !self.indexed_clustering_columns.is_empty() && !row.clustering.is_empty() {
+            let total = self.clustering_column_count();
+            let components = ferrosa_row_bridge::decode_clustering(&row.clustering, total);
+            for (index_name, component) in &self.indexed_clustering_columns {
+                let Some(value) = components.get(*component) else {
+                    tracing::warn!(
+                        index_name,
+                        component,
+                        total,
+                        "store: clustering index component missing from row clustering bytes"
+                    );
+                    continue;
+                };
+                let index_type = self.index_type_for(index_name);
+                match crate::index::scheduler::encode_index_key(index_type, value) {
+                    Ok(Some(index_key)) => {
+                        let row_pos = RowPosition {
+                            partition_key: key.key.as_bytes().to_vec(),
+                            clustering_key: row.clustering.clone(),
+                        };
+                        if let Some(idx) = guard.indexes.get(index_name) {
+                            idx.insert(index_key, row_pos);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            index_name,
+                            %e,
+                            "store: skipping clustering memtable index entry; key encoding failed"
+                        );
+                    }
                 }
             }
         }
@@ -1964,7 +2016,7 @@ impl<F: FlushTarget> TableStore<F> {
         // new writes go to the new active memtable, and the old memtable
         // contains a complete snapshot.
         let new_active: Arc<dyn Memtable> = new_memtable();
-        let fresh_indexes = new_indexes(&self.indexed_columns);
+        let fresh_indexes = new_indexes(&self.indexed_columns, &self.indexed_clustering_columns);
         let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
         let phase_start = Instant::now();
         let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
@@ -4259,6 +4311,104 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(partitions)
     }
 
+    /// Query by secondary index restricted to ONE partition (t_430c4188):
+    /// looks up the index key in the memtable index and all SSTable sidecar
+    /// indexes, keeps only the postings whose `RowPosition.partition_key`
+    /// equals `partition_key`, and point-reads exactly those rows.
+    ///
+    /// This serves the fully-keyed CQL shape `WHERE <full partition key> AND
+    /// <indexed_col> = ?`: work and memory are O(rows matching the value in
+    /// the partition), never O(partition rows). Postings from other partitions
+    /// are dropped per batch BEFORE retention, so a value that is hot globally
+    /// cannot blow the `INDEX_RESULT_CAP` bound (or memory) for a keyed query
+    /// that matches only a few rows in its partition. Postings retained after
+    /// keying are still capped by `INDEX_RESULT_CAP` — the same fail-loud
+    /// bound as [`read_by_index`](Self::read_by_index), never a silent
+    /// truncation.
+    ///
+    /// The secondary index is keyed globally by value (not by `(partition,
+    /// value)`), so this consult still walks the per-node postings list for
+    /// the value; only the retained set is partition-scoped. Staleness
+    /// semantics are identical to `read_by_index` — both read the same
+    /// memtable index + sidecar layers.
+    pub fn read_by_index_in_partition(
+        &self,
+        index_name: &str,
+        key: &IndexKey,
+        partition_key: &[u8],
+    ) -> Result<Vec<Partition>> {
+        let guard = self.view.load();
+
+        // Same per-type key encoding as `read_by_index` (see there for why a
+        // phonetic index must be probed by code, not raw bytes).
+        let index_type = self.index_type_for(index_name);
+        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "secondary index '{index_name}' read key encoding failed: {e}"
+                )));
+            }
+        };
+        let key = &lookup_key;
+
+        let mut positions: Vec<RowPosition> = Vec::new();
+        let mut append_in_partition = |batch: Vec<RowPosition>| -> Result<()> {
+            for pos in batch {
+                if pos.partition_key != partition_key {
+                    continue;
+                }
+                if positions.len() >= INDEX_RESULT_CAP {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "secondary index query exceeded {} row limit; \
+                         use ALLOW FILTERING for unbounded scans",
+                        INDEX_RESULT_CAP
+                    )));
+                }
+                positions.push(pos);
+            }
+            Ok(())
+        };
+
+        // 1. Memtable index.
+        if let Some(idx) = guard.indexes.get(index_name) {
+            append_in_partition(idx.lookup(key))?;
+        }
+
+        // 2. SSTable sidecar indexes (same lenient per-sidecar error handling
+        // as `read_by_index`: a missing/failed sidecar contributes nothing).
+        for sidecar in guard.sidecar_indexes.iter() {
+            if let Some(reader) = sidecar.get(index_name) {
+                if let Ok(results) = reader.lookup(key) {
+                    append_in_partition(results)?;
+                }
+            }
+        }
+
+        // 3. Deduplicate by clustering key (the partition key is fixed).
+        let mut seen = std::collections::HashSet::new();
+        positions.retain(|p| seen.insert(p.clustering_key.clone()));
+
+        // 4. Point-read exactly the matching rows — never the whole partition.
+        let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+            partition_key.to_vec(),
+        ));
+        let mut partitions = Vec::new();
+        for pos in &positions {
+            let read = if pos.clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &pos.clustering_key)
+            };
+            if let Ok(Some(partition)) = read {
+                partitions.push(partition);
+            }
+        }
+
+        Ok(partitions)
+    }
+
     /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
     /// ranges, returning the matching base-table partitions.
     ///
@@ -4391,6 +4541,48 @@ impl<F: FlushTarget> TableStore<F> {
         };
         new_view.check_invariants("update_indexes");
         self.view.store(Arc::new(new_view));
+    }
+
+    /// Dynamically adds a secondary index on a CLUSTERING column
+    /// (t_430c4188). Future writes extract the indexed value from the row's
+    /// composite clustering-key bytes at `clustering_component` — a
+    /// clustering column's value is not a cell, so the cell-based
+    /// [`add_index`](Self::add_index) path cannot see it at all.
+    pub fn add_clustering_index(
+        &mut self,
+        index_name: String,
+        clustering_component: usize,
+        index_type: IndexType,
+    ) {
+        self.indexed_clustering_columns
+            .push((index_name.clone(), clustering_component));
+        self.index_types.insert(index_name.clone(), index_type);
+        let current = self.view.load();
+        let mut new_indexes = (*current.indexes).clone();
+        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        let new_view = StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::new(new_indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        new_view.check_invariants("update_indexes");
+        self.view.store(Arc::new(new_view));
+    }
+
+    /// Clustering-column secondary index declarations:
+    /// `(index_name, clustering_component)` pairs.
+    pub fn indexed_clustering_columns(&self) -> &[(String, usize)] {
+        &self.indexed_clustering_columns
+    }
+
+    /// Number of clustering columns in this table's schema (the component
+    /// count needed to split composite clustering-key bytes).
+    pub fn clustering_column_count(&self) -> usize {
+        self.schema.load().clustering_columns.len()
     }
 
     /// Retrieve a named memtable-level secondary index.
@@ -5080,7 +5272,7 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(&self.indexed_columns),
+            indexes: new_indexes(&self.indexed_columns, &self.indexed_clustering_columns),
             sidecar_indexes: Arc::new(vec![]),
             vector_indexes: new_vector_indexes(&self.vector_index_configs),
         };

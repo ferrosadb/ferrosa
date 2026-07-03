@@ -10,6 +10,7 @@ repository.workspace = true
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-index = { path = "../ferrosa-index" }
+ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 arc-swap = "1.7"

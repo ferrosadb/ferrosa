@@ -31,6 +31,20 @@ pub enum BuildPriority {
     Initial,
 }
 
+/// Reference to one clustering-key component of a table (t_430c4188).
+///
+/// An index on a CLUSTERING column cannot be built from `row.cells` — the
+/// value lives inside the row's composite clustering-key bytes. The builder
+/// needs both the component's index and the table's total clustering-column
+/// count to split the composite encoding correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusteringComponentRef {
+    /// Zero-based index of the component within the clustering key.
+    pub component: usize,
+    /// Total number of clustering columns in the table.
+    pub total: usize,
+}
+
 /// A job to build an index for a single SSTable.
 #[derive(Debug, Clone)]
 pub struct IndexBuildJob {
@@ -48,6 +62,11 @@ pub struct IndexBuildJob {
     pub enqueued_at: Instant,
     /// Column position within the row to index.
     pub column_position: usize,
+    /// `Some` when the indexed column is a CLUSTERING column: the value is
+    /// extracted from the row's clustering-key bytes at this component instead
+    /// of from the cell at `column_position` (which is ignored). `None` for
+    /// regular/static-column indexes (t_430c4188).
+    pub clustering_source: Option<ClusteringComponentRef>,
     /// Partial-index predicate. `Some` only for [`IndexType::Filtered`] jobs:
     /// the build skips any row whose filter-column cell does not satisfy this
     /// predicate, so the sidecar holds only matching rows. `None` for every
@@ -276,22 +295,29 @@ impl IndexBuildBackend for LocalBackend {
                     }
                 }
 
-                // Find the cell at the declared column position.
-                let cell_opt = row
-                    .cells
-                    .iter()
-                    .find(|(pos, _)| *pos == job.column_position as u16);
-                if let Some((_col_pos, cell)) = cell_opt {
-                    if let Some(ref value) = cell.value {
-                        if let Some(key) = encode_index_key(job.index_type, value)? {
-                            entries.push((
-                                key,
-                                RowPosition {
-                                    partition_key: pk_bytes.clone(),
-                                    clustering_key: row.clustering.clone(),
-                                },
-                            ));
-                        }
+                // Extract the indexed value: a clustering-column index reads
+                // its component out of the composite clustering-key bytes
+                // (t_430c4188); a regular/static index reads the cell at the
+                // declared column position.
+                let value_owned: Option<Vec<u8>> = match job.clustering_source {
+                    Some(src) => ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
+                        .into_iter()
+                        .nth(src.component),
+                    None => row
+                        .cells
+                        .iter()
+                        .find(|(pos, _)| *pos == job.column_position as u16)
+                        .and_then(|(_, cell)| cell.value.clone()),
+                };
+                if let Some(ref value) = value_owned {
+                    if let Some(key) = encode_index_key(job.index_type, value)? {
+                        entries.push((
+                            key,
+                            RowPosition {
+                                partition_key: pk_bytes.clone(),
+                                clustering_key: row.clustering.clone(),
+                            },
+                        ));
                     }
                 }
             }
@@ -709,6 +735,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -763,6 +790,7 @@ mod tests {
                     priority: BuildPriority::Initial,
                     enqueued_at: Instant::now(),
                     column_position: 0,
+                    clustering_source: None,
                     filter_predicate: None,
                 })
                 .unwrap();
@@ -834,6 +862,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
@@ -853,6 +882,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job);
@@ -941,6 +971,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
@@ -1069,6 +1100,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: Some(FilterPredicate::single(1, FilterOp::Eq, b"active".to_vec())),
         };
         let result = backend.build(&job).unwrap();
@@ -1102,6 +1134,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 2,
+            clustering_source: None,
             filter_predicate: None,
         };
         assert_eq!(job.column_position, 2);
@@ -1119,6 +1152,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job);
@@ -1168,6 +1202,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1206,6 +1241,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1262,6 +1298,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1305,6 +1342,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1374,6 +1412,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1427,6 +1466,7 @@ mod tests {
                 priority: BuildPriority::Normal,
                 enqueued_at: Instant::now(),
                 column_position: 0,
+                clustering_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1539,6 +1579,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -1582,6 +1623,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -1606,6 +1648,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -1631,6 +1674,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -1673,6 +1717,7 @@ mod tests {
             priority: BuildPriority::Normal,
             enqueued_at: Instant::now(),
             column_position: 0,
+            clustering_source: None,
             filter_predicate: None,
         };
 
@@ -1726,6 +1771,7 @@ mod tests {
                     priority: BuildPriority::Initial,
                     enqueued_at: Instant::now(),
                     column_position: 0,
+                    clustering_source: None,
                     filter_predicate: None,
                 })
                 .unwrap();
