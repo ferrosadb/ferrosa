@@ -100,6 +100,14 @@ jobs:
                  --skip differential_oracle_rejects_unsupported_queries \
                  --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                  --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
+                 --skip fly_multi_node_streaming_scan \
+                 --skip orchestrator_cluster_teardown \
+                 --skip orchestrator_docker_cluster_provision \
+                 --skip provision_single_vm \
+                 --skip provision_t1_cluster \
+                 --skip rust_driver_connects_to_cluster \
+                 --skip ssh_execute_command \
+                 --skip ssh_upload_file \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
