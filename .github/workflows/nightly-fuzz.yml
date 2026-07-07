@@ -305,6 +305,12 @@ jobs:
   race-stress-fly:
     name: Read-vs-compaction stress (shared-cpu Fly)
     runs-on: ubuntu-latest
+    # Best-effort perf baseline on a throwaway shared-cpu Fly machine: the run is
+    # inherently noisy and has been hitting the 45-min budget without emitting an
+    # RS_RESULT marker (infra/duration flake, tracked in board task t_dfbc14f3).
+    # continue-on-error so a Fly timeout/flake does not gate the nightly — the job
+    # still runs and surfaces results; the real duration fix lives in t_dfbc14f3.
+    continue-on-error: true
     # The stress binary is cross-compiled on the fast GitHub runner, then copied
     # into a throwaway shared-cpu Fly machine. The starved baseline is what we
     # want to test; compiling on that same starved VM was consuming the entire

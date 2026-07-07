@@ -35,29 +35,51 @@ runs:
         set -euo pipefail
         repo='${{ github.repository }}'
 
+        # NOTE: `gh api --paginate --jq FILTER` applies FILTER to EACH PAGE
+        # separately, so a bare `... | sort_by | last` returns one release PER PAGE
+        # (multiple objects). That made `tag_name` multi-line and wrote a bare tag
+        # (e.g. an old `v0.15.2` release) into $GITHUB_OUTPUT → GHA "Invalid format".
+        # Fix: stream every release with `--jq '.[]'`, then SLURP (`jq -s`) so the
+        # sort/last aggregation is GLOBAL and yields exactly one object. `first`
+        # guards against a release exposing more than one matching .deb asset.
         if [ -n "$TAG_PATTERN" ]; then
           echo "::notice::Looking for nightly .deb matching tag pattern $TAG_PATTERN"
-          tag_asset=$(gh api "repos/$repo/releases" --paginate \
-            --jq '[.[] | select(.tag_name | test("'"$TAG_PATTERN"'"))] | sort_by(.created_at) | last | {tag_name, asset: (.assets[] | select(.name | test("ferrosa_.*_amd64\\.deb$")))}' 2>/dev/null || true)
+          release_filter='[.[] | select(.tag_name | test($pat))]'
         else
-          tag_asset=$(gh api "repos/$repo/releases" --paginate \
-            --jq '[.[] | select(.prerelease == true)] | sort_by(.created_at) | last | {tag_name, asset: (.assets[] | select(.name | test("ferrosa_.*_amd64\\.deb$")))}' 2>/dev/null || true)
+          release_filter='[.[] | select(.prerelease == true)]'
         fi
+        tag_asset=$(gh api "repos/$repo/releases" --paginate --jq '.[]' 2>/dev/null \
+          | jq -s --arg pat "$TAG_PATTERN" --arg re 'ferrosa_.*_amd64\.deb$' \
+              "$release_filter"' | sort_by(.created_at) | last
+                 | {tag_name, asset: ([.assets[] | select(.name | test($re))] | first)}' \
+          2>/dev/null || true)
 
-        if [ -z "$tag_asset" ] || [ "$tag_asset" = "null" ]; then
+        if [ -z "$tag_asset" ] || [ "$tag_asset" = "null" ] \
+           || [ "$(printf '%s' "$tag_asset" | jq -r '.asset // "null"')" = "null" ]; then
           echo "::error::No nightly Ferrosa .deb release asset found"
           exit 1
         fi
 
-        tag_name=$(echo "$tag_asset" | jq -r '.tag_name')
-        deb_url=$(echo "$tag_asset" | jq -r '.asset.browser_download_url')
-        deb_name=$(echo "$tag_asset" | jq -r '.asset.name')
-        version=$(echo "$deb_name" | sed -E 's/ferrosa_([^_]+)_amd64\.deb/\1/')
+        tag_name=$(printf '%s' "$tag_asset" | jq -r '.tag_name')
+        deb_url=$(printf '%s' "$tag_asset" | jq -r '.asset.browser_download_url')
+        deb_name=$(printf '%s' "$tag_asset" | jq -r '.asset.name')
+        version=$(printf '%s' "$deb_name" | sed -E 's/ferrosa_([^_]+)_amd64\.deb/\1/')
 
-        echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
-        echo "deb_url=$deb_url" >> "$GITHUB_OUTPUT"
-        echo "deb_name=$deb_name" >> "$GITHUB_OUTPUT"
-        echo "version=$version" >> "$GITHUB_OUTPUT"
+        # Defense in depth: a single resolved object must give single-line, non-empty
+        # values. Refuse to write a malformed $GITHUB_OUTPUT (the v0.15.2 failure).
+        for v in "$tag_name" "$deb_url" "$deb_name" "$version"; do
+          if [ -z "$v" ] || [ "$(printf '%s' "$v" | wc -l | tr -d ' ')" != "0" ]; then
+            echo "::error::Resolved an empty or multi-line release field ('$v') — refusing to write \$GITHUB_OUTPUT"
+            exit 1
+          fi
+        done
+
+        {
+          echo "tag_name=$tag_name"
+          echo "deb_url=$deb_url"
+          echo "deb_name=$deb_name"
+          echo "version=$version"
+        } >> "$GITHUB_OUTPUT"
         echo "::notice::Resolved nightly .deb: $deb_name from $tag_name"
 
     - name: Download and verify .deb
