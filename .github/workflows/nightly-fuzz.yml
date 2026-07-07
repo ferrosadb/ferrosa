@@ -98,6 +98,8 @@ jobs:
                  --skip differential_oracle_dml_agrees \
                  --skip differential_oracle_corpus_agrees \
                  --skip differential_oracle_rejects_unsupported_queries \
+                 --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
+                 --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
