@@ -1138,11 +1138,31 @@ async fn execute_expand(
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table_id = TableId::new(&adj_ks, "adjacency");
 
-    for hop in traversal_hops {
+    // t_0cc8d63e: LIMIT short-circuit. For a plain bounded expansion — no
+    // ORDER BY / DISTINCT / WITH pipeline / post-MATCH WHERE / OPTIONAL MATCH
+    // (each of which reorders rows or needs the full set before limiting) — the
+    // first `limit` rows in expansion order are exactly the final answer. So we
+    // may stop expanding (and hydrating) the LAST hop as soon as `limit` rows
+    // accumulate, instead of hydrating the whole fan-out and truncating at the
+    // end. Aggregates never reach this path (they use PhysicalPlan::Aggregate).
+    let pushdown_cap: Option<usize> = return_clause.limit.and_then(|limit| {
+        let safe = return_clause.order_by.is_empty()
+            && !return_clause.distinct
+            && with_pipeline.is_none()
+            && post_filters.is_empty()
+            && optional_hops.is_empty();
+        (safe && limit > 0).then_some(limit as usize)
+    });
+    let last_hop_idx = traversal_hops.len().saturating_sub(1);
+
+    for (hop_idx, hop) in traversal_hops.iter().enumerate() {
         check_timeout(start, config.query_timeout)?;
+        // Only the final hop may short-circuit; earlier hops must fully expand
+        // because their fan-out feeds the next hop.
+        let cap_this_hop = pushdown_cap.filter(|_| hop_idx == last_hop_idx);
 
         let mut next_states = Vec::new();
-        for state in &current_states {
+        'states: for state in &current_states {
             let vertex_key = &state.current_key;
             // Read adjacency entries for this vertex.
             let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
@@ -1160,161 +1180,67 @@ async fn execute_expand(
                     .as_ref()
                     .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
-                for row in &partition.rows {
-                    if let Some(neighbor_id) = extract_neighbor_id_for_direction(
-                        &row.clustering,
-                        hop.edge_label.as_deref(),
-                        expected_adjacency_direction(hop.direction),
-                    ) {
-                        // t_8c506227: hydrate the opposite endpoint (and the
-                        // relationship) even when the pattern omitted the edge
-                        // and/or the target-node label. Each missing piece is
-                        // resolved from this adjacency row — the edge from its
-                        // recorded edge_table, the opposite vertex from that
-                        // edge's declared source/target label. Typed labels from
-                        // the plan take precedence and are left untouched, so the
-                        // typed traversal path is unchanged.
-                        let neighbor_direction = match hop.direction {
-                            Direction::In => DIRECTION_IN,
-                            Direction::Out => DIRECTION_OUT,
-                            // Both: the adjacency clustering's first component
-                            // encodes the stored direction ([u16 len=1][dir]).
-                            Direction::Both => {
-                                row.clustering.get(2).copied().unwrap_or(DIRECTION_OUT)
-                            }
-                        };
-                        // Recover the edge table when the pattern didn't name it
-                        // and we need it — to hydrate/filter the relationship, or
-                        // to locate an unlabeled target vertex.
-                        let need_edge = hop.rel_var.is_some()
-                            || !hop.prop_filters.is_empty()
-                            || hop.vertex_table.is_none();
-                        let resolved_edge = if hop.edge_table.is_none() && need_edge {
-                            Some(resolve_edge_from_adjacency_row(schema, row)?)
-                        } else {
-                            None
-                        };
-                        let eff_edge_table = hop
-                            .edge_table
-                            .as_ref()
-                            .or(resolved_edge.as_ref().map(|e| &e.0));
-                        let eff_edge_meta =
-                            edge_meta.as_ref().or(resolved_edge.as_ref().map(|e| &e.1));
-                        let eff_edge_label = hop
-                            .edge_label
-                            .as_deref()
-                            .or(eff_edge_table.map(|e| e.label.as_str()));
-                        // Resolve the opposite vertex table when the target node
-                        // was unlabeled, from the effective edge's metadata.
-                        let resolved_vertex = if hop.vertex_table.is_none() {
-                            match eff_edge_meta {
-                                Some(em) => {
-                                    Some(resolve_opposite_vertex(schema, em, neighbor_direction)?)
-                                }
-                                None => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let eff_vertex_table = hop
-                            .vertex_table
-                            .as_ref()
-                            .or(resolved_vertex.as_ref().map(|v| &v.0));
-                        let eff_vertex_meta = vertex_meta
-                            .as_ref()
-                            .or(resolved_vertex.as_ref().map(|v| &v.1));
+                let pairs: Vec<(&Row, Vec<u8>)> = partition
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        extract_neighbor_id_for_direction(
+                            &row.clustering,
+                            hop.edge_label.as_deref(),
+                            expected_adjacency_direction(hop.direction),
+                        )
+                        .map(|nid| (row, nid))
+                    })
+                    .collect();
 
-                        let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
-                            if let (Some(et), Some(meta)) = (eff_edge_table, eff_edge_meta) {
-                                let edge_tid = TableId::new(&et.keyspace, &et.table);
-                                find_edge_match(
-                                    write_path,
-                                    &edge_tid,
-                                    meta,
-                                    &state.bindings,
-                                    &hop.prop_filters,
-                                    vertex_key.key.as_bytes(),
-                                    &neighbor_id,
-                                    schema,
-                                )
-                                .await?
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Apply property filters if present.
-                        if !hop.prop_filters.is_empty()
-                            && !edge_row_passes_filters(edge_match.as_ref(), &hop.prop_filters)
+                if let Some(cap) = cap_this_hop {
+                    // LIMIT push-down: hydrate sequentially and stop as soon as
+                    // the cap is met, so a bounded query touches minimal storage
+                    // (t_0cc8d63e).
+                    for (row, nid) in pairs {
+                        if let Some(st) = hydrate_hop_neighbor(
+                            write_path,
+                            schema,
+                            hop,
+                            state,
+                            vertex_key,
+                            edge_meta.as_ref(),
+                            vertex_meta.as_ref(),
+                            row,
+                            nid,
+                        )
+                        .await?
                         {
-                            continue;
-                        }
-
-                        let mut bindings = state.bindings.clone();
-                        let neighbor_key = DecoratedKey::new(ferrosa_common::PartitionKey::new(
-                            neighbor_id.clone(),
-                        ));
-
-                        let mut target_bindings = HashMap::new();
-                        if let Some(var_name) = &hop.var {
-                            if let Some(value) = state.bindings.get(var_name) {
-                                target_bindings.insert(var_name.clone(), value.clone());
+                            next_states.push(st);
+                            if next_states.len() >= cap {
+                                break 'states;
                             }
                         }
-                        if let Some(edge_match) = edge_match.as_ref() {
-                            target_bindings.insert("_edge".to_string(), edge_match.json.clone());
+                    }
+                } else {
+                    // Unbounded: hydrate every neighbor. Concurrent per-hop
+                    // hydration (bounded buffered pk_reads) is the intended win
+                    // here, but the borrowed per-neighbor futures can't satisfy
+                    // the multi-threaded runtime's Send bound without a
+                    // clone-heavy `'static` restructure of this loop — which the
+                    // streaming/pull executor (t_4ce82a3e) will supersede. Kept
+                    // sequential for now; correctness is unaffected.
+                    for (row, nid) in pairs {
+                        if let Some(st) = hydrate_hop_neighbor(
+                            write_path,
+                            schema,
+                            hop,
+                            state,
+                            vertex_key,
+                            edge_meta.as_ref(),
+                            vertex_meta.as_ref(),
+                            row,
+                            nid,
+                        )
+                        .await?
+                        {
+                            next_states.push(st);
                         }
-
-                        let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
-                            eff_vertex_table.map(|vt| TableId::new(&vt.keyspace, &vt.table)),
-                            eff_vertex_meta,
-                        ) {
-                            find_vertex_match(
-                                write_path,
-                                &vertex_tid,
-                                meta,
-                                &target_bindings,
-                                &neighbor_id,
-                                hop.target_props.as_slice(),
-                                hop.var.as_deref().unwrap_or("_hop"),
-                                schema,
-                            )
-                            .await?
-                            .map(|matched| matched.json)
-                        } else {
-                            None
-                        };
-
-                        if !hop.target_props.is_empty() && neighbor_json.is_none() {
-                            continue;
-                        }
-
-                        if let Some(var_name) = &hop.var {
-                            bindings.insert(
-                                var_name.clone(),
-                                neighbor_json.unwrap_or_else(|| {
-                                    serde_json::Value::String(hex::encode(&neighbor_id))
-                                }),
-                            );
-                        }
-
-                        if let Some(rel_var) = &hop.rel_var {
-                            let edge_json = edge_binding_json(
-                                row,
-                                edge_match.as_ref(),
-                                eff_edge_label,
-                                vertex_key,
-                                &neighbor_id,
-                            );
-                            bindings.insert(rel_var.clone(), edge_json);
-                        }
-
-                        next_states.push(ExpandState {
-                            current_key: neighbor_key,
-                            bindings,
-                        });
                     }
                 }
 
@@ -1329,6 +1255,9 @@ async fn execute_expand(
             }
         }
 
+        if let Some(cap) = cap_this_hop {
+            next_states.truncate(cap);
+        }
         stats.vertices_read += next_states.len();
         current_states = next_states;
     }
@@ -2654,6 +2583,147 @@ fn resolve_opposite_vertex(
         label: vertex_label,
     };
     Ok((vertex_rt, vertex_meta))
+}
+
+/// Hydrate one hop neighbor: resolve the effective edge/vertex tables
+/// (t_8c506227), match + filter the edge, hydrate the opposite vertex, and
+/// build the resulting bindings. Returns `Ok(None)` when the candidate is
+/// filtered out (edge property filter, or an unmatched target-node property).
+/// All inputs are shared/immutable, so many neighbors can be hydrated
+/// concurrently within a hop (t_0cc8d63e).
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_hop_neighbor(
+    write_path: &WritePath,
+    schema: Option<&Schema>,
+    hop: &Hop,
+    state: &ExpandState,
+    vertex_key: &DecoratedKey,
+    edge_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    vertex_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    row: &Row,
+    neighbor_id: Vec<u8>,
+) -> Result<Option<ExpandState>> {
+    let neighbor_direction = match hop.direction {
+        Direction::In => DIRECTION_IN,
+        Direction::Out => DIRECTION_OUT,
+        Direction::Both => row.clustering.get(2).copied().unwrap_or(DIRECTION_OUT),
+    };
+    let need_edge =
+        hop.rel_var.is_some() || !hop.prop_filters.is_empty() || hop.vertex_table.is_none();
+    let resolved_edge = if hop.edge_table.is_none() && need_edge {
+        Some(resolve_edge_from_adjacency_row(schema, row)?)
+    } else {
+        None
+    };
+    let eff_edge_table = hop
+        .edge_table
+        .as_ref()
+        .or(resolved_edge.as_ref().map(|e| &e.0));
+    let eff_edge_meta = edge_meta.or(resolved_edge.as_ref().map(|e| &e.1));
+    let eff_edge_label = hop
+        .edge_label
+        .as_deref()
+        .or(eff_edge_table.map(|e| e.label.as_str()));
+    let resolved_vertex = if hop.vertex_table.is_none() {
+        match eff_edge_meta {
+            Some(em) => Some(resolve_opposite_vertex(schema, em, neighbor_direction)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let eff_vertex_table = hop
+        .vertex_table
+        .as_ref()
+        .or(resolved_vertex.as_ref().map(|v| &v.0));
+    let eff_vertex_meta = vertex_meta.or(resolved_vertex.as_ref().map(|v| &v.1));
+
+    let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
+        if let (Some(et), Some(meta)) = (eff_edge_table, eff_edge_meta) {
+            let edge_tid = TableId::new(&et.keyspace, &et.table);
+            find_edge_match(
+                write_path,
+                &edge_tid,
+                meta,
+                &state.bindings,
+                &hop.prop_filters,
+                vertex_key.key.as_bytes(),
+                &neighbor_id,
+                schema,
+            )
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if !hop.prop_filters.is_empty()
+        && !edge_row_passes_filters(edge_match.as_ref(), &hop.prop_filters)
+    {
+        return Ok(None);
+    }
+
+    let mut bindings = state.bindings.clone();
+    let neighbor_key = DecoratedKey::new(ferrosa_common::PartitionKey::new(neighbor_id.clone()));
+
+    let mut target_bindings = HashMap::new();
+    if let Some(var_name) = &hop.var {
+        if let Some(value) = state.bindings.get(var_name) {
+            target_bindings.insert(var_name.clone(), value.clone());
+        }
+    }
+    if let Some(edge_match) = edge_match.as_ref() {
+        target_bindings.insert("_edge".to_string(), edge_match.json.clone());
+    }
+
+    let neighbor_json = if let (Some(vertex_tid), Some(meta)) = (
+        eff_vertex_table.map(|vt| TableId::new(&vt.keyspace, &vt.table)),
+        eff_vertex_meta,
+    ) {
+        find_vertex_match(
+            write_path,
+            &vertex_tid,
+            meta,
+            &target_bindings,
+            &neighbor_id,
+            hop.target_props.as_slice(),
+            hop.var.as_deref().unwrap_or("_hop"),
+            schema,
+        )
+        .await?
+        .map(|matched| matched.json)
+    } else {
+        None
+    };
+
+    if !hop.target_props.is_empty() && neighbor_json.is_none() {
+        return Ok(None);
+    }
+
+    if let Some(var_name) = &hop.var {
+        bindings.insert(
+            var_name.clone(),
+            neighbor_json.unwrap_or_else(|| serde_json::Value::String(hex::encode(&neighbor_id))),
+        );
+    }
+
+    if let Some(rel_var) = &hop.rel_var {
+        let edge_json = edge_binding_json(
+            row,
+            edge_match.as_ref(),
+            eff_edge_label,
+            vertex_key,
+            &neighbor_id,
+        );
+        bindings.insert(rel_var.clone(), edge_json);
+    }
+
+    Ok(Some(ExpandState {
+        current_key: neighbor_key,
+        bindings,
+    }))
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.

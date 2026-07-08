@@ -6607,3 +6607,87 @@ async fn graph_edge_table_without_endpoint_labels_is_rejected() {
         "rejection must name the offending edge table: {msg}"
     );
 }
+
+/// t_0cc8d63e: a bare `LIMIT k` expansion (no ORDER BY / DISTINCT / WITH /
+/// aggregation) must short-circuit — hydrating only ~k neighbors, not the whole
+/// fan-out. Asserted via `stats.vertices_read`, which counts hydrated neighbors.
+#[tokio::test]
+async fn http_limit_short_circuits_expansion_hydration() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    // Alice + five neighbors, all reachable via KNOWS.
+    for name in ["Alice", "N1", "N2", "N3", "N4", "N5"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+    for dst in ["N1", "N2", "N3", "N4", "N5"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (a:Person {{name: 'Alice'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // Baseline: the unlimited expansion hydrates every neighbor.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'Alice'})-[r]->(n) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let body = response_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        body["rows"].as_array().unwrap().len(),
+        5,
+        "baseline must see all five neighbors: {body}"
+    );
+    let read_all = body["stats"]["vertices_read"]
+        .as_u64()
+        .expect("vertices_read");
+
+    // LIMIT 2 must short-circuit: it stops hydrating once two rows accumulate,
+    // so it reads strictly fewer neighbors than the unlimited query.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'Alice'})-[r]->(n) RETURN n.name LIMIT 2",
+            "keyspace": "social"
+        })),
+    );
+    let body = response_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(
+        body["rows"].as_array().unwrap().len(),
+        2,
+        "LIMIT 2 must return exactly two rows: {body}"
+    );
+    let read_2 = body["stats"]["vertices_read"]
+        .as_u64()
+        .expect("vertices_read");
+    assert!(
+        read_all - read_2 >= 3,
+        "LIMIT 2 must skip hydrating the 3 excess neighbors (short-circuit): \
+         limited={read_2} unlimited={read_all}"
+    );
+}
