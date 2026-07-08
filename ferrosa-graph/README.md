@@ -37,6 +37,15 @@ the `ferrosa` binary.
 - **Expand executor** (`executor/expand.rs`) — anchor lookup, per-hop adjacency
   reads, property evaluation, aggregation, write clauses; honors DoS limits
   (`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`).
+- **Label-agnostic expansion** (`executor/expand.rs`) — traversals may omit the
+  relationship type and/or the target-node label (`(a)-[r]->(n)`, `(a)<-[r]-(n)`,
+  `-[r:T]->(n)`, `-[r]->(n:L)`). When a hop lacks a plan-time edge or vertex
+  table, the executor resolves it **per adjacency row**: the edge from the row's
+  recorded `edge_table`, and the opposite vertex from that edge's
+  `graph.source_label` / `graph.target_label` (outgoing → target, incoming →
+  source). The neighbor node and relationship hydrate with real properties, just
+  like a typed traversal. Requires the **edge-table endpoint-label contract**
+  (below); a resolution failure is loud (`400`), never a null endpoint.
 - **Variable-length paths** (`executor/varpath.rs`, `leapfrog.rs`) — BFS over
   `min..=max` hops with a visited set for cycle detection and a
   `max_var_path_visited` vertex budget (threat T13).
@@ -70,6 +79,20 @@ write as the edge row, not asynchronously. The background **reconciler** is the
 explicit, observable fallback: it scans edge tables to repair missing entries
 and scans the adjacency index to tombstone orphans, covering dropped-mutation
 and crash-recovery gaps. See [specs/data-flow.md](specs/data-flow.md).
+
+### Edge-table endpoint-label contract
+
+A graph **edge** table (`graph.type = edge`) must declare, besides its endpoint
+*columns* (`graph.source` / `graph.target`), its endpoint *labels*
+`graph.source_label` / `graph.target_label`, each naming an existing vertex
+table's `graph.label`. This is enforced at DDL time by `ferrosa-schema`
+(`registry.rs`) — creating an edge table without valid endpoint labels is
+rejected — so the metadata label-agnostic expansion relies on is guaranteed
+present. Typed traversals resolve the opposite vertex from the *query's* node
+label; label-agnostic traversals resolve it from these *edge-table* labels.
+Should an edge ever lack them (e.g. legacy data, or the referenced vertex table
+was dropped), a label-agnostic expansion **fails loud** with a `400` naming the
+edge and the missing key rather than returning a null endpoint.
 
 ## Public API (key entry points)
 

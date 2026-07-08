@@ -1166,47 +1166,63 @@ async fn execute_expand(
                         hop.edge_label.as_deref(),
                         expected_adjacency_direction(hop.direction),
                     ) {
-                        // t_8c506227: for a label-agnostic hop (no edge/vertex
-                        // label) resolve the edge + opposite-vertex tables from
-                        // this adjacency row so the neighbor hydrates. Typed
-                        // patterns keep their plan-time tables unchanged.
-                        let row_endpoints =
-                            if hop.edge_table.is_none() && hop.vertex_table.is_none() {
-                                let neighbor_direction = match hop.direction {
-                                    Direction::In => DIRECTION_IN,
-                                    Direction::Out => DIRECTION_OUT,
-                                    // Both: adjacency clustering's first component
-                                    // encodes the stored direction ([u16 len=1][dir]).
-                                    Direction::Both => {
-                                        row.clustering.get(2).copied().unwrap_or(DIRECTION_OUT)
-                                    }
-                                };
-                                Some(resolve_unlabeled_row_endpoints(
-                                    schema,
-                                    row,
-                                    neighbor_direction,
-                                )?)
-                            } else {
-                                None
-                            };
-                        let eff_edge_table = row_endpoints
+                        // t_8c506227: hydrate the opposite endpoint (and the
+                        // relationship) even when the pattern omitted the edge
+                        // and/or the target-node label. Each missing piece is
+                        // resolved from this adjacency row — the edge from its
+                        // recorded edge_table, the opposite vertex from that
+                        // edge's declared source/target label. Typed labels from
+                        // the plan take precedence and are left untouched, so the
+                        // typed traversal path is unchanged.
+                        let neighbor_direction = match hop.direction {
+                            Direction::In => DIRECTION_IN,
+                            Direction::Out => DIRECTION_OUT,
+                            // Both: the adjacency clustering's first component
+                            // encodes the stored direction ([u16 len=1][dir]).
+                            Direction::Both => {
+                                row.clustering.get(2).copied().unwrap_or(DIRECTION_OUT)
+                            }
+                        };
+                        // Recover the edge table when the pattern didn't name it
+                        // and we need it — to hydrate/filter the relationship, or
+                        // to locate an unlabeled target vertex.
+                        let need_edge = hop.rel_var.is_some()
+                            || !hop.prop_filters.is_empty()
+                            || hop.vertex_table.is_none();
+                        let resolved_edge = if hop.edge_table.is_none() && need_edge {
+                            Some(resolve_edge_from_adjacency_row(schema, row)?)
+                        } else {
+                            None
+                        };
+                        let eff_edge_table = hop
+                            .edge_table
                             .as_ref()
-                            .map(|e| &e.0)
-                            .or(hop.edge_table.as_ref());
+                            .or(resolved_edge.as_ref().map(|e| &e.0));
                         let eff_edge_meta =
-                            row_endpoints.as_ref().map(|e| &e.1).or(edge_meta.as_ref());
-                        let eff_vertex_table = row_endpoints
+                            edge_meta.as_ref().or(resolved_edge.as_ref().map(|e| &e.1));
+                        let eff_edge_label = hop
+                            .edge_label
+                            .as_deref()
+                            .or(eff_edge_table.map(|e| e.label.as_str()));
+                        // Resolve the opposite vertex table when the target node
+                        // was unlabeled, from the effective edge's metadata.
+                        let resolved_vertex = if hop.vertex_table.is_none() {
+                            match eff_edge_meta {
+                                Some(em) => {
+                                    Some(resolve_opposite_vertex(schema, em, neighbor_direction)?)
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let eff_vertex_table = hop
+                            .vertex_table
                             .as_ref()
-                            .map(|e| &e.2)
-                            .or(hop.vertex_table.as_ref());
-                        let eff_vertex_meta = row_endpoints
+                            .or(resolved_vertex.as_ref().map(|v| &v.0));
+                        let eff_vertex_meta = vertex_meta
                             .as_ref()
-                            .map(|e| &e.3)
-                            .or(vertex_meta.as_ref());
-                        let eff_edge_label = row_endpoints
-                            .as_ref()
-                            .map(|e| e.0.label.as_str())
-                            .or(hop.edge_label.as_deref());
+                            .or(resolved_vertex.as_ref().map(|v| &v.1));
 
                         let edge_match = if !hop.prop_filters.is_empty() || hop.rel_var.is_some() {
                             if let (Some(et), Some(meta)) = (eff_edge_table, eff_edge_meta) {
@@ -2533,22 +2549,15 @@ fn resolve_table_by_graph_label(
     })
 }
 
-/// Label-agnostic expansion (t_8c506227): the MATCH pattern gave no edge/vertex
-/// label, so resolve both from the adjacency row itself. Each adjacency row
-/// records its originating edge table (regular column 0, `keyspace.table`); we
-/// read that edge table's `graph.source_label` / `graph.target_label` to find
-/// the OPPOSITE vertex table (outgoing → target, incoming → source) so the
-/// neighbor node can be hydrated with real properties. Fails loud when the edge
-/// table or its endpoint-label metadata is missing/invalid rather than emitting
-/// a null endpoint (acceptance #4).
-#[allow(clippy::type_complexity)]
-fn resolve_unlabeled_row_endpoints(
+/// Label-agnostic expansion (t_8c506227): the MATCH pattern gave no edge label,
+/// so recover the edge table this adjacency row came from. Each adjacency row
+/// records its originating edge table in regular column 0 (`keyspace.table`).
+/// Fails loud when that column is missing or names a table absent from the
+/// schema rather than silently dropping the relationship's identity.
+fn resolve_edge_from_adjacency_row(
     schema: Option<&Schema>,
     adjacency_row: &Row,
-    neighbor_direction: u8,
 ) -> Result<(
-    crate::planner::ResolvedTable,
-    ferrosa_schema::metadata::table::TableMetadata,
     crate::planner::ResolvedTable,
     ferrosa_schema::metadata::table::TableMetadata,
 )> {
@@ -2565,8 +2574,8 @@ fn resolve_unlabeled_row_endpoints(
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .ok_or_else(|| {
             GraphError::Validation(
-                "adjacency row is missing its edge_table column; cannot hydrate the opposite \
-                 endpoint of a label-agnostic relationship expansion"
+                "adjacency row is missing its edge_table column; cannot hydrate the \
+                 relationship of a label-agnostic expansion"
                     .into(),
             )
         })?;
@@ -2580,6 +2589,40 @@ fn resolve_unlabeled_row_endpoints(
             "edge table '{edge_table_str}' recorded in adjacency is not registered in the schema"
         ))
     })?;
+    let edge_rt = crate::planner::ResolvedTable {
+        keyspace: edge_ks.to_string(),
+        table: edge_tbl.to_string(),
+        graph_type: "edge".to_string(),
+        label: edge_meta
+            .extensions
+            .get("graph.label")
+            .cloned()
+            .unwrap_or_default(),
+    };
+    Ok((edge_rt, edge_meta))
+}
+
+/// Resolve the OPPOSITE vertex table of an edge for a hop whose target node was
+/// unlabeled (t_8c506227). The opposite endpoint is the edge's target vertex
+/// for an outgoing traversal and its source vertex for an incoming one, named
+/// by the edge's `graph.target_label` / `graph.source_label`. Fails loud when
+/// the required endpoint label is absent or resolves to no vertex table, so a
+/// mis-declared edge surfaces as a clear error rather than a null endpoint
+/// (acceptance #4).
+fn resolve_opposite_vertex(
+    schema: Option<&Schema>,
+    edge_meta: &ferrosa_schema::metadata::table::TableMetadata,
+    neighbor_direction: u8,
+) -> Result<(
+    crate::planner::ResolvedTable,
+    ferrosa_schema::metadata::table::TableMetadata,
+)> {
+    let schema = schema.ok_or_else(|| {
+        GraphError::Validation(
+            "label-agnostic relationship expansion requires schema metadata".into(),
+        )
+    })?;
+    let edge_name = format!("{}.{}", edge_meta.keyspace, edge_meta.name);
     let (label_key, dir_word) = if neighbor_direction == DIRECTION_IN {
         ("graph.source_label", "incoming")
     } else {
@@ -2591,35 +2634,26 @@ fn resolve_unlabeled_row_endpoints(
         .cloned()
         .ok_or_else(|| {
             GraphError::Validation(format!(
-            "edge table '{edge_table_str}' lacks the '{label_key}' extension needed to hydrate \
-             the {dir_word} endpoint of a label-agnostic expansion; declare the edge's \
-             source/target vertex labels"
-        ))
-        })?;
-    let vertex_meta =
-        resolve_table_by_graph_label(schema, edge_ks, &vertex_label).ok_or_else(|| {
-            GraphError::Validation(format!(
-                "edge table '{edge_table_str}' declares {label_key}='{vertex_label}', but no \
-                 vertex table with graph.label '{vertex_label}' exists in keyspace '{edge_ks}'"
+                "edge table '{edge_name}' lacks the '{label_key}' extension needed to hydrate the \
+             {dir_word} endpoint of an unlabeled traversal; declare the edge's source/target \
+             vertex labels"
             ))
         })?;
-    let edge_rt = crate::planner::ResolvedTable {
-        keyspace: edge_ks.to_string(),
-        table: edge_tbl.to_string(),
-        graph_type: "edge".to_string(),
-        label: edge_meta
-            .extensions
-            .get("graph.label")
-            .cloned()
-            .unwrap_or_default(),
-    };
+    let vertex_meta = resolve_table_by_graph_label(schema, &edge_meta.keyspace, &vertex_label)
+        .ok_or_else(|| {
+            GraphError::Validation(format!(
+                "edge table '{edge_name}' declares {label_key}='{vertex_label}', but no vertex \
+                 table with graph.label '{vertex_label}' exists in keyspace '{}'",
+                edge_meta.keyspace
+            ))
+        })?;
     let vertex_rt = crate::planner::ResolvedTable {
         keyspace: vertex_meta.keyspace.clone(),
         table: vertex_meta.name.clone(),
         graph_type: "vertex".to_string(),
         label: vertex_label,
     };
-    Ok((edge_rt, edge_meta, vertex_rt, vertex_meta))
+    Ok((vertex_rt, vertex_meta))
 }
 
 /// Convert a `Literal` from the AST into raw bytes for storage.

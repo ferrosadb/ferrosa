@@ -89,6 +89,17 @@ full sequence.
    (Select for reads, Modify for writes) before planning — no plan executes for an
    unauthorized statement (threat T3). Observer/reconciler writes are internal
    system writes and run with system authority, not the caller's.
+6. **Edge tables declare their endpoint labels.** A `graph.type = edge` table
+   must carry `graph.source_label` / `graph.target_label`, each referencing an
+   existing vertex table, enforced at DDL time by `ferrosa-schema`. This is the
+   contract that lets **label-agnostic** expansion (`(a)-[r]->(n)` with the edge
+   and/or target-node label omitted) hydrate the opposite endpoint: when a hop
+   has no plan-time edge/vertex table, the expand executor resolves the edge from
+   the adjacency row's recorded `edge_table` and the opposite vertex from that
+   edge's endpoint label (outgoing → target, incoming → source), then hydrates
+   via the same path as a typed traversal. Missing/unresolvable endpoint metadata
+   is **fail-loud** (a `400`, naming the edge + missing key), never a null
+   endpoint — so a mis-declared edge is exposed, not silently empty.
 
 ## Position in the dependency graph
 

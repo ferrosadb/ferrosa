@@ -1,6 +1,6 @@
 ---
 title: "Graph: hydrate opposite endpoints for label-agnostic relationship expansion"
-status: proposed
+status: implemented
 crate: ferrosa-graph
 task: t_8c506227
 date: 2026-07-08
@@ -102,12 +102,22 @@ loud rather than silently return null (task acceptance #4).
   `hop.vertex_table` (and `hop.edge_table`) are `None`; labeled/typed patterns keep
   their existing, test-covered behavior byte-for-byte.
 
-**Highest-leverage open decision (needs your call):** does the loaded
-`sf_influence_query` keyspace's edge tables already declare
-`graph.source_label`/`graph.target_label`? If **yes**, the fix works on the existing
-data with no re-ingest. If **no**, generic recenter will (correctly) fail loud until
-the sf ingest sets those extensions on edge tables (a one-line schema addition +
-backfill/re-ingest). See §7.
+**RESOLVED (2026-07-08).** The loaded `sf_influence_query` edge tables **do**
+declare `graph.source_label`/`graph.target_label`, verified by running the fixed
+build against the live graph on the local sf node (`OWED_TO`/`DONATED_TO`
+neighbors hydrate with non-null ids + full edge props, both directions). The
+executor fix works on the existing data with **no re-ingest**. Moreover the
+write-side guarantee is **already enforced**: `ferrosa-schema` (`registry.rs`)
+rejects any `graph.type=edge` table lacking `graph.source_label`/`target_label`
+or whose labels don't reference existing vertex tables — so the metadata this
+relies on cannot be absent for a normally-created edge, and the query-time
+fail-loud is defense-in-depth.
+
+**Implementation note.** The fix resolves the edge and the opposite vertex
+**independently**, so it covers all four label combinations, not just the fully
+unlabeled one: `-[r]->(n)`, `<-[r]-(n)`, `-[r:T]->(n)` (typed edge, unlabeled
+node → vertex resolved from the edge's target label), and `-[r]->(n:L)`
+(unlabeled edge, labeled node → relationship hydrated from the adjacency edge).
 
 ## 4. Design
 
