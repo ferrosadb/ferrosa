@@ -6272,3 +6272,152 @@ async fn http_call_subquery_nested_call_fails_loud() {
         "a CALL {{}} nested inside a CALL {{}} must fail loud, not silently succeed"
     );
 }
+
+/// t_8c506227: a label-agnostic outgoing expansion `(a)-[r]->(n)` must hydrate
+/// the opposite endpoint node (and the relationship) across MULTIPLE edge
+/// labels — exactly like the typed `-[r:KNOWS]->` form does — instead of
+/// returning a null neighbor. Regression guard for the generic explorer's
+/// recenter / n-hop expansion over all relationship types.
+#[tokio::test]
+async fn http_label_agnostic_outgoing_expansion_hydrates_neighbor_nodes() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    create_social_likes_edge_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    register_social_likes_table_with_storage(&storage);
+
+    for name in ["Alice", "Bob", "Carol"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // Two DIFFERENT edge labels out of Alice, so the unlabeled hop must resolve
+    // the opposite vertex table per adjacency row (heterogeneous edge tables).
+    for (label, dst) in [("KNOWS", "Bob"), ("LIKES", "Carol")] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (a:Person {{name: 'Alice'}})-[r:{label}]->(b:Person {{name: '{dst}'}}) RETURN r"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "seeding the {label} edge should succeed"
+        );
+    }
+
+    // Label-agnostic outgoing expansion: BOTH neighbors must hydrate with real
+    // node properties, not null.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'Alice'})-[r]->(n) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            r[0].as_str()
+                .unwrap_or_else(|| {
+                    panic!("label-agnostic expansion left the neighbor un-hydrated (null): {r:?}")
+                })
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected both the KNOWS and LIKES neighbors, got {names:?}"
+    );
+    assert!(
+        names.contains(&"Bob".to_string()),
+        "KNOWS neighbor 'Bob' missing / un-hydrated: {names:?}"
+    );
+    assert!(
+        names.contains(&"Carol".to_string()),
+        "LIKES neighbor 'Carol' missing / un-hydrated: {names:?}"
+    );
+}
+
+/// t_8c506227 (inverse): a label-agnostic INCOMING expansion `(b)<-[r]-(n)`
+/// must hydrate the SOURCE neighbor (resolved via the edge's source label),
+/// not the target — the direction the earlier report found "surprising".
+#[tokio::test]
+async fn http_label_agnostic_incoming_expansion_hydrates_source_neighbor() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for name in ["Alice", "Bob"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN r",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Incoming expansion from Bob: the un-hydrated bug would leave n null; the
+    // fix must resolve the SOURCE vertex (Alice) via graph.source_label.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (b:Person {name: 'Bob'})<-[r]-(n) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one incoming neighbor, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0][0].as_str(),
+        Some("Alice"),
+        "incoming label-agnostic expansion must hydrate the SOURCE neighbor 'Alice': {rows:?}"
+    );
+}
