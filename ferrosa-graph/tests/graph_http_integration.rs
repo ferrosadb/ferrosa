@@ -6421,3 +6421,189 @@ async fn http_label_agnostic_incoming_expansion_hydrates_source_neighbor() {
         "incoming label-agnostic expansion must hydrate the SOURCE neighbor 'Alice': {rows:?}"
     );
 }
+
+/// t_8c506227 (partial-label gap): a TYPED edge with an UNLABELED target node
+/// `-[r:KNOWS]->(n)` must still hydrate `n` — its table is resolved from the
+/// edge's graph.target_label even though the pattern did not label `n`.
+#[tokio::test]
+async fn http_typed_edge_unlabeled_target_hydrates_neighbor() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for name in ["Alice", "Bob"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) RETURN r",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(n) RETURN n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "expected one neighbor, got {rows:?}");
+    assert_eq!(
+        rows[0][0].as_str(),
+        Some("Bob"),
+        "typed edge with unlabeled target must hydrate n via the edge's target_label: {rows:?}"
+    );
+}
+
+/// t_8c506227 (partial-label gap): an UNLABELED edge with a LABELED target
+/// `-[r]->(n:Person)` must hydrate the RELATIONSHIP `r` (real _type + edge
+/// properties), not fall back to raw adjacency cells (col_0).
+#[tokio::test]
+async fn http_unlabeled_edge_labeled_target_hydrates_relationship() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for name in ["Alice", "Bob"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MERGE (a:Person {name: 'Alice'})-[r:KNOWS {since: 2021}]->(b:Person {name: 'Bob'}) RETURN r",
+            "keyspace": "social"
+        })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person {name: 'Alice'})-[r]->(n:Person) RETURN r",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "expected one relationship, got {rows:?}");
+    let r = &rows[0][0];
+    assert_eq!(
+        r["_type"].as_str(),
+        Some("KNOWS"),
+        "unlabeled edge to a labeled target must hydrate r._type from the resolved edge: {r:?}"
+    );
+    assert_eq!(
+        r["since"].as_i64(),
+        Some(2021),
+        "relationship properties must be hydrated, not the col_0 fallback: {r:?}"
+    );
+    assert!(
+        r.get("col_0").is_none(),
+        "resolved relationship must not carry the raw col_0 adjacency fallback: {r:?}"
+    );
+}
+
+/// t_8c506227 (acceptance #4 / write-side guarantee): the "silent null endpoint"
+/// state is prevented at the source — a graph EDGE table must declare its
+/// endpoint labels, so creating one without `graph.target_label` is rejected at
+/// DDL time with a clear error rather than being allowed to exist and later
+/// yield un-hydratable neighbors.
+#[tokio::test]
+async fn graph_edge_table_without_endpoint_labels_is_rejected() {
+    let (schema, _storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    let auth = superuser_auth();
+
+    let mut cols = IndexMap::new();
+    cols.insert(
+        "src_id".to_string(),
+        ColumnMetadata {
+            name: "src_id".to_string(),
+            kind: ColumnKind::PartitionKey,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        },
+    );
+    cols.insert(
+        "dst_id".to_string(),
+        ColumnMetadata {
+            name: "dst_id".to_string(),
+            kind: ColumnKind::Clustering,
+            position: 0,
+            column_type: "uuid".to_string(),
+            clustering_order: ClusteringOrder::Asc,
+            mask: None,
+        },
+    );
+    let mut ext = HashMap::new();
+    ext.insert("graph.type".to_string(), "edge".to_string());
+    ext.insert("graph.label".to_string(), "UNDECLARED".to_string());
+    ext.insert("graph.source".to_string(), "src_id".to_string());
+    ext.insert("graph.target".to_string(), "dst_id".to_string());
+    // Deliberately no graph.source_label / graph.target_label.
+
+    let result = schema.create_table(
+        TableMetadata {
+            keyspace: "social".to_string(),
+            name: "undeclared_e".to_string(),
+            id: Uuid::new_v4(),
+            columns: cols,
+            partition_key: vec!["src_id".to_string()],
+            clustering_key: vec![("dst_id".to_string(), ClusteringOrder::Asc)],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: ext,
+            is_system: false,
+        },
+        &auth,
+    );
+
+    let err = result
+        .expect_err("an edge table missing its endpoint labels must be rejected, not created");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("graph.source_label") || msg.contains("graph.target_label"),
+        "rejection must name the missing endpoint-label extension: {msg}"
+    );
+    assert!(
+        msg.contains("undeclared_e"),
+        "rejection must name the offending edge table: {msg}"
+    );
+}
