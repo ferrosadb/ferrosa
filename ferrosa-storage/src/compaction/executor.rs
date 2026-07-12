@@ -452,7 +452,12 @@ impl CompactionExecutor {
     }
 
     /// Submits a compaction task to the background thread.
-    pub fn submit(&self, task: CompactionTask) -> ferrosa_common::Result<()> {
+    ///
+    /// Returns `Ok(false)` when one or more input SSTables are already claimed
+    /// by another queued or running task. Callers that need to report whether
+    /// a bounded maintenance batch was actually accepted can use this result
+    /// instead of treating overlap suppression as a successful submission.
+    pub fn try_submit(&self, task: CompactionTask) -> ferrosa_common::Result<bool> {
         crate::metrics::inc_compaction_submitted();
         if !Self::try_claim_in_flight_inputs(&self.in_flight_inputs, &task) {
             crate::metrics::inc_compaction_skipped_overlap();
@@ -461,7 +466,7 @@ impl CompactionExecutor {
                 inputs = task.inputs.len(),
                 "compaction: skipping overlapping task already in flight"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.task_txs.len();
@@ -471,7 +476,7 @@ impl CompactionExecutor {
             queued_at: Instant::now(),
         };
         match self.task_txs[worker_idx].send(queued) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(err) => {
                 crate::metrics::dec_compaction_queue_depth();
                 Self::release_in_flight_inputs(&self.in_flight_inputs, &err.0.task);
@@ -480,6 +485,12 @@ impl CompactionExecutor {
                 ))
             }
         }
+    }
+
+    /// Submits a compaction task and preserves the historical overlap behavior
+    /// for callers that do not need to distinguish a skipped task.
+    pub fn submit(&self, task: CompactionTask) -> ferrosa_common::Result<()> {
+        self.try_submit(task).map(|_| ())
     }
 
     /// Polls for completed compaction results (non-blocking).
