@@ -14,12 +14,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::WebAppState;
@@ -30,11 +31,28 @@ const MAX_SECONDS: u64 = 60;
 /// Maximum collected folded-stack data before we stop (64 MB).
 const MAX_COLLECT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default input cap for one operator-triggered incremental compaction batch.
+const DEFAULT_INCREMENTAL_COMPACTION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Never let the debug endpoint schedule more SSTables than normal STCS does.
+const MAX_INCREMENTAL_COMPACTION_SSTABLES: usize = 32;
+/// Never let a debug request exceed the normal default STCS byte cap.
+const MAX_INCREMENTAL_COMPACTION_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_INCREMENTAL_COMPACTION_SSTABLES: usize = 8;
+
 /// Query parameters for the flamechart endpoint.
 #[derive(Debug, Deserialize)]
 pub struct FlamechartParams {
     /// Duration in seconds to profile.
     seconds: Option<u64>,
+}
+
+/// Optional bounds for one incremental compaction batch.
+#[derive(Debug, Deserialize)]
+pub struct IncrementalCompactionParams {
+    /// Maximum input SSTables. Defaults to 8 and is capped at 32.
+    max_sstables: Option<usize>,
+    /// Maximum combined input bytes. Defaults to 256 MiB and is capped at 512 MiB.
+    max_input_bytes: Option<u64>,
 }
 
 /// Shared state for the debug profiler — one profiling session at a time.
@@ -63,6 +81,10 @@ pub fn debug_routes() -> Router<WebAppState> {
     Router::new()
         .route("/flamechart", get(flamechart_handler))
         .route("/force-compact", axum::routing::post(force_compact_handler))
+        .route(
+            "/incremental-compact/{keyspace}/{table}",
+            post(incremental_compact_handler),
+        )
 }
 
 /// Force compaction for all tables. Useful for debugging compaction issues.
@@ -73,6 +95,126 @@ async fn force_compact_handler(State(state): State<WebAppState>) -> impl IntoRes
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     state.storage.poll_compactions().await;
     (StatusCode::OK, "compaction triggered and polled\n")
+}
+
+/// Schedule one bounded, streaming compaction batch for a table.
+///
+/// `POST /api/debug/incremental-compact/{keyspace}/{table}`
+///
+/// The request deliberately schedules only one batch. Operators wait for the
+/// normal maintenance loop to promote it, then call this endpoint again. That
+/// prevents a full-table rewrite from accumulating an unbounded queue, memory
+/// working set, or temporary disk footprint.
+async fn incremental_compact_handler(
+    headers: axum::http::HeaderMap,
+    Path((keyspace, table)): Path<(String, String)>,
+    Query(params): Query<IncrementalCompactionParams>,
+    State(state): State<WebAppState>,
+) -> Response {
+    if let Err(resp) = check_auth(&headers) {
+        return resp;
+    }
+    if let Err(resp) = check_ip_whitelist(None) {
+        return resp;
+    }
+
+    let max_sstables = params
+        .max_sstables
+        .unwrap_or(DEFAULT_INCREMENTAL_COMPACTION_SSTABLES);
+    if !(2..=MAX_INCREMENTAL_COMPACTION_SSTABLES).contains(&max_sstables) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("max_sstables must be between 2 and {MAX_INCREMENTAL_COMPACTION_SSTABLES}"),
+        )
+            .into_response();
+    }
+
+    let max_input_bytes = params
+        .max_input_bytes
+        .unwrap_or(DEFAULT_INCREMENTAL_COMPACTION_MAX_BYTES);
+    if !(1..=MAX_INCREMENTAL_COMPACTION_BYTES).contains(&max_input_bytes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("max_input_bytes must be between 1 and {MAX_INCREMENTAL_COMPACTION_BYTES}"),
+        )
+            .into_response();
+    }
+
+    let table_id = ferrosa_storage::TableId::new(&keyspace, &table);
+    match state.storage.schedule_incremental_compaction(
+        &table_id,
+        max_sstables,
+        max_input_bytes,
+    ) {
+        Ok(ferrosa_storage::IncrementalCompactionSchedule::TableNotFound) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "error": "table not found",
+                "keyspace": keyspace,
+                "table": table,
+            })),
+        )
+            .into_response(),
+        Ok(ferrosa_storage::IncrementalCompactionSchedule::NoEligibleBatch {
+            available_sstables,
+        }) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "status": "complete",
+                "available_sstables": available_sstables,
+                "message": "fewer than two SSTables fit within the requested batch limits",
+            })),
+        )
+            .into_response(),
+        Ok(ferrosa_storage::IncrementalCompactionSchedule::InFlight {
+            input_sstables,
+            input_bytes,
+        }) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "status": "in_flight",
+                "input_sstables": input_sstables,
+                "input_bytes": input_bytes,
+                "message": "wait for the current batch to swap before scheduling another",
+            })),
+        )
+            .into_response(),
+        Ok(ferrosa_storage::IncrementalCompactionSchedule::InsufficientDisk {
+            available_bytes,
+            required_bytes,
+        }) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({
+                "status": "insufficient_disk",
+                "available_bytes": available_bytes,
+                "required_bytes": required_bytes,
+                "message": "the batch needs staged-output headroom plus the configured disk reserve",
+            })),
+        )
+            .into_response(),
+        Ok(ferrosa_storage::IncrementalCompactionSchedule::Scheduled {
+            input_sstables,
+            input_bytes,
+            available_sstables,
+        }) => (
+            StatusCode::ACCEPTED,
+            axum::Json(json!({
+                "status": "scheduled",
+                "keyspace": keyspace,
+                "table": table,
+                "input_sstables": input_sstables,
+                "input_bytes": input_bytes,
+                "available_sstables": available_sstables,
+                "message": "wait for this batch to swap before requesting the next batch",
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// Check the admin auth token from the `Authorization: Bearer <token>` header.
@@ -678,6 +820,50 @@ mod tests {
             StatusCode::NOT_FOUND,
             "GET /api/debug/flamechart must not return 404"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn incremental_compaction_endpoint_requires_auth_and_reports_missing_table() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "test-secret-42");
+        }
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/debug/incremental-compact/missing/table")
+            .header(axum::http::header::AUTHORIZATION, "Bearer test-secret-42")
+            .method("POST")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(env)]
+    async fn incremental_compaction_endpoint_rejects_unbounded_batch_limits() {
+        unsafe {
+            std::env::set_var("FERROSA_DEBUG_AUTH_TOKEN", "test-secret-42");
+        }
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/debug/incremental-compact/missing/table?max_sstables=33")
+            .header(axum::http::header::AUTHORIZATION, "Bearer test-secret-42")
+            .method("POST")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(router, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        unsafe {
+            std::env::remove_var("FERROSA_DEBUG_AUTH_TOKEN");
+        }
     }
 
     #[tokio::test]
