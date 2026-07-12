@@ -58,9 +58,9 @@ pub use compaction::{
 };
 pub use data_store::{DataStore, LocalDataStore};
 pub use engine::{
-    BatchOp, BatchTxn, IndexReloadOutcome, PersistedIndexRow, StorageEngine, StorageEngineConfig,
-    TempSortTableReservation, TimeSeriesWasmAggregateExecutor, TimeSeriesWasmAggregateInvocation,
-    FILTER_PREDICATE_OPTION_KEY,
+    BatchOp, BatchTxn, IncrementalCompactionSchedule, IndexReloadOutcome, PersistedIndexRow,
+    StorageEngine, StorageEngineConfig, TempSortTableReservation, TimeSeriesWasmAggregateExecutor,
+    TimeSeriesWasmAggregateInvocation, FILTER_PREDICATE_OPTION_KEY,
 };
 pub use external_sort::{ExternalSorter, RowOrder, SortedRows};
 pub use flush::{FileFlushTarget, FlushTarget, InMemoryFlushTarget};

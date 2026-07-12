@@ -417,6 +417,36 @@ pub struct StorageEngineConfig {
     pub memtable_num_shards: usize,
 }
 
+/// The outcome of scheduling one bounded incremental compaction batch.
+///
+/// A batch is deliberately limited to a small set of SSTables. The caller must
+/// wait for it to swap before requesting the next batch, which keeps both the
+/// compaction working set and temporary on-disk output bounded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncrementalCompactionSchedule {
+    /// The requested table is not registered on this node.
+    TableNotFound,
+    /// Fewer than two SSTables fit within the caller's batch limits.
+    NoEligibleBatch { available_sstables: usize },
+    /// A selected input is already part of a queued or running compaction.
+    InFlight {
+        input_sstables: usize,
+        input_bytes: u64,
+    },
+    /// The batch would violate the local disk reserve while its staged output
+    /// coexists with the input SSTables.
+    InsufficientDisk {
+        available_bytes: u64,
+        required_bytes: u64,
+    },
+    /// Exactly one bounded, streaming compaction task was accepted.
+    Scheduled {
+        input_sstables: usize,
+        input_bytes: u64,
+        available_sstables: usize,
+    },
+}
+
 impl StorageEngineConfig {
     /// Reads configuration from `FERROSA_*` environment variables.
     pub fn from_env() -> ferrosa_common::Result<Self> {
@@ -755,6 +785,45 @@ thread_local! {
     /// orphaned/dangling registrations (t_ee98faa0 layer 2, suspect 2).
     pub(crate) static FTS_SIDECAR_FILES_CONSULTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+/// Select the next compaction batch without accumulating an unbounded input
+/// set. Sorting by component size keeps early passes cheap and lets repeated
+/// calls progressively consolidate small SSTables before larger outputs.
+fn select_incremental_compaction_batch(
+    mut metadata: Vec<crate::compaction::metadata::SSTableMetadata>,
+    max_sstables: usize,
+    max_input_bytes: u64,
+) -> Vec<crate::compaction::metadata::SSTableMetadata> {
+    metadata.sort_by(|left, right| {
+        left.size_bytes
+            .cmp(&right.size_bytes)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut selected = Vec::with_capacity(max_sstables);
+    let mut selected_bytes = 0_u64;
+    for sstable in metadata {
+        if selected.len() >= max_sstables {
+            break;
+        }
+        let next_bytes = selected_bytes.saturating_add(sstable.size_bytes);
+        if next_bytes > max_input_bytes {
+            break;
+        }
+        selected_bytes = next_bytes;
+        selected.push(sstable);
+    }
+    selected
+}
+
+/// Reserve room for both the staged raw output and its promoted SSTable while
+/// preserving the normal write-path free-space reserve. The compaction writer
+/// is streaming, but file promotion can briefly require two output copies.
+fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes: u64) -> u64 {
+    input_bytes
+        .saturating_mul(2)
+        .saturating_add(disk_reserve_bytes)
 }
 
 /// Top-level storage engine.
@@ -7648,6 +7717,91 @@ impl StorageEngine {
         }
     }
 
+    /// Schedule one bounded, streaming compaction batch for a single table.
+    ///
+    /// Unlike [`Self::force_compact_all`], this never submits an entire table
+    /// at once. It chooses the smallest SSTables first, caps both input count
+    /// and input bytes, and requires enough free disk for a staged output plus
+    /// the configured write reserve before it queues work. A caller should
+    /// wait for the batch to swap before requesting another one.
+    pub fn schedule_incremental_compaction(
+        &self,
+        table_id: &TableId,
+        max_sstables: usize,
+        max_input_bytes: u64,
+    ) -> ferrosa_common::Result<IncrementalCompactionSchedule> {
+        if max_sstables < 2 || max_input_bytes == 0 {
+            return Ok(IncrementalCompactionSchedule::NoEligibleBatch {
+                available_sstables: self.sstable_count(table_id),
+            });
+        }
+
+        let (available_sstables, inputs, schema) = {
+            let tables = self.tables.read();
+            let Some(state) = tables.get(table_id) else {
+                return Ok(IncrementalCompactionSchedule::TableNotFound);
+            };
+            let metadata = self.collect_sstable_metadata(table_id, state);
+            let available_sstables = metadata.len();
+            let inputs =
+                select_incremental_compaction_batch(metadata, max_sstables, max_input_bytes);
+            (available_sstables, inputs, state.schema.clone())
+        };
+
+        if inputs.len() < 2 {
+            return Ok(IncrementalCompactionSchedule::NoEligibleBatch { available_sstables });
+        }
+
+        let input_bytes = inputs.iter().map(|input| input.size_bytes).sum::<u64>();
+        let available_bytes = self.disk_free_bytes_cached();
+        let required_bytes = incremental_compaction_disk_reservation(
+            input_bytes,
+            self.config.local_disk_free_reserve_bytes,
+        );
+        if available_bytes < required_bytes {
+            tracing::warn!(
+                %table_id,
+                input_sstables = inputs.len(),
+                input_bytes,
+                available_bytes,
+                required_bytes,
+                "incremental compaction refused: insufficient disk headroom"
+            );
+            return Ok(IncrementalCompactionSchedule::InsufficientDisk {
+                available_bytes,
+                required_bytes,
+            });
+        }
+
+        let task = crate::compaction::metadata::CompactionTask {
+            inputs,
+            output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
+            schema,
+            table_id: table_id.clone(),
+        };
+        let input_sstables = task.inputs.len();
+        match self.compaction_executor.try_submit(task)? {
+            true => {
+                tracing::info!(
+                    %table_id,
+                    input_sstables,
+                    input_bytes,
+                    available_sstables,
+                    "incremental compaction batch scheduled"
+                );
+                Ok(IncrementalCompactionSchedule::Scheduled {
+                    input_sstables,
+                    input_bytes,
+                    available_sstables,
+                })
+            }
+            false => Ok(IncrementalCompactionSchedule::InFlight {
+                input_sstables,
+                input_bytes,
+            }),
+        }
+    }
+
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);
@@ -9217,6 +9371,124 @@ mod tests {
     #[cfg(feature = "live-infra-tests")]
     use ferrosa_sstable::statistics::{CompactionMetadata, StatsMetadata};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+
+    fn incremental_batch_metadata(
+        id: &str,
+        size_bytes: u64,
+    ) -> crate::compaction::metadata::SSTableMetadata {
+        crate::compaction::metadata::SSTableMetadata {
+            id: id.to_string(),
+            path: std::path::PathBuf::new(),
+            size_bytes,
+            min_token: 0,
+            max_token: 0,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 1,
+            legacy_format: false,
+        }
+    }
+
+    #[test]
+    fn incremental_compaction_batch_is_bounded_by_count_and_bytes() {
+        let selected = select_incremental_compaction_batch(
+            vec![
+                incremental_batch_metadata("4", 64),
+                incremental_batch_metadata("2", 64),
+                incremental_batch_metadata("1", 64),
+                incremental_batch_metadata("3", 64),
+            ],
+            3,
+            128,
+        );
+
+        assert_eq!(selected.len(), 2, "the byte cap must win over file count");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|sstable| sstable.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"],
+            "equal-sized SSTables are selected deterministically"
+        );
+        assert!(
+            selected
+                .iter()
+                .map(|sstable| sstable.size_bytes)
+                .sum::<u64>()
+                <= 128,
+            "a scheduled batch must never exceed its input byte cap"
+        );
+    }
+
+    #[test]
+    fn incremental_compaction_reserves_two_output_copies_and_write_reserve() {
+        assert_eq!(incremental_compaction_disk_reservation(256, 64), 576);
+        assert_eq!(
+            incremental_compaction_disk_reservation(u64::MAX, 64),
+            u64::MAX,
+            "the disk reservation must saturate instead of wrapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_compaction_schedules_one_bounded_batch_and_refuses_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 100;
+        config.local_disk_free_reserve_bytes = 64;
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let table_id = table_id();
+
+        for (key, value, timestamp) in [
+            ("batch-1", b"one".as_slice(), 1_000),
+            ("batch-2", b"two".as_slice(), 2_000),
+            ("batch-3", b"three".as_slice(), 3_000),
+        ] {
+            engine
+                .write(
+                    &table_id,
+                    &make_key(key),
+                    make_row(value, timestamp),
+                    timestamp,
+                )
+                .unwrap();
+            engine.flush(&table_id).unwrap();
+        }
+
+        engine.set_disk_free_cache_for_test(64);
+        assert!(matches!(
+            engine
+                .schedule_incremental_compaction(&table_id, 2, 1024 * 1024)
+                .unwrap(),
+            IncrementalCompactionSchedule::InsufficientDisk { .. }
+        ));
+
+        engine.set_disk_free_cache_for_test(1024 * 1024 * 1024);
+        let first = engine
+            .schedule_incremental_compaction(&table_id, 2, 1024 * 1024)
+            .unwrap();
+        assert!(matches!(
+            first,
+            IncrementalCompactionSchedule::Scheduled {
+                input_sstables: 2,
+                available_sstables: 3,
+                ..
+            }
+        ));
+
+        let second = engine
+            .schedule_incremental_compaction(&table_id, 2, 1024 * 1024)
+            .unwrap();
+        assert!(matches!(
+            second,
+            IncrementalCompactionSchedule::InFlight {
+                input_sstables: 2,
+                ..
+            }
+        ));
+    }
 
     /// Regression (issue #172): a fresh install passes its data dir via
     /// `[storage].data_dir` in the TOML, which `main` resolves and exports as
