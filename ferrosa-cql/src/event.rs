@@ -54,7 +54,6 @@ pub enum SchemaChangeType {
 pub enum SchemaTarget {
     Keyspace,
     Table,
-    Index,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +89,6 @@ impl CqlEvent {
                 let tgt = match target {
                     SchemaTarget::Keyspace => "KEYSPACE",
                     SchemaTarget::Table => "TABLE",
-                    SchemaTarget::Index => "INDEX",
                 };
                 write_string(&mut buf, tgt);
                 write_string(&mut buf, keyspace);
