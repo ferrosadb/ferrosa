@@ -88,6 +88,13 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+`PartitionIndexLookup` and the generic scalar equality plans only consider
+B-tree, hash, composite, phonetic, and filtered indexes. Full-text, vector, and
+geo indexes use their dedicated operators; allowing them into a scalar `=` plan
+would consult an incompatible storage map and could turn a valid keyed read
+into a false empty result when, for example, a full-text and phonetic index
+share the same column.
+
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
 it resolves the matching row-granular doc keys through the cluster write path
 (`WritePath::fulltext_search`) — which scatter-gathers across every node's local
