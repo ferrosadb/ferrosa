@@ -103,7 +103,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   table is not registered in this engine process. Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after `schema.json`
-  boot preload. Replaying an already-registered declaration is a no-op only
+  boot preload. Concurrent registration is compare-and-install: a late schema
+  replay merges declarations into the winning store instead of replacing its
+  live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable
   postings (including phonetic postings) instead of replacing the live index.
   Boot-time
