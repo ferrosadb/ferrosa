@@ -699,61 +699,6 @@ pub(crate) async fn handle_connection<S>(
                             break;
                         }
 
-                        if was_ready
-                            && maybe_frame.header.opcode == Opcode::Register
-                            && opcode == Opcode::Ready
-                        {
-                            // Deliver any missed schema-change event inline after
-                            // the READY reply, so the driver has registered and
-                            // expects EVENT frames on this connection.
-                            if event_forwarder_cancel.is_none() {
-                                let missed_event =
-                                    state.last_schema_event.borrow().as_ref().and_then(
-                                        |(event, ts)| {
-                                            if ts.elapsed() < std::time::Duration::from_secs(10) {
-                                                Some(event.clone())
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    );
-                                if let Some(event) = missed_event {
-                                    let evt_frame = build_event_frame(event, response_version);
-                                    if framed.send(evt_frame).await.is_err() {
-                                        break;
-                                    }
-                                }
-
-                                let cancel = CancellationToken::new();
-                                spawn_schema_event_forwarder(
-                                    state.clone(),
-                                    event_tx.clone(),
-                                    response_version,
-                                    cancel.clone(),
-                                );
-                                event_forwarder_cancel = Some(cancel);
-                            } else {
-                                // Forwarder already started from the pre-handle
-                                // block; just deliver the missed event.
-                                let missed_event =
-                                    state.last_schema_event.borrow().as_ref().and_then(
-                                        |(event, ts)| {
-                                            if ts.elapsed() < std::time::Duration::from_secs(10) {
-                                                Some(event.clone())
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    );
-                                if let Some(event) = missed_event {
-                                    let evt_frame = build_event_frame(event, response_version);
-                                    if framed.send(evt_frame).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
                         // After READY or AUTH_SUCCESS, enable post-handshake features.
                         if opcode == Opcode::Ready || opcode == Opcode::AuthSuccess {
                             if let Some(compression) = pending_compression.take() {

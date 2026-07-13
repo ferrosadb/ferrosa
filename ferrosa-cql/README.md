@@ -122,7 +122,8 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast
-  channel.
+  channel. A reconnecting control connection receives a retained schema-change
+  event at most once, avoiding duplicate driver metadata refreshes after DDL.
 - **Virtual tables** (`virtual_tables/`) — `system_observability.*` runtime
   introspection tables (active_queries, connections, billing, index_usage,
   full_scan_reasons, materialization queues, alerts, query_fingerprints, …) plus

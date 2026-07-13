@@ -49,6 +49,24 @@ async fn start_server() -> (std::net::SocketAddr, tempfile::TempDir) {
     (addr, dir)
 }
 
+async fn start_server_with_retained_table_schema_event() -> (std::net::SocketAddr, tempfile::TempDir)
+{
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = ferrosa_cql::test_util::standalone_for_test(dir.path());
+    state.last_schema_event.send_replace(Some((
+        ferrosa_cql::event::CqlEvent::SchemaChange {
+            change_type: ferrosa_cql::event::SchemaChangeType::Created,
+            target: ferrosa_cql::event::SchemaTarget::Table,
+            keyspace: "regression".to_string(),
+            name: Some("entity_store".to_string()),
+        },
+        std::time::Instant::now(),
+    )));
+    let server = CqlServer::new(test_config(), state);
+    let addr = server.start_background().await.unwrap();
+    (addr, dir)
+}
+
 fn encode_startup_frame(version: u8) -> BytesMut {
     let mut body = BytesMut::new();
     body.put_u16(1);
@@ -82,6 +100,26 @@ fn encode_options_frame(version: u8) -> BytesMut {
     };
     let mut buf = BytesMut::new();
     header.encode(&mut buf);
+    buf
+}
+
+fn encode_register_schema_change_frame(version: u8) -> BytesMut {
+    let mut body = BytesMut::new();
+    body.put_u16(1); // string-list item count
+    let event = b"SCHEMA_CHANGE";
+    body.put_u16(event.len() as u16);
+    body.put_slice(event);
+
+    let header = FrameHeader {
+        version,
+        flags: 0,
+        stream_id: 1,
+        opcode: Opcode::Register,
+        length: body.len() as u32,
+    };
+    let mut buf = BytesMut::new();
+    header.encode(&mut buf);
+    buf.extend_from_slice(&body);
     buf
 }
 
@@ -275,6 +313,36 @@ async fn v4_startup_receives_ready_with_v4_response_byte() {
     assert_eq!(
         resp.header.version, 0x84,
         "server must reply to v4 with 0x84"
+    );
+}
+
+/// A reconnecting control connection must receive a retained schema change at
+/// most once.  Duplicate TABLE events make the Scylla driver launch concurrent
+/// metadata refreshes; after CREATE INDEX this caused client reads to return no
+/// rows in Ferrosa Memory's merge queue.
+#[tokio::test]
+async fn register_replays_retained_table_schema_event_once() {
+    let (addr, _dir) = start_server_with_retained_table_schema_event().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    send_frame(&mut stream, &encode_startup_frame(0x04)).await;
+    assert_eq!(read_frame(&mut stream).await.header.opcode, Opcode::Ready);
+
+    send_frame(&mut stream, &encode_register_schema_change_frame(0x04)).await;
+    assert_eq!(read_frame(&mut stream).await.header.opcode, Opcode::Ready);
+
+    let event = read_frame(&mut stream).await;
+    assert_eq!(event.header.opcode, Opcode::Event);
+    assert!(event
+        .body
+        .windows("SCHEMA_CHANGE".len())
+        .any(|window| window == b"SCHEMA_CHANGE"));
+
+    assert!(
+        timeout(Duration::from_millis(250), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "a retained table schema event must not be replayed twice"
     );
 }
 
