@@ -38,7 +38,7 @@ use crate::commitlog::CommitLog;
 use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
-use crate::flush::FileFlushTarget;
+use crate::flush::{FileFlushTarget, REQUIRED_SSTABLE_COMPONENTS};
 use crate::store::{TableStore, VectorIndexConfig, VectorIndexMethod};
 use crate::timeseries::aggregator::decode_typed_numeric;
 use crate::timeseries::config::{validate_numeric_columns, ConsolidationConfig};
@@ -3664,14 +3664,45 @@ impl StorageEngine {
         index_type: ferrosa_index::IndexType,
         filter_predicate: Option<ferrosa_index::FilterPredicate>,
     ) -> ferrosa_common::Result<()> {
-        // Register with the tracker.
-        self.index_tracker
-            .register_index(table_id.keyspace(), table_id.table(), index_name);
-
         let mut tables = self.tables.write();
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
+
+        // Schema events can be replayed after a reconnect. Replacing an
+        // already-live MemtableIndex would throw away every unflushed posting,
+        // making a read-after-write secondary-index query spuriously empty.
+        // The declaration must therefore be idempotent when it agrees with the
+        // registered column/type, and fail loud if the same name is reused for
+        // a different definition.
+        if let Some((_, existing_position)) = state
+            .store
+            .indexed_columns()
+            .iter()
+            .find(|(name, _)| name == index_name)
+        {
+            if *existing_position != column_position {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "index {index_name} already registered on {table_id} at column \
+                     {existing_position}, not {column_position}"
+                )));
+            }
+            let existing_type = state.store.index_type_for(index_name);
+            if existing_type != index_type {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "index {index_name} already registered on {table_id} as \
+                     {existing_type:?}, not {index_type:?}"
+                )));
+            }
+            drop(tables);
+            self.index_tracker
+                .register_index(table_id.keyspace(), table_id.table(), index_name);
+            return Ok(());
+        }
+
+        // Register with the tracker only after accepting the declaration.
+        self.index_tracker
+            .register_index(table_id.keyspace(), table_id.table(), index_name);
         state.store.add_index_with_predicate(
             index_name.to_string(),
             column_position,
@@ -8370,6 +8401,24 @@ impl StorageEngine {
 
                 let files = Self::collect_sstable_files(table_dir, gen);
                 if files.is_empty() {
+                    continue;
+                }
+
+                let missing_components: Vec<&str> = REQUIRED_SSTABLE_COMPONENTS
+                    .iter()
+                    .copied()
+                    .filter(|component| {
+                        let required_name = format!("{gen_str}-{component}");
+                        !files.iter().any(|file| file.name == required_name)
+                    })
+                    .collect();
+                if !missing_components.is_empty() {
+                    tracing::warn!(
+                        table = table_id_str,
+                        sstable = gen_str,
+                        ?missing_components,
+                        "s3-sync: skipping incomplete SSTable generation"
+                    );
                     continue;
                 }
 
@@ -18469,6 +18518,51 @@ mod tests {
         );
     }
 
+    /// Replaying an already-applied CREATE INDEX must preserve the active
+    /// memtable postings. Schema-event delivery is at-least-once, and replacing
+    /// the index map here would make a just-written phonetic row disappear
+    /// until a flush rebuilt its sidecar.
+    #[test]
+    fn duplicate_index_registration_preserves_unflushed_postings() {
+        use ferrosa_index::{IndexKey, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = TableId::new("test_ks", "test_table");
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_index(&table_id, "name_idx", 0, IndexType::Phonetic)
+            .unwrap();
+
+        let key = make_key("pk");
+        engine
+            .write(&table_id, &key, make_row(b"John", 1000), 1000)
+            .unwrap();
+        engine
+            .add_index(&table_id, "name_idx", 0, IndexType::Phonetic)
+            .unwrap();
+
+        assert_eq!(
+            engine
+                .read_by_index(&table_id, "name_idx", &IndexKey(b"Jon".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "duplicate index registration must not discard the live phonetic posting"
+        );
+
+        let type_conflict = engine
+            .add_index(&table_id, "name_idx", 0, IndexType::BTree)
+            .expect_err("a replay that changes index type must fail loud");
+        assert!(type_conflict.to_string().contains("Phonetic"));
+
+        let position_conflict = engine
+            .add_index(&table_id, "name_idx", 1, IndexType::Phonetic)
+            .expect_err("a replay that changes index column must fail loud");
+        assert!(position_conflict.to_string().contains("column 0"));
+    }
+
     #[test]
     fn drop_index_clears_tracker_when_table_is_not_registered() {
         let dir = tempfile::tempdir().unwrap();
@@ -19417,6 +19511,135 @@ mod tests {
     }
 
     // ── C2.2: S3 upload confirmation before manifest update ──────────────────
+
+    fn s3_sync_fixture(
+        prefix: &str,
+        components: &[(&str, &[u8])],
+    ) -> (
+        tempfile::TempDir,
+        StorageEngine,
+        Arc<dyn object_store::ObjectStore>,
+        String,
+        TableId,
+    ) {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = prefix.to_string();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.object_store = Some(crate::upload::ObjectStoreConfig {
+            prefix: prefix.clone(),
+            ..crate::upload::ObjectStoreConfig::test_config()
+        });
+        let engine = StorageEngine::new_with_upload_store(
+            config,
+            Arc::clone(&store),
+            prefix.clone(),
+            &tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        let table_dir = engine.table_sstable_dir(&tid);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        for (component, bytes) in components {
+            std::fs::write(table_dir.join(format!("1-{component}")), bytes).unwrap();
+        }
+
+        (dir, engine, store, prefix, tid)
+    }
+
+    #[tokio::test]
+    async fn sync_s3_rejects_generation_missing_required_rows_component() {
+        let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
+            "test-sync-missing-rows",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+            ],
+        );
+
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let entries = manifest
+            .sstables
+            .get(&tid.to_string())
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            uploaded, 0,
+            "sync must not upload a generation missing Rows.db; manifest entries: {entries:?}"
+        );
+        assert!(
+            entries.is_empty(),
+            "remote manifest must not contain a generation missing Rows.db: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_s3_accepts_present_zero_byte_rows_component() {
+        let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
+            "test-sync-empty-rows",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+                ("Rows.db", b""),
+                ("Filter.db", b"legacy filter"),
+            ],
+        );
+
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let entries = manifest
+            .sstables
+            .get(&tid.to_string())
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(uploaded, 1, "present zero-byte Rows.db must be uploaded");
+        assert_eq!(
+            entries.len(),
+            1,
+            "present zero-byte Rows.db must not prevent manifest publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_s3_rejects_generation_missing_required_filter_component() {
+        let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
+            "test-sync-missing-filter",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+                ("Rows.db", b""),
+            ],
+        );
+
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
+            .await
+            .unwrap();
+        let entries = manifest
+            .sstables
+            .get(&tid.to_string())
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            uploaded, 0,
+            "sync must not upload a generation missing Filter.db; manifest entries: {entries:?}"
+        );
+        assert!(
+            entries.is_empty(),
+            "remote manifest must not contain a generation missing Filter.db: {entries:?}"
+        );
+    }
 
     /// Object store wrapper that fails all PUT operations immediately with a
     /// non-transient error, simulating an S3 outage.  Read operations are

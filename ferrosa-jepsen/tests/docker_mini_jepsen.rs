@@ -9,8 +9,25 @@
 //!   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test docker_mini_jepsen -- --nocapture
 
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use uuid::Uuid;
+
+const CQLSH_IMAGE: &str = "cassandra:3.11";
+
+/// The mini-Jepsen cases restart and pause the same node. Serialize them so
+/// their fault injections cannot race each other.
+fn cluster_test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn memory_network() -> String {
+    std::env::var("FERROSA_MEMORY_NETWORK").unwrap_or_else(|_| "ferrosa-memory_default".to_string())
+}
 
 /// Return "docker" or "podman" — whichever container runtime is running.
 ///
@@ -73,18 +90,26 @@ fn cqlsh(port: u16, query: &str) -> Result<String, String> {
         19044 => "node3",
         p => return Err(format!("unknown ferrosa-memory CQL port {p}")),
     };
-    let network = std::env::var("FERROSA_MEMORY_NETWORK")
-        .unwrap_or_else(|_| "ferrosa-memory_default".to_string());
+    let network = memory_network();
+    let username = std::env::var("FERROSA_MEMORY_CQL_USERNAME")
+        .unwrap_or_else(|_| "ferrosa_admin".to_string());
+    let password = std::env::var("FERROSA_MEMORY_CQL_PASSWORD")
+        .unwrap_or_else(|_| "ferrosa_admin".to_string());
     let output = Command::new(container_runtime())
         .args([
             "run",
             "--rm",
             "--network",
             &network,
-            "cassandra:5",
+            CQLSH_IMAGE,
             "cqlsh",
+            "--no-color",
             service,
             "9042",
+            "-u",
+            &username,
+            "-p",
+            &password,
             "-e",
             query,
         ])
@@ -195,6 +220,7 @@ fn ensure_cluster_ready() {
 /// Test 1: Write entity, rolling restart, verify entity survives.
 #[test]
 fn write_survives_rolling_restart() {
+    let _guard = cluster_test_guard();
     require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_ROLLING_{}", Uuid::new_v4().as_simple());
@@ -219,6 +245,7 @@ fn write_survives_rolling_restart() {
 /// restart, verify entity is lost (expected with SIGKILL).
 #[test]
 fn write_lost_on_sigkill() {
+    let _guard = cluster_test_guard();
     require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_SIGKILL_{}", Uuid::new_v4().as_simple());
@@ -251,6 +278,7 @@ fn write_lost_on_sigkill() {
 /// Test 3: Write entity, pause node1 (network partition), unpause, verify consistency.
 #[test]
 fn pause_unpause_preserves_data() {
+    let _guard = cluster_test_guard();
     require_container_cluster();
     ensure_cluster_ready();
     let name = format!("JEPSEN_PAUSE_{}", Uuid::new_v4().as_simple());
@@ -279,6 +307,7 @@ fn pause_unpause_preserves_data() {
 /// verify all acknowledged writes are present after restart.
 #[test]
 fn rapid_writes_during_rolling_restart() {
+    let _guard = cluster_test_guard();
     require_container_cluster();
     ensure_cluster_ready();
     let mut written: Vec<String> = Vec::new();
@@ -321,20 +350,22 @@ fn rapid_writes_during_rolling_restart() {
 /// Test 5: Verify S3 has manifest and SSTables after a flush cycle.
 #[test]
 fn s3_contains_manifest_and_sstables() {
+    let _guard = cluster_test_guard();
     require_container_cluster();
 
     let rt = container_runtime();
+    let network = memory_network();
     let output = Command::new(rt)
         .args([
             "run",
             "--rm",
             "--network",
-            "ferrosa-memory_default",
+            &network,
             "--entrypoint",
             "/bin/sh",
             "minio/mc",
             "-c",
-            "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin >/dev/null 2>&1 \
+            "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 \
              && mc cat local/ferrosa-memory/node1/manifest.json",
         ])
         .output()
@@ -355,12 +386,12 @@ fn s3_contains_manifest_and_sstables() {
             "run",
             "--rm",
             "--network",
-            "ferrosa-memory_default",
+            &network,
             "--entrypoint",
             "/bin/sh",
             "minio/mc",
             "-c",
-            "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin >/dev/null 2>&1 \
+            "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 \
              && mc cat local/ferrosa-memory/node1/schema.json | head -c 100",
         ])
         .output()

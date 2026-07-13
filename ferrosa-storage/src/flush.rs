@@ -23,6 +23,11 @@ use ferrosa_sstable::statistics::SerializationHeader;
 use ferrosa_sstable::types::Partition;
 use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles};
 
+/// SSTable components that must exist before a generation can be opened or
+/// published to remote storage.
+pub(crate) const REQUIRED_SSTABLE_COMPONENTS: [&str; 4] =
+    ["Data.db", "Partitions.db", "Rows.db", "Filter.db"];
+
 /// Build a [`SerializationHeader`] by scanning partitions for minimum values.
 ///
 /// The header captures the minimum timestamp, local deletion time, and TTL
@@ -952,6 +957,8 @@ struct FileComponentPaths {
 /// fail loud (see the inline comment at the read). Genuinely-optional components
 /// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
+    let [data_component, partitions_component, rows_component, filter_component] =
+        REQUIRED_SSTABLE_COMPONENTS;
     let required = |suffix: &str| -> Result<PathBuf> {
         let p = dir.join(format!("{gen}-{suffix}"));
         if p.exists() {
@@ -964,9 +971,9 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
         }
     };
 
-    let data = FileReadAt::open(required("Data.db")?)?;
-    let partitions = FileReadAt::open(required("Partitions.db")?)?;
-    let rows = FileReadAt::open(required("Rows.db")?)?;
+    let data = FileReadAt::open(required(data_component)?)?;
+    let partitions = FileReadAt::open(required(partitions_component)?)?;
+    let rows = FileReadAt::open(required(rows_component)?)?;
 
     // `Filter.db` is ALWAYS written for a live SSTable (flush and compaction
     // both emit it unconditionally — see `file_flush_target_creates_component_files`).
@@ -979,7 +986,7 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     // read-path view-retry would never fire. Fail loud instead: this converts
     // the window into an open `Err`, engaging the existing `with_retried_view`
     // retry which reopens against the freshly-compacted view that holds the key.
-    let filter = std::fs::read(required("Filter.db")?)?;
+    let filter = std::fs::read(required(filter_component)?)?;
     let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
     let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
 
