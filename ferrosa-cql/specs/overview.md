@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-07-03
+last_updated: 2026-07-12
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -155,6 +155,8 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
 - **Schema-change events** are broadcast to registered control connections via
   a `broadcast` channel, with a `watch` channel fallback so that control
   connections that reconnect after a DDL can still receive the missed event.
+  The forwarder is the sole replay path: each retained event is delivered at
+  most once, preventing duplicate client metadata refreshes after index DDL.
 - Remaining v5-only features not yet complete are tracked in
   [roadmap.md](roadmap.md).
 
