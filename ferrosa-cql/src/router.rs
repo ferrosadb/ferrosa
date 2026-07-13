@@ -511,6 +511,7 @@ fn keyed_index_consult(
         .iter()
         .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
         .map(|(_, meta)| meta)
+        .filter(|meta| scalar_equality_index_is_usable(meta))
         .filter(|meta| {
             filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
         })
@@ -570,6 +571,23 @@ fn keyed_index_consult(
             None
         }
     }
+}
+
+/// Whether an index can serve an ordinary scalar `column = value` lookup.
+///
+/// Full-text, vector, and geo indexes have dedicated query operators and do
+/// not populate the `TableStore` scalar index map.  Passing one of those to
+/// the generic planner can turn a valid keyed equality query into an empty
+/// lookup, particularly when a phonetic and full-text index share a column.
+fn scalar_equality_index_is_usable(meta: &IndexMetadata) -> bool {
+    matches!(
+        meta.index_type,
+        IndexType::BTree
+            | IndexType::Hash
+            | IndexType::Composite
+            | IndexType::Phonetic
+            | IndexType::Filtered
+    )
 }
 
 fn row_matches_select_predicates(
@@ -4631,6 +4649,7 @@ async fn route_select_user_table(
             .iter()
             .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
             .map(|(_, meta)| meta)
+            .filter(|meta| scalar_equality_index_is_usable(meta))
             .filter(|meta| {
                 filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
             })
@@ -20741,6 +20760,38 @@ mod tests {
         assert!(
             visited_af <= 8,
             "ALLOW FILTERING form must also take the keyed consult, got {visited_af}"
+        );
+    }
+
+    /// A full-text index is only valid for `fts_match(...)`; it is not a
+    /// scalar equality index. A keyed `WHERE name = ...` query must therefore
+    /// fall back to its bounded partition read when full-text is the only
+    /// index on `name`, rather than consulting an empty scalar index map and
+    /// falsely returning no rows.
+    #[tokio::test]
+    async fn keyed_equality_does_not_consult_fulltext_index() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        for cql in [
+            "CREATE KEYSPACE keyed_fts WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE keyed_fts.people (tenant text, id text, name text, PRIMARY KEY (tenant, id))",
+            "CREATE INDEX people_name_fts ON keyed_fts.people (name) USING 'fulltext'",
+            "INSERT INTO keyed_fts.people (tenant, id, name) VALUES ('tenant-1', 'person-1', 'John Smith')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let q = "SELECT id FROM keyed_fts.people \
+                 WHERE tenant = 'tenant-1' AND name = 'John Smith'";
+        let count = assert_index_hit_and_count(&state, &ctx, q, 0).await;
+        assert_eq!(
+            count, 1,
+            "a keyed scalar equality query must not use a full-text index"
         );
     }
 
