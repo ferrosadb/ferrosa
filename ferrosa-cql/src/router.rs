@@ -9249,14 +9249,15 @@ async fn route_create_index(
         }
     }
 
-    // CQL native protocol: INDEX schema changes use TABLE as the target
-    // so cqlsh refreshes the table metadata (which includes indexes).
+    // CQL native protocol schema-change events do not define an INDEX target.
+    // Report the owning table so clients refresh the table metadata, including
+    // its newly created index.
     emit_schema_change(
         state,
         SchemaChangeType::Created,
-        SchemaTarget::Index,
+        SchemaTarget::Table,
         ks,
-        Some(&index_name),
+        Some(&s.table),
     );
 
     Ok(result::encode_schema_change(
@@ -9343,13 +9344,14 @@ async fn route_drop_index(
         }
     }
 
-    // Return TABLE event so cqlsh refreshes table metadata (includes indexes).
+    // Schema-change events use the owning TABLE target so clients refresh its
+    // metadata, which includes the removed index.
     emit_schema_change(
         state,
         SchemaChangeType::Dropped,
-        SchemaTarget::Index,
+        SchemaTarget::Table,
         ks,
-        Some(&s.name),
+        Some(&table_name),
     );
 
     Ok(result::encode_schema_change(
@@ -13143,6 +13145,71 @@ mod tests {
                 assert!(matches!(target, SchemaTarget::Table));
                 assert_eq!(keyspace, "ks_table_events");
                 assert_eq!(name.as_deref(), Some("tbl_events"));
+            }
+            other => panic!("expected schema-change event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn index_ddl_emits_owning_table_schema_change_events() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        for cql in [
+            "CREATE KEYSPACE index_events WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE index_events.items (id int PRIMARY KEY, embedding vector<float, 2>)",
+        ] {
+            let statement = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, statement).await.unwrap();
+        }
+
+        let mut events = state.event_sender.subscribe();
+        let create = crate::parser::parse(
+            "CREATE INDEX idx_embedding ON index_events.items (embedding) USING 'vector' \
+             WITH OPTIONS = {'method': 'hnsw', 'metric': 'cosine', 'dimensions': '2'}",
+        )
+        .unwrap();
+        route(&state, &ctx, create).await.unwrap();
+
+        let created = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("create index event should arrive")
+            .expect("event sender should remain open");
+        match created {
+            CqlEvent::SchemaChange {
+                change_type,
+                target,
+                keyspace,
+                name,
+            } => {
+                assert!(matches!(change_type, SchemaChangeType::Created));
+                assert!(matches!(target, SchemaTarget::Table));
+                assert_eq!(keyspace, "index_events");
+                assert_eq!(name.as_deref(), Some("items"));
+            }
+            other => panic!("expected schema-change event, got {other:?}"),
+        }
+
+        let drop = crate::parser::parse("DROP INDEX index_events.idx_embedding").unwrap();
+        route(&state, &ctx, drop).await.unwrap();
+
+        let dropped = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("drop index event should arrive")
+            .expect("event sender should remain open");
+        match dropped {
+            CqlEvent::SchemaChange {
+                change_type,
+                target,
+                keyspace,
+                name,
+            } => {
+                assert!(matches!(change_type, SchemaChangeType::Dropped));
+                assert!(matches!(target, SchemaTarget::Table));
+                assert_eq!(keyspace, "index_events");
+                assert_eq!(name.as_deref(), Some("items"));
             }
             other => panic!("expected schema-change event, got {other:?}"),
         }
