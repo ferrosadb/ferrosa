@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-07-12
+last_updated: 2026-07-13
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -96,7 +96,10 @@ for the mermaid diagrams.
 5. **Index registration is replay-safe.** Repeating the same index declaration
    preserves the active memtable index and its unflushed postings; a conflicting
    column position or index type fails loud instead of silently replacing it.
-5. **Malformed data is quarantined, not dropped or crashed on.** A row that
+6. **Table registration is compare-and-install.** A schema replay that loses
+   the table-map install race merges declarations into the already-live store;
+   it cannot replace active memtable rows or index postings.
+7. **Malformed data is quarantined, not dropped or crashed on.** A row that
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`
    increments — non-zero in steady state is an alert.

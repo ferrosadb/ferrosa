@@ -2946,13 +2946,24 @@ impl StorageEngine {
             Arc::clone(&self.reader_pool),
         )?;
 
+        // The initial read-side absence check above keeps the common path
+        // cheap, but it cannot make registration atomic: another schema replay
+        // can install the table while this thread is building its store. Keep
+        // the declarations so the losing replay can still merge anything the
+        // winning store did not have, without replacing its live memtable.
+        let late_indexed_columns = state.store.indexed_columns().to_vec();
+        if !self.install_table_state_if_absent(table_id.clone(), state) {
+            self.merge_index_declarations_for_registered_table(&table_id, &late_indexed_columns)?;
+            self.replay_deferred_mutations_for_table(&table_id);
+            return Ok(());
+        }
+
         // Register each declared index in the tracker.
-        for (index_name, _col_pos) in state.store.indexed_columns() {
+        for (index_name, _col_pos) in &late_indexed_columns {
             self.index_tracker
                 .register_index(table_id.keyspace(), table_id.table(), index_name);
         }
 
-        self.tables.write().insert(table_id.clone(), state);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
 
         // Trigger compaction check for tables loaded with existing SSTables.
@@ -2970,6 +2981,26 @@ impl StorageEngine {
         self.replay_deferred_mutations_for_table(&table_id);
 
         Ok(())
+    }
+
+    /// Install a freshly built table state only when no concurrent schema
+    /// replay has already installed a live state for the same table.
+    ///
+    /// A registration performs filesystem discovery before it can take the
+    /// table map write lock. Rechecking under that lock prevents the late
+    /// builder from replacing the winner's active memtable and unflushed index
+    /// postings.
+    fn install_table_state_if_absent(&self, table_id: TableId, state: TableState) -> bool {
+        use std::collections::hash_map::Entry;
+
+        let mut tables = self.tables.write();
+        match tables.entry(table_id) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(state);
+                true
+            }
+        }
     }
 
     fn merge_index_declarations_for_registered_table(
@@ -18561,6 +18592,50 @@ mod tests {
             .add_index(&table_id, "name_idx", 1, IndexType::Phonetic)
             .expect_err("a replay that changes index column must fail loud");
         assert!(position_conflict.to_string().contains("column 0"));
+    }
+
+    /// A concurrent schema replay may finish building a replacement store after
+    /// another replay has installed the live store and accepted writes.  It
+    /// must lose that install race rather than replacing the live memtable and
+    /// its secondary-index postings.
+    #[test]
+    fn late_table_registration_cannot_replace_live_memtable() {
+        use ferrosa_index::{IndexKey, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let table_id = table_id();
+        engine.register_table(test_schema()).unwrap();
+        engine
+            .add_index(&table_id, "name_idx", 0, IndexType::Phonetic)
+            .unwrap();
+        engine
+            .write(&table_id, &make_key("pk"), make_row(b"John", 1000), 1000)
+            .unwrap();
+
+        // Model the state a concurrent registration built after its initial
+        // absent-table check but before the first registration completed.
+        let late_state = StorageEngine::build_table_state(
+            &engine.config,
+            test_schema(),
+            vec![("name_idx".to_string(), 0)],
+            Arc::clone(&engine.reader_pool),
+        )
+        .unwrap();
+        assert!(
+            !engine.install_table_state_if_absent(table_id.clone(), late_state),
+            "a late registration must not replace an already-live table"
+        );
+
+        assert_eq!(
+            engine
+                .read_by_index(&table_id, "name_idx", &IndexKey(b"Jon".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "the winning table's unflushed phonetic posting must survive"
+        );
     }
 
     #[test]
