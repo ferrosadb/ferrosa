@@ -63,6 +63,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes
   both legacy flat SSTable components and restored generation directories.
+  Periodic sync publishes a generation only when all four required components
+  (`Data.db`, `Partitions.db`, `Rows.db`, and `Filter.db`) are present; component
+  presence is the invariant, so a valid zero-byte `Rows.db` is uploaded.
   **Wired into the flush path.**
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
@@ -100,7 +103,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   table is not registered in this engine process. Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after `schema.json`
-  boot preload. Boot-time
+  boot preload. Replaying an already-registered declaration is a no-op only
+  when its column and index type agree; it preserves unflushed memtable
+  postings (including phonetic postings) instead of replacing the live index.
+  Boot-time
   `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
   (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
   `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at

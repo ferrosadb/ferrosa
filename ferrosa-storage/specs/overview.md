@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-07-03
+last_updated: 2026-07-12
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -76,6 +76,10 @@ for the mermaid diagrams.
 
 1. **S3 is authoritative; local disk is a write-behind cache.** Cache eviction
    must never delete the only copy — manifest-pinned entries are never evicted.
+   Periodic S3 sync skips incomplete generations before upload or manifest
+   publication: all four required components (`Data.db`, `Partitions.db`,
+   `Rows.db`, and `Filter.db`) must be present. This is a presence check;
+   zero-byte `Rows.db` is a valid component.
    **Exception — local `file://` backend** (`FERROSA_LOCAL_STORE_PATH` /
    `[s3].local_path`): the local disk *is* the authoritative durable store, so
    `ObjectStoreConfig::is_local()` is threaded into `LocalCache` as `durable` and
@@ -89,6 +93,9 @@ for the mermaid diagrams.
    tombstones (partition/row/cell) suppress older data by `marked_for_delete_at`.
 4. **Durability is governed by the sync strategy.** Only `Batch` fsyncs every
    write; the **default `Periodic`** has a bounded loss window (`sync_interval`).
+5. **Index registration is replay-safe.** Repeating the same index declaration
+   preserves the active memtable index and its unflushed postings; a conflicting
+   column position or index type fails loud instead of silently replacing it.
 5. **Malformed data is quarantined, not dropped or crashed on.** A row that
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`
