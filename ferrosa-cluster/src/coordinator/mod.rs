@@ -38,6 +38,8 @@ use crate::ring::TokenRing;
 /// Maximum concurrent in-flight writes. Provides backpressure when the cluster
 /// is saturated, preventing runtime starvation of Raft heartbeat processing.
 const WRITE_CONCURRENCY_LIMIT: usize = 128;
+const STREAM_REQUEST_ID_EPOCH_BIT: u32 = 1 << 31;
+const STREAM_REQUEST_ID_RANDOM_MASK: u32 = (1 << 30) - 1;
 
 /// Coordinates writes and reads across replicas in cluster mode.
 pub struct ClusterCoordinator {
@@ -70,8 +72,9 @@ pub struct ClusterCoordinator {
     /// coordinator registered before sending the request.
     pub(crate) stream_router: Arc<StreamRouter>,
     /// Monotonic counter for generating per-call `request_id`s in
-    /// streaming range reads. Wraps around at u32::MAX (4 billion
-    /// in-flight calls is well past any realistic cluster).
+    /// streaming range reads. Seeded into a randomized high range so
+    /// late chunks from a pre-restart coordinator cannot collide with
+    /// freshly registered low request IDs after restart.
     pub(crate) next_request_id: Arc<AtomicU32>,
     /// When `true`, `coordinate_range_read_limited_rows` delegates to
     /// the ADR-020 streaming path instead of the legacy single-shot
@@ -89,6 +92,20 @@ fn streaming_range_reads_enabled(value: Option<&str>) -> bool {
         value.map(str::trim),
         Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
     )
+}
+
+fn stream_request_id_seed(random: u32, local_node_id: u64) -> u32 {
+    let node_mix = (local_node_id as u32) ^ ((local_node_id >> 32) as u32);
+    STREAM_REQUEST_ID_EPOCH_BIT | ((random ^ node_mix) & STREAM_REQUEST_ID_RANDOM_MASK)
+}
+
+fn fresh_stream_request_id_seed(local_node_id: u64) -> u32 {
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let random = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        ^ u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+        ^ u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+        ^ u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    stream_request_id_seed(random, local_node_id)
 }
 
 impl ClusterCoordinator {
@@ -127,7 +144,7 @@ impl ClusterCoordinator {
             raft_state: None,
             write_semaphore: Arc::new(tokio::sync::Semaphore::new(WRITE_CONCURRENCY_LIMIT)),
             stream_router: Arc::new(StreamRouter::new()),
-            next_request_id: Arc::new(AtomicU32::new(1)),
+            next_request_id: Arc::new(AtomicU32::new(fresh_stream_request_id_seed(local_node_id))),
             streaming_range_reads,
         }
     }
@@ -461,6 +478,46 @@ mod tests {
             assert!(
                 streaming_range_reads_enabled(Some(value)),
                 "{value} must keep streaming range reads enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_coordinator_does_not_reuse_low_stream_request_ids_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let coordinator = ClusterCoordinator::new(
+            Arc::new(ArcSwap::from_pointee(TokenRing::new())),
+            Arc::new(PeerManager::new(
+                Arc::new(ferrosa_net::config::NetConfig::default()),
+                Uuid::new_v4(),
+                Arc::new(NoopListener),
+            )),
+            1,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let request_id = coordinator.next_stream_request_id();
+        assert_ne!(
+            request_id, 1,
+            "fresh coordinators must not restart streaming range-read request IDs at 1; \
+             late internode chunks from a pre-restart stream are otherwise indistinguishable \
+             from the first frames of a new stream"
+        );
+    }
+
+    #[test]
+    fn stream_request_id_seed_uses_restart_epoch_with_wrap_headroom() {
+        let upper_bound = STREAM_REQUEST_ID_EPOCH_BIT + (1 << 30);
+
+        for random in [0, 1, 42, u32::MAX] {
+            let seed = stream_request_id_seed(random, 1);
+            assert!(
+                (STREAM_REQUEST_ID_EPOCH_BIT..upper_bound).contains(&seed),
+                "seed {seed} must stay in the high restart-epoch range with at least 2^30 request IDs of headroom"
             );
         }
     }
