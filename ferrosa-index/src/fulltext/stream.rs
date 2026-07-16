@@ -92,7 +92,7 @@ pub fn scan_term_top_k(
 /// are identical to [`super::reader::FullTextIndexReader::search`] for a
 /// `FtsQuery::Term`.
 ///
-/// `on_hit` returns [`ControlFlow::Break`] to stop the walk early (consumer-paced
+/// `on_hit` returns [`std::ops::ControlFlow::Break`] to stop the walk early (consumer-paced
 /// backpressure — e.g. the downstream channel's receiver was dropped, or a
 /// `LIMIT` is already satisfied). Because the term dictionary is written sorted,
 /// the walk also early-exits as soon as it passes the target term.
