@@ -107,18 +107,29 @@ impl RaftNetworkFactory<FerrosRaftConfig> for FerrosRaftNetworkFactory {
     type Network = FerrosRaftNetwork;
 
     async fn new_client(&mut self, target: u64, _node: &BasicNode) -> FerrosRaftNetwork {
-        // Resolve the UUID from the sync map.
-        let target_host_id = self.resolve_host_id(target).unwrap_or_else(|| {
-            // openraft does not allow returning an error here.  Return a
-            // nil UUID; the first RPC will fail with Unreachable which will
-            // trigger openraft's backoff logic.
-            tracing::error!(node_id = target, "no host_id registered for Raft node");
-            Uuid::nil()
-        });
+        // The host UUID is resolved PER RPC, never baked in here: openraft
+        // caches this client per target, and a client built before the
+        // node_id → host_id registration landed used to freeze `Uuid::nil()`
+        // forever — every retry then failed with "unknown peer: 00000000-…"
+        // and the cluster never healed even after the peer registered. Two
+        // live manifestations: the CI formation race (seed initializes raft
+        // before `register_node` runs for its peers → Vote RPCs unroutable →
+        // candidate stuck at term 1 while everyone else stays a Learner) and
+        // the 2026-07-16 dev-cluster incident (AppendEntries retry loop at
+        // 500 ms for hours). Resolving at send time makes a late
+        // registration heal the client on its next retry.
+        if self.resolve_host_id(target).is_none() {
+            tracing::info!(
+                node_id = target,
+                "raft network client created before host_id registration; \
+                 RPCs are Unreachable until the mapping registers, then heal"
+            );
+        }
 
         FerrosRaftNetwork {
             peer_manager: Arc::clone(&self.peer_manager),
-            target_host_id,
+            target,
+            node_map: Arc::clone(&self.node_map),
         }
     }
 }
@@ -131,10 +142,48 @@ impl RaftNetworkFactory<FerrosRaftConfig> for FerrosRaftNetworkFactory {
 ///
 /// All methods serialise the request with bincode, forward it via
 /// [`PeerManager::send`] on [`Lane::Raft`], and deserialise the response.
+///
+/// The target's host UUID is looked up in the shared `node_map` on EVERY
+/// RPC (a `HashMap` read under an uncontended `RwLock` — noise next to a
+/// network round-trip). An unregistered target yields
+/// [`openraft::error::Unreachable`], which openraft backs off and retries —
+/// and the retry succeeds as soon as `register_node` lands. Never cache the
+/// resolution here: a frozen nil UUID is permanent unreachability.
 pub struct FerrosRaftNetwork {
     peer_manager: Arc<PeerManager>,
-    target_host_id: Uuid,
+    target: u64,
+    node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
 }
+
+impl FerrosRaftNetwork {
+    /// Resolve the target's host UUID from the live registration map.
+    /// `None` until `register_node(target, ..)` has been called.
+    fn current_target_host_id(&self) -> Option<Uuid> {
+        self.node_map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.target)
+            .copied()
+    }
+}
+
+/// Error for an RPC attempted before the target's `node_id → host_id`
+/// mapping registered. Mapped to [`openraft::error::Unreachable`] so
+/// openraft backs off and retries (the retry heals once registration lands).
+#[derive(Debug)]
+struct UnresolvedRaftTarget(u64);
+
+impl std::fmt::Display for UnresolvedRaftTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "raft node {} has no registered host_id yet (registration pending)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedRaftTarget {}
 
 /// Serialise `value` with bincode, wrapping any error as an openraft
 /// [`RPCError`] (specifically a [`NetworkError`]).
@@ -205,11 +254,20 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         rpc: AppendEntriesRequest<FerrosRaftConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let Some(target_host_id) = self.current_target_host_id() else {
+            tracing::warn!(
+                node_id = self.target,
+                "AppendEntries before host_id registration; Unreachable until it lands"
+            );
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &UnresolvedRaftTarget(self.target),
+            )));
+        };
         let payload = encode(&rpc)?;
         let response = match self
             .peer_manager
             .send_with_timeout(
-                self.target_host_id,
+                target_host_id,
                 Message::RaftAppendEntries(payload),
                 Lane::Raft,
                 lane_timeout_for_rpc(&option),
@@ -218,7 +276,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         {
             Ok(response) => response,
             Err(e) => {
-                tracing::warn!(target = %self.target_host_id, %e, "AppendEntries send failed");
+                tracing::warn!(target = %target_host_id, %e, "AppendEntries send failed");
                 backoff_transient_raft_reconnect(&e).await;
                 return Err(net_error_to_unreachable(e));
             }
@@ -227,7 +285,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         match response {
             Message::RaftAppendResponse(bytes) => decode(&bytes),
             other => {
-                tracing::error!(target = %self.target_host_id, msg_type = ?other.msg_type(), "AppendEntries got unexpected response type");
+                tracing::error!(target = %target_host_id, msg_type = ?other.msg_type(), "AppendEntries got unexpected response type");
                 Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
                     format!("expected RaftAppendResponse, got {:?}", other.msg_type()),
                 ))))
@@ -244,6 +302,15 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
+        let Some(target_host_id) = self.current_target_host_id() else {
+            tracing::warn!(
+                node_id = self.target,
+                "InstallSnapshot before host_id registration; Unreachable until it lands"
+            );
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &UnresolvedRaftTarget(self.target),
+            )));
+        };
         let payload = bincode::serialize(&rpc)
             .map(Bytes::from)
             .map_err(|e| RPCError::Network(NetworkError::new(&*e)))?;
@@ -256,7 +323,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         let response = match self
             .peer_manager
             .send_with_timeout(
-                self.target_host_id,
+                target_host_id,
                 Message::RaftInstallSnapshot(payload),
                 crate::raft::snapshot_transport::snapshot_lane(),
                 lane_timeout_for_rpc(&option),
@@ -290,11 +357,20 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         rpc: VoteRequest<u64>,
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let Some(target_host_id) = self.current_target_host_id() else {
+            tracing::warn!(
+                node_id = self.target,
+                "Vote before host_id registration; Unreachable until it lands"
+            );
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &UnresolvedRaftTarget(self.target),
+            )));
+        };
         let payload = encode(&rpc)?;
         let response = match self
             .peer_manager
             .send_with_timeout(
-                self.target_host_id,
+                target_host_id,
                 Message::RaftVote(payload),
                 Lane::Raft,
                 lane_timeout_for_rpc(&option),
@@ -303,7 +379,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         {
             Ok(response) => response,
             Err(e) => {
-                tracing::debug!(target = %self.target_host_id, %e, "Vote send failed");
+                tracing::debug!(target = %target_host_id, %e, "Vote send failed");
                 backoff_transient_raft_reconnect(&e).await;
                 return Err(net_error_to_unreachable(e));
             }
@@ -312,7 +388,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         match response {
             Message::RaftVoteResponse(bytes) => decode(&bytes),
             other => {
-                tracing::error!(target = %self.target_host_id, msg_type = ?other.msg_type(), "Vote got unexpected response type");
+                tracing::error!(target = %target_host_id, msg_type = ?other.msg_type(), "Vote got unexpected response type");
                 Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
                     format!("expected RaftVoteResponse, got {:?}", other.msg_type()),
                 ))))
@@ -400,22 +476,59 @@ mod tests {
         };
         let network = factory.new_client(node_id, &node).await;
 
-        assert_eq!(network.target_host_id, host_id);
+        assert_eq!(network.current_target_host_id(), Some(host_id));
     }
 
-    // -- factory_unknown_node_yields_nil -----------------------------------
+    // -- factory_unknown_node_is_unresolved ---------------------------------
 
     #[tokio::test]
-    async fn factory_unknown_node_yields_nil() {
+    async fn factory_unknown_node_is_unresolved() {
         let pm = make_peer_manager();
         let mut factory = FerrosRaftNetworkFactory::new(pm);
 
-        // No registration — factory should log an error and return a nil UUID.
+        // No registration — the client exists but resolves to nothing, so
+        // every RPC maps to Unreachable (openraft backs off and retries).
         let node = BasicNode {
             addr: "127.0.0.1:7001".to_string(),
         };
         let network = factory.new_client(999, &node).await;
-        assert_eq!(network.target_host_id, Uuid::nil());
+        assert_eq!(network.current_target_host_id(), None);
+    }
+
+    // -- late_registration_heals_existing_client -----------------------------
+    //
+    // THE formation-race regression pin (PR #264 CI failure + the 2026-07-16
+    // live incident): openraft caches one network client per target, so a
+    // client created BEFORE `register_node` ran must pick the mapping up on
+    // its next RPC — a baked-in nil UUID is permanent unreachability (the
+    // candidate spins at term=1 while every peer stays a Learner and no
+    // leader is ever elected).
+    #[tokio::test]
+    async fn late_registration_heals_existing_client() {
+        let pm = make_peer_manager();
+        let mut factory = FerrosRaftNetworkFactory::new(pm);
+
+        let node = BasicNode {
+            addr: "127.0.0.1:7001".to_string(),
+        };
+        // Client created while the registration is still in flight.
+        let network = factory.new_client(42, &node).await;
+        assert_eq!(
+            network.current_target_host_id(),
+            None,
+            "pre-registration: unresolved, RPCs are Unreachable"
+        );
+
+        // Registration lands later (formation loop / membership observer).
+        let host_id = Uuid::new_v4();
+        factory.register_node(42, host_id);
+
+        assert_eq!(
+            network.current_target_host_id(),
+            Some(host_id),
+            "the EXISTING client must observe the late registration — \
+             freezing nil at construction is the bug this pins"
+        );
     }
 
     // -- node_map_registration ---------------------------------------------
