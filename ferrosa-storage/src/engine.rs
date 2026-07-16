@@ -6521,7 +6521,7 @@ impl StorageEngine {
     /// * Keys arrive **unordered** and **may repeat across sources**
     ///   (memtable vs sidecar vs fallback) — the caller dedups. Scores are not
     ///   surfaced; the no-`LIMIT` consumers treat the result as a key set.
-    /// * `on_hit` returning [`ControlFlow::Break`] halts the entire walk
+    /// * `on_hit` returning [`std::ops::ControlFlow::Break`] halts the entire walk
     ///   immediately (consumer-paced backpressure: dropped downstream
     ///   receiver, satisfied page). No callback fires after a Break.
     /// * Compound (non-single-`Term`) queries have no streaming evaluator yet:
