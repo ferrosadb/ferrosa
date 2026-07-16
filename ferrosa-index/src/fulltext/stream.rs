@@ -10,15 +10,25 @@
 //! [`super::builder`] for the layout) through a [`std::io::BufReader`]
 //! instead:
 //!
-//! * [`scan_term_top_k`] — single-term search (the live-OOM query shape).
-//!   Postings of the one matching term are scored as they are decoded and fed
-//!   into a bounded top-k heap when the query carries a `LIMIT k`; peak
-//!   additional memory is O(k), independent of the index or matching-doc
-//!   count. Without a limit the complete hit set is returned (O(matches) —
-//!   the result itself, nothing more).
+//! * [`scan_term_each`] — the non-materializing primitive: hands each match to
+//!   a callback as it is decoded, holding an O(1) working set (one posting key
+//!   at a time) and stopping early on [`std::ops::ControlFlow::Break`]. A caller
+//!   that forwards hits into a bounded channel keeps peak memory independent of
+//!   the matching-doc count even without a `LIMIT` — the shape that OOM-killed
+//!   replicas on a broad `fts_match` (t_8fc24ce2).
+//! * [`scan_term_top_k`] — single-term search (the live-OOM query shape), built
+//!   on `scan_term_each`. Postings of the one matching term are scored as they
+//!   are decoded and fed into a bounded top-k heap when the query carries a
+//!   `LIMIT k`; peak additional memory is O(k), independent of the index or
+//!   matching-doc count. Without a limit the complete hit set is returned
+//!   (O(matches) — the result itself, nothing more).
 //!
 //! The term dictionary is written sorted (see `serialize_fti`), so the walk
 //! early-exits as soon as it passes the target term.
+//!
+//! Last revised: 2026-07-15
+//! Last changed: Extracted `scan_term_each` (non-materializing callback walk)
+//! as the primitive underneath `scan_term_top_k`, for bounded-memory streaming.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -47,6 +57,53 @@ pub fn scan_term_top_k(
     if limit == Some(0) {
         return Ok(vec![]);
     }
+    let mut topk = limit.map(TopK::new);
+    let mut all_hits: Vec<FtsHit> = Vec::new();
+
+    scan_term_each(path, term, |hit| {
+        match topk.as_mut() {
+            Some(t) => t.push_owned(hit.partition_key, hit.score),
+            None => all_hits.push(hit),
+        }
+        std::ops::ControlFlow::Continue(())
+    })?;
+
+    Ok(match topk {
+        Some(t) => t.into_hits(),
+        None => {
+            all_hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then_with(|| a.partition_key.cmp(&b.partition_key))
+            });
+            all_hits
+        }
+    })
+}
+
+/// Streaming single-term search that hands each match to `on_hit` **as it is
+/// decoded**, holding no growing result buffer of its own.
+///
+/// This is the non-materializing primitive underneath [`scan_term_top_k`]: the
+/// walk's own working set is O(1) (one posting key at a time), so a caller that
+/// forwards hits into a bounded channel keeps peak memory independent of the
+/// matching-doc count — the shape that OOM-killed replicas on a broad
+/// `fts_match` with no `LIMIT` (t_8fc24ce2). Matching semantics and BM25 scores
+/// are identical to [`super::reader::FullTextIndexReader::search`] for a
+/// `FtsQuery::Term`.
+///
+/// `on_hit` returns [`std::ops::ControlFlow::Break`] to stop the walk early (consumer-paced
+/// backpressure — e.g. the downstream channel's receiver was dropped, or a
+/// `LIMIT` is already satisfied). Because the term dictionary is written sorted,
+/// the walk also early-exits as soon as it passes the target term.
+///
+/// # Errors
+///
+/// Returns `Err` on I/O failure or a malformed/truncated FTI file.
+pub fn scan_term_each<F>(path: &Path, term: &str, mut on_hit: F) -> Result<(), String>
+where
+    F: FnMut(FtsHit) -> std::ops::ControlFlow<()>,
+{
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let file_len = file
         .metadata()
@@ -92,8 +149,6 @@ pub fn scan_term_top_k(
     let params = Bm25Params::default();
     let target = term.as_bytes();
     let mut term_buf: Vec<u8> = Vec::new();
-    let mut topk = limit.map(TopK::new);
-    let mut all_hits: Vec<FtsHit> = Vec::new();
 
     for _ in 0..term_count {
         let term_len = read_u16(&mut reader)? as usize;
@@ -132,12 +187,13 @@ pub fn scan_term_top_k(
                         avgdl,
                         &params,
                     );
-                    match topk.as_mut() {
-                        Some(t) => t.push_owned(pk, score),
-                        None => all_hits.push(FtsHit {
-                            partition_key: pk,
-                            score,
-                        }),
+                    if on_hit(FtsHit {
+                        partition_key: pk,
+                        score,
+                    })
+                    .is_break()
+                    {
+                        return Ok(());
                     }
                 }
                 break; // dictionary is sorted; the term appears once.
@@ -146,17 +202,7 @@ pub fn scan_term_top_k(
         }
     }
 
-    Ok(match topk {
-        Some(t) => t.into_hits(),
-        None => {
-            all_hits.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.partition_key.cmp(&b.partition_key))
-            });
-            all_hits
-        }
-    })
+    Ok(())
 }
 
 fn read_u8(r: &mut impl Read) -> Result<u8, String> {
@@ -186,6 +232,8 @@ fn read_u64(r: &mut impl Read) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::ControlFlow;
+
     use crate::fulltext::builder::FullTextIndexBuilder;
     use crate::fulltext::reader::FullTextIndexReader;
 
@@ -264,6 +312,89 @@ mod tests {
             assert_eq!(a.partition_key, b.partition_key, "top-k must be the best k");
             assert!((a.score - b.score).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn scan_term_each_yields_every_match_without_materializing() {
+        // The callback walk must visit exactly the same hit set (keys + scores)
+        // as `scan_term_top_k(.., None)`, one hit at a time, holding no growing
+        // result Vec of its own.
+        let dir = tempfile::tempdir().unwrap();
+        let docs: Vec<(Vec<u8>, String)> = (0..120)
+            .map(|i| {
+                let text = if i % 2 == 0 {
+                    format!("memory row {i}")
+                } else {
+                    format!("filler row {i}")
+                };
+                (format!("pk{i:04}").into_bytes(), text)
+            })
+            .collect();
+        let doc_refs: Vec<(&[u8], &str)> = docs
+            .iter()
+            .map(|(pk, t)| (pk.as_slice(), t.as_str()))
+            .collect();
+        let path = write_fti(dir.path(), &doc_refs);
+
+        let expected = scan_term_top_k(&path, "memory", None).unwrap();
+
+        let mut seen: Vec<FtsHit> = Vec::new();
+        scan_term_each(&path, "memory", |hit| {
+            seen.push(hit);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+
+        assert_eq!(seen.len(), expected.len(), "same number of matches");
+        let expected_keys: std::collections::HashSet<_> =
+            expected.iter().map(|h| h.partition_key.clone()).collect();
+        for hit in &seen {
+            assert!(expected_keys.contains(&hit.partition_key));
+            let exp = expected
+                .iter()
+                .find(|h| h.partition_key == hit.partition_key)
+                .unwrap();
+            assert!((exp.score - hit.score).abs() < 1e-12, "identical score");
+        }
+    }
+
+    #[test]
+    fn scan_term_each_early_exit_stops_the_walk() {
+        // Returning `Break` after the first hit must halt the walk immediately
+        // (consumer-paced backpressure): the callback is not invoked again.
+        let dir = tempfile::tempdir().unwrap();
+        let docs: Vec<(Vec<u8>, String)> = (0..50)
+            .map(|i| (format!("pk{i:04}").into_bytes(), "memory".to_string()))
+            .collect();
+        let doc_refs: Vec<(&[u8], &str)> = docs
+            .iter()
+            .map(|(pk, t)| (pk.as_slice(), t.as_str()))
+            .collect();
+        let path = write_fti(dir.path(), &doc_refs);
+
+        let mut count = 0usize;
+        scan_term_each(&path, "memory", |_hit| {
+            count += 1;
+            ControlFlow::Break(())
+        })
+        .unwrap();
+
+        assert_eq!(count, 1, "walk stops at the first Break");
+    }
+
+    #[test]
+    fn scan_term_each_truncated_file_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fti(dir.path(), &[(b"pk1", "hello world")]);
+        let bytes = std::fs::read(&path).unwrap();
+        let cut = dir.path().join("cut2.db");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        let mut count = 0usize;
+        let res = scan_term_each(&cut, "hello", |_| {
+            count += 1;
+            ControlFlow::Continue(())
+        });
+        assert!(res.is_err());
     }
 
     #[test]

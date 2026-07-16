@@ -924,6 +924,7 @@ impl ModeController {
         // on the next line and is no longer directly accessible.
         let stream_router_for_handler = coordinator.stream_router();
         let peer_manager_for_handler = coordinator.peer_manager.clone();
+        let peer_manager_for_fulltext = coordinator.peer_manager.clone();
 
         // 6. Swap write path — cluster coordinator handles replica routing.
         self.write_path
@@ -1085,7 +1086,42 @@ impl ModeController {
         self.registry
             .register(MsgType::RangeReadStreamHeartbeat, frame_router.clone());
         self.registry
-            .register(MsgType::RangeReadStreamDone, frame_router);
+            .register(MsgType::RangeReadStreamDone, frame_router.clone());
+
+        // Streaming fulltext search (t_4ae47a9f) — the fts_match twin of the
+        // ADR-020 streaming range read. Server side: walks the local FTI via
+        // fulltext_search_each on a blocking thread and fires bounded key
+        // chunks back on Lane::Bulk. Registered on every node alongside the
+        // legacy single-shot FulltextSearchRequest so mixed-mode clusters can
+        // serve either flow (the coordinator picks per query shape).
+        use crate::coordinator::fulltext_stream::{
+            FulltextSearchStreamRequestHandler, FULLTEXT_STREAM_CHUNK_KEYS,
+        };
+        let fulltext_sink_factory = Arc::new(
+            crate::coordinator::stream_request_handler::PeerManagerSinkFactory::new(
+                peer_manager_for_fulltext,
+            ),
+        );
+        let fulltext_stream_handler = Arc::new(FulltextSearchStreamRequestHandler::new(
+            Arc::new(self.storage.clone()),
+            fulltext_sink_factory,
+            FULLTEXT_STREAM_CHUNK_KEYS,
+        ));
+        self.registry.register(
+            MsgType::FulltextSearchStreamRequest,
+            fulltext_stream_handler.clone(),
+        );
+        // Same handler serves Cancel — it owns the per-request tokens.
+        self.registry
+            .register(MsgType::FulltextSearchStreamCancel, fulltext_stream_handler);
+        // Coordinator side: the shared StreamFrameRouter routes the fulltext
+        // response frames through the same seq/Done bookkeeping.
+        self.registry
+            .register(MsgType::FulltextSearchStreamChunk, frame_router.clone());
+        self.registry
+            .register(MsgType::FulltextSearchStreamHeartbeat, frame_router.clone());
+        self.registry
+            .register(MsgType::FulltextSearchStreamDone, frame_router);
 
         let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
         self.registry
