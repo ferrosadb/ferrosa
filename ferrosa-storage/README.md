@@ -131,6 +131,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `tests/fulltext_replica_memory_bound.rs` (allocator-tracked peak: O(k),
   independent of matching-doc count) and
   `engine::tests::fts_search_touches_only_queried_index_sidecars`.
+  The no-`LIMIT` shape has a streaming twin, **`fulltext_search_each(table,
+  index, query, on_hit)`** (t_4ae47a9f layer 2b): single-term walks hand each
+  matching doc key to the callback with an O(1) working set (no score map;
+  `ControlFlow::Break` = consumer-paced early exit), so replica memory is
+  independent of the match count even without a LIMIT — the shape that
+  OOM-killed nodes in t_8fc24ce2. Keys arrive unordered and may repeat across
+  sources (caller dedups); compound queries delegate to `fulltext_search`
+  internally. Guarded by `tests/fulltext_streaming_each_memory_bound.rs`.
 - **Snapshot / PITR** (`snapshot/`, `restore/`, `commitlog/archiver.rs`) —
   S3 snapshot manager, commit-log archiving, restore manager with validation.
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
