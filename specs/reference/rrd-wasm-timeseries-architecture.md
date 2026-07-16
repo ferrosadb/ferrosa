@@ -177,7 +177,7 @@ sequenceDiagram
 
 ## Related Specs
 
-- [RRD materialized rollups work item](in-process/gap-rrd-materialized-rollups.md)
+- [RRD materialized rollups work item](../implemented/gap-rrd-materialized-rollups.md)
 - [CQL-loaded WASM UDF work item](in-process/gap-cql-loaded-wasm-udf-e2e.md)
 - [Example docs blueprint](timeseries-sensor-example-docs.md)
 - [FMEA](fmea-rrd-wasm-timeseries.md)
