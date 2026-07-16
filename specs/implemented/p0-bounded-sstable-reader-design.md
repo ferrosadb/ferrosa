@@ -66,12 +66,12 @@ sequenceDiagram
     loop each descriptor in current merge pass (<= fanin_cap)
         Rd->>P: get_or_open(gen, dir)
         alt cached
-            P-->>Rd: Arc<SSTableReader> (move to MRU)
+            P-->>Rd: Arc&lt;SSTableReader&gt; (move to MRU)
         else miss
             P->>FS: open components (data/partitions/rows/filter/...)
             FS-->>P: reader
             P->>P: insert; if len > reader_cap evict LRU (idle, refcount==1)
-            P-->>Rd: Arc<SSTableReader>
+            P-->>Rd: Arc&lt;SSTableReader&gt;
         end
     end
     Rd->>Rd: k-way merge this pass; emit/merge partials; drop readers (Arc released)
