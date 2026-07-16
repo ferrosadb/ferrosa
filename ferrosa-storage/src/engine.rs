@@ -6499,6 +6499,154 @@ impl StorageEngine {
         Ok(results.into_iter().map(|(pk, _)| pk).collect())
     }
 
+    /// Streaming full-text search: hands each matching doc key to `on_hit` as
+    /// it is found, holding a bounded working set — the non-materializing twin
+    /// of [`Self::fulltext_search`] for the no-`LIMIT` shape that OOM-killed
+    /// replicas on a broad `fts_match` (t_8fc24ce2 / t_4ae47a9f layer 2b).
+    ///
+    /// Memory contract, per source:
+    /// * **FTI sidecars** (the dominant source): walked via
+    ///   [`ferrosa_index::fulltext::stream::scan_term_each`] — O(1) working
+    ///   set, one posting key in flight, no score map. This is what makes the
+    ///   walk's peak independent of the matching-doc count.
+    /// * **Memtable overlay**: its matches are collected under the table lock
+    ///   and forwarded after release (the consumer is never invoked while
+    ///   `tables` is held — it may block on a bounded channel). Bounded by the
+    ///   memtable's own size.
+    /// * **Missing-sidecar fallback** (transient async-rebuild window,
+    ///   BUG-F-007): bounded by the matches of the uncovered generations;
+    ///   normally an empty set.
+    ///
+    /// Delivery contract:
+    /// * Keys arrive **unordered** and **may repeat across sources**
+    ///   (memtable vs sidecar vs fallback) — the caller dedups. Scores are not
+    ///   surfaced; the no-`LIMIT` consumers treat the result as a key set.
+    /// * `on_hit` returning [`ControlFlow::Break`] halts the entire walk
+    ///   immediately (consumer-paced backpressure: dropped downstream
+    ///   receiver, satisfied page). No callback fires after a Break.
+    /// * Compound (non-single-`Term`) queries have no streaming evaluator yet:
+    ///   they delegate to [`Self::fulltext_search`] internally and replay its
+    ///   keys, so callers get one code path for every query shape. Their
+    ///   memory is bounded by that path's contract, not this one's.
+    ///
+    /// # Errors
+    ///
+    /// Fails loudly on a malformed query BEFORE any walk work (no callback
+    /// fires), and on memtable/fallback scan errors. A corrupt individual
+    /// sidecar is logged and skipped, matching [`Self::fulltext_search`].
+    pub fn fulltext_search_each(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &str,
+        on_hit: &mut dyn FnMut(Vec<u8>) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_index::fulltext::query::{parse_fts_query, FtsQuery};
+        use std::collections::HashSet;
+        use std::ops::ControlFlow;
+
+        // Parse once, up front: an invalid query fails loudly before any
+        // sidecar/scan work and before any callback fires.
+        let parsed = parse_fts_query(query).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
+        })?;
+
+        if !self.tables.read().contains_key(table_id) {
+            return Ok(());
+        }
+
+        // Compound queries: delegate to the materializing evaluator and
+        // replay its keys through the callback (single caller-facing path).
+        let FtsQuery::Term(term) = &parsed else {
+            for key in self.fulltext_search(table_id, index_name, query, None)? {
+                if on_hit(key).is_break() {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        };
+
+        let table_dir = self
+            .config
+            .data_dir
+            .join("sstables")
+            .join(table_id.to_string());
+        let fti_suffix = format!("-FTI-{index_name}.db");
+        let mut fti_files: Vec<std::path::PathBuf> = Vec::new();
+        let mut covered_gens: HashSet<String> = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(&table_dir) {
+            for e in entries.flatten() {
+                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some(gen) = name.strip_suffix(&fti_suffix) {
+                    covered_gens.insert(gen.to_string());
+                    fti_files.push(e.path());
+                }
+            }
+        }
+
+        // Memtable overlay — collect under the lock, forward after release.
+        let memtable_hits = {
+            let tables = self.tables.read();
+            let Some(state) = tables.get(table_id) else {
+                return Ok(());
+            };
+            state
+                .store
+                .fulltext_memtable_search(index_name, query, None)?
+        };
+        for (key, _score) in memtable_hits {
+            if on_hit(key).is_break() {
+                return Ok(());
+            }
+        }
+
+        // FTI sidecars — the O(1) streaming walk.
+        for fti_path in fti_files {
+            #[cfg(test)]
+            FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(c.get() + 1));
+            let mut stopped = false;
+            if let Err(e) =
+                ferrosa_index::fulltext::stream::scan_term_each(&fti_path, term, |hit| {
+                    if on_hit(hit.partition_key).is_break() {
+                        stopped = true;
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+            {
+                tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}");
+                continue;
+            }
+            if stopped {
+                return Ok(());
+            }
+        }
+
+        // Missing-sidecar fallback (transient rebuild window) — collect under
+        // the lock, forward after release.
+        let fallback_hits = {
+            let tables = self.tables.read();
+            match tables.get(table_id) {
+                Some(state) => state.store.fulltext_sstable_scan_missing_sidecar(
+                    index_name,
+                    query,
+                    &covered_gens,
+                    None,
+                )?,
+                None => Vec::new(),
+            }
+        };
+        for (key, _score) in fallback_hits {
+            if on_hit(key).is_break() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     /// Subsequent reads for this table will return empty results. Existing
     /// readers holding `Arc` references to old data will complete normally.
     pub fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
