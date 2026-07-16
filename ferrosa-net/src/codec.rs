@@ -113,6 +113,14 @@ pub enum MsgType {
     RangeReadStreamHeartbeat = 0x38,
     RangeReadStreamDone = 0x39,
     RangeReadStreamCancel = 0x3A,
+    // Streaming fulltext search (t_4ae47a9f) — the fts_match twin of the
+    // ADR-020 range-read stream: matching doc KEYS flow back in bounded
+    // chunks keyed by request_id instead of one O(matches) FulltextSearchResponse.
+    FulltextSearchStreamRequest = 0x3B,
+    FulltextSearchStreamChunk = 0x3C,
+    FulltextSearchStreamHeartbeat = 0x3D,
+    FulltextSearchStreamDone = 0x3E,
+    FulltextSearchStreamCancel = 0x3F,
     // Streaming (row-based)
     StreamStart = 0x30,
     StreamChunk = 0x31,
@@ -211,7 +219,12 @@ impl MsgType {
     pub fn is_ordered_stream_response(self) -> bool {
         matches!(
             self,
-            Self::RangeReadStreamChunk | Self::RangeReadStreamHeartbeat | Self::RangeReadStreamDone
+            Self::RangeReadStreamChunk
+                | Self::RangeReadStreamHeartbeat
+                | Self::RangeReadStreamDone
+                | Self::FulltextSearchStreamChunk
+                | Self::FulltextSearchStreamHeartbeat
+                | Self::FulltextSearchStreamDone
         )
     }
 }
@@ -243,6 +256,11 @@ impl TryFrom<u8> for MsgType {
             0x38 => Ok(Self::RangeReadStreamHeartbeat),
             0x39 => Ok(Self::RangeReadStreamDone),
             0x3A => Ok(Self::RangeReadStreamCancel),
+            0x3B => Ok(Self::FulltextSearchStreamRequest),
+            0x3C => Ok(Self::FulltextSearchStreamChunk),
+            0x3D => Ok(Self::FulltextSearchStreamHeartbeat),
+            0x3E => Ok(Self::FulltextSearchStreamDone),
+            0x3F => Ok(Self::FulltextSearchStreamCancel),
             0x27 => Ok(Self::TruncateForward),
             0x28 => Ok(Self::TruncateAck),
             0x29 => Ok(Self::RepairMerkleRequest),
@@ -691,6 +709,30 @@ mod tests {
         let val = MsgType::IndexBuildComplete as u8;
         let parsed = MsgType::try_from(val).unwrap();
         assert_eq!(parsed, MsgType::IndexBuildComplete);
+    }
+
+    /// t_4ae47a9f: the streaming-fulltext frame family round-trips through
+    /// the wire ids 0x3B–0x3F, and its response frames (Chunk / Heartbeat /
+    /// Done) are classified as ordered stream responses so inbound dispatch
+    /// preserves wire order — exactly like the range-read stream family.
+    #[test]
+    fn fulltext_stream_msg_types_roundtrip_and_classify() {
+        let all = [
+            (MsgType::FulltextSearchStreamRequest, 0x3Bu8, false),
+            (MsgType::FulltextSearchStreamChunk, 0x3C, true),
+            (MsgType::FulltextSearchStreamHeartbeat, 0x3D, true),
+            (MsgType::FulltextSearchStreamDone, 0x3E, true),
+            (MsgType::FulltextSearchStreamCancel, 0x3F, false),
+        ];
+        for (ty, byte, ordered) in all {
+            assert_eq!(ty as u8, byte, "{ty:?} wire id");
+            assert_eq!(MsgType::try_from(byte).unwrap(), ty, "{ty:?} roundtrip");
+            assert_eq!(
+                ty.is_ordered_stream_response(),
+                ordered,
+                "{ty:?} ordered-stream classification"
+            );
+        }
     }
 
     #[test]

@@ -56,18 +56,9 @@ impl Default for WebConfig {
     }
 }
 
-impl WebConfig {
-    /// Build from environment variables, falling back to defaults.
-    ///
-    /// `FERROSA_WEB_BIND` — bind address (e.g. `127.0.0.1:9090`)
-    pub fn from_env() -> Self {
-        let bind_addr = std::env::var("FERROSA_WEB_BIND")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| "0.0.0.0:9090".parse().expect("hardcoded addr is valid"));
-        Self { bind_addr }
-    }
-}
+// The bind address is resolved by the binary via `config_val`
+// (`[web] bind` in the config file wins over `FERROSA_WEB_BIND`, then the
+// default), so `WebConfig` is constructed directly with the resolved address.
 
 #[derive(Clone)]
 pub struct WebAppState {
