@@ -75,6 +75,15 @@ fn expand_tilde(p: String) -> String {
 }
 
 /// Read a config value: env var takes precedence, then config file, then default.
+/// Resolve a configuration value.  Precedence is **TOML wins, env var is the
+/// fallback, then the built-in default**: `[section] key` in the config file
+/// overrides `env_key`, which overrides `default`.
+///
+/// (This is a deliberate inversion of the historical env-wins precedence:
+/// operators asked for the config file to be authoritative so a committed
+/// TOML cannot be silently overridden by a stray env var in the shell /
+/// launchd / container environment. Every setting must be reachable from
+/// either source.)
 fn config_val(
     env_key: &str,
     config: &toml::Value,
@@ -82,76 +91,84 @@ fn config_val(
     key: &str,
     default: &str,
 ) -> String {
-    std::env::var(env_key).unwrap_or_else(|_| {
-        config
-            .get(section)
-            .and_then(|s| s.get(key))
-            .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
-            .unwrap_or_else(|| default.to_string())
-    })
-}
-
-/// Like `config_val` but returns `None` when neither the env var nor the
-/// config file set the key.  Needed to distinguish "operator did not say"
-/// from "operator wrote `false`" for the deprecated `FERROSA_AUTH_DISABLED`
-/// override path.
-fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env_key) {
-        return Some(v);
-    }
     config
         .get(section)
         .and_then(|s| s.get(key))
         .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
+        .or_else(|| std::env::var(env_key).ok())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Like `config_val` but returns `None` when neither the config file nor the
+/// env var set the key.  Needed to distinguish "operator did not say" from
+/// "operator wrote `false`" for the deprecated `FERROSA_AUTH_DISABLED`
+/// override path.  Same TOML-wins precedence as [`config_val`].
+fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str) -> Option<String> {
+    config
+        .get(section)
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_str().map(String::from).or_else(|| Some(v.to_string())))
+        .or_else(|| std::env::var(env_key).ok())
+}
+
+/// Parse a `SocketAddr` from a resolved config string, failing **loud and
+/// clean** on a malformed value.
+///
+/// A bad bind address is operator error, not a bug — but it must not surface
+/// as a `.expect()` panic. A panic unwinds the `#[tokio::main]` async stack,
+/// which drops the subsystem tokio runtimes in an async context and fires the
+/// "Cannot drop a runtime …" panic *on top of* the real error, masking it
+/// (issue #172). `process::exit` runs no destructors, so the diagnostic below
+/// is the last thing the operator sees. `label`/`env_key` name the setting so
+/// the message is actionable.
+fn parse_bind_addr(label: &str, env_key: &str, value: &str) -> std::net::SocketAddr {
+    match value.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!(
+                "FATAL: invalid {label} bind address {value:?}: {e}\n\
+                 Fix the config-file value or the {env_key} environment variable \
+                 (expected host:port, e.g. 127.0.0.1:9090)."
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Apply TOML `[internode]` overrides to a `NetConfig`.
 ///
-/// The env-var-then-TOML precedence already exists for storage / cql /
-/// graph fields via [`config_val`]; this helper closes BUG-006 for the
-/// internode subsystem, which previously read *only* env vars. Env var
-/// wins if set (i.e. `FERROSA_INTERNODE_BIND`); otherwise the TOML
-/// value is applied. Parse failures are logged but never fatal.
-///
-/// Generic over the env lookup so tests can drive the path without
-/// touching process-global environment.
-fn apply_internode_toml_overrides<F>(
+/// Precedence is **TOML wins** over env (see [`config_val`]): the base
+/// `NetConfig::from_env()` seeds each field from `FERROSA_INTERNODE_*`, then
+/// this helper overwrites any field the config file sets, so a committed TOML
+/// is authoritative. Parse failures are logged but never fatal — a malformed
+/// `[internode].bind` leaves the env/default value in place rather than
+/// crashing startup.
+fn apply_internode_toml_overrides(
     cfg: &mut ferrosa_net::config::NetConfig,
     file_config: &toml::Value,
-    env: F,
-) where
-    F: Fn(&str) -> Option<String>,
-{
+) {
     let internode = match file_config.get("internode") {
         Some(t) => t,
         None => return,
     };
 
-    if env("FERROSA_INTERNODE_BIND").is_none() {
-        if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
-            match v.parse() {
-                Ok(addr) => cfg.bind_addr = addr,
-                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].bind"),
-            }
+    if let Some(v) = internode.get("bind").and_then(|v| v.as_str()) {
+        match v.parse() {
+            Ok(addr) => cfg.bind_addr = addr,
+            Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].bind"),
         }
     }
-    if env("FERROSA_INTERNODE_BROADCAST").is_none() {
-        if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
-            match v.parse() {
-                Ok(addr) => cfg.broadcast_addr = addr,
-                Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
-            }
+    if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
+        match v.parse() {
+            Ok(addr) => cfg.broadcast_addr = addr,
+            Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
         }
     }
-    if env("FERROSA_CLUSTER_NAME").is_none() {
-        if let Some(v) = internode.get("cluster_name").and_then(|v| v.as_str()) {
-            cfg.cluster_name = v.to_string();
-        }
+    if let Some(v) = internode.get("cluster_name").and_then(|v| v.as_str()) {
+        cfg.cluster_name = v.to_string();
     }
-    if env("FERROSA_INTERNODE_PSK").is_none() {
-        if let Some(v) = internode.get("psk").and_then(|v| v.as_str()) {
-            cfg.psk = Some(v.to_string());
-        }
+    if let Some(v) = internode.get("psk").and_then(|v| v.as_str()) {
+        cfg.psk = Some(v.to_string());
     }
 }
 
@@ -160,39 +177,46 @@ fn apply_internode_toml_overrides<F>(
 /// Defaults to ON (t_acc3c7fd): a fresh install should expose the full
 /// user-facing feature set, so the graph HTTP (7474) + Bolt (7687) endpoints
 /// come up by default. Opt out explicitly with `FERROSA_GRAPH_ENABLED=false`
-/// or `[graph] enabled = false`. (Env wins over TOML — historically the binary
-/// only read the env var, so a TOML-only `enabled` was silently ignored, BUG-006.)
+/// or `[graph] enabled = false`. TOML wins over the env var (config file is
+/// authoritative); the env var is the fallback when the TOML key is absent.
 fn resolve_graph_enabled<F>(file_config: &toml::Value, env: F) -> bool
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(v) = env("FERROSA_GRAPH_ENABLED") {
-        return v == "true" || v == "1";
-    }
-    file_config
+    if let Some(b) = file_config
         .get("graph")
         .and_then(|s| s.get("enabled"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+    {
+        return b;
+    }
+    if let Some(v) = env("FERROSA_GRAPH_ENABLED") {
+        return v == "true" || v == "1";
+    }
+    true
 }
 
 /// Resolve the SPARQL-enabled flag honouring TOML when the env var is unset.
 ///
 /// Defaults to ON (t_acc3c7fd) so a fresh install exposes the SPARQL 1.1
 /// endpoint (8080). Opt out with `FERROSA_SPARQL_ENABLED=false` or
-/// `[sparql] enabled = false`.
+/// `[sparql] enabled = false`. TOML wins over the env var; the env var is the
+/// fallback when the TOML key is absent.
 fn resolve_sparql_enabled<F>(file_config: &toml::Value, env: F) -> bool
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(v) = env("FERROSA_SPARQL_ENABLED") {
-        return v == "true" || v == "1";
-    }
-    file_config
+    if let Some(b) = file_config
         .get("sparql")
         .and_then(|s| s.get("enabled"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+    {
+        return b;
+    }
+    if let Some(v) = env("FERROSA_SPARQL_ENABLED") {
+        return v == "true" || v == "1";
+    }
+    true
 }
 
 /// Resolve the auth-enabled flag honouring TOML when the env var is unset.
@@ -258,24 +282,28 @@ fn resolve_auth_enabled_toml<F>(file_config: &toml::Value, env: F) -> Option<boo
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(v) = env("FERROSA_AUTH_ENABLED") {
-        return Some(v == "true" || v == "1");
-    }
-    file_config
+    if let Some(b) = file_config
         .get("cql")
         .and_then(|s| s.get("auth_enabled"))
         .and_then(|v| v.as_bool())
+    {
+        return Some(b);
+    }
+    if let Some(v) = env("FERROSA_AUTH_ENABLED") {
+        return Some(v == "true" || v == "1");
+    }
+    None
 }
 
 /// Human label for where the effective `auth_enabled` value came from, for the
-/// startup log. Env wins, then `[cql].auth_enabled` in the config file, then the
-/// built-in default. (Issue #172: the log used to always say `"default"` even
-/// when the config file set it.)
+/// startup log. `[cql].auth_enabled` in the config file wins, then the
+/// `FERROSA_AUTH_ENABLED` env var, then the built-in default. (Issue #172: the
+/// log used to always say `"default"` even when the config file set it.)
 fn auth_source_label(env_set: bool, toml_has_auth_key: bool) -> &'static str {
-    if env_set {
-        "FERROSA_AUTH_ENABLED env"
-    } else if toml_has_auth_key {
+    if toml_has_auth_key {
         "config file ([cql].auth_enabled)"
+    } else if env_set {
+        "FERROSA_AUTH_ENABLED env"
     } else {
         "default"
     }
@@ -298,15 +326,14 @@ fn resolve_hinted_handoff_dir(
     data_dir: &Path,
     env_override: Option<&str>,
 ) -> std::path::PathBuf {
-    env_override
+    // TOML wins over env (config file authoritative), then env, then the
+    // per-node default under the data dir.
+    config
+        .get("cluster")
+        .and_then(|s| s.get("hinted_handoff_dir"))
+        .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            config
-                .get("cluster")
-                .and_then(|s| s.get("hinted_handoff_dir"))
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-        })
+        .or_else(|| env_override.map(std::path::PathBuf::from))
         .unwrap_or_else(|| data_dir.join("hints"))
 }
 
@@ -793,8 +820,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BUG-006: `[cql].auth_enabled` in ferrosa.toml was silently ignored.
     // Apply it now if the env var did not already set it via from_env.
     if let Some(toml_auth) = resolve_auth_enabled_toml(&file_config, |k| std::env::var(k).ok()) {
-        // Env wins inside the resolver, so if we got Some(_) it is the
-        // operator's authoritative choice (env or TOML); set on config.
+        // TOML wins inside the resolver, so if we got Some(_) it is the
+        // operator's authoritative choice (TOML or env); set on config.
         storage_config.auth_enabled = toml_auth;
     }
     let storage_auth_warn = storage_config.auth_warn;
@@ -930,6 +957,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dedicated subsystem runtimes. The main runtime stays supervisor-only;
     // work below is routed to an explicit pool.
     let runtimes = runtime::RuntimeManager::new();
+    // Pin them to the process lifetime so no early-error return can drop a
+    // tokio Runtime on this async stack and mask the real error with the
+    // "Cannot drop a runtime …" panic (issue #172). Must precede any `?` below.
+    runtimes.leak_for_process_lifetime();
 
     // 4a. Seed default roles if auth is enabled.
     //
@@ -1144,10 +1175,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ModeController — needed downstream when populating system.local.tokens.
     let num_tokens = cluster_config.num_tokens as usize;
     let mut net_config_mut = ferrosa_net::config::NetConfig::from_env();
-    // BUG-006: apply TOML overrides (env wins; TOML falls back). Previously
-    // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml were
-    // silently ignored.
-    apply_internode_toml_overrides(&mut net_config_mut, &file_config, |k| std::env::var(k).ok());
+    // Seed the base from `FERROSA_INTERNODE_*`, then let the config file win:
+    // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml override
+    // the env-derived defaults (TOML-wins precedence).
+    apply_internode_toml_overrides(&mut net_config_mut, &file_config);
     let net_config = Arc::new(net_config_mut);
 
     // Build handler registry — shared between RPC server and ModeController.
@@ -1656,7 +1687,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
     };
-    let web_config = web::WebConfig::from_env();
+    // Web console bind: `[web] bind` in the config file wins over
+    // `FERROSA_WEB_BIND`, then the default. Previously this read only the env
+    // var and defaulted to 0.0.0.0:9090 — so every co-located node collided on
+    // 9090, the second binder hit EADDRINUSE, and the resulting `?` return
+    // masked the real error via the runtime-drop panic (issue #172).
+    let web_bind = config_val(
+        "FERROSA_WEB_BIND",
+        &file_config,
+        "web",
+        "bind",
+        "0.0.0.0:9090",
+    );
+    let web_config = web::WebConfig {
+        bind_addr: parse_bind_addr("web console", "FERROSA_WEB_BIND", &web_bind),
+    };
     let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
@@ -1758,11 +1803,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_cluster::AutoRepairScheduler::spawn(scheduler, shutdown_rx.clone());
     }
 
+    // Graph HTTP bind: `[graph] bind` in the config file wins over
+    // `FERROSA_GRAPH_BIND`, then the default. Previously this was hardcoded to
+    // the 7474 default, so co-located nodes collided (the second binder logged
+    // "graph HTTP server failed … Address already in use" and served no graph
+    // endpoint) — the same class of bug as the web-console 9090 collision, just
+    // non-fatal because the listener runs in a background task.
+    let graph_bind = config_val(
+        "FERROSA_GRAPH_BIND",
+        &file_config,
+        "graph",
+        "bind",
+        "0.0.0.0:7474",
+    );
+    let graph_bind_addr = parse_bind_addr("graph HTTP", "FERROSA_GRAPH_BIND", &graph_bind);
+
     if graph_enabled {
         let graph_config = ferrosa_graph::engine::GraphConfig {
             enabled: true,
             http: ferrosa_graph::http::GraphHttpConfig {
                 require_tls: false,
+                bind_addr: graph_bind_addr,
                 ..ferrosa_graph::http::GraphHttpConfig::default()
             },
             ..ferrosa_graph::engine::GraphConfig::default()
@@ -1792,7 +1853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             graph_schema_coordinator,
         ));
 
-        // 10a. Graph HTTP server (port 7474)
+        // 10a. Graph HTTP server (bind resolved above: [graph] bind / env / 7474)
         let schema_for_http = schema.clone();
         let state = ferrosa_graph::http::AppState {
             engine: graph_engine.clone(),
@@ -1845,6 +1906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
         let disabled_http_config = ferrosa_graph::http::GraphHttpConfig {
             require_tls: false,
+            bind_addr: graph_bind_addr,
             ..ferrosa_graph::http::GraphHttpConfig::default()
         };
         runtimes.background.spawn(async move {
@@ -1860,10 +1922,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sparql_enabled = resolve_sparql_enabled(&file_config, |k| std::env::var(k).ok());
 
     if sparql_enabled {
-        let sparql_bind: std::net::SocketAddr = std::env::var("FERROSA_SPARQL_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:8080".into())
-            .parse()
-            .expect("invalid FERROSA_SPARQL_BIND");
+        // `[sparql] bind` in the config file wins over `FERROSA_SPARQL_BIND`.
+        let sparql_bind_str = config_val(
+            "FERROSA_SPARQL_BIND",
+            &file_config,
+            "sparql",
+            "bind",
+            "0.0.0.0:8080",
+        );
+        let sparql_bind: std::net::SocketAddr =
+            parse_bind_addr("SPARQL", "FERROSA_SPARQL_BIND", &sparql_bind_str);
 
         let sparql_write_path = std::sync::Arc::new(
             ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
@@ -1902,10 +1970,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the other front-ends. Query execution is a fail-loud stub until the
     // relational engine (ferrosa-sql) is wired in (M1).
     {
-        let pg_bind: std::net::SocketAddr = std::env::var("FERROSA_POSTGRES_BIND")
-            .unwrap_or_else(|_| "0.0.0.0:5432".into())
-            .parse()
-            .expect("invalid FERROSA_POSTGRES_BIND");
+        // `[postgres] bind` in the config file wins over `FERROSA_POSTGRES_BIND`.
+        let pg_bind_str = config_val(
+            "FERROSA_POSTGRES_BIND",
+            &file_config,
+            "postgres",
+            "bind",
+            "0.0.0.0:5432",
+        );
+        let pg_bind: std::net::SocketAddr =
+            parse_bind_addr("Postgres", "FERROSA_POSTGRES_BIND", &pg_bind_str);
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
@@ -1932,8 +2006,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 12. Background: connect to seeds with exponential backoff
     // Seeds can be hostnames (e.g., "node2:7000") which SocketAddr can't parse.
     // Resolve via DNS in the background task.
-    let seed_strs: Vec<String> = std::env::var("FERROSA_SEED")
-        .unwrap_or_default()
+    // Seed list: `[internode] seed` in the config file wins over `FERROSA_SEED`
+    // (TOML-wins precedence), so a committed node config can join a cluster
+    // with no env wiring. Both accept a comma-separated list; entries may be
+    // hostnames (resolved via DNS in the background task below).
+    let seed_strs: Vec<String> = config_val("FERROSA_SEED", &file_config, "internode", "seed", "")
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -2423,15 +2500,49 @@ mod tests {
     }
 
     #[test]
-    fn config_val_env_overrides_toml() {
+    fn config_val_toml_overrides_env() {
+        // TOML-wins precedence: when both the config file and the env var set a
+        // value, the config file is authoritative.
         let key = "FERROSA_TEST_CFG_OVERRIDE_9f1c";
         std::env::set_var(key, "/env/override");
-        let config = sample_config();
+        let config = sample_config(); // [storage] data_dir = "/data/ferrosa"
 
         let result = config_val(key, &config, "storage", "data_dir", "/var/lib/ferrosa");
-        assert_eq!(result, "/env/override");
+        assert_eq!(result, "/data/ferrosa");
 
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn config_val_falls_back_to_env_when_toml_absent() {
+        // Env var is the fallback when the config file does not set the key.
+        let key = "FERROSA_TEST_CFG_ENV_FALLBACK_3b7d";
+        std::env::set_var(key, "/env/only");
+
+        let result = config_val(
+            key,
+            &empty_config(),
+            "storage",
+            "data_dir",
+            "/var/lib/ferrosa",
+        );
+        assert_eq!(result, "/env/only");
+
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn config_val_opt_toml_overrides_env() {
+        let key = "FERROSA_TEST_CFG_OPT_OVERRIDE_1a2b";
+        std::env::set_var(key, "false");
+        let cfg: toml::Value = toml::from_str("[cql]\nauth_disabled = true\n").unwrap();
+        let result = config_val_opt(key, &cfg, "cql", "auth_disabled");
+        std::env::remove_var(key);
+        assert_eq!(
+            result.as_deref(),
+            Some("true"),
+            "config file must win over env"
+        );
     }
 
     #[test]
@@ -2543,7 +2654,7 @@ mod tests {
         assert_eq!(first, second, "regenerated UUID was not persisted");
     }
 
-    // ---- BUG-006 -----------------------------------------------------
+    // ---- internode config resolution (TOML-wins) ----------------------
 
     /// Internode bind from TOML is honored when the env var is unset.
     #[test]
@@ -2551,26 +2662,24 @@ mod tests {
         let mut cfg = ferrosa_net::config::NetConfig::default();
         let toml: toml::Value =
             toml::from_str("[internode]\nbind = \"127.0.0.1:18001\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        apply_internode_toml_overrides(&mut cfg, &toml);
         assert_eq!(cfg.bind_addr, "127.0.0.1:18001".parse().unwrap());
     }
 
-    /// Env var beats TOML — env wins precedence as advertised.
+    /// TOML beats env: the base `NetConfig::from_env()` seeds the bind, then the
+    /// config-file value overwrites it (TOML-wins precedence). Modeled here by
+    /// pre-seeding the field to the "env" value and asserting TOML replaces it.
     #[test]
-    fn apply_internode_toml_overrides_env_wins() {
-        let mut cfg = ferrosa_net::config::NetConfig::default();
-        let default_bind = cfg.bind_addr;
+    fn apply_internode_toml_overrides_toml_wins_over_env() {
+        // `bind_addr` stands in for the env-derived base value.
+        let mut cfg = ferrosa_net::config::NetConfig {
+            bind_addr: "127.0.0.1:19999".parse().unwrap(),
+            ..ferrosa_net::config::NetConfig::default()
+        };
         let toml: toml::Value =
             toml::from_str("[internode]\nbind = \"127.0.0.1:18002\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml, |k| {
-            if k == "FERROSA_INTERNODE_BIND" {
-                Some("ignored".into())
-            } else {
-                None
-            }
-        });
-        // Env-set means we do NOT apply TOML; bind_addr is whatever it was.
-        assert_eq!(cfg.bind_addr, default_bind);
+        apply_internode_toml_overrides(&mut cfg, &toml);
+        assert_eq!(cfg.bind_addr, "127.0.0.1:18002".parse().unwrap());
     }
 
     /// Cluster name + broadcast + psk also flow from TOML.
@@ -2587,7 +2696,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        apply_internode_toml_overrides(&mut cfg, &toml);
         assert_eq!(cfg.bind_addr, "127.0.0.1:18003".parse().unwrap());
         assert_eq!(cfg.broadcast_addr, "10.0.0.1:18003".parse().unwrap());
         assert_eq!(cfg.cluster_name, "team-cluster");
@@ -2600,8 +2709,62 @@ mod tests {
         let mut cfg = ferrosa_net::config::NetConfig::default();
         let default_bind = cfg.bind_addr;
         let toml: toml::Value = toml::from_str("[internode]\nbind = \"not-an-addr\"\n").unwrap();
-        apply_internode_toml_overrides(&mut cfg, &toml, |_| None);
+        apply_internode_toml_overrides(&mut cfg, &toml);
         assert_eq!(cfg.bind_addr, default_bind);
+    }
+
+    /// Seed list resolves from `[internode] seed` in the config file (so a
+    /// committed node config can join a cluster with no env wiring), with
+    /// `FERROSA_SEED` as the fallback and TOML winning when both are set. This
+    /// mirrors the resolution in `main` (`config_val` + comma-split).
+    #[test]
+    #[serial_test::serial(env)]
+    fn seed_resolves_from_toml_over_env() {
+        fn seeds(raw: &str) -> Vec<String> {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+
+        std::env::remove_var("FERROSA_SEED");
+
+        // Config file provides the seed with no env set.
+        let cfg: toml::Value = toml::from_str("[internode]\nseed = \"127.0.0.1:17000\"\n").unwrap();
+        assert_eq!(
+            seeds(&config_val("FERROSA_SEED", &cfg, "internode", "seed", "")),
+            vec!["127.0.0.1:17000".to_string()]
+        );
+
+        // Env var is the fallback when TOML is silent (comma-separated list).
+        std::env::set_var("FERROSA_SEED", "a:1, b:2");
+        assert_eq!(
+            seeds(&config_val(
+                "FERROSA_SEED",
+                &empty_config(),
+                "internode",
+                "seed",
+                ""
+            )),
+            vec!["a:1".to_string(), "b:2".to_string()]
+        );
+
+        // TOML wins when both are set.
+        assert_eq!(
+            seeds(&config_val("FERROSA_SEED", &cfg, "internode", "seed", "")),
+            vec!["127.0.0.1:17000".to_string()]
+        );
+
+        // Neither set → empty seed list (single-node bootstrap).
+        std::env::remove_var("FERROSA_SEED");
+        assert!(seeds(&config_val(
+            "FERROSA_SEED",
+            &empty_config(),
+            "internode",
+            "seed",
+            ""
+        ))
+        .is_empty());
     }
 
     /// Graph enable via TOML when env unset.
@@ -2614,10 +2777,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_graph_enabled_env_wins_over_toml() {
+    fn resolve_graph_enabled_toml_wins_over_env() {
+        // TOML says off, env says on → TOML wins (off).
         let toml: toml::Value = toml::from_str("[graph]\nenabled = false\n").unwrap();
+        assert!(!resolve_graph_enabled(&toml, |k| {
+            (k == "FERROSA_GRAPH_ENABLED").then(|| "true".into())
+        }));
+    }
+
+    #[test]
+    fn resolve_graph_enabled_falls_back_to_env_when_toml_absent() {
+        // No TOML key → env is the fallback.
+        let toml = empty_config();
         assert!(resolve_graph_enabled(&toml, |k| {
             (k == "FERROSA_GRAPH_ENABLED").then(|| "true".into())
+        }));
+        assert!(!resolve_graph_enabled(&toml, |k| {
+            (k == "FERROSA_GRAPH_ENABLED").then(|| "false".into())
         }));
     }
 
@@ -2661,8 +2837,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_enabled_toml_env_wins() {
+    fn resolve_auth_enabled_toml_wins_over_env() {
+        // TOML says false, env says true → TOML wins (false).
         let toml: toml::Value = toml::from_str("[cql]\nauth_enabled = false\n").unwrap();
+        assert_eq!(
+            resolve_auth_enabled_toml(&toml, |k| (k == "FERROSA_AUTH_ENABLED")
+                .then(|| "true".into())),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn resolve_auth_enabled_toml_falls_back_to_env_when_toml_absent() {
+        // No TOML key → env is the fallback.
+        let toml = empty_config();
         assert_eq!(
             resolve_auth_enabled_toml(&toml, |k| (k == "FERROSA_AUTH_ENABLED")
                 .then(|| "true".into())),
@@ -2678,18 +2866,22 @@ mod tests {
 
     /// Regression (issue #172): the startup auth log used to always report
     /// `source="default"`, hiding the fact that `[cql].auth_enabled` in the
-    /// config file was in force. `auth_source_label` must attribute a config-file
-    /// value to the config file (not "default"), env to env, and only fall back
-    /// to "default" when neither is set.
+    /// config file was in force. Under TOML-wins precedence, `auth_source_label`
+    /// must attribute a config-file value to the config file (even when the env
+    /// var is also set), fall back to env when only the env var is set, and only
+    /// report "default" when neither is set.
     #[test]
     fn auth_source_label_attributes_config_file_not_default() {
-        // env unset, [cql].auth_enabled present in TOML -> config file
+        // [cql].auth_enabled present in TOML -> config file wins regardless of env
         assert_eq!(
             auth_source_label(false, true),
             "config file ([cql].auth_enabled)"
         );
-        // env set -> env wins regardless of TOML
-        assert_eq!(auth_source_label(true, true), "FERROSA_AUTH_ENABLED env");
+        assert_eq!(
+            auth_source_label(true, true),
+            "config file ([cql].auth_enabled)"
+        );
+        // only env set -> env
         assert_eq!(auth_source_label(true, false), "FERROSA_AUTH_ENABLED env");
         // neither set -> default
         assert_eq!(auth_source_label(false, false), "default");
@@ -3010,44 +3202,72 @@ mod tests {
         );
     }
 
-    /// BT-005f: WebConfig::from_env parses the FERROSA_WEB_BIND env var.
+    /// BT-005f: the web-console bind resolves via `config_val` — `[web] bind`
+    /// in the config file wins over `FERROSA_WEB_BIND`, which wins over the
+    /// default. (Regression: the old path read only the env var and defaulted
+    /// to 0.0.0.0:9090, so co-located nodes collided on 9090.)
     #[test]
     #[serial_test::serial(env)]
-    fn bt005_web_config_env_var_parsing() {
-        // Test 1: valid address.
+    fn bt005_web_bind_resolves_toml_over_env() {
+        std::env::remove_var("FERROSA_WEB_BIND");
+
+        // Default when neither source sets it.
+        assert_eq!(
+            config_val(
+                "FERROSA_WEB_BIND",
+                &empty_config(),
+                "web",
+                "bind",
+                "0.0.0.0:9090"
+            ),
+            "0.0.0.0:9090"
+        );
+
+        // Env var is the fallback when the config file is silent.
         std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
-        let wc = crate::web::WebConfig::from_env();
         assert_eq!(
-            wc.bind_addr.to_string(),
-            "127.0.0.1:8080",
-            "FERROSA_WEB_BIND must override the default"
+            config_val(
+                "FERROSA_WEB_BIND",
+                &empty_config(),
+                "web",
+                "bind",
+                "0.0.0.0:9090"
+            ),
+            "127.0.0.1:8080"
         );
 
-        // Test 2: invalid address falls back to default.
-        std::env::set_var("FERROSA_WEB_BIND", "not-an-address");
-        let wc = crate::web::WebConfig::from_env();
+        // Config file wins over the env var.
+        let cfg: toml::Value = toml::from_str("[web]\nbind = \"127.0.0.1:19091\"\n").unwrap();
         assert_eq!(
-            wc.bind_addr.to_string(),
-            "0.0.0.0:9090",
-            "invalid FERROSA_WEB_BIND must fall back to default"
+            config_val("FERROSA_WEB_BIND", &cfg, "web", "bind", "0.0.0.0:9090"),
+            "127.0.0.1:19091",
+            "config file [web] bind must win over FERROSA_WEB_BIND"
         );
 
-        // Clean up.
         std::env::remove_var("FERROSA_WEB_BIND");
     }
 
-    /// BT-005h: config_val env var with empty string is treated as a set value
-    /// (not as "unset"). The caller decides if "" is meaningful.
+    /// BT-005h: an env var set to the empty string is treated as a set value
+    /// (not as "unset") when it is the effective source. With TOML-wins
+    /// precedence, that means: when the config file does NOT set the key, the
+    /// empty env var is returned as-is rather than falling through to default.
     #[test]
     fn bt005_config_val_env_empty_string() {
         let key = "FERROSA_TEST_BT005H_EMPTY_STR";
         std::env::set_var(key, "");
-        let config = sample_config();
 
-        let result = config_val(key, &config, "storage", "data_dir", "/default");
+        // Config file silent → env var (even "") is the fallback, returned as-is.
+        let result = config_val(key, &empty_config(), "storage", "data_dir", "/default");
         assert_eq!(
             result, "",
-            "empty env var must be returned as-is (not fall through to TOML/default)"
+            "empty env var must be returned as-is (not fall through to default)"
+        );
+
+        // But the config file still wins when it sets the key.
+        let result = config_val(key, &sample_config(), "storage", "data_dir", "/default");
+        assert_eq!(
+            result, "/data/ferrosa",
+            "config file value must win over an empty env var"
         );
         std::env::remove_var(key);
     }
