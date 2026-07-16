@@ -254,6 +254,33 @@ fn committed_cdc_event(
     Some((bus, event))
 }
 
+/// Run a node-local full-text index scan on a blocking thread.
+///
+/// [`StorageEngine::fulltext_search`] is synchronous and blocking (directory
+/// enumeration + sequential sidecar walks + whole-file reads). Invoking it
+/// inline on an async worker starves that worker's other futures — raft
+/// heartbeats and CQL keepalives — which was a co-cause of the Bulk-lane
+/// timeout → retry storm during the OOM cascade (t_8fc24ce2; same class as the
+/// PR #131 range-read offload). Offloading it keeps the async runtime
+/// responsive while the scan runs.
+async fn offloaded_fulltext_search(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    index_name: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> crate::error::Result<Vec<Vec<u8>>> {
+    let table_id = table_id.clone();
+    let index_name = index_name.to_string();
+    let query = query.to_string();
+    tokio::task::spawn_blocking(move || {
+        engine.fulltext_search(&table_id, &index_name, &query, limit)
+    })
+    .await
+    .map_err(|e| crate::error::ClusterError::Internal(format!("fulltext_search task join: {e}")))?
+    .map_err(crate::error::ClusterError::Storage)
+}
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -987,13 +1014,19 @@ impl WritePath {
         limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         match self {
-            Self::Direct(engine) => engine
-                .fulltext_search(table_id, index_name, query, limit)
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
-                .local_storage()
-                .fulltext_search(table_id, index_name, query, limit)
-                .map_err(crate::error::ClusterError::Storage),
+            Self::Direct(engine) => {
+                offloaded_fulltext_search(engine.clone(), table_id, index_name, query, limit).await
+            }
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                offloaded_fulltext_search(
+                    coordinator.local_storage().clone(),
+                    table_id,
+                    index_name,
+                    query,
+                    limit,
+                )
+                .await
+            }
             Self::Cluster(coordinator) => {
                 coordinator
                     .coordinate_fulltext_search(table_id, index_name, query, limit)
