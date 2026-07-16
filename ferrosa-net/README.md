@@ -36,7 +36,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   length-prefixed encode/decode for lifecycle, Raft, mutation/read, repair,
   streaming, pair-mode, batchlog, index (incl. full-text scatter-gather and
   the keyed `IndexReadInPartition{Request,Response}` `0x66`/`0x67` pair,
-  t_430c4188), Accord
+  t_430c4188, and the streaming fulltext family
+  `FulltextSearchStream{Request,Chunk,Heartbeat,Done,Cancel}` `0x3B`..=`0x3F`,
+  t_4ae47a9f — the `fts_match` twin of the ADR-020 range-read stream whose
+  Chunk/Heartbeat/Done frames are `is_ordered_stream_response`), Accord
   (incl. the additive multi-key `AccordPreAcceptV2` `0x7B` / `AccordApplyV2` `0x7C`
   codes — bincode is not self-describing, so multi-key transactions get new codes
   rather than extending the single-key payloads), and bootstrap message types
