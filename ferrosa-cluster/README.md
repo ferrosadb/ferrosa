@@ -100,6 +100,18 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   leader-only serial, cross-DC Accord routing).
 - `coordinator/batch.rs` — 3-phase logged batchlog (write → fan out → delete only
   on full success) with replay task; `DEFAULT_BATCH_CONCURRENCY = 32`.
+- `coordinator/fulltext_stream.rs` — streaming fulltext search (t_4ae47a9f),
+  the `fts_match` twin of the ADR-020 range-read stream: the producer walks the
+  local FTI via `fulltext_search_each` on a blocking thread and fires bounded
+  `FulltextSearchStreamChunk` key batches (≤ 4096 keys) on `Lane::Bulk` with
+  heartbeats + Cancel; `coordinate_fulltext_search_stream` fans out to every
+  node, N-way merges over bounded channels, and dedups into one `seen` set —
+  the only O(distinct matches) allocation left in the path (scores and extra
+  copies are gone; the pre-fix union OOM-killed replicas, t_8fc24ce2). Any
+  replica failure fails the stream loudly — no silent partial union (stricter
+  than the legacy degrading path). `WritePath::fulltext_search_stream` is the
+  mode-dispatching entry; `FERROSA_BULK_STREAMING_FULLTEXT=0` falls back to
+  the legacy single-message union for mixed-version upgrades.
 - `coordinator/{range_read_stream,stream_*}.rs` — ADR-020 streaming range reads
   and projected streaming scans; the old Vec-returning
   `WritePath::range_read_projected` wrapper has been removed, so projected
