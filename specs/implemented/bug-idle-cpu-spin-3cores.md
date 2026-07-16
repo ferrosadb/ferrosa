@@ -1,6 +1,13 @@
 # Bug: idle 3-node cluster busy-spins ~3 CPU cores (CQL keepalive/RequestTimeout under 2 vCPU)
 
-**Status**: Open. Root-cause localized to a userspace busy-spin in the net/runtime layer; exact
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: `ferrosa-storage/src/self_heal/` now avoids clean-tick
+> row scans and replica-posture probes that caused the idle self-heal busy-spin;
+> the source comments explicitly reference this bug.
+> Verification runs: `cargo test -p ferrosa-storage --lib tick_with_no_corruption_is_idle`
+> and `cargo test -p ferrosa-storage --lib clean_tick_does_not_probe_replica_posture`.
+
+**Status**: Implemented and locally verified. Root-cause localized to a userspace busy-spin in the net/runtime layer; exact
 loop not yet pinned (needs a CPU flamegraph). Filed 2026-06-14.
 **Severity**: High — starves a 2-vCPU deployment before any work; surfaces as `KeepaliveTimeout` /
 `RequestTimeout` flakes (ferrosa-memory `cql_live` CI on `ubuntu-latest` 2 vCPU). Also wastes CPU

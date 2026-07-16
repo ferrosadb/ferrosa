@@ -1,10 +1,18 @@
 ---
 type: gap
 priority: P0
-status: in_progress
+status: implemented
 created: 2026-05-20
 updated: 2026-05-22
 ---
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: `ferrosa-storage/src/timeseries/materialization.rs`,
+> the storage materialization worker/drain path in `ferrosa-storage/src/engine.rs`,
+> and CQL router coverage for normal CQL writes producing queryable rollup rows.
+> Verification runs: `cargo test -p ferrosa-storage --test timeseries_materialization`
+> (18 passed), `cargo test -p ferrosa-cql --lib cql_inserts_materialize_rrd_rollup_rows`,
+> and `cargo test -p ferrosa-cql --lib timeseries_rrd_example_executes_real_rollup_rows`.
+
 
 # RRD consolidation extensions must materialize rollup tables
 
