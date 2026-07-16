@@ -1,10 +1,19 @@
 # Storage Multi-Write Batch / Transaction Primitive
 
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: `ferrosa-storage/src/engine.rs` exposes `BatchOp`,
+> `apply_batch`, and `BatchTxn`; `ferrosa-storage/tests/batch_primitive.rs`
+> covers atomic visibility, all-or-nothing failure, restart durability, empty
+> batches, unregistered-table errors, transaction commit/abort, periodic-sync
+> durability, oversized-entry rejection, and partition tombstones.
+> Verification run: `cargo test -p ferrosa-storage --test batch_primitive`
+> (9 passed).
+
 > Spec: URS-QEC-X02 (one real `StorageEngine` batch/transaction primitive for
 > delete-cascade, Bolt transactions, and forget — not three divergent paths).
 > Relates: `specs/bug-accord-lwt-acks-phantom-write.md`,
 > `specs/feat-query-engine-completeness.md` (D03 / B02 / X01 / X02).
-> Status: design. Implementation tracked separately (TDD, red-first).
+> Status: implemented and locally verified.
 
 ## 1. Problem
 
