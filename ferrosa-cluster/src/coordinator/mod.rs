@@ -3,6 +3,7 @@
 
 pub mod batch;
 pub mod cl_routing;
+pub mod fulltext_stream;
 pub mod metrics;
 pub mod range_read_stream;
 pub mod read;
@@ -85,6 +86,13 @@ pub struct ClusterCoordinator {
     /// path applies a hard partition cap and cannot serve complete
     /// full-scan semantics.
     pub(crate) streaming_range_reads: bool,
+    /// When `true` (the default), no-`LIMIT` `fts_match` queries use the
+    /// streaming fulltext protocol (t_4ae47a9f) instead of the legacy
+    /// single-message `FulltextSearchRequest` union whose O(matches)
+    /// materialization OOM-killed replicas (t_8fc24ce2).
+    /// `FERROSA_BULK_STREAMING_FULLTEXT=0` opts into the legacy path for
+    /// mixed-version rolling upgrades.
+    pub(crate) streaming_fulltext: bool,
 }
 
 fn streaming_range_reads_enabled(value: Option<&str>) -> bool {
@@ -119,6 +127,15 @@ impl ClusterCoordinator {
     ) -> Self {
         let streaming_env = std::env::var("FERROSA_BULK_STREAMING_RANGE_READ").ok();
         let streaming_range_reads = streaming_range_reads_enabled(streaming_env.as_deref());
+        let streaming_fulltext_env = std::env::var("FERROSA_BULK_STREAMING_FULLTEXT").ok();
+        let streaming_fulltext = streaming_range_reads_enabled(streaming_fulltext_env.as_deref());
+        if !streaming_fulltext {
+            tracing::warn!(
+                "coordinator: legacy single-message fulltext search enabled via \
+                 FERROSA_BULK_STREAMING_FULLTEXT=0; broad no-LIMIT fts_match queries \
+                 materialize the match set on every replica (t_8fc24ce2 OOM shape)"
+            );
+        }
         if streaming_range_reads {
             tracing::info!(
                 configured = streaming_env.as_deref().unwrap_or("default"),
@@ -146,6 +163,7 @@ impl ClusterCoordinator {
             stream_router: Arc::new(StreamRouter::new()),
             next_request_id: Arc::new(AtomicU32::new(fresh_stream_request_id_seed(local_node_id))),
             streaming_range_reads,
+            streaming_fulltext,
         }
     }
 

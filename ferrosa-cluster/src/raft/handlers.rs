@@ -1287,6 +1287,70 @@ pub struct RangeReadStreamCancelPayload {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming fulltext search (t_4ae47a9f) — the fts_match twin of the ADR-020
+// streaming range read. Matching doc KEYS flow back in bounded chunks instead
+// of one O(matches) FulltextSearchResponse frame; the producer's walk is
+// consumer-paced (bounded internal channel + Cancel), so no node materializes
+// the match set (the t_8fc24ce2 OOM shape).
+// ---------------------------------------------------------------------------
+
+/// Coordinator → handler: open a streaming fulltext search against one
+/// node's local FTI. There is deliberately no `limit` field: the streaming
+/// path exists for the no-`LIMIT` / escalated shape, and the consumer stops
+/// the stream via back-pressure + [`FulltextSearchStreamCancelPayload`] when
+/// it has enough. LIMIT-k queries keep using the bounded legacy
+/// [`FulltextSearchRequestPayload`] path (O(k) per replica already).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextSearchStreamRequestPayload {
+    /// Per-coordinator-call correlation id, echoed in every frame of this
+    /// stream so the StreamRouter can dispatch to the right consumer.
+    pub request_id: u32,
+    pub keyspace: String,
+    pub table: String,
+    pub index_name: String,
+    pub query: String,
+}
+
+/// Handler → coordinator: one bounded batch of matching doc keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextSearchStreamChunkPayload {
+    pub request_id: u32,
+    /// Monotonic 0-based chunk sequence within this stream.
+    pub seq: u32,
+    /// Raw doc keys (fulltext doc-key encoding, same bytes the legacy
+    /// `FulltextSearchResponsePayload.matching_keys` carries). Unordered;
+    /// may repeat across a node's sources — the coordinator dedups.
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// Handler → coordinator: keep-alive while the FTI walk is slow to yield
+/// the next chunk. Resets the coordinator's idle-timeout watchdog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextSearchStreamHeartbeatPayload {
+    pub request_id: u32,
+    /// Sequence number of the next chunk the handler is working on.
+    pub seq: u32,
+}
+
+/// Handler → coordinator: terminator for a streaming fulltext search.
+/// `truncated = true` reports a walk failure (bad query, storage error) —
+/// the coordinator fails the whole search rather than serving a silent
+/// partial match set (fail loud, never fake).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextSearchStreamDonePayload {
+    pub request_id: u32,
+    pub total_chunks: u32,
+    pub truncated: bool,
+}
+
+/// Coordinator → handler: abort a fulltext stream in-flight. The producer's
+/// walk observes the cancellation as a `ControlFlow::Break` between keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulltextSearchStreamCancelPayload {
+    pub request_id: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Index read handler
 // ---------------------------------------------------------------------------
 
@@ -1499,15 +1563,30 @@ impl RpcHandler for FulltextSearchHandler {
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
 
-        let matching_keys = match self.storage.fulltext_search(
-            &table_id,
-            &req.index_name,
-            &req.query,
-            req.limit.map(|k| k as usize),
-        ) {
-            Ok(keys) => keys,
-            Err(e) => {
+        // Offload the blocking FTI scan (read_dir + sequential sidecar walks +
+        // whole-file reads) onto a blocking thread so it cannot starve raft
+        // heartbeats / CQL keepalives on this node's async runtime. Running it
+        // inline on the RPC worker was a co-cause of the Bulk-timeout → retry
+        // storm that multiplied buffers during the OOM cascade (t_8fc24ce2;
+        // same class as the PR #131 range-read offload).
+        let storage = self.storage.clone();
+        let index_name = req.index_name;
+        let query = req.query;
+        let limit = req.limit.map(|k| k as usize);
+        let matching_keys = match tokio::task::spawn_blocking(move || {
+            storage.fulltext_search(&table_id, &index_name, &query, limit)
+        })
+        .await
+        {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
                 tracing::warn!("FulltextSearchHandler: fulltext_search failed: {e}");
+                vec![]
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    "FulltextSearchHandler: fulltext_search task join failed: {join_err}"
+                );
                 vec![]
             }
         };
