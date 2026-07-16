@@ -1,6 +1,13 @@
 # Geospatial Index — design proposal
 
-**Status:** Proposed (investigation + design). Not implemented.
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: `ferrosa-index/src/geo/` implements geo encoding,
+> coverings, k-NN/refinement, polygon predicates, and R-tree helpers;
+> `ferrosa-cql/src/router.rs` implements `GEO_NEAREST`, `GEO_WITHIN_RADIUS`,
+> `GEO_WITHIN_BBOX`, and `ST_WITHIN` query routing.
+> Verification run: `cargo test -p ferrosa-cql --lib geo_` (11 passed).
+
+**Status:** Implemented and locally verified.
 **Author:** blueprint, 2026-06-10.
 
 ## 1. Where we are today

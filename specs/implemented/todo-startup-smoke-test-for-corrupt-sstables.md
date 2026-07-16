@@ -1,10 +1,20 @@
 ---
 type: todo
 priority: P1
-status: in_progress
+status: implemented
 created: 2026-04-19
 updated: 2026-05-24
 ---
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: startup load performs default-on SSTable smoke testing
+> before admitting readers into the live view and quarantines unreadable/corrupt
+> generations.
+> Verification runs: `cargo test -p ferrosa-storage --lib startup_build_table_state_holds_resident_readers_within_cap`,
+> `cargo test -p ferrosa-storage --lib startup_warn_mode_excludes_corrupt_sstable_but_keeps_healthy_sstables_queryable`,
+> and `cargo test -p ferrosa-storage --lib startup_smoke_test_rejects_out_of_order_data_stream`.
+> Live replay on the original 2026-04-19 corrupted data directory remains outside
+> this local unit-test verification.
+
 
 # Startup smoke-test: detect-and-quarantine SSTables whose open() succeeds but whose row iteration fails
 

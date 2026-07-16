@@ -1,6 +1,15 @@
 # Corrupt-SSTable async anti-entropy repair (read-path fail-loud + failover)
 
-Status: proposed. Branch: `correctness/raft-plan` (feature effort). Parent task: `t_21b2c1fa`.
+> Docs triage note (2026-07-15): moved from `specs/todo/` to `specs/implemented/`.
+> Implementation evidence: storage returns typed corrupt-SSTable errors and
+> quarantines exhausted corrupt reads; cluster CL=ONE read coordination fails over
+> to a healthy replica and requests async anti-entropy repair.
+> Verification runs: `cargo test -p ferrosa-cluster --lib coordinate_read_at_one_fails_over_to_remote_on_local_corruption`,
+> `cargo test -p ferrosa-cluster --lib coordinate_read_at_one_requests_repair_on_local_corruption`,
+> `cargo test -p ferrosa-storage --lib exhausted_corrupt_read_unresolvable_fails_loud_and_quarantines`,
+> and `cargo test -p ferrosa-storage --lib corrupt_sstable_resolvable_from_memtable_returns_ok_some`.
+
+Status: implemented and locally verified. Original branch: `correctness/raft-plan` (feature effort). Parent task: `t_21b2c1fa`.
 
 ## Problem
 
