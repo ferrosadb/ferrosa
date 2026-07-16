@@ -1556,7 +1556,12 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::RangeReadStreamChunk
             | MsgType::RangeReadStreamHeartbeat
             | MsgType::RangeReadStreamDone
-            | MsgType::RangeReadStreamCancel,
+            | MsgType::RangeReadStreamCancel
+            | MsgType::FulltextSearchStreamRequest
+            | MsgType::FulltextSearchStreamChunk
+            | MsgType::FulltextSearchStreamHeartbeat
+            | MsgType::FulltextSearchStreamDone
+            | MsgType::FulltextSearchStreamCancel,
         ) => MessageFamily::Stream,
         Ok(
             MsgType::PairWriteForward

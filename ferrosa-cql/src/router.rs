@@ -4087,6 +4087,16 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only observability: how many times the `fts_match` arm fetched a
+    /// hit set (bounded top-k consult or complete stream) on this thread.
+    /// Pins the t_4ae47a9f contract: at most ONE bounded consult plus ONE
+    /// complete-stream fallback — never the removed geometric escalation
+    /// loop's unbounded re-consults (4 → 16 → 64 → …).
+    static FTS_MATCH_HIT_SET_FETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only observability: rows MATERIALIZED by the full-partition-key
     /// SELECT branch on this thread, before the residual-predicate post-filter.
     /// Lets tests assert STRUCTURALLY that `WHERE <full pk> AND <indexed> = ?`
@@ -4215,60 +4225,73 @@ async fn route_select_user_table(
             None
         };
 
-        // Memory bounds for this arm (t_ee98faa0 — a broad `fts_match` over a
-        // large table OOM-killed live nodes, first at the coordinator, then
-        // layer 2 inside every replica's `fulltext_search`):
-        //   * LIMIT k — the bound is pushed down to every replica
-        //     (`fulltext_search(.., Some(requested))`), so each holds a bounded
-        //     top-k working set and the unioned hit set is O(replicas × k).
-        //     Post-filter key exhaustion is handled by GEOMETRIC ESCALATION
-        //     (below) — never by a server-side cap.
-        //   * no LIMIT — the complete match set is legitimately required
-        //     (`limit=None` down the stack); ROW memory is still bounded by
-        //     building one page per response with a `PagingState` continuation.
-        // The result is NEVER truncated server-side: it is bounded only by the
-        // query's own LIMIT (or delivered completely across pages).
-        //
-        // Escalation loop: start with `requested = k`. If the post-filter
-        // (non-fts predicates + row-granular doc-key retain) drops enough rows
-        // that fewer than `limit` survive AND the replica hit set may have been
-        // truncated (union size >= requested implies SOME replica may have hit
-        // its bound; union < requested proves every replica returned its
-        // complete local set), retry with `requested × 4`. Terminates because
-        // `requested` grows geometrically and once it exceeds every replica's
-        // local match count the union is provably complete. Peak memory is
-        // O(final requested) — derived from the query's LIMIT and the actual
-        // post-filter selectivity, not a server constant.
-        let mut requested: Option<usize> = fts_limit;
+        // Memory bounds for this arm (t_ee98faa0 replica top-k + t_4ae47a9f
+        // streaming — a broad `fts_match` used to OOM-kill live nodes):
+        //   * LIMIT k — ONE bounded consult (`fulltext_search(.., Some(k))`;
+        //     every replica holds a top-k working set, union is
+        //     O(replicas × k)). If the post-filter leaves fewer than k rows
+        //     AND the hit set may be truncated, fall back ONCE to the
+        //     complete streamed match set — the removed geometric ×4
+        //     escalation loop instead re-consulted every replica with a
+        //     widening k until its terminal round degraded to `limit=None`
+        //     materialization on every replica at once (the t_8fc24ce2 OOM
+        //     shape).
+        //   * no LIMIT — the complete match set is legitimately required and
+        //     is collected from the bounded streaming protocol
+        //     (`fulltext_search_stream`): replicas walk their FTI with an
+        //     O(1) working set and ship bounded key chunks; the ONLY
+        //     O(distinct matches) allocation left is the deduped key set
+        //     itself, which this arm needs for row-granular doc-key
+        //     retention. ROW memory stays bounded by per-page delivery with
+        //     a `PagingState` continuation.
+        // The result is NEVER truncated server-side: it is bounded only by
+        // the query's own LIMIT (or delivered completely across pages).
+        let mut use_complete_stream = fts_limit.is_none();
         let (fts_rows, fts_paging_state) = loop {
-            // Route the FTI lookup through the write path so it scatter-gathers
-            // across the cluster. `fts_match` carries no partition key, so its
-            // hits span all token ranges; a coordinator-local lookup returned
-            // 0/1 depending on which node served the query (BUG-F-007 /
-            // t_0d08aa43). Standalone/pair still resolves locally via the same
-            // call.
-            let matching_pks = state
-                .write_path
-                .load()
-                .fulltext_search(&table_id, index_name, fts_query, requested)
-                .await
-                .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
-
-            // Complete ⇔ no replica can have truncated its local hit set: a
-            // replica truncates only when its local matches exceed `requested`,
-            // in which case it returns exactly `requested` keys and the union
-            // has at least that many.
-            let hit_set_complete = match requested {
-                None => true,
-                Some(r) => matching_pks.len() < r,
-            };
-
-            // `matching_pks` are full-key document ids (partition +
-            // clustering), one per matching ROW. Read each distinct partition
-            // once, keep ONLY the rows whose full key actually matched — so
-            // non-matching clustering rows in a matched partition don't leak
-            // (t_da51e20c) — then post-filter.
-            let matched: std::collections::HashSet<Vec<u8>> = matching_pks.into_iter().collect();
+            // Route the lookup through the write path so it scatter-gathers
+            // across the cluster. `fts_match` carries no partition key, so
+            // its hits span all token ranges; a coordinator-local lookup
+            // returned 0/1 depending on which node served the query
+            // (BUG-F-007 / t_0d08aa43). Standalone/pair resolve locally via
+            // the same calls.
+            #[cfg(test)]
+            FTS_MATCH_HIT_SET_FETCHES.with(|c| c.set(c.get() + 1));
+            // `matched` holds full-key document ids (partition + clustering),
+            // one per matching ROW. Read each distinct partition once, keep
+            // ONLY the rows whose full key actually matched — so non-matching
+            // clustering rows in a matched partition don't leak (t_da51e20c)
+            // — then post-filter.
+            let (matched, hit_set_complete): (std::collections::HashSet<Vec<u8>>, bool) =
+                if use_complete_stream {
+                    let mut rx = state
+                        .write_path
+                        .load()
+                        .fulltext_search_stream(&table_id, index_name, fts_query)
+                        .await
+                        .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
+                    let mut matched: std::collections::HashSet<Vec<u8>> = Default::default();
+                    while let Some(item) = rx.recv().await {
+                        let batch = item.map_err(|e| {
+                            CqlError::Invalid(format!("fts_match search failed: {e}"))
+                        })?;
+                        matched.extend(batch);
+                    }
+                    (matched, true)
+                } else {
+                    let k = fts_limit.expect("bounded consult only runs with a LIMIT");
+                    let matching_pks = state
+                        .write_path
+                        .load()
+                        .fulltext_search(&table_id, index_name, fts_query, Some(k))
+                        .await
+                        .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
+                    // Complete ⇔ no replica can have truncated its local hit
+                    // set: a replica truncates only when its local matches
+                    // exceed `k`, in which case it returns exactly `k` keys
+                    // and the union has at least that many.
+                    let complete = matching_pks.len() < k;
+                    (matching_pks.into_iter().collect(), complete)
+                };
 
             // Distinct matched partitions in a DETERMINISTIC order (raw
             // partition-key bytes). CQL promises no ordering for this arm, but
@@ -4365,20 +4388,22 @@ async fn route_select_user_table(
             }
 
             match fts_limit {
-                Some(limit) if fts_rows.len() < limit && !hit_set_complete => {
+                Some(limit)
+                    if fts_rows.len() < limit && !hit_set_complete && !use_complete_stream =>
+                {
                     // Post-filtering exhausted the bounded hit set before the
-                    // LIMIT was satisfied and more matches may exist — escalate.
-                    let next = requested.unwrap_or(limit).max(1).saturating_mul(4);
+                    // LIMIT was satisfied and more matches may exist — fall
+                    // back ONCE to the complete streamed match set. Bounded
+                    // everywhere by construction, so no re-consult loop.
                     tracing::debug!(
                         keyspace = ks,
                         table = %s.table,
                         limit,
                         rows_surviving = fts_rows.len(),
-                        requested = ?requested,
-                        next_requested = next,
-                        "fts_match: post-filter exhausted the bounded hit set — escalating"
+                        "fts_match: post-filter exhausted the bounded hit set — \
+                         falling back to the complete streamed match set"
                     );
-                    requested = Some(next);
+                    use_complete_stream = true;
                 }
                 _ => break (fts_rows, fts_paging_state),
             }
@@ -20073,11 +20098,11 @@ mod tests {
     /// LIMIT counts only rows that SURVIVE the post-filter: rows dropped by
     /// non-fts predicates must not count toward LIMIT. With the replica-side
     /// bound pushed down (t_ee98faa0 layer 2) the hit set arrives as the k
-    /// best doc keys, so exhausting it via the post-filter triggers GEOMETRIC
-    /// ESCALATION (k → 4k) rather than a wrong short result:
-    ///   * round 1 (requested=2): keys {1,2}, both flag=0 → dropped → 2 reads;
-    ///   * round 2 (requested=8): keys {1..8}, reads 1..=5 (3 dropped + 2
-    ///     kept) then stops at the LIMIT bound → 5 reads.
+    /// best doc keys, so exhausting it via the post-filter triggers the ONE
+    /// complete-stream fallback (t_4ae47a9f) rather than a wrong short result:
+    ///   * round 1 (bounded, k=2): keys {1,2}, both flag=0 → dropped → 2 reads;
+    ///   * round 2 (complete stream): keys {1..10}, reads 1..=5 (3 dropped +
+    ///     2 kept) then stops at the LIMIT bound → 5 reads.
     #[tokio::test]
     async fn fts_match_limit_post_filtered_rows_do_not_count_toward_limit() {
         let (state, _dir) = setup();
@@ -20117,14 +20142,15 @@ mod tests {
         );
     }
 
-    /// Escalation completeness (t_ee98faa0 layer 2): when the post-filter can
-    /// drop MOST of the bounded hit set, the arm must keep escalating the
-    /// pushed-down k until either LIMIT rows survive or the hit set is
-    /// provably complete — the result must NEVER be short while more matches
-    /// exist. 30 matching rows, only the last 5 survive `flag = 1`; LIMIT 4
-    /// must return 4 rows even though requested starts at 4 « 25 dropped.
+    /// Fallback completeness (t_ee98faa0 layer 2 / t_4ae47a9f): when the
+    /// post-filter drops MOST of the bounded hit set, the arm must fall back
+    /// to the complete streamed match set so either LIMIT rows survive or the
+    /// hit set is provably complete — the result must NEVER be short while
+    /// more matches exist. 30 matching rows, only the last 5 survive
+    /// `flag = 1`; LIMIT 4 must return 4 rows even though the bounded round
+    /// requested only 4 « 25 dropped.
     #[tokio::test]
-    async fn fts_match_limit_escalates_until_limit_survives_post_filter() {
+    async fn fts_match_limit_fallback_completes_until_limit_survives_post_filter() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -20169,6 +20195,64 @@ mod tests {
             vec![26, 27, 28, 29, 30],
             "when the complete surviving set is smaller than LIMIT, exactly \
              that set must be returned (and the escalation loop must stop)"
+        );
+    }
+
+    /// t_4ae47a9f: the geometric escalation loop is GONE. A post-filter that
+    /// drops most of the bounded hit set triggers exactly ONE fallback to the
+    /// complete streamed match set — never repeated re-consults with a
+    /// widening pushed-down k (the old 4 → 16 → 64 loop, whose terminal
+    /// iteration degraded to `limit=None` materialization on every replica —
+    /// the t_8fc24ce2 OOM shape). No-LIMIT queries go straight to the
+    /// complete stream: exactly one hit-set fetch.
+    #[tokio::test]
+    async fn fts_match_limit_falls_back_to_complete_stream_at_most_once() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        // ids 1..=25 flag=0 (post-filter drops them), ids 26..=30 flag=1.
+        seed_fts_docs(&state, &ctx, "fts_fb", "fbterm", 30, 25).await;
+
+        FTS_MATCH_HIT_SET_FETCHES.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_fb",
+            "SELECT id FROM fts_fb.docs WHERE body = fts_match('fbterm') \
+             AND flag = 1 LIMIT 4 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(fts_row_ids(&raw), vec![26, 27, 28, 29]);
+        let fetches = FTS_MATCH_HIT_SET_FETCHES.with(|c| c.get());
+        assert_eq!(
+            fetches, 2,
+            "LIMIT with a hostile post-filter must fetch the hit set exactly \
+             twice (bounded consult + one complete-stream fallback); {fetches} \
+             fetches means the geometric escalation loop is back"
+        );
+
+        // No LIMIT: straight to the complete stream — one fetch.
+        FTS_MATCH_HIT_SET_FETCHES.with(|c| c.set(0));
+        let raw = fts_select_raw(
+            &state,
+            &ctx,
+            "fts_fb",
+            "SELECT id FROM fts_fb.docs WHERE body = fts_match('fbterm') \
+             AND flag = 1 ALLOW FILTERING",
+        )
+        .await;
+        assert_eq!(fts_row_ids(&raw), vec![26, 27, 28, 29, 30]);
+        let fetches = FTS_MATCH_HIT_SET_FETCHES.with(|c| c.get());
+        assert_eq!(
+            fetches, 1,
+            "a no-LIMIT fts_match must consult the complete stream exactly once"
         );
     }
 

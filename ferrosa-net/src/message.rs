@@ -176,6 +176,25 @@ pub enum Message {
     /// satisfied, KILL issued). Handler stops iterating between
     /// batches.
     RangeReadStreamCancel(Bytes),
+    /// t_4ae47a9f: client side of the streaming fulltext-search RPC —
+    /// the `fts_match` twin of `RangeReadStreamRequest`. Payload is a
+    /// bincoded `FulltextSearchStreamRequestPayload` (defined in
+    /// ferrosa-cluster) carrying `request_id`, keyspace/table,
+    /// index name, and query.
+    FulltextSearchStreamRequest(Bytes),
+    /// t_4ae47a9f: one bounded batch of matching doc KEYS belonging to
+    /// a streaming fulltext response, keyed by `request_id`. Payload is
+    /// a bincoded `FulltextSearchStreamChunkPayload`.
+    FulltextSearchStreamChunk(Bytes),
+    /// t_4ae47a9f: keep-alive emitted while the FTI walk is slow to
+    /// yield the next chunk; the coordinator's idle watchdog treats
+    /// heartbeats as activity.
+    FulltextSearchStreamHeartbeat(Bytes),
+    /// t_4ae47a9f: terminator for a streaming fulltext response.
+    FulltextSearchStreamDone(Bytes),
+    /// t_4ae47a9f: coordinator → handler abort signal; the producer's
+    /// walk observes it as a Break between chunks.
+    FulltextSearchStreamCancel(Bytes),
     TruncateForward(Bytes),
     TruncateAck(Bytes),
 
@@ -339,6 +358,11 @@ impl Message {
             Self::RangeReadStreamHeartbeat(_) => MsgType::RangeReadStreamHeartbeat,
             Self::RangeReadStreamDone(_) => MsgType::RangeReadStreamDone,
             Self::RangeReadStreamCancel(_) => MsgType::RangeReadStreamCancel,
+            Self::FulltextSearchStreamRequest(_) => MsgType::FulltextSearchStreamRequest,
+            Self::FulltextSearchStreamChunk(_) => MsgType::FulltextSearchStreamChunk,
+            Self::FulltextSearchStreamHeartbeat(_) => MsgType::FulltextSearchStreamHeartbeat,
+            Self::FulltextSearchStreamDone(_) => MsgType::FulltextSearchStreamDone,
+            Self::FulltextSearchStreamCancel(_) => MsgType::FulltextSearchStreamCancel,
             Self::TruncateForward(_) => MsgType::TruncateForward,
             Self::TruncateAck(_) => MsgType::TruncateAck,
             Self::RepairMerkleRequest(_) => MsgType::RepairMerkleRequest,
@@ -498,6 +522,11 @@ impl Message {
             | Self::RangeReadStreamHeartbeat(b)
             | Self::RangeReadStreamDone(b)
             | Self::RangeReadStreamCancel(b)
+            | Self::FulltextSearchStreamRequest(b)
+            | Self::FulltextSearchStreamChunk(b)
+            | Self::FulltextSearchStreamHeartbeat(b)
+            | Self::FulltextSearchStreamDone(b)
+            | Self::FulltextSearchStreamCancel(b)
             | Self::TruncateForward(b)
             | Self::TruncateAck(b)
             | Self::RepairMerkleRequest(b)
@@ -703,6 +732,21 @@ impl Message {
             }
             MsgType::RangeReadStreamCancel => {
                 Self::RangeReadStreamCancel(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchStreamRequest => {
+                Self::FulltextSearchStreamRequest(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchStreamChunk => {
+                Self::FulltextSearchStreamChunk(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchStreamHeartbeat => {
+                Self::FulltextSearchStreamHeartbeat(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchStreamDone => {
+                Self::FulltextSearchStreamDone(body.split_to(body.remaining()))
+            }
+            MsgType::FulltextSearchStreamCancel => {
+                Self::FulltextSearchStreamCancel(body.split_to(body.remaining()))
             }
             MsgType::TruncateForward => Self::TruncateForward(body.split_to(body.remaining())),
             MsgType::TruncateAck => Self::TruncateAck(body.split_to(body.remaining())),

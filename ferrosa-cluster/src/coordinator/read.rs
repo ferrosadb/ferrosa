@@ -1842,9 +1842,17 @@ impl ClusterCoordinator {
 
                 async move {
                     if node_id == local_id {
-                        storage
-                            .fulltext_search(&table_id, &index_name, &query, limit)
-                            .map_err(ClusterError::Storage)
+                        // Offload the blocking local FTI scan so it does not
+                        // starve raft heartbeats / CQL keepalives on the
+                        // coordinator's async runtime (t_8fc24ce2).
+                        tokio::task::spawn_blocking(move || {
+                            storage.fulltext_search(&table_id, &index_name, &query, limit)
+                        })
+                        .await
+                        .map_err(|e| {
+                            ClusterError::Internal(format!("fulltext_search task join: {e}"))
+                        })?
+                        .map_err(ClusterError::Storage)
                     } else {
                         let (hid, addr) = remote.ok_or_else(|| {
                             ClusterError::Internal(format!(
