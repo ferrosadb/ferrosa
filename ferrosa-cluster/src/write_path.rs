@@ -254,6 +254,75 @@ fn committed_cdc_event(
     Some((bus, event))
 }
 
+/// Run a node-local full-text index scan on a blocking thread.
+///
+/// [`StorageEngine::fulltext_search`] is synchronous and blocking (directory
+/// enumeration + sequential sidecar walks + whole-file reads). Invoking it
+/// inline on an async worker starves that worker's other futures — raft
+/// heartbeats and CQL keepalives — which was a co-cause of the Bulk-lane
+/// timeout → retry storm during the OOM cascade (t_8fc24ce2; same class as the
+/// PR #131 range-read offload). Offloading it keeps the async runtime
+/// responsive while the scan runs.
+async fn offloaded_fulltext_search(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    index_name: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> crate::error::Result<Vec<Vec<u8>>> {
+    let table_id = table_id.clone();
+    let index_name = index_name.to_string();
+    let query = query.to_string();
+    tokio::task::spawn_blocking(move || {
+        engine.fulltext_search(&table_id, &index_name, &query, limit)
+    })
+    .await
+    .map_err(|e| crate::error::ClusterError::Internal(format!("fulltext_search task join: {e}")))?
+    .map_err(crate::error::ClusterError::Storage)
+}
+
+/// Node-local streaming fulltext walk for Direct/Pair modes: the blocking
+/// `fulltext_search_each` walk feeds bounded key batches into the returned
+/// channel; the walk's own working set is O(1) (t_4ae47a9f layer 2b), so
+/// resident memory is O(channel + one batch) regardless of match count.
+/// Dropping the receiver stops the walk on its next key (Break).
+fn local_fulltext_key_stream(
+    engine: Arc<StorageEngine>,
+    table_id: &TableId,
+    index_name: &str,
+    query: &str,
+) -> tokio::sync::mpsc::Receiver<crate::error::Result<Vec<Vec<u8>>>> {
+    const BATCH_KEYS: usize = 4_096;
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::error::Result<Vec<Vec<u8>>>>(8);
+    let table_id = table_id.clone();
+    let index_name = index_name.to_string();
+    let query = query.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_KEYS);
+        let result = engine.fulltext_search_each(&table_id, &index_name, &query, &mut |key| {
+            batch.push(key);
+            if batch.len() >= BATCH_KEYS {
+                let full = std::mem::take(&mut batch);
+                if tx.blocking_send(Ok(full)).is_err() {
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        match result {
+            Ok(()) => {
+                if !batch.is_empty() {
+                    let _ = tx.blocking_send(Ok(batch));
+                }
+            }
+            Err(e) => {
+                let _ = tx.blocking_send(Err(crate::error::ClusterError::Storage(e)));
+            }
+        }
+    });
+    rx
+}
+
 /// The active write path. Swapped atomically via `ArcSwap` when the
 /// deployment mode changes (standalone → pair → cluster).
 ///
@@ -987,17 +1056,81 @@ impl WritePath {
         limit: Option<usize>,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         match self {
-            Self::Direct(engine) => engine
-                .fulltext_search(table_id, index_name, query, limit)
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
-                .local_storage()
-                .fulltext_search(table_id, index_name, query, limit)
-                .map_err(crate::error::ClusterError::Storage),
+            Self::Direct(engine) => {
+                offloaded_fulltext_search(engine.clone(), table_id, index_name, query, limit).await
+            }
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                offloaded_fulltext_search(
+                    coordinator.local_storage().clone(),
+                    table_id,
+                    index_name,
+                    query,
+                    limit,
+                )
+                .await
+            }
             Self::Cluster(coordinator) => {
                 coordinator
                     .coordinate_fulltext_search(table_id, index_name, query, limit)
                     .await
+            }
+            Self::Unavailable => Err(crate::error::ClusterError::Internal(
+                "fulltext search unavailable: write path is in degraded mode".into(),
+            )),
+        }
+    }
+
+    /// Streaming fulltext search for the no-`LIMIT` / escalated shape
+    /// (t_4ae47a9f): yields batches of matching doc keys through a bounded
+    /// channel instead of one O(matches) `Vec` — the materialized union of a
+    /// broad `fts_match` is what OOM-killed replicas (t_8fc24ce2).
+    ///
+    /// Batch contract: cluster mode dedups across replicas at the
+    /// coordinator; Direct/Pair batches may contain cross-source duplicates
+    /// (memtable vs sidecar) — the caller dedups, exactly as it must for the
+    /// cluster path's cross-page keys. An `Err` item fails the whole search
+    /// (no silent partial match set); dropping the receiver cancels all
+    /// in-flight work.
+    ///
+    /// `FERROSA_BULK_STREAMING_FULLTEXT=0` (mixed-version rolling upgrades)
+    /// falls back to the legacy materializing union delivered as one batch —
+    /// degraded to the old memory profile, loudly logged at startup.
+    pub async fn fulltext_search_stream(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        query: &str,
+    ) -> crate::error::Result<tokio::sync::mpsc::Receiver<crate::error::Result<Vec<Vec<u8>>>>> {
+        match self {
+            Self::Direct(engine) => Ok(local_fulltext_key_stream(
+                engine.clone(),
+                table_id,
+                index_name,
+                query,
+            )),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                Ok(local_fulltext_key_stream(
+                    coordinator.local_storage().clone(),
+                    table_id,
+                    index_name,
+                    query,
+                ))
+            }
+            Self::Cluster(coordinator) => {
+                if coordinator.streaming_fulltext {
+                    coordinator
+                        .coordinate_fulltext_search_stream(table_id, index_name, query)
+                        .await
+                } else {
+                    // Legacy fallback: materialize the union (old memory
+                    // profile) and deliver it as a single batch.
+                    let keys = coordinator
+                        .coordinate_fulltext_search(table_id, index_name, query, None)
+                        .await?;
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let _ = tx.send(Ok(keys)).await;
+                    Ok(rx)
+                }
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
                 "fulltext search unavailable: write path is in degraded mode".into(),

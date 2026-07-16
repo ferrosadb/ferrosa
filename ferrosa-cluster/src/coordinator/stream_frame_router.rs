@@ -37,6 +37,13 @@ struct PendingDone {
     message: Message,
 }
 
+/// Leading fields shared by every streaming Done payload family; lets the
+/// payload-agnostic seq bookkeeping reuse the field-access shape of the
+/// legacy full-payload decode.
+struct DoneHeader {
+    total_chunks: u32,
+}
+
 #[derive(Default)]
 struct StreamSeqState {
     next_chunk_seq: u32,
@@ -153,6 +160,20 @@ impl StreamFrameRouter {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamChunkPayload>(bytes) else {
             return Some(None);
         };
+        self.accept_chunk_seq_value(from, request_id, payload.seq)
+    }
+
+    /// Payload-agnostic core of the chunk seq check: every streaming chunk
+    /// payload family (range-read partitions, fulltext keys) leads with
+    /// `request_id: u32, seq: u32`, so the seq bookkeeping is shared while
+    /// each `handle` arm decodes just enough of its own payload shape.
+    fn accept_chunk_seq_value(
+        &self,
+        from: PeerId,
+        request_id: u32,
+        seq: u32,
+    ) -> Option<Option<Message>> {
+        let payload_seq = seq;
         let key = (request_id, from.0);
         let mut guard = self
             .seq_state
@@ -165,18 +186,18 @@ impl StreamFrameRouter {
             tracing::debug!(
                 request_id,
                 peer = %from.0,
-                seq = payload.seq,
+                seq = payload_seq,
                 "straggler stream chunk for torn-down route; dropping"
             );
             return None;
         };
-        if payload.seq != state.next_chunk_seq {
+        if payload_seq != state.next_chunk_seq {
             tracing::warn!(
                 request_id,
                 peer = %from.0,
                 connection_addr = %from.1,
                 expected_seq = state.next_chunk_seq,
-                observed_seq = payload.seq,
+                observed_seq = payload_seq,
                 "stream chunk sequence gap/reorder; closing stream route"
             );
             drop(guard);
@@ -206,6 +227,19 @@ impl StreamFrameRouter {
         let Ok(payload) = bincode::deserialize::<RangeReadStreamDonePayload>(bytes) else {
             return Some(Some(msg));
         };
+        self.accept_done_seq_value(from, request_id, payload.total_chunks, msg)
+    }
+
+    /// Payload-agnostic core of the Done bookkeeping — every streaming Done
+    /// payload family leads with `request_id: u32, total_chunks: u32`.
+    fn accept_done_seq_value(
+        &self,
+        from: PeerId,
+        request_id: u32,
+        total_chunks: u32,
+        msg: Message,
+    ) -> Option<Option<Message>> {
+        let payload = DoneHeader { total_chunks };
         let key = (request_id, from.0);
         let mut guard = self
             .seq_state
@@ -316,6 +350,14 @@ fn peek_request_id(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+/// Decode the second leading `u32` (`seq` on chunk/heartbeat frames,
+/// `total_chunks` on Done frames) from a bincode-serialized streaming
+/// payload. Same LE fixint layout contract as [`peek_request_id`].
+fn peek_second_u32(bytes: &[u8]) -> Option<u32> {
+    let b = bytes.get(4..8)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
 #[async_trait]
 impl RpcHandler for StreamFrameRouter {
     async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
@@ -325,6 +367,15 @@ impl RpcHandler for StreamFrameRouter {
                 (peek_request_id(b), MsgType::RangeReadStreamHeartbeat)
             }
             Message::RangeReadStreamDone(b) => (peek_request_id(b), MsgType::RangeReadStreamDone),
+            Message::FulltextSearchStreamChunk(b) => {
+                (peek_request_id(b), MsgType::FulltextSearchStreamChunk)
+            }
+            Message::FulltextSearchStreamHeartbeat(b) => {
+                (peek_request_id(b), MsgType::FulltextSearchStreamHeartbeat)
+            }
+            Message::FulltextSearchStreamDone(b) => {
+                (peek_request_id(b), MsgType::FulltextSearchStreamDone)
+            }
             // Not ours — return None so the handler dispatch chain
             // can give a different handler a chance. (HandlerRegistry
             // currently dispatches by MsgType, so this is defensive.)
@@ -362,6 +413,52 @@ impl RpcHandler for StreamFrameRouter {
                 match self
                     .router
                     .route_lossy(request_id, Message::RangeReadStreamHeartbeat(bytes))
+                {
+                    Ok(()) | Err(RouteError::NoRoute(_)) => {}
+                    Err(RouteError::ChannelClosed(id)) => {
+                        self.clear_request_state(id);
+                    }
+                    Err(RouteError::ChannelFull(_)) => {
+                        unreachable!("route_lossy never reports ChannelFull")
+                    }
+                }
+                None
+            }
+            // Streaming fulltext frames (t_4ae47a9f): identical seq/Done
+            // bookkeeping via the payload-agnostic cores — both payload
+            // families lead with `request_id: u32` then `seq`/`total_chunks`.
+            Message::FulltextSearchStreamChunk(bytes) => {
+                let pending_done = match peek_second_u32(bytes.as_ref()) {
+                    Some(seq) => self.accept_chunk_seq_value(from, request_id, seq)?,
+                    // Malformed frame: route it anyway so the consumer's
+                    // decode fails the stream loudly (mirrors the range-read
+                    // decode-failure contract).
+                    None => None,
+                };
+                self.route_frame(
+                    request_id,
+                    msg_type,
+                    Message::FulltextSearchStreamChunk(bytes),
+                );
+                pending_done
+            }
+            Message::FulltextSearchStreamDone(bytes) => {
+                let msg = Message::FulltextSearchStreamDone(bytes.clone());
+                let route_done = match peek_second_u32(bytes.as_ref()) {
+                    Some(total_chunks) => {
+                        self.accept_done_seq_value(from, request_id, total_chunks, msg)?
+                    }
+                    None => Some(msg),
+                };
+                if let Some(done) = route_done {
+                    self.route_frame(request_id, msg_type, done);
+                }
+                return None;
+            }
+            Message::FulltextSearchStreamHeartbeat(bytes) => {
+                match self
+                    .router
+                    .route_lossy(request_id, Message::FulltextSearchStreamHeartbeat(bytes))
                 {
                     Ok(()) | Err(RouteError::NoRoute(_)) => {}
                     Err(RouteError::ChannelClosed(id)) => {
