@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "nightly-fuzz.yml"
+DOCKER_SMOKE = ROOT / "tests" / "docker-smoke.sh"
 
 
 class NightlyFuzzWorkflowTest(unittest.TestCase):
@@ -54,6 +55,31 @@ class NightlyFuzzWorkflowTest(unittest.TestCase):
             run_block,
             "nightly fuzz must keep ferrosa-loadgen proptest coverage active",
         )
+
+    def test_pair_failover_requires_operator_promotion_before_node2_reads(self):
+        smoke = DOCKER_SMOKE.read_text(encoding="utf-8")
+        phase_two = smoke.split("# Phase 2: Kill primary, verify degraded behavior", 1)[1]
+        phase_two, phase_three = phase_two.split("# Phase 3: Operator promotion", 1)
+
+        self.assertIn(
+            'if cql2 "SELECT v FROM smoke_test.kv WHERE k = \'key1\';"',
+            phase_two,
+            "an unpromoted secondary must reject CQL reads after primary loss",
+        )
+        self.assertIn(
+            "Unpromoted node2 served a CQL read after node1 death",
+            phase_two,
+        )
+
+        promote = 'curl -s -X POST "http://localhost:9091/api/cluster/promote"'
+        self.assertIn(promote, phase_three)
+        self.assertIn('wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"', phase_three)
+        for key in ("key1", "key2"):
+            self.assertGreater(
+                phase_three.index(f"SELECT v FROM smoke_test.kv WHERE k = '{key}';"),
+                phase_three.index(promote),
+                "the smoke test must verify replicated reads only after operator promotion",
+            )
 
 
 if __name__ == "__main__":
