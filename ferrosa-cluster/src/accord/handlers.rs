@@ -30,6 +30,36 @@ use super::wire::{
 /// by token range; for now a single lock suffices.
 pub type AccordState = Arc<parking_lot::Mutex<AccordStateMachine>>;
 
+/// A shared, swappable slot that publishes a node's live [`AccordState`] from
+/// the cluster controller (which creates it during formation) to the session
+/// layer (whose transaction committer needs it to cast the coordinator's own
+/// PreAccept vote locally — a node is never in its own peer map).
+///
+/// The session's `SessionCore` is built *before* the controller forms the
+/// cluster and creates the state, so the two cannot share a plain `AccordState`
+/// at construction time. This slot is created empty up front, handed to both
+/// sides, and filled by the controller at formation; the committer reads it on
+/// demand. Empty until formation (and in standalone/tests), in which case the
+/// committer falls back to remote-only votes (correct when peers are the
+/// replicas).
+pub type AccordStateSlot = Arc<arc_swap::ArcSwapOption<parking_lot::Mutex<AccordStateMachine>>>;
+
+/// An empty [`AccordStateSlot`] — the initial state before the controller
+/// publishes this node's live `AccordState`.
+pub fn empty_accord_state_slot() -> AccordStateSlot {
+    Arc::new(arc_swap::ArcSwapOption::empty())
+}
+
+/// Publish `state` into `slot` and return it, so the node's [`AccordHandler`]
+/// and the session-layer committer observe the **same** `AccordStateMachine`
+/// instance. The controller calls this once during cluster formation, then
+/// serves the returned state from its handler — guaranteeing the coordinator's
+/// local self-vote uses exactly the state its remote peers see.
+pub fn publish_accord_state(slot: &AccordStateSlot, state: AccordState) -> AccordState {
+    slot.store(Some(state.clone()));
+    state
+}
+
 // ---------------------------------------------------------------------------
 // AccordHandler — single handler for all 6 inbound Accord message types
 // ---------------------------------------------------------------------------
@@ -390,6 +420,39 @@ mod tests {
 
     fn ts(micros: u64) -> Timestamp {
         Timestamp::synthetic(micros)
+    }
+
+    /// `publish_accord_state` must make the slot observe the EXACT `AccordState`
+    /// instance the handler serves — same `Arc`, not a clone of the inner
+    /// machine. If they diverged, the coordinator's local self-vote would run
+    /// against different protocol state than its remote peers see, corrupting
+    /// dependency agreement. The slot starts empty (standalone/pre-formation).
+    #[test]
+    fn publish_accord_state_shares_the_same_instance_with_the_handler() {
+        let slot = empty_accord_state_slot();
+        assert!(
+            slot.load_full().is_none(),
+            "a fresh slot must be empty until the controller publishes state"
+        );
+
+        let sm = AccordStateMachine::new(7, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let served = publish_accord_state(&slot, state.clone());
+
+        // The handler is constructed from the returned/served state.
+        let _handler = AccordHandler::new(served.clone(), 7);
+
+        let published = slot
+            .load_full()
+            .expect("slot must be populated after publish");
+        assert!(
+            Arc::ptr_eq(&published, &state),
+            "the slot must hold the exact same Arc the handler serves"
+        );
+        assert!(
+            Arc::ptr_eq(&served, &state),
+            "the returned state (handed to the handler) must be the same instance"
+        );
     }
 
     /// AccordApplyV2 must apply EVERY write it was sent (the coordinator already

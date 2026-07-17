@@ -226,7 +226,15 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   (injected resolver wrapping `WritePath::accord_replicas_for_key` + schema in prod),
   then drives ONE unconditional (`ReadPredicate::Always`) multi-key Accord
   transaction via `new_multi`, mapping the outcome to `Committed`/`Aborted`/`Err`
-  (fail-loud — never acks an uncommitted txn).
+  (fail-loud — never acks an uncommitted txn). When the coordinator is itself a
+  replica for the txn's keys (the common case), it votes its OWN PreAccept
+  **locally** against the node's live `AccordState` — a node is never in its own
+  peer map, so a self-send would fail "unknown peer" and a sole-replica (RF=1)
+  txn would never reach quorum. That state is wired via `with_local_accord_state`
+  or, from the session layer, `with_local_accord_state_slot(&AccordStateSlot)`:
+  `handlers::publish_accord_state` fills the slot at cluster formation with the
+  SAME `AccordState` the node's `AccordHandler` serves, so the coordinator's
+  self-vote and its remote peers agree on dependencies.
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
   `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`

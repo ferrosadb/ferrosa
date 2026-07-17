@@ -250,6 +250,13 @@ pub struct ModeController {
     pub(super) raft_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
     /// Dedicated Data runtime for internode IO.
     pub(super) data_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
+    /// Shared slot publishing this node's live `AccordState` to the session
+    /// layer. Empty in standalone/pair; filled in `transition_to_cluster` with
+    /// the SAME state the node's `AccordHandler` serves, so the transaction
+    /// committer can cast the coordinator's own PreAccept vote locally (a node
+    /// is never in its own peer map). Read by `SessionCore` via
+    /// [`Self::accord_state_slot`].
+    pub(super) accord_state_slot: crate::accord::AccordStateSlot,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -337,6 +344,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            accord_state_slot: crate::accord::empty_accord_state_slot(),
         });
 
         let handles = ModeControllerHandles {
@@ -346,6 +354,15 @@ impl ModeController {
         };
 
         (controller, handles)
+    }
+
+    /// The shared slot that publishes this node's live `AccordState` once the
+    /// cluster forms. The session layer clones this into `SessionCore` so its
+    /// transaction committer can vote the coordinator's own PreAccept locally.
+    /// Empty until `transition_to_cluster` fills it (standalone/pair return an
+    /// empty slot, and the committer then uses remote-only votes).
+    pub fn accord_state_slot(&self) -> crate::accord::AccordStateSlot {
+        self.accord_state_slot.clone()
     }
 
     /// Create a standalone-mode `ModeController` for unit tests.
@@ -397,6 +414,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            accord_state_slot: crate::accord::empty_accord_state_slot(),
         })
     }
 
@@ -457,6 +475,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            accord_state_slot: crate::accord::empty_accord_state_slot(),
         })
     }
 

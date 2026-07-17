@@ -1168,7 +1168,7 @@ impl ModeController {
         // back by the coordinator, not received as RPC requests.
         let accord_state_for_maintenance;
         {
-            use crate::accord::handlers::{AccordHandler, AccordState};
+            use crate::accord::handlers::{publish_accord_state, AccordHandler, AccordState};
             use crate::accord::state_machine::build_accord_state_machine;
             use ferrosa_storage::accord::sync_writer::FileSyncWriter;
 
@@ -1192,12 +1192,17 @@ impl ModeController {
             // (bug-accord-lwt-acks-phantom-write.md). Previously this used
             // `AccordStateMachine::new`, which carries a NoopStorageApplier:
             // a replica recorded (txn_id, t) and acked while nothing landed.
-            let accord_state: AccordState =
-                Arc::new(parking_lot::Mutex::new(build_accord_state_machine(
-                    uuid_to_node_id(self.local_host_id),
-                    sync_writer,
-                    self.storage.clone(),
-                )));
+            let built: AccordState = Arc::new(parking_lot::Mutex::new(build_accord_state_machine(
+                uuid_to_node_id(self.local_host_id),
+                sync_writer,
+                self.storage.clone(),
+            )));
+            // Publish into the shared slot so the session layer's transaction
+            // committer votes the coordinator's own PreAccept against THIS exact
+            // instance (same Arc the handler serves) — the last mile that makes
+            // live BEGIN…COMMIT reach quorum instead of "Accord quorum
+            // unavailable" (a node is never in its own peer map).
+            let accord_state = publish_accord_state(&self.accord_state_slot, built);
             accord_state_for_maintenance = accord_state.clone();
 
             let accord_handler = Arc::new(AccordHandler::new(

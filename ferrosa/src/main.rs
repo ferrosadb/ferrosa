@@ -1491,6 +1491,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     node_id, 0, // use default 500 ms max drift
                 )))
             },
+            // Same shared slot the ModeController fills at cluster formation, so
+            // the Accord committer votes the coordinator's own PreAccept against
+            // the node's live AccordState (finishes the sole-replica/self-vote
+            // path — otherwise live BEGIN…COMMIT fails "quorum unavailable").
+            accord_state: mode_controller.accord_state_slot(),
         }),
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
         connection_tracker,
