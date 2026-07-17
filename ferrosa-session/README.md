@@ -39,7 +39,7 @@ ferrosa-session extraction as standalone soaked PR".
 
 | Item | Kind | Notes |
 |------|------|-------|
-| `SessionCore` | struct (11 pub fields) | neutral engine state; built by literal at each call site |
+| `SessionCore` | struct (12 pub fields) | neutral engine state; built by literal at each call site |
 | `SessionCore::accord_enabled(&self) -> bool` | method | `peer_manager.is_some() && accord_clock.is_some()`; no callers yet |
 
 ### `SessionCore` fields
@@ -57,6 +57,7 @@ ferrosa-session extraction as standalone soaked PR".
 | `auth_warn` | `bool` | soak mode: log+allow permission failures instead of deny |
 | `peer_manager` | `Option<Arc<PeerManager>>` | Accord fan-out; `None` standalone/unit-test |
 | `accord_clock` | `Option<Arc<HybridLogicalClock>>` | monotone txn timestamps; `None` when no peer manager |
+| `accord_state` | `AccordStateSlot` | shared slot the controller fills at formation with this node's live `AccordState`; the transaction committer reads it so the coordinator votes its own PreAccept locally (a node is never in its own peer map). Empty in standalone/tests |
 
 The three `ArcSwap`-wrapped paths are hot-swappable so cluster-mode transitions
 (Standalone → Pair → Cluster) can re-point routing without rebuilding the struct.
