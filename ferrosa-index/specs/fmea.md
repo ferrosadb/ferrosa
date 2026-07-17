@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-index
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-07-16
 ---
 
 # ferrosa-index — FMEA / Known Issues
@@ -23,6 +23,7 @@ corruption) dominates the high scores.
 | IDX-8 | Thin test coverage on quantized IVF builder & FTI builder | A change passes `cargo test -p ferrosa-index` while breaking the artifact path | 7 | 4 | 6 | 168 | quantized `ivf.rs` has 1 test, `ivf_staged.rs` 3, `fulltext/builder.rs` 3. **Open gap** — uneven coverage relative to risk. |
 | IDX-9 | Index file truncation/corruption read as valid | Partial/garbage index served as real results | 8 | 2 | 5 | 80 | `crc32fast` available; container/codec readers fail loud on malformed pages. **Verify CRC is checked on every artifact kind, not just `.qvec`.** |
 | IDX-10 | `nearest`/`range` on an unsupported kind | Caller assumes empty result is "no matches" | 6 | 2 | 3 | 36 | Kinds return `IndexError::Unsupported` (fail loud) rather than `Ok(vec![])`; covered by per-kind unit tests. |
+| IDX-11 | FTS query terms not run through the index analyzer (asymmetry) | Any natural-language `fts_match` query containing an English stop word (or a punctuation-bearing term) requires a posting list the analyzer never created → **deterministic false-empty result** even when documents match | 8 | 6 | 7 | 336 | **Fixed.** `query::analyze_query` normalizes the parsed query with the reader's analyzer inside `search`/`search_top_k`; the `ferrosa-storage` single-`Term` stream fast path normalizes the term too. Guarded by `reader.rs` parity tests, `query.rs` `analyze_*` unit tests, and `ferrosa-storage` `fts_stopword_bearing_query_matches_after_flush`. Live repro was ferrosa-memory `fixed_document_search_survives_fts_stopword_absent_from_corpus`. **Residual: analyzer is not persisted in the FTI; a future non-default per-index analyzer must be threaded to `open_with_analyzer` or parity breaks again.** |
 
 ## Top risks to act on
 
@@ -36,6 +37,13 @@ corruption) dominates the high scores.
 3. **IDX-5 (RPN 126)** — composite prefix ordering is only exact for equal-length
    components; variable-length component ordering needs a property test or a
    documented prohibition enforced at construction.
+4. **IDX-11 residual** — the query-vs-index analyzer asymmetry is fixed, but the
+   analyzer choice is *not persisted* in the FTI. Parity holds today only
+   because every builder and reader defaults to `analyzer::default_analyzer()`.
+   When a per-index analyzer option (`WITH OPTIONS {'analyzer': ...}`) is
+   actually threaded, the FTI must record it (or the read path must recover it
+   from index metadata) and open via `open_with_analyzer`, or the false-empty
+   failure returns for non-default analyzers.
 
 ## Detection assets
 
