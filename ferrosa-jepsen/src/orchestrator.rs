@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::chaos::{NemesisAction, NemesisContext, NemesisRegistry};
@@ -109,7 +109,7 @@ fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> 
     }
 
     if std::env::var("FERROSA_TEST_CONTAINERS").is_ok() {
-        let container_names = [
+        let container_names: Vec<String> = [
             "ferrosa-jepsen-t3-dc1-node1",
             "ferrosa-jepsen-t3-dc1-node2",
             "ferrosa-jepsen-t3-dc1-node3",
@@ -120,6 +120,12 @@ fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> 
         .into_iter()
         .map(str::to_string)
         .collect();
+        // The DC-partition nemesis installs iptables DROP rules *inside* the
+        // containers, so it must target each node's real cross-DC (WAN) network
+        // address. The outer `node_ips` come from the host-mapped CQL contacts
+        // (`localhost:2904x`); using those would make the partition drop
+        // loopback and silently sever nothing. Resolve the container WAN IPs.
+        let node_ips = resolve_container_wan_ips(&container_names)?;
         return Ok(NemesisContext {
             node_ips,
             ssh_user: "root".to_string(),
@@ -141,6 +147,51 @@ fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> 
             .unwrap_or(22),
         executor: crate::chaos::NemesisExecutor::Ssh,
     })
+}
+
+/// Resolve each container's WAN-network IP (the address cross-DC peers actually
+/// use), in the same order as `containers`. Container mode otherwise has no
+/// route to the internal IPs — the CQL contacts are host-mapped `localhost`
+/// ports — so the DC-partition nemesis needs this to drop real inter-DC traffic
+/// instead of loopback.
+fn resolve_container_wan_ips(containers: &[String]) -> Result<Vec<String>> {
+    let runtime = crate::docker_provision::container_runtime();
+    containers
+        .iter()
+        .map(|c| {
+            let out = std::process::Command::new(runtime)
+                .args([
+                    "inspect",
+                    c,
+                    "--format",
+                    "{{json .NetworkSettings.Networks}}",
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect container {c}"))?;
+            if !out.status.success() {
+                bail!(
+                    "{runtime} inspect {c} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let networks: serde_json::Value = serde_json::from_slice(&out.stdout)
+                .with_context(|| format!("parsing networks JSON for {c}"))?;
+            let obj = networks
+                .as_object()
+                .with_context(|| format!("networks for {c} not a JSON object"))?;
+            // Prefer the shared WAN network (the only one spanning both DCs);
+            // fall back to the first network if the naming differs.
+            let ip = obj
+                .iter()
+                .find(|(name, _)| name.contains("wan"))
+                .or_else(|| obj.iter().next())
+                .and_then(|(_, v)| v.get("IPAddress"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .with_context(|| format!("no IPAddress for container {c}"))?;
+            Ok(ip.to_string())
+        })
+        .collect()
 }
 
 /// Inject one fault window and always heal it before returning. The workload
@@ -412,8 +463,19 @@ async fn run_single_combination(
     let history_path = run_dir.join(format!("{topology:?}-{nemesis_name}-{workload_name}.jsonl"));
     history.to_jsonl(&history_path)?;
 
-    // Check linearizability.
-    let linearizability = check_linearizability(&history);
+    // Check linearizability — only for workloads whose history is a set of
+    // single-value register operations (register/LWT). Transactional workloads
+    // like `bank` opt out (`register_linearizable() == false`): their delta
+    // writes and multi-key snapshot reads cannot be modelled as a single-value
+    // register, and per-key linearizability is not a guarantee the
+    // eventually-consistent base makes. Their safety is judged by
+    // `check_invariant` (conservation) and, for transactions, strict
+    // serializability (Elle). An empty result vector is vacuously all-linear.
+    let linearizability = if workload.register_linearizable() {
+        check_linearizability(&history)
+    } else {
+        Vec::new()
+    };
     let all_linear = linearizability.iter().all(|r| r.valid);
 
     // Check workload-specific invariants.

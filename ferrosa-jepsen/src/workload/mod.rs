@@ -53,6 +53,27 @@ pub trait Workload: Send + Sync {
 
     /// Check the history for correctness invariants.
     fn check_invariant(&self, history: &History) -> Result<()>;
+
+    /// Whether the generic per-key **single-value register linearizability**
+    /// check ([`crate::checker::check_linearizability`]) applies to this
+    /// workload's history.
+    ///
+    /// `true` (the default) fits register/LWT workloads whose history is a set
+    /// of single-key `read`/`write`/`cas` operations against a linearizable
+    /// register — the model the checker implements.
+    ///
+    /// Transactional workloads such as `bank` return `false`: their writes
+    /// record transfer *deltas* (not the resulting value) and their reads are
+    /// multi-key snapshots (`CurrentValues`), so a single-value register model
+    /// cannot represent the history — it reports every such history as
+    /// non-linearizable regardless of what the database did. More
+    /// fundamentally, per-key linearizability is not a property Ferrosa's
+    /// eventually-consistent base claims; the transaction path's guarantee is
+    /// *strict serializability* (validated by Elle), and the bank workload's
+    /// own safety property is value conservation ([`Self::check_invariant`]).
+    fn register_linearizable(&self) -> bool {
+        true
+    }
 }
 
 /// Registry of all available workloads.
