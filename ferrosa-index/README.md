@@ -93,6 +93,25 @@ Memory model (t_ee98faa0 layer 2 — the replica-side `fts_match` OOM):
   serialize→deserialize round trip (used by the transient memtable / fallback
   scans in `ferrosa-storage`).
 
+**Analyzer parity (query side == index side).** Documents are indexed through
+the index's `analyzer`, which for the default `StandardAnalyzer` strips English
+stop words and splits on punctuation. The query side must apply the *same*
+analyzer to its terms, or a token the analyzer would drop/rewrite looks up a
+posting list that can never exist. `query::analyze_query(query, analyzer)`
+re-analyzes a parsed `FtsQuery` before evaluation: a term that analyzes to
+nothing (a stop word) is **dropped** from a conjunction rather than required, a
+term that splits on punctuation becomes a conjunction of its tokens, `Prefix` is
+left untouched, and a query that reduces to no searchable terms returns `None`
+(matches nothing, without erroring). `FullTextIndexReader` carries its analyzer
+(`open`/`from_index` default to the shared `analyzer::default_analyzer()`;
+`open_with_analyzer`/`from_index_with_analyzer` accept a non-default one) and
+normalizes inside `search`/`search_top_k`, so every caller — memtable, sidecar,
+and missing-sidecar scans — inherits parity. The single-`Term` streaming fast
+path in `ferrosa-storage` normalizes the term with the same analyzer before the
+`stream` walk. Without this, `fts_match('reports were emitted')` returned zero
+rows even when documents contained "reports … emitted" (live repro:
+ferrosa-memory `fixed_document_search_survives_fts_stopword_absent_from_corpus`).
+
 ### 4. Geospatial — the `geo` library (Phase 1, pure functions)
 
 A space-filling-curve **point** index: encode `(lat, lon)` to a sortable `u64`
