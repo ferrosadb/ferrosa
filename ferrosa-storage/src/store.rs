@@ -1173,7 +1173,65 @@ impl<F: FlushTarget> TableStore<F> {
     /// `SerializationHeader` with up-to-date `num_columns`, avoiding the
     /// writer's out-of-range-col_idx panic
     /// (see bug-sstable-writer-produces-zero-byte-rows-db.md).
-    pub fn update_schema(&self, new_schema: TableSchema) {
+    pub fn update_schema(&mut self, new_schema: TableSchema) {
+        // Regular columns are ordered by Cassandra's column-name comparator,
+        // so `ALTER TABLE ADD` of a column that sorts before an indexed
+        // column shifts the indexed column's ordinal (the `u16` cell tag).
+        // Index declarations store ordinals, not names — left stale, every
+        // subsequent write extracts the indexed value from the WRONG cell,
+        // and a backfilled-Current index then serves false empty results
+        // (memory-suite regression `fixed_phonetic_match`). Remap every
+        // positional declaration through the old schema's column name.
+        let old_schema = self.schema.load_full();
+        let remap = |index_name: &str, pos: &mut usize| {
+            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+                tracing::error!(
+                    index = index_name,
+                    position = *pos,
+                    "index ordinal points past the pre-ALTER regular column \
+                     set — leaving it unchanged; index writes may be wrong"
+                );
+                return;
+            };
+            match new_schema
+                .regular_columns
+                .iter()
+                .position(|c| c.name == old_col.name)
+            {
+                Some(new_pos) => {
+                    if new_pos != *pos {
+                        tracing::info!(
+                            index = index_name,
+                            column = %old_col.name,
+                            old_position = *pos,
+                            new_position = new_pos,
+                            "remapped index column ordinal after schema update"
+                        );
+                        *pos = new_pos;
+                    }
+                }
+                None => tracing::error!(
+                    index = index_name,
+                    column = %old_col.name,
+                    "indexed column absent from post-ALTER schema — leaving \
+                     ordinal unchanged; index writes may be wrong"
+                ),
+            }
+        };
+        for (name, pos) in &mut self.indexed_columns {
+            remap(name, pos);
+        }
+        for (name, pos) in &mut self.fulltext_indexes {
+            remap(name, pos);
+        }
+        for cfg in &mut self.vector_index_configs {
+            remap(&cfg.index_name.clone(), &mut cfg.column_position);
+        }
+        for (name, pred) in &mut self.index_filter_predicates {
+            for clause in &mut pred.clauses {
+                remap(name, &mut clause.column_position);
+            }
+        }
         self.schema.store(Arc::new(new_schema));
     }
 
@@ -8535,6 +8593,74 @@ mod tests {
             results.len(),
             1,
             "phonetic index must match 'Jon' to stored 'John' via code lookup"
+        );
+        assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    /// `update_schema` must remap index ordinals when an added column
+    /// re-sorts the regular columns. Regular columns are ordered by name, so
+    /// `ALTER TABLE ADD aaa` shifts an index declared on `name` from ordinal
+    /// 0 to 1; a stale declaration extracts the wrong cell on every
+    /// subsequent write and the index serves false empty results (the
+    /// memory-suite `fixed_phonetic_match` regression).
+    #[test]
+    fn update_schema_remaps_index_ordinal_when_added_column_sorts_first() {
+        use ferrosa_index::IndexKey;
+
+        let make_schema = |regulars: &[&str]| TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: regulars
+                .iter()
+                .map(|name| ColumnDefinition {
+                    name: (*name).to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                })
+                .collect(),
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new_with_indexes(
+            make_schema(&["name"]),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("name_idx".to_string(), 0_usize)],
+        );
+        store.add_index("name_idx".to_string(), 0, IndexType::Phonetic);
+
+        // ALTER TABLE ADD aaa_before — sorts before "name", shifting the
+        // indexed column's ordinal from 0 to 1.
+        store.update_schema(make_schema(&["aaa_before", "name"]));
+
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    // Post-ALTER layout: cell ordinal 1 is "name".
+                    cells: vec![(1, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+
+        let results = store
+            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "index must keep matching after ALTER shifts the column ordinal"
         );
         assert_eq!(results[0].key.key.as_bytes(), b"user1");
     }
