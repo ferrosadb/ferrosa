@@ -6363,7 +6363,8 @@ impl StorageEngine {
         query: &str,
         limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<Vec<u8>>> {
-        use ferrosa_index::fulltext::query::parse_fts_query;
+        use ferrosa_index::fulltext::analyzer::default_analyzer;
+        use ferrosa_index::fulltext::query::{analyze_query, parse_fts_query};
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
         use std::collections::{HashMap, HashSet};
 
@@ -6400,6 +6401,16 @@ impl StorageEngine {
         let parsed = parse_fts_query(query).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
         })?;
+        // Normalize through the index analyzer so the single-`Term` streaming
+        // fast path below looks up an analyzed token (not a raw stop word or a
+        // punctuation-bearing term). The reader/memtable/fallback paths also
+        // normalize internally; this keeps the fast path in parity. A query
+        // that analyzes away entirely matches nothing.
+        let analyzer = default_analyzer();
+        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+            Some(q) => q,
+            None => return Ok(vec![]),
+        };
 
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
         let merge_hits = |score_map: &mut HashMap<Vec<u8>, f64>, hits: Vec<(Vec<u8>, f64)>| {
@@ -6541,7 +6552,8 @@ impl StorageEngine {
         query: &str,
         on_hit: &mut dyn FnMut(Vec<u8>) -> std::ops::ControlFlow<()>,
     ) -> ferrosa_common::Result<()> {
-        use ferrosa_index::fulltext::query::{parse_fts_query, FtsQuery};
+        use ferrosa_index::fulltext::analyzer::default_analyzer;
+        use ferrosa_index::fulltext::query::{analyze_query, parse_fts_query, FtsQuery};
         use std::collections::HashSet;
         use std::ops::ControlFlow;
 
@@ -6550,6 +6562,13 @@ impl StorageEngine {
         let parsed = parse_fts_query(query).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("fts_match query error: {e}"))
         })?;
+        // Analyzer parity for the single-`Term` streaming fast path (see
+        // `fulltext_search`). A query that analyzes away matches nothing.
+        let analyzer = default_analyzer();
+        let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
+            Some(q) => q,
+            None => return Ok(()),
+        };
 
         if !self.tables.read().contains_key(table_id) {
             return Ok(());
@@ -20529,6 +20548,63 @@ mod tests {
             !result_keys.contains(&"r3".to_string()),
             "r3 has neither term"
         );
+    }
+
+    /// Analyzer-parity end-to-end: a natural-language query carrying an English
+    /// stop word absent from the corpus must still match. Mirrors the live
+    /// ferrosa-memory failure `fixed_document_search_survives_fts_stopword_
+    /// absent_from_corpus`. Exercises the flushed-sidecar path through the real
+    /// engine (not just the reader unit).
+    #[test]
+    fn fts_stopword_bearing_query_matches_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        engine
+            .write(
+                &tid,
+                &make_key("r1"),
+                make_row(
+                    b"quarterly latency reports emitted by the ingest pipeline",
+                    1000,
+                ),
+                1000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &make_key("r2"),
+                make_row(b"python scripting only", 1000),
+                1000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // "were" is stripped by the index analyzer and never appears in any
+        // posting list — before the fix this conjunction returned 0 rows.
+        let results = engine
+            .fulltext_search(&tid, "idx_body", "reports were emitted", None)
+            .unwrap();
+        let keys: Vec<String> = results
+            .iter()
+            .filter_map(|dk| {
+                ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .map(|pk| String::from_utf8_lossy(pk).to_string())
+            })
+            .collect();
+        assert!(keys.contains(&"r1".to_string()), "r1 has reports+emitted");
+        assert!(!keys.contains(&"r2".to_string()), "r2 lacks both terms");
+
+        // An all-stop-word query matches nothing but must not error.
+        let empty = engine
+            .fulltext_search(&tid, "idx_body", "was there", None)
+            .unwrap();
+        assert!(empty.is_empty(), "all-stop-word query matches nothing");
     }
 
     #[test]

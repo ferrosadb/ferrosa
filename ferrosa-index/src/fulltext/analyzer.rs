@@ -101,6 +101,19 @@ impl Analyzer for KeywordAnalyzer {
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
+/// The analyzer used when no per-index analyzer option is threaded.
+///
+/// Both the write side ([`super::builder::FullTextIndexBuilder::new`], document
+/// indexing) and the read side ([`super::reader::FullTextIndexReader`], query-
+/// term normalization) construct their default analyzer here, so the two sides
+/// stay in lock-step. If they diverge, a query term the analyzer would drop or
+/// rewrite looks up a posting list that can never exist → a deterministic
+/// false-empty result. When a per-index analyzer option is eventually persisted
+/// and threaded, both sides must be handed the *same* analyzer instance kind.
+pub fn default_analyzer() -> Box<dyn Analyzer> {
+    Box::new(StandardAnalyzer::new())
+}
+
 /// Select an analyzer from a CQL index `WITH OPTIONS` map.
 ///
 /// Recognized option keys:

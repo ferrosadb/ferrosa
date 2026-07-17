@@ -59,7 +59,7 @@ bincode tag order is asserted stable (`lib.rs::bincode_index_type_variant_tag_st
 | `vector/hnsw` (~669) | HNSW graph ANN (JSON artifact) |
 | `vector/ivfflat` (~504) | k-means inverted-file ANN (JSON artifact) |
 | `vector/quantized/*` (~2200) | Paged `.qvec` container, scalar codec, deterministic quantized-IVF builder, staged page-budget reader |
-| `fulltext/*` (~2600) | Analyzer, builder, BM25 reader (`search` + bounded `search_top_k`), query parser, scoring, compaction merge, streaming sidecar term search (`stream`), bounded top-k selection (`topk`) |
+| `fulltext/*` (~2600) | Analyzer (+ `analyze_query` query-side parity so stop-word/punctuation terms match the index), builder, BM25 reader (`search` + bounded `search_top_k`), query parser, scoring, compaction merge, streaming sidecar term search (`stream`), bounded top-k selection (`topk`) |
 | `geo/*` (~2300) | Cell-id encode, bbox/radius/k-NN cover, exact refine, R-tree, ST predicates |
 
 ## Data flow
