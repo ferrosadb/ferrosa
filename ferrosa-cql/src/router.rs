@@ -20416,6 +20416,101 @@ mod tests {
         }
     }
 
+    /// Phonetic + full-text index on the SAME regular column (the
+    /// `agent_memory.entity_store.entity_name` shape): a fully keyed equality
+    /// read with a phonetically equivalent probe must still match by Double
+    /// Metaphone. Guards the memory-suite regression `fixed_phonetic_match`:
+    /// the keyed consult must not turn the phonetic lookup into an exact-match
+    /// miss just because a full-text index also covers the column.
+    #[tokio::test]
+    async fn phonetic_keyed_equality_matches_when_fulltext_shares_the_column() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE phon_dual WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            // Full agent_memory.entity_store shape (ddl/002 + 005 + 009 + 020 +
+            // 040 + 043): uuid keys, every secondary index the live schema
+            // carries — including btree indexes on a partition-key component
+            // (tenant_id) and the clustering key (entity_id).
+            "CREATE TABLE phon_dual.entity_store (tenant_id uuid, entity_id uuid, session_id uuid, entity_name text, entity_type text, source_fold_id timeuuid, context_snippet text, entity_embedding vector<float, 768>, confidence float, created_at timestamp, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX idx_entity_name_phonetic ON phon_dual.entity_store (entity_name) USING 'phonetic' WITH OPTIONS = {'algorithm': 'double_metaphone'}",
+                        "CREATE INDEX IF NOT EXISTS idx_entity_by_tenant ON phon_dual.entity_store (tenant_id)",
+            "CREATE INDEX IF NOT EXISTS idx_entity_by_id ON phon_dual.entity_store (entity_id)",
+                                                                                                                                                "CREATE INDEX IF NOT EXISTS idx_entity_embedding ON phon_dual.entity_store (entity_embedding) USING 'vector' WITH OPTIONS = {'method': 'hnsw', 'metric': 'cosine', 'dimensions': '768'}",
+            "ALTER TABLE phon_dual.entity_store ADD tags text",
+            "ALTER TABLE phon_dual.entity_store ADD properties text",
+            "ALTER TABLE phon_dual.entity_store ADD content_hash text",
+            "ALTER TABLE phon_dual.entity_store ADD updated_at timestamp",
+            "ALTER TABLE phon_dual.entity_store ADD scope text",
+            "ALTER TABLE phon_dual.entity_store ADD ingested_by_session uuid",
+            "ALTER TABLE phon_dual.entity_store ADD description text",
+            "ALTER TABLE phon_dual.entity_store ADD description_embedding vector<float, 768>",
+            "CREATE INDEX IF NOT EXISTS idx_entity_description_embedding ON phon_dual.entity_store (description_embedding) USING 'vector' WITH OPTIONS = {'method': 'hnsw', 'metric': 'cosine', 'dimensions': '768'}",
+            "CREATE INDEX IF NOT EXISTS idx_entity_scope ON phon_dual.entity_store (scope)",
+            "CREATE INDEX IF NOT EXISTS idx_entity_context_fts ON phon_dual.entity_store (context_snippet) USING 'fulltext'",
+"CREATE INDEX IF NOT EXISTS idx_entity_name_fts ON phon_dual.entity_store (entity_name) USING 'fulltext'",
+                        "INSERT INTO phon_dual.entity_store (tenant_id, session_id, entity_id, entity_name, entity_type, context_snippet, confidence, created_at) VALUES (550e8400-e29b-41d4-a716-446655440000, d855258d-c5b7-41be-bf28-e8cfa0fc6b9e, 11111111-1111-1111-1111-111111111111, 'John Smith', 'person', 'test', 0.9, 1711036800000)",
+        ] {
+            let stmt = crate::parser::parse(cql).unwrap();
+            route(&state, &ctx, stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let explain = crate::parser::parse(
+            "EXPLAIN SELECT entity_name FROM phon_dual.entity_store \
+             WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
+             AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
+             AND entity_name = 'Jon Smyth'",
+        )
+        .unwrap();
+        match route(&state, &ctx, explain).await.unwrap() {
+            RouteResult::Result(b) => {
+                let plan = String::from_utf8_lossy(&b).to_string();
+                assert!(
+                    plan.contains("PartitionIndexLookup(idx_entity_name_phonetic"),
+                    "keyed phonetic equality must plan the phonetic index \
+                     (never the full-text index), got: {plan}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT entity_name FROM phon_dual.entity_store \
+             WHERE tenant_id = 550e8400-e29b-41d4-a716-446655440000 \
+             AND session_id = d855258d-c5b7-41be-bf28-e8cfa0fc6b9e \
+             AND entity_name = 'Jon Smyth'",
+        )
+        .unwrap();
+        let result = route(&state, &ctx, stmt).await;
+        assert!(
+            result.is_ok(),
+            "phonetic query should not error: {:?}",
+            result.err()
+        );
+        match result.unwrap() {
+            RouteResult::Result(b) => {
+                let count = extract_row_count(&b);
+                assert_eq!(
+                    count, 1,
+                    "phonetic index should match 'Jon Smyth' to 'John Smith' \
+                     when a full-text index shares the column, got {count} rows"
+                );
+            }
+            _ => panic!("expected Result"),
+        }
+    }
+
     /// Phonetic index: query WITHOUT partition key — forces index-only scan path.
     #[tokio::test]
     async fn phonetic_index_equality_matches_without_pk() {
