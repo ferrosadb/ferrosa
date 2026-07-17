@@ -10,6 +10,8 @@
 //!
 //! Parsing is case-insensitive for the `AND`/`OR` operators.
 
+use super::analyzer::Analyzer;
+
 /// A parsed full-text search query.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FtsQuery {
@@ -58,6 +60,79 @@ pub fn parse_fts_query(query: &str) -> Result<FtsQuery, String> {
 
     // Build the expression tree from raw tokens.
     build_expr(&raw_tokens)
+}
+
+/// Re-analyze a parsed query's terms with the SAME analyzer the index applied
+/// to its documents, so query-side tokens can match index-side tokens.
+///
+/// The parser only lowercases and splits on whitespace; the index, by contrast,
+/// ran every document through an [`Analyzer`] that lowercases, splits on
+/// punctuation, and (for the default `StandardAnalyzer`) strips English stop
+/// words. Without this step a plain conjunction like `reports were emitted`
+/// requires a posting list for the stop word `were` that the analyzer
+/// guarantees can never exist, so the query deterministically returns nothing.
+///
+/// Normalization rules (operator semantics are preserved):
+/// - A term that analyzes to **nothing** (a stop word) is DROPPED — it is never
+///   required by a conjunction and contributes nothing to a disjunction.
+/// - A term that analyzes to **several** tokens (punctuation split) becomes a
+///   conjunction of those tokens, matching how the index stored them.
+/// - `Prefix` is left untouched: analyzing a prefix fragment (stop-word or
+///   punctuation filtering) would corrupt the intended wildcard.
+/// - An `And`/`Or` operand that collapses to nothing yields its sibling; a
+///   `Not` whose operand analyzes away keeps the original operand verbatim, so
+///   `NOT <stop-word>` still excludes nothing (matches every document).
+///
+/// Returns `None` when the whole query reduces to no searchable terms (e.g.
+/// every term is a stop word). Callers treat `None` as "matches nothing"
+/// **without** erroring the query.
+pub fn analyze_query(query: &FtsQuery, analyzer: &dyn Analyzer) -> Option<FtsQuery> {
+    match query {
+        FtsQuery::Term(t) => from_tokens(analyzer.analyze(t)),
+        FtsQuery::MultiTerm(terms) => {
+            let tokens: Vec<String> = terms.iter().flat_map(|t| analyzer.analyze(t)).collect();
+            from_tokens(tokens)
+        }
+        FtsQuery::Phrase(words) => {
+            // Preserve order; drop words that analyze away. Phrase evaluation
+            // requires each surviving word to be present in the document.
+            let kept: Vec<String> = words.iter().flat_map(|w| analyzer.analyze(w)).collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some(FtsQuery::Phrase(kept))
+            }
+        }
+        // Wildcards are matched by prefix, not by exact token — leave as-is.
+        FtsQuery::Prefix(p) => Some(FtsQuery::Prefix(p.clone())),
+        FtsQuery::And(l, r) => match (analyze_query(l, analyzer), analyze_query(r, analyzer)) {
+            (Some(a), Some(b)) => Some(FtsQuery::And(Box::new(a), Box::new(b))),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        },
+        FtsQuery::Or(l, r) => match (analyze_query(l, analyzer), analyze_query(r, analyzer)) {
+            (Some(a), Some(b)) => Some(FtsQuery::Or(Box::new(a), Box::new(b))),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        },
+        FtsQuery::Not(inner) => match analyze_query(inner, analyzer) {
+            Some(i) => Some(FtsQuery::Not(Box::new(i))),
+            // Excluding an all-stop-word operand excludes nothing. Keep the
+            // operand verbatim so the evaluator's exclusion set is empty and
+            // every document qualifies — the pre-existing, correct behavior.
+            None => Some(FtsQuery::Not(inner.clone())),
+        },
+    }
+}
+
+/// Build a query from analyzed tokens: none → dropped, one → `Term`, many → a
+/// `MultiTerm` conjunction.
+fn from_tokens(tokens: Vec<String>) -> Option<FtsQuery> {
+    match tokens.len() {
+        0 => None,
+        1 => Some(FtsQuery::Term(tokens.into_iter().next().unwrap())),
+        _ => Some(FtsQuery::MultiTerm(tokens)),
+    }
 }
 
 // ── Internal tokenizer ────────────────────────────────────────────────────────
@@ -337,6 +412,110 @@ mod tests {
         let result = parse_fts_query("*");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("bare wildcard"));
+    }
+
+    // ── analyze_query (query-side analyzer parity) ────────────────────────────
+
+    use crate::fulltext::analyzer::{KeywordAnalyzer, StandardAnalyzer};
+
+    #[test]
+    fn analyze_drops_stopword_from_multiterm_conjunction() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("reports were emitted").unwrap();
+        let norm = analyze_query(&q, &a).expect("has searchable terms");
+        assert_eq!(
+            norm,
+            FtsQuery::MultiTerm(vec!["reports".into(), "emitted".into()])
+        );
+    }
+
+    #[test]
+    fn analyze_all_stopwords_yields_none() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("was there").unwrap();
+        assert_eq!(analyze_query(&q, &a), None);
+    }
+
+    #[test]
+    fn analyze_single_stopword_term_yields_none() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("were").unwrap();
+        assert_eq!(analyze_query(&q, &a), None);
+    }
+
+    #[test]
+    fn analyze_and_operand_stopword_collapses_to_sibling() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("reports AND were").unwrap();
+        assert_eq!(
+            analyze_query(&q, &a),
+            Some(FtsQuery::Term("reports".into()))
+        );
+        // Symmetric.
+        let q2 = parse_fts_query("were AND reports").unwrap();
+        assert_eq!(
+            analyze_query(&q2, &a),
+            Some(FtsQuery::Term("reports".into()))
+        );
+    }
+
+    #[test]
+    fn analyze_or_operand_stopword_collapses_to_sibling() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("reports OR were").unwrap();
+        assert_eq!(
+            analyze_query(&q, &a),
+            Some(FtsQuery::Term("reports".into()))
+        );
+    }
+
+    #[test]
+    fn analyze_term_with_punctuation_splits_into_conjunction() {
+        let a = StandardAnalyzer::new();
+        // A single token carrying punctuation is analyzed as the index stored it.
+        let q = parse_fts_query("foo-bar").unwrap();
+        assert_eq!(
+            analyze_query(&q, &a),
+            Some(FtsQuery::MultiTerm(vec!["foo".into(), "bar".into()]))
+        );
+    }
+
+    #[test]
+    fn analyze_prefix_is_left_untouched() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("rep*").unwrap();
+        assert_eq!(analyze_query(&q, &a), Some(FtsQuery::Prefix("rep".into())));
+    }
+
+    #[test]
+    fn analyze_phrase_drops_stopword_preserving_order() {
+        let a = StandardAnalyzer::new();
+        let q = parse_fts_query("\"reports were emitted\"").unwrap();
+        assert_eq!(
+            analyze_query(&q, &a),
+            Some(FtsQuery::Phrase(vec!["reports".into(), "emitted".into()]))
+        );
+    }
+
+    #[test]
+    fn analyze_not_stopword_keeps_operand_verbatim() {
+        let a = StandardAnalyzer::new();
+        // `NOT was` must remain a Not so the evaluator excludes nothing — it
+        // must not collapse to None (which would match nothing).
+        let q = parse_fts_query("NOT was").unwrap();
+        assert_eq!(
+            analyze_query(&q, &a),
+            Some(FtsQuery::Not(Box::new(FtsQuery::Term("was".into()))))
+        );
+    }
+
+    #[test]
+    fn analyze_keyword_analyzer_has_no_stopwords() {
+        // Parity must follow the INDEX's analyzer: a keyword analyzer keeps the
+        // whole string, so a "stop word" is a real, matchable token.
+        let a = KeywordAnalyzer;
+        let q = parse_fts_query("were").unwrap();
+        assert_eq!(analyze_query(&q, &a), Some(FtsQuery::Term("were".into())));
     }
 
     #[test]

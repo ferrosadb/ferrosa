@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use super::analyzer::{Analyzer, StandardAnalyzer};
+use super::analyzer::{default_analyzer, Analyzer};
 
 /// Magic bytes for FTI files.
 pub const FTI_MAGIC: &[u8; 4] = b"FTIX";
@@ -91,9 +91,9 @@ pub struct FullTextIndexBuilder {
 }
 
 impl FullTextIndexBuilder {
-    /// Create a builder using the default [`StandardAnalyzer`].
+    /// Create a builder using the shared [`default_analyzer`].
     pub fn new() -> Self {
-        Self::with_analyzer(Box::new(StandardAnalyzer::new()))
+        Self::with_analyzer(default_analyzer())
     }
 
     /// Create a builder with a custom analyzer.

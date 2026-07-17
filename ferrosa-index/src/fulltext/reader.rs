@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 
+use super::analyzer::{default_analyzer, Analyzer};
 use super::builder::{FullTextIndex, Posting, TermEntry, FTI_MAGIC, FTI_VERSION};
-use super::query::{parse_fts_query, FtsQuery};
+use super::query::{analyze_query, parse_fts_query, FtsQuery};
 use super::scoring::{bm25_score, Bm25Params};
 use super::topk::TopK;
 
@@ -23,24 +24,49 @@ pub struct FtsHit {
 /// Wraps a deserialized [`FullTextIndex`] and exposes query operations.
 pub struct FullTextIndexReader {
     index: FullTextIndex,
+    /// The analyzer applied to query terms before evaluation. It MUST be the
+    /// same analyzer the builder used to index the documents, or query tokens
+    /// won't match index tokens (see [`analyze_query`]). The serialized FTI
+    /// format does not record the analyzer, so callers that build with a
+    /// non-default analyzer must open with the matching `*_with_analyzer`
+    /// constructor.
+    analyzer: Box<dyn Analyzer>,
 }
 
 impl FullTextIndexReader {
-    /// Open an FTI from raw bytes.
+    /// Open an FTI from raw bytes, using the shared [`default_analyzer`].
     ///
     /// Validates the magic/version header before deserializing.
     pub fn open(bytes: Vec<u8>) -> Result<Self, String> {
-        let fti = deserialize_fti(&bytes)?;
-        Ok(Self { index: fti })
+        Self::open_with_analyzer(bytes, default_analyzer())
     }
 
-    /// Wrap an already-built in-memory [`FullTextIndex`] directly.
+    /// Open an FTI from raw bytes with an explicit query-side analyzer.
+    ///
+    /// Use this when the index was built with a non-default analyzer, to keep
+    /// query-term normalization in parity with document indexing.
+    pub fn open_with_analyzer(bytes: Vec<u8>, analyzer: Box<dyn Analyzer>) -> Result<Self, String> {
+        let fti = deserialize_fti(&bytes)?;
+        Ok(Self {
+            index: fti,
+            analyzer,
+        })
+    }
+
+    /// Wrap an already-built in-memory [`FullTextIndex`] directly, using the
+    /// shared [`default_analyzer`].
     ///
     /// Avoids the `serialize_fti` → `deserialize_fti` round trip that the
     /// transient memtable / sidecar-less-SSTable search paths used to pay
     /// (3× the indexed text held at once — t_ee98faa0 layer 2).
     pub fn from_index(index: FullTextIndex) -> Self {
-        Self { index }
+        Self::from_index_with_analyzer(index, default_analyzer())
+    }
+
+    /// Wrap an already-built in-memory [`FullTextIndex`] with an explicit
+    /// query-side analyzer (parity with a non-default index analyzer).
+    pub fn from_index_with_analyzer(index: FullTextIndex, analyzer: Box<dyn Analyzer>) -> Self {
+        Self { index, analyzer }
     }
 
     /// Total number of documents in this index.
@@ -68,8 +94,15 @@ impl FullTextIndexReader {
     /// Results are sorted by descending BM25 score. Deduplication by
     /// partition key is applied: the maximum score for any key wins.
     pub fn search(&self, query: &FtsQuery) -> Vec<FtsHit> {
+        // Normalize query terms through the index's analyzer first, so a term
+        // the index dropped/rewrote (e.g. a stop word) can't silently force a
+        // false-empty result. A query that analyzes away entirely matches
+        // nothing (without erroring).
+        let Some(normalized) = analyze_query(query, self.analyzer.as_ref()) else {
+            return vec![];
+        };
         let mut score_map: HashMap<&[u8], f64> = HashMap::new();
-        self.eval_query(query, &mut score_map);
+        self.eval_query(&normalized, &mut score_map);
 
         let mut hits: Vec<FtsHit> = score_map
             .into_iter()
@@ -115,8 +148,13 @@ impl FullTextIndexReader {
         if k == 0 {
             return vec![];
         }
+        // Analyzer parity (same as `search`): normalize before evaluating so a
+        // stop-word/punctuation term can't force a false-empty result.
+        let Some(normalized) = analyze_query(query, self.analyzer.as_ref()) else {
+            return vec![];
+        };
         let mut topk = TopK::new(k);
-        match query {
+        match &normalized {
             FtsQuery::Term(term) => self.stream_term_top_k(term, &mut topk),
             FtsQuery::MultiTerm(terms) | FtsQuery::Phrase(terms) => {
                 self.stream_conjunction_top_k(terms, &mut topk);
@@ -642,6 +680,122 @@ mod tests {
         let hits = reader.search_str("a*").unwrap();
         assert!(!hits.is_empty(), "prefix search must return results");
         assert!(hits.len() <= 500, "must not exceed doc count");
+    }
+
+    // ── Analyzer parity (query side == index side) ────────────────────────────
+    //
+    // Documents are indexed through the index's analyzer, which for the default
+    // `StandardAnalyzer` strips English stop words (a, an, ..., was, were, ...).
+    // The query side must apply the SAME analyzer to its terms, or a natural-
+    // language query carrying a stop word looks up a posting list the analyzer
+    // guarantees can never exist → a deterministic false-empty result. Live
+    // repro: ferrosa-memory `fixed_document_search_survives_fts_stopword_
+    // absent_from_corpus`.
+
+    #[test]
+    fn search_matches_when_query_contains_stopword_absent_from_corpus() {
+        // "by"/"the" are stripped at index time; "were" must be stripped at
+        // query time so the plain conjunction reduces to reports AND emitted.
+        let reader = make_reader(&[
+            (
+                b"pk1",
+                "quarterly latency reports emitted by the ingest pipeline",
+            ),
+            (b"pk2", "python scripting only"),
+        ]);
+        let hits = reader.search_str("reports were emitted").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(
+            pks.contains(&b"pk1".as_slice()),
+            "stop word 'were' must be dropped, not required — pk1 has reports+emitted"
+        );
+        assert!(
+            !pks.contains(&b"pk2".as_slice()),
+            "pk2 lacks reports/emitted"
+        );
+    }
+
+    #[test]
+    fn search_all_stopword_query_matches_nothing_without_error() {
+        let reader = make_reader(&[(b"pk1", "reports emitted")]);
+        // Every term analyzes away; the query must not error, it matches nothing.
+        let hits = reader.search_str("was there").expect("must not error");
+        assert!(hits.is_empty(), "all-stop-word query matches nothing");
+    }
+
+    #[test]
+    fn search_stopword_dropped_from_explicit_and() {
+        let reader = make_reader(&[
+            (b"pk1", "reports emitted here"),
+            (b"pk2", "nothing relevant"),
+        ]);
+        // The stop-word operand collapses to its sibling in both orders.
+        for q in ["reports AND were", "were AND reports"] {
+            let hits = reader.search_str(q).unwrap();
+            let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+            assert!(pks.contains(&b"pk1".as_slice()), "{q}: pk1 has 'reports'");
+            assert!(
+                !pks.contains(&b"pk2".as_slice()),
+                "{q}: pk2 lacks 'reports'"
+            );
+        }
+    }
+
+    #[test]
+    fn search_stopword_dropped_from_explicit_or() {
+        let reader = make_reader(&[(b"pk1", "reports emitted"), (b"pk2", "python scripting")]);
+        let hits = reader.search_str("reports OR were").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(pks.contains(&b"pk1".as_slice()), "pk1 has 'reports'");
+        assert!(
+            !pks.contains(&b"pk2".as_slice()),
+            "pk2 has neither 'reports' nor a real 'were' token"
+        );
+    }
+
+    #[test]
+    fn search_phrase_with_stopword_matches() {
+        let reader = make_reader(&[
+            (
+                b"pk1",
+                "quarterly latency reports emitted by the ingest pipeline",
+            ),
+            (b"pk2", "reports without the other word"),
+        ]);
+        // Phrase eval approximates as a conjunction of present terms; the stop
+        // word 'were' must drop so the phrase reduces to reports + emitted.
+        let hits = reader.search_str("\"reports were emitted\"").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(pks.contains(&b"pk1".as_slice()), "pk1 has reports+emitted");
+        assert!(!pks.contains(&b"pk2".as_slice()), "pk2 lacks 'emitted'");
+    }
+
+    #[test]
+    fn search_query_term_with_trailing_punctuation_matches() {
+        // A single query term carrying punctuation must analyze to the same
+        // token the index stored ("emitted." → "emitted"), not be looked up
+        // verbatim.
+        let reader = make_reader(&[(b"pk1", "latency reports emitted")]);
+        let hits = reader.search_str("emitted.").unwrap();
+        assert_eq!(hits.len(), 1, "'emitted.' must match indexed 'emitted'");
+        assert_eq!(hits[0].partition_key, b"pk1");
+    }
+
+    #[test]
+    fn search_not_with_only_stopword_still_returns_all_docs() {
+        // `NOT was` excludes documents containing 'was'; since the analyzer
+        // never indexed 'was', nothing is excluded → every document qualifies.
+        let reader = make_reader(&[(b"pk1", "reports emitted"), (b"pk2", "python only")]);
+        let hits = reader.search_str("NOT was").unwrap();
+        let pks: Vec<_> = hits.iter().map(|h| h.partition_key.as_slice()).collect();
+        assert!(
+            pks.contains(&b"pk1".as_slice()),
+            "pk1 not excluded by 'was'"
+        );
+        assert!(
+            pks.contains(&b"pk2".as_slice()),
+            "pk2 not excluded by 'was'"
+        );
     }
 
     #[test]
