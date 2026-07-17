@@ -6312,6 +6312,12 @@ fn route_explain(
         .indexes
         .iter()
         .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+        // Same scalar-usability gating as the SELECT paths (CQL-13): without
+        // it, EXPLAIN offers full-text/vector/geo indexes to the generic
+        // planner and — iteration-order dependently — reports a plan the
+        // executed query would never choose (e.g. PartitionIndexLookup on a
+        // full-text index when a phonetic index shares the column).
+        .filter(|(_, meta)| scalar_equality_index_is_usable(meta))
         .filter(|(_, meta)| {
             filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
         })
