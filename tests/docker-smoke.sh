@@ -20,8 +20,8 @@
 #
 #   PAIR MODE (2 nodes):
 #   Phase 1  — Bidirectional reads and writes + DDL replication
-#   Phase 2  — Primary failure (reads work, writes fail)
-#   Phase 3  — Operator promotion (writes resume)
+#   Phase 2  — Primary failure (unpromoted secondary rejects reads and writes)
+#   Phase 3  — Operator promotion (reads and writes resume)
 #   Phase 4  — Rejoin and catch-up (schema + data)
 #   Phase 5  — Switchover (swap roles)
 #
@@ -341,8 +341,8 @@ RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" 2>&1) || true
 echo "$RESULT" | grep -q "from_node2" || fail "Write not on node1"
 pass "Read from node1: key2=from_node2"
 
-# Read from node2 will be verified after Phase 2 when it becomes primary
-info "Read from node2 deferred to Phase 2 (after promotion)"
+# Read from node2 will be verified after Phase 3 operator promotion.
+info "Read from node2 deferred to Phase 3 (after operator promotion)"
 
 # ============================================================
 # Phase 2: Kill primary, verify degraded behavior
@@ -354,27 +354,20 @@ info "Killing node1..."
 docker compose stop node1
 sleep 3
 
-# Reads should still work on node2 (local data)
-info "Verifying reads still work on node2..."
-RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node1" || fail "Read from node2 failed after node1 death"
-pass "Read from node2 works after node1 death: key1=from_node1"
-
-RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node2" || fail "Read from node2 failed for key2"
-pass "Read from node2 works: key2=from_node2"
-
-# Writes should FAIL on node2 (primary unavailable)
-info "Verifying writes fail on node2 (primary unavailable)..."
-if cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('should_fail', 'nope')" 2>&1; then
-    # Write might "succeed" at CQL level but with an error — check if data is there
-    RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'should_fail';" 2>&1) || true
-    if echo "$RESULT" | grep -q "nope"; then
-        info "Write unexpectedly succeeded on degraded node2 (may be in standalone mode)"
-        # This is acceptable if the node auto-transitioned to standalone
-    fi
+# An unpromoted secondary must not serve client reads or writes: allowing either
+# would permit split brain after the primary is lost. An operator promotes it in
+# Phase 3 once that decision is safe.
+info "Verifying unpromoted node2 rejects CQL reads..."
+if cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1; then
+    fail "Unpromoted node2 served a CQL read after node1 death"
 fi
-pass "Writes correctly fail or are rejected on degraded node2"
+pass "Unpromoted node2 rejects CQL reads after node1 death"
+
+info "Verifying unpromoted node2 rejects CQL writes..."
+if cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('should_fail', 'nope')" 2>&1; then
+    fail "Unpromoted node2 served a CQL write after node1 death"
+fi
+pass "Unpromoted node2 rejects CQL writes after node1 death"
 
 # ============================================================
 # Phase 3: Operator promotion
@@ -391,6 +384,18 @@ PROMOTE_RESULT=$(curl -s -X POST "http://localhost:9091/api/cluster/promote")
 info "Promote result: $PROMOTE_RESULT"
 echo "$PROMOTE_RESULT" | grep -q "promoted" || fail "Promote failed"
 pass "Node2 promoted to standalone primary"
+
+wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
+
+# Promotion makes the replicated data safe to serve from node2.
+info "Verifying replicated reads on promoted node2..."
+RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
+echo "$RESULT" | grep -q "from_node1" || fail "Promoted node2 cannot read key1"
+pass "Promoted node2 reads replicated key1=from_node1"
+
+RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" 2>&1) || true
+echo "$RESULT" | grep -q "from_node2" || fail "Promoted node2 cannot read key2"
+pass "Promoted node2 reads replicated key2=from_node2"
 
 # Writes should now work on node2
 info "Writing failover data on promoted node2..."
