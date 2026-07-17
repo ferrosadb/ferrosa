@@ -56,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         sysstat \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
-COPY ferrosa-entrypoint.sh /usr/local/bin/
+COPY deploy/fly-bench/ferrosa-entrypoint.sh /usr/local/bin/
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa
 ENTRYPOINT ["ferrosa-entrypoint.sh"]
