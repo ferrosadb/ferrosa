@@ -141,6 +141,10 @@ jobs:
       - name: Run tier-multi-dc 1h bank workload
         env:
           FERROSA_TEST_CONTAINERS: '1'
+          # The T3 stack is brought up in the preceding step. Supplying every
+          # host-mapped CQL endpoint makes this a live workload rather than an
+          # in-process MockCqlSession run.
+          FERROSA_TEST_CLUSTER_NODES: 'localhost:29042,localhost:29043,localhost:29044,localhost:29142,localhost:29143,localhost:29144'
           # 10-min bank workload: 6 Docker containers on a 16 GB GitHub-hosted
           # runner OOM before the original 1-hour budget. The 10-min window
           # still exercises cross-DC Accord drift under nemesis injection.
@@ -164,6 +168,8 @@ jobs:
           ./driver/ferrosa-jepsen \
             run \
             --tier multi-dc \
+            --pattern bank \
+            --nemesis dc-partition+dc-slow \
             --output-dir ./jepsen-out \
             2>&1 | tee tier-multi-dc.log
 

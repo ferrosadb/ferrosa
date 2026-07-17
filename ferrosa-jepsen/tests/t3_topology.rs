@@ -141,6 +141,70 @@ fn t3_compose_seeds_within_each_dc() {
 }
 
 #[test]
+fn t3_compose_advertises_host_reachable_cql_ports() {
+    let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
+    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+
+    for (node, port) in [
+        ("dc1-node1", 29042),
+        ("dc1-node2", 29043),
+        ("dc1-node3", 29044),
+        ("dc2-node1", 29142),
+        ("dc2-node2", 29143),
+        ("dc2-node3", 29144),
+    ] {
+        let service = services
+            .get(serde_yaml::Value::String(node.into()))
+            .unwrap_or_else(|| panic!("service {node} missing"));
+        let env = service
+            .get("environment")
+            .and_then(|v| v.as_mapping())
+            .unwrap_or_else(|| panic!("{node} missing environment"));
+        let actual = env
+            .get(serde_yaml::Value::String("FERROSA_CQL_BROADCAST".into()))
+            .and_then(|v| v.as_str());
+
+        assert_eq!(
+            actual,
+            Some(format!("127.0.0.1:{port}").as_str()),
+            "{node} must advertise the CQL endpoint reachable by the host workload driver"
+        );
+    }
+}
+
+#[test]
+fn t3_compose_grants_nodes_network_admin_for_wan_nemeses() {
+    let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
+    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+
+    for node in [
+        "dc1-node1",
+        "dc1-node2",
+        "dc1-node3",
+        "dc2-node1",
+        "dc2-node2",
+        "dc2-node3",
+    ] {
+        let service = services
+            .get(serde_yaml::Value::String(node.into()))
+            .unwrap_or_else(|| panic!("service {node} missing"));
+        let capabilities = service
+            .get("cap_add")
+            .and_then(|value| value.as_sequence())
+            .unwrap_or_else(|| panic!("{node} must declare cap_add for WAN nemeses"));
+
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some("NET_ADMIN")),
+            "{node} must grant NET_ADMIN so dc-partition and dc-slow can apply iptables/tc"
+        );
+    }
+}
+
+#[test]
 fn t3_compose_attaches_each_dc_to_its_network_and_wan() {
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
     let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");

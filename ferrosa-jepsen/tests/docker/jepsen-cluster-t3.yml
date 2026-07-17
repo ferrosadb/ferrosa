@@ -109,6 +109,8 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc1-node1:7000"
       FERROSA_SEED: "dc1-node2:7000,dc1-node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      # The host-side Jepsen driver must reconnect through this mapped port.
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -125,6 +127,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc1-node1-data:/var/lib/ferrosa
     deploy:
@@ -161,6 +164,7 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc1-node2:7000"
       FERROSA_SEED: "dc1-node1:7000,dc1-node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29043"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -177,6 +181,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc1-node2-data:/var/lib/ferrosa
     deploy:
@@ -211,6 +216,7 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc1-node3:7000"
       FERROSA_SEED: "dc1-node1:7000,dc1-node2:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29044"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -227,6 +233,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc1-node3-data:/var/lib/ferrosa
     deploy:
@@ -264,6 +271,7 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc2-node1:7000"
       FERROSA_SEED: "dc2-node2:7000,dc2-node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29142"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -280,6 +288,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc2-node1-data:/var/lib/ferrosa
     deploy:
@@ -314,6 +323,7 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc2-node2:7000"
       FERROSA_SEED: "dc2-node1:7000,dc2-node3:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29143"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -330,6 +340,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc2-node2-data:/var/lib/ferrosa
     deploy:
@@ -364,6 +375,7 @@ services:
       FERROSA_INTERNODE_BROADCAST: "dc2-node3:7000"
       FERROSA_SEED: "dc2-node1:7000,dc2-node2:7000"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:29144"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_CLUSTER_NAME: "ferrosa-jepsen-t3"
       FERROSA_DATA_DIR: "/var/lib/ferrosa"
@@ -380,6 +392,7 @@ services:
       FERROSA_CACHE_MAX_BYTES: "536870912"             # 512 MiB (was 10 GiB default)
       FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728" # 128 MiB
       FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"        # 32 MiB
+    cap_add: [NET_ADMIN]
     volumes:
       - jepsen-t3-dc2-node3-data:/var/lib/ferrosa
     deploy:

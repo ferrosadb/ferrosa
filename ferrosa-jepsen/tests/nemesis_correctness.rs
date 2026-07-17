@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use ferrosa_jepsen::{
-    chaos::{NemesisContext, NemesisRegistry},
+    chaos::{NemesisContext, NemesisExecutor, NemesisRegistry},
     cluster::FerrosCluster,
     config::Topology,
     test_env::TestClusterEnv,
@@ -54,6 +54,7 @@ async fn disk_fail_no_phantom_commits() {
         ssh_user: "root".to_string(),
         ssh_key_path: env.ssh_key.clone(),
         ssh_port: env.ssh_port,
+        executor: NemesisExecutor::Ssh,
     };
 
     let registry = NemesisRegistry::phase2();
@@ -102,6 +103,7 @@ async fn packet_reorder_linearizability() {
         ssh_user: "root".to_string(),
         ssh_key_path: env.ssh_key.clone(),
         ssh_port: env.ssh_port,
+        executor: NemesisExecutor::Ssh,
     };
 
     let registry = NemesisRegistry::phase1();
@@ -147,6 +149,7 @@ async fn lwt_batch_atomicity_all_nemeses() {
         ssh_user: "root".to_string(),
         ssh_key_path: env.ssh_key.clone(),
         ssh_port: env.ssh_port,
+        executor: NemesisExecutor::Ssh,
     };
 
     let registry = NemesisRegistry::phase1();
@@ -188,6 +191,7 @@ fn mock_ctx_3_nodes() -> NemesisContext {
         ssh_user: "root".into(),
         ssh_key_path: PathBuf::from("/tmp/mock_key"),
         ssh_port: 22,
+        executor: NemesisExecutor::Ssh,
     }
 }
 
@@ -236,6 +240,7 @@ async fn nemesis_partition_halves_docker() {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(22),
+        executor: NemesisExecutor::Ssh,
     };
 
     // inject and heal — allowed to fail (SSH unreachable on mock IPs) but must
