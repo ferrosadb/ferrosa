@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::chaos::NemesisRegistry;
+use crate::chaos::{NemesisAction, NemesisContext, NemesisRegistry};
 use crate::checker::{check_linearizability, CheckResult};
 use crate::config::{Concurrency, RunConfig, Tier, Topology};
 use crate::cql_session::ScyllaCqlSession;
@@ -46,6 +46,114 @@ pub(crate) fn resolve_session_source(cluster: Option<&ClusterInfo>) -> SessionSo
         }
         None => SessionSource::Mock,
     }
+}
+
+/// Build a non-owning cluster description from caller-provisioned CQL contact
+/// points. This is the live path for Fly: the workload runner may dial the
+/// machines but must never create or tear down their lifecycle.
+fn cluster_from_preprovisioned_nodes(
+    topology: Topology,
+    contact_points: &str,
+) -> Result<ClusterInfo> {
+    let nodes = contact_points
+        .split(',')
+        .map(str::trim)
+        .filter(|point| !point.is_empty())
+        .map(|point| {
+            let (host, port) = point
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("CQL contact point `{point}` must be host:port"))?;
+            let host = host.trim_matches(['[', ']']);
+            if host.is_empty() {
+                bail!("CQL contact point `{point}` has an empty host");
+            }
+            let cql_port = port.parse::<u16>().map_err(|e| {
+                anyhow::anyhow!("CQL contact point `{point}` has invalid port: {e}")
+            })?;
+            Ok(crate::docker_provision::NodeInfo {
+                host: host.to_string(),
+                cql_port,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if nodes.len() != topology.node_count() {
+        bail!(
+            "{:?} requires exactly {} CQL contact points, got {}",
+            topology,
+            topology.node_count(),
+            nodes.len()
+        );
+    }
+    Ok(ClusterInfo::external(nodes))
+}
+
+/// Build the command transport for a live nemesis run. Fly machine IDs are
+/// required when the caller selects the Fly transport; otherwise this retains
+/// the direct-SSH path used by Firecracker-based tests.
+fn nemesis_context_for_cluster(cluster: &ClusterInfo) -> Result<NemesisContext> {
+    let node_ips = cluster.nodes.iter().map(|node| node.host.clone()).collect();
+    if let Ok(app_name) = std::env::var("FERROSA_JEPSEN_FLY_APP") {
+        let machine_ids = std::env::var("FERROSA_JEPSEN_FLY_MACHINE_IDS")
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "FERROSA_JEPSEN_FLY_APP is set but FERROSA_JEPSEN_FLY_MACHINE_IDS is missing"
+                )
+            })?
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect();
+        return NemesisContext::fly(node_ips, app_name, machine_ids);
+    }
+
+    if std::env::var("FERROSA_TEST_CONTAINERS").is_ok() {
+        let container_names = [
+            "ferrosa-jepsen-t3-dc1-node1",
+            "ferrosa-jepsen-t3-dc1-node2",
+            "ferrosa-jepsen-t3-dc1-node3",
+            "ferrosa-jepsen-t3-dc2-node1",
+            "ferrosa-jepsen-t3-dc2-node2",
+            "ferrosa-jepsen-t3-dc2-node3",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        return Ok(NemesisContext {
+            node_ips,
+            ssh_user: "root".to_string(),
+            ssh_key_path: std::path::PathBuf::new(),
+            ssh_port: 0,
+            executor: crate::chaos::NemesisExecutor::Docker { container_names },
+        });
+    }
+
+    Ok(NemesisContext {
+        node_ips,
+        ssh_user: std::env::var("FERROSA_SSH_USER").unwrap_or_else(|_| "root".to_string()),
+        ssh_key_path: std::env::var("FERROSA_SSH_KEY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("rootfs/test_key")),
+        ssh_port: std::env::var("FERROSA_SSH_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(22),
+        executor: crate::chaos::NemesisExecutor::Ssh,
+    })
+}
+
+/// Inject one fault window and always heal it before returning. The workload
+/// runs concurrently with this cycle, so a named Jepsen nemesis is evidence,
+/// not merely a label in the final report.
+async fn run_nemesis_cycle(
+    nemesis: &dyn NemesisAction,
+    ctx: &NemesisContext,
+    inject_duration: Duration,
+) -> Result<()> {
+    nemesis.inject(ctx).await?;
+    tokio::time::sleep(inject_duration).await;
+    nemesis.heal(ctx).await
 }
 
 /// Result of a single test combination (one workload + one nemesis).
@@ -99,22 +207,35 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
         // FERROSA_TEST_CONTAINERS is set; otherwise we fall back to a
         // no-op cluster (placeholder) so the orchestrator can still run
         // unit-level combinations without container infrastructure.
-        let cluster_opt: Option<ClusterInfo> =
-            if std::env::var("FERROSA_TEST_CONTAINERS").is_ok() && topology.node_count() <= 3 {
-                match provision_docker_cluster(*topology).await {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        tracing::error!(
-                            ?topology,
-                            error = %e,
-                            "Docker cluster provisioning failed; skipping topology"
-                        );
-                        continue;
-                    }
+        let cluster_opt: Option<ClusterInfo> = if let Ok(contact_points) =
+            std::env::var("FERROSA_TEST_CLUSTER_NODES")
+        {
+            Some(cluster_from_preprovisioned_nodes(
+                *topology,
+                &contact_points,
+            )?)
+        } else if std::env::var("FERROSA_TEST_CONTAINERS").is_ok() && topology.node_count() <= 3 {
+            match provision_docker_cluster(*topology).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!(
+                        ?topology,
+                        error = %e,
+                        "Docker cluster provisioning failed; skipping topology"
+                    );
+                    continue;
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
+
+        if matches!(config.tier, Tier::MultiDc) && cluster_opt.is_none() {
+            bail!(
+                "tier multi-dc requires a preprovisioned six-node cluster; set \
+                 FERROSA_TEST_CLUSTER_NODES=host1:9042,...,host6:9042"
+            );
+        }
 
         for concurrency in &concurrency_levels {
             for driver_name in &driver_names {
@@ -255,12 +376,34 @@ async fn run_single_combination(
     // Set up schema.
     workload.setup(session.as_ref()).await?;
 
-    // Run workload for configured duration.
+    // Run the workload while the selected fault is actually active. `noop`
+    // remains the control case; every other name must execute and heal rather
+    // than merely appearing in the report label.
     let run_duration = Duration::from_secs(config.run_duration_secs());
     let mut recorder = HistoryRecorder::new(&format!("{driver_name}-{workload_name}"));
-    workload
-        .run(session.as_ref(), &mut recorder, run_duration)
-        .await?;
+    if nemesis_name == "noop" {
+        workload
+            .run(session.as_ref(), &mut recorder, run_duration)
+            .await?;
+    } else {
+        let cluster = cluster.ok_or_else(|| {
+            anyhow::anyhow!(
+                "nemesis `{nemesis_name}` requires a live cluster; refusing to label a mock run as faulted"
+            )
+        })?;
+        let nemesis_registry = resolve_nemesis_registry(config.tier);
+        let nemesis = nemesis_registry
+            .get(nemesis_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown nemesis `{nemesis_name}`"))?;
+        let context = nemesis_context_for_cluster(cluster)?;
+        let inject_duration = run_duration.min(Duration::from_secs(60));
+        let (workload_result, nemesis_result) = tokio::join!(
+            workload.run(session.as_ref(), &mut recorder, run_duration),
+            run_nemesis_cycle(nemesis, &context, inject_duration),
+        );
+        workload_result?;
+        nemesis_result?;
+    }
     let history = recorder.finish();
 
     // Write history JSONL to output directory.
@@ -358,7 +501,7 @@ mod tests {
                     cql_port: 49044,
                 },
             ],
-            compose_file: std::path::PathBuf::from("/tmp/fake.yml"),
+            compose_file: Some(std::path::PathBuf::from("/tmp/fake.yml")),
         };
 
         let source = resolve_session_source(Some(&cluster));
@@ -386,6 +529,30 @@ mod tests {
     fn orchestrator_uses_mock_when_no_cluster_provided() {
         let source = resolve_session_source(None);
         assert_eq!(source, SessionSource::Mock);
+    }
+
+    #[test]
+    fn multi_dc_uses_preprovisioned_fly_nodes_as_real_cql_contacts() {
+        let cluster = cluster_from_preprovisioned_nodes(
+            Topology::T3,
+            "fdaa:0:abcd::1:9042,fdaa:0:abcd::2:9042,fdaa:0:abcd::3:9042,\
+             fdaa:0:dcba::1:9042,fdaa:0:dcba::2:9042,fdaa:0:dcba::3:9042",
+        )
+        .expect("six Fly nodes are a valid T3 cluster");
+
+        assert_eq!(cluster.nodes.len(), 6);
+        assert_eq!(
+            resolve_session_source(Some(&cluster)),
+            SessionSource::Real(vec![
+                "[fdaa:0:abcd::1]:9042".to_string(),
+                "[fdaa:0:abcd::2]:9042".to_string(),
+                "[fdaa:0:abcd::3]:9042".to_string(),
+                "[fdaa:0:dcba::1]:9042".to_string(),
+                "[fdaa:0:dcba::2]:9042".to_string(),
+                "[fdaa:0:dcba::3]:9042".to_string(),
+            ]),
+            "multi-DC runs must dial the supplied Fly cluster rather than use MockCqlSession"
+        );
     }
 
     #[tokio::test]
@@ -432,5 +599,75 @@ mod tests {
         // History file should exist.
         let history_path = dir.path().join("test-run").join("T1-noop-register.jsonl");
         assert!(history_path.exists(), "history JSONL must be written");
+    }
+
+    #[tokio::test]
+    async fn selected_nemesis_is_injected_and_healed() {
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingNemesis(Arc<Mutex<Vec<&'static str>>>);
+
+        #[async_trait::async_trait]
+        impl crate::chaos::NemesisAction for RecordingNemesis {
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            async fn inject(&self, _ctx: &crate::chaos::NemesisContext) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push("inject");
+                Ok(())
+            }
+
+            async fn heal(&self, _ctx: &crate::chaos::NemesisContext) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push("heal");
+                Ok(())
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let nemesis = RecordingNemesis(Arc::clone(&events));
+        let ctx = crate::chaos::NemesisContext {
+            node_ips: vec!["127.0.0.1".into()],
+            ssh_user: "root".into(),
+            ssh_key_path: std::path::PathBuf::from("/tmp/not-used"),
+            ssh_port: 22,
+            executor: crate::chaos::NemesisExecutor::Ssh,
+        };
+
+        run_nemesis_cycle(&nemesis, &ctx, Duration::ZERO)
+            .await
+            .expect("nemesis cycle succeeds");
+        assert_eq!(*events.lock().unwrap(), ["inject", "heal"]);
+    }
+
+    #[tokio::test]
+    async fn named_nemesis_refuses_to_run_against_the_mock_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RunConfig {
+            tier: Tier::Smoke,
+            topology: None,
+            nemesis: None,
+            pattern: None,
+            driver: None,
+            concurrency: None,
+            run_id: "mock-fault".into(),
+            output_dir: dir.path().to_path_buf(),
+            fly_regions: vec![],
+            alert_webhook: None,
+            output_json: false,
+        };
+
+        let error = run_single_combination(
+            Topology::T1,
+            "partition-halves",
+            "register",
+            "rust",
+            Concurrency::Low,
+            &config,
+            None,
+        )
+        .await
+        .expect_err("a named fault must never silently run against MockCqlSession");
+        assert!(error.to_string().contains("requires a live cluster"));
     }
 }

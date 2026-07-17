@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gdb \
         procps \
         curl \
+        iproute2 \
+        iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # The caller must supply ferrosa.deb (nightly release artifact).
