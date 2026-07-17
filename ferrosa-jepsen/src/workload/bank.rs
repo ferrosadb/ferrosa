@@ -42,6 +42,16 @@ impl Workload for BankWorkload {
         "bank"
     }
 
+    /// Bank is a transactional workload: writes record transfer *deltas* and
+    /// reads are whole-cluster balance snapshots, which the single-value
+    /// register linearizability model cannot represent (and per-key
+    /// linearizability is not a guarantee Ferrosa's eventually-consistent base
+    /// makes). Correctness is judged by value conservation ([`Self::check_invariant`])
+    /// and, for the Accord transaction path, by strict serializability (Elle).
+    fn register_linearizable(&self) -> bool {
+        false
+    }
+
     async fn setup(&self, session: &dyn CqlSession) -> Result<()> {
         session
             .execute(
@@ -313,5 +323,62 @@ mod tests {
 
         let wl = BankWorkload;
         assert!(wl.check_invariant(&history).is_err());
+    }
+
+    /// Regression guard for the register-model false-positive. A bank history
+    /// (delta writes + multi-key snapshot reads) is not a single-value register
+    /// history, so the generic linearizability checker reports it as
+    /// non-linearizable even when every balance was conserved. Bank therefore
+    /// opts out of that check and is judged by conservation (+ strict
+    /// serializability via Elle) instead.
+    #[test]
+    fn bank_opts_out_of_register_linearizability() {
+        use crate::checker::check_linearizability;
+
+        let wl = BankWorkload;
+        assert!(
+            !wl.register_linearizable(),
+            "bank must not be gated by the single-value register model"
+        );
+
+        // A conserved bank history: the write records the transfer *delta*, and
+        // a snapshot read sums to the expected total.
+        let history = History {
+            operations: vec![
+                make_op(
+                    "c1",
+                    100,
+                    200,
+                    Op::Write {
+                        key: "account-1".into(),
+                        value: 37,
+                    },
+                    OpResult::Ok,
+                ),
+                make_op(
+                    "c1",
+                    300,
+                    400,
+                    Op::SerialRead {
+                        key: "all-accounts".into(),
+                    },
+                    OpResult::CurrentValues(
+                        (0..NUM_ACCOUNTS)
+                            .map(|i| (format!("account-{i}"), INITIAL_BALANCE.to_string()))
+                            .collect(),
+                    ),
+                ),
+            ],
+        };
+
+        // Conservation holds…
+        assert!(wl.check_invariant(&history).is_ok());
+        // …yet the single-value register model still flags it, which is exactly
+        // why the orchestrator must skip linearizability for this workload.
+        let lin = check_linearizability(&history);
+        assert!(
+            lin.iter().any(|r| !r.valid),
+            "register model is expected to false-fail a (conserved) bank history"
+        );
     }
 }
