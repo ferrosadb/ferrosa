@@ -36,9 +36,129 @@ pub struct NemesisContext {
     pub ssh_key_path: PathBuf,
     /// SSH port.
     pub ssh_port: u16,
+    /// How chaos commands reach nodes. Fly's managed SSH transport is used
+    /// for real multi-DC machines; local Firecracker tests use direct SSH.
+    pub executor: NemesisExecutor,
+}
+
+/// Transport used to execute a nemesis command on a particular node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NemesisExecutor {
+    Ssh,
+    Docker {
+        container_names: Vec<String>,
+    },
+    Fly {
+        app_name: String,
+        machine_ids: Vec<String>,
+    },
 }
 
 impl NemesisContext {
+    /// Build a Fly-backed context. Machine order must match `node_ips`, so the
+    /// first half remains DC-A and the second half DC-B for WAN nemeses.
+    pub fn fly(
+        node_ips: Vec<String>,
+        app_name: impl Into<String>,
+        machine_ids: Vec<String>,
+    ) -> Result<Self> {
+        if node_ips.len() != machine_ids.len() {
+            anyhow::bail!(
+                "Fly nemesis needs one machine ID per node: {} nodes, {} machine IDs",
+                node_ips.len(),
+                machine_ids.len()
+            );
+        }
+        Ok(Self {
+            node_ips,
+            ssh_user: "root".to_string(),
+            ssh_key_path: PathBuf::new(),
+            ssh_port: 22,
+            executor: NemesisExecutor::Fly {
+                app_name: app_name.into(),
+                machine_ids,
+            },
+        })
+    }
+
+    fn fly_ssh_args(&self, node_index: usize, command: &str) -> Result<Vec<String>> {
+        let NemesisExecutor::Fly {
+            app_name,
+            machine_ids,
+        } = &self.executor
+        else {
+            anyhow::bail!("Fly command requested for a non-Fly nemesis context");
+        };
+        let machine_id = machine_ids
+            .get(node_index)
+            .ok_or_else(|| anyhow::anyhow!("missing Fly machine ID for node index {node_index}"))?;
+        let quoted = command.replace('\'', "'\"'\"'");
+        Ok(vec![
+            "ssh".to_string(),
+            "console".to_string(),
+            "--app".to_string(),
+            app_name.clone(),
+            "--machine".to_string(),
+            machine_id.clone(),
+            "--command".to_string(),
+            format!("sh -lc '{quoted}'"),
+        ])
+    }
+
+    /// Execute a command on one ordered cluster node through the configured
+    /// transport. WAN nemeses use this rather than assuming direct SSH.
+    pub async fn exec_on(
+        &self,
+        node_index: usize,
+        command: &str,
+    ) -> Result<crate::ssh::CommandOutput> {
+        match &self.executor {
+            NemesisExecutor::Ssh => {
+                let ip = self
+                    .node_ips
+                    .get(node_index)
+                    .ok_or_else(|| anyhow::anyhow!("missing node IP for index {node_index}"))?;
+                self.ssh_to(ip).await?.exec(command).await
+            }
+            NemesisExecutor::Fly { .. } => {
+                let args = self.fly_ssh_args(node_index, command)?;
+                let output = tokio::process::Command::new("fly")
+                    .args(args)
+                    .output()
+                    .await?;
+                let status = output.status.code().unwrap_or(255);
+                let result = crate::ssh::CommandOutput {
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    exit_code: status,
+                };
+                if output.status.success() {
+                    Ok(result)
+                } else {
+                    anyhow::bail!(
+                        "Fly command on node {node_index} failed with {status}: {}",
+                        result.stderr
+                    );
+                }
+            }
+            NemesisExecutor::Docker { container_names } => {
+                let container = container_names.get(node_index).ok_or_else(|| {
+                    anyhow::anyhow!("missing Docker container for node index {node_index}")
+                })?;
+                let output =
+                    tokio::process::Command::new(crate::docker_provision::container_runtime())
+                        .args(["exec", container, "sh", "-lc", command])
+                        .output()
+                        .await?;
+                Ok(crate::ssh::CommandOutput {
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                    exit_code: output.status.code().unwrap_or(255),
+                })
+            }
+        }
+    }
+
     /// Get IPs for "majority" partition (more than half).
     pub fn majority_ips(&self) -> Vec<String> {
         let n = (self.node_ips.len() / 2) + 1;
@@ -267,6 +387,7 @@ mod tests {
             ssh_user: "root".into(),
             ssh_key_path: PathBuf::from("/tmp/key"),
             ssh_port: 22,
+            executor: NemesisExecutor::Ssh,
         };
         assert_eq!(ctx.majority_ips(), vec!["1", "2"]);
         assert_eq!(ctx.minority_ips(), vec!["3"]);
@@ -279,9 +400,36 @@ mod tests {
             ssh_user: "root".into(),
             ssh_key_path: PathBuf::from("/tmp/key"),
             ssh_port: 22,
+            executor: NemesisExecutor::Ssh,
         };
         assert_eq!(ctx.majority_ips().len(), 3);
         assert_eq!(ctx.minority_ips().len(), 2);
+    }
+
+    #[test]
+    fn fly_context_targets_the_matching_machine_with_shell_quoting() {
+        let ctx = NemesisContext::fly(
+            vec!["fdaa:0:1::1".into(), "fdaa:0:1::2".into()],
+            "ferrosa-jepsen-live",
+            vec!["machine-a".into(), "machine-b".into()],
+        )
+        .expect("one Fly machine ID per node");
+
+        assert_eq!(
+            ctx.fly_ssh_args(1, "iptables -A OUTPUT -d 'fdaa:0:1::1' -j DROP")
+                .expect("Fly command"),
+            vec![
+                "ssh",
+                "console",
+                "--app",
+                "ferrosa-jepsen-live",
+                "--machine",
+                "machine-b",
+                "--command",
+                "sh -lc 'iptables -A OUTPUT -d '\"'\"'fdaa:0:1::1'\"'\"' -j DROP'",
+            ],
+            "the WAN action must execute on the selected Fly machine, not the local runner"
+        );
     }
 
     #[test]

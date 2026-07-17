@@ -20,30 +20,53 @@ use crate::config::Topology;
 // CQL ports assigned to each of the three Jepsen cluster nodes on localhost.
 const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
 
-/// Detect whether `docker` or `podman` is available and return the binary name.
+/// Detect whether `docker` or `podman` is usable and return the binary name.
 ///
-/// Checks `docker` first (most common on Linux CI), then falls back to `podman`.
-/// Returns `"docker"` or `"podman"`. Panics if neither is found in PATH.
+/// `FERROSA_CONTAINER_RUNTIME` can explicitly select either engine. Otherwise
+/// this checks `docker` first (most common on Linux CI), then falls back to
+/// `podman`. A binary alone is insufficient: its daemon must also answer
+/// `info`, so a stale Docker CLI does not mask a working Podman machine.
+/// Returns `"docker"` or `"podman"`. Panics if neither is usable.
 pub fn container_runtime() -> &'static str {
-    // Check docker first, then podman.
-    for candidate in &["docker", "podman"] {
-        let found = std::process::Command::new(candidate)
-            .arg("--version")
+    let requested = std::env::var("FERROSA_CONTAINER_RUNTIME").ok();
+    let runtime = select_container_runtime(requested.as_deref(), |candidate| {
+        std::process::Command::new(candidate)
+            .arg("info")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
-            .unwrap_or(false);
-        if found {
-            // Return a &'static str by matching on the known candidates.
-            if *candidate == "docker" {
-                return "docker";
-            } else {
-                return "podman";
-            }
-        }
+            .unwrap_or(false)
+    });
+
+    if let Some(runtime) = runtime {
+        return runtime;
     }
-    panic!("neither 'docker' nor 'podman' found in PATH — install one to run container tests");
+
+    if let Some(requested) = requested {
+        panic!("FERROSA_CONTAINER_RUNTIME={requested:?} is not a usable docker or podman engine");
+    }
+
+    panic!(
+        "neither a usable 'docker' nor 'podman' engine found — start one to run container tests"
+    );
+}
+
+fn select_container_runtime(
+    requested: Option<&str>,
+    is_usable: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let candidates: &[&str] = match requested {
+        Some("docker") => &["docker"],
+        Some("podman") => &["podman"],
+        Some(_) => return None,
+        None => &["docker", "podman"],
+    };
+
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| is_usable(candidate))
 }
 
 /// Information about a single provisioned node.
@@ -60,7 +83,14 @@ pub struct NodeInfo {
 impl NodeInfo {
     /// CQL contact address as `host:port`.
     pub fn cql_address(&self) -> String {
-        format!("{}:{}", self.host, self.cql_port)
+        // Fly private addresses are IPv6. CQL contact points use the standard
+        // bracketed IPv6 host:port form so the Scylla driver can parse them.
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{host}:{}", self.cql_port)
     }
 
     /// Return `true` if the CQL port accepts a TCP connection.
@@ -102,11 +132,23 @@ impl NodeInfo {
 pub struct ClusterInfo {
     /// The nodes in this cluster, in order.
     pub nodes: Vec<NodeInfo>,
-    /// Compose file used to provision the cluster.
-    pub(crate) compose_file: PathBuf,
+    /// Compose file used to provision the cluster. `None` means an external
+    /// (for example Fly.io) cluster owned by the caller.
+    pub(crate) compose_file: Option<PathBuf>,
 }
 
 impl ClusterInfo {
+    /// Describe a cluster already provisioned outside this process.
+    ///
+    /// The driver can use its CQL contact points but must not try to tear it
+    /// down: Fly lifecycle belongs to the invoking harness.
+    pub fn external(nodes: Vec<NodeInfo>) -> Self {
+        Self {
+            nodes,
+            compose_file: None,
+        }
+    }
+
     /// Assert that the number of nodes matches the topology.
     pub fn assert_node_count(&self, topology: Topology) {
         assert_eq!(
@@ -291,7 +333,7 @@ pub async fn provision_docker_cluster(topology: Topology) -> Result<ClusterInfo>
 
     let cluster = ClusterInfo {
         nodes,
-        compose_file,
+        compose_file: Some(compose_file),
     };
 
     // Wait for all nodes to accept CQL connections.
@@ -350,7 +392,11 @@ async fn wait_for_cluster_ready(cluster: &ClusterInfo) -> Result<()> {
 /// Runs `compose down -v` to remove containers and volumes.
 pub async fn teardown_docker_cluster(cluster: ClusterInfo) -> Result<()> {
     let rt = container_runtime();
-    let compose_file = cluster.compose_file.to_str().unwrap().to_owned();
+    let Some(compose_file) = cluster.compose_file else {
+        info!("external cluster lifecycle is owned by the caller; skipping compose teardown");
+        return Ok(());
+    };
+    let compose_file = compose_file.to_str().unwrap().to_owned();
 
     info!(compose_file = %compose_file, runtime = rt, "tearing down Docker cluster");
 
@@ -396,10 +442,38 @@ mod tests {
                     cql_port: 49044,
                 },
             ],
-            compose_file: PathBuf::from("/tmp/fake.yml"),
+            compose_file: Some(PathBuf::from("/tmp/fake.yml")),
         };
         // T1 = 3 nodes — should not panic.
         cluster.assert_node_count(Topology::T1);
+    }
+
+    #[test]
+    fn external_cluster_keeps_fly_contact_points_without_owning_teardown() {
+        let cluster = ClusterInfo::external(vec![
+            NodeInfo {
+                host: "fdaa:0:1234::1".to_string(),
+                cql_port: 9042,
+            },
+            NodeInfo {
+                host: "fdaa:0:1234::2".to_string(),
+                cql_port: 9042,
+            },
+        ]);
+
+        assert_eq!(
+            cluster
+                .nodes
+                .iter()
+                .map(NodeInfo::cql_address)
+                .collect::<Vec<_>>(),
+            vec!["[fdaa:0:1234::1]:9042", "[fdaa:0:1234::2]:9042"],
+            "an externally provisioned Fly cluster must retain routable CQL endpoints"
+        );
+        assert!(
+            cluster.compose_file.is_none(),
+            "the Jepsen driver must not tear down a cluster it did not create"
+        );
     }
 
     /// Sanity check the FERROSA_SEED parser on a hand-crafted snippet.
@@ -506,6 +580,13 @@ services:
             rt == "docker" || rt == "podman",
             "container_runtime() returned unexpected value: {rt}"
         );
+    }
+
+    #[test]
+    fn container_runtime_prefers_a_usable_engine_over_an_unusable_docker_binary() {
+        let runtime = select_container_runtime(None, |candidate| candidate == "podman");
+
+        assert_eq!(runtime, Some("podman"));
     }
 
     /// Provision a 3-node Docker cluster and verify all CQL ports are reachable.

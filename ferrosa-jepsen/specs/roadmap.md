@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-07-16
 ---
 
 # ferrosa-jepsen — Roadmap
@@ -14,13 +14,12 @@ external checkers.
 
 ## Now (highest value)
 
-- **Wire (or remove) the Firecracker/Fly.io cluster backends.** `firecracker.rs`
-  and `cluster.rs` (microVM provisioning) and `flyio.rs` (T3/T4 machines) are
-  implemented but unreachable from the orchestrator — `cluster.rs` itself has no
-  callers and carries a `// TODO: SSH into each node, run setup-guest.sh, start
-  ferrosa`. Today only Docker Compose (≤3 nodes) is wired, so T2/T3/T4 tiers fall
-  back to `MockCqlSession`. Either route the orchestrator through these backends
-  or drop the dead code (fail-loud: don't let a multi-node tier silently mock).
+- **Wire (or remove) Firecracker provisioning.** `firecracker.rs` and
+  `cluster.rs` (microVM provisioning) are still unreachable; `cluster.rs`
+  carries a `// TODO: SSH into each node, run setup-guest.sh, start ferrosa`.
+  T3 now accepts externally provisioned contacts and fails loud without them,
+  and a Fly caller can select Fly-SSH WAN faults; what remains is automated
+  Firecracker lifecycle ownership.
 - **Implement the `report` CLI subcommands.** `report list`/`compare`/`render`
   log "not yet implemented" (`main.rs`) despite `report/{comparison,timeline,
   anomaly}` modules existing. Finish wiring them to the archive.
@@ -42,10 +41,10 @@ external checkers.
 
 ## Later
 
-- **Real multi-DC (T3/T4) endurance on Fly.io.** The sim-equivalent endurance
-  run (`endurance_sim.rs`, ADR-016) stands in for the Fly.io tri-DC run; once
-  the Fly.io backend is wired, run the real 24h tier and compare against the
-  sim gate.
+- **Automate real multi-DC (T3/T4) endurance on Fly.io.** The run path now
+  accepts a caller-provisioned Fly topology and executes WAN faults over Fly
+  SSH, but it does not create/destroy the machine fleet itself. Add an explicit
+  cost-gated launcher and run the real 24h tier alongside the sim gate.
 - **Broaden checker models.** The native checker models a single-value register
   (read/write/CAS/serial-read); the `bank` and LWT workloads rely on
   workload-specific invariants. Consider a list/set/transactional model for

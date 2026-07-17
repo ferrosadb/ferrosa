@@ -97,6 +97,24 @@ fn multi_dc_nightly_workload_invokes_current_run_subcommand() {
         !step.contains("--run-id"),
         "ferrosa-jepsen no longer accepts --run-id on the run command"
     );
+
+    // This is one bounded, named correctness experiment—not the entire
+    // workload × nemesis matrix. Without these filters each combination gets
+    // the full JEPSEN_RUN_DURATION_SECS budget and a nominal 10-minute nightly
+    // cannot complete in its 45-minute job window.
+    assert!(
+        step.contains("--pattern bank"),
+        "nightly multi-DC must run only the bank workload; step was:\n{step}"
+    );
+    assert!(
+        step.contains("--nemesis dc-partition+dc-slow"),
+        "nightly multi-DC must run its named WAN nemesis; step was:\n{step}"
+    );
+    assert!(
+        step.contains("FERROSA_TEST_CLUSTER_NODES"),
+        "nightly multi-DC must provide the six already-running T3 CQL endpoints so \
+         the driver cannot fall back to MockCqlSession; step was:\n{step}"
+    );
 }
 
 #[test]

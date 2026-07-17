@@ -52,15 +52,21 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
   to per-language Docker images (Python/Go/Node/Java/C#) — `phase2`, not used by
   the default tier resolution.
 - **Cluster backends**:
-  - **Docker Compose** (`docker_provision.rs`) — the **wired** provisioning path.
-    The orchestrator provisions a 3-node cluster when `FERROSA_TEST_CONTAINERS`
-    is set and the topology has ≤3 nodes; otherwise it runs combinations against
-    an in-process `MockCqlSession`. Uses `container_runtime()` (docker→podman).
+  - **Docker Compose / external contacts** (`docker_provision.rs`) — the
+    orchestrator provisions a 3-node cluster when `FERROSA_TEST_CONTAINERS` is
+    set. A caller can instead provide `FERROSA_TEST_CLUSTER_NODES` (including
+    six T3 endpoints); those endpoints are always dialed as a real CQL cluster
+    and are never torn down by the driver. The multi-DC tier rejects a missing
+    live cluster rather than silently using `MockCqlSession`. Uses
+    `container_runtime()` (docker→podman).
   - **Firecracker** (`firecracker.rs`, `cluster.rs`) — microVM provisioning
     primitives exist but are **not wired** into the orchestrator/run path;
     `cluster.rs` is the only consumer and is itself unreferenced.
-  - **Fly.io** (`flyio.rs`) — machine-management types/primitives for the
-    multi-DC topologies (T3/T4) exist but are **not wired** into the run path.
+  - **Fly.io** (`flyio.rs`, `chaos/`) — machine-management primitives and a
+    Fly-SSH nemesis transport for T3/T4. Set `FERROSA_JEPSEN_FLY_APP` plus
+    ordered `FERROSA_JEPSEN_FLY_MACHINE_IDS` to execute WAN chaos on real Fly
+    machines; the same WAN actions use `container_runtime exec` for the local
+    T3 compose topology.
 - **Endurance sim** (`endurance_sim.rs`) — the **sim-equivalent endurance run**
   (W8.9, ADR-016). Drives `ferrosa_sim::multi_dc::DualDcBankSim` (voters +
   per-DC learners) over a 24-simulated-hour horizon with periodic rolling-window
@@ -113,4 +119,5 @@ External: `tokio`, `scylla` (CQL driver), `russh` (SSH for fault injection),
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, run pipeline, data flow
+- [FMEA](specs/fmea.md) — live-cluster, driver-routing, and WAN-nemesis failure controls
 - [Roadmap](specs/roadmap.md) — Now / Next / Later

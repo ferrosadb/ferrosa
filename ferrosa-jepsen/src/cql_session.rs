@@ -28,13 +28,14 @@ impl ScyllaCqlSession {
     /// would scatter the statements across coordinators and the buffered DML would
     /// never reach the `BEGIN`'s connection (silently non-atomic).
     ///
-    /// Pinning is by **`host_id`** (a stable cluster identity), discovered via a
-    /// short-lived probe session — NOT by address. A node's advertised address
-    /// differs from the port-mapped contact point in Docker/Fly, which is exactly
-    /// why the earlier `AllowListHostFilter` attempt filtered out the only node
-    /// and broke all connectivity (t_ec740b8f). The full topology stays connected
-    /// (`known_nodes` + `PoolSize(1)`); the pinned node forwards writes as the
-    /// Accord coordinator, so cross-shard fan-out still happens.
+    /// Pinning uses the **live node object** discovered by a short-lived probe
+    /// session — not an address and not a host-ID lookup in the freshly-created
+    /// session. A node's advertised address differs from the port-mapped contact
+    /// point in Docker/Fly, and a new session can execute before its topology
+    /// refresh has populated a host-ID map. Either alternative can leave the
+    /// load-balancing policy with no coordinator. The full topology stays
+    /// connected (`known_nodes` + `PoolSize(1)`); the pinned node forwards writes
+    /// as the Accord coordinator, so cross-shard fan-out still happens.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         assert!(
             !contact_points.is_empty(),
@@ -52,13 +53,13 @@ impl ScyllaCqlSession {
             .get_nodes_info()
             .iter()
             .min_by_key(|n| n.host_id) // deterministic across topology refreshes
-            .map(|n| n.host_id)
+            .cloned()
             .context("cluster reports no known nodes to pin to")?;
         drop(probe);
 
         // Phase 2 — pin all queries to that node (one connection ⇒ transaction
         // affinity), keeping the full topology connected for reachability.
-        let policy = SingleTargetLoadBalancingPolicy::new(NodeIdentifier::HostId(target), None);
+        let policy = SingleTargetLoadBalancingPolicy::new(NodeIdentifier::Node(target), None);
         let profile = ExecutionProfile::builder()
             .load_balancing_policy(policy)
             .build();

@@ -1,13 +1,13 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-07-16
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
   history, and checks it for linearizability and membership-invariant
-  violations. Docker Compose is the wired cluster backend; Firecracker and
-  Fly.io primitives exist but are not yet wired into the run path. A
+  violations. Docker Compose and caller-provisioned live clusters are wired
+  backends; Firecracker primitives remain unwired. A
   ferrosa-sim-backed endurance run is the headline acceptance gate when Fly.io
   is unavailable. Leaf crate — nothing depends on it.
 ---
@@ -32,15 +32,15 @@ SSH (`russh`) for fault injection, and to the simulator via `ferrosa-sim`.
 
 | Module | Responsibility |
 |--------|----------------|
-| `orchestrator` (`src/orchestrator.rs`) | Run loop: provision → iterate combinations → record → check → `RunReport`. Resolves real-cluster vs `MockCqlSession`. |
+| `orchestrator` (`src/orchestrator.rs`) | Run loop: provision/accept external contacts → iterate selected combinations → record → check → `RunReport`. Rejects a multi-DC run without live contact points and runs a named nemesis concurrently with its workload. |
 | `config` (`src/config.rs`) | `Tier`, `Topology` (T1–T4), `Concurrency`, `RunConfig` and their tier-driven resolution. |
 | `workload` (`src/workload/`) | `Workload` trait + registry: `register`, `bank`, 16 `lwt-*`, `forward-probe`, `membership-churn`, `late-join-flood`. |
-| `chaos` (`src/chaos/`) | `NemesisAction` trait + registry: network, process, clock, disk, WAN/cross-DC, composed nemeses. Inject/heal via SSH (`iptables`/`tc`/signals). |
+| `chaos` (`src/chaos/`) | `NemesisAction` trait + registry: network, process, clock, disk, WAN/cross-DC, composed nemeses. WAN actions execute via SSH, Fly SSH, or `container_runtime() exec` (`iptables`/`tc`/signals). |
 | `checker` (`src/checker/`) | Linearizability (native WGL backtracking), membership invariants, Knossos (subprocess), Elle (stub). |
 | `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection); `ContainerDriver` (per-language Docker images, not in default tiers). |
-| `docker_provision` (`src/docker_provision.rs`) | **Wired** cluster backend: Docker Compose 3-node cluster, `container_runtime()` (docker→podman). |
+| `docker_provision` (`src/docker_provision.rs`) | **Wired** backend: managed Docker Compose for up to three nodes and non-owning external contact points for T3/Fly. `container_runtime()` selects a usable Docker/Podman daemon, not merely an installed CLI. |
 | `firecracker` / `cluster` | microVM provisioning primitives — present but **not wired** into the run path. |
-| `flyio` (`src/flyio.rs`) | Fly.io machine management for T3/T4 — present but **not wired**. |
+| `flyio` (`src/flyio.rs`) | Fly.io machine management primitives. A caller-provisioned Fly T3/T4 becomes a real run via `FERROSA_TEST_CLUSTER_NODES`; `FERROSA_JEPSEN_FLY_APP` plus ordered machine IDs selects Fly-SSH WAN faults. |
 | `endurance` / `endurance_sim` | `ferrosa-sim`-backed sim-equivalent 24h endurance run (W8.9, ADR-016). |
 | `history` (`src/history.rs`) | `Operation`/`Op`/`OpResult`, JSONL I/O, per-key filtering. |
 | `report` / `alert` / `archive` / `ssh` / `cql_session` / `test_env` | Reporting (JSON/HTML/timeline/anomaly/comparison), webhook alerting, run archiving, SSH client, CQL session, env helpers. |
@@ -50,25 +50,34 @@ SSH (`russh`) for fault injection, and to the simulator via `ferrosa-sim`.
 
 ```mermaid
 flowchart TD
-    CLI["ferrosa-jepsen run --tier T"] --> RESOLVE["config: resolve topologies x concurrency x drivers x nemeses x workloads"]
-    RESOLVE --> PROV{"FERROSA_TEST_CONTAINERS set and nodes &lt;= 3?"}
+    CLI["ferrosa-jepsen run --tier T"] --> RESOLVE["config: resolve selected topology, driver, nemesis, workload"]
+    RESOLVE --> EXTERNAL{"FERROSA_TEST_CLUSTER_NODES set?"}
+    EXTERNAL -- yes --> LIVE["non-owning live CQL contacts"]
+    EXTERNAL -- no --> PROV{"containers set and nodes &lt;= 3?"}
     PROV -- yes --> DOCKER["provision_docker_cluster (Docker Compose)"]
-    PROV -- no --> MOCK["MockCqlSession (in-process, no I/O)"]
-    DOCKER --> COMB["run_single_combination"]
+    PROV -- no --> REJECT{"multi-DC?"}
+    REJECT -- yes --> ERROR["fail loud: live cluster required"]
+    REJECT -- no --> MOCK["MockCqlSession (in-process, no I/O)"]
+    LIVE --> COMB["run_single_combination"]
+    DOCKER --> COMB
     MOCK --> COMB
     COMB --> WL["workload.setup + run -> HistoryRecorder"]
-    WL --> NEM["nemesis inject/heal over SSH"]
-    NEM --> HIST["history -> JSONL"]
+    COMB --> NEM["selected nemesis inject -> hold -> heal"]
+    WL --> HIST["history -> JSONL"]
+    NEM --> HIST
     HIST --> LIN["check_linearizability (native WGL)"]
     HIST --> INV["workload.check_invariant"]
     LIN --> REP["RunReport (results.json + report.html)"]
     INV --> REP
 ```
 
-The orchestrator currently provisions via Docker only; when no container
-runtime is requested it runs every combination against the in-process
-`MockCqlSession`, so unit-level combinations execute without infrastructure.
-Firecracker and Fly.io paths are not reached from this loop.
+The orchestrator accepts `FERROSA_TEST_CLUSTER_NODES` before considering
+managed provisioning. This makes a six-node T3 compose stack or Fly topology a
+real CQL run without giving the harness ownership of its lifecycle. T3 refuses
+to silently fall back to `MockCqlSession`. The nightly T3 compose stack maps
+every CQL port to the host and advertises that mapped address back to the
+driver; its nodes have `NET_ADMIN` because the selected WAN nemesis applies
+`iptables` and `tc` inside them. Firecracker provisioning remains unwired.
 
 ## Checker stack
 
@@ -103,6 +112,13 @@ written history; Elle is type-only (`elle_result = None`).
 4. **Sim endurance is a real gate.** The tri-DC endurance sim must report zero
    conservation failures, zero learner divergence, and final convergence — it
    runs under default `cargo test`, not behind live-infra gating.
+5. **A named fault is not a label.** Non-`noop` runs require a real cluster and
+   invoke the selected nemesis, then heal it even when the concurrent workload
+   fails. A missing executor or unsuccessful fault command fails the run.
+6. **WAN filters match the address family.** Docker T3 bridge addresses use
+   `iptables`; Fly private IPv6 addresses use `ip6tables`. The partition action
+   selects the filter binary from the target address rather than applying a
+   no-op/invalid IPv4 rule to a Fly node.
 
 ## Position in the dependency graph
 
