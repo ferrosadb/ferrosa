@@ -38,9 +38,19 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
   `full` (25+ incl. WAN + composed).
 - **Checkers** (`checker/`):
   - **Linearizability** — a native Rust WGL-style backtracking checker
-    (`check_linearizability`) with a register model (read/write/CAS/serial-read),
-    a 100k-node search bound, and minimal counterexamples. This is the checker
-    that actually runs in unit tests and CI.
+    (`check_linearizability`) with a single-value register model
+    (read/write/CAS/serial-read), a 100k-node search bound, and minimal
+    counterexamples. This is the checker that actually runs in unit tests and CI.
+    It only applies to workloads whose history is a set of single-key register
+    ops: a workload opts in/out via `Workload::register_linearizable()` (default
+    `true`). Transactional workloads such as `bank` return `false` — their writes
+    record transfer *deltas* and their reads are multi-key snapshots
+    (`CurrentValues`), which a single-value register model cannot represent, so
+    the orchestrator would otherwise false-report every conserved bank run as
+    non-linearizable. Bank's safety is judged by conservation
+    (`check_invariant`); strict serializability of the Accord path is a separate
+    (Elle) check. Per-key linearizability is deliberately *not* asserted over the
+    eventually-consistent base.
   - **Membership invariants** (`checker/membership.rs`) — structural checks
     I-06–I-10, I-13 over per-node membership snapshots.
   - **Knossos** (`checker/knossos.rs`) — shells out to Clojure/`lein`; only runs
@@ -66,7 +76,10 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     Fly-SSH nemesis transport for T3/T4. Set `FERROSA_JEPSEN_FLY_APP` plus
     ordered `FERROSA_JEPSEN_FLY_MACHINE_IDS` to execute WAN chaos on real Fly
     machines; the same WAN actions use `container_runtime exec` for the local
-    T3 compose topology.
+    T3 compose topology. In container mode the DC-partition nemesis targets each
+    node's **WAN-network IP** (resolved via `container_runtime inspect`), not the
+    host-mapped `localhost` CQL contacts — otherwise the injected `iptables`
+    DROP rules would hit loopback and silently sever nothing.
 - **Endurance sim** (`endurance_sim.rs`) — the **sim-equivalent endurance run**
   (W8.9, ADR-016). Drives `ferrosa_sim::multi_dc::DualDcBankSim` (voters +
   per-DC learners) over a 24-simulated-hour horizon with periodic rolling-window
@@ -86,7 +99,7 @@ ferrosa-jepsen report list                       # (report subcommands are stubs
 
 ## Tests
 
-- **232** in-crate unit tests (checker correctness, registries, config
+- **233** in-crate unit tests (checker correctness, registries, config
   resolution, the endurance-sim smoke + tri-DC headline runs, etc.) — these run
   under default `cargo test -p ferrosa-jepsen`.
 - **30** integration test functions across `tests/`. The live-infra ones
