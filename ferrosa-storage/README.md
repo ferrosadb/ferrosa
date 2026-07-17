@@ -108,6 +108,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable
   postings (including phonetic postings) instead of replacing the live index.
+  `update_schema` (the ALTER TABLE apply) remaps every positional index
+  declaration through the old schema's column name, because adding a column
+  that sorts before an indexed column shifts the indexed column's cell
+  ordinal (ST-16); a declaration that cannot be mapped fails loud instead of
+  silently indexing the wrong cell.
   Boot-time
   `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
   (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
