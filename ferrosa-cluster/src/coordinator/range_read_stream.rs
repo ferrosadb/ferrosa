@@ -918,6 +918,35 @@ async fn run_fragment_merge_nway<S>(
 ) where
     S: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
 {
+    // The merge parks in `FragmentCursor::ensure_peeked` (`stream.next().await`)
+    // whenever a source has neither yielded its next fragment nor closed — which
+    // is exactly what a still-scanning remote producer does after it emits its
+    // flow-control window and parks between batches. In that state the merge
+    // only ever observes consumer abandonment through `out_tx.send` (via
+    // `send_or_abort` / `try_or_forward`), and it never reaches a send. A page
+    // abandoned while the merge is parked on a stalled source would therefore
+    // deadlock: the merge waits on `remote_rx.recv()` while that replica's
+    // forwarder waits on `remote_tx.closed()`, which only fires once the merge
+    // drops its cursor. Racing the whole merge against `out_tx.closed()` breaks
+    // the wait — when the consumer drops the merged stream this returns, the
+    // cursors (and their `remote_rx`) drop, and each forwarder observes
+    // `tx.closed()` and fires `RangeReadStreamCancel` (t_3fc6be3c). `closed()`
+    // stays pending for the whole scan while the consumer is reading, so this is
+    // inert on the normal path.
+    tokio::select! {
+        biased;
+        _ = out_tx.closed() => {}
+        _ = run_fragment_merge_nway_inner(cursors, k, &out_tx) => {}
+    }
+}
+
+async fn run_fragment_merge_nway_inner<S>(
+    cursors: Vec<FragmentCursor<S>>,
+    k: usize,
+    out_tx: &mpsc::Sender<crate::error::Result<Partition>>,
+) where
+    S: futures::Stream<Item = Result<Partition, ClusterError>> + Unpin,
+{
     macro_rules! send_or_abort {
         ($item:expr) => {
             if out_tx.send($item).await.is_err() {

@@ -99,7 +99,12 @@ for the mermaid diagrams.
 6. **Table registration is compare-and-install.** A schema replay that loses
    the table-map install race merges declarations into the already-live store;
    it cannot replace active memtable rows or index postings.
-7. **Malformed data is quarantined, not dropped or crashed on.** A row that
+7. **Schema updates remap index ordinals.** Regular columns are ordered by
+   name, so `ALTER TABLE ADD` can shift an indexed column's cell ordinal;
+   `update_schema` remaps every positional index declaration (scalar,
+   full-text, vector, filtered-predicate clauses) through the old schema's
+   column name before swapping in the new schema (ST-16).
+8. **Malformed data is quarantined, not dropped or crashed on.** A row that
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`
    increments — non-zero in steady state is an alert.
