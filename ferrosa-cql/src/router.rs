@@ -1878,6 +1878,108 @@ fn lwt_condition_columns(
     Ok(cols)
 }
 
+/// Execute a linearizable SELECT (a point read issued at SERIAL/LOCAL_SERIAL) by
+/// reading this node's Accord-applied local state at a read timestamp, after
+/// dep-waiting for conflicting committed writes to apply.
+///
+/// Why a local read is the linearization point: the serving node is a replica for
+/// the key (RF includes it) and applies every transaction it coordinates to its
+/// LOCAL engine synchronously before COMMIT returns (`AccordCoordinatorDriver`
+/// Phase 5). For writes coordinated by other nodes it is a follower replica that
+/// applies via the Apply broadcast, so we first `await_conflicting_deps_applied`
+/// until every committed txn ordered before our read timestamp has landed locally,
+/// then read. That read observes exactly the committed prefix at the timestamp.
+///
+/// This is what the tunable-CL path cannot guarantee: cluster reads use
+/// `default_cl = ONE` and can land on a replica that has not yet applied the
+/// just-committed write, which is why single-threaded reads returned an empty list
+/// for a key with committed appends (the read-visibility bug this fixes).
+///
+/// Fail loud, never a silent stale read: a non-point-read is rejected `Invalid` (a
+/// linearizable read needs a full partition-key equality); missing Accord wiring
+/// (pre-formation/standalone) and a dep-wait timeout both return `ServerError`.
+async fn route_accord_read(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    s: &SelectStatement,
+) -> Result<RouteResult, CqlError> {
+    let ks = s
+        .keyspace
+        .as_deref()
+        .or(ctx.current_keyspace.as_deref())
+        .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
+    let snap = state.schema.snapshot();
+    let table_meta = snap
+        .tables
+        .get(&(ks.to_string(), s.table.clone()))
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{} not found", s.table)))?;
+
+    // A linearizable read needs a single-partition point key. Reject anything else
+    // loudly rather than serve a non-linearizable scan under SERIAL.
+    let pk_values = extract_pk_values(
+        &s.where_clauses,
+        &table_meta.partition_key,
+        table_meta,
+        ks,
+        &state.schema,
+    )
+    .map_err(|_| {
+        CqlError::Invalid(
+            "SERIAL/LOCAL_SERIAL SELECT requires a full partition-key equality \
+             (single-partition point read)"
+                .into(),
+        )
+    })?;
+    let pk_types: Vec<CqlType> = table_meta
+        .partition_key
+        .iter()
+        .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
+    let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
+
+    // Cluster-mode Accord wiring is required; fail loud otherwise (p0-03 policy).
+    let clock = state.accord_clock.clone().ok_or_else(|| {
+        CqlError::ServerError(
+            "linearizable SELECT requires cluster mode (Accord clock unwired)".into(),
+        )
+    })?;
+    let sm = state.accord_state.load_full().ok_or_else(|| {
+        CqlError::ServerError(
+            "linearizable SELECT requires cluster mode (Accord state unpublished)".into(),
+        )
+    })?;
+
+    // Linearization point: read at `t`, but first wait until every committed
+    // conflicting txn ordered before `t` for this key has applied locally. The
+    // Accord conflict key is the partition-key bytes (matching the write path's
+    // `TransactionWrite.key`).
+    let t = clock.now();
+    if !ferrosa_cluster::accord::await_conflicting_deps_applied(
+        &sm,
+        decorated_key.key.as_bytes(),
+        t,
+    )
+    .await
+    {
+        return Err(CqlError::ServerError(
+            "linearizable SELECT dep-wait timed out waiting for conflicting writes to apply".into(),
+        ));
+    }
+
+    // Read the coordinator's own applied state (it is a replica for the key).
+    let rows = state
+        .engine
+        .read(&table_id, &decorated_key)
+        .map_err(|e| CqlError::ServerError(format!("linearizable local read failed: {e}")))?
+        .map(|p| p.rows)
+        .unwrap_or_default();
+
+    let frame = cdc_event_to_result_frame(state.schema.as_ref(), ks, s, decorated_key, rows)?
+        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{} not found", s.table)))?;
+    Ok(RouteResult::Result(frame))
+}
+
 /// Route a LWT statement through the Accord consensus protocol.
 ///
 /// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
@@ -2220,6 +2322,11 @@ pub async fn route(
             // silently falling through to a non-linearizable local path.
             match (&state.peer_manager, &state.accord_clock) {
                 (Some(peers), Some(clock)) => {
+                    // A read-only SELECT takes the linearizable-read path (read at a
+                    // timestamp after dep-wait); LWT writes take the write path.
+                    if let Statement::Select(sel) = &stmt {
+                        return route_accord_read(state, ctx, sel).await;
+                    }
                     return route_lwt_via_accord(state, ctx, &stmt, peers.clone(), clock.clone())
                         .await;
                 }
@@ -13597,6 +13704,75 @@ mod tests {
             RouteResult::Result(b) => assert_eq!(&b[0..4], &0x0002i32.to_be_bytes()),
             _ => panic!("expected Result"),
         }
+    }
+
+    /// A linearizable SELECT (SERIAL) needs a single-partition point key: a
+    /// range/scan cannot be served linearizably, so `route_accord_read` rejects it
+    /// loudly rather than fall back to a non-linearizable scan.
+    #[tokio::test]
+    async fn accord_read_rejects_non_point_read() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::Serial,
+            serial_consistency: Some(ConsistencyLevel::Serial),
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (id int PRIMARY KEY, v int)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+        // No partition-key equality → not a point read → Invalid.
+        let Statement::Select(scan) = crate::parser::parse("SELECT * FROM ks.t").unwrap() else {
+            panic!("expected SELECT");
+        };
+        let res = route_accord_read(&state, &ctx, &scan).await;
+        assert!(
+            matches!(res, Err(CqlError::Invalid(_))),
+            "range SELECT at SERIAL must be rejected (needs a partition-key equality)"
+        );
+    }
+
+    /// Standalone / pre-formation has no Accord clock or published state. A
+    /// linearizable SELECT must fail loud there — never silently serve a
+    /// non-linearizable local read.
+    #[tokio::test]
+    async fn accord_read_fails_loud_without_cluster_wiring() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::Serial,
+            serial_consistency: Some(ConsistencyLevel::Serial),
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (id int PRIMARY KEY, v int)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+        let Statement::Select(point) =
+            crate::parser::parse("SELECT * FROM ks.t WHERE id = 1").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let res = route_accord_read(&state, &ctx, &point).await;
+        assert!(
+            matches!(res, Err(CqlError::ServerError(_))),
+            "linearizable SELECT without Accord wiring must fail loud, not fake a stale read"
+        );
     }
 
     /// The CDC change-event encoder must produce the *same* RESULT frame as the

@@ -2106,7 +2106,13 @@ fn build_request_context<'a>(
         auth: auth_context.as_ref().unwrap(),
         current_keyspace,
         consistency,
-        serial_consistency: None,
+        // A CQL client requests a linearizable operation by issuing it at a regular
+        // consistency of SERIAL / LOCAL_SERIAL (there is no separate serial-read
+        // verb). Surface that as the serial-consistency signal so `route_decision`
+        // sends the statement through Accord. Without this a SERIAL SELECT fell
+        // through to a tunable-CL read (default ONE) and could return a state older
+        // than an already-committed Accord write (the read-visibility bug).
+        serial_consistency: crate::accord_router::effective_serial_consistency(consistency, None),
         paging,
         client_address: peer.to_string(),
         protocol_version,
