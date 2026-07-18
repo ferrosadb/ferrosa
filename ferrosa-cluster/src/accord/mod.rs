@@ -62,6 +62,9 @@ pub use durability::{DurabilityHealth, DurabilityService, ExclusiveSyncPoint, Sh
 pub use electorate::{Electorate, ElectorateError, JoinGate, MemberStatus, ProtocolHistory};
 pub use epoch::{EpochDecision, EpochMessage, EpochTracker, MessageKind, QuorumEpochCheck};
 pub use epoch_drain::{DrainCheckResult, EpochDrain, TxnDrainStatus};
+pub use handlers::{
+    empty_accord_state_slot, publish_accord_state, AccordHandler, AccordState, AccordStateSlot,
+};
 pub use leaseholder::{LeaseAssignment, LeaseError, LeaseholderManager};
 pub use linearizable_read::{LinearizableReadManager, ReadError, ReadResult};
 pub use metrics::AccordMetrics;

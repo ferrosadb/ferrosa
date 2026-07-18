@@ -3365,6 +3365,7 @@ mod tests {
                     auth_warn: false,
                     peer_manager: None,
                     accord_clock: None,
+                    accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
                 }),
                 prepared_cache: Arc::new(PreparedCache::new(1024 * 1024)),
                 connection_tracker: Arc::new(ConnectionTracker::new()),

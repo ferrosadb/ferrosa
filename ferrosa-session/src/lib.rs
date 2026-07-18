@@ -55,6 +55,13 @@ pub struct SessionCore {
     /// Hybrid logical clock for monotone transaction timestamps. `None` when
     /// `peer_manager` is `None`.
     pub accord_clock: Option<Arc<HybridLogicalClock>>,
+    /// Shared slot holding this node's live `AccordState`, filled by the cluster
+    /// controller during formation. The transaction committer reads it so the
+    /// coordinator can vote its own PreAccept locally (a node is never in its
+    /// own peer map); without it a sole-replica `BEGIN…COMMIT` fails "Accord
+    /// quorum unavailable". Empty in standalone/tests — use
+    /// [`ferrosa_cluster::accord::empty_accord_state_slot`].
+    pub accord_state: ferrosa_cluster::accord::AccordStateSlot,
 }
 
 impl SessionCore {
@@ -101,10 +108,14 @@ impl SessionCore {
         let applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
             self.engine.clone(),
         ));
+        // Attach the node's live Accord state (published by the controller at
+        // formation) so a replica-coordinator votes its own PreAccept locally.
+        // An empty slot (standalone/pre-formation) leaves remote-only votes.
         Some(Arc::new(
             ferrosa_cluster::accord::AccordTransactionCommitter::new(
                 node_id, clock, peers, applier, resolve,
-            ),
+            )
+            .with_local_accord_state_slot(&self.accord_state),
         ))
     }
 }

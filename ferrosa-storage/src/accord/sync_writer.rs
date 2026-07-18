@@ -81,6 +81,14 @@ impl FileSyncWriter {
             "parent directory must exist: {:?}",
             path.parent()
         );
+        // Fail loud: `path` is the append-only log FILE. If a caller hands us a
+        // directory (the accord dir itself), every `write_and_sync` would open a
+        // directory as an append file (EISDIR) and silently fail forever, which
+        // makes every Accord PreAccept return `None` → "quorum unavailable".
+        assert!(
+            !path.is_dir(),
+            "FileSyncWriter path must be a file, not a directory: {path:?}"
+        );
         Self { path }
     }
 }
@@ -188,6 +196,38 @@ impl SyncWriter for MockSyncWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `FileSyncWriter` must persist to a real FILE inside the accord dir and
+    /// return `Ok` — the path is a log file, never the directory itself. This is
+    /// the regression for the production bug where `transition_to_cluster` passed
+    /// the accord *directory* to `FileSyncWriter`: every `write_and_sync` then
+    /// opened a directory as an append file (EISDIR) → `FsyncFailed` → every
+    /// Accord `handle_preaccept` returned `SmResponse::None` → every transaction
+    /// failed "Accord quorum unavailable".
+    #[test]
+    fn file_sync_writer_persists_to_a_file_not_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("protocol.log");
+        let writer = FileSyncWriter::new(log_path.clone());
+
+        let result = writer.write_and_sync(b"PreAccepted:1:2");
+        assert!(
+            result.is_ok(),
+            "write_and_sync to a real file must succeed, got {result:?}"
+        );
+        let persisted = std::fs::read(&log_path).expect("log file must exist");
+        assert_eq!(persisted, b"PreAccepted:1:2");
+    }
+
+    /// Fail loud: constructing a `FileSyncWriter` on an existing DIRECTORY is a
+    /// caller bug (the write path would silently EISDIR forever). Reject it at
+    /// construction instead of failing every fsync at runtime.
+    #[test]
+    #[should_panic(expected = "must be a file, not a directory")]
+    fn file_sync_writer_rejects_a_directory_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = FileSyncWriter::new(dir.path().to_path_buf());
+    }
 
     /// Test 1: Verify that write happens before fsync in the call ordering.
     ///
