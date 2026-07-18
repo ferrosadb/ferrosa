@@ -1861,8 +1861,13 @@ async fn commit_transaction(
         }
     };
     match txn.commit(committer.as_ref()).await {
-        Ok(CommitOutcome::Committed) => Ok(RouteResult::Result(crate::result::encode_void())),
-        Ok(CommitOutcome::Aborted { reason }) => {
+        // A write-only transaction acks with void. Read-in-transaction (returning
+        // the buffered SELECT's rows from COMMIT) is wired in the
+        // SELECT-in-transaction slice; a write-only COMMIT never carries reads.
+        Ok((CommitOutcome::Committed, _reads)) => {
+            Ok(RouteResult::Result(crate::result::encode_void()))
+        }
+        Ok((CommitOutcome::Aborted { reason }, _)) => {
             Err(CqlError::Invalid(format!("transaction aborted: {reason}")))
         }
         Err(e) => Err(e),
