@@ -985,18 +985,29 @@ impl AccordCoordinatorDriver {
         let self_is_replica =
             self.self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self.self_id);
         let has_remote_replica = self.replica_ids.iter().any(|&p| p != self.self_id);
-        // Process our OWN PreAccept locally ONLY when we are the sole replica
-        // (RF=1, no remote to hear from) — the deployed "Accord quorum unavailable"
-        // bug: a node is never in its own peer map, so a self-send fails and the
-        // sole replica collects zero votes. When remote replicas exist we leave the
-        // whole flow to the fan-out below (self filtered out): the remotes register
-        // the txn in their conflict indexes and vote, which is what lets the
-        // ReadVote dep-wait serialize concurrent conditional txns (INSERT IF NOT
-        // EXISTS / LWT). Touching our own local state machine here would instead
-        // make a racing coordinator's PreAccept observe the conflict and refuse the
-        // fast path, and `fast_quorum_size` can be 1 so our lone local vote would
-        // fast-path and skip the fan-out entirely — both break LWT linearizability.
-        if self_is_replica && !self.coordinator.is_leaseholder && !has_remote_replica {
+        // Process our OWN PreAccept locally when we are a replica — a node is never
+        // in its own peer map, so a self-send fails "unknown peer" and loses the
+        // coordinator's vote. The coordinator is a replica in the common case (the
+        // node serving the request), so this is the norm, not an edge case.
+        //
+        // The self-vote is required for LIVENESS whenever `fast_quorum_size(rf)`
+        // equals the full replica count (RF≥3): the coordinator gathers only the
+        // RF-1 REMOTE votes, so if they all AGREE the driver can neither fast-commit
+        // (needs all RF, i.e. the coordinator's own vote too) nor slow-path (no
+        // disagreement) — it stalls at `Pending` → "Accord quorum unavailable". The
+        // self-vote supplies the missing RF-th vote.
+        //
+        // The one case we must NOT self-vote is when it would SHORT-CIRCUIT the
+        // remote fan-out: at RF=2, `fast_quorum_size(2) == 1`, so a lone local vote
+        // fast-paths and skips telling the remote replica — which breaks the LWT
+        // ReadVote dep-wait serialization (the remote must register the txn to
+        // serialize concurrent INSERT IF NOT EXISTS). RF=1 has no remote to skip, so
+        // the sole-replica self-vote is always correct. Hence: self-vote when we are
+        // the sole replica OR when `fast_quorum_size(rf) > 1` (RF≥3), where the
+        // self-vote can never reach quorum alone and the fan-out always runs.
+        let self_vote_cannot_short_circuit =
+            !has_remote_replica || fast_quorum_size(self.coordinator.rf) > 1;
+        if self_is_replica && !self.coordinator.is_leaseholder && self_vote_cannot_short_circuit {
             if let Some(local_sm) = &self.local_accord_state {
                 let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
                 let resp =
@@ -2771,6 +2782,94 @@ mod tests {
         assert!(
             targets.contains(&remote1) && targets.contains(&remote2),
             "coordinator must fan Accept out to BOTH remote replicas; sent to {targets:?}"
+        );
+    }
+
+    /// A transport whose remote replicas AGREE with the coordinator: each echoes
+    /// back the coordinator's proposed `t0` with no dependencies, so the fast path
+    /// hinges entirely on whether the coordinator counts its OWN vote. Records
+    /// every peer that received a PreAccept.
+    struct AgreeingPreAcceptTransport {
+        preaccept_targets: parking_lot::Mutex<Vec<uuid::Uuid>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for AgreeingPreAcceptTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{PreAcceptOkPayload, PreAcceptPayload};
+            match msg {
+                Message::AccordPreAccept(b) => {
+                    self.preaccept_targets.lock().push(host_id);
+                    // Echo the coordinator's own t0 so this replica genuinely agrees.
+                    let pa: PreAcceptPayload = bincode::deserialize(&b).unwrap();
+                    let payload = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t: pa.t0,
+                        deps: vec![],
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
+                }
+                // Commit / Apply / anything else: ack.
+                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+            }
+        }
+    }
+
+    /// Regression for the RF≥3 stall: when the coordinator is a replica and every
+    /// REMOTE replica agrees on the PreAccept, the driver reaches `fast_quorum` (=RF)
+    /// only if the coordinator counts its OWN PreAccept vote. Without it the RF-1
+    /// remote votes can neither fast-commit (need all RF) nor slow-path (no
+    /// disagreement), so the driver stalls at `Pending` → QuorumUnavailable. This is
+    /// the exact live failure: `decision=Pending pa_votes=2 rf=3` on every commit.
+    #[tokio::test]
+    async fn preaccept_self_vote_reaches_fast_quorum_rf3() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let self_host = uuid::Uuid::from_u128(0xC0DE);
+        let remote1 = uuid::Uuid::from_u128(0x1111);
+        let remote2 = uuid::Uuid::from_u128(0x2222);
+        let self_node = node_id_of(self_host);
+
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(self_node, Arc::new(MockSyncWriter::new())),
+        ));
+
+        let transport = Arc::new(AgreeingPreAcceptTransport {
+            preaccept_targets: parking_lot::Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(self_node, 0);
+
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            self_node,
+            vec![self_host, remote1, remote2], // RF=3, coordinator is a replica
+            transport.clone(),
+            false, // not leaseholder
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
+
+        let result = driver.run_transaction().await;
+        assert!(
+            result.is_ok(),
+            "RF=3 coordinator-is-replica txn with all remotes AGREEING must fast-commit \
+             via the coordinator's OWN PreAccept vote (fast_quorum=3), not stall at \
+             Pending; got {result:?}"
+        );
+
+        let targets = transport.preaccept_targets.lock();
+        assert!(
+            !targets.contains(&self_host),
+            "coordinator must never send PreAccept to itself; sent to {targets:?}"
         );
     }
 
