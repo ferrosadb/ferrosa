@@ -228,6 +228,15 @@ impl PeerEventListener for ModeController {
             track_connected_peer(&mut peers, host_id, addr, super::MAX_CONNECTED_PEERS);
         }
 
+        // Register this peer's host_id in the raft network factory's node_map so
+        // the leader can route raft RPCs to it. Idempotent, and a no-op before
+        // cluster formation. Critically this covers an already-committed member
+        // that reconnects AFTER the leader restarted: no `JoinNode` fires (it is
+        // already a member) and it may be absent from the leader's freshly
+        // recovered formation map, so without registering here every raft RPC to
+        // it stays "registration pending" forever and the leader churns.
+        self.register_peer_in_raft_node_map(host_id);
+
         // Hold the transition guard across mode-check-and-transition to prevent
         // two simultaneous peer connections from both triggering transition_to_pair.
         let guard_start = std::time::Instant::now();
