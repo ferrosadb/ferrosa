@@ -971,49 +971,95 @@ impl AccordCoordinatorDriver {
             Message::AccordPreAcceptV2(Bytes::from(pa_bytes))
         };
 
-        // Fanout to all replicas in parallel.
-        let futs: Vec<_> = self
-            .replica_ids
-            .iter()
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = pa_msg.clone();
-                async move {
-                    peers
-                        .send(peer_id, msg, Lane::Data)
-                        .await
-                        .map(|resp| (peer_id, resp))
-                }
-            })
-            .collect();
-
-        let responses = futures::future::join_all(futs).await;
-
         let mut decision = CoordinatorDecision::Pending;
-        for result in &responses {
-            match result {
-                Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
-                    let ok: PreAcceptOkPayload = bincode::deserialize(b)
-                        .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
-                    let resp = PreAcceptResponse {
-                        from: ok.from,
-                        t: ok.t,
-                        deps: ok.deps,
-                    };
-                    decision = self.coordinator.handle_preaccept_ok(resp);
-                    if decision != CoordinatorDecision::Pending {
-                        break;
+
+        // The coordinator is itself a replica for these keys in the common case
+        // (the node serving the request is a replica). It must process its OWN
+        // PreAccept LOCALLY — registering the txn under every key and computing
+        // real deps, exactly as a remote replica's handler does — and MUST NOT
+        // send PreAccept to itself: a node is never in its own peer map, so the
+        // self-send fails "unknown peer" and (at RF=1) loses the only vote,
+        // stalling the fast-path at `Pending` → "Accord quorum unavailable". This
+        // mirrors the self-handling the Commit/Apply phases already do
+        // (`record_node_ack(self_id)` + filtering self from the fan-out).
+        let self_is_replica =
+            self.self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self.self_id);
+        let has_remote_replica = self.replica_ids.iter().any(|&p| p != self.self_id);
+        // Process our OWN PreAccept locally ONLY when we are the sole replica
+        // (RF=1, no remote to hear from) — the deployed "Accord quorum unavailable"
+        // bug: a node is never in its own peer map, so a self-send fails and the
+        // sole replica collects zero votes. When remote replicas exist we leave the
+        // whole flow to the fan-out below (self filtered out): the remotes register
+        // the txn in their conflict indexes and vote, which is what lets the
+        // ReadVote dep-wait serialize concurrent conditional txns (INSERT IF NOT
+        // EXISTS / LWT). Touching our own local state machine here would instead
+        // make a racing coordinator's PreAccept observe the conflict and refuse the
+        // fast path, and `fast_quorum_size` can be 1 so our lone local vote would
+        // fast-path and skip the fan-out entirely — both break LWT linearizability.
+        if self_is_replica && !self.coordinator.is_leaseholder && !has_remote_replica {
+            if let Some(local_sm) = &self.local_accord_state {
+                let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
+                let resp =
+                    local_sm
+                        .lock()
+                        .handle_preaccept_multi(txn_id, t0, &keys, BallotNumber(0), 0);
+                if let crate::accord::state_machine::SmResponse::PreAcceptOK { t, deps, .. } = resp
+                {
+                    decision = self.coordinator.handle_preaccept_ok(PreAcceptResponse {
+                        from: self.coordinator.node_id,
+                        t,
+                        deps,
+                    });
+                }
+            }
+        }
+
+        // Fanout to the REMOTE replicas only (self is handled locally above / by
+        // the leaseholder implicit vote); a self-send would hit "unknown peer".
+        if decision == CoordinatorDecision::Pending {
+            let futs: Vec<_> = self
+                .replica_ids
+                .iter()
+                .filter(|&&peer_id| peer_id != self.self_id)
+                .map(|&peer_id| {
+                    let peers = Arc::clone(&self.peers);
+                    let msg = pa_msg.clone();
+                    async move {
+                        peers
+                            .send(peer_id, msg, Lane::Data)
+                            .await
+                            .map(|resp| (peer_id, resp))
                     }
-                }
-                Ok(_) => {
-                    // Empty or unexpected response — treat as non-vote (skip).
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        txn_id = ?txn_id,
-                        error = %e,
-                        "accord: PreAccept RPC failed (non-fatal, continuing)"
-                    );
+                })
+                .collect();
+
+            let responses = futures::future::join_all(futs).await;
+
+            for result in &responses {
+                match result {
+                    Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
+                        let ok: PreAcceptOkPayload = bincode::deserialize(b)
+                            .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                        let resp = PreAcceptResponse {
+                            from: ok.from,
+                            t: ok.t,
+                            deps: ok.deps,
+                        };
+                        decision = self.coordinator.handle_preaccept_ok(resp);
+                        if decision != CoordinatorDecision::Pending {
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        // Empty or unexpected response — treat as non-vote (skip).
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            txn_id = ?txn_id,
+                            error = %e,
+                            "accord: PreAccept RPC failed (non-fatal, continuing)"
+                        );
+                    }
                 }
             }
         }
@@ -2501,6 +2547,55 @@ mod tests {
             &clock,
             vec![(b"k".to_vec(), b"m".to_vec())],
         )
+    }
+
+    /// Regression for the deployed-Accord failure: the coordinator is itself the
+    /// SOLE replica (RF=1) — the normal production case where the node serving the
+    /// request is a replica for the key. It must process its OWN PreAccept locally
+    /// (via its Accord state machine) and MUST NOT send PreAccept to itself: a node
+    /// is never in its own peer map, so a self-send fails "unknown peer" and, at
+    /// RF=1, loses the only vote — which is why every deployed transaction failed
+    /// "Accord quorum unavailable".
+    #[tokio::test]
+    async fn preaccept_self_is_processed_locally_never_sent_rf1() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let host = uuid::Uuid::from_u128(0xC0DE);
+        let node_id = u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap());
+
+        // The coordinator's own Accord state machine (its local replica).
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(node_id, Arc::new(MockSyncWriter::new())),
+        ));
+
+        // A transport that records every send and never contains self — exactly
+        // like the production PeerManager, which has no entry for the node's own id.
+        let transport = Arc::new(CapturingTransport {
+            sent: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        });
+        let clock = HybridLogicalClock::new(node_id, 0);
+
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            node_id,
+            vec![host], // RF=1: self is the ONLY replica
+            transport.clone(),
+            false, // not leaseholder — mirrors the production committer's flag
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
+
+        let result = driver.run_transaction().await;
+        assert!(
+            result.is_ok(),
+            "RF=1 sole-replica transaction must commit via a local self-vote; got {result:?}"
+        );
+        assert!(
+            !transport.sent.lock().contains_key(&host),
+            "coordinator must never send PreAccept to itself (its id is not in the peer map)"
+        );
     }
 
     /// Two RF=3 shards: A = n[0..3], B = n[3..6].

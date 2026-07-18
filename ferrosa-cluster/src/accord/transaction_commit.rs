@@ -46,6 +46,13 @@ pub struct AccordTransactionCommitter {
     applier: Arc<dyn StorageApplier>,
     /// Per-key replica resolution (wraps `WritePath` + schema in production).
     resolve: ReplicaResolver,
+    /// The coordinator node's own Accord state machine. When the coordinator is
+    /// itself a replica for a transaction's keys (the common case), the driver
+    /// processes its OWN PreAccept against this state — casting a real vote with
+    /// real deps — instead of dialing itself over the network (a node is never in
+    /// its own peer map, so that self-send fails "unknown peer"). `None` falls
+    /// back to remote votes only (used by tests with an external coordinator).
+    local_accord_state: Option<crate::accord::handlers::AccordState>,
 }
 
 impl AccordTransactionCommitter {
@@ -62,7 +69,35 @@ impl AccordTransactionCommitter {
             transport,
             applier,
             resolve,
+            local_accord_state: None,
         }
+    }
+
+    /// Wire the coordinator node's own Accord state machine so a
+    /// replica-coordinator votes on its own PreAccept locally (real deps) instead
+    /// of an unreachable self-send. Production passes the node's shared
+    /// `AccordState`; without it, an RF=1 (sole-replica) transaction cannot reach
+    /// quorum.
+    pub fn with_local_accord_state(mut self, state: crate::accord::handlers::AccordState) -> Self {
+        self.local_accord_state = Some(state);
+        self
+    }
+
+    /// Wire the coordinator node's own Accord state from a shared
+    /// [`AccordStateSlot`](crate::accord::handlers::AccordStateSlot) if it is
+    /// populated. The controller fills the slot with this node's live
+    /// `AccordState` during cluster formation; the session layer, which builds
+    /// the committer, holds only the slot (it is constructed before formation).
+    /// An empty slot leaves the committer on remote-only votes — correct when
+    /// the node is not itself a replica, and the pre-fix behavior otherwise.
+    pub fn with_local_accord_state_slot(
+        mut self,
+        slot: &crate::accord::handlers::AccordStateSlot,
+    ) -> Self {
+        if let Some(state) = slot.load_full() {
+            self.local_accord_state = Some(state);
+        }
+        self
     }
 }
 
@@ -117,6 +152,13 @@ impl TransactionCommitter for AccordTransactionCommitter {
         .with_per_key_replicas(Arc::new(participant_resolver))
         .with_local_applier(self.applier.clone())
         .with_read_predicate(ReadPredicate::Always);
+
+        // When the coordinator is itself a replica, let it vote on its own
+        // PreAccept locally rather than dial itself (unreachable in its own peer
+        // map). Without this a sole-replica transaction never reaches quorum.
+        if let Some(state) = &self.local_accord_state {
+            driver = driver.with_local_accord_state(state.clone());
+        }
 
         match driver.run_transaction().await {
             Ok(_) => Ok(CommitOutcome::Committed),
@@ -318,6 +360,139 @@ mod tests {
             applier_b.applied_data(),
             vec![b"row_b".to_vec()],
             "shard B must apply its key"
+        );
+    }
+
+    #[tokio::test]
+    async fn commits_single_key_when_coordinator_is_sole_replica() {
+        // The request-serving node IS the (sole) replica for the key — the normal
+        // production case. Its own PreAccept must be voted locally, never sent to
+        // itself (a node is not in its own peer map), so the transaction reaches
+        // quorum and applies. This reproduces the deployed "Accord quorum
+        // unavailable" failure at the committer boundary.
+        use crate::accord::handlers::AccordState;
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let host = Uuid::from_u128(0xC0);
+        let node_id = node_id_of(host);
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+
+        // The coordinator's own Accord state machine (protocol state for the
+        // local self-vote); its own storage is applied via the committer's applier.
+        let local_state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
+            node_id,
+            Arc::new(MockSyncWriter::new()),
+        )));
+        let applier = Arc::new(RecordingApplier::new());
+
+        // Sole replica = the coordinator; NoPeersTransport => self is unreachable
+        // over the network, exactly like the production PeerManager.
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            clock,
+            Arc::new(NoPeersTransport),
+            applier.clone(),
+            resolve,
+        )
+        .with_local_accord_state(local_state);
+
+        let outcome = committer
+            .commit(vec![write("ks", b"k", b"v")])
+            .await
+            .expect("sole-replica commit must succeed");
+
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert_eq!(
+            applier.applied_data(),
+            vec![b"v".to_vec()],
+            "the coordinator (sole replica) must apply its own write"
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_replica_commit_uses_local_state_from_populated_slot() {
+        // The session layer wires the committer from an AccordStateSlot the
+        // controller fills at formation. A populated slot must enable the
+        // coordinator's local self-vote exactly as with_local_accord_state does,
+        // so an RF=1 (sole-replica) transaction commits.
+        use crate::accord::handlers::{empty_accord_state_slot, AccordState};
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let host = Uuid::from_u128(0xC1);
+        let node_id = node_id_of(host);
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+
+        let slot = empty_accord_state_slot();
+        let state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
+            node_id,
+            Arc::new(MockSyncWriter::new()),
+        )));
+        slot.store(Some(state));
+
+        let applier = Arc::new(RecordingApplier::new());
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            clock,
+            Arc::new(NoPeersTransport),
+            applier.clone(),
+            resolve,
+        )
+        .with_local_accord_state_slot(&slot);
+
+        let outcome = committer
+            .commit(vec![write("ks", b"k", b"v")])
+            .await
+            .expect("populated slot must enable the sole-replica commit");
+
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert_eq!(
+            applier.applied_data(),
+            vec![b"v".to_vec()],
+            "the coordinator must apply its own write when the slot is populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_replica_commit_fails_without_local_state_slot() {
+        // The empty slot (standalone / pre-formation) leaves no local self-vote:
+        // the sole replica is self, which NoPeersTransport cannot reach — exactly
+        // the deployed "Accord quorum unavailable" failure. This proves the slot
+        // is the causal factor, not incidental to the setup.
+        use crate::accord::handlers::empty_accord_state_slot;
+
+        let host = Uuid::from_u128(0xC2);
+        let node_id = node_id_of(host);
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+
+        let slot = empty_accord_state_slot();
+        let applier = Arc::new(RecordingApplier::new());
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            clock,
+            Arc::new(NoPeersTransport),
+            applier.clone(),
+            resolve,
+        )
+        .with_local_accord_state_slot(&slot);
+
+        let err = committer
+            .commit(vec![write("ks", b"k", b"v")])
+            .await
+            .expect_err("an empty slot must not reach quorum for a self-only replica");
+        let reason = err.reason.to_lowercase();
+        assert!(
+            reason.contains("quorum") || reason.contains("unavailable"),
+            "expected a quorum-unavailable failure, got: {}",
+            err.reason
+        );
+        assert!(
+            applier.applied_data().is_empty(),
+            "nothing must be applied when the commit cannot reach a decision"
         );
     }
 
