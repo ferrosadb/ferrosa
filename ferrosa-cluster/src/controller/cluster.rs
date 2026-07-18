@@ -1185,7 +1185,11 @@ impl ModeController {
                     tmp
                 }
             };
-            let sync_writer = Arc::new(FileSyncWriter::new(accord_dir));
+            // The sync writer needs the append-only log FILE, not the directory.
+            // Passing `accord_dir` here made every write_and_sync open a directory
+            // (EISDIR) → every PreAccept persist failed → SmResponse::None → every
+            // Accord transaction failed "quorum unavailable" (self + remote votes).
+            let sync_writer = Arc::new(FileSyncWriter::new(accord_dir.join("protocol.log")));
             // Wire the live StorageEngine into the Accord state machine so an
             // applied LWT is durably persisted BEFORE the replica returns
             // ApplyOK — closing the production phantom-write gap
