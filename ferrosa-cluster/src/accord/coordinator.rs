@@ -984,9 +984,19 @@ impl AccordCoordinatorDriver {
         // (`record_node_ack(self_id)` + filtering self from the fan-out).
         let self_is_replica =
             self.self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self.self_id);
-        if self_is_replica && !self.coordinator.is_leaseholder {
-            // A leaseholder already cast its implicit vote at construction; a
-            // non-leaseholder replica-coordinator votes here from its local state.
+        let has_remote_replica = self.replica_ids.iter().any(|&p| p != self.self_id);
+        // Process our OWN PreAccept locally ONLY when we are the sole replica
+        // (RF=1, no remote to hear from) — the deployed "Accord quorum unavailable"
+        // bug: a node is never in its own peer map, so a self-send fails and the
+        // sole replica collects zero votes. When remote replicas exist we leave the
+        // whole flow to the fan-out below (self filtered out): the remotes register
+        // the txn in their conflict indexes and vote, which is what lets the
+        // ReadVote dep-wait serialize concurrent conditional txns (INSERT IF NOT
+        // EXISTS / LWT). Touching our own local state machine here would instead
+        // make a racing coordinator's PreAccept observe the conflict and refuse the
+        // fast path, and `fast_quorum_size` can be 1 so our lone local vote would
+        // fast-path and skip the fan-out entirely — both break LWT linearizability.
+        if self_is_replica && !self.coordinator.is_leaseholder && !has_remote_replica {
             if let Some(local_sm) = &self.local_accord_state {
                 let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
                 let resp =
