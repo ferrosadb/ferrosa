@@ -1082,42 +1082,75 @@ impl AccordCoordinatorDriver {
                 let ac_bytes = bincode::serialize(&accept_payload)
                     .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
                 let ac_msg = Message::AccordAccept(Bytes::from(ac_bytes));
-
-                let ac_futs: Vec<_> = self
-                    .replica_ids
-                    .iter()
-                    .map(|&peer_id| {
-                        let peers = Arc::clone(&self.peers);
-                        let msg = ac_msg.clone();
-                        async move { peers.send(peer_id, msg, Lane::Data).await }
-                    })
-                    .collect();
-
-                let ac_responses = futures::future::join_all(ac_futs).await;
+                let accept_deps: Vec<TxnId> = deps.iter().copied().collect();
 
                 let mut ac_decision = CoordinatorDecision::Pending;
-                for result in &ac_responses {
-                    match result {
-                        Ok(Message::AccordAcceptOK(b)) if !b.is_empty() => {
-                            let ok: AcceptOkPayload = bincode::deserialize(b)
-                                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
-                            let resp = AcceptResponse {
-                                from: ok.txn_id.0.node, // node ID embedded in txn_id
+
+                // The coordinator processes its OWN Accept LOCALLY and fans out to
+                // the REMOTE replicas only. A node is never in its own peer map, so
+                // an Accept self-send fails "unknown peer" and loses the
+                // coordinator's own vote — the slow path then needs EVERY remote
+                // replica, so under concurrency (which is what pushes a txn onto
+                // the slow path in the first place) many transactions fail "Accord
+                // quorum unavailable". This mirrors the PreAccept self-vote.
+                let self_is_replica =
+                    self.self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self.self_id);
+                if self_is_replica {
+                    if let Some(local_sm) = &self.local_accord_state {
+                        let resp = local_sm.lock().handle_accept(
+                            txn_id,
+                            t0,
+                            t,
+                            accept_deps.clone(),
+                            BallotNumber(1),
+                        );
+                        if let crate::accord::state_machine::SmResponse::AcceptOK { .. } = resp {
+                            ac_decision = self.coordinator.handle_accept_ok(AcceptResponse {
+                                from: self.coordinator.node_id,
                                 ballot: BallotNumber(1),
-                                deps: deps.iter().copied().collect(),
-                            };
-                            ac_decision = self.coordinator.handle_accept_ok(resp);
-                            if ac_decision != CoordinatorDecision::Pending {
-                                break;
-                            }
+                                deps: accept_deps.clone(),
+                            });
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                txn_id = ?txn_id,
-                                error = %e,
-                                "accord: Accept RPC failed"
-                            );
+                    }
+                }
+
+                if ac_decision == CoordinatorDecision::Pending {
+                    let ac_futs: Vec<_> = self
+                        .replica_ids
+                        .iter()
+                        .filter(|&&peer_id| peer_id != self.self_id)
+                        .map(|&peer_id| {
+                            let peers = Arc::clone(&self.peers);
+                            let msg = ac_msg.clone();
+                            async move { peers.send(peer_id, msg, Lane::Data).await }
+                        })
+                        .collect();
+
+                    let ac_responses = futures::future::join_all(ac_futs).await;
+
+                    for result in &ac_responses {
+                        match result {
+                            Ok(Message::AccordAcceptOK(b)) if !b.is_empty() => {
+                                let ok: AcceptOkPayload = bincode::deserialize(b)
+                                    .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                                let resp = AcceptResponse {
+                                    from: ok.txn_id.0.node, // node ID embedded in txn_id
+                                    ballot: BallotNumber(1),
+                                    deps: accept_deps.clone(),
+                                };
+                                ac_decision = self.coordinator.handle_accept_ok(resp);
+                                if ac_decision != CoordinatorDecision::Pending {
+                                    break;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    txn_id = ?txn_id,
+                                    error = %e,
+                                    "accord: Accept RPC failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -2595,6 +2628,149 @@ mod tests {
         assert!(
             !transport.sent.lock().contains_key(&host),
             "coordinator must never send PreAccept to itself (its id is not in the peer map)"
+        );
+    }
+
+    /// A transport that drives a coordinator-is-a-replica transaction onto the
+    /// slow (Accept) path and then makes ONE remote replica time out during
+    /// Accept. It records every peer that received an `AccordAccept`.
+    ///
+    /// - PreAccept: `remote2` proposes a higher timestamp + a dependency, so the
+    ///   two remote votes disagree → the coordinator needs an Accept round.
+    /// - Accept: `remote1` votes; `remote2` times out. Slow quorum (RF=3) is 2,
+    ///   so the transaction can ONLY commit if the coordinator counts its OWN
+    ///   Accept vote locally. Under the pre-fix code the coordinator instead sent
+    ///   `AccordAccept` to itself (which fails "unknown peer" in production and
+    ///   is silently dropped here), so it saw one remote vote and failed.
+    /// - Commit/Apply: every remote acks, so only the Accept phase is stressed.
+    struct SlowPathSelfVoteTransport {
+        remote1: uuid::Uuid,
+        remote2: uuid::Uuid,
+        t0: Timestamp,
+        conflict_t: Timestamp,
+        conflict_dep: TxnId,
+        accept_targets: parking_lot::Mutex<Vec<uuid::Uuid>>,
+    }
+
+    fn node_id_of(host: uuid::Uuid) -> u64 {
+        u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap())
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for SlowPathSelfVoteTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{AcceptOkPayload, AcceptPayload, PreAcceptOkPayload};
+            match msg {
+                Message::AccordPreAccept(_) | Message::AccordPreAcceptV2(_) => {
+                    let (t, deps) = if host_id == self.remote1 {
+                        (self.t0, vec![])
+                    } else if host_id == self.remote2 {
+                        (self.conflict_t, vec![self.conflict_dep])
+                    } else {
+                        panic!("PreAccept to an unexpected host {host_id} (self must be local)");
+                    };
+                    let payload = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t,
+                        deps,
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
+                }
+                Message::AccordAccept(b) => {
+                    self.accept_targets.lock().push(host_id);
+                    if host_id == self.remote1 {
+                        let ap: AcceptPayload = bincode::deserialize(&b).unwrap();
+                        let ok = AcceptOkPayload { txn_id: ap.txn_id };
+                        Ok(Message::AccordAcceptOK(Bytes::from(
+                            bincode::serialize(&ok).unwrap(),
+                        )))
+                    } else if host_id == self.remote2 {
+                        // remote2 is slow during Accept — its vote never arrives,
+                        // so the coordinator's own local vote is what reaches quorum.
+                        Err(ferrosa_net::error::NetError::Timeout(
+                            "slow remote during Accept".into(),
+                        ))
+                    } else {
+                        // A self-send would land here under the pre-fix code — the
+                        // recorded target is what the test's assertion catches.
+                        Err(ferrosa_net::error::NetError::Timeout(
+                            "unexpected Accept target (self must be local)".into(),
+                        ))
+                    }
+                }
+                // Commit / Apply / anything else: ack so only Accept is stressed.
+                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+            }
+        }
+    }
+
+    /// Regression for the Accept-phase self-send bug (sibling of the PreAccept
+    /// fix). When the coordinator is itself a replica (RF=3), the slow path must
+    /// process its OWN Accept LOCALLY and fan `AccordAccept` out to the REMOTE
+    /// replicas only. A node is never in its own peer map, so an Accept self-send
+    /// fails "unknown peer" and loses the coordinator's vote — and because a
+    /// transaction only reaches the slow path under contention (exactly when a
+    /// remote is likely slow), losing that vote made ~61% of concurrent
+    /// transactions fail "Accord quorum unavailable" in the live Elle run.
+    #[tokio::test]
+    async fn accept_self_is_processed_locally_never_sent_rf3() {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let self_host = uuid::Uuid::from_u128(0xC0DE);
+        let remote1 = uuid::Uuid::from_u128(0x1111);
+        let remote2 = uuid::Uuid::from_u128(0x2222);
+        let self_node = node_id_of(self_host);
+
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(self_node, Arc::new(MockSyncWriter::new())),
+        ));
+
+        let t0 = make_ts(1000);
+        let transport = Arc::new(SlowPathSelfVoteTransport {
+            remote1,
+            remote2,
+            t0,
+            conflict_t: make_ts(2000),
+            conflict_dep: make_txn_id(7, 500),
+            accept_targets: parking_lot::Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(self_node, 0);
+
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            self_node,
+            vec![self_host, remote1, remote2], // RF=3, coordinator is a replica
+            transport.clone(),
+            false, // not leaseholder
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
+
+        let result = driver.run_transaction().await;
+        assert!(
+            result.is_ok(),
+            "slow-path transaction must commit via the coordinator's LOCAL Accept \
+             vote when one remote is slow (self + remote1 = slow quorum 2); got {result:?}"
+        );
+
+        let targets = transport.accept_targets.lock();
+        assert!(
+            !targets.contains(&self_host),
+            "coordinator must never send AccordAccept to itself (its id is not in \
+             the peer map); sent to {targets:?}"
+        );
+        assert!(
+            targets.contains(&remote1) && targets.contains(&remote2),
+            "coordinator must fan Accept out to BOTH remote replicas; sent to {targets:?}"
         );
     }
 
