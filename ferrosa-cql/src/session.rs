@@ -7,7 +7,9 @@
 use std::time::{Duration, Instant};
 
 use crate::error::CqlError;
-use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter, TransactionWrite};
+use ferrosa_storage::accord::{
+    CommitOutcome, CommitReads, TransactionCommitter, TransactionRead, TransactionWrite,
+};
 use ferrosa_storage::{BatchOp, StorageEngine};
 
 /// Per-connection **explicit-transaction state machine** (spec URS-QEC-B02).
@@ -218,6 +220,10 @@ pub struct CqlTransaction {
     /// committed. The client must `ROLLBACK` and retry.
     poisoned: bool,
     buffer: Vec<TransactionWrite>,
+    /// Buffered `SELECT`s inside the transaction. Evaluated at the transaction's
+    /// agreed commit timestamp and returned from `COMMIT` (read-in-transaction),
+    /// positionally aligned with the rows in [`CommitReads`].
+    reads: Vec<TransactionRead>,
 }
 
 /// Max DML writes buffered in one transaction before it is poisoned. A client
@@ -251,6 +257,7 @@ impl CqlTransaction {
         self.open = true;
         self.poisoned = false;
         self.buffer.clear();
+        self.reads.clear();
         Ok(())
     }
 
@@ -272,6 +279,31 @@ impl CqlTransaction {
         Ok(())
     }
 
+    /// Buffer one `SELECT` read. FAILS LOUD (and POISONS the transaction) if no
+    /// transaction is open or the combined statement cap is exceeded — reads
+    /// count against the same bound as writes so an open `BEGIN` can never grow
+    /// unboundedly (Power-of-10 Rule 3).
+    pub fn stage_read(&mut self, read: TransactionRead) -> Result<(), CqlError> {
+        if !self.open {
+            return Err(CqlError::Invalid(
+                "SELECT staged outside of a transaction".to_string(),
+            ));
+        }
+        if self.buffer.len() + self.reads.len() >= MAX_TXN_WRITES {
+            self.poisoned = true;
+            return Err(CqlError::Invalid(format!(
+                "transaction statement-set exceeds the {MAX_TXN_WRITES}-statement limit; ROLLBACK required"
+            )));
+        }
+        self.reads.push(read);
+        Ok(())
+    }
+
+    /// Number of `SELECT` reads buffered so far.
+    pub fn staged_reads_len(&self) -> usize {
+        self.reads.len()
+    }
+
     /// Mark the open transaction un-committable after a statement failed inside
     /// it (e.g. a DML that could not be encoded). The next `COMMIT` fails loud
     /// rather than committing an incomplete write-set. No-op outside a txn.
@@ -290,7 +322,7 @@ impl CqlTransaction {
     pub async fn commit(
         &mut self,
         committer: &dyn TransactionCommitter,
-    ) -> Result<CommitOutcome, CqlError> {
+    ) -> Result<(CommitOutcome, CommitReads), CqlError> {
         if !self.open {
             return Err(CqlError::Invalid(
                 "COMMIT outside of a transaction".to_string(),
@@ -298,6 +330,7 @@ impl CqlTransaction {
         }
         if self.poisoned {
             self.buffer.clear();
+            self.reads.clear();
             self.open = false;
             self.poisoned = false;
             return Err(CqlError::Invalid(
@@ -305,9 +338,10 @@ impl CqlTransaction {
             ));
         }
         let writes = std::mem::take(&mut self.buffer);
+        let reads = std::mem::take(&mut self.reads);
         self.open = false;
         committer
-            .commit(writes)
+            .commit_with_reads(writes, reads)
             .await
             .map_err(|e| CqlError::ServerError(format!("transaction commit failed: {}", e.reason)))
     }
@@ -320,6 +354,7 @@ impl CqlTransaction {
             ));
         }
         self.buffer.clear();
+        self.reads.clear();
         self.open = false;
         self.poisoned = false;
         Ok(())
@@ -335,6 +370,14 @@ mod tests {
             keyspace: ks.to_string(),
             key: key.to_vec(),
             mutation: b"m".to_vec(),
+        }
+    }
+
+    fn tr(ks: &str, table: &str, key: &[u8]) -> TransactionRead {
+        TransactionRead {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
         }
     }
 
@@ -369,15 +412,49 @@ mod tests {
         tx.stage(tw("ks", b"a")).unwrap();
         tx.stage(tw("ks", b"b")).unwrap();
 
-        let outcome = tx.commit(&committer).await.unwrap();
+        let (outcome, _reads) = tx.commit(&committer).await.unwrap();
 
         assert_eq!(outcome, CommitOutcome::Committed);
         assert!(!tx.is_open(), "COMMIT closes the transaction");
         assert_eq!(tx.staged_len(), 0, "buffer is drained on commit");
         assert_eq!(
+            committer.reads(),
+            vec![vec![]],
+            "no reads staged → empty read-set"
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_txn_commit_returns_staged_reads_rows() {
+        // A BEGIN; SELECT; UPDATE; COMMIT must send the read-set to the committer
+        // and return the rows it observed at the agreed commit timestamp.
+        use ferrosa_storage::accord::MockTransactionCommitter;
+        let committer =
+            MockTransactionCommitter::with_read_rows(vec![Some(b"row-a".to_vec()), None]);
+        let mut tx = CqlTransaction::new();
+        tx.begin().unwrap();
+        tx.stage_read(tr("ks", "t", b"a")).unwrap();
+        tx.stage_read(tr("ks", "t", b"b")).unwrap();
+        tx.stage(tw("ks", b"a")).unwrap();
+
+        let (outcome, reads) = tx.commit(&committer).await.unwrap();
+
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert_eq!(
+            reads.rows,
+            vec![Some(b"row-a".to_vec()), None],
+            "COMMIT returns the per-read row bytes observed at the agreed t"
+        );
+        assert_eq!(
+            committer.reads(),
+            vec![vec![tr("ks", "t", b"a"), tr("ks", "t", b"b")]],
+            "the exact buffered read-set reaches the committer, in order"
+        );
+        assert_eq!(tx.staged_reads_len(), 0, "read buffer is drained on commit");
+        assert_eq!(
             committer.committed(),
-            vec![vec![tw("ks", b"a"), tw("ks", b"b")]],
-            "the exact buffered write-set reaches the committer, in order"
+            vec![vec![tw("ks", b"a")]],
+            "the write-set still reaches the committer alongside the reads"
         );
     }
 
