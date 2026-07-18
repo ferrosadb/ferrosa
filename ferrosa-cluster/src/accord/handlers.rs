@@ -106,11 +106,7 @@ impl AccordHandler {
 /// and to grab the apply-notify handle, then released BEFORE every `.await`.
 /// `handle_apply` (which fires the notify that unblocks us) takes the same lock,
 /// so holding it across the await would deadlock.
-pub(crate) async fn await_conflicting_deps_applied(
-    state: &AccordState,
-    key: &[u8],
-    t: Timestamp,
-) -> bool {
+pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: Timestamp) -> bool {
     let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
     loop {
         // Compute the pending set and grab the notify UNDER the lock, then drop
