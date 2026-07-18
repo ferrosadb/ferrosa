@@ -1367,6 +1367,84 @@ async fn approved_peer_triggers_join_in_cluster_mode() {
     );
 }
 
+/// Regression: a peer that connects in cluster mode must have its
+/// `host_id → node_id` registered in the raft network factory's node_map.
+///
+/// Without this, an already-committed member reconnecting *after the leader
+/// restarted* triggers no `JoinNode` (it is already a member), so the leader's
+/// join-time registration never fires and every raft RPC to it fails
+/// "no registered host_id yet (registration pending)" — the leader loses quorum
+/// contact, steps down, and the cluster churns indefinitely. Reproduced live on
+/// the fmem cluster during a rolling restart (2026-07-18).
+#[tokio::test]
+async fn on_peer_connected_registers_peer_host_id_in_raft_node_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        auto_join: true,
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    // Two peers → cluster mode (this runs transition_to_cluster, which captures
+    // the raft node_map).
+    controller.on_peer_connected((peer1_id, "127.0.0.1:7001".parse().unwrap()));
+    controller.on_peer_connected((peer2_id, "127.0.0.2:7002".parse().unwrap()));
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    controller
+        .raft_node_map_snapshot()
+        .expect("raft node_map must be captured once in cluster mode");
+
+    // Simulate the leader having RESTARTED and finished raft-init before this
+    // peer reconnected: its host_id is absent from the freshly-recovered node_map
+    // (it was not in the formation peer list, and being an already-committed
+    // member it triggers no JoinNode on reconnect).
+    let reconnecting = peer2_id;
+    let node_id = crate::raft::uuid_to_node_id(reconnecting);
+    {
+        let m = controller.raft_node_map.load_full().unwrap();
+        m.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node_id);
+    }
+    assert!(
+        !controller
+            .raft_node_map_snapshot()
+            .unwrap()
+            .contains_key(&node_id),
+        "precondition: peer must be absent from the node_map before reconnect"
+    );
+
+    // The existing member reconnects.
+    controller.on_peer_connected((reconnecting, "127.0.0.2:7002".parse().unwrap()));
+
+    let map = controller.raft_node_map_snapshot().unwrap();
+    assert_eq!(
+        map.get(&node_id),
+        Some(&reconnecting),
+        "on_peer_connected must (re)register the reconnecting peer's host_id in the raft node_map \
+         so the leader can route raft RPCs to it; got map={map:?}"
+    );
+}
+
 #[tokio::test]
 async fn existing_cluster_member_does_not_queue_duplicate_join() {
     let dir = tempfile::tempdir().unwrap();

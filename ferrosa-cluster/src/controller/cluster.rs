@@ -779,6 +779,11 @@ impl ModeController {
         // This shared map is used by DdlPath::Cluster to resolve leader NodeId → Uuid.
         let node_map_for_ddl = network_factory.node_map();
         let node_map_for_bootstrap = node_map_for_ddl.clone();
+        // Publish the shared node_map so `on_peer_connected` can register a
+        // (re)connecting peer's host_id — the leader must learn a reconnecting
+        // committed member's host_id even when no `JoinNode` fires, or raft RPCs
+        // to it stay "registration pending" forever.
+        self.raft_node_map.store(Some(node_map_for_ddl.clone()));
         // Clone peer_manager for DdlPath::Cluster forwarding (ClusterCoordinator
         // will consume `peer_manager` below).
         let peer_manager_for_ddl = peer_manager.clone();

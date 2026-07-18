@@ -250,6 +250,13 @@ pub struct ModeController {
     pub(super) raft_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
     /// Dedicated Data runtime for internode IO.
     pub(super) data_runtime: std::sync::OnceLock<Arc<tokio::runtime::Runtime>>,
+    /// The raft network factory's shared `node_id → host_id` map, captured at
+    /// cluster formation. `on_peer_connected` registers a (re)connecting peer's
+    /// host_id here so the leader can route raft RPCs to it — closing the gap
+    /// where a peer that is already a committed member reconnects after the
+    /// leader restarted (no `JoinNode`, so the leader would otherwise never learn
+    /// its host_id → "registration pending" forever). Empty until formation.
+    pub(super) raft_node_map: arc_swap::ArcSwapOption<std::sync::RwLock<HashMap<u64, uuid::Uuid>>>,
     /// Shared slot publishing this node's live `AccordState` to the session
     /// layer. Empty in standalone/pair; filled in `transition_to_cluster` with
     /// the SAME state the node's `AccordHandler` serves, so the transaction
@@ -344,6 +351,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
         });
 
@@ -363,6 +371,32 @@ impl ModeController {
     /// empty slot, and the committer then uses remote-only votes).
     pub fn accord_state_slot(&self) -> crate::accord::AccordStateSlot {
         self.accord_state_slot.clone()
+    }
+
+    /// Register a (re)connecting peer's `host_id` in the raft network factory's
+    /// shared node_map so the leader can resolve it and route raft RPCs to it.
+    ///
+    /// Idempotent (`HashMap` insert). A no-op before cluster formation (the map
+    /// is captured in `transition_to_cluster`). This is what lets an
+    /// already-committed member that reconnects *after the leader restarted*
+    /// become raft-routable again: such a reconnect triggers no `JoinNode`, so
+    /// the leader's join-time registration never fires and — without this — the
+    /// peer stays "registration pending" forever, wedging replication.
+    pub(super) fn register_peer_in_raft_node_map(&self, host_id: uuid::Uuid) {
+        if let Some(map) = self.raft_node_map.load_full() {
+            let node_id = crate::raft::uuid_to_node_id(host_id);
+            map.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(node_id, host_id);
+        }
+    }
+
+    /// Test-only snapshot of the raft node_map contents (`None` before formation).
+    #[cfg(test)]
+    pub(super) fn raft_node_map_snapshot(&self) -> Option<HashMap<u64, uuid::Uuid>> {
+        self.raft_node_map
+            .load_full()
+            .map(|m| m.read().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     /// Create a standalone-mode `ModeController` for unit tests.
@@ -414,6 +448,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
         })
     }
@@ -475,6 +510,7 @@ impl ModeController {
             contention_metrics: Arc::new(ContentionMetrics::new()),
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
+            raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
         })
     }
