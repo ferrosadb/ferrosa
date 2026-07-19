@@ -12,6 +12,7 @@
 
 pub mod accord;
 pub mod cell;
+pub mod complex_cell;
 pub mod cql_type;
 pub mod data_type;
 pub mod error;
@@ -30,6 +31,9 @@ pub use accord::{
     Timestamp as AccordTimestamp, TxnId, TxnPhase, TxnState,
 };
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
+pub use complex_cell::{
+    reconcile, CellPath, ComplexColumn, CounterCell, CounterShard, CounterShardId,
+};
 pub use cql_type::{CqlType, CqlValue};
 pub use data_type::DataType;
 pub use error::{Error, Result};
