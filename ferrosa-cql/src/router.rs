@@ -7865,10 +7865,27 @@ fn materialize_update(
                 let val = bridge::term_to_cql_value(value, &cql_type)?;
                 (column.as_str(), val)
             }
-            _ => {
-                // For complex assignments (Add, Sub, Element), fall back to simple value
-                // extraction. Full handling deferred to route_update.
-                continue;
+            Assignment::Add { column, .. }
+            | Assignment::Sub { column, .. }
+            | Assignment::Element { column, .. } => {
+                // Collection append/subtract (`v = v + [..]`), counter
+                // increment, and map/list element assignment are a
+                // read-modify-write. The plain `route_update` path performs that
+                // RMW, but it is NEVER invoked for a `BEGIN…COMMIT` transaction
+                // (or a logged batch) — those materialize here. Silently skipping
+                // the assignment (the previous behavior) committed a bare row
+                // marker with no cell for the column, dropping the write with no
+                // signal: an Accord `UPDATE v = v + [x]` read back empty.
+                //
+                // FAIL LOUD rather than lose data. Correct transactional support
+                // requires carrying the delta and applying the RMW at commit/apply
+                // time (t_83c4f093); until then, reject it.
+                return Err(CqlError::Invalid(format!(
+                    "column '{column}': collection append/subtract, counter, and \
+                     element updates are not yet supported inside a transaction \
+                     (BEGIN…COMMIT) or logged batch — the write would be silently \
+                     dropped. Use a non-transactional UPDATE."
+                )));
             }
         };
         let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
@@ -13769,6 +13786,55 @@ mod tests {
         assert!(
             matches!(res, Err(CqlError::ServerError(_))),
             "linearizable SELECT without Accord wiring must fail loud, not fake a stale read"
+        );
+    }
+
+    /// A collection append/counter update inside a transaction (or logged batch)
+    /// materializes via `materialize_update`, which cannot yet perform the
+    /// read-modify-write. It must FAIL LOUD rather than silently drop the mutation
+    /// (which committed an empty write — an Accord `v = v + [x]` read back empty).
+    /// A scalar assignment on the same path still materializes fine.
+    #[tokio::test]
+    async fn transaction_collection_append_fails_loud_not_silent_drop() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, s int, v list<int>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Collection append must fail loud (was: silent drop -> empty write).
+        let Statement::Update(append) =
+            crate::parser::parse("UPDATE ks.t SET v = v + [7] WHERE k = 1").unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        assert!(
+            materialize_update(&state, &ctx, &append, 123).is_err(),
+            "collection append in a transaction/batch must fail loud, not silently drop the write"
+        );
+
+        // A scalar assignment on the same materialization path still works.
+        let Statement::Update(scalar) =
+            crate::parser::parse("UPDATE ks.t SET s = 5 WHERE k = 1").unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        assert!(
+            materialize_update(&state, &ctx, &scalar, 123).is_ok(),
+            "a scalar UPDATE must still materialize in a transaction"
         );
     }
 
