@@ -45,6 +45,15 @@ pub struct CellValue {
     pub ttl: i32,
     /// Local deletion time (seconds since epoch). `i32::MAX` means not deleted.
     pub local_deletion_time: i32,
+    /// Cell path for a **complex** (collection) column — Cassandra's per-element
+    /// cell identity: a timeuuid for `list`, the element bytes for `set`, the key
+    /// bytes for `map`. `None` for a simple (scalar) cell, of which there is one
+    /// per column. Complex columns store many cells sharing a column index,
+    /// distinguished by this path; they are merged per `(column, path)`. Declared
+    /// last so the derived ordering of simple cells (all `None`) is unchanged.
+    ///
+    /// See [`crate::complex_cell`] for the per-element CRDT this enables.
+    pub path: Option<Vec<u8>>,
 }
 
 impl CellValue {
@@ -63,6 +72,7 @@ impl CellValue {
             timestamp,
             ttl: NO_TTL,
             local_deletion_time: NO_DELETION_TIME,
+            path: None,
         }
     }
 
@@ -78,7 +88,17 @@ impl CellValue {
             timestamp,
             ttl,
             local_deletion_time,
+            path: None,
         }
+    }
+
+    /// Attach a complex-column cell [`path`](Self::path) to this cell (builder).
+    /// Use for one element of a `list`/`set`/`map` — e.g.
+    /// `CellValue::live(elem, ts).with_path(timeuuid)`.
+    #[must_use]
+    pub fn with_path(mut self, path: Vec<u8>) -> Self {
+        self.path = Some(path);
+        self
     }
 
     /// A tombstone marking deletion at the given timestamp.
@@ -96,6 +116,7 @@ impl CellValue {
             timestamp,
             ttl: NO_TTL,
             local_deletion_time,
+            path: None,
         }
     }
 
