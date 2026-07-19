@@ -528,6 +528,9 @@ impl Mutation {
                 timestamp,
                 ttl,
                 local_deletion_time,
+                // Legacy commit-log cell format carries no cell path; complex-cell
+                // paths are added to the wire format in a later increment.
+                path: None,
             },
         ))
     }

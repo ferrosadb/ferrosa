@@ -128,6 +128,9 @@ impl From<CellValueWire> for CellValue {
             timestamp: w.timestamp,
             ttl: w.ttl,
             local_deletion_time: w.local_deletion_time,
+            // CellValueWire predates complex-cell paths; extended with the wire
+            // format in a later increment.
+            path: None,
         }
     }
 }
