@@ -1936,7 +1936,6 @@ async fn route_accord_read(
         .map(|name| resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema))
         .collect::<Result<Vec<_>, _>>()?;
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let table_id = TableId::new(&table_meta.keyspace, &table_meta.name);
 
     // Cluster-mode Accord wiring is required; fail loud otherwise (p0-03 policy).
     let clock = state.accord_clock.clone().ok_or_else(|| {
@@ -1950,10 +1949,10 @@ async fn route_accord_read(
         )
     })?;
 
-    // Linearization point: read at `t`, but first wait until every committed
-    // conflicting txn ordered before `t` for this key has applied locally. The
-    // Accord conflict key is the partition-key bytes (matching the write path's
-    // `TransactionWrite.key`).
+    // Linearization point: wait until every committed conflicting txn ordered
+    // before `t` for this key has applied on THIS node, so the read observes the
+    // full committed prefix. The Accord conflict key is the partition-key bytes
+    // (matching the write path's `TransactionWrite.key`).
     let t = clock.now();
     if !ferrosa_cluster::accord::await_conflicting_deps_applied(
         &sm,
@@ -1967,16 +1966,14 @@ async fn route_accord_read(
         ));
     }
 
-    // Read the coordinator's own applied state (it is a replica for the key).
-    let rows = state
-        .engine
-        .read(&table_id, &decorated_key)
-        .map_err(|e| CqlError::ServerError(format!("linearizable local read failed: {e}")))?
-        .map(|p| p.rows)
-        .unwrap_or_default();
-
-    let frame = cdc_event_to_result_frame(state.schema.as_ref(), ks, s, decorated_key, rows)?
-        .ok_or_else(|| CqlError::Invalid(format!("table {ks}.{} not found", s.table)))?;
+    // Serve the read through the normal SELECT path. It reads at the client's
+    // consistency — SERIAL / LOCAL_SERIAL blocks for a quorum — and correctly
+    // reconstructs collection columns (list/set/map), which a raw single-replica
+    // engine read does not surface. The dep-wait above is what upgrades this from
+    // "quorum read" to "linearizable read": every committed write ordered before
+    // `t` is durably applied on this replica (and, being committed, on an apply
+    // quorum), so the quorum read cannot miss it.
+    let frame = route_select(state, ctx, s.clone()).await?;
     Ok(RouteResult::Result(frame))
 }
 
