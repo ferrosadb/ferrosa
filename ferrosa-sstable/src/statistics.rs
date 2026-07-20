@@ -163,6 +163,18 @@ pub struct SerializationHeader {
     pub static_columns: Vec<(Vec<u8>, String)>,
     /// Regular columns: (name bytes, CQL type string).
     pub regular_columns: Vec<(Vec<u8>, String)>,
+    /// Whether non-frozen collection / UDT columns are stored as Cassandra's
+    /// per-element **complex** cells (cell-count + cell-paths) rather than
+    /// Ferrosa's legacy **whole-value** single cell. Carried on the header so it
+    /// flows to every `DataReader`/`SSTableWriter` uniformly (a per-SSTable
+    /// format switch). `false` = legacy whole-value (Ferrosa's current writes);
+    /// Cassandra-sourced SSTables are complex → set `true` when reading them.
+    ///
+    /// NOT YET serialized to the binary Statistics.db (like `max_timestamp`);
+    /// defaults `false` on read. Persisting it is deferred to when Ferrosa itself
+    /// writes complex collections (D-write) so old whole-value and new complex
+    /// SSTables coexist on the native read path (t_b7cec413).
+    pub complex_collections: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +453,7 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     };
 
     Ok(SerializationHeader {
+        complex_collections: false,
         min_timestamp,
         min_local_deletion_time,
         min_ttl,
@@ -686,6 +699,7 @@ mod tests {
     /// Helper: build a sample `SerializationHeader`.
     fn sample_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_700_000_000_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -749,6 +763,7 @@ mod tests {
     #[test]
     fn serialization_header_empty_columns() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: TIMESTAMP_EPOCH,
             min_local_deletion_time: DELETION_TIME_EPOCH,
             min_ttl: 0,
@@ -772,6 +787,7 @@ mod tests {
     fn serialization_header_live_partition_values() {
         // i32::MAX for local_deletion_time means "live" (no deletion).
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: TIMESTAMP_EPOCH + 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -795,6 +811,7 @@ mod tests {
         // panic on subtraction. This happens during load tests where synthetic
         // timestamps are small integers (e.g., 1000).
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1000,        // << TIMESTAMP_EPOCH
             min_local_deletion_time: 0, // << DELETION_TIME_EPOCH
             min_ttl: 0,
@@ -868,6 +885,7 @@ mod tests {
             compaction: CompactionMetadata { data: vec![] },
             stats: StatsMetadata { data: vec![] },
             header: SerializationHeader {
+                complex_collections: false,
                 min_timestamp: TIMESTAMP_EPOCH,
                 min_local_deletion_time: DELETION_TIME_EPOCH,
                 min_ttl: 0,
@@ -887,6 +905,7 @@ mod tests {
     #[test]
     fn simple_bti_stats_metadata_records_key_range_and_counts() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,

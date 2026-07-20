@@ -197,6 +197,7 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+        complex_collections: false,
         min_timestamp: 1_000_000,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -335,6 +336,7 @@ fn read_real_cassandra_collections() {
     // VALUES (deltas are uvints either way), not byte alignment or the element
     // paths/values we assert here.
     let header = SerializationHeader {
+            complex_collections: true,
         min_timestamp: 0,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -358,7 +360,7 @@ fn read_real_cassandra_collections() {
         ],
     };
 
-    let mut reader = DataReader::new(&data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&data, &header, 0);
     let p = reader.read_partition().unwrap().expect("row1 partition");
     assert_eq!(p.key.key.as_bytes(), b"row1");
     let cells = &p.rows[0].cells;
@@ -431,6 +433,7 @@ fn read_real_cassandra_udt() {
     // 2-byte-path + length-prefixed value. Field-value decoding happens in the
     // row-bridge assembly layer (CqlType::Udt), not here.
     let header = SerializationHeader {
+        complex_collections: true,
         min_timestamp: 0,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -447,7 +450,7 @@ fn read_real_cassandra_udt() {
         )],
     };
 
-    let mut reader = DataReader::new(&data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&data, &header, 0);
     let p = reader.read_partition().unwrap().expect("row1 partition");
     assert_eq!(p.key.key.as_bytes(), b"row1");
     let cells = &p.rows[0].cells;
@@ -492,6 +495,7 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+        complex_collections: true,
         min_timestamp: 1_000_000,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -544,11 +548,11 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
+    let mut writer = SSTableWriter::new(options, header.clone());
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
-    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&output.data, &header, 0);
     let p = reader.read_partition().unwrap().expect("list partition");
     let cells = &p.rows[0].cells;
     assert_eq!(cells.len(), 2, "two element cells round-trip");
@@ -573,6 +577,7 @@ fn ferrosa_roundtrips_complex_column_deletion() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+        complex_collections: true,
         min_timestamp: 100,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -613,11 +618,11 @@ fn ferrosa_roundtrips_complex_column_deletion() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
+    let mut writer = SSTableWriter::new(options, header.clone());
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
-    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&output.data, &header, 0);
     let p = reader.read_partition().unwrap().expect("partition");
     let cells = &p.rows[0].cells;
 
@@ -648,6 +653,7 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+            complex_collections: true,
         min_timestamp: 1_000_000,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -693,11 +699,11 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
+    let mut writer = SSTableWriter::new(options, header.clone());
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
-    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&output.data, &header, 0);
     let p = reader.read_partition().unwrap().expect("partition");
     let cells = &p.rows[0].cells;
     // 2 set cells (col 0) + 1 map cell (col 1)
@@ -747,6 +753,7 @@ fn ferrosa_projected_read_over_complex_column() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+            complex_collections: true,
         min_timestamp: 1_000_000,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -789,13 +796,13 @@ fn ferrosa_projected_read_over_complex_column() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
+    let mut writer = SSTableWriter::new(options, header.clone());
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
     // Project only the scalar column (ordinal 1): the list complex framing must
     // be skipped without drift.
-    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&output.data, &header, 0);
     let p = reader
         .read_partition_projected(&[1])
         .unwrap()
@@ -806,7 +813,7 @@ fn ferrosa_projected_read_over_complex_column() {
     assert_eq!(cells[0].1.value.as_deref(), Some(&42i32.to_be_bytes()[..]));
 
     // Project only the list column (ordinal 0): its element cell comes back.
-    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let mut reader = DataReader::new(&output.data, &header, 0);
     let p = reader
         .read_partition_projected(&[0])
         .unwrap()
@@ -888,6 +895,7 @@ fn sstable_compat_simple_types() {
     //   4 v_double DoubleType
     //   5 v_blob   BytesType
     let header = SerializationHeader {
+        complex_collections: false,
         min_timestamp: 1_000_000,
         min_local_deletion_time: i32::MAX,
         min_ttl: 0,
