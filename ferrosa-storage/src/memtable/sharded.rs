@@ -123,6 +123,9 @@ impl ShardedBTreeMemtable {
             if let Some(ref v) = cell.value {
                 size += v.len();
             }
+            if let Some(ref p) = cell.path {
+                size += p.len();
+            }
         }
         size
     }
@@ -342,22 +345,28 @@ pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) 
                 existing_row.primary_key_liveness = new_row.primary_key_liveness;
             }
 
-            // Merge cells: for each cell in the new row, apply LWW
+            // Merge cells, keyed by (column index, cell path). A simple column
+            // has one cell (path == None); a complex (collection) column has many
+            // cells sharing the column index, one per element, distinguished by
+            // path. Cells stay sorted by (col_idx, path) — for simple cells (all
+            // None) this is identical to the historical col_idx order, so existing
+            // data and searches are unaffected. Reconciliation uses the CRDT rule
+            // (higher timestamp wins; tombstone wins an equal-timestamp tie), which
+            // is what makes concurrent per-element appends converge.
             for (col_idx, new_cell) in new_row.cells {
-                // Find existing cell with same column index
+                let key = (col_idx, &new_cell.path);
                 let cell_pos = existing_row
                     .cells
-                    .binary_search_by_key(&col_idx, |(idx, _)| *idx);
+                    .binary_search_by(|(idx, cell)| (*idx, &cell.path).cmp(&key));
 
                 match cell_pos {
                     Ok(ci) => {
-                        // Same column exists — LWW by timestamp
-                        if new_cell.timestamp > existing_row.cells[ci].1.timestamp {
-                            existing_row.cells[ci].1 = new_cell;
-                        }
+                        let existing_cell = &existing_row.cells[ci].1;
+                        existing_row.cells[ci].1 =
+                            ferrosa_common::reconcile(existing_cell, &new_cell);
                     }
                     Err(ci) => {
-                        // New column — insert at sorted position
+                        // New (col_idx, path) — insert at sorted position.
                         existing_row.cells.insert(ci, (col_idx, new_cell));
                     }
                 }
@@ -578,6 +587,95 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         }
+    }
+
+    /// A row carrying one **complex** (collection) element cell: column `col`,
+    /// cell path `path`, live value `value` at `timestamp`.
+    fn complex_row(col: u16, path: &[u8], value: &[u8], timestamp: i64) -> Row {
+        Row {
+            clustering: vec![],
+            cells: vec![(
+                col,
+                CellValue::live(value.to_vec(), timestamp).with_path(path.to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+        }
+    }
+
+    fn empty_partition() -> Partition {
+        Partition {
+            key: make_key("pk"),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![],
+        }
+    }
+
+    #[test]
+    fn merge_keeps_distinct_complex_cells_per_path() {
+        // Two per-element appends to the same collection column (col 0) with distinct
+        // paths both survive — the convergence a single whole-collection cell cannot
+        // express, and the reason a list-append no longer needs a read-modify-write.
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"a", 10));
+        merge_row_into_partition(&mut p, complex_row(0, b"pB", b"b", 11));
+        let cells = &p.rows[0].cells;
+        assert_eq!(cells.len(), 2, "both element cells retained");
+        // Cells stay sorted by (col, path): pA before pB.
+        assert_eq!(cells[0].1.value.as_deref(), Some(b"a".as_slice()));
+        assert_eq!(cells[0].1.path.as_deref(), Some(b"pA".as_slice()));
+        assert_eq!(cells[1].1.value.as_deref(), Some(b"b".as_slice()));
+    }
+
+    #[test]
+    fn merge_reconciles_same_path_by_lww() {
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"old", 10));
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"new", 20));
+        assert_eq!(
+            p.rows[0].cells.len(),
+            1,
+            "same (col,path) reconciled, not duplicated"
+        );
+        assert_eq!(
+            p.rows[0].cells[0].1.value.as_deref(),
+            Some(b"new".as_slice())
+        );
+        // A stale write (lower ts) does not win.
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"stale", 5));
+        assert_eq!(
+            p.rows[0].cells[0].1.value.as_deref(),
+            Some(b"new".as_slice())
+        );
+    }
+
+    #[test]
+    fn merge_same_path_tombstone_wins_equal_timestamp() {
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"v", 10));
+        // A remove (tombstone) at the SAME timestamp wins the tie — element gone.
+        let mut remove = complex_row(0, b"pA", b"v", 10);
+        remove.cells[0].1 = CellValue::tombstone(10, i32::MAX).with_path(b"pA".to_vec());
+        merge_row_into_partition(&mut p, remove);
+        assert!(
+            p.rows[0].cells[0].1.is_tombstone(),
+            "tombstone wins the equal-ts tie"
+        );
+    }
+
+    #[test]
+    fn merge_simple_and_complex_cells_are_distinct_keys() {
+        // A path=None (simple) cell and a path=Some (complex) cell on the same column
+        // index are distinct merge keys; both survive. Defensive — a real column is
+        // either simple or complex — but it pins that the merge keys uniformly on
+        // (col, path) and never conflates the two.
+        let mut p = empty_partition();
+        merge_row_into_partition(&mut p, make_row(0, b"s", 10)); // path None
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"c", 11));
+        assert_eq!(p.rows[0].cells.len(), 2);
+        assert_eq!(p.rows[0].cells[0].1.path, None, "None sorts first");
+        assert_eq!(p.rows[0].cells[1].1.path.as_deref(), Some(b"pA".as_slice()));
     }
 
     /// Schema with a TimeUUID column at index 0. Used for the fail-loud

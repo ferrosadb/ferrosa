@@ -112,6 +112,16 @@ pub struct CellValueWire {
 
 impl From<CellValue> for CellValueWire {
     fn from(c: CellValue) -> Self {
+        // Fail loud: this streaming wire (bincode `RowWire`) cannot yet carry a
+        // complex-column cell path, and silently dropping it would lose collection
+        // elements during repair/bootstrap streaming. No write path emits complex
+        // cells today, so this never fires; it must be extended (with its own
+        // bincode-format versioning) before complex cells reach the streaming path
+        // (t_83c4f093, a later increment).
+        assert!(
+            c.path.is_none(),
+            "streaming RowWire cannot yet carry a complex-cell path"
+        );
         Self {
             value: c.value,
             timestamp: c.timestamp,
@@ -128,6 +138,9 @@ impl From<CellValueWire> for CellValue {
             timestamp: w.timestamp,
             ttl: w.ttl,
             local_deletion_time: w.local_deletion_time,
+            // CellValueWire predates complex-cell paths; extended with the wire
+            // format in a later increment.
+            path: None,
         }
     }
 }

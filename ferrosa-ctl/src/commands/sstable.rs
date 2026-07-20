@@ -1444,6 +1444,7 @@ mod tests {
 
     fn entity_store_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 0,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -1539,6 +1540,7 @@ mod tests {
                     timestamp: 1234,
                     ttl: 0,
                     local_deletion_time: 5,
+                    path: None,
                 },
             )],
             deletion: DeletionTime::LIVE,
@@ -1582,6 +1584,7 @@ mod tests {
             clustering: vec![],
         };
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 0,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,

@@ -21,6 +21,12 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
 - **CQL type-name parser** — `parse_cql_type` / `parse_cql_type_in_keyspace`.
 - **Write-direction row assembly** — `build_decorated_key` (single + composite
   partition keys), `build_row`, `build_delete_row`, `encode_clustering`.
+- **Collection (CRDT per-element) cells** — `build_collection_cells` encodes a
+  `col = col ± {..}` collection assignment as read-free per-element cells
+  (set element / map key / list TimeUUID paths); `assemble_collection` /
+  `assemble_column_cells` are the read-side inverse (reconcile-by-path LWW +
+  assemble). Lives here so the read path can assemble complex columns without an
+  up-dependency on `ferrosa-cql`; `ferrosa-cql::collection_cells` re-exports it.
 - **Read-direction decomposition** — `partition_to_rows`,
   `partition_to_rows_with_storage_mapping`, `partition_to_rows_with_clustering`,
   `write_partition_raw_rows_with_storage_mapping`, plus `decode_pk` /
@@ -30,9 +36,11 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
 
 ## How it works
 
-Two modules:
+Three modules:
 
 - **`codec`** (`src/codec.rs`) — value ↔ CQL wire bytes + the type-name parser.
+- **`collection`** (`src/collection.rs`) — CRDT per-element collection cell
+  builder + read-side assembly (see above).
 - **`row`** (`src/row.rs`) — partition/clustering key decoders, the read-path
   decomposition (tombstone/TTL skipping, storage-order → table-order mapping),
   and the write-path row builders.

@@ -816,3 +816,27 @@ rule = "server-side-result-cap"
 reason = "truncate(10) is the Caverphone ALGORITHM's fixed code length (a value's length, not a result count)."
 owner = "bkearns"
 expires = "2027-07-01"
+
+# (b) complex-column assembly read path: `.copied()` flattens a `&[&CellValue]`
+# (already reconciled to one live-or-tombstone cell per path by the memtable /
+# merge_rows merge) down to `&CellValue`. It copies the 8-byte REFERENCE, never
+# the CellValue itself — the cells are borrowed in place, which is the whole
+# point of the borrow-only assembly. Removing `.copied()` is not possible without
+# a readability regression: the `Vec<&CellValue>` collect at collection.rs:337
+# needs it, and the max_by_key bindings would otherwise carry a `&&CellValue`.
+# Scoped by symbol `cells` — the only copied/cloned chain root in these files.
+[[allow]]
+path = "ferrosa-row-bridge/src/collection.rs"
+rule = "cloned-stream-elements"
+symbol = "cells"
+reason = "complex-column assembly: `.copied()` flattens `&[&CellValue]` -> `&CellValue` (8-byte reference copy of already-reconciled borrowed cells, NOT cell data); required by the Vec<&CellValue> collect + single-ref max_by_key bindings."
+owner = "bkearns"
+expires = "2027-07-01"
+
+[[allow]]
+path = "ferrosa-cql/src/bridge.rs"
+rule = "cloned-stream-elements"
+symbol = "cells"
+reason = "column-meta assembly: `.copied()` flattens a grouped column's `&CellValue` cells for max_by_key; copies the reference, not the CellValue."
+owner = "bkearns"
+expires = "2027-07-01"

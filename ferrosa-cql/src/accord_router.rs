@@ -86,6 +86,35 @@ pub fn route_decision(
     RouteDecision::Local
 }
 
+/// Resolve the *effective* serial consistency that signals a linearizable,
+/// Accord-routed operation — the signal [`route_decision`] keys on.
+///
+/// There is no separate "serial read" verb in CQL: a client requests a
+/// linearizable read by issuing the statement at a regular consistency of
+/// `SERIAL` / `LOCAL_SERIAL`. LWT writes additionally carry an explicit
+/// serial-consistency field. Either is a request for Accord linearizability, so
+/// this collapses both into one signal:
+///
+/// - an explicit serial-consistency flag (`explicit_serial`) always wins;
+/// - otherwise a regular consistency of `SERIAL` / `LOCAL_SERIAL` is itself the
+///   signal;
+/// - any other regular consistency is a non-linearizable (tunable-CL) request.
+///
+/// Invariant: the result is `Some` iff the request must route through Accord for
+/// linearizability. It never fabricates a serial level from a normal CL.
+pub fn effective_serial_consistency(
+    consistency: ConsistencyLevel,
+    explicit_serial: Option<ConsistencyLevel>,
+) -> Option<ConsistencyLevel> {
+    if let Some(sc) = explicit_serial {
+        return Some(sc);
+    }
+    match consistency {
+        ConsistencyLevel::Serial | ConsistencyLevel::LocalSerial => Some(consistency),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LWT condition evaluation
 // ---------------------------------------------------------------------------
@@ -604,6 +633,78 @@ mod tests {
             route_decision(RoutingMode::Cluster, &ddl, Some(ConsistencyLevel::Serial)),
             RouteDecision::Local,
             "DDL must not route through Accord even in cluster mode"
+        );
+    }
+
+    #[test]
+    fn regular_serial_consistency_is_the_linearizable_read_signal() {
+        // A CQL client requests a linearizable read by issuing the SELECT at a
+        // regular consistency of SERIAL / LOCAL_SERIAL (there is no separate
+        // "serial read" verb). ferrosa must treat that regular consistency as the
+        // effective serial-consistency signal so the read routes through Accord.
+        assert_eq!(
+            effective_serial_consistency(ConsistencyLevel::Serial, None),
+            Some(ConsistencyLevel::Serial),
+            "regular SERIAL is a linearizable-read signal"
+        );
+        assert_eq!(
+            effective_serial_consistency(ConsistencyLevel::LocalSerial, None),
+            Some(ConsistencyLevel::LocalSerial),
+            "regular LOCAL_SERIAL is a linearizable-read signal"
+        );
+    }
+
+    #[test]
+    fn non_serial_regular_consistency_is_not_linearizable() {
+        // A normal read/write consistency does NOT request linearizability.
+        assert_eq!(
+            effective_serial_consistency(ConsistencyLevel::Quorum, None),
+            None
+        );
+        assert_eq!(
+            effective_serial_consistency(ConsistencyLevel::One, None),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_serial_consistency_flag_passes_through() {
+        // An LWT write carries an explicit serial_consistency alongside a normal
+        // regular consistency; that explicit signal must win.
+        assert_eq!(
+            effective_serial_consistency(ConsistencyLevel::One, Some(ConsistencyLevel::Serial)),
+            Some(ConsistencyLevel::Serial),
+            "explicit serial_consistency takes precedence over a non-serial regular CL"
+        );
+    }
+
+    #[test]
+    fn serial_select_routes_through_accord_end_to_end() {
+        // The whole point: a SELECT issued at regular SERIAL consistency routes to
+        // Accord for a linearizable read.
+        let select = Statement::Select(SelectStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            columns: vec![SelectColumn::Star],
+            distinct: false,
+            where_clauses: vec![WhereClause {
+                column: "id".into(),
+                op: ComparisonOp::Eq,
+                value: Term::IntegerLiteral(1),
+                token_fn: false,
+            }],
+            order_by: vec![],
+            limit: None,
+            allow_filtering: false,
+            ann_of: None,
+            geo_nearest: None,
+            geo_predicates: vec![],
+        });
+        let serial = effective_serial_consistency(ConsistencyLevel::Serial, None);
+        assert_eq!(
+            route_decision(RoutingMode::Cluster, &select, serial),
+            RouteDecision::Accord,
+            "SELECT at regular SERIAL must route through Accord"
         );
     }
 

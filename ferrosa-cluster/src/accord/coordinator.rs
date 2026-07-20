@@ -1455,30 +1455,49 @@ impl AccordCoordinatorDriver {
         // to reach F+1 total before returning the LWT result.
         // ------------------------------------------------------------------
 
-        // Coordinator's OWN replica apply. Its self-send is unreachable, so apply
-        // the committed mutation locally here (mirroring a remote replica's
-        // handle_apply) before counting the implicit ack. Without this the
-        // coordinator node never persists what it coordinates. Fail loud: a local
-        // apply error must abort, never fake the implicit ack.
+        // Coordinator's OWN replica Commit + Apply. A node is never in its own
+        // peer map, so its self-addressed Commit/Apply RPCs are unreachable — it
+        // must drive its OWN state machine through the same Commit → Apply path a
+        // remote replica takes on receiving `AccordCommit` + `AccordApply`. Doing
+        // so (a) persists the mutation via the dep-ordered apply engine and, just
+        // as importantly, (b) advances the SM to `Applied` and fires the
+        // applied-notify. Without (b) a later linearizable read served by THIS node
+        // dep-waits forever on a conflict that is durably written but never marked
+        // Applied in the SM (the read-visibility bug: committed writes invisible to
+        // a subsequent SERIAL read on the coordinator).
+        //
+        // When the SM is present (production cluster) it is the single apply path —
+        // its apply engine is idempotent on `(txn_id, key, t)`, so there is no
+        // double-apply. The bare `local_applier` fallback is for tests / no-SM
+        // setups that persist but have no state machine to advance.
         if self_is_replica {
-            if let Some(applier) = &self.local_applier {
-                // Apply every write in the write-set that THIS node owns, as one
-                // atomic write-set (all-or-nothing). For a single-key / single-
-                // shard txn this is the whole set; with a multi-shard resolver it
-                // is only the coordinator's owned keys.
-                let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
-                let owned: Vec<crate::accord::apply::ApplyMutation> = self
-                    .write_set
-                    .iter()
-                    .filter(|e| !e.mutation.is_empty())
-                    .filter(|e| self.replica_owns_key(self_id, &e.key))
-                    .map(|e| crate::accord::apply::ApplyMutation {
-                        data: e.mutation.clone(),
-                        t: commit_t,
-                        deps: deps.clone(),
-                    })
-                    .collect();
-                if !owned.is_empty() {
+            let owned_writes: Vec<Vec<u8>> = self
+                .write_set
+                .iter()
+                .filter(|e| !e.mutation.is_empty())
+                .filter(|e| self.replica_owns_key(self_id, &e.key))
+                .map(|e| e.mutation.clone())
+                .collect();
+            if !owned_writes.is_empty() {
+                if let Some(local_sm) = &self.local_accord_state {
+                    let mut sm = local_sm.lock();
+                    // Commit then apply on this node's own state machine, mirroring
+                    // the `handle_commit` + `handle_apply_writeset` RPC handlers.
+                    sm.handle_commit(txn_id, t0, commit_t, commit_deps.iter().copied().collect());
+                    sm.handle_apply_writeset(txn_id, owned_writes);
+                } else if let Some(applier) = &self.local_applier {
+                    let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
+                    let owned: Vec<crate::accord::apply::ApplyMutation> = self
+                        .write_set
+                        .iter()
+                        .filter(|e| !e.mutation.is_empty())
+                        .filter(|e| self.replica_owns_key(self_id, &e.key))
+                        .map(|e| crate::accord::apply::ApplyMutation {
+                            data: e.mutation.clone(),
+                            t: commit_t,
+                            deps: deps.clone(),
+                        })
+                        .collect();
                     applier.apply_writeset(txn_id, owned).map_err(|e| {
                         AccordDriverError::Network(format!("coordinator local apply failed: {e}"))
                     })?;

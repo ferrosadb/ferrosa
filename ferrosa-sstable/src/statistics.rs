@@ -163,6 +163,18 @@ pub struct SerializationHeader {
     pub static_columns: Vec<(Vec<u8>, String)>,
     /// Regular columns: (name bytes, CQL type string).
     pub regular_columns: Vec<(Vec<u8>, String)>,
+    /// Whether non-frozen collection / UDT columns are stored as Cassandra's
+    /// per-element **complex** cells (cell-count + cell-paths) rather than
+    /// Ferrosa's legacy **whole-value** single cell. Carried on the header so it
+    /// flows to every `DataReader`/`SSTableWriter` uniformly (a per-SSTable
+    /// format switch). `false` = legacy whole-value (Ferrosa's current writes);
+    /// Cassandra-sourced SSTables are complex → set `true` when reading them.
+    ///
+    /// NOT YET serialized to the binary Statistics.db (like `max_timestamp`);
+    /// defaults `false` on read. Persisting it is deferred to when Ferrosa itself
+    /// writes complex collections (D-write) so old whole-value and new complex
+    /// SSTables coexist on the native read path (t_b7cec413).
+    pub complex_collections: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +441,9 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
         regular_columns.push((name, typ));
     }
 
-    // Ferrosa extension: max_timestamp appended after standard Cassandra
-    // fields. If the data has remaining bytes, read it; otherwise fall back
-    // to the sentinel value (when reading Cassandra-produced SSTables).
+    // Ferrosa extensions appended after the standard Cassandra fields:
+    // `[max_timestamp uvint]?[complex_collections byte]?`. Absent → defaults
+    // (Cassandra-produced SSTables lack both).
     let max_timestamp = if pos < data.len() {
         read_uvint_u64(data, &mut pos)
             .ok()
@@ -439,8 +451,11 @@ pub fn read_serialization_header(data: &[u8]) -> Result<SerializationHeader> {
     } else {
         i64::MAX
     };
+    // A trailing byte after max_timestamp is the complex_collections flag.
+    let complex_collections = pos < data.len() && data[pos] != 0;
 
     Ok(SerializationHeader {
+        complex_collections,
         min_timestamp,
         min_local_deletion_time,
         min_ttl,
@@ -504,13 +519,20 @@ pub fn write_serialization_header(h: &SerializationHeader) -> Vec<u8> {
         write_vint_prefixed_string(&mut out, typ);
     }
 
-    // Ferrosa extension: max_timestamp, appended after standard Cassandra
-    // fields so that Cassandra-produced SSTables (which lack this field)
-    // can still be read.
-    if h.max_timestamp != i64::MAX {
+    // Ferrosa extensions, appended after the standard Cassandra fields so a
+    // Cassandra-produced SSTable (which lacks them) still reads (they default on
+    // read). Layout is `[max_timestamp uvint]?[complex_collections byte]?`, in
+    // this order. `complex_collections` is written as a single trailing byte
+    // ONLY when true; when it is written, `max_timestamp` is ALSO written (even
+    // if `i64::MAX`) so the reader never mistakes the complex byte for the
+    // max_timestamp vint.
+    if h.max_timestamp != i64::MAX || h.complex_collections {
         let max_ts_delta = h.max_timestamp.wrapping_sub(TIMESTAMP_EPOCH) as u64;
         let n = varint::write_unsigned_vint(&mut vbuf, max_ts_delta);
         out.extend_from_slice(&vbuf[..n]);
+    }
+    if h.complex_collections {
+        out.push(1u8);
     }
 
     out
@@ -686,6 +708,7 @@ mod tests {
     /// Helper: build a sample `SerializationHeader`.
     fn sample_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_700_000_000_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -744,11 +767,47 @@ mod tests {
         assert_eq!(decoded.clustering_types, original.clustering_types);
         assert_eq!(decoded.static_columns, original.static_columns);
         assert_eq!(decoded.regular_columns, original.regular_columns);
+        // Default (whole-value) round-trips as false.
+        assert!(!decoded.complex_collections);
+    }
+
+    /// `complex_collections` persists through Statistics.db (the per-SSTable
+    /// format switch), for both `max_timestamp` present and absent.
+    #[test]
+    fn serialization_header_complex_collections_round_trips() {
+        for max_timestamp in [i64::MAX, 1_700_000_000_000] {
+            for complex in [false, true] {
+                let mut h = sample_header();
+                h.max_timestamp = max_timestamp;
+                h.complex_collections = complex;
+                let decoded = read_serialization_header(&write_serialization_header(&h)).unwrap();
+                assert_eq!(
+                    decoded.complex_collections, complex,
+                    "complex={complex} max_timestamp={max_timestamp}"
+                );
+                assert_eq!(decoded.max_timestamp, max_timestamp);
+            }
+        }
+    }
+
+    /// A Cassandra-produced header (no Ferrosa extension bytes) decodes with
+    /// `complex_collections = false` (its collection-ness is derived elsewhere).
+    #[test]
+    fn cassandra_header_without_extensions_defaults_false() {
+        // Encode only the standard Cassandra fields (max=MAX, complex=false → no
+        // trailing extension bytes are written).
+        let mut h = sample_header();
+        h.max_timestamp = i64::MAX;
+        h.complex_collections = false;
+        let decoded = read_serialization_header(&write_serialization_header(&h)).unwrap();
+        assert!(!decoded.complex_collections);
+        assert_eq!(decoded.max_timestamp, i64::MAX);
     }
 
     #[test]
     fn serialization_header_empty_columns() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: TIMESTAMP_EPOCH,
             min_local_deletion_time: DELETION_TIME_EPOCH,
             min_ttl: 0,
@@ -772,6 +831,7 @@ mod tests {
     fn serialization_header_live_partition_values() {
         // i32::MAX for local_deletion_time means "live" (no deletion).
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: TIMESTAMP_EPOCH + 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -795,6 +855,7 @@ mod tests {
         // panic on subtraction. This happens during load tests where synthetic
         // timestamps are small integers (e.g., 1000).
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1000,        // << TIMESTAMP_EPOCH
             min_local_deletion_time: 0, // << DELETION_TIME_EPOCH
             min_ttl: 0,
@@ -868,6 +929,7 @@ mod tests {
             compaction: CompactionMetadata { data: vec![] },
             stats: StatsMetadata { data: vec![] },
             header: SerializationHeader {
+                complex_collections: false,
                 min_timestamp: TIMESTAMP_EPOCH,
                 min_local_deletion_time: DELETION_TIME_EPOCH,
                 min_ttl: 0,
@@ -887,6 +949,7 @@ mod tests {
     #[test]
     fn simple_bti_stats_metadata_records_key_range_and_counts() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
