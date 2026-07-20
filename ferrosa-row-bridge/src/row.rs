@@ -691,13 +691,15 @@ mod tests {
     }
 
     /// A set with a removal tombstone: the read path reconciles per path (LWW),
-    /// so the removed element does not resurrect.
+    /// so the removed element does not resurrect. Cells reaching the read path
+    /// are already one-per-path (the merge reconciled `a`'s live+tombstone into a
+    /// tombstone), so the input here is `b` live + `a` tombstoned.
     #[test]
     fn primary_read_path_reconciles_set_removal() {
         let mut cells: Vec<(u16, CellValue)> = Vec::new();
         for c in build_collection_cells(
             CollectionOp::Add,
-            &CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]),
+            &CqlValue::Set(vec![CqlValue::Text("b".into())]),
             100,
         )
         .unwrap()

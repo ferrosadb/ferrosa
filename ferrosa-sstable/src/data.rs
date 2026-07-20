@@ -82,14 +82,27 @@ const CELL_USE_ROW_TTL: u8 = 0x10;
 /// collection is *complex* (multi-cell): its element cells carry a cell-path and
 /// their value is serialized with the collection's element/value type. Anything
 /// else is *simple*: one cell, value serialized with the column type itself.
-fn complex_col_meta(column_type: &str) -> (bool, String) {
-    if marshal::is_multicell_collection(column_type) {
+fn complex_col_meta(column_type: &str, complex_collections: bool) -> (bool, String) {
+    if complex_collections && marshal::is_multicell_collection(column_type) {
         let value_type = marshal::collection_value_type(column_type)
             .unwrap_or(column_type)
             .to_string();
         (true, value_type)
     } else {
         (false, column_type.to_string())
+    }
+}
+
+/// Represent a non-live complex `DeletionTime` as a `path == None` tombstone
+/// cell — the collection-level tombstone that flows through the `(col, path)`
+/// merge and is applied at read-assembly. `LIVE` (or absent) yields nothing.
+fn complex_deletion_sentinel(dt: Option<DeletionTime>) -> Option<CellValue> {
+    match dt {
+        Some(d) if !d.is_live() => Some(CellValue::tombstone(
+            d.marked_for_delete_at,
+            d.local_deletion_time as i32,
+        )),
+        _ => None,
     }
 }
 
@@ -117,6 +130,12 @@ pub struct DataReader<'a, R: ReadAt> {
     header: &'a SerializationHeader,
     pos: u64,
     legacy_fixed_value_lengths: bool,
+    /// Whether non-frozen collection columns are stored as Cassandra's per-element
+    /// **complex** cells (cell-count + cell-paths). `false` (the default) reads
+    /// Ferrosa's legacy **whole-value** single-cell collection storage. Must match
+    /// the writer's [`crate::writer::SSTableWriter::with_complex_collections`].
+    /// Cassandra-sourced SSTables are always complex → open with `true`.
+    complex_collections: bool,
 }
 
 impl<'a, R: ReadAt> DataReader<'a, R> {
@@ -127,7 +146,16 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             header,
             pos: start_pos,
             legacy_fixed_value_lengths: false,
+            complex_collections: false,
         }
+    }
+
+    /// Read non-frozen collection columns as Cassandra-style per-element (complex)
+    /// cells. Must match the writer's `with_complex_collections`; Cassandra
+    /// SSTables are always complex.
+    pub fn with_complex_collections(mut self, enabled: bool) -> Self {
+        self.complex_collections = enabled;
+        self
     }
 
     fn missing_partition_end_error() -> Error {
@@ -1191,7 +1219,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let col_meta: Vec<(usize, bool, String)> = present_columns
             .iter()
             .map(|&ci| {
-                let (is_complex, value_type) = complex_col_meta(&columns[ci].1);
+                let (is_complex, value_type) =
+                    complex_col_meta(&columns[ci].1, self.complex_collections);
                 (ci, is_complex, value_type)
             })
             .collect();
@@ -1203,7 +1232,10 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let mut cells = Vec::with_capacity(present_columns.len());
         for (col_idx, is_complex, value_type) in &col_meta {
             if *is_complex {
-                self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                let dt = self.read_complex_deletion(has_complex_deletion)?;
+                if let Some(sentinel) = complex_deletion_sentinel(dt) {
+                    cells.push((*col_idx as u16, sentinel));
+                }
                 let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 for _ in 0..count {
@@ -1226,23 +1258,32 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
     /// When the row flag `HAS_COMPLEX_DELETION` is set, every complex column in
     /// the row carries a leading complex `DeletionTime` (two unsigned-vint deltas
-    /// against the header mins). Ferrosa's `Row` has no per-column complex-deletion
-    /// slot, so this reads the bytes to stay aligned and discards the value.
+    /// against the header mins) before its cell count. Reads it and returns the
+    /// `DeletionTime` if the flag is set (which may be `LIVE`), or `None` if not.
     ///
-    /// LIMITATION (t_83c4f093 follow-up): a collection-level deletion from a
-    /// Cassandra overwrite (`SET v = {..}`) that has not yet been compacted away
-    /// will therefore not shadow older element cells living in other SSTables.
-    /// Compacted SSTables (the common import case) already have the deletion
-    /// applied, so this is correct for them.
-    fn skip_complex_deletion_if_present(&mut self, has_complex_deletion: bool) -> Result<()> {
+    /// The caller represents a *non-live* complex deletion as a `path == None`
+    /// tombstone cell at the column's index (a collection-level tombstone),
+    /// which flows through the `(col, path)` memtable/SSTable merge and is
+    /// applied at read-assembly. A `LIVE` complex deletion carries no
+    /// information and is dropped.
+    fn read_complex_deletion(
+        &mut self,
+        has_complex_deletion: bool,
+    ) -> Result<Option<DeletionTime>> {
         if !has_complex_deletion {
-            return Ok(());
+            return Ok(None);
         }
-        let (_ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        let (ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
-        let (_ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        let (ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
-        Ok(())
+        let marked_for_delete_at = self.header.min_timestamp.wrapping_add(ts_delta as i64);
+        let local_deletion_time =
+            (self.header.min_local_deletion_time as i64).wrapping_add(ldt_delta as i64) as u32;
+        Ok(Some(DeletionTime::new(
+            marked_for_delete_at,
+            local_deletion_time,
+        )))
     }
 
     /// Read the next partition with a column projection — only the
@@ -1414,12 +1455,13 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 };
                 let col_meta: Vec<(bool, String)> = present_columns
                     .iter()
-                    .map(|&ci| complex_col_meta(&columns[ci].1))
+                    .map(|&ci| complex_col_meta(&columns[ci].1, self.complex_collections))
                     .collect();
                 let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
                 for (is_complex, value_type) in &col_meta {
                     if *is_complex {
-                        self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                        // Skip-all path: consume the complex deletion, emit nothing.
+                        self.read_complex_deletion(has_complex_deletion)?;
                         let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                         self.pos += n as u64;
                         for _ in 0..count {
@@ -1455,7 +1497,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         let col_meta: Vec<(usize, bool, String)> = present_columns
             .iter()
             .map(|&ci| {
-                let (is_complex, value_type) = complex_col_meta(&columns[ci].1);
+                let (is_complex, value_type) =
+                    complex_col_meta(&columns[ci].1, self.complex_collections);
                 (ci, is_complex, value_type)
             })
             .collect();
@@ -1471,7 +1514,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             let col_u16 = *col_idx as u16;
             let want = wanted.contains(&col_u16);
             if *is_complex {
-                self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                let dt = self.read_complex_deletion(has_complex_deletion)?;
+                if want {
+                    if let Some(sentinel) = complex_deletion_sentinel(dt) {
+                        cells.push((col_u16, sentinel));
+                    }
+                }
                 let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 for _ in 0..count {

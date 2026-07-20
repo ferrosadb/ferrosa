@@ -178,6 +178,8 @@ const HAS_TTL: u8 = 0x08;
 const HAS_DELETION: u8 = 0x10;
 /// All columns in the schema are present (no missing-column bitmap).
 const HAS_ALL_COLUMNS: u8 = 0x20;
+/// At least one complex column in the row has a complex `DeletionTime`.
+const HAS_COMPLEX_DELETION: u8 = 0x40;
 /// Extended flags byte follows.
 const EXTENSION_FLAG: u8 = 0x80;
 /// Extended flag: this row is a static row.
@@ -315,6 +317,13 @@ pub struct SSTableWriter {
     total_rows: u64,
     /// Number of regular/static cells written to Data.db.
     total_columns_set: u64,
+    /// Whether non-frozen collection columns are stored as Cassandra's
+    /// per-element **complex** cells (cell-count + cell-paths). `false` (the
+    /// default) keeps Ferrosa's legacy **whole-value** single-cell storage, where
+    /// a `list`/`set`/`map` column is one cell whose value is the entire encoded
+    /// collection. The reader must be opened with the matching flag. This is a
+    /// lightweight per-writer format switch until a persisted format version lands.
+    complex_collections: bool,
 }
 
 impl SSTableWriter {
@@ -337,7 +346,16 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
+            complex_collections: false,
         }
+    }
+
+    /// Enable Cassandra-style per-element (complex) storage of non-frozen
+    /// collection columns. Must match the reader's
+    /// [`DataReader::with_complex_collections`].
+    pub fn with_complex_collections(mut self, enabled: bool) -> Self {
+        self.complex_collections = enabled;
+        self
     }
 
     /// Create an SSTable writer whose Data.db serialization buffer is backed
@@ -362,6 +380,7 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
+            complex_collections: false,
         })
     }
 
@@ -927,6 +946,11 @@ impl SSTableWriter {
         // body bytes and the reader's parse position would drift, silently
         // corrupting every row after the first drift.
         let mut prev_idx: Option<u16> = None;
+        // A complex column may carry one `path == None` tombstone — the
+        // collection-level deletion sentinel. Any such cell sets the row-level
+        // HAS_COMPLEX_DELETION flag (all-or-nothing: every complex column then
+        // writes a DeletionTime, LIVE for those without a sentinel).
+        let mut has_complex_deletion = false;
         for (idx, cell) in &row.cells {
             assert!(
                 (*idx as usize) < num_columns,
@@ -935,7 +959,8 @@ impl SSTableWriter {
                 idx,
                 num_columns
             );
-            let is_complex = crate::marshal::is_multicell_collection(&column_defs[*idx as usize].1);
+            let is_complex = self.complex_collections
+                && crate::marshal::is_multicell_collection(&column_defs[*idx as usize].1);
             match prev_idx {
                 Some(p) if *idx < p => panic!(
                     "SSTable writer: row.cells must be sorted by col_idx (found {idx} after {p})"
@@ -947,14 +972,23 @@ impl SSTableWriter {
                 ),
                 _ => {}
             }
-            // A complex column's cells must carry a path; a simple column's must not.
-            assert_eq!(
-                cell.path.is_some(),
-                is_complex,
-                "SSTable writer: col_idx {idx} path presence ({}) does not match its \
-                 complex-ness ({is_complex})",
-                cell.path.is_some(),
-            );
+            if is_complex {
+                // Element cell (path present) or collection-deletion sentinel
+                // (path absent, must be a tombstone).
+                if cell.path.is_none() {
+                    assert!(
+                        cell.is_tombstone(),
+                        "SSTable writer: complex col_idx {idx} path=None cell must be a \
+                         collection-deletion tombstone"
+                    );
+                    has_complex_deletion = true;
+                }
+            } else {
+                assert!(
+                    cell.path.is_none(),
+                    "SSTable writer: simple col_idx {idx} must not carry a cell path"
+                );
+            }
             prev_idx = Some(*idx);
         }
 
@@ -969,6 +1003,9 @@ impl SSTableWriter {
             && present_columns.iter().enumerate().all(|(i, c)| *c == i);
         if all_present {
             flags |= HAS_ALL_COLUMNS;
+        }
+        if has_complex_deletion {
+            flags |= HAS_COMPLEX_DELETION;
         }
 
         // Set EXTENSION_FLAG if we have extended flags
@@ -1068,18 +1105,37 @@ impl SSTableWriter {
         while i < row.cells.len() {
             let col_idx = row.cells[i].0;
             let column_type = &column_defs[col_idx as usize].1;
-            if crate::marshal::is_multicell_collection(column_type) {
+            if self.complex_collections && crate::marshal::is_multicell_collection(column_type) {
                 let mut j = i;
                 while j < row.cells.len() && row.cells[j].0 == col_idx {
                     j += 1;
                 }
+                // Split the collection-deletion sentinel (path=None tombstone)
+                // from the element cells (path present).
+                let sentinel = row.cells[i..j].iter().find(|(_, c)| c.path.is_none());
+                let mut elements: Vec<&CellValue> = row.cells[i..j]
+                    .iter()
+                    .filter(|(_, c)| c.path.is_some())
+                    .map(|(_, c)| c)
+                    .collect();
                 // Element cells are stored in cell-path order.
-                let mut group: Vec<&CellValue> = row.cells[i..j].iter().map(|(_, c)| c).collect();
-                group.sort_by(|a, b| a.path.cmp(&b.path));
-                push_unsigned_vint_to(&mut row_body, group.len() as u64);
+                elements.sort_by(|a, b| a.path.cmp(&b.path));
+                // When the row flag is set, EVERY complex column writes a
+                // DeletionTime — its sentinel's, or LIVE if it has none.
+                if has_complex_deletion {
+                    let dt = match sentinel {
+                        Some((_, c)) => crate::types::DeletionTime::new(
+                            c.timestamp,
+                            c.local_deletion_time as u32,
+                        ),
+                        None => crate::types::DeletionTime::LIVE,
+                    };
+                    write_complex_deletion(&mut row_body, dt, &self.header);
+                }
+                push_unsigned_vint_to(&mut row_body, elements.len() as u64);
                 let value_type =
                     crate::marshal::collection_value_type(column_type).unwrap_or(column_type);
-                for cell in group {
+                for cell in elements {
                     serialize_cell(&mut row_body, cell, row, &self.header, value_type, true);
                 }
                 i = j;
@@ -1615,6 +1671,22 @@ fn serialize_cell(
             buf.extend_from_slice(value);
         }
     }
+}
+
+/// Write a complex-column `DeletionTime` as two unsigned-vint deltas against the
+/// header mins (`markedForDeleteAt - minTimestamp`, `localDeletionTime -
+/// minLocalDeletionTime`). Wrapping arithmetic is used so a `LIVE` deletion
+/// (`i64::MIN` / `u32::MAX`) round-trips through the reader's wrapping add.
+fn write_complex_deletion(
+    buf: &mut Vec<u8>,
+    dt: crate::types::DeletionTime,
+    header: &SerializationHeader,
+) {
+    let ts_delta = dt.marked_for_delete_at.wrapping_sub(header.min_timestamp) as u64;
+    push_unsigned_vint_to(buf, ts_delta);
+    let ldt_delta =
+        (dt.local_deletion_time as i64).wrapping_sub(header.min_local_deletion_time as i64) as u64;
+    push_unsigned_vint_to(buf, ldt_delta);
 }
 
 /// Write an unsigned varint to a Vec buffer.
