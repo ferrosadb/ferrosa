@@ -1639,7 +1639,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.pos += plen;
         }
         if !has_empty_value {
-            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
+            let vlen = if is_complex {
+                // Collection element values are always length-prefixed.
+                let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                vlen
+            } else if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {
                     let saved = self.pos;
                     let (encoded_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1784,6 +1789,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // element/value type for a complex column, the column type for a simple one.
         let value = if has_empty_value {
             None
+        } else if is_complex {
+            // A collection element value is always length-prefixed (uvint), even
+            // when its element type is fixed-width — matching Cassandra.
+            let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            Some(self.read_value_bytes(vlen as usize, "cell value")?)
         } else {
             let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {

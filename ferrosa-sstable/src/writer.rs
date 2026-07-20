@@ -1597,7 +1597,13 @@ fn serialize_cell(
                  this is a bug in the write path, not user data",
                 value.len()
             );
-            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(value_type) {
+            // A collection element value is ALWAYS length-prefixed, even for a
+            // fixed-width element type (Cassandra serializes `list<int>` /
+            // `map<k,int>` values with a uvint length). The fixed-width raw-bytes
+            // optimization applies only to simple (scalar) columns.
+            if is_complex {
+                push_unsigned_vint_to(buf, value.len() as u64);
+            } else if let Some(fixed_len) = crate::marshal::value_length_if_fixed(value_type) {
                 assert!(
                     value.len() == fixed_len,
                     "SSTable writer: fixed-width column {value_type} expects {fixed_len} bytes, got {}",

@@ -310,6 +310,97 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
     assert!(reader.read_partition().unwrap().is_none());
 }
 
+/// THE compatibility gate: read a `Data.db` produced by a real Cassandra 5.0
+/// (`nb-big` format, uncompressed) for a table with non-frozen `list<int>`,
+/// `set<text>`, and `map<text,int>` columns, and confirm ferrosa parses the
+/// complex-column cells — proving Cassandra collection SSTables are importable.
+///
+/// This caught (and now guards against) a real byte-format bug: Cassandra
+/// length-prefixes a collection element value even for a fixed-width element
+/// type (`list<int>` values carry a `uvint(4)` prefix). It also exercises the
+/// `HAS_COMPLEX_DELETION` path — a plain collection INSERT writes a complex
+/// deletion before each collection column's cell count.
+#[test]
+fn read_real_cassandra_collections() {
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+
+    let data = std::fs::read(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cassandra_collections/Data.db"),
+    )
+    .expect("cassandra_collections fixture Data.db");
+
+    // Storage column order is alphabetical: l, m, s. min_* only affect timestamp
+    // VALUES (deltas are uvints either way), not byte alignment or the element
+    // paths/values we assert here.
+    let header = SerializationHeader {
+        min_timestamp: 0,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![
+            (
+                b"l".to_vec(),
+                "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+            (
+                b"m".to_vec(),
+                "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+            (
+                b"s".to_vec(),
+                "org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            ),
+        ],
+    };
+
+    let mut reader = DataReader::new(&data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("row1 partition");
+    assert_eq!(p.key.key.as_bytes(), b"row1");
+    let cells = &p.rows[0].cells;
+
+    // Column ordinals: l=0, m=1, s=2 (storage order).
+    let list: Vec<i32> = cells
+        .iter()
+        .filter(|(i, _)| *i == 0)
+        .filter_map(|(_, c)| c.value.as_deref())
+        .map(|v| i32::from_be_bytes(v.try_into().unwrap()))
+        .collect();
+    assert_eq!(list, vec![10, 20, 30], "list<int> elements parse in order");
+
+    let mut map: Vec<(String, i32)> = cells
+        .iter()
+        .filter(|(i, _)| *i == 1)
+        .map(|(_, c)| {
+            let k = String::from_utf8(c.path.clone().unwrap()).unwrap();
+            let v = i32::from_be_bytes(c.value.as_deref().unwrap().try_into().unwrap());
+            (k, v)
+        })
+        .collect();
+    map.sort();
+    assert_eq!(
+        map,
+        vec![("k1".into(), 1), ("k2".into(), 2)],
+        "map<text,int> parses"
+    );
+
+    let mut set: Vec<String> = cells
+        .iter()
+        .filter(|(i, _)| *i == 2)
+        .map(|(_, c)| String::from_utf8(c.path.clone().unwrap()).unwrap())
+        .collect();
+    set.sort();
+    assert_eq!(
+        set,
+        vec!["a", "b", "c"],
+        "set<text> elements parse from paths"
+    );
+}
+
 /// A non-frozen `list<int>` column stores each element as its own cell sharing
 /// the column's storage index, distinguished by a 16-byte TimeUUID cell path
 /// (Cassandra's complex-column layout). Two appended elements must round-trip
