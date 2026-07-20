@@ -1139,9 +1139,14 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     let mut max_timestamp = i64::MIN;
     let mut min_local_deletion_time = NO_DELETION_TIME;
     let mut min_ttl = NO_TTL;
+    // Propagate complex-collection framing: if ANY input SSTable stores complex
+    // (per-element) columns, the compacted output must too, or the merged cell
+    // paths would be dropped and the collection corrupted (D-write, t_83c4f093).
+    let mut has_complex = false;
 
     for r in readers {
         let h = r.header();
+        has_complex |= h.complex_collections;
         if h.min_timestamp != NO_TIMESTAMP
             && (min_timestamp == NO_TIMESTAMP || h.min_timestamp < min_timestamp)
         {
@@ -1166,7 +1171,7 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     }
 
     SerializationHeader {
-        complex_collections: false,
+        complex_collections: has_complex,
         min_timestamp,
         max_timestamp,
         min_local_deletion_time,
