@@ -25,6 +25,7 @@
 //!   clustering key decoders.
 
 pub mod codec;
+pub mod collection;
 pub mod row;
 
 /// Error returned by the fallible row-bridge functions (`decode_value`,
@@ -71,3 +72,13 @@ pub use row::{
 // Liveness helpers are re-exported for `ferrosa-cql`'s remaining metadata
 // decomposition variants, which still live in `ferrosa-cql` but reuse these.
 pub use row::{cell_is_live, ldt_is_expired};
+
+// Collection (CRDT per-element) cell encoding/assembly. Lives here (not in
+// `ferrosa-cql`) because both the write builder and the read assembly use this
+// crate's `encode_value`/`decode_value` codecs and `ferrosa_common::reconcile`,
+// and the primary SELECT read path (`row::decode_output_row`) must call the
+// assembly directly. `ferrosa-cql::collection_cells` re-exports these.
+pub use collection::{
+    assemble_collection, assemble_column_cells, build_collection_cells, list_cell_path,
+    timeuuid_time, AssembleError, CollectionOp, UnsupportedCollectionOp,
+};

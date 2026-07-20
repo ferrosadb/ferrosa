@@ -283,6 +283,15 @@ fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<Cq
     // Fill regular/static columns from cells. Cell indices are in storage
     // column space (0-based within static+regular columns); translate to
     // full-table column index via the mapping built above.
+    //
+    // Group cells by table column: a simple (scalar) column has one cell
+    // (path = None); a complex (collection) column has many cells sharing one
+    // storage index, distinguished by a per-element path (set element / map key
+    // / list TimeUUID). Complex columns are reconciled per path (CRDT LWW so a
+    // removed element cannot resurrect) and assembled back into the whole
+    // collection value — not decoded cell-by-cell as if each were the column.
+    let mut cells_by_col: std::collections::BTreeMap<usize, Vec<&CellValue>> =
+        std::collections::BTreeMap::new();
     for (col_index, cell) in &row.cells {
         let storage_idx = *col_index as usize;
         let table_idx = match context.storage_to_table.get(storage_idx) {
@@ -290,12 +299,30 @@ fn decode_output_row(row: &Row, context: &RowDecodeContext<'_>) -> Vec<Option<Cq
             None => continue,
         };
         if table_idx < context.column_types.len() {
-            if !cell_is_live(cell, context.now_secs) {
+            cells_by_col.entry(table_idx).or_default().push(cell);
+        }
+    }
+
+    for (table_idx, cells) in cells_by_col {
+        match crate::collection::assemble_column_cells(
+            &context.column_types[table_idx],
+            &cells,
+            context.now_secs,
+        ) {
+            Ok(value) => output_row[table_idx] = value,
+            Err(e) => {
+                // A complex column whose per-element cells cannot be assembled
+                // is logged loudly rather than silently dropped.
+                tracing::error!(
+                    column = context
+                        .column_names
+                        .get(table_idx)
+                        .map(String::as_str)
+                        .unwrap_or("?"),
+                    error = %e,
+                    "failed to assemble complex collection column from per-element cells",
+                );
                 output_row[table_idx] = None;
-            } else if let Some(ref value_bytes) = cell.value {
-                if let Ok(val) = decode_value(&context.column_types[table_idx], value_bytes) {
-                    output_row[table_idx] = Some(val);
-                }
             }
         }
     }
@@ -600,5 +627,122 @@ pub fn build_delete_row(
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::NONE,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::encode_value;
+    use crate::collection::{build_collection_cells, CollectionOp};
+
+    fn single_row_partition(cells: Vec<(u16, CellValue)>) -> Partition {
+        let dk = DecoratedKey::new(PartitionKey::new(encode_value(&CqlValue::Int(1))));
+        let row = Row {
+            clustering: vec![],
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        }
+    }
+
+    /// The primary SELECT read path assembles a complex `list` column from its
+    /// per-element cells (many cells at one storage index, each path-keyed) in
+    /// append order — rather than decoding each element cell as the whole column.
+    #[test]
+    fn primary_read_path_assembles_complex_list_in_append_order() {
+        let mut cells: Vec<(u16, CellValue)> = Vec::new();
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::List(vec![CqlValue::Int(10)]),
+            100,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::List(vec![CqlValue::Int(20)]),
+            200,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        let partition = single_row_partition(cells);
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::List(Box::new(CqlType::Int))],
+            &[0],
+            &[],
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::List(vec![CqlValue::Int(10), CqlValue::Int(20)])),
+        );
+    }
+
+    /// A set with a removal tombstone: the read path reconciles per path (LWW),
+    /// so the removed element does not resurrect.
+    #[test]
+    fn primary_read_path_reconciles_set_removal() {
+        let mut cells: Vec<(u16, CellValue)> = Vec::new();
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]),
+            100,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        for c in build_collection_cells(
+            CollectionOp::Sub,
+            &CqlValue::Set(vec![CqlValue::Text("a".into())]),
+            200,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        let partition = single_row_partition(cells);
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::Set(Box::new(CqlType::Varchar))],
+            &[0],
+            &[],
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::Set(vec![CqlValue::Text("b".into())]))
+        );
+    }
+
+    /// Backward compatibility: a legacy single-cell whole-value collection
+    /// (path = None) still decodes as the whole value.
+    #[test]
+    fn primary_read_path_legacy_whole_value_collection() {
+        let whole = encode_value(&CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)]));
+        let partition = single_row_partition(vec![(0, CellValue::live(whole, 100))]);
+        let rows = partition_to_rows(
+            &partition,
+            &["id".into(), "v".into()],
+            &[CqlType::Int, CqlType::List(Box::new(CqlType::Int))],
+            &[0],
+            &[],
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)])),
+        );
     }
 }

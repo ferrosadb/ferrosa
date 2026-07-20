@@ -856,6 +856,13 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
     let mut meta_result = Vec::new();
 
     let pk_values = decode_pk(&partition.key, pk_columns.len());
+    let now_secs = i32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i32::MAX);
 
     for row in &partition.rows {
         if !row.deletion.is_live() {
@@ -922,43 +929,22 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
                 ttl: newest.ttl,
             };
 
-            if cells.iter().any(|c| c.path.is_some()) {
-                // Per-element (complex) column: reconcile the cells by path
-                // (CRDT LWW — higher timestamp wins, tombstone wins a tie) so a
-                // removed element cannot resurrect, then assemble the survivors
-                // into the whole collection. A genuine assembly failure (corrupt
-                // paths, undecodable element) is logged loudly rather than
-                // silently returning None, which would hide data loss.
-                let mut by_path: std::collections::BTreeMap<Vec<u8>, ferrosa_common::CellValue> =
-                    std::collections::BTreeMap::new();
-                for &c in &cells {
-                    let key = c.path.clone().unwrap_or_default();
-                    by_path
-                        .entry(key)
-                        .and_modify(|e| *e = ferrosa_common::reconcile(e, c))
-                        .or_insert_with(|| c.clone());
-                }
-                let owned = by_path.into_values().collect::<Vec<_>>();
-                match crate::collection_cells::assemble_collection(&column_types[table_idx], &owned)
-                {
-                    Ok(val) => output_row[table_idx] = Some(val),
-                    Err(e) => {
-                        tracing::error!(
-                            column = column_names.get(table_idx).map(String::as_str).unwrap_or("?"),
-                            error = %e,
-                            "failed to assemble complex collection column from per-element cells",
-                        );
-                        output_row[table_idx] = None;
-                    }
-                }
-            } else if newest.is_tombstone() {
-                // Simple scalar column (or a legacy whole-value collection: a
-                // single path=None cell holding the entire encoded collection,
-                // which decodes as the whole value — the lazy dual-read path).
-                output_row[table_idx] = None;
-            } else if let Some(ref value_bytes) = newest.value {
-                if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
-                    output_row[table_idx] = Some(val);
+            // Value assembly is shared with the primary SELECT read path so the
+            // two cannot diverge (complex → reconcile-by-path + assemble; simple
+            // → newest live cell; legacy whole-value collection decodes whole).
+            match crate::collection_cells::assemble_column_cells(
+                &column_types[table_idx],
+                &cells,
+                now_secs,
+            ) {
+                Ok(value) => output_row[table_idx] = value,
+                Err(e) => {
+                    tracing::error!(
+                        column = column_names.get(table_idx).map(String::as_str).unwrap_or("?"),
+                        error = %e,
+                        "failed to assemble complex collection column from per-element cells",
+                    );
+                    output_row[table_idx] = None;
                 }
             }
         }
