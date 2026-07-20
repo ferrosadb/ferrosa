@@ -133,32 +133,21 @@ pub struct DataReader<'a, R: ReadAt> {
     header: &'a SerializationHeader,
     pos: u64,
     legacy_fixed_value_lengths: bool,
-    /// Whether non-frozen collection columns are stored as Cassandra's per-element
-    /// **complex** cells (cell-count + cell-paths). `false` (the default) reads
-    /// Ferrosa's legacy **whole-value** single-cell collection storage. Must match
-    /// the writer's [`crate::writer::SSTableWriter::with_complex_collections`].
-    /// Cassandra-sourced SSTables are always complex → open with `true`.
-    complex_collections: bool,
 }
 
 impl<'a, R: ReadAt> DataReader<'a, R> {
     /// Create a new `DataReader` starting at `start_pos` in the data file.
+    ///
+    /// Whether non-frozen collection / UDT columns are read as per-element
+    /// (complex) cells vs a legacy whole-value cell comes from
+    /// `header.complex_collections`.
     pub fn new(reader: &'a R, header: &'a SerializationHeader, start_pos: u64) -> Self {
         Self {
             reader,
             header,
             pos: start_pos,
             legacy_fixed_value_lengths: false,
-            complex_collections: false,
         }
-    }
-
-    /// Read non-frozen collection columns as Cassandra-style per-element (complex)
-    /// cells. Must match the writer's `with_complex_collections`; Cassandra
-    /// SSTables are always complex.
-    pub fn with_complex_collections(mut self, enabled: bool) -> Self {
-        self.complex_collections = enabled;
-        self
     }
 
     fn missing_partition_end_error() -> Error {
@@ -1223,7 +1212,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             .iter()
             .map(|&ci| {
                 let (is_complex, value_type) =
-                    complex_col_meta(&columns[ci].1, self.complex_collections);
+                    complex_col_meta(&columns[ci].1, self.header.complex_collections);
                 (ci, is_complex, value_type)
             })
             .collect();
@@ -1458,7 +1447,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 };
                 let col_meta: Vec<(bool, String)> = present_columns
                     .iter()
-                    .map(|&ci| complex_col_meta(&columns[ci].1, self.complex_collections))
+                    .map(|&ci| complex_col_meta(&columns[ci].1, self.header.complex_collections))
                     .collect();
                 let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
                 for (is_complex, value_type) in &col_meta {
@@ -1501,7 +1490,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             .iter()
             .map(|&ci| {
                 let (is_complex, value_type) =
-                    complex_col_meta(&columns[ci].1, self.complex_collections);
+                    complex_col_meta(&columns[ci].1, self.header.complex_collections);
                 (ci, is_complex, value_type)
             })
             .collect();
@@ -1909,6 +1898,7 @@ mod tests {
     /// Build a minimal serialization header for testing.
     fn test_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -1976,6 +1966,7 @@ mod tests {
     #[test]
     fn corrupt_clustering_length_is_rejected_before_alloc() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2148,6 +2139,7 @@ mod tests {
     fn read_partition_with_deleted_cell() {
         // Use a header where min_local_deletion_time allows positive unsigned deltas
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 50,
             min_ttl: 0,
@@ -2241,6 +2233,7 @@ mod tests {
     fn read_partition_with_row_deletion() {
         // Use a header where min_local_deletion_time allows positive unsigned deltas
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -2307,6 +2300,7 @@ mod tests {
     fn read_partition_with_missing_columns() {
         // Header with 2 regular columns
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2377,6 +2371,7 @@ mod tests {
     #[test]
     fn read_partition_accepts_legacy_raw_present_column_bitmap() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2435,6 +2430,7 @@ mod tests {
     #[test]
     fn legacy_raw_bitmap_rows_accept_fixed_width_value_length_prefixes() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2485,6 +2481,7 @@ mod tests {
     #[test]
     fn read_partition_without_clustering_columns_starts_at_row_body_length() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2531,6 +2528,7 @@ mod tests {
     #[test]
     fn read_projected_without_clustering_columns_accepts_legacy_empty_prefix() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2589,6 +2587,7 @@ mod tests {
     #[test]
     fn read_partition_with_fixed_width_cell_without_value_length_prefix() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2643,6 +2642,7 @@ mod tests {
     #[test]
     fn projected_empty_projection_skips_sparse_row_body_without_cell_decode() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2771,6 +2771,7 @@ mod tests {
     fn read_partition_with_delta_decoded_timestamps() {
         // Use non-trivial min_timestamp to verify delta decoding
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_700_000_000_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,

@@ -1281,6 +1281,7 @@ mod tests {
     /// Build a test SerializationHeader with one regular column.
     fn test_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,

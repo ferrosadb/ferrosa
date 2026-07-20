@@ -112,6 +112,7 @@ mod cell_roundtrip {
 
     fn make_header(min_ts: i64, min_ldt: i32, min_ttl: i32) -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: min_ts,
             min_local_deletion_time: min_ldt,
             min_ttl,
@@ -263,6 +264,7 @@ mod cell_roundtrip {
         ) {
             let header = make_header(1_000_000, 0, 0);
             let header_with_ck = SerializationHeader {
+            complex_collections: false,
                 clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
                 ..header
             };
@@ -338,6 +340,7 @@ mod reader_fuzz {
 
     fn default_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 0,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -354,6 +357,7 @@ mod reader_fuzz {
 
     fn header_with_clustering() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             clustering_types: vec!["org.apache.cassandra.db.marshal.Int32Type".into()],
             ..default_header()
         }
@@ -487,6 +491,7 @@ mod reader_fuzz {
             use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
             let header = SerializationHeader {
+            complex_collections: false,
                 min_timestamp: 1_000_000,
                 min_local_deletion_time: 0,
                 min_ttl: 0,

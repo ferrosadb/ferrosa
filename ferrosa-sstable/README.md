@@ -64,11 +64,14 @@ resolution beyond the serialization header, or cluster routing.
   `ferrosa_row_bridge::collection::assemble_udt`. A complex `DeletionTime` (from a
   collection/UDT overwrite) is now captured as a `path=None` tombstone sentinel,
   round-trips writer↔reader, and is applied at assembly. Complex framing is gated
-  on the `complex_collections` flag (`SSTableWriter`/`DataReader::with_complex_collections`),
-  default `false` = Ferrosa's legacy whole-value storage; Cassandra import opts in.
-  Still deferred: **tuple** complex columns, and a *persisted* format version so
-  Ferrosa's own complex writes and legacy whole-value SSTables coexist on one read
-  path (the flag is a stopgap — t_b7cec413). Tracked in t_83c4f093.
+  on `SerializationHeader.complex_collections`, default `false` = Ferrosa's legacy
+  whole-value storage; Cassandra import sets it `true`. Living on the header, it
+  flows to every `DataReader`/`SSTableWriter` uniformly (a per-SSTable format
+  switch). Still deferred: **tuple** complex columns, and *serializing*
+  `complex_collections` into Statistics.db — it is currently non-persisted (like
+  `max_timestamp`), defaulting `false` on reopen, which is enough for in-memory
+  reads and Cassandra import; persistence lands with Ferrosa's own complex writes
+  (D-write, t_b7cec413). Tracked in t_83c4f093.
 - **Snappy / Deflate compression** — only None / LZ4 / Zstd are supported.
 
 ## How it works

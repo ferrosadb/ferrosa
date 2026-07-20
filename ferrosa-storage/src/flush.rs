@@ -162,6 +162,7 @@ pub fn build_serialization_header(
     }
 
     SerializationHeader {
+        complex_collections: false,
         min_timestamp,
         min_local_deletion_time,
         min_ttl,

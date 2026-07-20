@@ -17,6 +17,7 @@
 //! #     max_timestamp: i64::MAX,
 //! #     key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
 //! #     clustering_types: vec![], static_columns: vec![], regular_columns: vec![],
+//! #     complex_collections: false,
 //! # };
 //! # let partitions: Vec<Partition> = vec![];
 //! let mut writer = SSTableWriter::new(WriteOptions::default(), header);
@@ -317,13 +318,6 @@ pub struct SSTableWriter {
     total_rows: u64,
     /// Number of regular/static cells written to Data.db.
     total_columns_set: u64,
-    /// Whether non-frozen collection columns are stored as Cassandra's
-    /// per-element **complex** cells (cell-count + cell-paths). `false` (the
-    /// default) keeps Ferrosa's legacy **whole-value** single-cell storage, where
-    /// a `list`/`set`/`map` column is one cell whose value is the entire encoded
-    /// collection. The reader must be opened with the matching flag. This is a
-    /// lightweight per-writer format switch until a persisted format version lands.
-    complex_collections: bool,
 }
 
 impl SSTableWriter {
@@ -346,16 +340,7 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
-            complex_collections: false,
         }
-    }
-
-    /// Enable Cassandra-style per-element (complex) storage of non-frozen
-    /// collection columns. Must match the reader's
-    /// [`DataReader::with_complex_collections`].
-    pub fn with_complex_collections(mut self, enabled: bool) -> Self {
-        self.complex_collections = enabled;
-        self
     }
 
     /// Create an SSTable writer whose Data.db serialization buffer is backed
@@ -380,7 +365,6 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
-            complex_collections: false,
         })
     }
 
@@ -959,7 +943,7 @@ impl SSTableWriter {
                 idx,
                 num_columns
             );
-            let is_complex = self.complex_collections
+            let is_complex = self.header.complex_collections
                 && crate::marshal::is_multicell(&column_defs[*idx as usize].1);
             match prev_idx {
                 Some(p) if *idx < p => panic!(
@@ -1105,7 +1089,7 @@ impl SSTableWriter {
         while i < row.cells.len() {
             let col_idx = row.cells[i].0;
             let column_type = &column_defs[col_idx as usize].1;
-            if self.complex_collections && crate::marshal::is_multicell(column_type) {
+            if self.header.complex_collections && crate::marshal::is_multicell(column_type) {
                 let mut j = i;
                 while j < row.cells.len() && row.cells[j].0 == col_idx {
                     j += 1;
@@ -1767,6 +1751,7 @@ mod tests {
     /// Build a minimal serialization header for testing.
     fn test_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -1928,6 +1913,7 @@ mod tests {
     fn composite_text_pk_uuid_clustering_roundtrip() {
         // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2067,6 +2053,7 @@ mod tests {
 
         // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2620,6 +2607,7 @@ mod tests {
     fn write_partition_with_tombstone_cell() {
         // Use a header with min_local_deletion_time that allows unsigned deltas
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -2675,6 +2663,7 @@ mod tests {
     #[test]
     fn write_no_clustering_columns_roundtrip() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2735,6 +2724,7 @@ mod tests {
     #[test]
     fn write_partition_with_expiring_cell_roundtrip() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -2806,6 +2796,7 @@ mod tests {
     #[test]
     fn partitions_db_pk1_pk2_hex_dump() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2939,6 +2930,7 @@ mod tests {
     #[test]
     fn writer_serializes_sparse_columns_as_cassandra_subset_vint() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3007,6 +2999,7 @@ mod tests {
     #[test]
     fn writer_serializes_fixed_width_cells_without_value_length_prefix() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3079,6 +3072,7 @@ mod tests {
     #[should_panic(expected = "delta would underflow")]
     fn row_deletion_timestamp_below_header_min_panics() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000, // header min is 1M
             min_local_deletion_time: 100,
             min_ttl: 0,
@@ -3128,6 +3122,7 @@ mod tests {
     fn multi_column_clustering_key_roundtrip() {
         // Header matching typed_edges: (uuid, text, uuid) clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3274,6 +3269,7 @@ mod tests {
     fn writer_rejects_duplicate_column_index_cells() {
         // 7-column header matching entity_store shape
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3349,6 +3345,7 @@ mod tests {
         // entity_store shape: PK (tenant_id uuid, session_id uuid), CK entity_id uuid,
         // regular columns: entity_name text, entity_type text, embedding (3072B blob)
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3588,6 +3585,7 @@ mod tests {
     /// Build a header with the given clustering types and no cells beyond the default `val`.
     fn header_with_clustering(clustering_types: Vec<&str>) -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
