@@ -32,6 +32,13 @@ resolution beyond the serialization header, or cluster routing.
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
   token-seek (`seek_to_token`) and projection variants.
+- **Complex (non-frozen collection) columns** — `list`/`set`/`map` columns
+  read and write Cassandra's per-element cell layout: `uvint(cell-count)` then
+  one cell per element, each with a length-prefixed cell path (list → TimeUUID,
+  set → element, map → key). Read, write, and the projection/skip paths handle
+  it; the element value uses the collection's element/value type. `marshal`
+  detects multicell-ness from the type string (`ListType(..)` vs
+  `FrozenType(..)`).
 - **Trie index** — on-disk trie walker + builder (`trie/`) backing the partition
   index (Partitions.db) and the row index (Rows.db) for wide clustered
   partitions.
@@ -51,8 +58,14 @@ resolution beyond the serialization header, or cluster routing.
   BTI only. There is no Big-format read path (deferred per ADR-004).
 - **Range tombstone markers** — not encoded by the writer; the reader skips
   them. Documented in `data.rs` / `writer.rs` as deferred.
-- **Complex columns** (collections, UDTs, frozen/tuple types) — deferred in the
-  Data.db row codec.
+- **Non-frozen collections** are supported (see above). Still deferred: **UDT /
+  tuple** complex columns (non-frozen UDTs use a 2-byte short path serializer,
+  not the collection vint form), and a per-column complex `DeletionTime` on the
+  **write** side. On **read**, a complex `DeletionTime` (from a Cassandra
+  collection overwrite) is parsed to stay byte-aligned but discarded — Ferrosa's
+  `Row` has no per-column complex-deletion slot, so an un-compacted
+  collection-clear would not shadow older cells in other SSTables (compacted
+  SSTables, the common import case, are already correct). Tracked in t_83c4f093.
 - **Snappy / Deflate compression** — only None / LZ4 / Zstd are supported.
 
 ## How it works
