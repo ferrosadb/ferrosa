@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::error::CqlError;
 
@@ -23,32 +23,92 @@ type HmacSha256 = Hmac<Sha256>;
 /// Length of the HMAC-SHA256 tag appended to every paging token.
 const PAGING_HMAC_LEN: usize = 32;
 
-/// Process-wide key used to sign paging tokens (FMEA CQL-2). Without a signature
-/// a client can forge a cursor to resume at an arbitrary partition key — an
-/// IDOR-class cross-partition read. Sourced from `FERROSA_PAGING_HMAC_KEY` (64
-/// hex chars) when set; otherwise a random per-process key is generated.
+/// The cluster-wide paging HMAC signing key, set once at node startup by
+/// [`init_paging_hmac_key`]. If it is never set (single-node dev, tests, or a
+/// bare binary), [`paging_hmac_key`] falls back to the env var or a random
+/// per-process key.
+static PAGING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// `FERROSA_PAGING_HMAC_KEY` (64 hex chars) parsed into a key, if set + valid.
+fn env_paging_key() -> Option<[u8; 32]> {
+    let hex = std::env::var("FERROSA_PAGING_HMAC_KEY").ok()?;
+    match decode_hex_32(hex.trim()) {
+        Some(k) => Some(k),
+        None => {
+            tracing::warn!("FERROSA_PAGING_HMAC_KEY is set but is not 64 hex chars; ignoring it");
+            None
+        }
+    }
+}
+
+/// Derive a 32-byte key from a domain-separated seed (`SHA-256(domain || 0 || seed)`).
+/// Deterministic, so every coordinator with the same seed computes the same key.
+fn derive_paging_key(domain: &[u8], seed: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(domain);
+    h.update([0u8]);
+    h.update(seed);
+    h.finalize().into()
+}
+
+/// Initialize the cluster-wide paging HMAC signing key at node startup — call
+/// this BEFORE the CQL server serves any query.
 ///
-/// NOTE: in a multi-node cluster set `FERROSA_PAGING_HMAC_KEY` identically on
-/// every node — a token issued by one coordinator is otherwise rejected by
-/// another (paging would break across coordinators). Single-node is unaffected.
+/// The paging cursor is HMAC-signed (FMEA CQL-2) so a client cannot forge one to
+/// resume at an arbitrary partition (an IDOR-class cross-partition read). Every
+/// coordinator in a cluster MUST derive the SAME key, or a cursor issued by one
+/// coordinator is rejected by another and the paged read breaks mid-scan.
+/// Priority:
+///   1. `FERROSA_PAGING_HMAC_KEY` (64 hex) — an explicit shared secret.
+///   2. the internode PSK — already a shared secret across the cluster.
+///   3. the cluster name — CONSISTENT across coordinators (so paging works), but
+///      NOT a secret; set a PSK or the env var for full cross-partition-read
+///      protection.
+///
+/// No-op if `FERROSA_PAGING_HMAC_KEY` is set (the lazy path uses it) or the key
+/// is already initialized.
+pub fn init_paging_hmac_key(psk: Option<&str>, cluster_name: &str) {
+    if PAGING_KEY.get().is_some() || env_paging_key().is_some() {
+        return;
+    }
+    let (key, is_secret) = match psk.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(psk) => (
+            derive_paging_key(b"ferrosa-paging-psk-v1", psk.as_bytes()),
+            true,
+        ),
+        None => (
+            derive_paging_key(b"ferrosa-paging-cluster-v1", cluster_name.as_bytes()),
+            false,
+        ),
+    };
+    if PAGING_KEY.set(key).is_ok() {
+        if is_secret {
+            tracing::info!("paging HMAC key derived from the internode PSK (shared + secret)");
+        } else {
+            tracing::warn!(
+                cluster_name,
+                "paging HMAC key derived from the cluster name — consistent across coordinators \
+                 (paged reads work) but NOT a secret; set an internode PSK or \
+                 FERROSA_PAGING_HMAC_KEY for full cross-partition-read protection"
+            );
+        }
+    }
+}
+
+/// Process-wide key used to sign paging tokens. Prefers the cluster-wide key set
+/// by [`init_paging_hmac_key`]; otherwise the env var; otherwise a random
+/// per-process key (single-node only — multi-node paging would reject cursors).
 fn paging_hmac_key() -> &'static [u8; 32] {
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    KEY.get_or_init(|| {
-        if let Ok(hex) = std::env::var("FERROSA_PAGING_HMAC_KEY") {
-            match decode_hex_32(hex.trim()) {
-                Some(k) => return k,
-                None => tracing::warn!(
-                    "FERROSA_PAGING_HMAC_KEY is set but is not 64 hex chars; \
-                     using a random per-process paging signing key instead"
-                ),
-            }
+    PAGING_KEY.get_or_init(|| {
+        if let Some(k) = env_paging_key() {
+            return k;
         }
         let mut k = [0u8; 32];
         rand::rng().fill_bytes(&mut k);
         tracing::warn!(
-            "FERROSA_PAGING_HMAC_KEY unset — generated a random per-process paging \
-             signing key. Multi-node clusters MUST set a shared key or cross-coordinator \
-             paging will reject cursors."
+            "paging HMAC key not initialized and FERROSA_PAGING_HMAC_KEY unset — using a random \
+             per-process key. Multi-node paging will reject cursors across coordinators; call \
+             init_paging_hmac_key() at startup so all nodes agree."
         );
         k
     })
@@ -291,6 +351,40 @@ mod tests {
         let encoded = state.encode();
         let decoded = PagingState::decode(&encoded).unwrap();
         assert_eq!(decoded, state);
+    }
+
+    /// The fix's core invariant: every coordinator deriving the paging key from
+    /// the same shared seed computes the SAME key, so a cursor issued by one
+    /// coordinator verifies on another (paged reads no longer break mid-scan on
+    /// a multi-node cluster). Different clusters and different seed sources are
+    /// domain-separated.
+    #[test]
+    fn derive_paging_key_is_deterministic_and_domain_separated() {
+        // Two nodes, same cluster name -> identical key.
+        let node_a = derive_paging_key(b"ferrosa-paging-cluster-v1", b"ferrosa-memory-dev");
+        let node_b = derive_paging_key(b"ferrosa-paging-cluster-v1", b"ferrosa-memory-dev");
+        assert_eq!(
+            node_a, node_b,
+            "same cluster name -> same key (cross-coordinator paging works)"
+        );
+        // A different cluster gets a different key.
+        let other = derive_paging_key(b"ferrosa-paging-cluster-v1", b"some-other-cluster");
+        assert_ne!(node_a, other);
+        // PSK-derived and cluster-name-derived keys are separated even for the
+        // same seed bytes (domain separation).
+        let psk_key = derive_paging_key(b"ferrosa-paging-psk-v1", b"ferrosa-memory-dev");
+        assert_ne!(node_a, psk_key);
+        // The derived key is a valid 32-byte HMAC key that signs + verifies a
+        // paging token (round-trips through the HMAC construction).
+        let mut mac = HmacSha256::new_from_slice(&node_a).unwrap();
+        mac.update(b"payload");
+        let tag = mac.finalize().into_bytes();
+        let mut v = HmacSha256::new_from_slice(&node_b).unwrap();
+        v.update(b"payload");
+        assert!(
+            v.verify_slice(&tag).is_ok(),
+            "token signed under node A's derived key verifies under node B's"
+        );
     }
 
     #[test]
