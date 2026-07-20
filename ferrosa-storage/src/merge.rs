@@ -145,21 +145,26 @@ pub fn merge_rows(a: Row, b: Row) -> Row {
             a.primary_key_liveness
         };
 
-    // Cell-level LWW: merge cells from both rows
+    // Cell-level LWW: merge cells from both rows, keyed by (column index, cell
+    // path). A simple column has one cell (path == None); a complex (collection)
+    // column has one cell per element, distinguished by path — so two cells with
+    // the same column but different paths are distinct elements that BOTH survive,
+    // NOT competing writes. Keying by column index alone would collapse a
+    // collection to a single element on every cross-SSTable merge / compaction.
     let mut cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
 
-    // Collect all cells from both rows and sort by column index
+    // Collect all cells from both rows and sort by (column index, path).
     let mut all_cells: Vec<(u16, ferrosa_common::CellValue)> =
         Vec::with_capacity(a.cells.len() + b.cells.len());
     all_cells.extend(a.cells);
     all_cells.extend(b.cells);
-    all_cells.sort_by_key(|(col, _)| *col);
+    all_cells.sort_by(|(ca, cella), (cb, cellb)| (ca, &cella.path).cmp(&(cb, &cellb.path)));
 
-    // Merge cells with the same column_index using LWW
+    // Merge cells with the same (column_index, path) using LWW.
     for (col, cell) in all_cells {
         if let Some(last) = cells.last() {
-            if last.0 == col {
-                // Same column — deterministic last-write-wins.
+            if last.0 == col && last.1.path == cell.path {
+                // Same (column, path) — deterministic last-write-wins.
                 if cell_supersedes(&cell, &last.1) {
                     cells.pop();
                     cells.push((col, cell));
@@ -338,6 +343,67 @@ mod tests {
         assert_eq!(merged.rows.len(), 1);
         assert_eq!(merged.rows[0].cells.len(), 1);
         assert_eq!(merged.rows[0].cells[0].1.timestamp, 1000);
+    }
+
+    #[test]
+    fn merge_rows_keeps_distinct_path_complex_cells() {
+        // Two per-element cells of the SAME collection column (col 0) with
+        // DIFFERENT cell paths must BOTH survive a cross-SSTable merge — they are
+        // distinct collection elements, not competing writes to one cell. Keying
+        // the merge by column index alone would collapse them and destroy the
+        // collection.
+        let a = Row {
+            clustering: b"c1".to_vec(),
+            cells: vec![(
+                0,
+                CellValue::live(b"a".to_vec(), 10).with_path(b"pA".to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(10),
+        };
+        let b = Row {
+            clustering: b"c1".to_vec(),
+            cells: vec![(
+                0,
+                CellValue::live(b"b".to_vec(), 11).with_path(b"pB".to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(11),
+        };
+        let merged = merge_rows(a, b);
+        assert_eq!(
+            merged.cells.len(),
+            2,
+            "both distinct-path elements retained"
+        );
+        assert_eq!(merged.cells[0].1.path.as_deref(), Some(b"pA".as_slice()));
+        assert_eq!(merged.cells[1].1.path.as_deref(), Some(b"pB".as_slice()));
+    }
+
+    #[test]
+    fn merge_rows_reconciles_same_path_complex_cell_lww() {
+        // Same (col, path) from two sources IS a competing write — LWW applies.
+        let a = Row {
+            clustering: b"c1".to_vec(),
+            cells: vec![(
+                0,
+                CellValue::live(b"old".to_vec(), 10).with_path(b"pA".to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(10),
+        };
+        let b = Row {
+            clustering: b"c1".to_vec(),
+            cells: vec![(
+                0,
+                CellValue::live(b"new".to_vec(), 20).with_path(b"pA".to_vec()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(20),
+        };
+        let merged = merge_rows(a, b);
+        assert_eq!(merged.cells.len(), 1, "same (col,path) reconciled");
+        assert_eq!(merged.cells[0].1.value.as_deref(), Some(b"new".as_slice()));
     }
 
     #[test]
