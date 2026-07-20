@@ -12482,6 +12482,62 @@ mod tests {
         );
     }
 
+    /// End-to-end D-write: a per-element collection cell (path set) written to the
+    /// memtable must survive a flush WITH its path — i.e. the flush's data-driven
+    /// activation frames the SSTable as complex. If activation failed
+    /// (`complex_collections = false`), the writer would drop the path and the
+    /// element would read back as a scalar/whole-value cell, losing the CRDT model.
+    #[test]
+    fn write_flush_read_complex_collection_auto_activates_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        // A non-frozen list<int> column is multicell -> complex framing applies
+        // when a cell carries a path.
+        let mut schema = test_schema();
+        schema.regular_columns = vec![ColumnDefinition {
+            name: "val".to_string(),
+            type_name:
+                "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)"
+                    .to_string(),
+        }];
+        engine.register_table(schema).unwrap();
+
+        let tid = table_id();
+        let key = make_key("complex_key");
+        // One per-element list cell: value = encoded int 7, path = a 16-byte list path.
+        let path: Vec<u8> = (0u8..16).collect();
+        let cell = CellValue::live(7i32.to_be_bytes().to_vec(), 1000).with_path(path.clone());
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(0, cell)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 1);
+        assert_eq!(engine.memtable_size(&tid), 0);
+
+        let got = engine
+            .read(&tid, &key)
+            .unwrap()
+            .expect("row present after flush");
+        let (_, got_cell) = &got.rows[0].cells[0];
+        assert_eq!(
+            got_cell.value.as_deref(),
+            Some(7i32.to_be_bytes().as_slice()),
+            "per-element value survives flush"
+        );
+        assert_eq!(
+            got_cell.path.as_deref(),
+            Some(path.as_slice()),
+            "per-element PATH survives flush -> complex framing was auto-activated"
+        );
+    }
+
     #[test]
     fn write_flush_write_read_merges() {
         let dir = tempfile::tempdir().unwrap();
