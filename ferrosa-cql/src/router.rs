@@ -7229,7 +7229,50 @@ async fn route_update(
 
     // Build cells from SET assignments
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // CRDT per-element collection cells (D-write, t_83c4f093): commutative ops
+    // emit read-free per-element cells and converge instead of LWW-clobbering the
+    // whole collection. Same read cost as before (the RMW read below is untouched);
+    // read elimination for pure-commutative updates is a later optimization.
+    let mut complex_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
     for assignment in &s.assignments {
+        // Commutative collection ops (list append, set add/remove, map put,
+        // map-key remove) become per-element cells and skip the whole-value RMW.
+        // Ops that need a read (counter, list remove-by-value, positional) build
+        // nothing here and fall through to the RMW match below.
+        if let Assignment::Add { column, value } | Assignment::Sub { column, value } = assignment {
+            let col_meta = table_meta
+                .columns
+                .get(column)
+                .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+            let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+            let is_add = matches!(assignment, Assignment::Add { .. });
+            let op = if is_add {
+                crate::collection_cells::CollectionOp::Add
+            } else {
+                crate::collection_cells::CollectionOp::Sub
+            };
+            // A Sub on a map removes keys given as a set; other ops use the column type.
+            let rhs_type = match (&cql_type, is_add) {
+                (CqlType::Map(k, _), false) => CqlType::Set(k.clone()),
+                _ => cql_type.clone(),
+            };
+            if let Ok(rhs) = bridge::term_to_cql_value(value, &rhs_type) {
+                if let Ok(cells) =
+                    crate::collection_cells::build_collection_cells(op, &rhs, timestamp)
+                {
+                    let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
+                        CqlError::Invalid(format!(
+                            "column '{}' not found in storage schema",
+                            column
+                        ))
+                    })?;
+                    for c in cells {
+                        complex_cells.push((col_idx, c));
+                    }
+                    continue;
+                }
+            }
+        }
         let (col_name, value) = match assignment {
             Assignment::Simple { column, value } => {
                 let col_meta = table_meta
@@ -7375,12 +7418,16 @@ async fn route_update(
         regular_cells.push((col_idx, value));
     }
 
-    let row = bridge::build_row(
+    let mut row = bridge::build_row(
         &regular_cells,
         &ck_values,
         timestamp,
         using_ttl_as_i32(&s.using_ttl)?,
     );
+    if !complex_cells.is_empty() {
+        row.cells.extend(complex_cells);
+        row.cells.sort_by_key(|(idx, _)| *idx);
+    }
     let strategy = keyspace_strategy(&state.schema, ks);
 
     state

@@ -162,6 +162,35 @@ pub struct AssembleError {
     pub reason: String,
 }
 
+/// Reconcile a legacy whole-value blob's synthetic per-element cells (`blob_cells`)
+/// with the real per-element cells (`real_cells`, `path == Some`) by path, LWW:
+/// higher timestamp wins, tombstone wins a tie. A newer real cell therefore
+/// overrides or removes the corresponding baseline element. Owned — used only on
+/// the rare §8 mixed-partition read path (a partition holding both a whole-value
+/// blob and per-element cells for the same column).
+fn merge_blob_and_element_cells(
+    blob_cells: &[CellValue],
+    real_cells: &[&CellValue],
+) -> Vec<CellValue> {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<Vec<u8>, CellValue> = BTreeMap::new();
+    let real = real_cells
+        .iter()
+        .copied()
+        .filter(|c| c.path.is_some())
+        .cloned();
+    for cell in blob_cells.iter().cloned().chain(real) {
+        let key = cell.path.clone().unwrap_or_default();
+        by_path
+            .entry(key)
+            .and_modify(|existing| {
+                *existing = ferrosa_common::complex_cell::reconcile(existing, &cell)
+            })
+            .or_insert(cell);
+    }
+    by_path.into_values().collect()
+}
+
 impl std::fmt::Display for AssembleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.reason)
@@ -329,16 +358,59 @@ pub fn assemble_column_cells(
             .map(|c| c.timestamp)
             .max();
 
-        // Cells are already one-per-path from the merge, so filter references in
-        // place — no CellValue copy. Keep live element cells not shadowed by the
-        // collection deletion.
-        let live: Vec<&CellValue> = cells
+        // §8 lazy dual-read (mixed partition): a LIVE `path == None` cell is a
+        // legacy/pre-migration whole-value collection blob — the BASELINE. Decode
+        // it into synthetic per-element cells at its own timestamp (list paths
+        // therefore sort before any later append), so the baseline's elements are
+        // not dropped when newer per-element cells exist for the same column. A
+        // non-frozen UDT never carries a whole-value blob, so it is exempt.
+        let blob_cells: Vec<CellValue> = match cells
             .iter()
             .copied()
-            .filter(|c| c.path.is_some())
-            .filter(|c| crate::row::cell_is_live(c, now_secs))
-            .filter(|c| collection_deletion_ts.is_none_or(|d| c.timestamp > d))
-            .collect();
+            .find(|c| c.path.is_none() && !c.is_tombstone())
+        {
+            Some(blob)
+                if !matches!(col_type, CqlType::Udt { .. })
+                    && crate::row::cell_is_live(blob, now_secs) =>
+            {
+                match &blob.value {
+                    Some(bytes) => {
+                        let decoded = decode_value(col_type, bytes).map_err(|e| AssembleError {
+                            reason: format!("decode whole-value collection blob: {e}"),
+                        })?;
+                        build_collection_cells(CollectionOp::Add, &decoded, blob.timestamp)
+                            .map_err(|e| AssembleError { reason: e.reason })?
+                    }
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
+
+        // Fast path (no whole-value baseline — the common case): cells are already
+        // one-per-path from the merge, so filter references in place with no copy.
+        // `merged` outlives `live`, which borrows it on the §8 mixed path.
+        let merged: Vec<CellValue>;
+        let live: Vec<&CellValue> = if blob_cells.is_empty() {
+            cells
+                .iter()
+                .copied()
+                .filter(|c| c.path.is_some())
+                .filter(|c| crate::row::cell_is_live(c, now_secs))
+                .filter(|c| collection_deletion_ts.is_none_or(|d| c.timestamp > d))
+                .collect()
+        } else {
+            // §8 merge: reconcile the synthetic baseline cells with the real
+            // per-element cells by path (LWW — a newer real cell overrides or
+            // tombstones the corresponding baseline element). Owned, but only on
+            // the rare mixed-partition path.
+            merged = merge_blob_and_element_cells(&blob_cells, cells);
+            merged
+                .iter()
+                .filter(|c| crate::row::cell_is_live(c, now_secs))
+                .filter(|c| collection_deletion_ts.is_none_or(|d| c.timestamp > d))
+                .collect()
+        };
         // A non-frozen UDT is a complex column too, but its cell paths are
         // 2-byte field positions and its fields have distinct types.
         if let CqlType::Udt { fields, .. } = col_type {
@@ -421,6 +493,37 @@ mod tests {
         let cells: Vec<&CellValue> = vec![&a[0], &deletion];
         let got = assemble_column_cells(&text_set(), &cells, 0).unwrap();
         assert_eq!(got, Some(CqlValue::Set(vec![])), "all elements shadowed");
+    }
+
+    /// §8 lazy dual-read: a partition holding a LIVE whole-value blob (`path ==
+    /// None`) PLUS newer per-element cells assembles the MERGED collection — the
+    /// baseline blob elements are preserved (not dropped), a newer append lands in
+    /// order after them, and a newer per-element tombstone removes a baseline
+    /// element. This is the mixed-partition case a txn append creates on a key
+    /// that already held whole-value collection data.
+    #[test]
+    fn mixed_whole_value_blob_and_per_element_cells_merge() {
+        // list: blob [a, b] @100 + append [c] @200 -> [a, b, c].
+        let blob = CellValue::live(encode_value(&CqlValue::List(vec![t("a"), t("b")])), 100);
+        let append =
+            build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("c")]), 200).unwrap();
+        let cells: Vec<&CellValue> = vec![&blob, &append[0]];
+        assert_eq!(
+            assemble_column_cells(&text_list(), &cells, 0).unwrap(),
+            Some(CqlValue::List(vec![t("a"), t("b"), t("c")])),
+            "blob baseline elements are preserved and precede the newer append"
+        );
+
+        // set: blob {a, b} @100 + per-element remove of a @200 -> {b}.
+        let sblob = CellValue::live(encode_value(&CqlValue::Set(vec![t("a"), t("b")])), 100);
+        let sremove =
+            build_collection_cells(CollectionOp::Sub, &CqlValue::Set(vec![t("a")]), 200).unwrap();
+        let scells: Vec<&CellValue> = vec![&sblob, &sremove[0]];
+        assert_eq!(
+            assemble_column_cells(&text_set(), &scells, 0).unwrap(),
+            Some(CqlValue::Set(vec![t("b")])),
+            "a newer per-element tombstone removes the baseline element `a`"
+        );
     }
 
     fn text_list() -> CqlType {
