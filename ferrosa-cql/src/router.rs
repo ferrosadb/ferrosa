@@ -7854,8 +7854,15 @@ fn materialize_update(
     }
 
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // CRDT per-element collection cells (D-write, t_83c4f093). A commutative
+    // collection op (list append, set add/remove, map put) emits one read-free
+    // cell per element — many cells sharing a column index, keyed by path. No
+    // read-modify-write, so concurrent appends commute and Accord serializes them
+    // by distinct cell paths. `Row.cells` is a `Vec<(u16, CellValue)>`, which
+    // already carries multiple path-keyed cells per column.
+    let mut complex_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
     for assignment in &s.assignments {
-        let (col_name, value) = match assignment {
+        match assignment {
             Assignment::Simple { column, value } => {
                 let col_meta = table_meta
                     .columns
@@ -7863,44 +7870,67 @@ fn materialize_update(
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
                 let val = bridge::term_to_cql_value(value, &cql_type)?;
-                (column.as_str(), val)
+                let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", column))
+                })?;
+                regular_cells.push((col_idx, val));
             }
-            Assignment::Add { column, .. }
-            | Assignment::Sub { column, .. }
-            | Assignment::Element { column, .. } => {
-                // Collection append/subtract (`v = v + [..]`), counter
-                // increment, and map/list element assignment are a
-                // read-modify-write. The plain `route_update` path performs that
-                // RMW, but it is NEVER invoked for a `BEGIN…COMMIT` transaction
-                // (or a logged batch) — those materialize here. Silently skipping
-                // the assignment (the previous behavior) committed a bare row
-                // marker with no cell for the column, dropping the write with no
-                // signal: an Accord `UPDATE v = v + [x]` read back empty.
-                //
-                // FAIL LOUD rather than lose data. Correct transactional support
-                // requires carrying the delta and applying the RMW at commit/apply
-                // time (t_83c4f093); until then, reject it.
+            Assignment::Add { column, value } | Assignment::Sub { column, value } => {
+                let col_meta = table_meta
+                    .columns
+                    .get(column)
+                    .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
+                let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
+                let op = if matches!(assignment, Assignment::Add { .. }) {
+                    crate::collection_cells::CollectionOp::Add
+                } else {
+                    crate::collection_cells::CollectionOp::Sub
+                };
+                let rhs = bridge::term_to_cql_value(value, &cql_type)?;
+                // Commutative ops build per-element cells; ops that inherently need
+                // a read (list remove-by-value, positional index, counter, map-sub)
+                // return `Unsupported` and stay fail-loud rather than silently drop.
+                let cells = crate::collection_cells::build_collection_cells(op, &rhs, timestamp)
+                    .map_err(|e| {
+                        CqlError::Invalid(format!(
+                            "column '{column}': {} — not supported inside a transaction \
+                             (BEGIN…COMMIT) or logged batch; use a non-transactional UPDATE",
+                            e.reason
+                        ))
+                    })?;
+                let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
+                    CqlError::Invalid(format!("column '{}' not found in storage schema", column))
+                })?;
+                for c in cells {
+                    complex_cells.push((col_idx, c));
+                }
+            }
+            Assignment::Element { column, .. } => {
+                // `m[k] = v` / `l[i] = v`. Map-put by key is a per-element cell, but
+                // list index-set needs a read; keep the whole element form fail-loud
+                // in a transaction until it is handled explicitly.
                 return Err(CqlError::Invalid(format!(
-                    "column '{column}': collection append/subtract, counter, and \
-                     element updates are not yet supported inside a transaction \
-                     (BEGIN…COMMIT) or logged batch — the write would be silently \
-                     dropped. Use a non-transactional UPDATE."
+                    "column '{column}': element/positional updates (m[k]=v, l[i]=v) are \
+                     not yet supported inside a transaction (BEGIN…COMMIT) or logged \
+                     batch. Use a non-transactional UPDATE."
                 )));
             }
-        };
-        let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
-            CqlError::Invalid(format!("column '{}' not found in storage schema", col_name))
-        })?;
-        regular_cells.push((col_idx, value));
+        }
     }
 
     let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
-    let row = bridge::build_row(
+    let mut row = bridge::build_row(
         &regular_cells,
         &ck_values,
         timestamp,
         using_ttl_as_i32(&s.using_ttl)?,
     );
+    if !complex_cells.is_empty() {
+        row.cells.extend(complex_cells);
+        // Keep cells grouped by column index (per-element cells within a column
+        // keep insertion order — a stable sort — and are re-ordered by path on read).
+        row.cells.sort_by_key(|(idx, _)| *idx);
+    }
     let table_id = TableId::new(ks, &s.table);
 
     Ok((table_id, decorated_key, row, timestamp))
@@ -13789,13 +13819,13 @@ mod tests {
         );
     }
 
-    /// A collection append/counter update inside a transaction (or logged batch)
-    /// materializes via `materialize_update`, which cannot yet perform the
-    /// read-modify-write. It must FAIL LOUD rather than silently drop the mutation
-    /// (which committed an empty write — an Accord `v = v + [x]` read back empty).
-    /// A scalar assignment on the same path still materializes fine.
+    /// A commutative collection op inside a transaction (or logged batch)
+    /// materializes via `materialize_update` as read-free per-element cells (CRDT
+    /// D-write, t_83c4f093) — an Accord `v = v + [x]` now commits the appended
+    /// element instead of failing loud. Ops that inherently need a read
+    /// (list remove-by-value) stay fail-loud rather than silently dropping.
     #[tokio::test]
-    async fn transaction_collection_append_fails_loud_not_silent_drop() {
+    async fn transaction_collection_append_materializes_per_element_cells() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -13815,15 +13845,25 @@ mod tests {
                 .unwrap();
         }
 
-        // Collection append must fail loud (was: silent drop -> empty write).
+        // List append now materializes one read-free per-element cell (path set,
+        // value = the appended element), not a fail-loud reject.
         let Statement::Update(append) =
             crate::parser::parse("UPDATE ks.t SET v = v + [7] WHERE k = 1").unwrap()
         else {
             panic!("expected UPDATE");
         };
-        assert!(
-            materialize_update(&state, &ctx, &append, 123).is_err(),
-            "collection append in a transaction/batch must fail loud, not silently drop the write"
+        let (_tid, _dk, row, _ts) = materialize_update(&state, &ctx, &append, 123)
+            .expect("collection append must materialize per-element cells in a transaction");
+        let elem_cells: Vec<_> = row.cells.iter().filter(|(_, c)| c.path.is_some()).collect();
+        assert_eq!(
+            elem_cells.len(),
+            1,
+            "list append [7] materializes one per-element cell"
+        );
+        assert_eq!(
+            elem_cells[0].1.value.as_deref(),
+            Some(encode_value(&CqlValue::Int(7)).as_slice()),
+            "the element cell carries the appended value"
         );
 
         // A scalar assignment on the same materialization path still works.
@@ -13835,6 +13875,18 @@ mod tests {
         assert!(
             materialize_update(&state, &ctx, &scalar, 123).is_ok(),
             "a scalar UPDATE must still materialize in a transaction"
+        );
+
+        // list remove-by-value (`v = v - [x]`) inherently needs a read — it must
+        // stay fail-loud, never silently drop.
+        let Statement::Update(remove) =
+            crate::parser::parse("UPDATE ks.t SET v = v - [7] WHERE k = 1").unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        assert!(
+            materialize_update(&state, &ctx, &remove, 123).is_err(),
+            "list remove-by-value needs a read — must stay fail-loud in a transaction"
         );
     }
 
