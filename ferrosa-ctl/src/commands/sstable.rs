@@ -1539,6 +1539,7 @@ mod tests {
                     timestamp: 1234,
                     ttl: 0,
                     local_deletion_time: 5,
+                    path: None,
                 },
             )],
             deletion: DeletionTime::LIVE,
