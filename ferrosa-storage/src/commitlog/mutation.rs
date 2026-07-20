@@ -25,7 +25,13 @@
 //!
 //! Cell: column_index:u16 | timestamp:i64 | ttl:i32 | local_deletion_time:i32
 //!     | value_len:i32 (-1=tombstone) | value
+//!     | [path_len:u16 | path]   -- iff the 0x8000 bit of column_index is set
 //! ```
+//!
+//! The high bit (`0x8000`) of `column_index` flags a **complex-column cell path**
+//! (a collection element identity — timeuuid/element/key). Real column indices are
+//! `< 0x8000`, so simple cells and old segments (which never set the bit) are
+//! byte-for-byte identical to the pre-path format — no version bump required.
 //!
 //! All multi-byte integers are big-endian.
 //!
@@ -260,6 +266,16 @@ fn byte_vec_size(data: &[u8]) -> usize {
     2 + data.len()
 }
 
+/// High bit of a cell's `column_index`, set to signal that a complex-column cell
+/// **path** follows the value. Real column indices are `< 0x8000`, and a simple
+/// (scalar) cell — the only kind pre-dating this and the only kind produced until
+/// the write path emits complex cells — never sets it, so old commit-log segments
+/// and simple cells serialize byte-for-byte as before. Only path-bearing cells use
+/// the extended encoding; no format-version bump is needed.
+const CELL_HAS_PATH_FLAG: u16 = 0x8000;
+/// Mask for the real column index (the low 15 bits) once the flag is stripped.
+const CELL_COLUMN_INDEX_MASK: u16 = 0x7FFF;
+
 /// Size of a single serialized cell.
 fn cell_size(cell: &CellValue) -> usize {
     // column_index:u16 + timestamp:i64 + ttl:i32 + local_deletion_time:i32 + value_len:i32
@@ -268,7 +284,9 @@ fn cell_size(cell: &CellValue) -> usize {
         Some(v) => v.len(),
         None => 0, // tombstone: value_len = -1, no bytes follow
     };
-    header + value_bytes
+    // Complex-cell path (when present): path_len:u16 + path bytes.
+    let path_bytes = cell.path.as_ref().map_or(0, |p| 2 + p.len());
+    header + value_bytes + path_bytes
 }
 
 /// Size of a single serialized row.
@@ -420,7 +438,18 @@ impl Mutation {
     }
 
     fn serialize_cell(w: &mut WriteCursor<'_>, column_index: u16, cell: &CellValue) {
-        w.write_u16(column_index);
+        // Fail loud: a column index that collides with the path flag would corrupt
+        // the encoding. 0x8000 columns is far beyond any real table.
+        assert!(
+            column_index & CELL_HAS_PATH_FLAG == 0,
+            "column index {column_index} collides with the cell-path flag (>= 0x8000)"
+        );
+        let tagged = if cell.path.is_some() {
+            column_index | CELL_HAS_PATH_FLAG
+        } else {
+            column_index
+        };
+        w.write_u16(tagged);
         w.write_i64(cell.timestamp);
         w.write_i32(cell.ttl);
         w.write_i32(cell.local_deletion_time);
@@ -434,6 +463,11 @@ impl Mutation {
                 w.write_i32(v.len() as i32);
                 w.write_bytes(v);
             }
+        }
+
+        // Complex-column cell path (path_len:u16 | path bytes), only when present.
+        if let Some(path) = &cell.path {
+            w.write_byte_vec(path);
         }
     }
 
@@ -507,7 +541,9 @@ impl Mutation {
     }
 
     fn deserialize_cell(r: &mut ReadCursor<'_>) -> Result<(u16, CellValue)> {
-        let column_index = r.read_u16("cell.column_index")?;
+        let tagged = r.read_u16("cell.column_index")?;
+        let has_path = tagged & CELL_HAS_PATH_FLAG != 0;
+        let column_index = tagged & CELL_COLUMN_INDEX_MASK;
         let timestamp = r.read_i64("cell.timestamp")?;
         let ttl = r.read_i32("cell.ttl")?;
         let local_deletion_time = r.read_i32("cell.local_deletion_time")?;
@@ -521,6 +557,14 @@ impl Mutation {
             Some(bytes.to_vec())
         };
 
+        // A complex-column cell path follows the value iff the flag was set. Old
+        // segments and simple cells never set it, so they decode with path == None.
+        let path = if has_path {
+            Some(r.read_byte_vec("cell.path")?)
+        } else {
+            None
+        };
+
         Ok((
             column_index,
             CellValue {
@@ -528,9 +572,7 @@ impl Mutation {
                 timestamp,
                 ttl,
                 local_deletion_time,
-                // Legacy commit-log cell format carries no cell path; complex-cell
-                // paths are added to the wire format in a later increment.
-                path: None,
+                path,
             },
         ))
     }
@@ -736,6 +778,58 @@ mod tests {
             );
         }
     }
+
+    /// A complex-column cell (with a path) round-trips through the commit-log /
+    /// Accord-wire encoding — value AND path preserved — for both live and
+    /// tombstone cells.
+    #[test]
+    fn complex_cell_path_round_trips() {
+        let mut m = simple_mutation();
+        m.rows[0].cells = vec![
+            (
+                3,
+                CellValue::live(b"elem".to_vec(), 1000).with_path(b"timeuuid-path".to_vec()),
+            ),
+            (
+                3,
+                CellValue::tombstone(1001, 1_700_000_000).with_path(b"removed-elem".to_vec()),
+            ),
+        ];
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let back = Mutation::deserialize_from(&buf).unwrap();
+        assert_eq!(
+            back.rows[0].cells, m.rows[0].cells,
+            "value + path round-trip"
+        );
+        assert_eq!(
+            back.rows[0].cells[0].1.path.as_deref(),
+            Some(b"timeuuid-path".as_slice())
+        );
+    }
+
+    /// Backward-compat: a simple cell (path == None) serializes with no extra bytes
+    /// and never sets the path flag — byte-for-byte identical to the pre-path
+    /// format, so old commit-log segments and simple cells are unaffected. The path
+    /// encoding adds exactly `u16 len + bytes`.
+    #[test]
+    fn simple_cell_bytes_unchanged_complex_adds_exactly_the_path() {
+        let simple = CellValue::live(b"v".to_vec(), 100);
+        let complex = simple.clone().with_path(b"pathXYZ".to_vec());
+        assert_eq!(cell_size(&simple), 22 + 1, "simple cell has no path bytes");
+        assert_eq!(
+            cell_size(&complex),
+            cell_size(&simple) + 2 + 7,
+            "path adds only its u16 length + bytes"
+        );
+
+        // A path==None cell decodes back to path==None (no flag consumed).
+        let m = simple_mutation();
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let back = Mutation::deserialize_from(&buf).unwrap();
+        assert!(back.rows[0].cells.iter().all(|(_, c)| c.path.is_none()));
+    }
 }
 
 #[cfg(test)]
@@ -794,28 +888,101 @@ mod prop_tests {
             })
     }
 
+    /// A cell that MAY carry a complex-column path. Scoped to this module's
+    /// commit-log round-trip — the shared `arb_cell_value` stays path-free because
+    /// SSTable round-trip proptests don't yet support complex cells.
+    fn arb_cell_value_maybe_path() -> impl Strategy<Value = CellValue> {
+        (
+            arb_cell_value(),
+            prop::option::of(prop::collection::vec(any::<u8>(), 1..24)),
+        )
+            .prop_map(|(cell, path)| match path {
+                Some(p) => cell.with_path(p),
+                None => cell,
+            })
+    }
+
+    /// Like `arb_row` but with per-element cells: cells are de-duplicated and sorted
+    /// by `(col_idx, path)` — the same key the memtable merges on — so a column can
+    /// carry many element cells with distinct paths.
+    fn arb_row_with_paths() -> impl Strategy<Value = Row> {
+        (
+            prop::collection::vec(any::<u8>(), 0..32),
+            prop::collection::vec((0u16..64, arb_cell_value_maybe_path()), 0..16),
+            prop_oneof![
+                Just(DeletionTime::LIVE),
+                (1i64..1_000_000, 1u32..100_000).prop_map(|(ts, ldt)| DeletionTime::new(ts, ldt)),
+            ],
+            1i64..1_000_000,
+        )
+            .prop_map(|(clustering, mut cells, deletion, ts)| {
+                cells.sort_by(|(a_idx, a), (b_idx, b)| (*a_idx, &a.path).cmp(&(*b_idx, &b.path)));
+                cells.dedup_by(|(a_idx, a), (b_idx, b)| a_idx == b_idx && a.path == b.path);
+                Row {
+                    clustering,
+                    cells,
+                    deletion,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                }
+            })
+    }
+
+    fn arb_mutation_with_paths() -> impl Strategy<Value = Mutation> {
+        (
+            "[a-z]{1,8}",
+            "[a-z]{1,8}",
+            arb_decorated_key(),
+            prop::collection::vec(arb_row_with_paths(), 0..8),
+            1i64..1_000_000,
+            prop::collection::vec(any::<u8>(), 16..=16),
+        )
+            .prop_map(|(keyspace, table, key, rows, timestamp, id_vec)| {
+                let mut mutation_id = [0u8; 16];
+                mutation_id.copy_from_slice(&id_vec);
+                if mutation_id == [0u8; 16] {
+                    mutation_id[0] = 1;
+                }
+                Mutation {
+                    mutation_id,
+                    keyspace,
+                    table,
+                    key,
+                    rows,
+                    timestamp,
+                }
+            })
+    }
+
+    fn assert_round_trips(mutation: &Mutation) {
+        let size = mutation.serialized_size();
+        let mut buf = vec![0u8; size];
+        mutation.serialize_into(&mut buf);
+        let deserialized = Mutation::deserialize_from(&buf).unwrap();
+        assert_eq!(mutation.mutation_id, deserialized.mutation_id);
+        assert_eq!(mutation.keyspace, deserialized.keyspace);
+        assert_eq!(mutation.table, deserialized.table);
+        assert_eq!(mutation.key, deserialized.key);
+        assert_eq!(mutation.rows.len(), deserialized.rows.len());
+        assert_eq!(mutation.timestamp, deserialized.timestamp);
+        for (orig, deser) in mutation.rows.iter().zip(deserialized.rows.iter()) {
+            assert_eq!(orig.clustering, deser.clustering);
+            assert_eq!(orig.deletion, deser.deletion);
+            assert_eq!(orig.primary_key_liveness, deser.primary_key_liveness);
+            // Full cell equality includes the path.
+            assert_eq!(orig.cells, deser.cells);
+        }
+    }
+
     proptest! {
         #[test]
         fn serialization_round_trip(mutation in arb_mutation()) {
-            let size = mutation.serialized_size();
-            let mut buf = vec![0u8; size];
-            mutation.serialize_into(&mut buf);
-            let deserialized = Mutation::deserialize_from(&buf).unwrap();
-            prop_assert_eq!(mutation.mutation_id, deserialized.mutation_id);
-            prop_assert_eq!(&mutation.keyspace, &deserialized.keyspace);
-            prop_assert_eq!(&mutation.table, &deserialized.table);
-            prop_assert_eq!(&mutation.key, &deserialized.key);
-            prop_assert_eq!(mutation.rows.len(), deserialized.rows.len());
-            prop_assert_eq!(mutation.timestamp, deserialized.timestamp);
-            for (orig, deser) in mutation.rows.iter().zip(deserialized.rows.iter()) {
-                prop_assert_eq!(&orig.clustering, &deser.clustering);
-                prop_assert_eq!(orig.cells.len(), deser.cells.len());
-                prop_assert_eq!(orig.deletion, deser.deletion);
-                prop_assert_eq!(orig.primary_key_liveness, deser.primary_key_liveness);
-                for (oc, dc) in orig.cells.iter().zip(deser.cells.iter()) {
-                    prop_assert_eq!(oc, dc);
-                }
-            }
+            assert_round_trips(&mutation);
+        }
+
+        /// Same round-trip, now with per-element complex-column cells (paths).
+        #[test]
+        fn serialization_round_trip_with_paths(mutation in arb_mutation_with_paths()) {
+            assert_round_trips(&mutation);
         }
     }
 }
