@@ -20,6 +20,7 @@ pub mod ast;
 pub mod auth;
 pub mod bridge;
 pub mod client;
+pub mod collection_cells;
 pub mod connection;
 pub mod duration;
 pub mod error;

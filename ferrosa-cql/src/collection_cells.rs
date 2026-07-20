@@ -1,0 +1,274 @@
+//! Module: Build per-element cells for collection column writes (CRDT-collections).
+//! Correctness: Correct when a collection add/remove/put maps to the Cassandra-exact
+//! per-element cells — set element → cell path = encoded element (empty value); map
+//! entry → path = encoded key, value = encoded value; list append → path = a v1
+//! TimeUUID minted from the write timestamp so later appends sort after earlier ones;
+//! and a remove is a tombstone at the element's path — all read-free (commutative), so
+//! concurrent updates converge (see [`ferrosa_common::complex_cell`]). Read-modify-write
+//! shapes (list remove-by-value, prepend, positional index) are rejected loudly here
+//! rather than silently mis-encoded. Verified by the unit tests below.
+//! Last revised: 2026-07-20
+//! Last changed: New module — increment 3 of the CRDT-collections design
+//!   (specs/proposed/crdt-collections-and-counters.md): the pure builder, wired into the
+//!   AP and Accord write paths in the same change.
+//!
+//! This turns a `v = v + [..]` / `v = v + {..}` / `v = v - {..}` collection assignment
+//! into the per-element cells that flow through the memtable, commit log, and Accord
+//! apply (increments 1–2). It replaces the whole-collection read-modify-write, which
+//! could not be expressed by the Accord transaction path (the write was silently
+//! dropped — see t_83c4f093).
+
+use ferrosa_common::cql_type::CqlValue;
+use ferrosa_common::{CellValue, Timestamp, NO_DELETION_TIME};
+use ferrosa_row_bridge::encode_value;
+
+/// 100-nanosecond intervals between the UUID epoch (1582-10-15) and the Unix epoch
+/// (1970-01-01) — the same constant `bridge::eval_now` uses to mint v1 TimeUUIDs.
+const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+
+/// A collection update could not be expressed as read-free per-element cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedCollectionOp {
+    pub reason: String,
+}
+
+impl std::fmt::Display for UnsupportedCollectionOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for UnsupportedCollectionOp {}
+
+/// The collection assignment operator: `col = col + rhs` (Add) or `col = col - rhs`
+/// (Sub).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionOp {
+    Add,
+    Sub,
+}
+
+/// Mint a v1 TimeUUID cell path for a `list` element written at `write_ts` (micros
+/// since the Unix epoch) as the `seq`-th element of this append. The time field
+/// carries `write_ts`, so a later append (larger `write_ts`) sorts after an earlier
+/// one, and `seq` orders the elements of a single append. `node` is fixed (the path
+/// only needs to be unique and time-ordered, not node-attributed).
+///
+/// The bytes are a valid v1 TimeUUID (Cassandra-exact layout). Because a v1 UUID's
+/// raw-byte order is NOT its time order, the read-assembly orders list elements by
+/// the extracted time — see [`timeuuid_time`].
+pub fn list_cell_path(write_ts: Timestamp, seq: u16) -> Vec<u8> {
+    let uuid_ts = (write_ts.max(0) as u64)
+        .wrapping_mul(10)
+        .wrapping_add(UUID_EPOCH_OFFSET);
+    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
+    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
+    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
+    let clock_seq = (seq & 0x3FFF) | 0x8000; // variant 1, seq disambiguates
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&time_low.to_be_bytes());
+    b[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    b[6..8].copy_from_slice(&time_hi.to_be_bytes());
+    b[8..10].copy_from_slice(&clock_seq.to_be_bytes());
+    // b[10..16] = node, left zero.
+    b.to_vec()
+}
+
+/// The `(time, seq)` ordering key of a `list` cell path minted by [`list_cell_path`]:
+/// reconstruct the v1 TimeUUID time field and the clock-seq. List elements materialize
+/// in this order (append order), which raw-byte path order does not give.
+pub fn timeuuid_time(path: &[u8]) -> Option<(u64, u16)> {
+    if path.len() != 16 {
+        return None;
+    }
+    let time_low = u32::from_be_bytes([path[0], path[1], path[2], path[3]]) as u64;
+    let time_mid = u16::from_be_bytes([path[4], path[5]]) as u64;
+    let time_hi = (u16::from_be_bytes([path[6], path[7]]) & 0x0FFF) as u64;
+    let time = time_low | (time_mid << 32) | (time_hi << 48);
+    let clock_seq = u16::from_be_bytes([path[8], path[9]]) & 0x3FFF;
+    Some((time, clock_seq))
+}
+
+/// Build the per-element cells to write for a collection assignment `col = col {op}
+/// rhs` at `write_ts`. Read-free — no current value is read.
+///
+/// - `rhs = Set{..}`, Add → live cells, path = encoded element, empty value (set add).
+/// - `rhs = Set{..}`, Sub → tombstones, path = encoded element (set remove; also map
+///   key removal, `map = map - {k}`, since keys arrive as a set).
+/// - `rhs = Map{..}`, Add → live cells, path = encoded key, value = encoded value.
+/// - `rhs = List[..]`, Add → live cells, path = v1 TimeUUID (append order), value =
+///   encoded element.
+///
+/// Rejected (need a read; kept out of the read-free path): list remove-by-value
+/// (`list - [..]`), any Sub on a `Map` rhs, prepend, and positional index ops.
+pub fn build_collection_cells(
+    op: CollectionOp,
+    rhs: &CqlValue,
+    write_ts: Timestamp,
+) -> Result<Vec<CellValue>, UnsupportedCollectionOp> {
+    match (rhs, op) {
+        // ---- set add / set remove / map-key remove --------------------------
+        (CqlValue::Set(items), CollectionOp::Add) => Ok(items
+            .iter()
+            .map(|e| CellValue::live(Vec::new(), write_ts).with_path(encode_value(e)))
+            .collect()),
+        (CqlValue::Set(items), CollectionOp::Sub) => Ok(items
+            .iter()
+            .map(|e| CellValue::tombstone(write_ts, NO_DELETION_TIME).with_path(encode_value(e)))
+            .collect()),
+
+        // ---- map put --------------------------------------------------------
+        (CqlValue::Map(pairs), CollectionOp::Add) => Ok(pairs
+            .iter()
+            .map(|(k, v)| CellValue::live(encode_value(v), write_ts).with_path(encode_value(k)))
+            .collect()),
+        (CqlValue::Map(_), CollectionOp::Sub) => Err(UnsupportedCollectionOp {
+            reason: "map subtraction removes keys given as a set, not a map".into(),
+        }),
+
+        // ---- list append ----------------------------------------------------
+        (CqlValue::List(items), CollectionOp::Add) => Ok(items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                CellValue::live(encode_value(e), write_ts)
+                    .with_path(list_cell_path(write_ts, i as u16))
+            })
+            .collect()),
+        (CqlValue::List(_), CollectionOp::Sub) => Err(UnsupportedCollectionOp {
+            // Cassandra removes ALL occurrences of the value — an inherent read.
+            reason: "list remove-by-value requires a read-modify-write (not yet supported \
+                     in a transaction)"
+                .into(),
+        }),
+
+        _ => Err(UnsupportedCollectionOp {
+            reason: format!(
+                "unsupported collection assignment: {op:?} of a {} value",
+                match rhs {
+                    CqlValue::List(_) => "list",
+                    CqlValue::Set(_) => "set",
+                    CqlValue::Map(_) => "map",
+                    _ => "non-collection",
+                }
+            ),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(v: &str) -> CqlValue {
+        CqlValue::Text(v.to_string())
+    }
+
+    #[test]
+    fn set_add_makes_live_element_cells() {
+        let rhs = CqlValue::Set(vec![t("a"), t("b")]);
+        let cells = build_collection_cells(CollectionOp::Add, &rhs, 100).unwrap();
+        assert_eq!(cells.len(), 2);
+        for (cell, elem) in cells.iter().zip([t("a"), t("b")]) {
+            assert!(
+                cell.value.as_deref() == Some(&[][..]),
+                "set element value is empty"
+            );
+            assert!(cell.is_live());
+            assert_eq!(cell.path.as_deref(), Some(encode_value(&elem).as_slice()));
+            assert_eq!(cell.timestamp, 100);
+        }
+    }
+
+    #[test]
+    fn set_sub_makes_tombstones_at_element_paths() {
+        let rhs = CqlValue::Set(vec![t("a")]);
+        let cells = build_collection_cells(CollectionOp::Sub, &rhs, 100).unwrap();
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0].is_tombstone());
+        assert_eq!(
+            cells[0].path.as_deref(),
+            Some(encode_value(&t("a")).as_slice())
+        );
+    }
+
+    #[test]
+    fn map_put_makes_live_cells_keyed_by_key() {
+        let rhs = CqlValue::Map(vec![(t("k1"), t("v1")), (t("k2"), t("v2"))]);
+        let cells = build_collection_cells(CollectionOp::Add, &rhs, 100).unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            cells[0].path.as_deref(),
+            Some(encode_value(&t("k1")).as_slice())
+        );
+        assert_eq!(
+            cells[0].value.as_deref(),
+            Some(encode_value(&t("v1")).as_slice())
+        );
+    }
+
+    #[test]
+    fn list_append_makes_timeuuid_paths_in_append_order() {
+        let rhs = CqlValue::List(vec![t("x"), t("y"), t("z")]);
+        let cells = build_collection_cells(CollectionOp::Add, &rhs, 100).unwrap();
+        assert_eq!(cells.len(), 3);
+        // Values are the elements, in order.
+        assert_eq!(
+            cells[0].value.as_deref(),
+            Some(encode_value(&t("x")).as_slice())
+        );
+        // Paths are distinct 16-byte v1 TimeUUIDs.
+        let paths: Vec<_> = cells.iter().map(|c| c.path.clone().unwrap()).collect();
+        assert!(paths.iter().all(|p| p.len() == 16));
+        assert_ne!(paths[0], paths[1]);
+        // Same-append elements order by seq.
+        let k: Vec<_> = paths.iter().map(|p| timeuuid_time(p).unwrap()).collect();
+        assert!(
+            k[0] < k[1] && k[1] < k[2],
+            "seq preserves append order: {k:?}"
+        );
+    }
+
+    #[test]
+    fn later_append_sorts_after_earlier_by_time() {
+        let early =
+            build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("x")]), 100).unwrap();
+        let late =
+            build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("y")]), 200).unwrap();
+        let ke = timeuuid_time(early[0].path.as_deref().unwrap()).unwrap();
+        let kl = timeuuid_time(late[0].path.as_deref().unwrap()).unwrap();
+        assert!(ke < kl, "later write_ts sorts after: {ke:?} < {kl:?}");
+    }
+
+    #[test]
+    fn read_modify_write_shapes_are_rejected_loudly() {
+        // list remove-by-value
+        assert!(
+            build_collection_cells(CollectionOp::Sub, &CqlValue::List(vec![t("a")]), 1).is_err()
+        );
+        // map subtraction of a map (keys come as a set, not a map)
+        assert!(build_collection_cells(
+            CollectionOp::Sub,
+            &CqlValue::Map(vec![(t("k"), t("v"))]),
+            1
+        )
+        .is_err());
+    }
+
+    /// The v1 TimeUUID is valid: version nibble is 1, variant bits are 10xx.
+    #[test]
+    fn list_path_is_a_valid_v1_timeuuid() {
+        let p = list_cell_path(123_456, 7);
+        assert_eq!(p.len(), 16);
+        assert_eq!(p[6] & 0xF0, 0x10, "version 1");
+        assert_eq!(p[8] & 0xC0, 0x80, "variant 1 (10xx)");
+    }
+
+    #[test]
+    fn timeuuid_time_round_trips_write_ts_and_seq() {
+        let p = list_cell_path(999_000, 42);
+        let (time, seq) = timeuuid_time(&p).unwrap();
+        assert_eq!(time, 999_000u64 * 10 + UUID_EPOCH_OFFSET);
+        assert_eq!(seq, 42);
+    }
+}
