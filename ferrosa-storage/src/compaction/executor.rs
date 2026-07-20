@@ -1166,6 +1166,7 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     }
 
     SerializationHeader {
+        complex_collections: false,
         min_timestamp,
         max_timestamp,
         min_local_deletion_time,

@@ -197,6 +197,7 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
     use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
 
     let header = SerializationHeader {
+        complex_collections: false,
         min_timestamp: 1_000_000,
         min_local_deletion_time: 0,
         min_ttl: 0,
@@ -310,6 +311,520 @@ fn ferrosa_write_read_roundtrip_all_cell_types() {
     assert!(reader.read_partition().unwrap().is_none());
 }
 
+/// THE compatibility gate: read a `Data.db` produced by a real Cassandra 5.0
+/// (`nb-big` format, uncompressed) for a table with non-frozen `list<int>`,
+/// `set<text>`, and `map<text,int>` columns, and confirm ferrosa parses the
+/// complex-column cells — proving Cassandra collection SSTables are importable.
+///
+/// This caught (and now guards against) a real byte-format bug: Cassandra
+/// length-prefixes a collection element value even for a fixed-width element
+/// type (`list<int>` values carry a `uvint(4)` prefix). It also exercises the
+/// `HAS_COMPLEX_DELETION` path — a plain collection INSERT writes a complex
+/// deletion before each collection column's cell count.
+#[test]
+fn read_real_cassandra_collections() {
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+
+    let data = std::fs::read(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cassandra_collections/Data.db"),
+    )
+    .expect("cassandra_collections fixture Data.db");
+
+    // Storage column order is alphabetical: l, m, s. min_* only affect timestamp
+    // VALUES (deltas are uvints either way), not byte alignment or the element
+    // paths/values we assert here.
+    let header = SerializationHeader {
+            complex_collections: true,
+        min_timestamp: 0,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![
+            (
+                b"l".to_vec(),
+                "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+            (
+                b"m".to_vec(),
+                "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+            (
+                b"s".to_vec(),
+                "org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type)".into(),
+            ),
+        ],
+    };
+
+    let mut reader = DataReader::new(&data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("row1 partition");
+    assert_eq!(p.key.key.as_bytes(), b"row1");
+    let cells = &p.rows[0].cells;
+
+    // A plain collection INSERT sets HAS_COMPLEX_DELETION: each collection column
+    // carries a complex deletion, which the reader captures as a `path == None`
+    // tombstone sentinel. Element assertions below skip those sentinels.
+    for col in 0..=2 {
+        assert!(
+            cells
+                .iter()
+                .any(|(i, c)| *i == col && c.path.is_none() && c.is_tombstone()),
+            "column {col} carries its captured complex-deletion sentinel"
+        );
+    }
+    let elems = |col: u16| {
+        cells
+            .iter()
+            .filter(move |(i, c)| *i == col && c.path.is_some())
+    };
+
+    // Column ordinals: l=0, m=1, s=2 (storage order).
+    let list: Vec<i32> = elems(0)
+        .map(|(_, c)| i32::from_be_bytes(c.value.as_deref().unwrap().try_into().unwrap()))
+        .collect();
+    assert_eq!(list, vec![10, 20, 30], "list<int> elements parse in order");
+
+    let mut map: Vec<(String, i32)> = elems(1)
+        .map(|(_, c)| {
+            let k = String::from_utf8(c.path.clone().unwrap()).unwrap();
+            let v = i32::from_be_bytes(c.value.as_deref().unwrap().try_into().unwrap());
+            (k, v)
+        })
+        .collect();
+    map.sort();
+    assert_eq!(
+        map,
+        vec![("k1".into(), 1), ("k2".into(), 2)],
+        "map<text,int> parses"
+    );
+
+    let mut set: Vec<String> = elems(2)
+        .map(|(_, c)| String::from_utf8(c.path.clone().unwrap()).unwrap())
+        .collect();
+    set.sort();
+    assert_eq!(
+        set,
+        vec!["a", "b", "c"],
+        "set<text> elements parse from paths"
+    );
+}
+
+/// Read a `Data.db` from a real Cassandra 5.0 with a NON-FROZEN UDT column
+/// (`addr {street text, zip int}`). A non-frozen UDT is a complex column: each
+/// field is a cell whose cell-path is a 2-byte big-endian field position. Proves
+/// ferrosa parses real Cassandra UDT field cells (t_edf9fd15).
+#[test]
+fn read_real_cassandra_udt() {
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+
+    let data = std::fs::read(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cassandra_udt/Data.db"),
+    )
+    .expect("cassandra_udt fixture Data.db");
+
+    // The reader only needs the column type's simple class name to be `UserType`
+    // (to detect the complex UDT framing); it reads field cells as opaque
+    // 2-byte-path + length-prefixed value. Field-value decoding happens in the
+    // row-bridge assembly layer (CqlType::Udt), not here.
+    let header = SerializationHeader {
+        complex_collections: true,
+        min_timestamp: 0,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"a".to_vec(),
+            "org.apache.cassandra.db.marshal.UserType(test,61646472,\
+             73747265657400:org.apache.cassandra.db.marshal.UTF8Type,\
+             7a697000:org.apache.cassandra.db.marshal.Int32Type)"
+                .into(),
+        )],
+    };
+
+    let mut reader = DataReader::new(&data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("row1 partition");
+    assert_eq!(p.key.key.as_bytes(), b"row1");
+    let cells = &p.rows[0].cells;
+
+    // A UDT INSERT sets HAS_COMPLEX_DELETION -> captured sentinel (path=None).
+    assert!(
+        cells
+            .iter()
+            .any(|(_, c)| c.path.is_none() && c.is_tombstone()),
+        "complex-deletion sentinel captured"
+    );
+    // Field cells: path = 2-byte position, value length-prefixed.
+    let field = |pos: [u8; 2]| {
+        cells
+            .iter()
+            .find(|(_, c)| c.path.as_deref() == Some(&pos[..]))
+            .map(|(_, c)| c.value.clone().unwrap())
+    };
+    assert_eq!(
+        field([0, 0]).as_deref(),
+        Some(b"main".as_slice()),
+        "field 0 = street 'main'"
+    );
+    assert_eq!(
+        field([0, 1]).map(|v| i32::from_be_bytes(v.try_into().unwrap())),
+        Some(12345),
+        "field 1 = zip 12345"
+    );
+}
+
+/// A non-frozen `list<int>` column stores each element as its own cell sharing
+/// the column's storage index, distinguished by a 16-byte TimeUUID cell path
+/// (Cassandra's complex-column layout). Two appended elements must round-trip
+/// through the BTI writer + reader as two cells with their paths and values
+/// intact — the increment-C hard gate before per-element collection writes.
+#[test]
+fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+        complex_collections: true,
+        min_timestamp: 1_000_000,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"l".to_vec(),
+            "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)"
+                .into(),
+        )],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+        verify_output: true,
+    };
+    let ts = 1_000_100i64;
+
+    // Two list<int> elements: value = 4-byte big-endian int (Int32Type is
+    // fixed-width, so no length prefix), path = a 16-byte v1 TimeUUID.
+    let path_a = {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&10u32.to_be_bytes());
+        p[6] = 0x10; // version 1
+        p[8] = 0x80; // variant
+        p.to_vec()
+    };
+    let path_b = {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&20u32.to_be_bytes());
+        p[6] = 0x10;
+        p[8] = 0x80;
+        p.to_vec()
+    };
+    let cell_a = CellValue::live(10i32.to_be_bytes().to_vec(), ts).with_path(path_a.clone());
+    let cell_b = CellValue::live(20i32.to_be_bytes().to_vec(), ts).with_path(path_b.clone());
+
+    let partition = Partition {
+        key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, cell_a), (0, cell_b)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("list partition");
+    let cells = &p.rows[0].cells;
+    assert_eq!(cells.len(), 2, "two element cells round-trip");
+    assert!(cells.iter().all(|(idx, _)| *idx == 0), "same column index");
+    assert_eq!(cells[0].1.path.as_deref(), Some(path_a.as_slice()));
+    assert_eq!(cells[0].1.value.as_deref(), Some(&10i32.to_be_bytes()[..]));
+    assert_eq!(cells[1].1.path.as_deref(), Some(path_b.as_slice()));
+    assert_eq!(cells[1].1.value.as_deref(), Some(&20i32.to_be_bytes()[..]));
+    assert!(reader.read_partition().unwrap().is_none());
+}
+
+/// A complex-column deletion (represented as a `path=None` tombstone sentinel)
+/// round-trips through the writer + reader: the writer sets HAS_COMPLEX_DELETION
+/// and emits the DeletionTime; the reader captures it back as the sentinel,
+/// alongside the surviving element cells.
+#[test]
+fn ferrosa_roundtrips_complex_column_deletion() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+        complex_collections: true,
+        min_timestamp: 100,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"l".to_vec(),
+            "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)"
+                .into(),
+        )],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+        verify_output: true,
+    };
+
+    // Collection deletion at ts=499 (a `path=None` tombstone), one element at ts=500.
+    let deletion = CellValue::tombstone(499, 1_700_000);
+    let mut lp = [0u8; 16];
+    lp[0..4].copy_from_slice(&7u32.to_be_bytes());
+    lp[6] = 0x10;
+    lp[8] = 0x80;
+    let elem = CellValue::live(55i32.to_be_bytes().to_vec(), 500).with_path(lp.to_vec());
+
+    let partition = Partition {
+        key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, deletion), (0, elem)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(500),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("partition");
+    let cells = &p.rows[0].cells;
+
+    let sentinel = cells
+        .iter()
+        .find(|(_, c)| c.path.is_none())
+        .expect("complex-deletion sentinel round-trips");
+    assert!(sentinel.1.is_tombstone());
+    assert_eq!(sentinel.1.timestamp, 499, "deletion marked_for_delete_at");
+
+    let element = cells
+        .iter()
+        .find(|(_, c)| c.path.is_some())
+        .expect("element cell round-trips");
+    assert_eq!(element.1.value.as_deref(), Some(&55i32.to_be_bytes()[..]));
+    assert_eq!(element.1.path.as_deref(), Some(&lp[..]));
+}
+
+/// `set<text>` (element = path, empty value), `map<text,int>` (key = path,
+/// value = int), and a set-element tombstone (remove) all round-trip through
+/// the complex-column layout — with the two complex columns in the same row.
+#[test]
+fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+            complex_collections: true,
+        min_timestamp: 1_000_000,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![
+            (
+                b"s".to_vec(),
+                "org.apache.cassandra.db.marshal.SetType(org.apache.cassandra.db.marshal.UTF8Type)"
+                    .into(),
+            ),
+            (
+                b"m".to_vec(),
+                "org.apache.cassandra.db.marshal.MapType(org.apache.cassandra.db.marshal.UTF8Type,org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+        ],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+        verify_output: true,
+    };
+    let ts = 1_000_100i64;
+
+    // set col 0: element "a" live (empty value, path="a"), element "b" removed (tombstone, path="b")
+    let set_a = CellValue::live(Vec::new(), ts).with_path(b"a".to_vec());
+    let set_b = CellValue::tombstone(ts, 1_700_000).with_path(b"b".to_vec());
+    // map col 1: key "k" -> 7
+    let map_k = CellValue::live(7i32.to_be_bytes().to_vec(), ts).with_path(b"k".to_vec());
+
+    let partition = Partition {
+        key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, set_a), (0, set_b), (1, map_k)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader.read_partition().unwrap().expect("partition");
+    let cells = &p.rows[0].cells;
+    // 2 set cells (col 0) + 1 map cell (col 1)
+    let set_cells: Vec<_> = cells.iter().filter(|(i, _)| *i == 0).collect();
+    let map_cells: Vec<_> = cells.iter().filter(|(i, _)| *i == 1).collect();
+    assert_eq!(set_cells.len(), 2, "set element + tombstone both present");
+    assert_eq!(map_cells.len(), 1);
+
+    // set element "a": live, empty value, path "a".
+    let a = set_cells
+        .iter()
+        .find(|(_, c)| c.path.as_deref() == Some(b"a"))
+        .unwrap();
+    assert!(!a.1.is_tombstone());
+    assert_eq!(
+        a.1.value.as_deref(),
+        Some(&[][..]),
+        "set element value is empty"
+    );
+    // set element "b": tombstone, path "b".
+    let b = set_cells
+        .iter()
+        .find(|(_, c)| c.path.as_deref() == Some(b"b"))
+        .unwrap();
+    assert!(
+        b.1.is_tombstone(),
+        "removed set element round-trips as a tombstone"
+    );
+    // map entry: key "k" (path), value 7 (int).
+    assert_eq!(map_cells[0].1.path.as_deref(), Some(b"k".as_slice()));
+    assert_eq!(
+        map_cells[0].1.value.as_deref(),
+        Some(&7i32.to_be_bytes()[..])
+    );
+}
+
+/// A projected read (SELECT of a subset of columns) over a table with a complex
+/// column must skip/read the complex-column framing correctly — otherwise the
+/// parse position drifts. Projecting the list column returns its element cells;
+/// projecting the scalar column skips the list without corruption.
+#[test]
+fn ferrosa_projected_read_over_complex_column() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+            complex_collections: true,
+        min_timestamp: 1_000_000,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![
+            (
+                b"l".to_vec(),
+                "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)".into(),
+            ),
+            (b"n".to_vec(), "org.apache.cassandra.db.marshal.Int32Type".into()),
+        ],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+        verify_output: true,
+    };
+    let ts = 1_000_100i64;
+
+    let mut lp = [0u8; 16];
+    lp[0..4].copy_from_slice(&5u32.to_be_bytes());
+    lp[6] = 0x10;
+    lp[8] = 0x80;
+    let list_elem = CellValue::live(99i32.to_be_bytes().to_vec(), ts).with_path(lp.to_vec());
+    let scalar = CellValue::live(42i32.to_be_bytes().to_vec(), ts);
+
+    let partition = Partition {
+        key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, list_elem), (1, scalar)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone());
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    // Project only the scalar column (ordinal 1): the list complex framing must
+    // be skipped without drift.
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader
+        .read_partition_projected(&[1])
+        .unwrap()
+        .expect("partition");
+    let cells = &p.rows[0].cells;
+    assert_eq!(cells.len(), 1, "only the projected scalar column");
+    assert_eq!(cells[0].0, 1);
+    assert_eq!(cells[0].1.value.as_deref(), Some(&42i32.to_be_bytes()[..]));
+
+    // Project only the list column (ordinal 0): its element cell comes back.
+    let mut reader = DataReader::new(&output.data, &header, 0);
+    let p = reader
+        .read_partition_projected(&[0])
+        .unwrap()
+        .expect("partition");
+    let cells = &p.rows[0].cells;
+    assert_eq!(cells.len(), 1, "one list element");
+    assert_eq!(cells[0].0, 0);
+    assert_eq!(cells[0].1.path.as_deref(), Some(&lp[..]));
+    assert_eq!(cells[0].1.value.as_deref(), Some(&99i32.to_be_bytes()[..]));
+}
+
 #[test]
 /// The compat test infrastructure files must exist before a Docker run is
 /// attempted.  This test acts as a quick smoke-check: if the files are
@@ -380,6 +895,7 @@ fn sstable_compat_simple_types() {
     //   4 v_double DoubleType
     //   5 v_blob   BytesType
     let header = SerializationHeader {
+        complex_collections: false,
         min_timestamp: 1_000_000,
         min_local_deletion_time: i32::MAX,
         min_ttl: 0,

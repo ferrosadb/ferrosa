@@ -32,6 +32,13 @@ resolution beyond the serialization header, or cluster routing.
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
   token-seek (`seek_to_token`) and projection variants.
+- **Complex (non-frozen collection) columns** — `list`/`set`/`map` columns
+  read and write Cassandra's per-element cell layout: `uvint(cell-count)` then
+  one cell per element, each with a length-prefixed cell path (list → TimeUUID,
+  set → element, map → key). Read, write, and the projection/skip paths handle
+  it; the element value uses the collection's element/value type. `marshal`
+  detects multicell-ness from the type string (`ListType(..)` vs
+  `FrozenType(..)`).
 - **Trie index** — on-disk trie walker + builder (`trie/`) backing the partition
   index (Partitions.db) and the row index (Rows.db) for wide clustered
   partitions.
@@ -51,8 +58,23 @@ resolution beyond the serialization header, or cluster routing.
   BTI only. There is no Big-format read path (deferred per ADR-004).
 - **Range tombstone markers** — not encoded by the writer; the reader skips
   them. Documented in `data.rs` / `writer.rs` as deferred.
-- **Complex columns** (collections, UDTs, frozen/tuple types) — deferred in the
-  Data.db row codec.
+- **Non-frozen collections and UDTs** are supported (see above). A non-frozen
+  UDT is a complex column whose per-field cell path is a 2-byte big-endian field
+  position (`marshal::is_nonfrozen_udt`); field values assemble via
+  `ferrosa_row_bridge::collection::assemble_udt`. A complex `DeletionTime` (from a
+  collection/UDT overwrite) is now captured as a `path=None` tombstone sentinel,
+  round-trips writer↔reader, and is applied at assembly. Complex framing is gated
+  on `SerializationHeader.complex_collections`, default `false` = Ferrosa's legacy
+  whole-value storage; Cassandra import sets it `true`. Living on the header, it
+  flows to every `DataReader`/`SSTableWriter` uniformly (a per-SSTable format
+  switch), and is **persisted** in Statistics.db (a trailing byte after the
+  `max_timestamp` Ferrosa extension; a Cassandra header lacks it → `false`), so a
+  complex SSTable round-trips across reopen (`verify_output` included). Still
+  deferred: **tuple** complex columns; the engine setting it `true` on flush
+  (D-write emits per-element cells); and deriving `true` when importing a
+  Cassandra *BTI* SSTable with collections via `SSTableReader` (its header has no
+  Ferrosa byte — today collection/UDT imports read `Data.db` directly through
+  `DataReader` with an explicit header). Tracked in t_83c4f093 / t_b7cec413.
 - **Snappy / Deflate compression** — only None / LZ4 / Zstd are supported.
 
 ## How it works

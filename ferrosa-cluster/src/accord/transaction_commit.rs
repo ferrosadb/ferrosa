@@ -378,13 +378,19 @@ mod tests {
         let node_id = node_id_of(host);
         let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
 
-        // The coordinator's own Accord state machine (protocol state for the
-        // local self-vote); its own storage is applied via the committer's applier.
-        let local_state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
-            node_id,
-            Arc::new(MockSyncWriter::new()),
-        )));
+        // The coordinator's own Accord state machine. It drives BOTH the local
+        // self-vote AND its own Commit → Apply (a node is never in its own peer
+        // map, so its self-addressed Apply RPC is unreachable). The SM's apply
+        // engine is the recording applier, so the coordinator's write is applied —
+        // and the SM advances to Applied — through the same path a remote replica
+        // takes.
         let applier = Arc::new(RecordingApplier::new());
+        let local_state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                applier.clone(),
+            )));
 
         // Sole replica = the coordinator; NoPeersTransport => self is unreachable
         // over the network, exactly like the production PeerManager.
@@ -425,14 +431,17 @@ mod tests {
         let node_id = node_id_of(host);
         let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
 
-        let slot = empty_accord_state_slot();
-        let state: AccordState = Arc::new(parking_lot::Mutex::new(AccordStateMachine::new(
-            node_id,
-            Arc::new(MockSyncWriter::new()),
-        )));
-        slot.store(Some(state));
-
         let applier = Arc::new(RecordingApplier::new());
+        let slot = empty_accord_state_slot();
+        // SM apply engine = the recording applier, so the coordinator's own
+        // Commit → Apply (driven through the SM) is observable.
+        let state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                applier.clone(),
+            )));
+        slot.store(Some(state));
         let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
         let committer = AccordTransactionCommitter::new(
             node_id,
@@ -453,6 +462,56 @@ mod tests {
             applier.applied_data(),
             vec![b"v".to_vec()],
             "the coordinator must apply its own write when the slot is populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_marks_its_own_committed_write_applied_in_its_state_machine() {
+        // The read-visibility fix: a coordinator that commits a write must drive its
+        // OWN state machine to Applied — not just persist to storage. Otherwise a
+        // later linearizable (SERIAL) read served by this node dep-waits forever on
+        // a conflict that is durably written but never marked Applied in the SM.
+        //
+        // After a sole-replica commit of key `k`, the SM must report NO unapplied
+        // conflicts for `k` at any later timestamp (the committed txn is Applied).
+        use crate::accord::handlers::AccordState;
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let host = Uuid::from_u128(0xC2);
+        let node_id = node_id_of(host);
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+        let applier = Arc::new(RecordingApplier::new());
+        let local_state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                applier.clone(),
+            )));
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            clock.clone(),
+            Arc::new(NoPeersTransport),
+            applier,
+            resolve,
+        )
+        .with_local_accord_state(local_state.clone());
+
+        committer
+            .commit(vec![write("ks", b"k", b"v")])
+            .await
+            .expect("sole-replica commit must succeed");
+
+        let later_t = clock.now();
+        let pending = local_state
+            .lock()
+            .unapplied_conflicts_before(b"k", &later_t);
+        assert!(
+            pending.is_empty(),
+            "coordinator's own committed write must be Applied in its SM (no pending \
+             conflicts), else a linearizable read served by this node dep-waits forever; \
+             pending={pending:?}"
         );
     }
 

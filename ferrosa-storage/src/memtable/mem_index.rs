@@ -94,12 +94,14 @@ impl MemIndex {
             timestamp: Timestamp::MIN,
             ttl: i32::MIN,
             local_deletion_time: i32::MIN,
+            path: None,
         };
         let max_cell = CellValue {
             value: value.value.clone(),
             timestamp: Timestamp::MAX,
             ttl: i32::MAX,
             local_deletion_time: i32::MAX,
+            path: None,
         };
         let start = (min_cell, Timestamp::MIN);
         let end = (max_cell, Timestamp::MAX);
@@ -119,12 +121,14 @@ impl MemIndex {
             timestamp: Timestamp::MIN,
             ttl: i32::MIN,
             local_deletion_time: i32::MIN,
+            path: None,
         };
         let end_cell = CellValue {
             value: to.value.clone(),
             timestamp: Timestamp::MAX,
             ttl: i32::MAX,
             local_deletion_time: i32::MAX,
+            path: None,
         };
         let start = (start_cell, Timestamp::MIN);
         let end = (end_cell, Timestamp::MAX);
@@ -203,12 +207,14 @@ impl MemIndex {
             timestamp: Timestamp::MIN,
             ttl: i32::MIN,
             local_deletion_time: i32::MIN,
+            path: None,
         };
         let max_cell = CellValue {
             value: value.value.clone(),
             timestamp: Timestamp::MAX,
             ttl: i32::MAX,
             local_deletion_time: i32::MAX,
+            path: None,
         };
         let start = (min_cell, Timestamp::MIN);
         let end = (max_cell, Timestamp::MAX);

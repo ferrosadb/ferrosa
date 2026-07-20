@@ -63,7 +63,8 @@ pub use electorate::{Electorate, ElectorateError, JoinGate, MemberStatus, Protoc
 pub use epoch::{EpochDecision, EpochMessage, EpochTracker, MessageKind, QuorumEpochCheck};
 pub use epoch_drain::{DrainCheckResult, EpochDrain, TxnDrainStatus};
 pub use handlers::{
-    empty_accord_state_slot, publish_accord_state, AccordHandler, AccordState, AccordStateSlot,
+    await_conflicting_deps_applied, empty_accord_state_slot, publish_accord_state, AccordHandler,
+    AccordState, AccordStateSlot,
 };
 pub use leaseholder::{LeaseAssignment, LeaseError, LeaseholderManager};
 pub use linearizable_read::{LinearizableReadManager, ReadError, ReadResult};

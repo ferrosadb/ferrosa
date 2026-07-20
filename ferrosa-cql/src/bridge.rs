@@ -856,6 +856,13 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
     let mut meta_result = Vec::new();
 
     let pk_values = decode_pk(&partition.key, pk_columns.len());
+    let now_secs = i32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+    .unwrap_or(i32::MAX);
 
     for row in &partition.rows {
         if !row.deletion.is_live() {
@@ -891,6 +898,14 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
             }
         }
 
+        // Group cells by their table column index. A simple (scalar) column has
+        // exactly one cell (path = None). A complex (collection) column has many
+        // cells sharing one column index, each distinguished by a per-element
+        // path (set element / map key / list TimeUUID) — the CRDT encoding from
+        // t_83c4f093. Those must be ASSEMBLED into a single collection value, not
+        // decoded cell-by-cell as if each were the whole column.
+        let mut cells_by_col: std::collections::BTreeMap<usize, Vec<&ferrosa_common::CellValue>> =
+            std::collections::BTreeMap::new();
         for (col_index, cell) in &row.cells {
             let storage_idx = *col_index as usize;
             let table_idx = match storage_to_table.get(storage_idx) {
@@ -898,16 +913,38 @@ pub fn partition_to_rows_with_metadata_storage_mapping(
                 None => continue,
             };
             if table_idx < column_types.len() {
-                meta_row[table_idx] = CellMeta {
-                    timestamp: cell.timestamp,
-                    ttl: cell.ttl,
-                };
-                if cell.is_tombstone() {
+                cells_by_col.entry(table_idx).or_default().push(cell);
+            }
+        }
+
+        for (table_idx, cells) in cells_by_col {
+            // Column metadata carries the newest cell's timestamp/ttl.
+            let newest = cells
+                .iter()
+                .copied()
+                .max_by_key(|c| c.timestamp)
+                .expect("grouped column has at least one cell");
+            meta_row[table_idx] = CellMeta {
+                timestamp: newest.timestamp,
+                ttl: newest.ttl,
+            };
+
+            // Value assembly is shared with the primary SELECT read path so the
+            // two cannot diverge (complex → reconcile-by-path + assemble; simple
+            // → newest live cell; legacy whole-value collection decodes whole).
+            match crate::collection_cells::assemble_column_cells(
+                &column_types[table_idx],
+                &cells,
+                now_secs,
+            ) {
+                Ok(value) => output_row[table_idx] = value,
+                Err(e) => {
+                    tracing::error!(
+                        column = column_names.get(table_idx).map(String::as_str).unwrap_or("?"),
+                        error = %e,
+                        "failed to assemble complex collection column from per-element cells",
+                    );
                     output_row[table_idx] = None;
-                } else if let Some(ref value_bytes) = cell.value {
-                    if let Ok(val) = decode_value(&column_types[table_idx], value_bytes) {
-                        output_row[table_idx] = Some(val);
-                    }
                 }
             }
         }
@@ -2837,6 +2874,168 @@ mod tests {
         assert_eq!(rows[0][1], Some(CqlValue::Text("alice".into())));
         // Metadata should have timestamp for the data cell
         assert_eq!(metas[0][1].timestamp, 1000);
+    }
+
+    /// A complex (collection) column stored as per-element cells — many cells
+    /// sharing one column index, each with a path — must be ASSEMBLED back into
+    /// a single collection value, not overwritten cell-by-cell as a scalar. Two
+    /// appends `[10]` then `[20]` (later timestamp) assemble in append order.
+    #[test]
+    fn partition_to_rows_assembles_complex_list_column_in_append_order() {
+        use crate::collection_cells::{build_collection_cells, CollectionOp};
+        use ferrosa_sstable::types::Partition;
+
+        let dk = DecoratedKey::new(PartitionKey::new(encode_value(&CqlValue::Int(1))));
+
+        let mut cells: Vec<(u16, CellValue)> = Vec::new();
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::List(vec![CqlValue::Int(10)]),
+            100,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::List(vec![CqlValue::Int(20)]),
+            200,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        let row = Row {
+            clustering: vec![],
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(200),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let column_names = vec!["id".into(), "v".into()];
+        let column_types = vec![CqlType::Int, CqlType::List(Box::new(CqlType::Int))];
+        let (rows, metas) = partition_to_rows_with_metadata(
+            &partition,
+            &column_names,
+            &column_types,
+            &[0usize],
+            &[],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::List(vec![CqlValue::Int(10), CqlValue::Int(20)])),
+            "per-element cells assemble into the whole list in append order"
+        );
+        // Column metadata reports the newest element's timestamp.
+        assert_eq!(metas[0][1].timestamp, 200);
+    }
+
+    /// A `set<T>` stored as per-element cells with a removal tombstone: the
+    /// removed element is excluded from the assembled value.
+    #[test]
+    fn partition_to_rows_assembles_complex_set_excluding_tombstoned_element() {
+        use crate::collection_cells::{build_collection_cells, CollectionOp};
+        use ferrosa_sstable::types::Partition;
+
+        let dk = DecoratedKey::new(PartitionKey::new(encode_value(&CqlValue::Int(1))));
+        // Cells reaching the read path are already one-per-path (the merge folded
+        // "a"'s live+tombstone into a tombstone): "b" live + "a" tombstoned.
+        let mut cells: Vec<(u16, CellValue)> = Vec::new();
+        for c in build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::Set(vec![CqlValue::Text("b".into())]),
+            100,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        // Remove "a" at a later timestamp — tombstone at "a"'s path.
+        for c in build_collection_cells(
+            CollectionOp::Sub,
+            &CqlValue::Set(vec![CqlValue::Text("a".into())]),
+            200,
+        )
+        .unwrap()
+        {
+            cells.push((0, c));
+        }
+        let row = Row {
+            clustering: vec![],
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(200),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let column_names = vec!["id".into(), "v".into()];
+        let column_types = vec![CqlType::Int, CqlType::Set(Box::new(CqlType::Varchar))];
+        let (rows, _metas) = partition_to_rows_with_metadata(
+            &partition,
+            &column_names,
+            &column_types,
+            &[0usize],
+            &[],
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::Set(vec![CqlValue::Text("b".into())])),
+            "tombstoned set element is excluded from assembly"
+        );
+    }
+
+    /// Backward compatibility: a collection written the LEGACY way — a single
+    /// scalar cell (path = None) holding the whole encoded collection — must
+    /// still decode as the whole value. This is the lazy dual-read guarantee:
+    /// old on-disk collections keep reading correctly after the per-element
+    /// encoding lands.
+    #[test]
+    fn partition_to_rows_legacy_whole_value_collection_still_decodes() {
+        use ferrosa_sstable::types::Partition;
+
+        let dk = DecoratedKey::new(PartitionKey::new(encode_value(&CqlValue::Int(1))));
+        // One cell, no path, value = the whole encoded list.
+        let whole = encode_value(&CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)]));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(whole, 100))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(100),
+        };
+        let partition = Partition {
+            key: dk,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row],
+        };
+
+        let column_names = vec!["id".into(), "v".into()];
+        let column_types = vec![CqlType::Int, CqlType::List(Box::new(CqlType::Int))];
+        let (rows, _metas) = partition_to_rows_with_metadata(
+            &partition,
+            &column_names,
+            &column_types,
+            &[0usize],
+            &[],
+        );
+        assert_eq!(
+            rows[0][1],
+            Some(CqlValue::List(vec![CqlValue::Int(7), CqlValue::Int(8)])),
+            "legacy single-cell whole-value collection still decodes"
+        );
     }
 
     // ── parse_cql_type_in_keyspace coverage ──────────────────────────

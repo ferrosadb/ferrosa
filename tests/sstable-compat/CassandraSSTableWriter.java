@@ -18,6 +18,12 @@
 
 import java.io.File;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.apache.cassandra.io.sstable.CQLSSTableWriter;
 
 public class CassandraSSTableWriter {
@@ -102,6 +108,35 @@ public class CassandraSSTableWriter {
             }
         }
         System.out.println("Generated: wide_partition");
+
+        // === Fixture 6: Non-frozen collections (complex columns) ===
+        // Exercises Cassandra's complex-column on-disk layout: each collection
+        // element is its own cell sharing the column's storage index, keyed by a
+        // cell path (list -> TimeUUID, set -> element, map -> key). This is the
+        // ground-truth fixture for ferrosa's complex-column reader.
+        String collSchema = "CREATE TABLE test.collections ("
+                + "pk text, "
+                + "l list<int>, "
+                + "s set<text>, "
+                + "m map<text,int>, "
+                + "PRIMARY KEY (pk)"
+                + ")";
+        String collInsert =
+                "INSERT INTO test.collections (pk, l, s, m) VALUES (?, ?, ?, ?)";
+        try (CQLSSTableWriter writer = CQLSSTableWriter.builder()
+                .inDirectory(outputDir + "/collections")
+                .forTable(collSchema)
+                .using(collInsert)
+                .build()) {
+
+            List<Integer> list = Arrays.asList(10, 20, 30);
+            Set<String> set = new LinkedHashSet<>(Arrays.asList("a", "b", "c"));
+            Map<String, Integer> map = new LinkedHashMap<>();
+            map.put("k1", 1);
+            map.put("k2", 2);
+            writer.addRow("row1", list, set, map);
+        }
+        System.out.println("Generated: collections");
 
         System.out.println("All fixtures generated in: " + outputDir);
     }

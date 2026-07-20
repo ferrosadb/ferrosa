@@ -17,6 +17,7 @@
 //! #     max_timestamp: i64::MAX,
 //! #     key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
 //! #     clustering_types: vec![], static_columns: vec![], regular_columns: vec![],
+//! #     complex_collections: false,
 //! # };
 //! # let partitions: Vec<Partition> = vec![];
 //! let mut writer = SSTableWriter::new(WriteOptions::default(), header);
@@ -26,9 +27,12 @@
 //! let output = writer.finish().unwrap();
 //! ```
 //!
-//! Partitions must be added in token order. The writer currently handles
-//! simple single-row partitions with live cells; more complex cases
-//! (range tombstones, complex columns) are deferred.
+//! Partitions must be added in token order. The writer handles simple and
+//! complex (non-frozen collection) columns — the latter as Cassandra's
+//! per-element cells: `uvint(cell-count)` followed by one cell per element,
+//! each carrying a length-prefixed cell path. Range tombstones and a
+//! per-column complex `DeletionTime` on write are still deferred (Ferrosa's
+//! collection ops are element add/remove, not whole-collection clears).
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -175,6 +179,8 @@ const HAS_TTL: u8 = 0x08;
 const HAS_DELETION: u8 = 0x10;
 /// All columns in the schema are present (no missing-column bitmap).
 const HAS_ALL_COLUMNS: u8 = 0x20;
+/// At least one complex column in the row has a complex `DeletionTime`.
+const HAS_COMPLEX_DELETION: u8 = 0x40;
 /// Extended flags byte follows.
 const EXTENSION_FLAG: u8 = 0x80;
 /// Extended flag: this row is a static row.
@@ -915,15 +921,21 @@ impl SSTableWriter {
         };
         let num_columns = column_defs.len();
 
-        // P0 correctness: every cell's col_idx must be in range for the header's
-        // column set, and col_idx values must be unique within a row. If either
-        // invariant is violated, the writer's bitmap (built from a HashSet) will
-        // under-count cells relative to the body bytes written, producing an
-        // SSTable where the reader's parse-position drifts row-over-row until
-        // it hits a byte with bit-0 set and terminates the partition early.
-        // That manifests on disk as "corrupted DeletionTime flags" warnings
-        // with silent data loss for every row after the first drift.
-        for (i, (idx, _)) in row.cells.iter().enumerate() {
+        // P0 correctness: every cell's col_idx must be in range, and cells must
+        // be grouped/sorted by col_idx. A *simple* column has exactly one cell;
+        // a *complex* (non-frozen collection) column has one cell PER ELEMENT,
+        // all sharing that col_idx and each carrying a distinct cell-path — that
+        // is Cassandra's complex-column layout. If these invariants are violated
+        // the present-column bitmap (distinct indices) would under-count the
+        // body bytes and the reader's parse position would drift, silently
+        // corrupting every row after the first drift.
+        let mut prev_idx: Option<u16> = None;
+        // A complex column may carry one `path == None` tombstone — the
+        // collection-level deletion sentinel. Any such cell sets the row-level
+        // HAS_COMPLEX_DELETION flag (all-or-nothing: every complex column then
+        // writes a DeletionTime, LIVE for those without a sentinel).
+        let mut has_complex_deletion = false;
+        for (idx, cell) in &row.cells {
             assert!(
                 (*idx as usize) < num_columns,
                 "SSTable writer: cell col_idx {} is out of range (num_columns={}). \
@@ -931,27 +943,53 @@ impl SSTableWriter {
                 idx,
                 num_columns
             );
-            if i > 0 {
-                let prev = row.cells[i - 1].0;
+            let is_complex = self.header.complex_collections
+                && crate::marshal::is_multicell(&column_defs[*idx as usize].1);
+            match prev_idx {
+                Some(p) if *idx < p => panic!(
+                    "SSTable writer: row.cells must be sorted by col_idx (found {idx} after {p})"
+                ),
+                Some(p) if *idx == p => assert!(
+                    is_complex,
+                    "SSTable writer: duplicate col_idx {idx} for a non-complex column — \
+                     only complex (collection) columns may have multiple cells per row"
+                ),
+                _ => {}
+            }
+            if is_complex {
+                // Element cell (path present) or collection-deletion sentinel
+                // (path absent, must be a tombstone).
+                if cell.path.is_none() {
+                    assert!(
+                        cell.is_tombstone(),
+                        "SSTable writer: complex col_idx {idx} path=None cell must be a \
+                         collection-deletion tombstone"
+                    );
+                    has_complex_deletion = true;
+                }
+            } else {
                 assert!(
-                    *idx > prev,
-                    "SSTable writer: row.cells must be strictly sorted by col_idx \
-                     with no duplicates (found {} after {}). Duplicates would cause \
-                     the bitmap to under-count the body, producing a silently \
-                     corrupt SSTable.",
-                    idx,
-                    prev
+                    cell.path.is_none(),
+                    "SSTable writer: simple col_idx {idx} must not carry a cell path"
                 );
             }
+            prev_idx = Some(*idx);
         }
-        let all_present = row.cells.len() == num_columns
-            && row
-                .cells
-                .iter()
-                .enumerate()
-                .all(|(i, (idx, _))| *idx as usize == i);
+
+        // Distinct present columns (cells are grouped by col_idx, so dedup runs).
+        let mut present_columns: Vec<usize> = Vec::new();
+        for (idx, _) in &row.cells {
+            if present_columns.last() != Some(&(*idx as usize)) {
+                present_columns.push(*idx as usize);
+            }
+        }
+        let all_present = present_columns.len() == num_columns
+            && present_columns.iter().enumerate().all(|(i, c)| *c == i);
         if all_present {
             flags |= HAS_ALL_COLUMNS;
+        }
+        if has_complex_deletion {
+            flags |= HAS_COMPLEX_DELETION;
         }
 
         // Set EXTENSION_FLAG if we have extended flags
@@ -1038,15 +1076,64 @@ impl SSTableWriter {
         // Columns.Serializer writes an unsigned vint, not a raw MSB-first
         // bitmap: for <64 columns, bit i set means column i is missing.
         if flags & HAS_ALL_COLUMNS == 0 {
-            let present_columns: Vec<usize> =
-                row.cells.iter().map(|(idx, _)| *idx as usize).collect();
             write_columns_subset(&mut row_body, &present_columns, num_columns);
         }
 
-        // Cells
-        for (col_idx, cell) in &row.cells {
-            let column_type = &column_defs[*col_idx as usize].1;
-            serialize_cell(&mut row_body, cell, row, &self.header, column_type);
+        // Cells. A simple column writes one cell; a complex (non-frozen
+        // collection) column writes `uvint(cell-count)` then one element cell
+        // per element, each with a cell-path. Ferrosa never emits a complex
+        // DeletionTime on its own writes (its collection ops are element
+        // add/remove, not whole-collection clears), so HAS_COMPLEX_DELETION is
+        // never set here and no complex deletion precedes the cell count.
+        let mut i = 0;
+        while i < row.cells.len() {
+            let col_idx = row.cells[i].0;
+            let column_type = &column_defs[col_idx as usize].1;
+            if self.header.complex_collections && crate::marshal::is_multicell(column_type) {
+                let mut j = i;
+                while j < row.cells.len() && row.cells[j].0 == col_idx {
+                    j += 1;
+                }
+                // Split the collection-deletion sentinel (path=None tombstone)
+                // from the element cells (path present).
+                let sentinel = row.cells[i..j].iter().find(|(_, c)| c.path.is_none());
+                let mut elements: Vec<&CellValue> = row.cells[i..j]
+                    .iter()
+                    .filter(|(_, c)| c.path.is_some())
+                    .map(|(_, c)| c)
+                    .collect();
+                // Element cells are stored in cell-path order.
+                elements.sort_by(|a, b| a.path.cmp(&b.path));
+                // When the row flag is set, EVERY complex column writes a
+                // DeletionTime — its sentinel's, or LIVE if it has none.
+                if has_complex_deletion {
+                    let dt = match sentinel {
+                        Some((_, c)) => crate::types::DeletionTime::new(
+                            c.timestamp,
+                            c.local_deletion_time as u32,
+                        ),
+                        None => crate::types::DeletionTime::LIVE,
+                    };
+                    write_complex_deletion(&mut row_body, dt, &self.header);
+                }
+                push_unsigned_vint_to(&mut row_body, elements.len() as u64);
+                let value_type =
+                    crate::marshal::collection_value_type(column_type).unwrap_or(column_type);
+                for cell in elements {
+                    serialize_cell(&mut row_body, cell, row, &self.header, value_type, true);
+                }
+                i = j;
+            } else {
+                serialize_cell(
+                    &mut row_body,
+                    &row.cells[i].1,
+                    row,
+                    &self.header,
+                    column_type,
+                    false,
+                );
+                i += 1;
+            }
         }
 
         // Write row body size + previous unfiltered size + row body
@@ -1459,13 +1546,17 @@ fn serialize_cell(
     cell: &CellValue,
     row: &crate::types::Row,
     header: &SerializationHeader,
-    column_type: &str,
+    value_type: &str,
+    is_complex: bool,
 ) {
     let is_tombstone = cell.is_tombstone();
     let is_expiring = !is_tombstone
         && cell.ttl != ferrosa_common::NO_TTL
         && cell.local_deletion_time != ferrosa_common::NO_DELETION_TIME;
-    let has_empty_value = cell.value.is_none() || (is_tombstone && cell.value.is_none());
+    // HAS_EMPTY_VALUE covers both a tombstone (no value) and a live cell whose
+    // value is empty — e.g. a `set` element, whose identity is its cell-path and
+    // whose value is empty. Cassandra sets this flag on any zero-length value.
+    let has_empty_value = cell.value.as_ref().is_none_or(|v| v.is_empty());
     let use_row_timestamp = row.primary_key_liveness.has_timestamp()
         && cell.timestamp == row.primary_key_liveness.timestamp;
     let use_row_ttl = is_expiring
@@ -1522,7 +1613,19 @@ fn serialize_cell(
         push_unsigned_vint_to(buf, ttl_delta);
     }
 
-    // Value (absent if HAS_EMPTY_VALUE)
+    // Cell path (complex/collection columns only): `uvint(len) + bytes`, written
+    // between the ttl and the value. It is present for EVERY element cell of a
+    // complex column and is gated purely by the column's complex-ness — there is
+    // no cell-flag bit for it (matching Cassandra's CollectionType path serializer).
+    if is_complex {
+        let path = cell.path.as_deref().unwrap_or(&[]);
+        push_unsigned_vint_to(buf, path.len() as u64);
+        buf.extend_from_slice(path);
+    }
+
+    // Value (absent if HAS_EMPTY_VALUE). `value_type` is the element/value type
+    // for a complex column (e.g. the `V` of `map<K,V>`), the column type for a
+    // simple one — it decides fixed-width (raw bytes) vs varint-length prefix.
     if !has_empty_value {
         if let Some(ref value) = cell.value {
             // Safety assertion: catch corrupt cell values at write time.
@@ -1534,10 +1637,16 @@ fn serialize_cell(
                  this is a bug in the write path, not user data",
                 value.len()
             );
-            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(column_type) {
+            // A collection element value is ALWAYS length-prefixed, even for a
+            // fixed-width element type (Cassandra serializes `list<int>` /
+            // `map<k,int>` values with a uvint length). The fixed-width raw-bytes
+            // optimization applies only to simple (scalar) columns.
+            if is_complex {
+                push_unsigned_vint_to(buf, value.len() as u64);
+            } else if let Some(fixed_len) = crate::marshal::value_length_if_fixed(value_type) {
                 assert!(
                     value.len() == fixed_len,
-                    "SSTable writer: fixed-width column {column_type} expects {fixed_len} bytes, got {}",
+                    "SSTable writer: fixed-width column {value_type} expects {fixed_len} bytes, got {}",
                     value.len()
                 );
             } else {
@@ -1546,6 +1655,22 @@ fn serialize_cell(
             buf.extend_from_slice(value);
         }
     }
+}
+
+/// Write a complex-column `DeletionTime` as two unsigned-vint deltas against the
+/// header mins (`markedForDeleteAt - minTimestamp`, `localDeletionTime -
+/// minLocalDeletionTime`). Wrapping arithmetic is used so a `LIVE` deletion
+/// (`i64::MIN` / `u32::MAX`) round-trips through the reader's wrapping add.
+fn write_complex_deletion(
+    buf: &mut Vec<u8>,
+    dt: crate::types::DeletionTime,
+    header: &SerializationHeader,
+) {
+    let ts_delta = dt.marked_for_delete_at.wrapping_sub(header.min_timestamp) as u64;
+    push_unsigned_vint_to(buf, ts_delta);
+    let ldt_delta =
+        (dt.local_deletion_time as i64).wrapping_sub(header.min_local_deletion_time as i64) as u64;
+    push_unsigned_vint_to(buf, ldt_delta);
 }
 
 /// Write an unsigned varint to a Vec buffer.
@@ -1626,6 +1751,7 @@ mod tests {
     /// Build a minimal serialization header for testing.
     fn test_header() -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -1787,6 +1913,7 @@ mod tests {
     fn composite_text_pk_uuid_clustering_roundtrip() {
         // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -1926,6 +2053,7 @@ mod tests {
 
         // Header matching memo_cache: CompositeType(UTF8,UTF8) PK, UUID clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2479,6 +2607,7 @@ mod tests {
     fn write_partition_with_tombstone_cell() {
         // Use a header with min_local_deletion_time that allows unsigned deltas
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -2534,6 +2663,7 @@ mod tests {
     #[test]
     fn write_no_clustering_columns_roundtrip() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2594,6 +2724,7 @@ mod tests {
     #[test]
     fn write_partition_with_expiring_cell_roundtrip() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: 0,
             min_ttl: 0,
@@ -2665,6 +2796,7 @@ mod tests {
     #[test]
     fn partitions_db_pk1_pk2_hex_dump() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2798,6 +2930,7 @@ mod tests {
     #[test]
     fn writer_serializes_sparse_columns_as_cassandra_subset_vint() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2866,6 +2999,7 @@ mod tests {
     #[test]
     fn writer_serializes_fixed_width_cells_without_value_length_prefix() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -2938,6 +3072,7 @@ mod tests {
     #[should_panic(expected = "delta would underflow")]
     fn row_deletion_timestamp_below_header_min_panics() {
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000, // header min is 1M
             min_local_deletion_time: 100,
             min_ttl: 0,
@@ -2987,6 +3122,7 @@ mod tests {
     fn multi_column_clustering_key_roundtrip() {
         // Header matching typed_edges: (uuid, text, uuid) clustering
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3133,6 +3269,7 @@ mod tests {
     fn writer_rejects_duplicate_column_index_cells() {
         // 7-column header matching entity_store shape
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3208,6 +3345,7 @@ mod tests {
         // entity_store shape: PK (tenant_id uuid, session_id uuid), CK entity_id uuid,
         // regular columns: entity_name text, entity_type text, embedding (3072B blob)
         let header = SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
@@ -3447,6 +3585,7 @@ mod tests {
     /// Build a header with the given clustering types and no cells beyond the default `val`.
     fn header_with_clustering(clustering_types: Vec<&str>) -> SerializationHeader {
         SerializationHeader {
+            complex_collections: false,
             min_timestamp: 1_000_000,
             min_local_deletion_time: i32::MAX,
             min_ttl: 0,
