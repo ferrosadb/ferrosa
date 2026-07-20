@@ -83,7 +83,10 @@ const CELL_USE_ROW_TTL: u8 = 0x10;
 /// their value is serialized with the collection's element/value type. Anything
 /// else is *simple*: one cell, value serialized with the column type itself.
 fn complex_col_meta(column_type: &str, complex_collections: bool) -> (bool, String) {
-    if complex_collections && marshal::is_multicell_collection(column_type) {
+    if complex_collections && marshal::is_multicell(column_type) {
+        // value_type is used only for simple columns; complex columns always
+        // length-prefix their value. For a collection it's the element/value
+        // type; for a UDT (per-field types) it is unused, so pass the column type.
         let value_type = marshal::collection_value_type(column_type)
             .unwrap_or(column_type)
             .to_string();

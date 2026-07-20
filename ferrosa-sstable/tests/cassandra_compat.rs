@@ -411,6 +411,73 @@ fn read_real_cassandra_collections() {
     );
 }
 
+/// Read a `Data.db` from a real Cassandra 5.0 with a NON-FROZEN UDT column
+/// (`addr {street text, zip int}`). A non-frozen UDT is a complex column: each
+/// field is a cell whose cell-path is a 2-byte big-endian field position. Proves
+/// ferrosa parses real Cassandra UDT field cells (t_edf9fd15).
+#[test]
+fn read_real_cassandra_udt() {
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+
+    let data = std::fs::read(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cassandra_udt/Data.db"),
+    )
+    .expect("cassandra_udt fixture Data.db");
+
+    // The reader only needs the column type's simple class name to be `UserType`
+    // (to detect the complex UDT framing); it reads field cells as opaque
+    // 2-byte-path + length-prefixed value. Field-value decoding happens in the
+    // row-bridge assembly layer (CqlType::Udt), not here.
+    let header = SerializationHeader {
+        min_timestamp: 0,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"a".to_vec(),
+            "org.apache.cassandra.db.marshal.UserType(test,61646472,\
+             73747265657400:org.apache.cassandra.db.marshal.UTF8Type,\
+             7a697000:org.apache.cassandra.db.marshal.Int32Type)"
+                .into(),
+        )],
+    };
+
+    let mut reader = DataReader::new(&data, &header, 0).with_complex_collections(true);
+    let p = reader.read_partition().unwrap().expect("row1 partition");
+    assert_eq!(p.key.key.as_bytes(), b"row1");
+    let cells = &p.rows[0].cells;
+
+    // A UDT INSERT sets HAS_COMPLEX_DELETION -> captured sentinel (path=None).
+    assert!(
+        cells
+            .iter()
+            .any(|(_, c)| c.path.is_none() && c.is_tombstone()),
+        "complex-deletion sentinel captured"
+    );
+    // Field cells: path = 2-byte position, value length-prefixed.
+    let field = |pos: [u8; 2]| {
+        cells
+            .iter()
+            .find(|(_, c)| c.path.as_deref() == Some(&pos[..]))
+            .map(|(_, c)| c.value.clone().unwrap())
+    };
+    assert_eq!(
+        field([0, 0]).as_deref(),
+        Some(b"main".as_slice()),
+        "field 0 = street 'main'"
+    );
+    assert_eq!(
+        field([0, 1]).map(|v| i32::from_be_bytes(v.try_into().unwrap())),
+        Some(12345),
+        "field 1 = zip 12345"
+    );
+}
+
 /// A non-frozen `list<int>` column stores each element as its own cell sharing
 /// the column's storage index, distinguished by a 16-byte TimeUUID cell path
 /// (Cassandra's complex-column layout). Two appended elements must round-trip

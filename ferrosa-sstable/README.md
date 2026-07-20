@@ -58,14 +58,17 @@ resolution beyond the serialization header, or cluster routing.
   BTI only. There is no Big-format read path (deferred per ADR-004).
 - **Range tombstone markers** — not encoded by the writer; the reader skips
   them. Documented in `data.rs` / `writer.rs` as deferred.
-- **Non-frozen collections** are supported (see above). Still deferred: **UDT /
-  tuple** complex columns (non-frozen UDTs use a 2-byte short path serializer,
-  not the collection vint form), and a per-column complex `DeletionTime` on the
-  **write** side. On **read**, a complex `DeletionTime` (from a Cassandra
-  collection overwrite) is parsed to stay byte-aligned but discarded — Ferrosa's
-  `Row` has no per-column complex-deletion slot, so an un-compacted
-  collection-clear would not shadow older cells in other SSTables (compacted
-  SSTables, the common import case, are already correct). Tracked in t_83c4f093.
+- **Non-frozen collections and UDTs** are supported (see above). A non-frozen
+  UDT is a complex column whose per-field cell path is a 2-byte big-endian field
+  position (`marshal::is_nonfrozen_udt`); field values assemble via
+  `ferrosa_row_bridge::collection::assemble_udt`. A complex `DeletionTime` (from a
+  collection/UDT overwrite) is now captured as a `path=None` tombstone sentinel,
+  round-trips writer↔reader, and is applied at assembly. Complex framing is gated
+  on the `complex_collections` flag (`SSTableWriter`/`DataReader::with_complex_collections`),
+  default `false` = Ferrosa's legacy whole-value storage; Cassandra import opts in.
+  Still deferred: **tuple** complex columns, and a *persisted* format version so
+  Ferrosa's own complex writes and legacy whole-value SSTables coexist on one read
+  path (the flag is a stopgap — t_b7cec413). Tracked in t_83c4f093.
 - **Snappy / Deflate compression** — only None / LZ4 / Zstd are supported.
 
 ## How it works

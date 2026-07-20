@@ -246,6 +246,51 @@ pub fn assemble_collection(
     }
 }
 
+/// Assemble the per-field cells of a **non-frozen UDT** column into a
+/// [`CqlValue::Udt`]. Each field cell's path is a 2-byte big-endian field
+/// position (`ByteBufferUtil` short); the value is decoded with that field's
+/// type. Fields with no live cell are `None`. `live` are the live field cells
+/// (already reconciled one-per-path by the merge).
+pub fn assemble_udt(
+    fields: &[(String, CqlType)],
+    live: &[&CellValue],
+) -> Result<CqlValue, AssembleError> {
+    let mut values: Vec<Option<CqlValue>> = vec![None; fields.len()];
+    for c in live {
+        let path = c.path.as_deref().ok_or_else(|| AssembleError {
+            reason: "UDT field cell is missing its path".into(),
+        })?;
+        if path.len() != 2 {
+            return Err(AssembleError {
+                reason: format!(
+                    "UDT field cell path is not a 2-byte position (len {})",
+                    path.len()
+                ),
+            });
+        }
+        let pos = u16::from_be_bytes([path[0], path[1]]) as usize;
+        let (_, field_ty) = fields.get(pos).ok_or_else(|| AssembleError {
+            reason: format!(
+                "UDT field position {pos} out of range ({} fields)",
+                fields.len()
+            ),
+        })?;
+        let value =
+            decode_value(field_ty, c.value.as_deref().unwrap_or_default()).map_err(|e| {
+                AssembleError {
+                    reason: format!("decode UDT field {pos}: {e}"),
+                }
+            })?;
+        values[pos] = Some(value);
+    }
+    let out = fields
+        .iter()
+        .zip(values)
+        .map(|((name, _), v)| (name.clone(), v))
+        .collect();
+    Ok(CqlValue::Udt(out))
+}
+
 /// Read-path assembly of a single column's cells into its value — the one place
 /// both the primary SELECT path (`crate::row::decode_output_row`) and the
 /// metadata variant (`ferrosa_cql::bridge`) share, so their collection handling
@@ -294,6 +339,11 @@ pub fn assemble_column_cells(
             .filter(|c| crate::row::cell_is_live(c, now_secs))
             .filter(|c| collection_deletion_ts.is_none_or(|d| c.timestamp > d))
             .collect();
+        // A non-frozen UDT is a complex column too, but its cell paths are
+        // 2-byte field positions and its fields have distinct types.
+        if let CqlType::Udt { fields, .. } = col_type {
+            return Ok(Some(assemble_udt(fields, &live)?));
+        }
         return Ok(Some(assemble_collection(col_type, &live)?));
     }
 
@@ -317,6 +367,30 @@ mod tests {
 
     fn t(v: &str) -> CqlValue {
         CqlValue::Text(v.to_string())
+    }
+
+    /// A non-frozen UDT assembles its per-field cells (path = 2-byte field
+    /// position) into a `CqlValue::Udt`, ordered by field, with each field value
+    /// decoded by that field's type. An absent field is `None`.
+    #[test]
+    fn udt_assembles_fields_by_position() {
+        let fields = vec![
+            ("street".to_string(), CqlType::Varchar),
+            ("zip".to_string(), CqlType::Int),
+            ("country".to_string(), CqlType::Varchar), // no cell -> None
+        ];
+        let street = CellValue::live(encode_value(&t("main")), 100).with_path(vec![0, 0]);
+        let zip = CellValue::live(encode_value(&CqlValue::Int(12345)), 100).with_path(vec![0, 1]);
+        let live: Vec<&CellValue> = vec![&street, &zip];
+        let got = assemble_udt(&fields, &live).unwrap();
+        assert_eq!(
+            got,
+            CqlValue::Udt(vec![
+                ("street".into(), Some(t("main"))),
+                ("zip".into(), Some(CqlValue::Int(12345))),
+                ("country".into(), None),
+            ])
+        );
     }
 
     /// A collection-level deletion (a `path == None` tombstone) shadows element

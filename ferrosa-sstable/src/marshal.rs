@@ -79,6 +79,20 @@ pub fn is_multicell_collection(type_name: &str) -> bool {
     )
 }
 
+/// True if `type_name` is a **non-frozen (multicell) UDT** (`UserType(...)`).
+/// A non-frozen UDT is also a complex column: each field is a cell whose cell
+/// path is a 2-byte big-endian field position. `FrozenType(UserType(..))` is a
+/// single value cell.
+pub fn is_nonfrozen_udt(type_name: &str) -> bool {
+    simple_class_name(type_name) == "UserType"
+}
+
+/// True if `type_name` uses Cassandra's **complex** (per-element / per-field)
+/// cell layout: a non-frozen collection or a non-frozen UDT.
+pub fn is_multicell(type_name: &str) -> bool {
+    is_multicell_collection(type_name) || is_nonfrozen_udt(type_name)
+}
+
 /// For a multicell collection column, the element **value** type used to
 /// serialize each element cell's value (to decide fixed- vs varint-length):
 /// - `list<T>` -> `T`
@@ -122,6 +136,22 @@ mod tests {
         assert!(!is_multicell_collection(
             "org.apache.cassandra.db.marshal.UTF8Type"
         ));
+    }
+
+    const UDT: &str = "org.apache.cassandra.db.marshal.UserType(test,61646472,73:org.apache.cassandra.db.marshal.UTF8Type,7a:org.apache.cassandra.db.marshal.Int32Type)";
+    const FROZEN_UDT: &str = "org.apache.cassandra.db.marshal.FrozenType(org.apache.cassandra.db.marshal.UserType(test,61646472))";
+
+    #[test]
+    fn nonfrozen_udt_is_multicell_but_frozen_is_not() {
+        assert!(is_nonfrozen_udt(UDT));
+        assert!(is_multicell(UDT));
+        assert!(!is_nonfrozen_udt(FROZEN_UDT));
+        assert!(!is_multicell(FROZEN_UDT));
+        // A UDT is not a collection.
+        assert!(!is_multicell_collection(UDT));
+        // Collections are still multicell.
+        assert!(is_multicell(LIST_INT));
+        assert!(!is_multicell("org.apache.cassandra.db.marshal.Int32Type"));
     }
 
     #[test]

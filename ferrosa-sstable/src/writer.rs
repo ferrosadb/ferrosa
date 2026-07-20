@@ -960,7 +960,7 @@ impl SSTableWriter {
                 num_columns
             );
             let is_complex = self.complex_collections
-                && crate::marshal::is_multicell_collection(&column_defs[*idx as usize].1);
+                && crate::marshal::is_multicell(&column_defs[*idx as usize].1);
             match prev_idx {
                 Some(p) if *idx < p => panic!(
                     "SSTable writer: row.cells must be sorted by col_idx (found {idx} after {p})"
@@ -1105,7 +1105,7 @@ impl SSTableWriter {
         while i < row.cells.len() {
             let col_idx = row.cells[i].0;
             let column_type = &column_defs[col_idx as usize].1;
-            if self.complex_collections && crate::marshal::is_multicell_collection(column_type) {
+            if self.complex_collections && crate::marshal::is_multicell(column_type) {
                 let mut j = i;
                 while j < row.cells.len() && row.cells[j].0 == col_idx {
                     j += 1;
