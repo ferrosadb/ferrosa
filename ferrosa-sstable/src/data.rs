@@ -47,8 +47,9 @@ const HAS_TTL: u8 = 0x08;
 const HAS_DELETION: u8 = 0x10;
 /// All columns in the schema are present (no missing-column bitmap).
 const HAS_ALL_COLUMNS: u8 = 0x20;
-/// Row has complex column deletion for at least one column.
-#[allow(dead_code)]
+/// Row has complex column deletion for at least one column. When set, every
+/// complex column in the row carries a leading `DeletionTime` before its cell
+/// count.
 const HAS_COMPLEX_DELETION: u8 = 0x40;
 /// Extended flags byte follows.
 const EXTENSION_FLAG: u8 = 0x80;
@@ -76,6 +77,21 @@ const CELL_HAS_EMPTY_VALUE: u8 = 0x04;
 const CELL_USE_ROW_TIMESTAMP: u8 = 0x08;
 /// Cell inherits the row-level TTL.
 const CELL_USE_ROW_TTL: u8 = 0x10;
+
+/// `(is_complex, value_type)` for a column's storage type. A non-frozen
+/// collection is *complex* (multi-cell): its element cells carry a cell-path and
+/// their value is serialized with the collection's element/value type. Anything
+/// else is *simple*: one cell, value serialized with the column type itself.
+fn complex_col_meta(column_type: &str) -> (bool, String) {
+    if marshal::is_multicell_collection(column_type) {
+        let value_type = marshal::collection_value_type(column_type)
+            .unwrap_or(column_type)
+            .to_string();
+        (true, value_type)
+    } else {
+        (false, column_type.to_string())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Partition-level DeletionTime format (Cassandra 5.x UInt format)
@@ -1170,11 +1186,34 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.read_columns_subset(num_columns)?
         };
 
-        // Read cells for present columns
+        // Precompute per-column (is_complex, value_type) so the read loop below
+        // does not borrow `self.header` across the `&mut self` cell reads.
+        let col_meta: Vec<(usize, bool, String)> = present_columns
+            .iter()
+            .map(|&ci| {
+                let (is_complex, value_type) = complex_col_meta(&columns[ci].1);
+                (ci, is_complex, value_type)
+            })
+            .collect();
+        let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
+
+        // Read cells. A simple column is one cell; a complex (collection) column
+        // is `[complex deletion?] uvint(cell-count)` then that many element cells,
+        // each carrying a cell-path.
         let mut cells = Vec::with_capacity(present_columns.len());
-        for &col_idx in &present_columns {
-            let cell = self.read_cell(&liveness, &columns[col_idx].1)?;
-            cells.push((col_idx as u16, cell));
+        for (col_idx, is_complex, value_type) in &col_meta {
+            if *is_complex {
+                self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                for _ in 0..count {
+                    let cell = self.read_cell(&liveness, value_type, true)?;
+                    cells.push((*col_idx as u16, cell));
+                }
+            } else {
+                let cell = self.read_cell(&liveness, value_type, false)?;
+                cells.push((*col_idx as u16, cell));
+            }
         }
 
         Ok(Row {
@@ -1183,6 +1222,27 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             deletion,
             primary_key_liveness: liveness,
         })
+    }
+
+    /// When the row flag `HAS_COMPLEX_DELETION` is set, every complex column in
+    /// the row carries a leading complex `DeletionTime` (two unsigned-vint deltas
+    /// against the header mins). Ferrosa's `Row` has no per-column complex-deletion
+    /// slot, so this reads the bytes to stay aligned and discards the value.
+    ///
+    /// LIMITATION (t_83c4f093 follow-up): a collection-level deletion from a
+    /// Cassandra overwrite (`SET v = {..}`) that has not yet been compacted away
+    /// will therefore not shadow older element cells living in other SSTables.
+    /// Compacted SSTables (the common import case) already have the deletion
+    /// applied, so this is correct for them.
+    fn skip_complex_deletion_if_present(&mut self, has_complex_deletion: bool) -> Result<()> {
+        if !has_complex_deletion {
+            return Ok(());
+        }
+        let (_ts_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        let (_ldt_delta, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += n as u64;
+        Ok(())
     }
 
     /// Read the next partition with a column projection — only the
@@ -1352,8 +1412,22 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 } else {
                     self.read_columns_subset(num_columns)?
                 };
-                for &col_idx in &present_columns {
-                    self.read_cell_skip(&liveness, &columns[col_idx].1)?;
+                let col_meta: Vec<(bool, String)> = present_columns
+                    .iter()
+                    .map(|&ci| complex_col_meta(&columns[ci].1))
+                    .collect();
+                let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
+                for (is_complex, value_type) in &col_meta {
+                    if *is_complex {
+                        self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                        let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                        self.pos += n as u64;
+                        for _ in 0..count {
+                            self.read_cell_skip(&liveness, value_type, true)?;
+                        }
+                    } else {
+                        self.read_cell_skip(&liveness, value_type, false)?;
+                    }
                 }
                 Ok(())
             })();
@@ -1376,18 +1450,43 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             self.read_columns_subset(num_columns)?
         };
 
-        // For each present column: decode if wanted, skip otherwise.
-        // `wanted` is small (typical SELECT projects a few cols), so
-        // linear contains() is faster than a HashSet for the common
-        // case.
+        // Per-column (is_complex, value_type), precomputed so the read loop does
+        // not borrow `self.header` across the `&mut self` cell reads.
+        let col_meta: Vec<(usize, bool, String)> = present_columns
+            .iter()
+            .map(|&ci| {
+                let (is_complex, value_type) = complex_col_meta(&columns[ci].1);
+                (ci, is_complex, value_type)
+            })
+            .collect();
+        let has_complex_deletion = flags & HAS_COMPLEX_DELETION != 0;
+
+        // For each present column: decode if wanted, skip otherwise. A complex
+        // (collection) column is `[complex deletion?] uvint(cell-count)` then that
+        // many element cells — read or skip all of them as a unit.
+        // `wanted` is small (typical SELECT projects a few cols), so linear
+        // contains() is faster than a HashSet for the common case.
         let mut cells = Vec::with_capacity(wanted.len().min(present_columns.len()));
-        for &col_idx in &present_columns {
-            let col_u16 = col_idx as u16;
-            if wanted.contains(&col_u16) {
-                let cell = self.read_cell(&liveness, &columns[col_idx].1)?;
+        for (col_idx, is_complex, value_type) in &col_meta {
+            let col_u16 = *col_idx as u16;
+            let want = wanted.contains(&col_u16);
+            if *is_complex {
+                self.skip_complex_deletion_if_present(has_complex_deletion)?;
+                let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+                self.pos += n as u64;
+                for _ in 0..count {
+                    if want {
+                        let cell = self.read_cell(&liveness, value_type, true)?;
+                        cells.push((col_u16, cell));
+                    } else {
+                        self.read_cell_skip(&liveness, value_type, true)?;
+                    }
+                }
+            } else if want {
+                let cell = self.read_cell(&liveness, value_type, false)?;
                 cells.push((col_u16, cell));
             } else {
-                self.read_cell_skip(&liveness, &columns[col_idx].1)?;
+                self.read_cell_skip(&liveness, value_type, false)?;
             }
         }
 
@@ -1495,7 +1594,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     /// projection-aware decode path so cells outside the SELECT list
     /// never pay the read+decode cost (especially big values like
     /// vector embeddings).
-    fn read_cell_skip(&mut self, row_liveness: &LivenessInfo, column_type: &str) -> Result<()> {
+    fn read_cell_skip(
+        &mut self,
+        row_liveness: &LivenessInfo,
+        value_type: &str,
+        is_complex: bool,
+    ) -> Result<()> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
@@ -1520,8 +1624,22 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             let (_, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
         }
+        // Cell path (complex columns): skip `uvint(len) + bytes`.
+        if is_complex {
+            let (plen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            if plen > MAX_VALUE_LEN as u64 {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cell path length {plen} exceeds maximum ({MAX_VALUE_LEN}), likely corrupt SSTable"
+                    ),
+                )));
+            }
+            self.pos += plen;
+        }
         if !has_empty_value {
-            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {
                     let saved = self.pos;
                     let (encoded_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1601,7 +1719,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     }
 
     /// Read a single cell value.
-    fn read_cell(&mut self, row_liveness: &LivenessInfo, column_type: &str) -> Result<CellValue> {
+    fn read_cell(
+        &mut self,
+        row_liveness: &LivenessInfo,
+        value_type: &str,
+        is_complex: bool,
+    ) -> Result<CellValue> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
@@ -1646,11 +1769,23 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             ferrosa_common::NO_TTL
         };
 
-        // Value (absent if HAS_EMPTY_VALUE is set)
+        // Cell path (complex/collection columns only): `uvint(len) + bytes`,
+        // between the ttl and the value. Present for every element cell of a
+        // complex column, gated purely by complex-ness (no cell-flag bit).
+        let path = if is_complex {
+            let (plen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+            self.pos += n as u64;
+            Some(self.read_value_bytes(plen as usize, "cell path")?)
+        } else {
+            None
+        };
+
+        // Value (absent if HAS_EMPTY_VALUE is set). `value_type` is the
+        // element/value type for a complex column, the column type for a simple one.
         let value = if has_empty_value {
             None
         } else {
-            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(column_type) {
+            let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {
                     let saved = self.pos;
                     let (encoded_len, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
@@ -1669,18 +1804,22 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             Some(self.read_value_bytes(vlen, "cell value")?)
         };
 
-        if is_deleted {
-            Ok(CellValue::tombstone(timestamp, local_deletion_time))
+        let cell = if is_deleted {
+            CellValue::tombstone(timestamp, local_deletion_time)
         } else if is_expiring {
-            Ok(CellValue::expiring(
+            CellValue::expiring(
                 value.unwrap_or_default(),
                 timestamp,
                 ttl,
                 local_deletion_time,
-            ))
+            )
         } else {
-            Ok(CellValue::live(value.unwrap_or_default(), timestamp))
-        }
+            CellValue::live(value.unwrap_or_default(), timestamp)
+        };
+        Ok(match path {
+            Some(p) => cell.with_path(p),
+            None => cell,
+        })
     }
 }
 

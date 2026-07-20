@@ -26,9 +26,12 @@
 //! let output = writer.finish().unwrap();
 //! ```
 //!
-//! Partitions must be added in token order. The writer currently handles
-//! simple single-row partitions with live cells; more complex cases
-//! (range tombstones, complex columns) are deferred.
+//! Partitions must be added in token order. The writer handles simple and
+//! complex (non-frozen collection) columns — the latter as Cassandra's
+//! per-element cells: `uvint(cell-count)` followed by one cell per element,
+//! each carrying a length-prefixed cell path. Range tombstones and a
+//! per-column complex `DeletionTime` on write are still deferred (Ferrosa's
+//! collection ops are element add/remove, not whole-collection clears).
 
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -915,15 +918,16 @@ impl SSTableWriter {
         };
         let num_columns = column_defs.len();
 
-        // P0 correctness: every cell's col_idx must be in range for the header's
-        // column set, and col_idx values must be unique within a row. If either
-        // invariant is violated, the writer's bitmap (built from a HashSet) will
-        // under-count cells relative to the body bytes written, producing an
-        // SSTable where the reader's parse-position drifts row-over-row until
-        // it hits a byte with bit-0 set and terminates the partition early.
-        // That manifests on disk as "corrupted DeletionTime flags" warnings
-        // with silent data loss for every row after the first drift.
-        for (i, (idx, _)) in row.cells.iter().enumerate() {
+        // P0 correctness: every cell's col_idx must be in range, and cells must
+        // be grouped/sorted by col_idx. A *simple* column has exactly one cell;
+        // a *complex* (non-frozen collection) column has one cell PER ELEMENT,
+        // all sharing that col_idx and each carrying a distinct cell-path — that
+        // is Cassandra's complex-column layout. If these invariants are violated
+        // the present-column bitmap (distinct indices) would under-count the
+        // body bytes and the reader's parse position would drift, silently
+        // corrupting every row after the first drift.
+        let mut prev_idx: Option<u16> = None;
+        for (idx, cell) in &row.cells {
             assert!(
                 (*idx as usize) < num_columns,
                 "SSTable writer: cell col_idx {} is out of range (num_columns={}). \
@@ -931,25 +935,38 @@ impl SSTableWriter {
                 idx,
                 num_columns
             );
-            if i > 0 {
-                let prev = row.cells[i - 1].0;
-                assert!(
-                    *idx > prev,
-                    "SSTable writer: row.cells must be strictly sorted by col_idx \
-                     with no duplicates (found {} after {}). Duplicates would cause \
-                     the bitmap to under-count the body, producing a silently \
-                     corrupt SSTable.",
-                    idx,
-                    prev
-                );
+            let is_complex = crate::marshal::is_multicell_collection(&column_defs[*idx as usize].1);
+            match prev_idx {
+                Some(p) if *idx < p => panic!(
+                    "SSTable writer: row.cells must be sorted by col_idx (found {idx} after {p})"
+                ),
+                Some(p) if *idx == p => assert!(
+                    is_complex,
+                    "SSTable writer: duplicate col_idx {idx} for a non-complex column — \
+                     only complex (collection) columns may have multiple cells per row"
+                ),
+                _ => {}
+            }
+            // A complex column's cells must carry a path; a simple column's must not.
+            assert_eq!(
+                cell.path.is_some(),
+                is_complex,
+                "SSTable writer: col_idx {idx} path presence ({}) does not match its \
+                 complex-ness ({is_complex})",
+                cell.path.is_some(),
+            );
+            prev_idx = Some(*idx);
+        }
+
+        // Distinct present columns (cells are grouped by col_idx, so dedup runs).
+        let mut present_columns: Vec<usize> = Vec::new();
+        for (idx, _) in &row.cells {
+            if present_columns.last() != Some(&(*idx as usize)) {
+                present_columns.push(*idx as usize);
             }
         }
-        let all_present = row.cells.len() == num_columns
-            && row
-                .cells
-                .iter()
-                .enumerate()
-                .all(|(i, (idx, _))| *idx as usize == i);
+        let all_present = present_columns.len() == num_columns
+            && present_columns.iter().enumerate().all(|(i, c)| *c == i);
         if all_present {
             flags |= HAS_ALL_COLUMNS;
         }
@@ -1038,15 +1055,45 @@ impl SSTableWriter {
         // Columns.Serializer writes an unsigned vint, not a raw MSB-first
         // bitmap: for <64 columns, bit i set means column i is missing.
         if flags & HAS_ALL_COLUMNS == 0 {
-            let present_columns: Vec<usize> =
-                row.cells.iter().map(|(idx, _)| *idx as usize).collect();
             write_columns_subset(&mut row_body, &present_columns, num_columns);
         }
 
-        // Cells
-        for (col_idx, cell) in &row.cells {
-            let column_type = &column_defs[*col_idx as usize].1;
-            serialize_cell(&mut row_body, cell, row, &self.header, column_type);
+        // Cells. A simple column writes one cell; a complex (non-frozen
+        // collection) column writes `uvint(cell-count)` then one element cell
+        // per element, each with a cell-path. Ferrosa never emits a complex
+        // DeletionTime on its own writes (its collection ops are element
+        // add/remove, not whole-collection clears), so HAS_COMPLEX_DELETION is
+        // never set here and no complex deletion precedes the cell count.
+        let mut i = 0;
+        while i < row.cells.len() {
+            let col_idx = row.cells[i].0;
+            let column_type = &column_defs[col_idx as usize].1;
+            if crate::marshal::is_multicell_collection(column_type) {
+                let mut j = i;
+                while j < row.cells.len() && row.cells[j].0 == col_idx {
+                    j += 1;
+                }
+                // Element cells are stored in cell-path order.
+                let mut group: Vec<&CellValue> = row.cells[i..j].iter().map(|(_, c)| c).collect();
+                group.sort_by(|a, b| a.path.cmp(&b.path));
+                push_unsigned_vint_to(&mut row_body, group.len() as u64);
+                let value_type =
+                    crate::marshal::collection_value_type(column_type).unwrap_or(column_type);
+                for cell in group {
+                    serialize_cell(&mut row_body, cell, row, &self.header, value_type, true);
+                }
+                i = j;
+            } else {
+                serialize_cell(
+                    &mut row_body,
+                    &row.cells[i].1,
+                    row,
+                    &self.header,
+                    column_type,
+                    false,
+                );
+                i += 1;
+            }
         }
 
         // Write row body size + previous unfiltered size + row body
@@ -1459,13 +1506,17 @@ fn serialize_cell(
     cell: &CellValue,
     row: &crate::types::Row,
     header: &SerializationHeader,
-    column_type: &str,
+    value_type: &str,
+    is_complex: bool,
 ) {
     let is_tombstone = cell.is_tombstone();
     let is_expiring = !is_tombstone
         && cell.ttl != ferrosa_common::NO_TTL
         && cell.local_deletion_time != ferrosa_common::NO_DELETION_TIME;
-    let has_empty_value = cell.value.is_none() || (is_tombstone && cell.value.is_none());
+    // HAS_EMPTY_VALUE covers both a tombstone (no value) and a live cell whose
+    // value is empty — e.g. a `set` element, whose identity is its cell-path and
+    // whose value is empty. Cassandra sets this flag on any zero-length value.
+    let has_empty_value = cell.value.as_ref().is_none_or(|v| v.is_empty());
     let use_row_timestamp = row.primary_key_liveness.has_timestamp()
         && cell.timestamp == row.primary_key_liveness.timestamp;
     let use_row_ttl = is_expiring
@@ -1522,7 +1573,19 @@ fn serialize_cell(
         push_unsigned_vint_to(buf, ttl_delta);
     }
 
-    // Value (absent if HAS_EMPTY_VALUE)
+    // Cell path (complex/collection columns only): `uvint(len) + bytes`, written
+    // between the ttl and the value. It is present for EVERY element cell of a
+    // complex column and is gated purely by the column's complex-ness — there is
+    // no cell-flag bit for it (matching Cassandra's CollectionType path serializer).
+    if is_complex {
+        let path = cell.path.as_deref().unwrap_or(&[]);
+        push_unsigned_vint_to(buf, path.len() as u64);
+        buf.extend_from_slice(path);
+    }
+
+    // Value (absent if HAS_EMPTY_VALUE). `value_type` is the element/value type
+    // for a complex column (e.g. the `V` of `map<K,V>`), the column type for a
+    // simple one — it decides fixed-width (raw bytes) vs varint-length prefix.
     if !has_empty_value {
         if let Some(ref value) = cell.value {
             // Safety assertion: catch corrupt cell values at write time.
@@ -1534,10 +1597,10 @@ fn serialize_cell(
                  this is a bug in the write path, not user data",
                 value.len()
             );
-            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(column_type) {
+            if let Some(fixed_len) = crate::marshal::value_length_if_fixed(value_type) {
                 assert!(
                     value.len() == fixed_len,
-                    "SSTable writer: fixed-width column {column_type} expects {fixed_len} bytes, got {}",
+                    "SSTable writer: fixed-width column {value_type} expects {fixed_len} bytes, got {}",
                     value.len()
                 );
             } else {
