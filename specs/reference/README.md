@@ -1,6 +1,6 @@
 # Ferrosa Specs
 
-> Last updated: 2026-06-04
+> Last updated: 2026-07-18
 > Status: Internal evidence index, not public release guarantees
 
 These documents separate implemented evidence from proposals, active work, and
@@ -51,6 +51,7 @@ Keep unsupported engineering topics in `proposed/`, `todo/`, or
 | [CQL](cql.md) | CQL native protocol v4/v5, parser, query routing, LWT, pagination |
 | [Testing](testing.md) | Test infrastructure and suites |
 | [Cancel Safety](cancel-safety-conventions.md) | Async cancel safety conventions |
+| [I/O Page-Cache and Copy Audit](io-page-cache-copy-audit.md) | Source evidence and staged plan for copy elimination and direct-I/O evaluation |
 
 ## Feature Specs and Proposals
 

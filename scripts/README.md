@@ -14,6 +14,21 @@ scripts/test-with-cluster.sh --ci
 
 ## Scripts
 
+### Static I/O Audit
+
+These read-only scanners create a review queue for redundant byte copies,
+materialized streams, and filesystem/page-cache boundaries. They do not make a
+performance claim; classify each result by its full production call path before
+changing it.
+
+```bash
+scripts/audit-io-copy-candidates.sh
+scripts/audit-page-cache-boundaries.sh
+```
+
+Add `--include-tests` when test and benchmark code is relevant, or pass a
+different Ferrosa checkout path as the final argument.
+
 ### `test-cluster-up.sh` — Local (Podman)
 
 Brings up a 3-node cluster via `podman compose` on ports **30042–30044** (CQL) and
