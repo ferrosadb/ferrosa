@@ -67,11 +67,14 @@ resolution beyond the serialization header, or cluster routing.
   on `SerializationHeader.complex_collections`, default `false` = Ferrosa's legacy
   whole-value storage; Cassandra import sets it `true`. Living on the header, it
   flows to every `DataReader`/`SSTableWriter` uniformly (a per-SSTable format
-  switch). Still deferred: **tuple** complex columns, and *serializing*
-  `complex_collections` into Statistics.db — it is currently non-persisted (like
-  `max_timestamp`), defaulting `false` on reopen, which is enough for in-memory
-  reads and Cassandra import; persistence lands with Ferrosa's own complex writes
-  (D-write, t_b7cec413). Tracked in t_83c4f093.
+  switch), and is **persisted** in Statistics.db (a trailing byte after the
+  `max_timestamp` Ferrosa extension; a Cassandra header lacks it → `false`), so a
+  complex SSTable round-trips across reopen (`verify_output` included). Still
+  deferred: **tuple** complex columns; the engine setting it `true` on flush
+  (D-write emits per-element cells); and deriving `true` when importing a
+  Cassandra *BTI* SSTable with collections via `SSTableReader` (its header has no
+  Ferrosa byte — today collection/UDT imports read `Data.db` directly through
+  `DataReader` with an explicit header). Tracked in t_83c4f093 / t_b7cec413.
 - **Snappy / Deflate compression** — only None / LZ4 / Zstd are supported.
 
 ## How it works

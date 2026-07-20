@@ -513,7 +513,7 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: false,
+        verify_output: true,
     };
     let ts = 1_000_100i64;
 
@@ -595,7 +595,7 @@ fn ferrosa_roundtrips_complex_column_deletion() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: false,
+        verify_output: true,
     };
 
     // Collection deletion at ts=499 (a `path=None` tombstone), one element at ts=500.
@@ -677,7 +677,7 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: false,
+        verify_output: true,
     };
     let ts = 1_000_100i64;
 
@@ -773,7 +773,7 @@ fn ferrosa_projected_read_over_complex_column() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: false,
+        verify_output: true,
     };
     let ts = 1_000_100i64;
 
