@@ -72,6 +72,27 @@ flyctl deploy "$BUILD_CTX" --app "$APP" --config "$BUILD_CTX/fly.toml" \
   --dockerfile "$BUILD_CTX/Dockerfile.elle" --remote-only --build-only --push \
   --image-label "cert-${RUN_ID}" 2>&1 | tail -8 || die "image build/push failed"
 
+# Let the pushed manifest propagate before launching machines by digest —
+# otherwise the first `machine run` can 404 MANIFEST_UNKNOWN (fly registry race).
+log "image pushed; settling 30s for fly registry propagation"
+sleep 30
+
+# Launch a fly machine, retrying on the transient registry/manifest race.
+mrun() {
+  local i out
+  for i in 1 2 3 4 5; do
+    if out="$(flyctl machine run "$@" 2>&1)"; then printf '%s\n' "$out" | tail -3; return 0; fi
+    printf '%s\n' "$out" | tail -2
+    if printf '%s' "$out" | grep -qiE "MANIFEST_UNKNOWN|manifest unknown|not found|429|timeout|deadline"; then
+      log "transient machine-run error (attempt $i/5) — retry in 15s"
+      sleep 15
+      continue
+    fi
+    return 1
+  done
+  return 1
+}
+
 # 3. Common env (trimmed fly-lax pattern for a small healthy cluster).
 COMMON=(
   --env "FERROSA_DATA_DIR=/var/lib/ferrosa"
@@ -100,12 +121,12 @@ wait_ready() { # <machine-id> <name>
 
 # 4. Seed node (node1).
 log "run node1 (seed)"
-flyctl machine run "$IMAGE" --app "$APP" --org "$ORG" --region "$REGION" \
+mrun "$IMAGE" --app "$APP" --org "$ORG" --region "$REGION" \
   --name ferrosa-1 --restart always --rootfs-size 20 \
   --vm-cpu-kind "$CPU_KIND" --vm-cpus "$CPUS" --vm-memory "$MEM" \
   "${COMMON[@]}" \
   --env "FERROSA_HOST_ID=${HOST_IDS[0]}" \
-  --env "FERROSA_S3_PREFIX=accord-elle/${RUN_ID}/node1" 2>&1 | tail -4 || die "node1 run failed"
+  --env "FERROSA_S3_PREFIX=accord-elle/${RUN_ID}/node1" || die "node1 run failed"
 SEED_ID="$(mid ferrosa-1)"; [ -n "$SEED_ID" ] || die "no seed id"
 wait_ready "$SEED_ID" ferrosa-1
 SEED="$(dns "$SEED_ID"):17000"
@@ -113,13 +134,13 @@ SEED="$(dns "$SEED_ID"):17000"
 # 5. Joiners (node2, node3).
 for n in 2 3; do
   log "run node$n (join $SEED)"
-  flyctl machine run "$IMAGE" --app "$APP" --org "$ORG" --region "$REGION" \
+  mrun "$IMAGE" --app "$APP" --org "$ORG" --region "$REGION" \
     --name "ferrosa-${n}" --restart always --rootfs-size 20 \
     --vm-cpu-kind "$CPU_KIND" --vm-cpus "$CPUS" --vm-memory "$MEM" \
     "${COMMON[@]}" \
     --env "FERROSA_HOST_ID=${HOST_IDS[$((n-1))]}" \
     --env "FERROSA_S3_PREFIX=accord-elle/${RUN_ID}/node${n}" \
-    --env "FERROSA_SEED=${SEED}" 2>&1 | tail -4 || die "node$n run failed"
+    --env "FERROSA_SEED=${SEED}" || die "node$n run failed"
   wait_ready "$(mid ferrosa-${n})" "ferrosa-${n}"
 done
 
