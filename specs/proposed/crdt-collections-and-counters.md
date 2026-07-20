@@ -99,12 +99,33 @@ Accord's at-least-once Apply and safe under AP concurrency.
 3. **Commit-log `Mutation`** (`ferrosa-cql` build path): a list append encodes as
    **one element cell** (path=timeuuid(t)), not a full-list blob. Round-trips
    through serialize/deserialize (the Accord wire path) with cell-paths intact.
-4. **SSTable BTI writer** (`ferrosa-sstable/src/writer.rs`): implement
-   **complex-column writing** (currently "deferred", writer.rs L30–31). The
-   reader (`data.rs`, "Complex columns (collections, UDTs, frozen types)")
-   already *parses* Cassandra complex cells — this closes the write side.
-5. **Read assembly** (`ferrosa-cql/src/bridge.rs`): assemble the per-element
-   cells for a column into `CqlValue::List/Set/Map`, ordered by cell-path.
+4. **SSTable BTI writer AND reader** (`ferrosa-sstable/src/{writer,data}.rs`):
+   implement Cassandra's exact **complex-column on-disk layout** on *both* sides.
+   **Correction (2026-07-20 investigation):** the earlier claim that the reader
+   "already parses Cassandra complex cells" is FALSE. `data.rs::read_cell` reads
+   only `flags|ts|ldt|ttl|value` and never a cell-path (always builds
+   `CellValue{path:None}`); the row-body loop reads exactly one simple cell per
+   present column; `HAS_COMPLEX_DELETION (0x40)` is defined but UNUSED; there is
+   no complex-vs-simple branch. So today ferrosa can import Cassandra **scalars
+   and frozen collections** (single value cell) but **misparses non-frozen
+   (multi-cell) collections**. Increment C scope is therefore BOTH sides:
+   - Writer: per complex column emit `[complex-deletion?][cell-count vint]` then
+     each cell `flags|ts|ldt|ttl|[path-len+path]|[value-len+value]`.
+   - Reader: branch on column type (the type string is already threaded into
+     `read_cell`); for a complex column read the cell-count + per-cell path and
+     populate `CellValue.path`.
+   Net effect: preserves scalar/frozen import, ADDS non-frozen collection import
+   **and** export (round-trippable), round-trips ferrosa's own per-element cells.
+   Legacy ferrosa whole-value collections keep reading (single `path=None` cell →
+   whole-value decode, handled by the D-read lazy dual-read already landed).
+   **Compatibility gate:** a test that reads a real Cassandra SSTable with a
+   non-frozen `list/set/map` column (no such fixture exists today — that gap is
+   why this went unnoticed).
+5. **Read assembly** (`ferrosa-row-bridge::collection::assemble_column_cells`,
+   used by both `row::decode_output_row` and `ferrosa-cql::bridge`): assemble the
+   per-element cells for a column into `CqlValue::List/Set/Map`, ordered by
+   cell-path. **DONE** (increment 3, D-read) — relocated to `ferrosa-row-bridge`
+   so the primary SELECT path can call it.
 
 ## 5. Both-paths integration
 
