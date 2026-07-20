@@ -78,7 +78,7 @@ const READ_DEP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Per-iteration cap on a single `notified()` wait. A coalesced/lost broadcast
 /// wake (the apply fired between our unlock and re-arming the notify) costs at
 /// most this long before the loop re-checks the condition under the lock again,
-/// so the wait can never hang past [`READ_DEP_WAIT_TIMEOUT`].
+/// so the wait can never hang past `READ_DEP_WAIT_TIMEOUT`.
 const READ_DEP_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 impl AccordHandler {
@@ -92,7 +92,7 @@ impl AccordHandler {
 
 /// Block until every conflicting transaction ordered before `t` (`t0 < t`) has
 /// reached `Applied` on the replica behind `state`, or until
-/// [`READ_DEP_WAIT_TIMEOUT`] elapses.
+/// `READ_DEP_WAIT_TIMEOUT` elapses.
 ///
 /// Returns `true` if all conflicts applied (a read-at-`t` may now proceed
 /// linearizably), `false` on timeout (the caller MUST ABSTAIN — never read
