@@ -18,9 +18,9 @@
 //! could not be expressed by the Accord transaction path (the write was silently
 //! dropped — see t_83c4f093).
 
-use ferrosa_common::cql_type::CqlValue;
+use ferrosa_common::cql_type::{CqlType, CqlValue};
 use ferrosa_common::{CellValue, Timestamp, NO_DELETION_TIME};
-use ferrosa_row_bridge::encode_value;
+use ferrosa_row_bridge::{decode_value, encode_value};
 
 /// 100-nanosecond intervals between the UUID epoch (1582-10-15) and the Unix epoch
 /// (1970-01-01) — the same constant `bridge::eval_now` uses to mint v1 TimeUUIDs.
@@ -156,12 +156,109 @@ pub fn build_collection_cells(
     }
 }
 
+/// A complex column's per-element cells could not be assembled into a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembleError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for AssembleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for AssembleError {}
+
+/// Assemble the per-element cells of one complex column back into a [`CqlValue`]
+/// collection — the read-side inverse of [`build_collection_cells`]. `cells` are all
+/// cells for the column (with paths); tombstones are excluded. `col_type` selects the
+/// shape and the element/key/value decoding.
+///
+/// - `set<T>`  → elements decoded from each live cell's PATH (value is empty), sorted
+///   by element.
+/// - `map<K,V>`→ entries `(decode PATH as K, decode VALUE as V)`, sorted by key.
+/// - `list<T>` → elements = decode each live cell's VALUE, ordered by the path's
+///   TimeUUID time (append order) — raw-byte path order would be wrong.
+///
+/// Cells are assumed already reconciled (one live-or-tombstone cell per path), which
+/// is what the memtable/SSTable merge produces.
+pub fn assemble_collection(
+    col_type: &CqlType,
+    cells: &[CellValue],
+) -> Result<CqlValue, AssembleError> {
+    let live = || cells.iter().filter(|c| c.value.is_some());
+    let decode = |ty: &CqlType, bytes: &[u8]| -> Result<CqlValue, AssembleError> {
+        decode_value(ty, bytes).map_err(|e| AssembleError {
+            reason: format!("decode element: {e}"),
+        })
+    };
+    let path_of = |c: &CellValue| -> Result<Vec<u8>, AssembleError> {
+        c.path.clone().ok_or_else(|| AssembleError {
+            reason: "complex column cell is missing its path".into(),
+        })
+    };
+
+    match col_type {
+        CqlType::Set(elem_ty) => {
+            let mut elems: Vec<CqlValue> = live()
+                .map(|c| decode(elem_ty, &path_of(c)?))
+                .collect::<Result<_, _>>()?;
+            elems.sort();
+            elems.dedup();
+            Ok(CqlValue::Set(elems))
+        }
+        CqlType::Map(key_ty, val_ty) => {
+            let mut entries: Vec<(CqlValue, CqlValue)> = live()
+                .map(|c| {
+                    Ok((
+                        decode(key_ty, &path_of(c)?)?,
+                        decode(val_ty, c.value.as_deref().unwrap_or_default())?,
+                    ))
+                })
+                .collect::<Result<_, AssembleError>>()?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.dedup_by(|a, b| a.0 == b.0);
+            Ok(CqlValue::Map(entries))
+        }
+        CqlType::List(elem_ty) => {
+            // Order by the path's TimeUUID (time, seq) — append order.
+            let mut keyed: Vec<((u64, u16), CqlValue)> = live()
+                .map(|c| {
+                    let key = timeuuid_time(&path_of(c)?).ok_or_else(|| AssembleError {
+                        reason: "list cell path is not a 16-byte TimeUUID".into(),
+                    })?;
+                    Ok((
+                        key,
+                        decode(elem_ty, c.value.as_deref().unwrap_or_default())?,
+                    ))
+                })
+                .collect::<Result<_, AssembleError>>()?;
+            keyed.sort_by_key(|(k, _)| *k);
+            Ok(CqlValue::List(keyed.into_iter().map(|(_, v)| v).collect()))
+        }
+        other => Err(AssembleError {
+            reason: format!("not a collection column type: {other:?}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn t(v: &str) -> CqlValue {
         CqlValue::Text(v.to_string())
+    }
+
+    fn text_list() -> CqlType {
+        CqlType::List(Box::new(CqlType::Varchar))
+    }
+    fn text_set() -> CqlType {
+        CqlType::Set(Box::new(CqlType::Varchar))
+    }
+    fn text_map() -> CqlType {
+        CqlType::Map(Box::new(CqlType::Varchar), Box::new(CqlType::Varchar))
     }
 
     #[test]
@@ -270,5 +367,124 @@ mod tests {
         let (time, seq) = timeuuid_time(&p).unwrap();
         assert_eq!(time, 999_000u64 * 10 + UUID_EPOCH_OFFSET);
         assert_eq!(seq, 42);
+    }
+
+    // ---- read assembly (round-trips build_collection_cells) -----------------
+
+    #[test]
+    fn list_append_round_trips_in_order() {
+        let cells = build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::List(vec![t("x"), t("y")]),
+            100,
+        )
+        .unwrap();
+        let back = assemble_collection(&text_list(), &cells).unwrap();
+        assert_eq!(back, CqlValue::List(vec![t("x"), t("y")]));
+    }
+
+    #[test]
+    fn list_two_appends_merge_and_assemble_in_append_order() {
+        // Two appends at different timestamps, stored/delivered in REVERSE order:
+        // assembly yields append order via the TimeUUID time.
+        let mut cells =
+            build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("later")]), 200)
+                .unwrap();
+        cells.extend(
+            build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("earlier")]), 100)
+                .unwrap(),
+        );
+        let back = assemble_collection(&text_list(), &cells).unwrap();
+        assert_eq!(back, CqlValue::List(vec![t("earlier"), t("later")]));
+    }
+
+    /// The load-bearing ordering guarantee: a v1 TimeUUID's RAW-BYTE order is not its
+    /// time order (the low time bits are stored first). This crafts two list cells
+    /// whose paths sort OPPOSITELY by raw bytes vs by time, and asserts assembly uses
+    /// TIME. If assembly ever fell back to the BTreeMap's raw-byte path order, list
+    /// reads would silently reorder across ~430s append boundaries.
+    #[test]
+    fn list_orders_by_timeuuid_time_not_raw_bytes() {
+        let list_cell = |value: &str, path: [u8; 16]| {
+            CellValue::live(encode_value(&t(value)), 1).with_path(path.to_vec())
+        };
+        // A: time_low = all-ones, mid/hi = 0  => time = 0x0000_FFFF_FFFF, bytes start 0xFF.
+        let mut a = [0u8; 16];
+        a[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        a[6] = 0x10; // version 1
+        a[8] = 0x80; // variant
+                     // B: time_low = 0, time_mid = 1 => time = 0x0001_0000_0000 (> A), bytes start 0x00.
+        let mut b = [0u8; 16];
+        b[4..6].copy_from_slice(&1u16.to_be_bytes());
+        b[6] = 0x10;
+        b[8] = 0x80;
+
+        assert!(b < a, "raw-byte order puts B before A");
+        assert!(
+            timeuuid_time(&a).unwrap() < timeuuid_time(&b).unwrap(),
+            "but A's TimeUUID time is earlier than B's"
+        );
+
+        let cells = vec![list_cell("A", a), list_cell("B", b)];
+        let back = assemble_collection(&text_list(), &cells).unwrap();
+        assert_eq!(
+            back,
+            CqlValue::List(vec![t("A"), t("B")]),
+            "assembled in TimeUUID-time order, not raw-byte path order"
+        );
+    }
+
+    #[test]
+    fn set_add_round_trips_sorted() {
+        let cells =
+            build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("b"), t("a")]), 100)
+                .unwrap();
+        let back = assemble_collection(&text_set(), &cells).unwrap();
+        assert_eq!(back, CqlValue::Set(vec![t("a"), t("b")]));
+    }
+
+    #[test]
+    fn map_put_round_trips_sorted_by_key() {
+        let cells = build_collection_cells(
+            CollectionOp::Add,
+            &CqlValue::Map(vec![(t("k2"), t("v2")), (t("k1"), t("v1"))]),
+            100,
+        )
+        .unwrap();
+        let back = assemble_collection(&text_map(), &cells).unwrap();
+        assert_eq!(
+            back,
+            CqlValue::Map(vec![(t("k1"), t("v1")), (t("k2"), t("v2"))])
+        );
+    }
+
+    #[test]
+    fn tombstones_are_excluded_from_assembly() {
+        let mut cells =
+            build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a"), t("b")]), 100)
+                .unwrap();
+        // Remove "a" at a later timestamp (tombstone at its path).
+        cells.extend(
+            build_collection_cells(CollectionOp::Sub, &CqlValue::Set(vec![t("a")]), 200).unwrap(),
+        );
+        // Reconcile by path (higher-ts tombstone wins), mirroring the memtable merge.
+        let reconciled = reconcile_by_path(&cells);
+        let back = assemble_collection(&text_set(), &reconciled).unwrap();
+        assert_eq!(back, CqlValue::Set(vec![t("b")]));
+    }
+
+    /// Test helper: reduce cells to one per path via the CRDT reconcile (what the
+    /// memtable does), so an assembly test can exercise adds + removes together.
+    fn reconcile_by_path(cells: &[CellValue]) -> Vec<CellValue> {
+        use std::collections::BTreeMap;
+        let mut by_path: BTreeMap<Vec<u8>, CellValue> = BTreeMap::new();
+        for c in cells {
+            let key = c.path.clone().unwrap_or_default();
+            by_path
+                .entry(key)
+                .and_modify(|existing| *existing = ferrosa_common::reconcile(existing, c))
+                .or_insert_with(|| c.clone());
+        }
+        by_path.into_values().collect()
     }
 }
