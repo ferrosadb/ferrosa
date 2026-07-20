@@ -1291,6 +1291,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
 
+    // Initialize the cluster-wide paging HMAC key BEFORE the CQL server serves a
+    // query, so every coordinator signs/verifies paging cursors with the SAME
+    // key. Without this each node picks a random per-process key and a cursor
+    // issued by one coordinator is rejected by another, breaking multi-node
+    // paged reads mid-scan (derives from FERROSA_PAGING_HMAC_KEY / internode PSK
+    // / cluster name, in that order).
+    ferrosa_cql::paging::init_paging_hmac_key(net_config.psk.as_deref(), &net_config.cluster_name);
+
     // 8. Start CQL server
     let cql_bind: std::net::SocketAddr = config_val(
         "FERROSA_CQL_BIND",
