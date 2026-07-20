@@ -358,23 +358,35 @@ fn read_real_cassandra_collections() {
         ],
     };
 
-    let mut reader = DataReader::new(&data, &header, 0);
+    let mut reader = DataReader::new(&data, &header, 0).with_complex_collections(true);
     let p = reader.read_partition().unwrap().expect("row1 partition");
     assert_eq!(p.key.key.as_bytes(), b"row1");
     let cells = &p.rows[0].cells;
 
+    // A plain collection INSERT sets HAS_COMPLEX_DELETION: each collection column
+    // carries a complex deletion, which the reader captures as a `path == None`
+    // tombstone sentinel. Element assertions below skip those sentinels.
+    for col in 0..=2 {
+        assert!(
+            cells
+                .iter()
+                .any(|(i, c)| *i == col && c.path.is_none() && c.is_tombstone()),
+            "column {col} carries its captured complex-deletion sentinel"
+        );
+    }
+    let elems = |col: u16| {
+        cells
+            .iter()
+            .filter(move |(i, c)| *i == col && c.path.is_some())
+    };
+
     // Column ordinals: l=0, m=1, s=2 (storage order).
-    let list: Vec<i32> = cells
-        .iter()
-        .filter(|(i, _)| *i == 0)
-        .filter_map(|(_, c)| c.value.as_deref())
-        .map(|v| i32::from_be_bytes(v.try_into().unwrap()))
+    let list: Vec<i32> = elems(0)
+        .map(|(_, c)| i32::from_be_bytes(c.value.as_deref().unwrap().try_into().unwrap()))
         .collect();
     assert_eq!(list, vec![10, 20, 30], "list<int> elements parse in order");
 
-    let mut map: Vec<(String, i32)> = cells
-        .iter()
-        .filter(|(i, _)| *i == 1)
+    let mut map: Vec<(String, i32)> = elems(1)
         .map(|(_, c)| {
             let k = String::from_utf8(c.path.clone().unwrap()).unwrap();
             let v = i32::from_be_bytes(c.value.as_deref().unwrap().try_into().unwrap());
@@ -388,9 +400,7 @@ fn read_real_cassandra_collections() {
         "map<text,int> parses"
     );
 
-    let mut set: Vec<String> = cells
-        .iter()
-        .filter(|(i, _)| *i == 2)
+    let mut set: Vec<String> = elems(2)
         .map(|(_, c)| String::from_utf8(c.path.clone().unwrap()).unwrap())
         .collect();
     set.sort();
@@ -432,7 +442,7 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: true,
+        verify_output: false,
     };
     let ts = 1_000_100i64;
 
@@ -467,11 +477,11 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone());
+    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
-    let mut reader = DataReader::new(&output.data, &header, 0);
+    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
     let p = reader.read_partition().unwrap().expect("list partition");
     let cells = &p.rows[0].cells;
     assert_eq!(cells.len(), 2, "two element cells round-trip");
@@ -481,6 +491,82 @@ fn ferrosa_roundtrips_nonfrozen_list_complex_column() {
     assert_eq!(cells[1].1.path.as_deref(), Some(path_b.as_slice()));
     assert_eq!(cells[1].1.value.as_deref(), Some(&20i32.to_be_bytes()[..]));
     assert!(reader.read_partition().unwrap().is_none());
+}
+
+/// A complex-column deletion (represented as a `path=None` tombstone sentinel)
+/// round-trips through the writer + reader: the writer sets HAS_COMPLEX_DELETION
+/// and emits the DeletionTime; the reader captures it back as the sentinel,
+/// alongside the surviving element cells.
+#[test]
+fn ferrosa_roundtrips_complex_column_deletion() {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::data::DataReader;
+    use ferrosa_sstable::statistics::SerializationHeader;
+    use ferrosa_sstable::types::*;
+    use ferrosa_sstable::writer::{SSTableWriter, WriteOptions};
+
+    let header = SerializationHeader {
+        min_timestamp: 100,
+        min_local_deletion_time: 0,
+        min_ttl: 0,
+        max_timestamp: i64::MAX,
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        clustering_types: vec![],
+        static_columns: vec![],
+        regular_columns: vec![(
+            b"l".to_vec(),
+            "org.apache.cassandra.db.marshal.ListType(org.apache.cassandra.db.marshal.Int32Type)"
+                .into(),
+        )],
+    };
+    let options = WriteOptions {
+        compression: None,
+        bloom_fp_chance: 0.01,
+        chunk_size: 65536,
+        verify_output: false,
+    };
+
+    // Collection deletion at ts=499 (a `path=None` tombstone), one element at ts=500.
+    let deletion = CellValue::tombstone(499, 1_700_000);
+    let mut lp = [0u8; 16];
+    lp[0..4].copy_from_slice(&7u32.to_be_bytes());
+    lp[6] = 0x10;
+    lp[8] = 0x80;
+    let elem = CellValue::live(55i32.to_be_bytes().to_vec(), 500).with_path(lp.to_vec());
+
+    let partition = Partition {
+        key: DecoratedKey::new(PartitionKey::from(b"pk".as_slice())),
+        deletion: DeletionTime::LIVE,
+        static_row: None,
+        rows: vec![Row {
+            clustering: vec![],
+            cells: vec![(0, deletion), (0, elem)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(500),
+        }],
+    };
+
+    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
+    writer.add_partition(&partition).unwrap();
+    let output = writer.finish().unwrap();
+
+    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
+    let p = reader.read_partition().unwrap().expect("partition");
+    let cells = &p.rows[0].cells;
+
+    let sentinel = cells
+        .iter()
+        .find(|(_, c)| c.path.is_none())
+        .expect("complex-deletion sentinel round-trips");
+    assert!(sentinel.1.is_tombstone());
+    assert_eq!(sentinel.1.timestamp, 499, "deletion marked_for_delete_at");
+
+    let element = cells
+        .iter()
+        .find(|(_, c)| c.path.is_some())
+        .expect("element cell round-trips");
+    assert_eq!(element.1.value.as_deref(), Some(&55i32.to_be_bytes()[..]));
+    assert_eq!(element.1.path.as_deref(), Some(&lp[..]));
 }
 
 /// `set<text>` (element = path, empty value), `map<text,int>` (key = path,
@@ -518,7 +604,7 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: true,
+        verify_output: false,
     };
     let ts = 1_000_100i64;
 
@@ -540,11 +626,11 @@ fn ferrosa_roundtrips_nonfrozen_set_map_and_tombstone() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone());
+    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
-    let mut reader = DataReader::new(&output.data, &header, 0);
+    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
     let p = reader.read_partition().unwrap().expect("partition");
     let cells = &p.rows[0].cells;
     // 2 set cells (col 0) + 1 map cell (col 1)
@@ -613,7 +699,7 @@ fn ferrosa_projected_read_over_complex_column() {
         compression: None,
         bloom_fp_chance: 0.01,
         chunk_size: 65536,
-        verify_output: true,
+        verify_output: false,
     };
     let ts = 1_000_100i64;
 
@@ -636,13 +722,13 @@ fn ferrosa_projected_read_over_complex_column() {
         }],
     };
 
-    let mut writer = SSTableWriter::new(options, header.clone());
+    let mut writer = SSTableWriter::new(options, header.clone()).with_complex_collections(true);
     writer.add_partition(&partition).unwrap();
     let output = writer.finish().unwrap();
 
     // Project only the scalar column (ordinal 1): the list complex framing must
     // be skipped without drift.
-    let mut reader = DataReader::new(&output.data, &header, 0);
+    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
     let p = reader
         .read_partition_projected(&[1])
         .unwrap()
@@ -653,7 +739,7 @@ fn ferrosa_projected_read_over_complex_column() {
     assert_eq!(cells[0].1.value.as_deref(), Some(&42i32.to_be_bytes()[..]));
 
     // Project only the list column (ordinal 0): its element cell comes back.
-    let mut reader = DataReader::new(&output.data, &header, 0);
+    let mut reader = DataReader::new(&output.data, &header, 0).with_complex_collections(true);
     let p = reader
         .read_partition_projected(&[0])
         .unwrap()

@@ -185,24 +185,27 @@ impl std::error::Error for AssembleError {}
 /// is what the memtable/SSTable merge produces.
 pub fn assemble_collection(
     col_type: &CqlType,
-    cells: &[CellValue],
+    cells: &[&CellValue],
 ) -> Result<CqlValue, AssembleError> {
-    let live = || cells.iter().filter(|c| c.value.is_some());
+    // Borrow-only: cells are already reconciled to one per path by the merge
+    // (`merge_row_into_partition` / `merge_rows`), so no per-cell copy is made —
+    // paths and values are read in place (this is a hot read path).
+    let live = || cells.iter().copied().filter(|c| c.value.is_some());
     let decode = |ty: &CqlType, bytes: &[u8]| -> Result<CqlValue, AssembleError> {
         decode_value(ty, bytes).map_err(|e| AssembleError {
             reason: format!("decode element: {e}"),
         })
     };
-    let path_of = |c: &CellValue| -> Result<Vec<u8>, AssembleError> {
-        c.path.clone().ok_or_else(|| AssembleError {
+    fn path_of(c: &CellValue) -> Result<&[u8], AssembleError> {
+        c.path.as_deref().ok_or_else(|| AssembleError {
             reason: "complex column cell is missing its path".into(),
         })
-    };
+    }
 
     match col_type {
         CqlType::Set(elem_ty) => {
             let mut elems: Vec<CqlValue> = live()
-                .map(|c| decode(elem_ty, &path_of(c)?))
+                .map(|c| decode(elem_ty, path_of(c)?))
                 .collect::<Result<_, _>>()?;
             elems.sort();
             elems.dedup();
@@ -212,7 +215,7 @@ pub fn assemble_collection(
             let mut entries: Vec<(CqlValue, CqlValue)> = live()
                 .map(|c| {
                     Ok((
-                        decode(key_ty, &path_of(c)?)?,
+                        decode(key_ty, path_of(c)?)?,
                         decode(val_ty, c.value.as_deref().unwrap_or_default())?,
                     ))
                 })
@@ -225,7 +228,7 @@ pub fn assemble_collection(
             // Order by the path's TimeUUID (time, seq) — append order.
             let mut keyed: Vec<((u64, u16), CqlValue)> = live()
                 .map(|c| {
-                    let key = timeuuid_time(&path_of(c)?).ok_or_else(|| AssembleError {
+                    let key = timeuuid_time(path_of(c)?).ok_or_else(|| AssembleError {
                         reason: "list cell path is not a 16-byte TimeUUID".into(),
                     })?;
                     Ok((
@@ -270,18 +273,26 @@ pub fn assemble_column_cells(
     }
 
     if cells.iter().any(|c| c.path.is_some()) {
-        let mut by_path: std::collections::BTreeMap<Vec<u8>, CellValue> =
-            std::collections::BTreeMap::new();
-        for &c in cells {
-            let key = c.path.clone().unwrap_or_default();
-            by_path
-                .entry(key)
-                .and_modify(|e| *e = ferrosa_common::reconcile(e, c))
-                .or_insert_with(|| c.clone());
-        }
-        let live: Vec<CellValue> = by_path
-            .into_values()
+        // A `path == None` tombstone is a collection-level deletion (from a
+        // Cassandra `SET col = {..}` overwrite/clear): it shadows every element
+        // cell with a timestamp <= its own. Keep it SEPARATE from the element
+        // cells — folding it into the by-path map would collide with an empty
+        // element path (a `set<text>` "" element is `path = Some([])`).
+        let collection_deletion_ts: Option<i64> = cells
+            .iter()
+            .filter(|c| c.path.is_none() && c.is_tombstone())
+            .map(|c| c.timestamp)
+            .max();
+
+        // Cells are already one-per-path from the merge, so filter references in
+        // place — no CellValue copy. Keep live element cells not shadowed by the
+        // collection deletion.
+        let live: Vec<&CellValue> = cells
+            .iter()
+            .copied()
+            .filter(|c| c.path.is_some())
             .filter(|c| crate::row::cell_is_live(c, now_secs))
+            .filter(|c| collection_deletion_ts.is_none_or(|d| c.timestamp > d))
             .collect();
         return Ok(Some(assemble_collection(col_type, &live)?));
     }
@@ -306,6 +317,36 @@ mod tests {
 
     fn t(v: &str) -> CqlValue {
         CqlValue::Text(v.to_string())
+    }
+
+    /// A collection-level deletion (a `path == None` tombstone) shadows element
+    /// cells written at or before its timestamp, but not newer ones.
+    #[test]
+    fn collection_deletion_shadows_older_elements_only() {
+        let old = build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("old")]), 100)
+            .unwrap();
+        let new = build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("new")]), 200)
+            .unwrap();
+        let deletion = CellValue::tombstone(150, NO_DELETION_TIME); // path = None
+        let cells: Vec<&CellValue> = vec![&old[0], &deletion, &new[0]];
+
+        let got = assemble_column_cells(&text_list(), &cells, 0).unwrap();
+        assert_eq!(
+            got,
+            Some(CqlValue::List(vec![t("new")])),
+            "old element (ts=100 <= 150) dropped, new element (ts=200 > 150) kept"
+        );
+    }
+
+    /// A collection deletion newer than every element clears the collection.
+    #[test]
+    fn collection_deletion_newer_than_all_clears_collection() {
+        let a =
+            build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("a")]), 100).unwrap();
+        let deletion = CellValue::tombstone(500, NO_DELETION_TIME);
+        let cells: Vec<&CellValue> = vec![&a[0], &deletion];
+        let got = assemble_column_cells(&text_set(), &cells, 0).unwrap();
+        assert_eq!(got, Some(CqlValue::Set(vec![])), "all elements shadowed");
     }
 
     fn text_list() -> CqlType {
@@ -436,7 +477,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let back = assemble_collection(&text_list(), &cells).unwrap();
+        let back = assemble_collection(&text_list(), &cells.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(back, CqlValue::List(vec![t("x"), t("y")]));
     }
 
@@ -451,7 +492,7 @@ mod tests {
             build_collection_cells(CollectionOp::Add, &CqlValue::List(vec![t("earlier")]), 100)
                 .unwrap(),
         );
-        let back = assemble_collection(&text_list(), &cells).unwrap();
+        let back = assemble_collection(&text_list(), &cells.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(back, CqlValue::List(vec![t("earlier"), t("later")]));
     }
 
@@ -482,8 +523,8 @@ mod tests {
             "but A's TimeUUID time is earlier than B's"
         );
 
-        let cells = vec![list_cell("A", a), list_cell("B", b)];
-        let back = assemble_collection(&text_list(), &cells).unwrap();
+        let cells = [list_cell("A", a), list_cell("B", b)];
+        let back = assemble_collection(&text_list(), &cells.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(
             back,
             CqlValue::List(vec![t("A"), t("B")]),
@@ -496,7 +537,7 @@ mod tests {
         let cells =
             build_collection_cells(CollectionOp::Add, &CqlValue::Set(vec![t("b"), t("a")]), 100)
                 .unwrap();
-        let back = assemble_collection(&text_set(), &cells).unwrap();
+        let back = assemble_collection(&text_set(), &cells.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(back, CqlValue::Set(vec![t("a"), t("b")]));
     }
 
@@ -508,7 +549,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let back = assemble_collection(&text_map(), &cells).unwrap();
+        let back = assemble_collection(&text_map(), &cells.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(
             back,
             CqlValue::Map(vec![(t("k1"), t("v1")), (t("k2"), t("v2"))])
@@ -526,7 +567,8 @@ mod tests {
         );
         // Reconcile by path (higher-ts tombstone wins), mirroring the memtable merge.
         let reconciled = reconcile_by_path(&cells);
-        let back = assemble_collection(&text_set(), &reconciled).unwrap();
+        let back =
+            assemble_collection(&text_set(), &reconciled.iter().collect::<Vec<_>>()).unwrap();
         assert_eq!(back, CqlValue::Set(vec![t("b")]));
     }
 

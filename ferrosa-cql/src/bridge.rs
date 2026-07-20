@@ -2946,10 +2946,12 @@ mod tests {
         use ferrosa_sstable::types::Partition;
 
         let dk = DecoratedKey::new(PartitionKey::new(encode_value(&CqlValue::Int(1))));
+        // Cells reaching the read path are already one-per-path (the merge folded
+        // "a"'s live+tombstone into a tombstone): "b" live + "a" tombstoned.
         let mut cells: Vec<(u16, CellValue)> = Vec::new();
         for c in build_collection_cells(
             CollectionOp::Add,
-            &CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]),
+            &CqlValue::Set(vec![CqlValue::Text("b".into())]),
             100,
         )
         .unwrap()
