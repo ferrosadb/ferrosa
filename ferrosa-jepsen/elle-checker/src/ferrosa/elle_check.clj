@@ -40,6 +40,12 @@
                      (map (fn [[k v]] [k (if (coll? v) (count v) v)])
                           (:anomalies res)))))
     (println "output dir:" out-dir)
+    ;; Dump the raw anomalies next to the history so a post-pass can cross-
+    ;; reference the cycle transactions against :info (indeterminate) ops — is a
+    ;; residual anomaly a real :ok/:ok violation, or :info-tainted noise?
+    (let [dump (str path ".anomalies.edn")]
+      (spit dump (pr-str (:anomalies res)))
+      (println "anomalies dumped:" dump))
     (flush)
     (shutdown-agents)
     ;; Exit 0 ONLY on a definitive :valid? true. false = real violation;
