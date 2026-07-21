@@ -279,6 +279,110 @@ impl CounterCell {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Accord-ordered list cell paths — the single source of truth for the 16-byte
+// v1-TimeUUID layout shared by the read-side assembly (`ferrosa-row-bridge`,
+// which re-exports [`accord_list_cell_path`]) and the Accord apply-time rebind
+// (`ferrosa-storage::commitlog::mutation`). Co-locating the mint here keeps the
+// two byte-for-byte consistent — a drift would silently reorder or drop list
+// elements.
+// ---------------------------------------------------------------------------
+
+/// 100-nanosecond intervals between the UUID epoch (1582-10-15) and the Unix
+/// epoch (1970-01-01) — the offset a v1 TimeUUID's 60-bit time field carries.
+pub const UUID_EPOCH_OFFSET: u64 = 0x01B2_1DD2_1381_4000;
+
+/// Mint a globally-unique, **Accord-ordered** `list` cell path from the AGREED
+/// Accord execution timestamp `t` (never a coordinator-local wall clock).
+///
+/// Concurrent list appends must serialize by the Accord total order
+/// `(time, seq, node)` on read, and must never collide on one path (which would
+/// silently drop an element). This encodes:
+///   - **time field** ← `t.time` (HLC nanos): primary order, respects real-time.
+///   - **clock_seq**  ← `element_seq`: order of elements within one append.
+///   - **node field** ← `t.seq` (bytes 10..14) then `t.node` low 16 bits
+///     (14..16): the Accord secondary order `(seq, node)` — a deterministic
+///     tiebreak for concurrent same-`time` appends AND global uniqueness across
+///     coordinators.
+///
+/// The read-assembly orders list cells by `(time, clock_seq, node-bytes)`, so
+/// the assembled order equals the Accord order `(time, element_seq, seq, node)`.
+/// Legacy coordinator-clock paths (`node = 0`) sort unchanged. The bytes are a
+/// valid v1 TimeUUID (Cassandra layout).
+pub fn accord_list_cell_path(t: &crate::accord::Timestamp, element_seq: u16) -> Vec<u8> {
+    let uuid_ts = t.time.wrapping_add(UUID_EPOCH_OFFSET);
+    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
+    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
+    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
+    let clock_seq = (element_seq & 0x3FFF) | 0x8000; // variant 1
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&time_low.to_be_bytes());
+    b[4..6].copy_from_slice(&time_mid.to_be_bytes());
+    b[6..8].copy_from_slice(&time_hi.to_be_bytes());
+    b[8..10].copy_from_slice(&clock_seq.to_be_bytes());
+    b[10..14].copy_from_slice(&t.seq.to_be_bytes());
+    b[14..16].copy_from_slice(&((t.node & 0xFFFF) as u16).to_be_bytes());
+    b.to_vec()
+}
+
+/// Extract the element-seq (the v1 TimeUUID's low-14-bit clock_seq) from a
+/// 16-byte list cell path. This is the `element_seq` an [`accord_list_cell_path`]
+/// (or the legacy coordinator-clock `list_cell_path`) baked in — the apply-time
+/// rebind recovers it from the pre-consensus path so the rebound path preserves
+/// the element's within-append order. Returns `None` if `path` is not 16 bytes.
+pub fn list_path_element_seq(path: &[u8]) -> Option<u16> {
+    if path.len() != 16 {
+        return None;
+    }
+    Some(u16::from_be_bytes([path[8], path[9]]) & 0x3FFF)
+}
+
+#[cfg(test)]
+mod accord_list_path_tests {
+    use super::*;
+    use crate::accord::Timestamp;
+
+    fn ts(time: u64, seq: u32, node: u64) -> Timestamp {
+        Timestamp {
+            epoch: 0,
+            time,
+            seq,
+            node,
+        }
+    }
+
+    /// The minted path is a valid 16-byte v1 TimeUUID and its element-seq round-
+    /// trips through [`list_path_element_seq`].
+    #[test]
+    fn accord_list_path_is_v1_timeuuid_and_seq_round_trips() {
+        let p = accord_list_cell_path(&ts(12_345, 7, 3), 42);
+        assert_eq!(p.len(), 16);
+        assert_eq!(p[6] & 0xF0, 0x10, "version 1");
+        assert_eq!(p[8] & 0xC0, 0x80, "variant 1 (10xx)");
+        assert_eq!(list_path_element_seq(&p), Some(42));
+    }
+
+    /// Distinct Accord `(time, seq, node)` or element index → distinct paths, so
+    /// no concurrent append is silently lost to a path collision.
+    #[test]
+    fn distinct_coordinates_give_distinct_paths() {
+        let paths = [
+            accord_list_cell_path(&ts(100, 0, 1), 0),
+            accord_list_cell_path(&ts(100, 1, 1), 0), // +seq
+            accord_list_cell_path(&ts(100, 0, 2), 0), // +node
+            accord_list_cell_path(&ts(100, 0, 1), 1), // +element index
+        ];
+        let unique: std::collections::HashSet<Vec<u8>> = paths.iter().cloned().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn list_path_element_seq_rejects_non_16_byte() {
+        assert_eq!(list_path_element_seq(&[0u8; 8]), None);
+        assert_eq!(list_path_element_seq(&[]), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

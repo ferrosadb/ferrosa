@@ -93,19 +93,10 @@ pub fn list_cell_path(write_ts: Timestamp, seq: u16) -> Vec<u8> {
 /// order `(time, element_seq, seq, node)`. Legacy `node = 0` paths sort unchanged.
 /// The bytes are a valid v1 TimeUUID (Cassandra layout).
 pub fn accord_list_cell_path(t: &AccordTimestamp, element_seq: u16) -> Vec<u8> {
-    let uuid_ts = t.time.wrapping_add(UUID_EPOCH_OFFSET);
-    let time_low = (uuid_ts & 0xFFFF_FFFF) as u32;
-    let time_mid = ((uuid_ts >> 32) & 0xFFFF) as u16;
-    let time_hi = ((uuid_ts >> 48) & 0x0FFF) as u16 | 0x1000; // version 1
-    let clock_seq = (element_seq & 0x3FFF) | 0x8000; // variant 1
-    let mut b = [0u8; 16];
-    b[0..4].copy_from_slice(&time_low.to_be_bytes());
-    b[4..6].copy_from_slice(&time_mid.to_be_bytes());
-    b[6..8].copy_from_slice(&time_hi.to_be_bytes());
-    b[8..10].copy_from_slice(&clock_seq.to_be_bytes());
-    b[10..14].copy_from_slice(&t.seq.to_be_bytes());
-    b[14..16].copy_from_slice(&((t.node & 0xFFFF) as u16).to_be_bytes());
-    b.to_vec()
+    // Single source of truth: the byte layout lives in `ferrosa-common` so the
+    // read-side assembly here and the Accord apply-time rebind
+    // (`ferrosa-storage::commitlog::mutation`) can never drift apart.
+    ferrosa_common::accord_list_cell_path(t, element_seq)
 }
 
 /// The list-cell ordering key `(time, clock_seq, node-bytes)` — the Accord total

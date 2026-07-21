@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c10db8fc309fe14445402ef7c3c966062b949fe0388c952d4c4b0073b14ab37b # shrinks to mutation = Mutation { mutation_id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 31, 118, 196, 78], keyspace: "a", table: "a", key: DecoratedKey { token: Token(5048724184180415669), key: PartitionKey([0]) }, rows: [Row { clustering: [], cells: [(0, CellValue { value: Some([]), timestamp: 1, ttl: 0, local_deletion_time: 2147483647, path: Some([0]) })], deletion: DeletionTime { marked_for_delete_at: -9223372036854775808, local_deletion_time: 4294967295 }, primary_key_liveness: LivenessInfo { timestamp: 1, ttl: 0, local_deletion_time: 2147483647 } }], timestamp: 1 }

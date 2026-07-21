@@ -1614,16 +1614,26 @@ fn build_lwt_mutation(
             .as_micros() as i64)
     };
 
-    let (table_id, key, row, ts) = match stmt {
-        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+    let (table_id, key, mut row, ts, list_append_cols) = match stmt {
+        Statement::Insert(s) => {
+            let (t, k, r, ts) = materialize_insert(state, ctx, s, now_micros()?)?;
+            (t, k, r, ts, Vec::new())
+        }
         Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
-        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => {
+            let (t, k, r, ts) = materialize_delete(state, ctx, s, now_micros()?)?;
+            (t, k, r, ts, Vec::new())
+        }
         _ => {
             return Err(CqlError::Invalid(
                 "LWT via Accord supports only INSERT/UPDATE/DELETE statements".into(),
             ));
         }
     };
+
+    // Accord write path: flag list-append cells so apply rebinds their paths to
+    // the agreed execution ts (t_68f226b5).
+    flag_accord_list_append_cells(&mut row, &list_append_cols);
 
     let key_bytes = key.key.as_bytes().to_vec();
 
@@ -1658,16 +1668,26 @@ fn build_transaction_write(
             .as_micros() as i64)
     };
 
-    let (table_id, key, row, ts) = match stmt {
-        Statement::Insert(s) => materialize_insert(state, ctx, s, now_micros()?)?,
+    let (table_id, key, mut row, ts, list_append_cols) = match stmt {
+        Statement::Insert(s) => {
+            let (t, k, r, ts) = materialize_insert(state, ctx, s, now_micros()?)?;
+            (t, k, r, ts, Vec::new())
+        }
         Statement::Update(s) => materialize_update(state, ctx, s, now_micros()?)?,
-        Statement::Delete(s) => materialize_delete(state, ctx, s, now_micros()?)?,
+        Statement::Delete(s) => {
+            let (t, k, r, ts) = materialize_delete(state, ctx, s, now_micros()?)?;
+            (t, k, r, ts, Vec::new())
+        }
         _ => {
             return Err(CqlError::Invalid(
                 "only INSERT/UPDATE/DELETE may be buffered in a transaction".into(),
             ));
         }
     };
+
+    // Accord write path: flag list-append cells so apply rebinds their paths to
+    // the agreed execution ts (t_68f226b5).
+    flag_accord_list_append_cells(&mut row, &list_append_cols);
 
     let keyspace = table_id.keyspace.clone();
     let key_bytes = key.key.as_bytes().to_vec();
@@ -7715,7 +7735,11 @@ async fn route_logged_batch(
                 ));
             }
             Statement::Update(s) => {
-                let (table_id, key, row, ts) = materialize_update(state, ctx, s, batch_timestamp)?;
+                // Logged batches are NOT Accord transactions — their list elements
+                // order by the coordinator wall clock (Cassandra LWW semantics), so
+                // the list-append rebind columns are intentionally ignored here.
+                let (table_id, key, row, ts, _list_append_cols) =
+                    materialize_update(state, ctx, s, batch_timestamp)?;
                 mutations.push(Mutation::new(
                     table_id.keyspace.clone(),
                     table_id.table.clone(),
@@ -7839,6 +7863,14 @@ fn materialize_insert(
 
 /// Materialize an UPDATE statement into its key, row, and table ID without
 /// writing. Used by `route_logged_batch()` to collect mutations.
+/// Materialize an UPDATE into `(table_id, key, row, timestamp, list_append_cols)`.
+///
+/// `list_append_cols` are the storage column indices of any non-frozen `list`
+/// append cells built here (`v = v + [..]`). They order by a cell path that the
+/// Accord write path must **rebind** to the agreed execution timestamp at apply
+/// (t_68f226b5) — so the Accord-txn builders flag exactly these columns and the
+/// AP/logged-batch path (which keeps Cassandra coordinator-clock LWW ordering)
+/// ignores them. `set`/`map` cells are order-independent and never listed.
 fn materialize_update(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -7850,6 +7882,7 @@ fn materialize_update(
         ferrosa_common::DecoratedKey,
         ferrosa_sstable::types::Row,
         i64,
+        Vec<u16>,
     ),
     CqlError,
 > {
@@ -7908,6 +7941,9 @@ fn materialize_update(
     // by distinct cell paths. `Row.cells` is a `Vec<(u16, CellValue)>`, which
     // already carries multiple path-keyed cells per column.
     let mut complex_cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
+    // Storage indices of `list` append columns whose per-element cell paths must
+    // be rebound to the Accord execution ts at apply (t_68f226b5).
+    let mut list_append_cols: Vec<u16> = Vec::new();
     for assignment in &s.assignments {
         match assignment {
             Assignment::Simple { column, value } => {
@@ -7948,6 +7984,15 @@ fn materialize_update(
                 let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
                     CqlError::Invalid(format!("column '{}' not found in storage schema", column))
                 })?;
+                // A `list` append (`v = v + [..]`) builds order-sensitive per-element
+                // cells whose path encodes the write time; the Accord path must
+                // rebind that path to the agreed execution ts at apply. Set/map ops
+                // are order-independent, so they are not flagged.
+                if matches!(op, crate::collection_cells::CollectionOp::Add)
+                    && matches!(rhs, CqlValue::List(_))
+                {
+                    list_append_cols.push(col_idx);
+                }
                 for c in cells {
                     complex_cells.push((col_idx, c));
                 }
@@ -7980,7 +8025,28 @@ fn materialize_update(
     }
     let table_id = TableId::new(ks, &s.table);
 
-    Ok((table_id, decorated_key, row, timestamp))
+    Ok((table_id, decorated_key, row, timestamp, list_append_cols))
+}
+
+/// Set the transient Accord list-path rebind flag on `row`'s list-append cells —
+/// those whose (clean) storage column index is in `list_append_cols`. The replica
+/// apply phase rebinds these cells' paths to the agreed execution timestamp
+/// (t_68f226b5); the flag is stripped at decode and never reaches the SSTable.
+///
+/// Only the Accord write path (`build_transaction_write` / `build_lwt_mutation`)
+/// calls this. The AP and logged-batch paths deliberately do NOT — their list
+/// elements order by the coordinator wall clock (Cassandra LWW semantics), which
+/// is correct for non-transactional writes.
+fn flag_accord_list_append_cells(row: &mut ferrosa_sstable::types::Row, list_append_cols: &[u16]) {
+    if list_append_cols.is_empty() {
+        return;
+    }
+    for (idx, cell) in &mut row.cells {
+        let clean = *idx;
+        if cell.path.is_some() && list_append_cols.contains(&clean) {
+            *idx |= ferrosa_storage::CELL_REBIND_LIST_PATH_FLAG;
+        }
+    }
 }
 
 /// Materialize a DELETE statement into its key, row, and table ID without
@@ -13899,8 +13965,14 @@ mod tests {
         else {
             panic!("expected UPDATE");
         };
-        let (_tid, _dk, row, _ts) = materialize_update(&state, &ctx, &append, 123)
-            .expect("collection append must materialize per-element cells in a transaction");
+        let (_tid, _dk, row, _ts, list_append_cols) =
+            materialize_update(&state, &ctx, &append, 123)
+                .expect("collection append must materialize per-element cells in a transaction");
+        assert_eq!(
+            list_append_cols.len(),
+            1,
+            "a list append reports exactly its column for Accord rebind"
+        );
         let elem_cells: Vec<_> = row.cells.iter().filter(|(_, c)| c.path.is_some()).collect();
         assert_eq!(
             elem_cells.len(),
@@ -13934,6 +14006,88 @@ mod tests {
         assert!(
             materialize_update(&state, &ctx, &remove, 123).is_err(),
             "list remove-by-value needs a read — must stay fail-loud in a transaction"
+        );
+    }
+
+    /// The Accord transaction write path flags a `list` append cell so the replica
+    /// rebinds its path to the agreed execution ts at apply (t_68f226b5); an
+    /// order-independent `set` add is NOT flagged (rebinding it would be wrong and
+    /// would fail loud on its non-TimeUUID element path).
+    #[tokio::test]
+    async fn accord_txn_write_flags_list_append_for_rebind() {
+        use ferrosa_storage::Mutation;
+
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for ddl in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, s int, se set<int>, v list<int>)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(ddl).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let t = ferrosa_common::accord::Timestamp {
+            epoch: 0,
+            time: 424_242,
+            seq: 3,
+            node: 5,
+        };
+
+        // A `list` append: the flag makes the apply-side rebind rewrite the cell
+        // path to `accord_list_cell_path(t, 0)`; a plain decode keeps the
+        // coordinator-clock path. The difference proves the flag was set.
+        let append = crate::parser::parse("UPDATE ks.t SET v = v + [7] WHERE k = 1").unwrap();
+        let w = build_transaction_write(&state, &ctx, &append).unwrap();
+        let rebound = Mutation::deserialize_from_rebinding_list_paths(&w.mutation, t).unwrap();
+        let plain = Mutation::deserialize_from(&w.mutation).unwrap();
+        let (_, list_rebound) = rebound.rows[0]
+            .cells
+            .iter()
+            .find(|(_, c)| c.path.is_some())
+            .expect("list append cell");
+        assert_eq!(
+            list_rebound.path.as_deref(),
+            Some(ferrosa_common::accord_list_cell_path(&t, 0).as_slice()),
+            "flagged list cell rebinds to the Accord execution ts at apply"
+        );
+        let (_, list_plain) = plain.rows[0]
+            .cells
+            .iter()
+            .find(|(_, c)| c.path.is_some())
+            .unwrap();
+        assert_ne!(
+            list_plain.path, list_rebound.path,
+            "the rebind flag is what triggers the rewrite (plain decode keeps the coord path)"
+        );
+
+        // A `set` add must NOT be flagged: rebinding decode leaves its element
+        // path exactly as a plain decode does (and would fail loud if flagged,
+        // since a set<int> element path is not a 16-byte TimeUUID).
+        let set_add = crate::parser::parse("UPDATE ks.t SET se = se + {9} WHERE k = 1").unwrap();
+        let w = build_transaction_write(&state, &ctx, &set_add).unwrap();
+        let set_rebound = Mutation::deserialize_from_rebinding_list_paths(&w.mutation, t).unwrap();
+        let set_plain = Mutation::deserialize_from(&w.mutation).unwrap();
+        let path_of = |m: &Mutation| {
+            m.rows[0]
+                .cells
+                .iter()
+                .find(|(_, c)| c.path.is_some())
+                .and_then(|(_, c)| c.path.clone())
+        };
+        assert_eq!(
+            path_of(&set_rebound),
+            path_of(&set_plain),
+            "a set element path is order-independent — never flagged for rebind"
         );
     }
 

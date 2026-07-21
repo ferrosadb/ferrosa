@@ -29,9 +29,16 @@
 //! ```
 //!
 //! The high bit (`0x8000`) of `column_index` flags a **complex-column cell path**
-//! (a collection element identity — timeuuid/element/key). Real column indices are
-//! `< 0x8000`, so simple cells and old segments (which never set the bit) are
-//! byte-for-byte identical to the pre-path format — no version bump required.
+//! (a collection element identity — timeuuid/element/key). The next bit
+//! (`0x4000`) is a **transient Accord list-path rebind flag**: the coordinator
+//! sets it on a non-frozen `list` append cell so the replica's apply phase
+//! rewrites the cell's path from the coordinator-local wall clock to the
+//! Accord-agreed execution timestamp (see
+//! [`Mutation::deserialize_from_rebinding_list_paths`]). It is consumed at
+//! decode time and NEVER reaches the SSTable — the stored column index is always
+//! the clean low-14-bit value. Real column indices are `< 0x4000`, so simple
+//! cells and old segments (which never set either bit) are byte-for-byte
+//! identical to the pre-path format — no version bump required.
 //!
 //! All multi-byte integers are big-endian.
 //!
@@ -42,7 +49,10 @@
 //! `mutation_id` with all-zeros.  A zero `mutation_id` is **never** used for
 //! deduplication — mutations with a zero id are always re-applied on replay.
 
-use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+use ferrosa_common::accord::Timestamp as AccordTimestamp;
+use ferrosa_common::{
+    accord_list_cell_path, list_path_element_seq, CellValue, DecoratedKey, PartitionKey, Token,
+};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use uuid::Uuid;
 
@@ -116,6 +126,14 @@ pub enum MutationError {
         /// Which field.
         field: &'static str,
     },
+    /// A cell carried the Accord list-path rebind flag (`0x4000`) but did not
+    /// have a 16-byte v1-TimeUUID path to rebind — the coordinator only sets the
+    /// flag on `list` append cells, which always have a 16-byte path, so this is
+    /// a corrupt/forged payload. Fail loud rather than silently mis-rebind.
+    InvalidRebindListPath {
+        /// The actual path length found (not 16).
+        len: usize,
+    },
 }
 
 impl std::fmt::Display for MutationError {
@@ -132,6 +150,11 @@ impl std::fmt::Display for MutationError {
             MutationError::InvalidUtf8 { field } => {
                 write!(f, "invalid UTF-8 in field {field}")
             }
+            MutationError::InvalidRebindListPath { len } => write!(
+                f,
+                "cell has the Accord list-path rebind flag but a {len}-byte path (expected a \
+                 16-byte v1 TimeUUID)"
+            ),
         }
     }
 }
@@ -273,8 +296,19 @@ fn byte_vec_size(data: &[u8]) -> usize {
 /// and simple cells serialize byte-for-byte as before. Only path-bearing cells use
 /// the extended encoding; no format-version bump is needed.
 const CELL_HAS_PATH_FLAG: u16 = 0x8000;
-/// Mask for the real column index (the low 15 bits) once the flag is stripped.
-const CELL_COLUMN_INDEX_MASK: u16 = 0x7FFF;
+/// Second-highest bit of a cell's `column_index`, set by the coordinator to mark
+/// a non-frozen `list` append cell whose path must be **rebound** from the
+/// coordinator-local wall clock to the Accord-agreed execution timestamp at apply
+/// time (see [`Mutation::deserialize_from_rebinding_list_paths`]). Transient: it
+/// is stripped at decode and never persisted — the stored column index is always
+/// the clean low-14-bit value. Only set on the Accord write path, so old segments
+/// and the AP/logged-batch paths never carry it. Public so the CQL coordinator
+/// (`ferrosa-cql`) sets exactly this bit when materializing an Accord list append
+/// — one source of truth for the flag value across the serialize/deserialize seam.
+pub const CELL_REBIND_LIST_PATH_FLAG: u16 = 0x4000;
+/// Mask for the real column index (the low 14 bits) once both high flags are
+/// stripped. Real column indices are `< 0x4000` (16384) — far beyond any table.
+const CELL_COLUMN_INDEX_MASK: u16 = 0x3FFF;
 
 /// Size of a single serialized cell.
 fn cell_size(cell: &CellValue) -> usize {
@@ -438,17 +472,24 @@ impl Mutation {
     }
 
     fn serialize_cell(w: &mut WriteCursor<'_>, column_index: u16, cell: &CellValue) {
-        // Fail loud: a column index that collides with the path flag would corrupt
-        // the encoding. 0x8000 columns is far beyond any real table.
+        // The caller may pre-set the transient rebind flag (0x4000) on the column
+        // index for an Accord `list` append cell; pass it through so the replica's
+        // apply phase can rebind the path. The path flag (0x8000) is derived from
+        // the cell, never passed in — fail loud if a real index collides with it.
+        let rebind = column_index & CELL_REBIND_LIST_PATH_FLAG;
         assert!(
-            column_index & CELL_HAS_PATH_FLAG == 0,
-            "column index {column_index} collides with the cell-path flag (>= 0x8000)"
+            column_index & !(CELL_REBIND_LIST_PATH_FLAG | CELL_COLUMN_INDEX_MASK) == 0,
+            "column index {} collides with a reserved cell flag (>= 0x8000, or >= 0x4000 without \
+             being the rebind flag)",
+            column_index & CELL_COLUMN_INDEX_MASK
         );
-        let tagged = if cell.path.is_some() {
-            column_index | CELL_HAS_PATH_FLAG
-        } else {
-            column_index
-        };
+        let tagged = (column_index & CELL_COLUMN_INDEX_MASK)
+            | rebind
+            | if cell.path.is_some() {
+                CELL_HAS_PATH_FLAG
+            } else {
+                0
+            };
         w.write_u16(tagged);
         w.write_i64(cell.timestamp);
         w.write_i32(cell.ttl);
@@ -474,8 +515,35 @@ impl Mutation {
     /// Deserializes a mutation from a byte slice.
     ///
     /// Returns an error if the buffer is truncated or contains invalid UTF-8
-    /// in string fields.
+    /// in string fields. Any transient Accord list-path rebind flag (`0x4000`)
+    /// on a cell is **stripped** (the clean column index is kept) but the path is
+    /// left as-is — use [`deserialize_from_rebinding_list_paths`] on the apply
+    /// path to actually rebind. In practice only the Accord apply path ever sees
+    /// a flagged payload, so this default decode never encounters the flag.
+    ///
+    /// [`deserialize_from_rebinding_list_paths`]: Self::deserialize_from_rebinding_list_paths
     pub fn deserialize_from(buf: &[u8]) -> Result<Self> {
+        Self::deserialize_inner(buf, None)
+    }
+
+    /// Deserialize a mutation, rebinding every Accord `list` append cell (flagged
+    /// with `0x4000`) to the agreed execution timestamp `t`.
+    ///
+    /// The coordinator stamps a list append cell's path with its own wall clock
+    /// *before* consensus picks `t`, which would order concurrent appends by
+    /// coordinator clock rather than the Accord total order (non-strict-
+    /// serializable, t_68f226b5). This rewrites each flagged cell's path to
+    /// [`accord_list_cell_path(&t, element_seq)`], preserving the element's
+    /// within-append order (`element_seq` recovered from the pre-consensus path's
+    /// clock_seq) while making the primary order the Accord `t`. Non-flagged cells
+    /// (scalars, `set`/`map` elements, non-frozen UDT fields) are untouched. The
+    /// stripped-clean column index is stored, so the flag never reaches the
+    /// SSTable. Fails loud if a flagged cell lacks a 16-byte path.
+    pub fn deserialize_from_rebinding_list_paths(buf: &[u8], t: AccordTimestamp) -> Result<Self> {
+        Self::deserialize_inner(buf, Some(t))
+    }
+
+    fn deserialize_inner(buf: &[u8], rebind_t: Option<AccordTimestamp>) -> Result<Self> {
         let mut r = ReadCursor::new(buf);
 
         // mutation_id: 16 raw bytes (UUID v4, or all-zeros for legacy entries)
@@ -497,7 +565,7 @@ impl Mutation {
 
         let mut rows = Vec::with_capacity(row_count);
         for _ in 0..row_count {
-            rows.push(Self::deserialize_row(&mut r)?);
+            rows.push(Self::deserialize_row(&mut r, rebind_t)?);
         }
 
         Ok(Mutation {
@@ -510,7 +578,7 @@ impl Mutation {
         })
     }
 
-    fn deserialize_row(r: &mut ReadCursor<'_>) -> Result<Row> {
+    fn deserialize_row(r: &mut ReadCursor<'_>, rebind_t: Option<AccordTimestamp>) -> Result<Row> {
         let clustering = r.read_byte_vec("clustering")?;
 
         let marked_for_delete_at = r.read_i64("deletion.marked_for_delete_at")?;
@@ -529,7 +597,7 @@ impl Mutation {
         let cell_count = r.read_u16("cell_count")? as usize;
         let mut cells = Vec::with_capacity(cell_count);
         for _ in 0..cell_count {
-            cells.push(Self::deserialize_cell(r)?);
+            cells.push(Self::deserialize_cell(r, rebind_t)?);
         }
 
         Ok(Row {
@@ -540,9 +608,15 @@ impl Mutation {
         })
     }
 
-    fn deserialize_cell(r: &mut ReadCursor<'_>) -> Result<(u16, CellValue)> {
+    fn deserialize_cell(
+        r: &mut ReadCursor<'_>,
+        rebind_t: Option<AccordTimestamp>,
+    ) -> Result<(u16, CellValue)> {
         let tagged = r.read_u16("cell.column_index")?;
         let has_path = tagged & CELL_HAS_PATH_FLAG != 0;
+        let needs_rebind = tagged & CELL_REBIND_LIST_PATH_FLAG != 0;
+        // The clean column index — both transient flags stripped, so the stored
+        // index (and thus the SSTable) never carries them.
         let column_index = tagged & CELL_COLUMN_INDEX_MASK;
         let timestamp = r.read_i64("cell.timestamp")?;
         let ttl = r.read_i32("cell.ttl")?;
@@ -559,11 +633,25 @@ impl Mutation {
 
         // A complex-column cell path follows the value iff the flag was set. Old
         // segments and simple cells never set it, so they decode with path == None.
-        let path = if has_path {
+        let mut path = if has_path {
             Some(r.read_byte_vec("cell.path")?)
         } else {
             None
         };
+
+        // Accord list-path rebind: when this cell was flagged AND a rebind
+        // timestamp was supplied (the apply path), rewrite the coordinator-clock
+        // list path to the agreed execution timestamp, preserving the element's
+        // within-append order via the original path's clock_seq. A flagged cell
+        // must have a 16-byte v1-TimeUUID path — fail loud otherwise.
+        if needs_rebind {
+            if let Some(t) = rebind_t {
+                let old = path.as_deref().unwrap_or_default();
+                let element_seq = list_path_element_seq(old)
+                    .ok_or(MutationError::InvalidRebindListPath { len: old.len() })?;
+                path = Some(accord_list_cell_path(&t, element_seq));
+            }
+        }
 
         Ok((
             column_index,
@@ -829,6 +917,165 @@ mod tests {
         m.serialize_into(&mut buf);
         let back = Mutation::deserialize_from(&buf).unwrap();
         assert!(back.rows[0].cells.iter().all(|(_, c)| c.path.is_none()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Accord list-path rebind flag (0x4000) — t_68f226b5.
+    // -----------------------------------------------------------------------
+
+    use ferrosa_common::accord::Timestamp as AccordTimestamp;
+
+    const REBIND_FLAG: u16 = 0x4000;
+
+    fn accord_ts(time: u64, seq: u32, node: u64) -> AccordTimestamp {
+        AccordTimestamp {
+            epoch: 0,
+            time,
+            seq,
+            node,
+        }
+    }
+
+    /// Serialize a one-row mutation from raw `(tagged_col_idx, cell)` tuples so a
+    /// test can pre-set the 0x4000 rebind flag exactly as the coordinator would.
+    fn mutation_with_cells(cells: Vec<(u16, CellValue)>) -> Vec<u8> {
+        let m = Mutation {
+            mutation_id: [7u8; 16],
+            keyspace: "ks".into(),
+            table: "t".into(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            rows: vec![Row {
+                clustering: vec![],
+                cells,
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            }],
+            timestamp: 1000,
+        };
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        buf
+    }
+
+    /// The DEFAULT decode strips the rebind flag into a clean column index and
+    /// leaves the (coordinator-clock) path untouched — so any non-apply consumer
+    /// (commit-log replay, read-vote) is unaffected and the flag never reaches the
+    /// SSTable via a polluted column index.
+    #[test]
+    fn default_deserialize_strips_rebind_flag_keeps_path() {
+        let coord_path = ferrosa_common::accord_list_cell_path(&accord_ts(999, 0, 0), 5);
+        let buf = mutation_with_cells(vec![(
+            3 | REBIND_FLAG,
+            CellValue::live(b"elem".to_vec(), 1000).with_path(coord_path.clone()),
+        )]);
+        let back = Mutation::deserialize_from(&buf).unwrap();
+        let (idx, cell) = &back.rows[0].cells[0];
+        assert_eq!(*idx, 3, "rebind flag stripped from the stored column index");
+        assert_eq!(
+            cell.path.as_deref(),
+            Some(coord_path.as_slice()),
+            "default decode leaves the path unchanged"
+        );
+    }
+
+    /// The apply decode rebinds a flagged `list` cell's path to the Accord
+    /// execution timestamp, preserving the element_seq baked into the original
+    /// path; a NON-flagged sibling cell (a `set` element) is left untouched.
+    #[test]
+    fn rebinding_deserialize_rewrites_only_flagged_list_path() {
+        let element_seq = 3u16;
+        // Coordinator-clock list path (wrong time, but carries element_seq).
+        let coord_path = ferrosa_common::accord_list_cell_path(&accord_ts(999, 0, 0), element_seq);
+        // A set element path — arbitrary 16 bytes, NOT flagged; must survive.
+        let set_path = vec![0xABu8; 16];
+        let buf = mutation_with_cells(vec![
+            (
+                2 | REBIND_FLAG,
+                CellValue::live(b"L".to_vec(), 1000).with_path(coord_path),
+            ),
+            (
+                5,
+                CellValue::live(Vec::new(), 1000).with_path(set_path.clone()),
+            ),
+        ]);
+
+        let t = accord_ts(4242, 7, 9);
+        let back = Mutation::deserialize_from_rebinding_list_paths(&buf, t).unwrap();
+        let cells = &back.rows[0].cells;
+
+        let (list_idx, list_cell) = cells.iter().find(|(i, _)| *i == 2).unwrap();
+        assert_eq!(*list_idx, 2, "clean column index stored");
+        assert_eq!(
+            list_cell.path.as_deref(),
+            Some(ferrosa_common::accord_list_cell_path(&t, element_seq).as_slice()),
+            "flagged list path rebound to the Accord execution ts, element_seq preserved"
+        );
+
+        let (_, set_cell) = cells.iter().find(|(i, _)| *i == 5).unwrap();
+        assert_eq!(
+            set_cell.path.as_deref(),
+            Some(set_path.as_slice()),
+            "a non-flagged set element path must NOT be rebound"
+        );
+    }
+
+    /// Two flagged appends within one write keep their within-append order
+    /// (element_seq 0 before 1) and both take the Accord `t.time` as primary
+    /// order after rebind.
+    #[test]
+    fn rebinding_preserves_within_append_element_order() {
+        let buf = mutation_with_cells(vec![
+            (
+                2 | REBIND_FLAG,
+                CellValue::live(b"a".to_vec(), 1000).with_path(
+                    ferrosa_common::accord_list_cell_path(&accord_ts(999, 0, 0), 0),
+                ),
+            ),
+            (
+                2 | REBIND_FLAG,
+                CellValue::live(b"b".to_vec(), 1000).with_path(
+                    ferrosa_common::accord_list_cell_path(&accord_ts(999, 0, 0), 1),
+                ),
+            ),
+        ]);
+        let t = accord_ts(5000, 1, 2);
+        let back = Mutation::deserialize_from_rebinding_list_paths(&buf, t).unwrap();
+        let seqs: Vec<u16> = back.rows[0]
+            .cells
+            .iter()
+            .map(|(_, c)| {
+                ferrosa_common::list_path_element_seq(c.path.as_deref().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, vec![0, 1], "element order preserved across rebind");
+        for (_, c) in &back.rows[0].cells {
+            let p = c.path.as_deref().unwrap();
+            assert_eq!(
+                p,
+                ferrosa_common::accord_list_cell_path(
+                    &t,
+                    ferrosa_common::list_path_element_seq(p).unwrap()
+                )
+                .as_slice(),
+                "every rebound path carries the Accord t"
+            );
+        }
+    }
+
+    /// A flagged cell whose path is not a 16-byte v1 TimeUUID is corrupt — fail
+    /// loud rather than silently mis-rebind (never fake success).
+    #[test]
+    fn rebinding_flagged_cell_without_16_byte_path_fails_loud() {
+        let buf = mutation_with_cells(vec![(
+            2 | REBIND_FLAG,
+            CellValue::live(b"x".to_vec(), 1000).with_path(vec![0u8; 8]),
+        )]);
+        let err = Mutation::deserialize_from_rebinding_list_paths(&buf, accord_ts(1, 0, 0))
+            .expect_err("a flagged cell with a non-16-byte path must fail loud");
+        assert!(matches!(
+            err,
+            MutationError::InvalidRebindListPath { len: 8 }
+        ));
     }
 }
 
