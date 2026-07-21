@@ -33,7 +33,7 @@ pub use config::{
     ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, SyncStrategyConfig,
     TableId,
 };
-pub use mutation::Mutation;
+pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
 
 use std::collections::HashSet;
 use std::fs;
