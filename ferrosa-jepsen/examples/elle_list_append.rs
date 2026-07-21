@@ -92,6 +92,11 @@ async fn main() -> Result<()> {
     let history: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let next_val = Arc::new(AtomicU64::new(1));
     let failures = Arc::new(AtomicU64::new(0));
+    // Tally normalized BEGIN/UPDATE/COMMIT failure reasons so a run reports WHY
+    // ops went :fail/:info — the key to driving indeterminate commits down (the
+    // error text was previously only eprintln'd for the first 3 and lost).
+    let errors: Arc<Mutex<std::collections::BTreeMap<String, u64>>> =
+        Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     let mut handles = Vec::new();
     for w in 0..workers {
@@ -100,6 +105,7 @@ async fn main() -> Result<()> {
         let history = history.clone();
         let next_val = next_val.clone();
         let failures = failures.clone();
+        let errors = errors.clone();
         let contact = contact.clone();
         let target = target.clone();
         handles.push(tokio::spawn(async move {
@@ -147,6 +153,11 @@ async fn main() -> Result<()> {
                             if failures.load(Ordering::Relaxed) < 3 {
                                 eprintln!("APPEND {kind} on {why}");
                             }
+                            *errors
+                                .lock()
+                                .unwrap()
+                                .entry(normalize_err(kind, &why))
+                                .or_insert(0) += 1;
                             // Clear any half-open transaction on THIS connection so the
                             // next BEGIN doesn't hit "nested transactions". ROLLBACK is
                             // cheap and idempotent; only reconnect if it, too, fails.
@@ -211,6 +222,20 @@ async fn main() -> Result<()> {
         h.await.ok();
     }
 
+    // Report WHY ops failed, most frequent first — the harness diagnostic that
+    // tells us whether :info is a real cluster failure mode or a client artifact.
+    {
+        let errs = errors.lock().unwrap();
+        if !errs.is_empty() {
+            let mut v: Vec<(&String, &u64)> = errs.iter().collect();
+            v.sort_by(|a, b| b.1.cmp(a.1));
+            eprintln!("=== failure reasons (normalized, most frequent first) ===");
+            for (reason, count) in v {
+                eprintln!("  {count:>5}  {reason}");
+            }
+        }
+    }
+
     let hist = history.lock().unwrap();
     let mut edn = String::from("[\n");
     for e in hist.iter() {
@@ -256,6 +281,22 @@ async fn connect_pinned(contact: &str, target: &Arc<scylla::cluster::Node>) -> R
 
 fn log(history: &Arc<Mutex<Vec<Event>>>, e: Event) {
     history.lock().unwrap().push(e);
+}
+
+/// Collapse a failure to a stable category so similar errors tally together:
+/// the op kind plus the message with digit runs replaced by `#` (partition keys,
+/// timestamps, node ids vary per op but the failure class does not) and
+/// truncated. Only digits are replaced, so error words stay readable.
+fn normalize_err(kind: &str, why: &str) -> String {
+    let mut s: String = why
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    while s.contains("##") {
+        s = s.replace("##", "#");
+    }
+    s.truncate(110);
+    format!("{kind} {s}")
 }
 
 fn decode_int_list(col: Option<&Option<CqlValue>>) -> Vec<i64> {

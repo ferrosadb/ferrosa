@@ -150,7 +150,7 @@ sleep 20
 # 6. Run the Elle generator ON the seed (in-network → all peers reachable).
 log "run generator on seed: elle_list_append localhost:9042 /tmp/hist.edn $GEN_ARGS"
 flyctl ssh console --app "$APP" --machine "$SEED_ID" --command \
-  "sh -lc 'elle_list_append localhost:9042 /tmp/hist.edn ${GEN_ARGS}'" 2>&1 | tail -6 \
+  "sh -lc 'elle_list_append localhost:9042 /tmp/hist.edn ${GEN_ARGS}'" 2>&1 | tail -30 \
   || die "generator run failed"
 
 # 7. Retrieve the history EDN.
