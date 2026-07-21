@@ -435,13 +435,17 @@ impl StorageApplier for EngineStorageApplier {
             // Snapshot the idempotency set under the lock to decide what to skip.
             let already = self.applied.lock();
             for mutation in &mutations {
-                // Decode the self-describing commit-log mutation (one partition).
-                // Fail loud on garbage.
+                // Decode the self-describing commit-log mutation (one partition),
+                // rebinding any Accord `list` append cell's path from the
+                // coordinator-local wall clock to the agreed execution timestamp
+                // `mutation.t` (t_68f226b5) so concurrent appends serialize in the
+                // Accord order. Non-list cells are untouched. Fail loud on garbage.
                 let mut decoded =
-                    Mutation::deserialize_from(&mutation.data).map_err(|e| ApplyError {
-                        txn_id,
-                        reason: format!("failed to decode apply mutation: {e}"),
-                    })?;
+                    Mutation::deserialize_from_rebinding_list_paths(&mutation.data, mutation.t)
+                        .map_err(|e| ApplyError {
+                            txn_id,
+                            reason: format!("failed to decode apply mutation: {e}"),
+                        })?;
 
                 // Idempotency gate: an already-applied (txn,key,t) is a no-op.
                 // Checked AFTER decode so the partition key is available — this is
@@ -733,7 +737,10 @@ impl CdcPublishingApplier {
         {
             return None;
         }
-        Mutation::deserialize_from(&mutation.data)
+        // Rebind list paths to the agreed `t` so the CDC event mirrors the
+        // durably-applied rows (not the coordinator-clock paths), matching
+        // `EngineStorageApplier::apply_writeset`.
+        Mutation::deserialize_from_rebinding_list_paths(&mutation.data, mutation.t)
             .ok()
             .map(|m| ferrosa_cdc::CdcEvent {
                 stream: ferrosa_cdc::CdcStream::CommittedToCluster,
@@ -1476,6 +1483,85 @@ mod engine_applier_tests {
             "the row written by apply must be readable via the engine — \
              not a phantom write"
         );
+    }
+
+    /// Applying a mutation with an Accord `list` append cell (flagged 0x4000)
+    /// rebinds the cell's path to the agreed execution timestamp `t` — not the
+    /// coordinator wall clock baked in at materialize — while preserving the
+    /// element_seq. This is what makes concurrent list appends strict-
+    /// serializable (t_68f226b5): the persisted path orders by the Accord `t`,
+    /// so a read observes the Accord serialization order.
+    #[test]
+    fn apply_rebinds_flagged_list_cell_path_to_accord_ts() {
+        use ferrosa_common::accord_list_cell_path;
+        const REBIND_FLAG: u16 = 0x4000;
+
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let key = make_key("pk-list");
+        let element_seq = 2u16;
+        // Coordinator-clock list path: a huge wall-clock time, but it carries the
+        // element_seq the rebind must preserve.
+        let coord_path = accord_list_cell_path(&accord_ts(9_999_999), element_seq);
+        let row = Row {
+            clustering: vec![0x00, 0x00, 0x00, 0x01],
+            cells: vec![(
+                REBIND_FLAG, // storage column 0, flagged for rebind
+                CellValue::live(b"L".to_vec(), 9_999_999).with_path(coord_path.clone()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(9_999_999),
+        };
+        let m = Mutation::new(
+            KS.to_string(),
+            TABLE.to_string(),
+            key.clone(),
+            vec![row],
+            9_999_999,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+
+        // The agreed execution ts is tiny (777) — far below the wall clock stamped
+        // at materialize — so a rebound path proves the Accord ts drove it.
+        let agreed = accord_ts(777);
+        applier
+            .apply(
+                txn(1, 777),
+                ApplyMutation {
+                    data: buf,
+                    t: agreed,
+                    deps: vec![],
+                },
+            )
+            .expect("apply must decode, rebind, and persist");
+
+        let partition = engine
+            .read(&TableId::new(KS, TABLE), &key)
+            .unwrap()
+            .unwrap();
+        let (idx, cell) = partition.rows[0]
+            .cells
+            .iter()
+            .find(|(_, c)| c.path.is_some())
+            .expect("the persisted list cell must have a path");
+        assert_eq!(
+            *idx & 0xC000,
+            0,
+            "stored column index carries no transient flag"
+        );
+        assert_eq!(
+            cell.path.as_deref(),
+            Some(accord_list_cell_path(&agreed, element_seq).as_slice()),
+            "list cell path rebound to the Accord execution ts, element_seq preserved"
+        );
+        assert_ne!(
+            cell.path.as_deref(),
+            Some(coord_path.as_slice()),
+            "the coordinator wall-clock path must NOT survive"
+        );
+        assert_eq!(cell.timestamp, 777, "cell ts restamped to the agreed t");
     }
 
     // -----------------------------------------------------------------------

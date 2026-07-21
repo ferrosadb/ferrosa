@@ -51,7 +51,7 @@ pub use cache::LocalCache;
 pub use commitlog::cdc::CdcReader;
 pub use commitlog::{
     CommitLog, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, Mutation,
-    SyncStrategyConfig, TableId,
+    SyncStrategyConfig, TableId, CELL_REBIND_LIST_PATH_FLAG,
 };
 pub use compaction::{
     CompactionConfig, CompactionExecutor, CompactionStrategy, SizeTieredStrategy,
