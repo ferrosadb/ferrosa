@@ -1715,7 +1715,8 @@ fn build_transaction_write(
 }
 
 /// Intercept transaction control and transaction-scoped DML/SELECT for a CQL
-/// session, driving the connection-independent [`TransactionRegistry`]. Returns
+/// session, driving the connection-independent
+/// [`TransactionRegistry`](crate::txn_registry::TransactionRegistry). Returns
 /// `Some(result)` when the statement is a transaction operation; `None` when it
 /// should be routed normally.
 ///
