@@ -39,7 +39,16 @@ RUN for d in ferrosa ferrosa-common ferrosa-sstable ferrosa-storage ferrosa-sche
     echo 'fn main() {}' > ferrosa-worker/src/main.rs
 
 ENV CARGO_BUILD_JOBS=4
-ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1"
+# Fast-but-optimized build for the ephemeral cert cluster: opt-level=1 keeps
+# Accord/raft timing healthy (unlike a debug build) while compiling far faster
+# than opt-level 3; high codegen-units + no debuginfo cut compile time further so
+# the whole cert run fits inside the background-job window (the fly remote builder
+# does not persist cache between runs, so every build is cold).
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=1
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256
+ENV CARGO_PROFILE_RELEASE_DEBUG=false
+ENV CARGO_PROFILE_RELEASE_LTO=false
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
 RUN cargo build --release -p ferrosa 2>&1 || true
 
 COPY . .
