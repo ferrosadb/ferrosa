@@ -81,9 +81,38 @@ pub struct ConflictIndex {
     /// Indexed column projections for transactional 2i.
     indexed_writes: HashMap<String, HashMap<Vec<u8>, Vec<TxnId>>>,
 
+    /// Per-key high-water-mark of the highest committed **execution** timestamp
+    /// ever seen for a key — retained across [`gc_applied`](Self::gc_applied),
+    /// unlike the in-flight [`single_key`] entries. Without it, once a committed
+    /// append is applied and GC'd, a later append on the same key sees no
+    /// conflict and mints a timestamp below the GC'd one — the GC-boundary
+    /// real-time inversion (t_813caf39). Bounded by `max_entries`; when full,
+    /// new keys are skipped (they fall back to the entry-based conflict path,
+    /// still correct while they have live entries).
+    single_key_hwm: HashMap<Vec<u8>, Timestamp>,
+
     /// Hard cap on total entries.
     max_entries: usize,
     current_entries: usize,
+}
+
+/// Raise a key's execution-timestamp high-water-mark to `t` (monotonic). A new
+/// key is tracked only while under `cap`; a skipped new key degrades gracefully
+/// to the entry-based conflict path (correct while it has live entries), keeping
+/// the HWM map bounded.
+fn raise_hwm(hwm: &mut HashMap<Vec<u8>, Timestamp>, key: &[u8], t: Timestamp, cap: usize) {
+    match hwm.get_mut(key) {
+        Some(existing) => {
+            if t > *existing {
+                *existing = t;
+            }
+        }
+        None => {
+            if hwm.len() < cap {
+                hwm.insert(key.to_vec(), t);
+            }
+        }
+    }
 }
 
 impl ConflictIndex {
@@ -98,6 +127,7 @@ impl ConflictIndex {
             single_key: HashMap::new(),
             range_ops: BTreeMap::new(),
             indexed_writes: HashMap::new(),
+            single_key_hwm: HashMap::new(),
             max_entries,
             current_entries: 0,
         }
@@ -159,22 +189,41 @@ impl ConflictIndex {
     /// a later txn assigned an execution `t` below it — a real-time inversion that
     /// reorders accumulating list elements (t_813caf39).
     pub fn max_conflicting_timestamp(&self, key: &[u8]) -> Option<Timestamp> {
-        self.single_key
+        let live = self
+            .single_key
             .get(key)
-            .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max())
+            .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
+        // Fold in the per-key high-water-mark, which survives GC of the live
+        // entries — so a later append still bumps past an already-applied one.
+        let hwm = self.single_key_hwm.get(key).copied();
+        match (live, hwm) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Record a transaction's agreed execution timestamp on every entry it owns,
     /// so subsequent [`max_conflicting_timestamp`](Self::max_conflicting_timestamp)
     /// lookups bump past its real serialization point rather than its stale `t0`.
-    /// Called when the timestamp is finalized (Accept / Commit). No-op if the txn
-    /// is not indexed (e.g. already GC'd).
+    /// Called when the timestamp is finalized (Accept / Commit).
+    ///
+    /// Also raises the per-key execution-timestamp **high-water-mark** for every
+    /// key the transaction touches, so the bump survives [`gc_applied`] once the
+    /// transaction is applied and its live entry is removed. No-op on the live
+    /// entries if the txn is already GC'd, but the HWM is still raised.
+    ///
+    /// [`gc_applied`]: Self::gc_applied
     pub fn set_commit_ts(&mut self, txn_id: &TxnId, t: Timestamp) {
-        for writes in self.single_key.values_mut() {
+        for (key, writes) in self.single_key.iter_mut() {
+            let mut touches_key = false;
             for entry in writes.iter_mut() {
                 if entry.txn_id == *txn_id {
                     entry.accord_ts = Some(t);
+                    touches_key = true;
                 }
+            }
+            if touches_key {
+                raise_hwm(&mut self.single_key_hwm, key, t, self.max_entries);
             }
         }
     }
@@ -466,6 +515,42 @@ mod tests {
             "a committed txn's execution timestamp (accord_ts) — not its stale t0 — \
              must be its conflict timestamp, so a later PreAccept bumps past it"
         );
+    }
+
+    /// The GC-boundary edge of the list-append inversion (t_813caf39): a
+    /// committed append's execution timestamp must survive `gc_applied` as a
+    /// per-key high-water-mark, so a LATER append on the same key still bumps past
+    /// it even though the earlier append's live entry is gone. Without the HWM,
+    /// `max_conflicting_timestamp` returns `None` after GC and the later append
+    /// mints a lower timestamp → it sorts before the earlier one (mid-list).
+    #[test]
+    fn max_conflicting_timestamp_survives_gc_via_per_key_hwm() {
+        let mut idx = ConflictIndex::new(100);
+        let key = b"k";
+        let id = txn(500);
+        idx.register(
+            key,
+            InFlightWrite {
+                txn_id: id,
+                t0: ts(500),
+                accord_ts: Some(ts(1000)),
+                status: TxnStatus::Committed,
+            },
+        )
+        .unwrap();
+        idx.set_commit_ts(&id, ts(1000)); // records the per-key HWM
+
+        // The txn applies and is GC'd — its live entry is removed.
+        idx.mark_applied(&id);
+        idx.gc_applied();
+        assert_eq!(
+            idx.max_conflicting_timestamp(key),
+            None.or(Some(ts(1000))),
+            "the committed execution timestamp must survive gc_applied as a per-key HWM"
+        );
+
+        // A different key is unaffected (no false HWM bleed across keys).
+        assert_eq!(idx.max_conflicting_timestamp(b"other"), None);
     }
 
     // -----------------------------------------------------------------------
