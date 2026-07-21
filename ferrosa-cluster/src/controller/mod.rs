@@ -264,6 +264,13 @@ pub struct ModeController {
     /// is never in its own peer map). Read by `SessionCore` via
     /// [`Self::accord_state_slot`].
     pub(super) accord_state_slot: crate::accord::AccordStateSlot,
+    /// The node's shared hybrid logical clock — the same `Arc` the CQL layer's
+    /// transaction committer mints `t0` from. Set once at startup via
+    /// [`Self::set_accord_clock`] and handed to the node's `AccordStateMachine`
+    /// at formation so the replica advances it past every execution timestamp it
+    /// witnesses (write-side monotonicity for strict-serializable list appends,
+    /// t_813caf39). Empty until set.
+    pub(super) accord_clock: std::sync::OnceLock<Arc<ferrosa_common::accord::HybridLogicalClock>>,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -353,6 +360,7 @@ impl ModeController {
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
+            accord_clock: std::sync::OnceLock::new(),
         });
 
         let handles = ModeControllerHandles {
@@ -371,6 +379,20 @@ impl ModeController {
     /// empty slot, and the committer then uses remote-only votes).
     pub fn accord_state_slot(&self) -> crate::accord::AccordStateSlot {
         self.accord_state_slot.clone()
+    }
+
+    /// Register the node's shared [`HybridLogicalClock`](ferrosa_common::accord::HybridLogicalClock)
+    /// — the same `Arc` the CQL transaction committer mints `t0` from — so the
+    /// state machine built at formation advances it past every witnessed
+    /// execution timestamp (t_813caf39). Called once at startup, before
+    /// formation. Idempotent: a second set is ignored (the clock is process-wide).
+    pub fn set_accord_clock(&self, clock: Arc<ferrosa_common::accord::HybridLogicalClock>) {
+        let _ = self.accord_clock.set(clock);
+    }
+
+    /// The node's shared HLC, if registered ([`Self::set_accord_clock`]).
+    pub(super) fn accord_clock(&self) -> Option<Arc<ferrosa_common::accord::HybridLogicalClock>> {
+        self.accord_clock.get().cloned()
     }
 
     /// Register a (re)connecting peer's `host_id` in the raft network factory's
@@ -450,6 +472,7 @@ impl ModeController {
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
+            accord_clock: std::sync::OnceLock::new(),
         })
     }
 
@@ -512,6 +535,7 @@ impl ModeController {
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
+            accord_clock: std::sync::OnceLock::new(),
         })
     }
 

@@ -1205,6 +1205,7 @@ impl ModeController {
                 uuid_to_node_id(self.local_host_id),
                 sync_writer,
                 self.storage.clone(),
+                self.accord_clock(),
             )));
             // Publish into the shared slot so the session layer's transaction
             // committer votes the coordinator's own PreAccept against THIS exact

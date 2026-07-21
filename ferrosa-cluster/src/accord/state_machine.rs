@@ -28,7 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ferrosa_common::accord::{
-    AcceptedBallot, BallotNumber, PromisedBallot, Timestamp, TxnId, TxnPhase, TxnState,
+    AcceptedBallot, BallotNumber, HybridLogicalClock, PromisedBallot, Timestamp, TxnId, TxnPhase,
+    TxnState,
 };
 use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
 use ferrosa_storage::accord::sync_writer::SyncWriter;
@@ -115,6 +116,16 @@ pub struct AccordStateMachine {
     /// always re-checks the unapplied-conflict condition under the lock after a
     /// wake — a spurious or coalesced wake just costs one extra re-check.
     applied_notify: Arc<Notify>,
+    /// The node's shared hybrid logical clock (the same `Arc` the transaction
+    /// committer mints `t0` from). When set, every timestamp this replica
+    /// observes through consensus — a PreAccept's proposed/bumped `t`, a
+    /// committed execution `t` — is fed to [`HybridLogicalClock::witness`], so
+    /// this node's clock tracks the global-max execution timestamp. That keeps a
+    /// later transaction's `t0` above every already-committed conflict even after
+    /// the conflict has been GC'd from the [`ConflictIndex`] — the write-side
+    /// monotonicity that makes concurrent list appends strict-serializable
+    /// (t_813caf39). `None` in protocol-only tests that mint no timestamps.
+    clock: Option<Arc<HybridLogicalClock>>,
 }
 
 impl AccordStateMachine {
@@ -135,6 +146,7 @@ impl AccordStateMachine {
             apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            clock: None,
         }
     }
 
@@ -157,6 +169,7 @@ impl AccordStateMachine {
             apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            clock: None,
         }
     }
 
@@ -181,6 +194,7 @@ impl AccordStateMachine {
             apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            clock: None,
         }
     }
 
@@ -208,6 +222,25 @@ impl AccordStateMachine {
             apply_engine: Arc::new(DepWaitApplier::new(applier)),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
+            clock: None,
+        }
+    }
+
+    /// Wire the node's shared [`HybridLogicalClock`] — the same `Arc` the
+    /// transaction committer mints `t0` from — so this replica advances that
+    /// clock past every execution timestamp it witnesses through consensus (see
+    /// the [`clock`](Self::clock) field). Builder; returns `self`.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<HybridLogicalClock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Feed a witnessed execution timestamp to the node's shared clock, if wired,
+    /// so a subsequently minted `t0` is `>= t`. No-op when no clock is wired.
+    fn witness_timestamp(&self, t: Timestamp) {
+        if let Some(clock) = &self.clock {
+            clock.witness(t);
         }
     }
 
@@ -406,6 +439,11 @@ impl AccordStateMachine {
             _ => t0,
         };
 
+        // Witness the proposed execution timestamp into the node's shared clock so
+        // a later `t0` minted here is `>= t` (t_813caf39). `t >= t0`, so this also
+        // covers the remote coordinator's proposed `t0`.
+        self.witness_timestamp(t);
+
         // Register the txn under EVERY key it writes, so a later conflicting
         // txn on any of them sees it as a dependency.
         for key in keys {
@@ -507,8 +545,10 @@ impl AccordStateMachine {
         state.accept(AcceptedBallot(ballot), t, deps_set);
 
         // The slow path may move the execution timestamp; keep the conflict index
-        // in sync so a later PreAccept bumps past the accepted `t` (t_813caf39).
+        // in sync so a later PreAccept bumps past the accepted `t` (t_813caf39),
+        // and advance the node's shared clock past it too.
         self.conflict_index.set_commit_ts(&txn_id, t);
+        self.witness_timestamp(t);
 
         // Persist before reply.
         let data = format!("Accepted:{}:{}:{}", txn_id.0.time, t.time, ballot.0);
@@ -582,6 +622,13 @@ impl AccordStateMachine {
         // committed append whose `t` was bumped high is under-counted and a later
         // append lands before it — a list-order real-time inversion.
         self.conflict_index.set_commit_ts(&txn_id, t);
+
+        // Advance the node's shared clock past this execution timestamp so the
+        // next `t0` this node mints is `> t` — which keeps a later append after
+        // this one even once this txn is applied and GC'd from the conflict index
+        // (the index-only bump above cannot survive GC). This is the write-side
+        // monotonicity that makes concurrent list appends strict-serializable.
+        self.witness_timestamp(t);
 
         // Wake dep waiters.
         self.last_notified.clear();
@@ -925,6 +972,7 @@ pub fn build_accord_state_machine(
     node_id: u64,
     sync_writer: Arc<dyn SyncWriter>,
     storage: Arc<ferrosa_storage::engine::StorageEngine>,
+    clock: Option<Arc<HybridLogicalClock>>,
 ) -> AccordStateMachine {
     let engine_applier = Arc::new(crate::accord::apply::EngineStorageApplier::new(
         storage.clone(),
@@ -940,7 +988,13 @@ pub fn build_accord_state_machine(
         None => engine_applier,
     };
     let reader = Arc::new(crate::accord::apply::EngineStorageReader::new(storage));
-    AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader)
+    let sm = AccordStateMachine::with_applier_and_reader(node_id, sync_writer, applier, reader);
+    // Share the node's HLC so the replica advances it past every witnessed
+    // execution timestamp (t_813caf39). `None` in setups with no shared clock.
+    match clock {
+        Some(c) => sm.with_clock(c),
+        None => sm,
+    }
 }
 
 // Helper extension for TxnPhase to expose rank for comparison.
@@ -1090,6 +1144,41 @@ mod tests {
             b_t > a_t,
             "a later append B must be ordered AFTER committed A (b_t={b_t:?} > a_t={a_t:?}); \
              a b_t below a_t reorders the list element ahead of A (t_813caf39)"
+        );
+    }
+
+    /// A node's shared HLC must advance past every execution timestamp it
+    /// commits, so a LATER append's `t0` is `>` earlier-committed appends' `t` —
+    /// even after the earlier conflict is GC'd from the index. Without this a
+    /// later append mints a low `t0` and lands mid-list: the write-side
+    /// strict-serializability failure the fly cert exposed (t_813caf39).
+    #[test]
+    fn commit_witnesses_execution_ts_into_shared_clock() {
+        use ferrosa_common::accord::HybridLogicalClock;
+        let clock = Arc::new(HybridLogicalClock::new(1, 0));
+        let (sm, _w) = make_sm(1);
+        let mut sm = sm.with_clock(clock.clone());
+
+        // An execution t 100 ms ahead of the node's wall clock (well within the
+        // 500 ms drift guard) — as a conflict bump against a faster peer would
+        // produce. The margin is wide enough that plain wall-clock advancement
+        // during handle_commit cannot cross it, so the assertion is only met if
+        // the clock actually *witnesses* the committed timestamp.
+        let now0 = clock.now();
+        let high = Timestamp {
+            epoch: 0,
+            time: now0.time + 100_000_000,
+            seq: 0,
+            node: 2,
+        };
+        let id = TxnId::new(2, high);
+        sm.handle_commit(id, high, high, vec![]);
+
+        let next = clock.now();
+        assert!(
+            next > high,
+            "committing execution t={high:?} must advance the node's shared clock so the next \
+             minted t0 ({next:?}) is > it — else a later append lands mid-list (t_813caf39)"
         );
     }
 
@@ -2533,7 +2622,7 @@ mod production_wiring_tests {
 
         // Build EXACTLY as the controller does: the production factory.
         let writer = Arc::new(MockSyncWriter::new());
-        let mut sm = build_accord_state_machine(7, writer, engine.clone());
+        let mut sm = build_accord_state_machine(7, writer, engine.clone(), None);
 
         let key = make_key("pk-prod");
         let txn_id = txn(1, 1000);
@@ -2570,7 +2659,7 @@ mod production_wiring_tests {
     fn production_apply_failure_does_not_fake_applied() {
         let (engine, _dir) = make_engine();
         let writer = Arc::new(MockSyncWriter::new());
-        let mut sm = build_accord_state_machine(7, writer, engine.clone());
+        let mut sm = build_accord_state_machine(7, writer, engine.clone(), None);
 
         let key = make_key("pk-missing-table");
         let txn_id = txn(2, 2000);
