@@ -128,6 +128,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         event_sender: tokio::sync::broadcast::channel(64).0,
         last_schema_event: tokio::sync::watch::channel(None).0,
         topology_policy: ClientTopologyPolicy::default(),
+        txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
     });
     (state, dir)

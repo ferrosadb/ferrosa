@@ -332,7 +332,7 @@ pub(crate) async fn handle_connection<S>(
     // Per-connection BEGIN/COMMIT transaction buffer (shared across this
     // connection's concurrent in-flight requests; transactions are serialized).
     let conn_txn = std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::session::CqlTransaction::new(),
+        None::<crate::txn_registry::CqlTxnId>,
     ));
     let mut pending_compression: Option<Compression> = None;
     let mut client_protocol_version: u8 = 4; // default; updated from STARTUP frame
@@ -1145,7 +1145,7 @@ async fn handle_frame(
     pending_compression: &mut Option<Compression>,
     peer: SocketAddr,
     task_pool: TaskPool,
-    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
+    conn_txn: &tokio::sync::Mutex<Option<crate::txn_registry::CqlTxnId>>,
 ) -> HandleResult {
     match phase {
         ConnectionPhase::AwaitingStartup => match frame.header.opcode {
@@ -1506,7 +1506,7 @@ async fn handle_query(
     body: &Bytes,
     peer: SocketAddr,
     protocol_version: u8,
-    conn_txn: &tokio::sync::Mutex<crate::session::CqlTransaction>,
+    conn_txn: &tokio::sync::Mutex<Option<crate::txn_registry::CqlTxnId>>,
 ) -> HandleResult {
     // Parse the query string: [int length][bytes query][short consistency][byte flags]...
     if body.len() < 4 {
@@ -1597,8 +1597,9 @@ async fn handle_query(
     // check/commit (transactions on a connection are inherently serial), then
     // released before normal routing; `None` falls through.
     let txn_result = {
-        let mut txn = conn_txn.lock().await;
-        crate::router::route_transactional(state, &ctx, &stmt, &mut txn).await
+        let mut shim = conn_txn.lock().await;
+        crate::router::route_transactional(state, &ctx, &stmt, &mut shim, std::time::Instant::now())
+            .await
     };
     if let Some(result) = txn_result {
         return match result {
@@ -3382,6 +3383,9 @@ mod tests {
                 last_schema_event: tokio::sync::watch::channel(None).0,
                 cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
                 topology_policy: crate::topology::ClientTopologyPolicy::default(),
+                txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::txn_registry::TransactionRegistry::default(),
+                )),
             },
             dir,
         )
