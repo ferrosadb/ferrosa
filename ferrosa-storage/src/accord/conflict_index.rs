@@ -148,12 +148,35 @@ impl ConflictIndex {
             .push(txn_id);
     }
 
-    /// Returns the maximum `t0` of all conflicting in-flight transactions
-    /// for a single key. O(1) lookup.
+    /// Returns the maximum **effective** timestamp of all conflicting
+    /// transactions for a single key — each entry's agreed execution timestamp
+    /// (`accord_ts`) once known, else its proposed `t0`. O(1) lookup.
+    ///
+    /// PreAccept bumps a new transaction past this value, so it MUST be the
+    /// conflicting txns' serialization point (their execution `t`), not their
+    /// proposed `t0`: a committed txn whose `t` was bumped far past its `t0`
+    /// (past an earlier, now-GC'd conflict) would otherwise be under-counted, and
+    /// a later txn assigned an execution `t` below it — a real-time inversion that
+    /// reorders accumulating list elements (t_813caf39).
     pub fn max_conflicting_timestamp(&self, key: &[u8]) -> Option<Timestamp> {
         self.single_key
             .get(key)
-            .and_then(|writes| writes.iter().map(|w| w.t0).max())
+            .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max())
+    }
+
+    /// Record a transaction's agreed execution timestamp on every entry it owns,
+    /// so subsequent [`max_conflicting_timestamp`](Self::max_conflicting_timestamp)
+    /// lookups bump past its real serialization point rather than its stale `t0`.
+    /// Called when the timestamp is finalized (Accept / Commit). No-op if the txn
+    /// is not indexed (e.g. already GC'd).
+    pub fn set_commit_ts(&mut self, txn_id: &TxnId, t: Timestamp) {
+        for writes in self.single_key.values_mut() {
+            for entry in writes.iter_mut() {
+                if entry.txn_id == *txn_id {
+                    entry.accord_ts = Some(t);
+                }
+            }
+        }
     }
 
     /// Returns the maximum `t0` of conflicting range operations that
@@ -410,6 +433,39 @@ mod tests {
         // Register T2 with higher t0 (t0 = 20).
         idx.register(key, write_entry(20)).unwrap();
         assert_eq!(idx.max_conflicting_timestamp(key), Some(ts(20)));
+    }
+
+    /// Root cause of the Accord list-append real-time inversion (t_813caf39): a
+    /// committed transaction's serialization point is its EXECUTION timestamp
+    /// (`accord_ts`), not its proposed `t0`. `max_conflicting_timestamp` — used by
+    /// PreAccept to bump a new txn past existing conflicts — must reflect the
+    /// execution timestamp. Otherwise a txn A that bumped its execution `t` far
+    /// past its `t0` (past an earlier, now-GC'd conflict) is under-counted, and a
+    /// later txn B is assigned an execution `t` BELOW A — a real-time inversion
+    /// (and, for accumulating lists, an out-of-order element).
+    #[test]
+    fn max_conflicting_timestamp_reflects_committed_execution_ts_not_t0() {
+        let mut idx = ConflictIndex::new(100);
+        let key = b"k";
+        // Txn A: proposed t0 = 500, but its AGREED execution t = 1000 (it bumped
+        // past an earlier, higher-t0 conflict that has since applied + been GC'd).
+        idx.register(
+            key,
+            InFlightWrite {
+                txn_id: txn(500),
+                t0: ts(500),
+                accord_ts: Some(ts(1000)),
+                status: TxnStatus::Committed,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            idx.max_conflicting_timestamp(key),
+            Some(ts(1000)),
+            "a committed txn's execution timestamp (accord_ts) — not its stale t0 — \
+             must be its conflict timestamp, so a later PreAccept bumps past it"
+        );
     }
 
     // -----------------------------------------------------------------------

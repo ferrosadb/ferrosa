@@ -412,7 +412,11 @@ impl AccordStateMachine {
             let entry = InFlightWrite {
                 txn_id,
                 t0,
-                accord_ts: None,
+                // Record the bumped PROPOSED execution timestamp as this txn's
+                // effective serialization point, so a concurrent PreAccept bumps
+                // past `t` (not the stale `t0`). Finalized at Accept/Commit
+                // (t_813caf39). `t == t0` when there was no conflict to bump past.
+                accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
             // Don't fail the protocol message on capacity errors, but log them.
@@ -502,6 +506,10 @@ impl AccordStateMachine {
         let deps_set: HashSet<TxnId> = deps.iter().copied().collect();
         state.accept(AcceptedBallot(ballot), t, deps_set);
 
+        // The slow path may move the execution timestamp; keep the conflict index
+        // in sync so a later PreAccept bumps past the accepted `t` (t_813caf39).
+        self.conflict_index.set_commit_ts(&txn_id, t);
+
         // Persist before reply.
         let data = format!("Accepted:{}:{}:{}", txn_id.0.time, t.time, ballot.0);
         let result = self.sync_writer.write_and_sync(data.as_bytes());
@@ -567,6 +575,13 @@ impl AccordStateMachine {
             state.commit(t, deps_set);
         }
         self.committed_txns.insert(txn_id);
+
+        // Lock the committed execution timestamp into the conflict index so a
+        // later PreAccept on this key bumps past this txn's real serialization
+        // point, not its stale proposed `t0` (t_813caf39). Without this a
+        // committed append whose `t` was bumped high is under-counted and a later
+        // append lands before it — a list-order real-time inversion.
+        self.conflict_index.set_commit_ts(&txn_id, t);
 
         // Wake dep waiters.
         self.last_notified.clear();
@@ -1028,6 +1043,54 @@ mod tests {
 
         let state = sm.get_state(&txn_id).expect("state must exist");
         assert_eq!(state.phase, TxnPhase::PreAccepted);
+    }
+
+    /// Protocol-level regression for the Accord list-append real-time inversion
+    /// (t_813caf39): a committed txn A whose execution `t` was bumped high (past
+    /// an earlier conflict that has since applied + been GC'd) must still order a
+    /// LATER PreAccept B after it — B's execution `t` must exceed A's. Before the
+    /// fix the conflict index tracked only A's proposed `t0`, so B (with a `t0`
+    /// above A's `t0` but below A's execution `t`) was NOT bumped and landed
+    /// before A — reordering the list element ahead of A.
+    #[test]
+    fn preaccept_bumps_past_committed_conflicts_execution_ts_not_t0() {
+        let (mut sm, _w) = make_sm(1);
+        let key = b"k";
+
+        // C: an early high-t0 conflict on the key.
+        let c = txn(9, 1000);
+        sm.handle_preaccept(c, ts(1000), key, BallotNumber(0), 0);
+
+        // A: a lagging coordinator proposes t0 = 500, but A bumps its execution t
+        // past C. Commit A at that execution t.
+        let a = txn(2, 500);
+        let a_t = match sm.handle_preaccept(a, ts(500), key, BallotNumber(0), 0) {
+            SmResponse::PreAcceptOK { t, .. } => t,
+            other => panic!("expected PreAcceptOK, got {other:?}"),
+        };
+        assert!(
+            a_t > ts(500),
+            "A must bump its execution t past the C conflict"
+        );
+        sm.handle_commit(a, ts(500), a_t, vec![]);
+
+        // C applies and is GC'd, leaving only A on the key — registered with the
+        // stale proposed t0=500 but a HIGH execution t.
+        sm.conflict_index.mark_applied(&c);
+        sm.conflict_index.gc_applied();
+
+        // B: a later append, proposed t0 = 600 (above A's t0 but below A's exec t).
+        let b = txn(3, 600);
+        let b_t = match sm.handle_preaccept(b, ts(600), key, BallotNumber(0), 0) {
+            SmResponse::PreAcceptOK { t, .. } => t,
+            other => panic!("expected PreAcceptOK, got {other:?}"),
+        };
+
+        assert!(
+            b_t > a_t,
+            "a later append B must be ordered AFTER committed A (b_t={b_t:?} > a_t={a_t:?}); \
+             a b_t below a_t reorders the list element ahead of A (t_813caf39)"
+        );
     }
 
     /// Accept after PreAccept moves to Accepted.
