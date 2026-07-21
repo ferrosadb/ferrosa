@@ -195,9 +195,15 @@ const DEFAULT_MAX_DRIFT_NS: u64 = 500_000_000;
 /// A hybrid logical clock (HLC) that produces monotonic [`Timestamp`]s.
 ///
 /// Combines wall-clock time (nanoseconds) with a logical sequence counter
-/// so that timestamps never regress, even under wall-clock jitter. The
-/// `merge` method advances the local clock past a remote timestamp while
-/// rejecting excessive drift.
+/// so that timestamps never regress, even under wall-clock jitter.
+///
+/// Cross-node monotonicity flows through one seam: [`witness`](Self::witness)
+/// ingests a timestamp observed from another node (a proposal, an agreed or
+/// committed `t`) and returns a fresh local stamp advanced past it. It is built
+/// on the lower-level [`merge`](Self::merge) primitive (advance-past-remote,
+/// drift-rejecting). New Accord code should call `witness`, not `now`, wherever a
+/// remote timestamp has just been observed — so the invariant is honored by
+/// construction rather than by convention.
 ///
 /// All operations are lock-free via [`AtomicU64`] / [`AtomicU32`].
 pub struct HybridLogicalClock {
@@ -323,6 +329,26 @@ impl HybridLogicalClock {
                 return Ok(());
             }
         }
+    }
+
+    /// Ingest a timestamp `remote` observed from another node, then mint a fresh
+    /// monotonic timestamp. This is the single seam through which the Accord path
+    /// should consume any timestamp it did not itself mint (a PreAccept proposal,
+    /// an agreed execution `t`, a committed `t`): it advances the local clock past
+    /// `remote` — so a subsequently minted [`now`](Self::now) is `>= remote` —
+    /// then returns that fresh stamp.
+    ///
+    /// Encapsulates the cross-node monotonicity invariant that [`merge`](Self::merge)
+    /// only *offers* (nothing on the Accord path calls `merge` directly). If
+    /// `remote` is beyond `max_drift_ns` ahead of the wall clock the advance is
+    /// skipped (the drift guard), but a fresh local stamp is still returned — so a
+    /// caller always gets a usable, locally-monotonic timestamp.
+    pub fn witness(&self, remote: Timestamp) -> Timestamp {
+        // Advance past the witnessed timestamp where the drift guard permits; a
+        // rejected (too-far-ahead) remote leaves the local clock untouched, same
+        // as `merge`. Either way `now()` then yields a fresh monotonic stamp.
+        let _ = self.merge(remote);
+        self.now()
     }
 }
 
@@ -872,6 +898,55 @@ mod tests {
             after.time <= before.time + max_drift * 10,
             "HLC must not have jumped to remote time: after={:?}",
             after,
+        );
+    }
+
+    /// `witness` is the single ingestion seam: it advances the clock past an
+    /// observed (drift-permitting) timestamp AND hands back a fresh, locally
+    /// monotonic stamp reflecting that floor.
+    #[test]
+    fn hlc_witness_advances_past_remote_and_stays_monotonic() {
+        let hlc = HybridLogicalClock::new(1, DEFAULT_MAX_DRIFT_NS);
+        let base = hlc.now();
+        let remote = Timestamp {
+            epoch: 0,
+            time: HybridLogicalClock::wall_clock_ns() + 1_000, // 1 us ahead — within drift
+            seq: 5,
+            node: 2,
+        };
+        let stamped = hlc.witness(remote);
+        assert!(
+            stamped.time >= remote.time,
+            "witness advances the clock past the observed time: stamped={stamped:?}, remote={remote:?}"
+        );
+        assert!(stamped >= base, "witness returns a locally-monotonic stamp");
+        assert!(
+            hlc.now() >= stamped,
+            "a later now() stays past the witnessed floor"
+        );
+    }
+
+    /// A drift-rejected witness must NOT adopt the absurd remote time, yet must
+    /// still return a usable, locally-monotonic stamp (never error/panic).
+    #[test]
+    fn hlc_witness_beyond_drift_still_returns_local_stamp() {
+        let max_drift = 1_000_000u64; // 1 ms
+        let hlc = HybridLogicalClock::new(1, max_drift);
+        let before = hlc.now();
+        let remote = Timestamp {
+            epoch: 0,
+            time: HybridLogicalClock::wall_clock_ns() + max_drift * 1_000, // way beyond drift
+            seq: 0,
+            node: 9,
+        };
+        let stamped = hlc.witness(remote);
+        assert!(
+            stamped >= before,
+            "a drift-rejected witness still yields a monotonic local stamp"
+        );
+        assert!(
+            stamped.time < remote.time,
+            "the absurd remote time must NOT be adopted (drift guard held): stamped={stamped:?}"
         );
     }
 
