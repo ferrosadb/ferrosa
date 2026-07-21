@@ -551,6 +551,9 @@ mod tests {
             last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(crate::observability::CqlMetrics::new()),
             topology_policy: crate::topology::ClientTopologyPolicy::default(),
+            txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::txn_registry::TransactionRegistry::default(),
+            )),
         };
 
         (Arc::new(state), dir)

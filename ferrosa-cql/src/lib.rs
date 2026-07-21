@@ -43,6 +43,7 @@ pub mod test_util;
 pub mod topology;
 pub mod transaction_keys;
 pub mod transaction_limits;
+pub mod txn_registry;
 pub mod types;
 pub mod virtual_tables;
 pub mod wasm_aggregate;

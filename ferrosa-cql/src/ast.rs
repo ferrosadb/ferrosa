@@ -147,12 +147,30 @@ pub enum Statement {
         stream_id: Option<u16>,
     },
     Explain(Box<SelectStatement>),
-    /// BEGIN TRANSACTION — starts a multi-statement Accord transaction.
-    BeginTransaction,
-    /// COMMIT — commits the current Accord transaction.
-    Commit,
-    /// ROLLBACK — aborts the current Accord transaction.
-    Rollback,
+    /// `BEGIN TRANSACTION [USING TIMEOUT <ms>]` — starts a multi-statement Accord
+    /// transaction and returns its server-minted id as a single result row.
+    /// `timeout_ms` overrides the cluster-default open-transaction timeout (A1b),
+    /// bounded by the hard cluster maximum.
+    BeginTransaction {
+        timeout_ms: Option<u64>,
+    },
+    /// `COMMIT [TRANSACTION [<id>]]` — commits a transaction. `txn_id = Some(id)`
+    /// targets a connection-independent transaction by id; `None` resolves via the
+    /// connection's compat-shim binding (bare `COMMIT`).
+    Commit {
+        txn_id: Option<String>,
+    },
+    /// `ROLLBACK [TRANSACTION [<id>]]` — aborts a transaction (explicit id or shim).
+    Rollback {
+        txn_id: Option<String>,
+    },
+    /// `<inner> IN TRANSACTION <id>` — a DML/SELECT explicitly scoped to a
+    /// transaction by id (connection-independent). The router stages the write, or
+    /// scopes the read, under `txn_id` in the transaction registry.
+    InTransaction {
+        txn_id: String,
+        inner: Box<Statement>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
