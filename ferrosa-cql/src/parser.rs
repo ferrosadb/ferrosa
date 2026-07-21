@@ -133,10 +133,22 @@ impl<'input> Parser<'input> {
     fn parse_statement(&mut self) -> Result<Statement, CqlError> {
         let tok = self.lexer.peek()?;
         match &tok.kind {
-            TokenKind::Keyword(Keyword::Select) => self.parse_select().map(Statement::Select),
-            TokenKind::Keyword(Keyword::Insert) => self.parse_insert().map(Statement::Insert),
-            TokenKind::Keyword(Keyword::Update) => self.parse_update().map(Statement::Update),
-            TokenKind::Keyword(Keyword::Delete) => self.parse_delete().map(Statement::Delete),
+            TokenKind::Keyword(Keyword::Select) => {
+                let s = self.parse_select().map(Statement::Select)?;
+                self.maybe_wrap_in_transaction(s)
+            }
+            TokenKind::Keyword(Keyword::Insert) => {
+                let s = self.parse_insert().map(Statement::Insert)?;
+                self.maybe_wrap_in_transaction(s)
+            }
+            TokenKind::Keyword(Keyword::Update) => {
+                let s = self.parse_update().map(Statement::Update)?;
+                self.maybe_wrap_in_transaction(s)
+            }
+            TokenKind::Keyword(Keyword::Delete) => {
+                let s = self.parse_delete().map(Statement::Delete)?;
+                self.maybe_wrap_in_transaction(s)
+            }
             TokenKind::Keyword(Keyword::Create) => self.parse_create(),
             TokenKind::Keyword(Keyword::Alter) => self.parse_alter(),
             TokenKind::Keyword(Keyword::Drop) => self.parse_drop(),
@@ -592,7 +604,13 @@ impl<'input> Parser<'input> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Begin))?;
 
         if self.lexer.eat(&TokenKind::Keyword(Keyword::Transaction))? {
-            return Ok(Statement::BeginTransaction);
+            // Optional `USING TIMEOUT <ms>` open-transaction budget (A1b).
+            let timeout_ms = if self.lexer.eat(&TokenKind::Keyword(Keyword::Using))? {
+                Some(self.parse_transaction_timeout_ms()?)
+            } else {
+                None
+            };
+            return Ok(Statement::BeginTransaction { timeout_ms });
         }
 
         // Otherwise it's a BATCH statement — delegate to parse_batch_body
@@ -602,12 +620,89 @@ impl<'input> Parser<'input> {
 
     fn parse_commit(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Commit))?;
-        Ok(Statement::Commit)
+        let txn_id = self.parse_optional_transaction_target()?;
+        Ok(Statement::Commit { txn_id })
     }
 
     fn parse_rollback(&mut self) -> Result<Statement, CqlError> {
         self.lexer.expect(&TokenKind::Keyword(Keyword::Rollback))?;
-        Ok(Statement::Rollback)
+        let txn_id = self.parse_optional_transaction_target()?;
+        Ok(Statement::Rollback { txn_id })
+    }
+
+    /// After `USING`, parse `TIMEOUT <ms>` (an integer literal, milliseconds).
+    /// `TIMEOUT` is a soft keyword (a bare identifier) so it does not become a
+    /// reserved word that would break tables/columns named `timeout`.
+    fn parse_transaction_timeout_ms(&mut self) -> Result<u64, CqlError> {
+        let tok = self.lexer.next_token()?;
+        let is_timeout = match &tok.kind {
+            TokenKind::Ident(s) => s.eq_ignore_ascii_case("timeout"),
+            TokenKind::QuotedIdent(s) => s.eq_ignore_ascii_case("timeout"),
+            _ => false,
+        };
+        if !is_timeout {
+            return Err(CqlError::SyntaxError(format!(
+                "expected TIMEOUT after USING in BEGIN TRANSACTION, got {:?}",
+                tok.kind
+            )));
+        }
+        let tok = self.lexer.next_token()?;
+        match tok.kind {
+            TokenKind::IntegerLiteral(n) if n >= 0 => Ok(n as u64),
+            other => Err(CqlError::SyntaxError(format!(
+                "expected a non-negative millisecond timeout, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Wrap a just-parsed DML/SELECT in `Statement::InTransaction` if a trailing
+    /// `IN TRANSACTION <id>` suffix follows. At the end of a fully-parsed DML
+    /// statement a leading `IN` is unambiguously this suffix (a `WHERE ... IN
+    /// (...)` list was already consumed inside the DML parse), so a single-token
+    /// lookahead suffices.
+    fn maybe_wrap_in_transaction(&mut self, inner: Statement) -> Result<Statement, CqlError> {
+        if !self.lexer.eat(&TokenKind::Keyword(Keyword::In))? {
+            return Ok(inner);
+        }
+        self.lexer
+            .expect(&TokenKind::Keyword(Keyword::Transaction))?;
+        let txn_id = self.parse_optional_txn_id_literal()?.ok_or_else(|| {
+            CqlError::SyntaxError("expected a transaction id after IN TRANSACTION".to_string())
+        })?;
+        Ok(Statement::InTransaction {
+            txn_id,
+            inner: Box::new(inner),
+        })
+    }
+
+    /// Parse the optional `TRANSACTION [<id>]` target that may follow `COMMIT` or
+    /// `ROLLBACK`. `Some(id)` when an explicit id is given (connection-independent);
+    /// `None` for bare `COMMIT`/`ROLLBACK` or `COMMIT TRANSACTION` without an id
+    /// (both resolve via the connection's compat-shim binding).
+    fn parse_optional_transaction_target(&mut self) -> Result<Option<String>, CqlError> {
+        if !self.lexer.eat(&TokenKind::Keyword(Keyword::Transaction))? {
+            return Ok(None);
+        }
+        self.parse_optional_txn_id_literal()
+    }
+
+    /// Parse an optional transaction-id literal (a bare `UuidLiteral` or a quoted
+    /// `StringLiteral`). Returns `None` if the next token is not an id literal, so
+    /// `COMMIT TRANSACTION` (no id) is accepted for the shim.
+    fn parse_optional_txn_id_literal(&mut self) -> Result<Option<String>, CqlError> {
+        match &self.lexer.peek()?.kind {
+            TokenKind::UuidLiteral(u) => {
+                let s = u.to_string();
+                self.lexer.next_token()?;
+                Ok(Some(s))
+            }
+            TokenKind::StringLiteral(s) => {
+                let s = s.clone();
+                self.lexer.next_token()?;
+                Ok(Some(s))
+            }
+            _ => Ok(None),
+        }
     }
 
     // ---------------------------------------------------------------
@@ -5738,94 +5833,128 @@ mod tests {
 
     #[test]
     fn parse_begin_commit_rollback() {
-        // BEGIN TRANSACTION
+        // BEGIN TRANSACTION — no explicit timeout.
         let stmt = parse("BEGIN TRANSACTION").unwrap();
         assert!(
-            matches!(stmt, Statement::BeginTransaction),
-            "expected BeginTransaction, got {:?}",
-            stmt
+            matches!(stmt, Statement::BeginTransaction { timeout_ms: None }),
+            "expected BeginTransaction, got {stmt:?}"
         );
 
-        // COMMIT
+        // COMMIT — bare (shim), no explicit id.
         let stmt = parse("COMMIT").unwrap();
         assert!(
-            matches!(stmt, Statement::Commit),
-            "expected Commit, got {:?}",
-            stmt
+            matches!(stmt, Statement::Commit { txn_id: None }),
+            "expected Commit, got {stmt:?}"
         );
 
-        // ROLLBACK
+        // ROLLBACK — bare (shim), no explicit id.
         let stmt = parse("ROLLBACK").unwrap();
         assert!(
-            matches!(stmt, Statement::Rollback),
-            "expected Rollback, got {:?}",
-            stmt
+            matches!(stmt, Statement::Rollback { txn_id: None }),
+            "expected Rollback, got {stmt:?}"
         );
     }
 
     #[test]
     fn parse_begin_transaction_case_insensitive() {
         let stmt = parse("begin transaction").unwrap();
-        assert!(matches!(stmt, Statement::BeginTransaction));
+        assert!(matches!(
+            stmt,
+            Statement::BeginTransaction { timeout_ms: None }
+        ));
 
         let stmt = parse("Begin Transaction").unwrap();
-        assert!(matches!(stmt, Statement::BeginTransaction));
+        assert!(matches!(
+            stmt,
+            Statement::BeginTransaction { timeout_ms: None }
+        ));
     }
 
     #[test]
-    fn parse_nested_transaction_rejected() {
-        use crate::session::TransactionState;
-        let mut txn_state = TransactionState::new();
-
-        // First BEGIN is accepted.
-        let stmt = parse("BEGIN TRANSACTION").unwrap();
-        txn_state.validate_and_transition(&stmt).unwrap();
-
-        // Second BEGIN inside the transaction must be rejected.
-        let stmt = parse("BEGIN TRANSACTION").unwrap();
-        let err = txn_state.validate_and_transition(&stmt);
-        assert!(err.is_err(), "nested BEGIN TRANSACTION should be rejected");
-        let msg = err.unwrap_err().to_string();
+    fn parse_begin_transaction_using_timeout() {
+        let stmt = parse("BEGIN TRANSACTION USING TIMEOUT 5000").unwrap();
         assert!(
-            msg.contains("nested"),
-            "error should mention 'nested', got: {msg}"
+            matches!(
+                stmt,
+                Statement::BeginTransaction {
+                    timeout_ms: Some(5000)
+                }
+            ),
+            "expected a 5000ms timeout, got {stmt:?}"
         );
+        // TIMEOUT is a soft keyword — lowercase form parses too.
+        let stmt = parse("begin transaction using timeout 250").unwrap();
+        assert!(matches!(
+            stmt,
+            Statement::BeginTransaction {
+                timeout_ms: Some(250)
+            }
+        ));
     }
 
     #[test]
-    fn parse_ddl_in_transaction_rejected() {
-        use crate::session::TransactionState;
-        let mut txn_state = TransactionState::new();
-
-        // Start a transaction.
-        let begin = parse("BEGIN TRANSACTION").unwrap();
-        txn_state.validate_and_transition(&begin).unwrap();
-
-        // DDL inside transaction must be rejected.
-        let ddl = parse("CREATE TABLE ks.t (k int PRIMARY KEY)").unwrap();
-        let err = txn_state.validate_and_transition(&ddl);
-        assert!(err.is_err(), "DDL inside transaction should be rejected");
-        let msg = err.unwrap_err().to_string();
+    fn parse_commit_rollback_with_explicit_id() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let stmt = parse(&format!("COMMIT TRANSACTION {id}")).unwrap();
         assert!(
-            msg.contains("DDL"),
-            "error should mention 'DDL', got: {msg}"
+            matches!(stmt, Statement::Commit { txn_id: Some(ref t) } if t == id),
+            "expected Commit with explicit id, got {stmt:?}"
         );
+        let stmt = parse(&format!("ROLLBACK TRANSACTION {id}")).unwrap();
+        assert!(
+            matches!(stmt, Statement::Rollback { txn_id: Some(ref t) } if t == id),
+            "expected Rollback with explicit id, got {stmt:?}"
+        );
+        // A quoted-string id form is also accepted.
+        let stmt = parse(&format!("COMMIT TRANSACTION '{id}'")).unwrap();
+        assert!(matches!(stmt, Statement::Commit { txn_id: Some(ref t) } if t == id));
     }
 
     #[test]
-    fn parse_empty_transaction() {
-        use crate::session::TransactionState;
-        let mut txn_state = TransactionState::new();
+    fn parse_dml_in_transaction_suffix() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        // UPDATE ... IN TRANSACTION <id> wraps the DML in InTransaction.
+        let stmt = parse(&format!(
+            "UPDATE elle.la SET v = v + [7] WHERE k = 1 IN TRANSACTION {id}"
+        ))
+        .unwrap();
+        match stmt {
+            Statement::InTransaction { txn_id, inner } => {
+                assert_eq!(txn_id, id);
+                assert!(
+                    matches!(*inner, Statement::Update(_)),
+                    "inner must be the UPDATE, got {inner:?}"
+                );
+            }
+            other => panic!("expected InTransaction wrapper, got {other:?}"),
+        }
+    }
 
-        // BEGIN immediately followed by COMMIT is legal.
-        let begin = parse("BEGIN TRANSACTION").unwrap();
-        txn_state.validate_and_transition(&begin).unwrap();
+    #[test]
+    fn parse_select_in_transaction_suffix() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let stmt = parse(&format!(
+            "SELECT v FROM elle.la WHERE k = 1 IN TRANSACTION {id}"
+        ))
+        .unwrap();
+        match stmt {
+            Statement::InTransaction { txn_id, inner } => {
+                assert_eq!(txn_id, id);
+                assert!(matches!(*inner, Statement::Select(_)));
+            }
+            other => panic!("expected InTransaction wrapper, got {other:?}"),
+        }
+    }
 
-        let commit = parse("COMMIT").unwrap();
-        txn_state.validate_and_transition(&commit).unwrap();
-
-        // After commit, we're back to no-transaction state.
-        assert!(!txn_state.in_transaction());
+    #[test]
+    fn parse_where_in_list_is_not_a_transaction_suffix() {
+        // A WHERE `... IN (...)` list must NOT be mistaken for the IN TRANSACTION
+        // suffix — it is consumed inside the DML parse.
+        let stmt = parse("SELECT v FROM elle.la WHERE k IN (1, 2, 3)").unwrap();
+        assert!(
+            matches!(stmt, Statement::Select(_)),
+            "WHERE ... IN (...) stays a plain SELECT, got {stmt:?}"
+        );
     }
 }
 

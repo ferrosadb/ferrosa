@@ -1514,7 +1514,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
         topology_policy,
+        // Server-wide (per-node) transaction registry: the connection-independent
+        // BEGIN/IN TRANSACTION/COMMIT surface. Default 10s open-transaction timeout
+        // (A1b); the reaper below actively evicts abandoned transactions.
+        txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_default(),
     });
+    // Start the open-transaction reaper (A1b): sweeps every second, aborting and
+    // evicting any transaction past its deadline without a client statement.
+    ferrosa_cql::txn_registry::spawn_transaction_reaper(shared_state.txn_registry.clone());
     let auth_disabled = cql_config.auth_disabled;
 
     // 9a. Register observability virtual tables into the schema's shared registry

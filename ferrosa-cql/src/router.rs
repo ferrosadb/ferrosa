@@ -1461,6 +1461,12 @@ pub struct SharedState {
     /// Decides whether a given connection should see public or internal
     /// topology addresses in `system.local` / `system.peers_v2`.
     pub topology_policy: ClientTopologyPolicy,
+    /// Server-wide (per-node) transaction registry backing the connection-
+    /// independent `BEGIN TRANSACTION` / `... IN TRANSACTION <id>` / `COMMIT
+    /// TRANSACTION <id>` surface. Shared across every connection on this node, so
+    /// the statements of one transaction need not land on the same TCP connection
+    /// — this is what deletes the connection-affinity desync bug class.
+    pub txn_registry: crate::txn_registry::SharedTransactionRegistry,
 }
 
 impl std::ops::Deref for SharedState {
@@ -1708,61 +1714,139 @@ fn build_transaction_write(
     })
 }
 
-/// Intercept transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) and in-transaction
-/// DML for a CQL session. Returns `Some(result)` if the statement was handled as
-/// a transaction operation; `None` if it should be routed normally.
+/// Intercept transaction control and transaction-scoped DML/SELECT for a CQL
+/// session, driving the connection-independent [`TransactionRegistry`]. Returns
+/// `Some(result)` when the statement is a transaction operation; `None` when it
+/// should be routed normally.
 ///
-/// In an open transaction, `INSERT`/`UPDATE`/`DELETE` are **buffered** (not
-/// executed); `COMMIT` commits the whole buffered write-set as one multi-key
-/// Accord transaction via the `SessionCore` committer
-/// (`accord_transaction_committer`); `ROLLBACK` drops the buffer.
+/// The registry (server-wide, on `state.txn_registry`) is keyed by an opaque
+/// txn-id, so `BEGIN`/`UPDATE`/`COMMIT` need not land on the same TCP connection
+/// (deletes the connection-affinity desync). `shim` is this connection's binding
+/// for the **compat shim**: a bare `BEGIN` returns an id AND records it here, so a
+/// later bare `COMMIT`/`ROLLBACK` (or bare DML) resolves to it; explicit-id
+/// clients pass the id back via `... IN TRANSACTION <id>` and ignore the shim.
 pub async fn route_transactional(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     stmt: &Statement,
-    txn: &mut crate::session::CqlTransaction,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    now: std::time::Instant,
 ) -> Option<Result<RouteResult, CqlError>> {
+    let owner = ctx.auth.role.as_str();
     match stmt {
-        Statement::BeginTransaction => Some(
-            txn.begin()
-                .map(|()| RouteResult::Result(crate::result::encode_void())),
-        ),
-        Statement::Rollback => Some(
-            txn.rollback()
-                .map(|()| RouteResult::Result(crate::result::encode_void())),
-        ),
-        Statement::Commit => Some(commit_cql_transaction(state, txn).await),
-        // Buffer DML only while a transaction is open; otherwise route normally.
-        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if txn.is_open() => {
-            Some(
-                match build_transaction_write(state, ctx, stmt).and_then(|w| txn.stage(w)) {
-                    Ok(()) => Ok(RouteResult::Result(crate::result::encode_void())),
-                    Err(e) => {
-                        // A statement that fails inside a transaction POISONS it,
-                        // so the next COMMIT fails loud rather than committing an
-                        // incomplete write-set (never a silently partial txn).
-                        txn.poison();
-                        Err(e)
-                    }
-                },
-            )
+        Statement::BeginTransaction { timeout_ms } => {
+            Some(begin_transaction(state, owner, shim, now, *timeout_ms))
+        }
+        Statement::Commit { txn_id } => {
+            Some(commit_transaction(state, owner, shim, now, txn_id.as_deref()).await)
+        }
+        Statement::Rollback { txn_id } => {
+            Some(rollback_transaction(state, owner, shim, txn_id.as_deref()))
+        }
+        Statement::InTransaction { txn_id, inner } => {
+            Some(route_in_transaction(state, ctx, owner, now, txn_id, inner).await)
+        }
+        // Bare DML with an open compat-shim transaction stages into it (legacy
+        // single-connection BEGIN/UPDATE/COMMIT). Explicit-id clients use
+        // `... IN TRANSACTION <id>` and never reach this arm.
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) if shim.is_some() => {
+            let id = shim.expect("shim is Some in this match arm");
+            Some(stage_dml(state, ctx, owner, now, id, stmt))
         }
         _ => None,
     }
 }
 
-/// Commit the buffered write-set through the Accord committer. Fails loud (and
-/// closes the transaction) when not in cluster mode or when the commit cannot be
-/// driven — the client never gets a success it did not earn.
-async fn commit_cql_transaction(
+/// Clear the connection's compat-shim binding if it points at `id` (the
+/// just-committed / just-rolled-back transaction), so a later bare `BEGIN` on this
+/// connection is not mistaken for a nested transaction.
+fn clear_shim_if(
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    id: crate::txn_registry::CqlTxnId,
+) {
+    if *shim == Some(id) {
+        *shim = None;
+    }
+}
+
+/// Encode `BEGIN TRANSACTION`'s reply: a single-row, single-column Rows RESULT
+/// carrying the minted transaction id as text. Stock drivers read it as an
+/// ordinary result set; explicit-id clients pass it back via `IN TRANSACTION`.
+fn encode_txn_id_row(id: crate::txn_registry::CqlTxnId) -> BytesMut {
+    let names = vec!["txn_id".to_string()];
+    let types = vec![CqlType::Varchar];
+    let rows = vec![vec![Some(CqlValue::Text(id.to_string()))]];
+    result::encode_rows(&names, &types, "system", "transaction", &rows)
+}
+
+/// `BEGIN TRANSACTION [USING TIMEOUT <ms>]`: mint an id, bind it to the connection
+/// (compat shim), and return it. FAILS LOUD on a nested bare BEGIN.
+fn begin_transaction(
     state: &SharedState,
-    txn: &mut crate::session::CqlTransaction,
+    owner: &str,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    now: std::time::Instant,
+    timeout_ms: Option<u64>,
+) -> Result<RouteResult, CqlError> {
+    let timeout = timeout_ms.map(std::time::Duration::from_millis);
+    let id = { state.txn_registry.lock().begin(owner, now, timeout) }?;
+    // Rebind the connection's compat-shim to the newest transaction (last-wins).
+    //
+    // The txn-id model has NO connection-scoped "nested" transaction: a client may
+    // legitimately hold several independent transactions at once (e.g. spread
+    // across a driver's connection pool, where BEGIN and COMMIT need not share a
+    // TCP connection — the whole point of this design). So a fresh BEGIN never
+    // conflicts with a prior one and MUST NOT reject. The old nested-BEGIN guard
+    // was a vestige of the per-connection model; under pooled load it spuriously
+    // rejected the overwhelming majority of BEGINs ("nested transactions") because
+    // a connection could carry a stale shim binding from an earlier transaction
+    // whose COMMIT landed on a different connection. Overwriting the shim (rather
+    // than guarding on it) is correct and cannot affect serializability — it only
+    // removes a rejection; an orphaned bare-shim transaction is reaped on timeout.
+    *shim = Some(id);
+    Ok(RouteResult::Result(encode_txn_id_row(id)))
+}
+
+/// Resolve the transaction an operation targets: an explicit `TRANSACTION <id>`
+/// text, else the connection's shim binding. FAILS LOUD if neither is present.
+fn resolve_txn_id(
+    explicit: Option<&str>,
+    shim: Option<crate::txn_registry::CqlTxnId>,
+    verb: &str,
+) -> Result<crate::txn_registry::CqlTxnId, CqlError> {
+    match explicit {
+        Some(text) => crate::txn_registry::CqlTxnId::parse(text),
+        None => {
+            // Compat-shim path (bare COMMIT/ROLLBACK). Deprecated: prefer the
+            // explicit, connection-independent `... TRANSACTION <id>` form.
+            tracing::debug!(
+                verb,
+                "resolving transaction via the connection shim (deprecated bare form); \
+                 prefer an explicit TRANSACTION <id>"
+            );
+            shim.ok_or_else(|| CqlError::Invalid(format!("{verb} outside of a transaction")))
+        }
+    }
+}
+
+/// `COMMIT [TRANSACTION [<id>]]`: take the owned staging machine out of the
+/// registry (brief lock) and drive the async Accord commit WITHOUT holding the
+/// registry lock. Fails loud when not in cluster mode or when the commit cannot be
+/// driven — the client never gets a success it did not earn.
+async fn commit_transaction(
+    state: &SharedState,
+    owner: &str,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    now: std::time::Instant,
+    explicit_id: Option<&str>,
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_storage::accord::CommitOutcome;
+    let id = resolve_txn_id(explicit_id, *shim, "COMMIT")?;
+    let mut txn = { state.txn_registry.lock().take_for_commit(id, owner, now) }?;
+    clear_shim_if(shim, id);
     let committer = match state.accord_transaction_committer() {
         Some(c) => c,
         None => {
-            let _ = txn.rollback();
             return Err(CqlError::Invalid(
                 "multi-statement transactions require cluster mode (Accord)".into(),
             ));
@@ -1774,6 +1858,75 @@ async fn commit_cql_transaction(
             Err(CqlError::Invalid(format!("transaction aborted: {reason}")))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// `ROLLBACK [TRANSACTION [<id>]]`: drop the transaction from the registry. No
+/// deadline check — rollback of an expired transaction is still a clean abort.
+fn rollback_transaction(
+    state: &SharedState,
+    owner: &str,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    explicit_id: Option<&str>,
+) -> Result<RouteResult, CqlError> {
+    let id = resolve_txn_id(explicit_id, *shim, "ROLLBACK")?;
+    state.txn_registry.lock().abort(id, owner)?;
+    clear_shim_if(shim, id);
+    Ok(RouteResult::Result(crate::result::encode_void()))
+}
+
+/// Handle `<inner> IN TRANSACTION <id>`. A write is staged under `<id>`; a SELECT
+/// (Phase A: not MVCC-isolated — that is Phase D) validates the transaction is
+/// owned + open, then routes the read normally against committed state.
+async fn route_in_transaction(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    owner: &str,
+    now: std::time::Instant,
+    txn_id_text: &str,
+    inner: &Statement,
+) -> Result<RouteResult, CqlError> {
+    let id = crate::txn_registry::CqlTxnId::parse(txn_id_text)?;
+    match inner {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            stage_dml(state, ctx, owner, now, id, inner)
+        }
+        Statement::Select(_) => {
+            state.txn_registry.lock().ensure_active(id, owner, now)?;
+            route(state, ctx, inner.clone()).await
+        }
+        _ => Err(CqlError::Invalid(
+            "only INSERT/UPDATE/DELETE/SELECT may be scoped with IN TRANSACTION".to_string(),
+        )),
+    }
+}
+
+/// Build a [`TransactionWrite`] from a DML statement and stage it under `id`. A
+/// build or stage failure POISONS the transaction so the next COMMIT fails loud
+/// rather than committing an incomplete write-set (never a silently partial txn).
+fn stage_dml(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    owner: &str,
+    now: std::time::Instant,
+    id: crate::txn_registry::CqlTxnId,
+    stmt: &Statement,
+) -> Result<RouteResult, CqlError> {
+    match build_transaction_write(state, ctx, stmt) {
+        Ok(write) => {
+            let mut reg = state.txn_registry.lock();
+            match reg.stage(id, owner, now, write) {
+                Ok(()) => Ok(RouteResult::Result(crate::result::encode_void())),
+                Err(e) => {
+                    reg.poison(id, owner);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            state.txn_registry.lock().poison(id, owner);
+            Err(e)
+        }
     }
 }
 
@@ -2556,11 +2709,16 @@ pub async fn route(
             .await
             .map(RouteResult::Result),
         Statement::Explain(s) => route_explain(state, ctx, *s).map(RouteResult::Result),
-        // Accord transaction control statements are handled at the session/connection
-        // level, not in the router. If they reach here, return a void result.
-        Statement::BeginTransaction | Statement::Commit | Statement::Rollback => {
-            Ok(RouteResult::Result(crate::result::encode_void()))
-        }
+        // Accord transaction control statements are handled by route_transactional
+        // (the connection layer) before reaching here. If one arrives, return void.
+        Statement::BeginTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => Ok(RouteResult::Result(crate::result::encode_void())),
+        // A transaction-scoped statement must be handled by route_transactional; if
+        // it reaches the normal router it is an internal routing bug — fail loud.
+        Statement::InTransaction { .. } => Err(CqlError::Invalid(
+            "transaction-scoped statement reached the normal router (internal error)".to_string(),
+        )),
     };
 
     // Track CQL metrics: increment per-opcode counter, and error counter on failure.
@@ -13347,6 +13505,9 @@ mod tests {
             last_schema_event: tokio::sync::watch::channel(None).0,
             cql_metrics: Arc::new(CqlMetrics::new()),
             topology_policy: ClientTopologyPolicy::default(),
+            txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::txn_registry::TransactionRegistry::default(),
+            )),
         };
         (state, dir)
     }
@@ -13780,35 +13941,118 @@ mod tests {
             client_address: String::new(),
             protocol_version: 4,
         };
-        let mut txn = crate::session::CqlTransaction::new();
+        let mut shim: Option<crate::txn_registry::CqlTxnId> = None;
+        let now = std::time::Instant::now();
 
         // A non-transactional statement is NOT intercepted (routes normally).
         let select = crate::parser::parse("SELECT * FROM system.local").unwrap();
         assert!(
-            route_transactional(&state, &ctx, &select, &mut txn)
+            route_transactional(&state, &ctx, &select, &mut shim, now)
                 .await
                 .is_none(),
             "SELECT must fall through to normal routing"
         );
 
-        // BEGIN opens the transaction; ROLLBACK closes it.
+        // BEGIN opens a transaction, returns a Rows result with its id, and binds
+        // the connection's compat shim to it.
+        let begun = route_transactional(
+            &state,
+            &ctx,
+            &Statement::BeginTransaction { timeout_ms: None },
+            &mut shim,
+            now,
+        )
+        .await;
+        match begun {
+            Some(Ok(RouteResult::Result(ref body))) => {
+                assert_eq!(&body[0..4], &0x0002i32.to_be_bytes(), "BEGIN returns Rows")
+            }
+            Some(Ok(_)) => panic!("BEGIN must return a Rows result, got a non-Rows result"),
+            Some(Err(e)) => panic!("BEGIN failed: {e}"),
+            None => panic!("BEGIN must be intercepted by route_transactional"),
+        }
+        assert!(shim.is_some(), "BEGIN binds the connection's shim");
+
+        // Bare ROLLBACK closes it and clears the shim.
         assert!(matches!(
-            route_transactional(&state, &ctx, &Statement::BeginTransaction, &mut txn).await,
+            route_transactional(
+                &state,
+                &ctx,
+                &Statement::Rollback { txn_id: None },
+                &mut shim,
+                now
+            )
+            .await,
             Some(Ok(_))
         ));
-        assert!(txn.is_open());
-        assert!(matches!(
-            route_transactional(&state, &ctx, &Statement::Rollback, &mut txn).await,
-            Some(Ok(_))
-        ));
-        assert!(!txn.is_open());
+        assert!(shim.is_none(), "ROLLBACK clears the shim binding");
 
         // COMMIT in standalone mode (no Accord committer) must fail loud.
-        txn.begin().unwrap();
-        let committed = route_transactional(&state, &ctx, &Statement::Commit, &mut txn).await;
+        route_transactional(
+            &state,
+            &ctx,
+            &Statement::BeginTransaction { timeout_ms: None },
+            &mut shim,
+            now,
+        )
+        .await;
+        let committed = route_transactional(
+            &state,
+            &ctx,
+            &Statement::Commit { txn_id: None },
+            &mut shim,
+            now,
+        )
+        .await;
         assert!(
             matches!(committed, Some(Err(_))),
             "COMMIT without a cluster committer must fail loud, not fake success"
+        );
+    }
+
+    /// Regression for the Elle-cert "nested transactions" defect: consecutive
+    /// BEGINs on ONE connection must BOTH succeed with distinct ids. The txn-id
+    /// model has no connection-scoped nested transaction; the old guard spuriously
+    /// rejected ~84% of BEGINs under pooled load because a connection could carry a
+    /// stale shim binding from a transaction whose COMMIT landed elsewhere.
+    #[tokio::test]
+    async fn consecutive_begins_on_one_connection_never_report_nested() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let mut shim: Option<crate::txn_registry::CqlTxnId> = None;
+        let now = std::time::Instant::now();
+
+        // Ten BEGINs in a row on the same shim — none rolled back or committed —
+        // must every one succeed (no "nested transactions" rejection).
+        for i in 0..10 {
+            let r = route_transactional(
+                &state,
+                &ctx,
+                &Statement::BeginTransaction { timeout_ms: None },
+                &mut shim,
+                now,
+            )
+            .await;
+            assert!(
+                matches!(r, Some(Ok(_))),
+                "BEGIN #{i} must succeed — a fresh BEGIN is never 'nested' in the txn-id model"
+            );
+            assert!(shim.is_some(), "each BEGIN (re)binds the shim");
+        }
+        // All ten opened independent registry entries (last-wins shim, no rejection).
+        assert_eq!(
+            state.txn_registry.lock().len(),
+            10,
+            "ten independent transactions are open concurrently"
         );
     }
 

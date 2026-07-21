@@ -115,5 +115,8 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         last_schema_event: tokio::sync::watch::channel(None).0,
         cql_metrics: Arc::new(CqlMetrics::new()),
         topology_policy: ClientTopologyPolicy::default(),
+        txn_registry: std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::txn_registry::TransactionRegistry::default(),
+        )),
     })
 }
