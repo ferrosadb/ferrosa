@@ -14,7 +14,26 @@ REGION="${REGION:-lax}"
 APP="${APP:-ferrosa-accord-elle-cert}"
 # Unique per run: Tigris imposes a cooldown on reusing a just-deleted bucket name.
 BUCKET="${BUCKET:-ferrosa-accord-elle-${RANDOM}${RANDOM}}"
+# Image label. Derived from the git HEAD, BUT when the working tree is dirty the
+# HEAD hash alone collides with a prior committed-code build — fly then serves the
+# CACHED old image and the cert silently tests stale code (the txn-manager cert hit
+# exactly this). Append a content hash of the working tree (via `git stash create`,
+# which snapshots tracked changes WITHOUT touching the tree) so uncommitted changes
+# always get a fresh, distinct image. Falls back to a timestamp if stash is empty.
 RUN_ID="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+if ! git -C "$ROOT_DIR" diff --quiet HEAD 2>/dev/null \
+   || [ -n "$(git -C "$ROOT_DIR" ls-files -o --exclude-standard -- '*.rs' '*.toml')" ]; then
+  # DETERMINISTIC content hash of the working tree (tracked edits + untracked
+  # .rs/.toml source), so identical code always yields the SAME label — a re-run
+  # after a killed build can reuse fly's build cache instead of cold-compiling
+  # again, while committed-code runs still get their clean HEAD label.
+  WT_HASH="$( { git -C "$ROOT_DIR" diff HEAD; \
+                git -C "$ROOT_DIR" ls-files -o --exclude-standard -- '*.rs' '*.toml' \
+                  | LC_ALL=C sort | xargs -r cat; } 2>/dev/null \
+              | shasum -a 256 | cut -c1-12 )"
+  [ -z "$WT_HASH" ] && WT_HASH="$(date +%s)"
+  RUN_ID="${RUN_ID}-dirty-${WT_HASH}"
+fi
 IMAGE="registry.fly.io/${APP}:cert-${RUN_ID}"
 CPU_KIND="${CPU_KIND:-performance}"
 CPUS="${CPUS:-2}"
@@ -68,9 +87,17 @@ primary_region = "${REGION}"
 [build]
   dockerfile = "Dockerfile.elle"
 EOF
+# Keep the full build log (was `tail -8`, which hid whether a compile actually ran
+# and masked the stale-image cert). Tee to a file and surface the `Compiling` lines
+# + summary so a cached-image (no-compile) build is obvious in the output.
+BUILD_LOG="$(mktemp)"
 flyctl deploy "$BUILD_CTX" --app "$APP" --config "$BUILD_CTX/fly.toml" \
   --dockerfile "$BUILD_CTX/Dockerfile.elle" --remote-only --build-only --push \
-  --image-label "cert-${RUN_ID}" 2>&1 | tail -8 || die "image build/push failed"
+  --image-label "cert-${RUN_ID}" 2>&1 | tee "$BUILD_LOG" | grep -iE "compiling ferrosa|finished|error|image:|image size|CACHED" || true
+if ! grep -qiE "Compiling ferrosa-cql|Compiling ferrosa " "$BUILD_LOG"; then
+  log "WARN: no 'Compiling ferrosa' lines in the build — image may be CACHED/stale (label reuse). Full log: $BUILD_LOG"
+fi
+grep -q "image:" "$BUILD_LOG" || die "image build/push failed (no image pushed) — see $BUILD_LOG"
 
 # Let the pushed manifest propagate before launching machines by digest —
 # otherwise the first `machine run` can 404 MANIFEST_UNKNOWN (fly registry race).

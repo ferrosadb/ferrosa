@@ -64,7 +64,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         linux-perf \
         procps \
         sysstat \
+        iptables \
+        iproute2 \
     && rm -rf /var/lib/apt/lists/*
+# iptables/ip6tables + iproute2(tc) are required by the WAN nemeses
+# (chaos::wan_bridge DcPartition uses ip6tables on fly's IPv6 private net; DcSlow
+# uses `tc qdisc ... netem`). Without them the dual-DC fault injection can't run.
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
 COPY --from=builder /build/target/release/examples/elle_list_append /usr/local/bin/
 COPY deploy/fly-bench/ferrosa-entrypoint.sh /usr/local/bin/

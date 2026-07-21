@@ -2,17 +2,21 @@
 //! validation (t_d7ffb5b7).
 //!
 //! Model: each list is a `list<int>` column (order-preserving).
-//! - **append(k, v)** = `BEGIN TRANSACTION; UPDATE la SET v = v + [v] WHERE k=?;
-//!   COMMIT` — an Accord-serialized write. `v` is globally unique so Elle can
-//!   recover the per-key version order.
+//! - **append(k, v)** = `BEGIN TRANSACTION` (returns a server-minted txn id);
+//!   `UPDATE la SET v = v + [v] WHERE k=? IN TRANSACTION <id>`;
+//!   `COMMIT TRANSACTION <id>` — an Accord-serialized write threaded by explicit
+//!   id (Phase A transaction manager), so it is connection-INDEPENDENT: the three
+//!   statements need not share a TCP connection. `v` is globally unique so Elle
+//!   can recover the per-key version order.
 //! - **read(k)** = `SELECT v FROM la WHERE k=?` at **SERIAL** consistency — a
 //!   linearizable read routed through Accord (cluster mode). Returns the list in
 //!   append order.
 //!
-//! Concurrent workers share one pinned coordinator (so each `BEGIN…COMMIT` is
-//! atomic on one connection); concurrency comes from many client tasks. Each op
-//! logs an `:invoke` before and an `:ok`/`:fail` after into a shared, time-
-//! ordered history, which is written as Elle-compatible EDN.
+//! Concurrent workers each drive their own session against one pinned coordinator;
+//! because the transaction rides an explicit id (not connection affinity), the
+//! ~24% `:info` from the old connection-keyed BEGIN/COMMIT desync is gone. Each op
+//! logs an `:invoke` before and an `:ok`/`:fail` after into a shared, time-ordered
+//! history, which is written as Elle-compatible EDN.
 //!
 //! Usage: cargo run -p ferrosa-jepsen --example elle_list_append -- <host:port> <out.edn> [keys] [ops-per-worker] [workers]
 
@@ -129,18 +133,53 @@ async fn main() -> Result<()> {
                     //     may not have landed): :info, never :fail — logging it :fail
                     //     would let a write that actually committed masquerade as a
                     //     failed op and fabricate an Elle "aberrant read" violation.
-                    let upd = format!("UPDATE elle.la SET v = v + [{v}] WHERE k = {k}");
-                    let outcome = if let Err(e) = session
+                    // Connection-INDEPENDENT append (Phase A transaction manager):
+                    // BEGIN returns a server-minted txn id; UPDATE and COMMIT carry
+                    // it via `IN TRANSACTION <id>` / `COMMIT TRANSACTION <id>`, so the
+                    // three statements need not land on the same TCP connection — this
+                    // removes the connection-affinity desync that produced the ~24%
+                    // :info ("COMMIT outside of a transaction" / "nested transactions").
+                    let mut txn_id_opt: Option<String> = None;
+                    let outcome = match session
                         .query_unpaged("BEGIN TRANSACTION".to_string(), &[])
                         .await
                     {
-                        Some((":fail", format!("BEGIN: {e}")))
-                    } else if let Err(e) = session.query_unpaged(upd.clone(), &[]).await {
-                        Some((":fail", format!("UPDATE: {e}")))
-                    } else if let Err(e) = session.query_unpaged("COMMIT".to_string(), &[]).await {
-                        Some((":info", format!("COMMIT: {e}")))
-                    } else {
-                        None
+                        Err(e) => Some((":fail", format!("BEGIN: {e}"))),
+                        Ok(res) => {
+                            // BEGIN's reply is a single text row carrying the id.
+                            let id = res
+                                .into_rows_result()
+                                .ok()
+                                .and_then(|rr| {
+                                    rr.rows::<Row>()
+                                        .ok()
+                                        .and_then(|mut it| it.next().and_then(|r| r.ok()))
+                                })
+                                .and_then(|row| match row.columns.first() {
+                                    Some(Some(CqlValue::Text(s))) => Some(s.clone()),
+                                    Some(Some(CqlValue::Ascii(s))) => Some(s.clone()),
+                                    _ => None,
+                                });
+                            match id {
+                                None => Some((":fail", "BEGIN: no txn id in result".to_string())),
+                                Some(id) => {
+                                    txn_id_opt = Some(id.clone());
+                                    let upd = format!(
+                                        "UPDATE elle.la SET v = v + [{v}] WHERE k = {k} IN TRANSACTION {id}"
+                                    );
+                                    if let Err(e) = session.query_unpaged(upd, &[]).await {
+                                        Some((":fail", format!("UPDATE: {e}")))
+                                    } else if let Err(e) = session
+                                        .query_unpaged(format!("COMMIT TRANSACTION {id}"), &[])
+                                        .await
+                                    {
+                                        Some((":info", format!("COMMIT: {e}")))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        }
                     };
                     match outcome {
                         None => {
@@ -158,16 +197,19 @@ async fn main() -> Result<()> {
                                 .unwrap()
                                 .entry(normalize_err(kind, &why))
                                 .or_insert(0) += 1;
-                            // Clear any half-open transaction on THIS connection so the
-                            // next BEGIN doesn't hit "nested transactions". ROLLBACK is
-                            // cheap and idempotent; only reconnect if it, too, fails.
-                            if session
-                                .query_unpaged("ROLLBACK".to_string(), &[])
-                                .await
-                                .is_err()
-                            {
-                                if let Ok(fresh) = connect_pinned(&contact, &target).await {
-                                    session = Arc::new(fresh);
+                            // Best-effort abort of the (possibly still-open) txn by id
+                            // so a lingering entry cannot block this connection's next
+                            // BEGIN via the shim binding. Reconnect only if even that
+                            // fails. If BEGIN itself failed there is no id to roll back.
+                            if let Some(id) = txn_id_opt {
+                                if session
+                                    .query_unpaged(format!("ROLLBACK TRANSACTION {id}"), &[])
+                                    .await
+                                    .is_err()
+                                {
+                                    if let Ok(fresh) = connect_pinned(&contact, &target).await {
+                                        session = Arc::new(fresh);
+                                    }
                                 }
                             }
                             failures.fetch_add(1, Ordering::Relaxed);
