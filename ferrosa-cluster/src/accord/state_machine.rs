@@ -229,7 +229,7 @@ impl AccordStateMachine {
     /// Wire the node's shared [`HybridLogicalClock`] — the same `Arc` the
     /// transaction committer mints `t0` from — so this replica advances that
     /// clock past every execution timestamp it witnesses through consensus (see
-    /// the [`clock`](Self::clock) field). Builder; returns `self`.
+    /// the `clock` field). Builder; returns `self`.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HybridLogicalClock>) -> Self {
         self.clock = Some(clock);
