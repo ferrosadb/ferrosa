@@ -417,6 +417,138 @@ mod tests {
         );
     }
 
+    /// END-TO-END rebind (t_813caf39): a `BEGIN..COMMIT` list-append cell flagged
+    /// with the transient rebind bit must persist a path bound to the AGREED
+    /// Accord execution timestamp — not the coordinator materialize clock baked in
+    /// at `build_transaction_write`. This proves the 0x4000 flag survives the whole
+    /// committer → PreAccept/Commit/Apply → `EngineStorageApplier` path against a
+    /// REAL storage engine, closing the gap between the isolated apply unit test
+    /// (which proves the applier rebinds) and the live commit path (which must
+    /// deliver a flagged, un-mangled payload to that applier).
+    #[tokio::test]
+    async fn sole_replica_commit_rebinds_flagged_list_path_end_to_end() {
+        use crate::accord::apply::EngineStorageApplier;
+        use crate::accord::handlers::AccordState;
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        use ferrosa_common::{accord_list_cell_path, list_path_element_seq};
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+        use ferrosa_storage::{
+            Mutation, StorageEngine, StorageEngineConfig, TableId, CELL_REBIND_LIST_PATH_FLAG,
+        };
+
+        // Real engine + a table to persist the row into.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        engine
+            .register_table(TableSchema {
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "v".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        let engine_applier: Arc<dyn StorageApplier> =
+            Arc::new(EngineStorageApplier::new(engine.clone()));
+
+        // A flagged list-append cell whose path carries an OBVIOUSLY WRONG
+        // coordinator-clock time (t.time = 1). If the rebind is live end-to-end,
+        // apply overwrites it with the agreed execution ts (~now); if a wiring gap
+        // drops the flag, this ancient path survives.
+        let element_seq = 0u16;
+        let coord_path = accord_list_cell_path(
+            &ferrosa_common::accord::Timestamp {
+                epoch: 0,
+                time: 1,
+                seq: 0,
+                node: 0,
+            },
+            element_seq,
+        );
+        let key = DecoratedKey::new(PartitionKey::new(vec![0, 0, 0, 5]));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(
+                CELL_REBIND_LIST_PATH_FLAG, // storage col 0, flagged for rebind
+                CellValue::live(b"L".to_vec(), 1).with_path(coord_path.clone()),
+            )],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1),
+        };
+        let m = Mutation::new("ks".into(), "t".into(), key.clone(), vec![row], 1);
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+
+        // Sole-replica committer wired to the REAL engine applier on both the
+        // committer boundary and the coordinator's own state machine.
+        let host = Uuid::from_u128(0xD0);
+        let node_id = node_id_of(host);
+        let clock = Arc::new(HybridLogicalClock::new(node_id, 0));
+        let local_state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                engine_applier.clone(),
+            )));
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, _key: &[u8]| Some(vec![host]));
+        let committer = AccordTransactionCommitter::new(
+            node_id,
+            clock,
+            Arc::new(NoPeersTransport),
+            engine_applier.clone(),
+            resolve,
+        )
+        .with_local_accord_state(local_state);
+
+        let outcome = committer
+            .commit(vec![write("ks", &[0, 0, 0, 5], &buf)])
+            .await
+            .expect("sole-replica list-append commit must succeed");
+        assert_eq!(outcome, CommitOutcome::Committed);
+
+        // Read back the persisted cell and inspect its path.
+        let partition = engine
+            .read(&TableId::new("ks", "t"), &key)
+            .unwrap()
+            .expect("the committed row must be persisted");
+        let (idx, cell) = partition.rows[0]
+            .cells
+            .iter()
+            .find(|(_, c)| c.path.is_some())
+            .expect("the persisted list cell must have a path");
+
+        assert_eq!(
+            *idx & 0xC000,
+            0,
+            "stored column index carries no transient flag"
+        );
+        assert_ne!(
+            cell.path.as_deref(),
+            Some(coord_path.as_slice()),
+            "REBIND NOT ACTIVE end-to-end: the coordinator-clock path (t.time=1) survived the \
+             commit path — the 0x4000 flag was dropped between build_transaction_write and apply"
+        );
+        assert_eq!(
+            list_path_element_seq(cell.path.as_deref().unwrap()),
+            Some(element_seq),
+            "the rebound path preserves the element_seq"
+        );
+        assert_ne!(
+            cell.timestamp, 1,
+            "the cell timestamp is restamped to the agreed execution ts, confirming apply ran"
+        );
+    }
+
     #[tokio::test]
     async fn sole_replica_commit_uses_local_state_from_populated_slot() {
         // The session layer wires the committer from an AccordStateSlot the

@@ -115,6 +115,12 @@ pub fn build_serialization_header(
         }
     }
 
+    // Data-driven complex-collection activation (D-write, t_83c4f093): if the
+    // memtable produced any per-element cell (path set), this SSTable holds at
+    // least one complex column and must be framed as complex so the paths
+    // persist. Legacy whole-value cells (path=None) leave it false; the reader
+    // handles both formats (lazy dual-read).
+    let mut has_complex = false;
     for partition in partitions {
         // Scan static row cells if present
         if let Some(ref static_row) = partition.static_row {
@@ -130,6 +136,7 @@ pub fn build_serialization_header(
                 update_max_ts(&mut max_timestamp, cell.timestamp);
                 update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
                 update_min_ttl(&mut min_ttl, cell.ttl);
+                has_complex |= cell.path.is_some();
             }
         }
 
@@ -147,6 +154,7 @@ pub fn build_serialization_header(
                 update_max_ts(&mut max_timestamp, cell.timestamp);
                 update_min_ldt(&mut min_local_deletion_time, cell.local_deletion_time);
                 update_min_ttl(&mut min_ttl, cell.ttl);
+                has_complex |= cell.path.is_some();
             }
         }
     }
@@ -162,7 +170,7 @@ pub fn build_serialization_header(
     }
 
     SerializationHeader {
-        complex_collections: false,
+        complex_collections: has_complex,
         min_timestamp,
         min_local_deletion_time,
         min_ttl,

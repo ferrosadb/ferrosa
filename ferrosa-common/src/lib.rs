@@ -32,7 +32,8 @@ pub use accord::{
 };
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use complex_cell::{
-    reconcile, CellPath, ComplexColumn, CounterCell, CounterShard, CounterShardId,
+    accord_list_cell_path, list_path_element_seq, reconcile, CellPath, ComplexColumn, CounterCell,
+    CounterShard, CounterShardId,
 };
 pub use cql_type::{CqlType, CqlValue};
 pub use data_type::DataType;
