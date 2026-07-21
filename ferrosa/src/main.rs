@@ -1250,6 +1250,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mode_controller.set_raft_runtime(runtimes.raft.clone());
     mode_controller.set_data_runtime(runtimes.data.clone());
 
+    // Shared HLC: created once per process. The CQL transaction committer mints
+    // `t0` from it (below, via SharedState.accord_clock) and the node's
+    // AccordStateMachine — built at formation — advances the SAME clock past
+    // every execution timestamp it witnesses, so a later append's `t0` stays
+    // above earlier-committed appends even after they are GC'd (t_813caf39).
+    let accord_clock = {
+        let host_bytes = host_id.as_bytes();
+        let node_id = u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
+        Arc::new(ferrosa_common::accord::HybridLogicalClock::new(node_id, 0))
+    };
+    mode_controller.set_accord_clock(accord_clock.clone());
+
     // 6b. Start heartbeat loop for peer failure detection
     let heartbeat_pm = peer_manager.clone();
     runtimes.raft.spawn(async move {
@@ -1483,14 +1495,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // host_id (big-endian). The HLC is created once per process; all
             // Accord transactions on this node share it to guarantee monotone
             // timestamp ordering across concurrent LWT coordinators.
-            accord_clock: {
-                let host_bytes = host_id.as_bytes();
-                let node_id =
-                    u64::from_be_bytes(host_bytes[..8].try_into().expect("uuid has 16 bytes"));
-                Some(Arc::new(ferrosa_common::accord::HybridLogicalClock::new(
-                    node_id, 0, // use default 500 ms max drift
-                )))
-            },
+            // The SAME shared clock registered on the ModeController above, so the
+            // committer's `t0` and the replica's witnessed-timestamp advances act
+            // on one clock (t_813caf39).
+            accord_clock: Some(accord_clock.clone()),
             // Same shared slot the ModeController fills at cluster formation, so
             // the Accord committer votes the coordinator's own PreAccept against
             // the node's live AccordState (finishes the sole-replica/self-vote
