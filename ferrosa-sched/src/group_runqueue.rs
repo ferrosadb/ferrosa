@@ -63,10 +63,12 @@ pub struct GroupRunQueue {
 }
 
 /// A query picked to run, tagged with the group it belongs to (pass `group` back
-/// to [`charge`](GroupRunQueue::charge) when the query consumes service).
+/// to [`charge`](GroupRunQueue::charge) when the query consumes service, and
+/// `group_weight` to re-enqueue it on a cooperative yield).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Picked {
     pub group: GroupId,
+    pub group_weight: u32,
     pub entity: SchedEntity,
 }
 
@@ -123,14 +125,29 @@ impl GroupRunQueue {
         self.min_vruntime = self.min_vruntime.max(group.vruntime);
         // If the group has no more queued queries, it leaves the outer tree
         // until one of its queries re-enqueues.
+        let group_weight = group.weight;
         if group.queries.is_empty() {
             self.tree.remove(&key);
             group.tree_key = None;
         }
         Some(Picked {
             group: group_id,
+            group_weight,
             entity,
         })
+    }
+
+    /// The `(group_vruntime, query_vruntime)` of the query that [`pick_next`] would
+    /// return — the lexicographic priority of the most-deserving waiting scan.
+    /// A running scan yields when this is strictly smaller than its own
+    /// `(group_vruntime, query_vruntime)`, giving fairness at both levels: same
+    /// group → compare queries; different group → the group dominates.
+    ///
+    /// [`pick_next`]: GroupRunQueue::pick_next
+    pub fn peek_min(&self) -> Option<(u64, u64)> {
+        let (&(group_vruntime, _), group_id) = self.tree.iter().next()?;
+        let query_vruntime = self.groups[group_id].queries.peek_min_vruntime()?;
+        Some((group_vruntime, query_vruntime))
     }
 
     /// Charge `service` to group `group_id` (a query in it ran for `service`),
@@ -155,6 +172,39 @@ impl GroupRunQueue {
     /// for a should-switch decision at the group level.
     pub fn peek_min_group_vruntime(&self) -> Option<u64> {
         self.tree.keys().next().map(|(vruntime, _seq)| *vruntime)
+    }
+
+    /// Current `vruntime` of `group_id` (`None` if the group is unknown) — lets a
+    /// running query compare its group against the least waiting group.
+    pub fn group_vruntime(&self, group_id: GroupId) -> Option<u64> {
+        self.groups.get(&group_id).map(|g| g.vruntime)
+    }
+
+    /// Total queued queries across all groups (the admission-waiter count, for
+    /// the bounded-queue / `Overloaded` backpressure check).
+    pub fn len(&self) -> usize {
+        self.groups.values().map(|g| g.queries.len()).sum()
+    }
+
+    /// Remove the queued query `id` from whichever group holds it, dropping the
+    /// group from the outer tree if it becomes empty. Returns whether one was
+    /// removed. Used by admission cancellation cleanup (across groups).
+    pub fn remove_by_id(&mut self, id: u64) -> bool {
+        let mut emptied_key: Option<(u64, u64)> = None;
+        let mut removed = false;
+        for group in self.groups.values_mut() {
+            if group.queries.remove_by_id(id) {
+                removed = true;
+                if group.queries.is_empty() {
+                    emptied_key = group.tree_key.take();
+                }
+                break;
+            }
+        }
+        if let Some(key) = emptied_key {
+            self.tree.remove(&key);
+        }
+        removed
     }
 
     /// The monotonic group-level floor.

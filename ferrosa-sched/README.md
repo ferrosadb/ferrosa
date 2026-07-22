@@ -102,8 +102,14 @@ a CheckQuorum leader step-down.
   (group→query) fair queue with the T3.9 anti-gaming property (1 tenant × 100
   queries == 1 tenant × 1 query) and a T3.2 weight preview (share ∝ weight),
   plus an `advance_vruntime` floor so a high-weight group can't monopolize via
-  integer-division rounding. T3.8 (bounded runqueue + `Overloaded`) already
-  shipped in B1.5. Next: make it live in `FairAdmit` (thread the tenant group
-  through `submit_scan`), per-tenant weights from TOML (T3.2), and fold the
-  background work — compaction/repair/index-build/ANN — into the pool as the
-  `system` group (T3.3–T3.6), where the weighting finally arbitrates.
+  integer-division rounding. **Now LIVE in `FairAdmit`**: admission uses the
+  two-level queue (`admit(group, group_weight, class, cancel)`), charging the
+  group on each `reschedule` and yielding on a lexicographic `(group_vruntime,
+  query_vruntime)` compare — cross-tenant fairness proven end-to-end
+  (`tenants_get_equal_share_regardless_of_query_count`). All current pool work
+  runs in one `DEFAULT_TENANT_GROUP` (behavior-preserving); T3.8 (bounded
+  runqueue + `Overloaded`) already shipped in B1.5. Next: per-tenant weights
+  from TOML (T3.2), thread real `TenantContext` → group through the read path,
+  and fold background work — compaction/repair/index-build/ANN — into the pool
+  as the `system` group (T3.3–T3.6), where the weighting finally arbitrates
+  real mixed-weight contention.
