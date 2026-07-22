@@ -22,10 +22,85 @@
 //! reserved cores stay free for consensus. This crate is a leaf: it depends only
 //! on tokio, so nothing in the storage/cluster/cql stack leaks in (DSM guard).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+
+// Process-wide pool metrics. Cumulative counters live here (the Prometheus
+// registry reads them); instantaneous gauges (`headroom_cores`, `active`) are
+// read live off the global pool.
+static TASKS_ADMITTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ADMIT_WAIT_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total closures admitted to the bounded pool since process start.
+pub fn tasks_admitted_total() -> u64 {
+    TASKS_ADMITTED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Cumulative microseconds producers spent waiting for an admission slot
+/// (`admit-wait latency`). Rising fast = the pool is the bottleneck (scans
+/// queued behind the reservation), which is the intended backpressure.
+pub fn admit_wait_micros_total() -> u64 {
+    ADMIT_WAIT_MICROS_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_admission(wait: Duration) {
+    TASKS_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    ADMIT_WAIT_MICROS_TOTAL.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Render the scheduler's Prometheus metrics (text exposition format), reading
+/// the live gauges off the process-global pool plus the cumulative counters.
+/// Concatenated into `/metrics` by the web layer.
+///
+/// `ferrosa_sched_consensus_headroom_cores` is the load-bearing gauge for
+/// `t_88223ad0`: it must stay `> 0` (indeed `>= reserved`) throughout a scan
+/// storm — if it hits 0, consensus has no schedulable core.
+pub fn render_prometheus() -> String {
+    let pool = global_pool();
+    let mut out = String::with_capacity(768);
+    out.push_str(
+        "# HELP ferrosa_sched_consensus_headroom_cores CPU cores currently free of scheduler-pool work (>= reserved).\n\
+         # TYPE ferrosa_sched_consensus_headroom_cores gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_consensus_headroom_cores {}\n",
+        pool.headroom_cores()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_pool_capacity Max concurrent background closures the pool admits (cores - reserved).\n\
+         # TYPE ferrosa_sched_pool_capacity gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_pool_capacity {}\n",
+        pool.capacity()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_pool_active Background closures currently admitted (running).\n\
+         # TYPE ferrosa_sched_pool_active gauge\n",
+    );
+    out.push_str(&format!("ferrosa_sched_pool_active {}\n", pool.active()));
+    out.push_str(
+        "# HELP ferrosa_sched_tasks_admitted_total Closures admitted to the bounded pool since start.\n\
+         # TYPE ferrosa_sched_tasks_admitted_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_tasks_admitted_total {}\n",
+        tasks_admitted_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_admit_wait_micros_total Cumulative microseconds producers waited for a pool slot.\n\
+         # TYPE ferrosa_sched_admit_wait_micros_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_admit_wait_micros_total {}\n",
+        admit_wait_micros_total()
+    ));
+    out
+}
 
 /// Scheduling class of a unit of work. Phase 0 does not *act* on the class (the
 /// pool admits FIFO); it exists so B1 can attach fair-share weights without
@@ -102,6 +177,7 @@ impl SchedTicket {
 pub struct SchedPool {
     slots: Arc<Semaphore>,
     capacity: usize,
+    reservation: Reservation,
 }
 
 impl SchedPool {
@@ -111,6 +187,7 @@ impl SchedPool {
         Self {
             slots: Arc::new(Semaphore::new(capacity)),
             capacity,
+            reservation,
         }
     }
 
@@ -124,6 +201,18 @@ impl SchedPool {
         self.slots.available_permits()
     }
 
+    /// Background closures currently admitted (running or on a blocking thread).
+    pub fn active(&self) -> usize {
+        self.capacity.saturating_sub(self.slots.available_permits())
+    }
+
+    /// CPU cores currently NOT doing pool work — the consensus headroom
+    /// (`SCHED_CONSENSUS_HEADROOM_CORES`). Never drops below `reserved`, so raft
+    /// always has a schedulable core. Falls as scans admit, recovers as they end.
+    pub fn headroom_cores(&self) -> usize {
+        self.reservation.cores.saturating_sub(self.active())
+    }
+
     /// Admit and run `f` on a blocking thread once a slot is free, returning the
     /// join handle. Awaiting this future blocks (asynchronously) until admission;
     /// the returned handle resolves to `f`'s result (or a `JoinError` if `f`
@@ -133,12 +222,14 @@ impl SchedPool {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        let waited = Instant::now();
         let permit = self
             .slots
             .clone()
             .acquire_owned()
             .await
             .expect("scheduler pool semaphore is never closed");
+        record_admission(waited.elapsed());
         tokio::task::spawn_blocking(move || {
             // RAII: the permit is released when this closure returns OR unwinds,
             // so a panicking scan producer never leaks its admission slot.
@@ -165,10 +256,12 @@ impl SchedPool {
     {
         let slots = self.slots.clone();
         tokio::spawn(async move {
+            let waited = Instant::now();
             let permit = slots
                 .acquire_owned()
                 .await
                 .expect("scheduler pool semaphore is never closed");
+            record_admission(waited.elapsed());
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 f()
@@ -212,8 +305,7 @@ pub fn global_pool() -> &'static SchedPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn available_is_cores_minus_reserved_floored_at_one() {
@@ -340,5 +432,105 @@ mod tests {
             "global pool must be a stable singleton"
         );
         assert!(p1.capacity() >= 1, "global pool is always bounded (>= 1)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn headroom_reflects_active_and_never_below_reserved() {
+        // cores 4, reserved 2 => capacity 2.
+        let pool = SchedPool::new(Reservation::new(4, 2));
+        assert_eq!(pool.headroom_cores(), 4, "idle headroom == cores");
+        assert_eq!(pool.reservation.reserved, 2);
+
+        // Park both slots so `active` == capacity while we sample.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let rx = rx.clone();
+            handles.push(pool.submit_blocking(move || {
+                let _ = rx.lock().unwrap().recv(); // park until tx drops
+            }));
+        }
+        for _ in 0..400 {
+            if pool.active() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.active(), 2, "both slots admitted");
+        assert_eq!(
+            pool.headroom_cores(),
+            2,
+            "headroom == cores - active == reserved when full"
+        );
+        assert!(
+            pool.headroom_cores() >= pool.reservation.reserved,
+            "headroom never drops below the consensus reservation"
+        );
+
+        drop(tx); // recv() returns Err -> parked tasks finish
+        for h in handles {
+            let _ = h.await;
+        }
+        for _ in 0..400 {
+            if pool.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.headroom_cores(), 4, "headroom recovers to cores");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_counters_increase() {
+        // Process-wide counters are shared across parallel tests, so assert a
+        // monotonic DELTA that our submissions must at least account for.
+        let before_admitted = tasks_admitted_total();
+        let before_wait = admit_wait_micros_total();
+        let pool = SchedPool::new(Reservation::new(2, 0));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            handles.push(pool.submit_blocking(|| {}));
+        }
+        for h in handles {
+            h.await.expect("task joined");
+        }
+        assert!(
+            tasks_admitted_total() >= before_admitted + 5,
+            "admitted counter must reflect at least our 5 admissions"
+        );
+        assert!(
+            admit_wait_micros_total() >= before_wait,
+            "admit-wait micros is monotonic"
+        );
+    }
+
+    #[test]
+    fn render_prometheus_emits_headroom_gauge_and_counters() {
+        let text = render_prometheus();
+        for metric in [
+            "ferrosa_sched_consensus_headroom_cores",
+            "ferrosa_sched_pool_capacity",
+            "ferrosa_sched_pool_active",
+            "ferrosa_sched_tasks_admitted_total",
+            "ferrosa_sched_admit_wait_micros_total",
+        ] {
+            assert!(text.contains(metric), "missing metric {metric}");
+        }
+        assert!(
+            text.contains("# TYPE ferrosa_sched_consensus_headroom_cores gauge"),
+            "headroom must be typed as a gauge"
+        );
+        // The headroom sample line must carry a numeric value.
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ferrosa_sched_consensus_headroom_cores "))
+            .expect("headroom sample line present");
+        let value: usize = line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("headroom value is a number");
+        assert!(value >= 1, "global pool headroom is always >= 1 core");
     }
 }
