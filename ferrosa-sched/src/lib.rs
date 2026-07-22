@@ -149,26 +149,6 @@ impl Reservation {
     }
 }
 
-/// Opaque scheduling ticket threaded router -> coordinator -> producer. Phase 0
-/// is a no-op carrier that records the [`SchedClass`]; B1 activates fair-share
-/// accounting on it without changing the call sites that already pass it.
-#[derive(Clone, Copy, Debug)]
-pub struct SchedTicket {
-    class: SchedClass,
-}
-
-impl SchedTicket {
-    /// Mint a ticket for `class`.
-    pub fn new(class: SchedClass) -> Self {
-        Self { class }
-    }
-
-    /// The class this ticket was minted for.
-    pub fn class(&self) -> SchedClass {
-        self.class
-    }
-}
-
 /// Bounded execution pool for CPU-bound background work.
 ///
 /// [`submit`](SchedPool::submit) runs a blocking closure on tokio's blocking
