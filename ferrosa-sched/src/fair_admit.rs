@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use crate::runqueue::{RunQueue, SchedEntity};
+use crate::group_runqueue::{GroupId, GroupRunQueue};
+use crate::runqueue::SchedEntity;
 use crate::scheduler::advance_vruntime;
 use crate::SchedClass;
 
@@ -55,10 +56,14 @@ pub enum Admitted {
 struct State {
     /// Free slots (starts at `capacity`).
     free: usize,
-    /// Scans waiting for a slot, ordered by `vruntime`.
-    queue: RunQueue,
-    /// Scans currently holding a slot: id → its live scheduling state.
-    running: HashMap<u64, SchedEntity>,
+    /// Scans waiting for a slot, ordered by (group `vruntime`, query `vruntime`)
+    /// — the two-level hierarchical queue (B3), so scheduling is fair between
+    /// tenants (groups) as well as between a tenant's queries.
+    queue: GroupRunQueue,
+    /// Scans currently holding a slot: id → (group, group weight, live
+    /// scheduling state). The group + weight are kept so a yielding scan
+    /// re-enters its own group.
+    running: HashMap<u64, (GroupId, u32, SchedEntity)>,
     /// Per-waiter wakeups, keyed by scan id.
     waiters: HashMap<u64, Arc<Notify>>,
     next_id: u64,
@@ -106,13 +111,13 @@ impl FairAdmit {
     /// A pool granting at most `capacity` (≥1) concurrent slots, admitting up to
     /// `max_waiters` (≥1) scans to *wait* before rejecting further requests with
     /// [`Admitted::Overloaded`]; waking scans get `boost` sleeper credit (see
-    /// [`RunQueue::new`]).
+    /// [`GroupRunQueue::new`]).
     pub fn new(capacity: usize, boost: u64, max_waiters: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
             state: Mutex::new(State {
                 free: capacity,
-                queue: RunQueue::new(boost),
+                queue: GroupRunQueue::new(boost),
                 running: HashMap::new(),
                 waiters: HashMap::new(),
                 next_id: 0,
@@ -147,8 +152,16 @@ impl FairAdmit {
     ///   occupies a slot just to discover the closed channel.
     ///
     /// Pass [`std::future::pending()`] for `cancel` when the caller has no
-    /// cancellation signal.
-    pub async fn admit(&self, class: SchedClass, cancel: impl Future<Output = ()>) -> Admitted {
+    /// cancellation signal. `group` (weighted by `group_weight`) is the tenant
+    /// the scan belongs to — admission is fair *between* groups as well as within
+    /// them (B3).
+    pub async fn admit(
+        &self,
+        group: GroupId,
+        group_weight: u32,
+        class: SchedClass,
+        cancel: impl Future<Output = ()>,
+    ) -> Admitted {
         let (id, notify) = {
             let mut s = self.state.lock().expect("fair-admit poisoned");
             // Backpressure: no free slot and the waiter queue is full → reject
@@ -161,7 +174,8 @@ impl FairAdmit {
             }
             let id = s.next_id;
             s.next_id += 1;
-            s.queue.enqueue(SchedEntity::new(id, class));
+            s.queue
+                .enqueue(group, group_weight, SchedEntity::new(id, class));
             let notify = Arc::new(Notify::new());
             s.waiters.insert(id, notify.clone());
             self.dispatch(&mut s);
@@ -221,21 +235,28 @@ impl FairAdmit {
     pub fn reschedule(&self, handle: &tokio::runtime::Handle, id: u64, service: u64) {
         let notify = {
             let mut s = self.state.lock().expect("fair-admit poisoned");
-            let mut entity = match s.running.remove(&id) {
-                Some(e) => e,
+            let (group, weight, mut entity) = match s.running.remove(&id) {
+                Some(x) => x,
                 None => return, // not currently granted — nothing to do
             };
             entity.vruntime = advance_vruntime(entity.vruntime, service, entity.weight);
-            // Keep the slot unless a strictly-more-deserving scan waits.
-            let should_yield =
-                crate::scheduler::should_switch(entity.vruntime, s.queue.peek_min_vruntime());
+            // Charge the group too, so its aggregate share reflects all its
+            // queries' service (B3 group fairness).
+            s.queue.charge(group, service);
+            // Yield only if a strictly-more-deserving scan waits, compared
+            // lexicographically (group `vruntime`, then query `vruntime`): same
+            // group → the query comparison decides (within-tenant fairness);
+            // different group → the group dominates (cross-tenant fairness).
+            let group_vruntime = s.queue.group_vruntime(group).unwrap_or(entity.vruntime);
+            let running_key = (group_vruntime, entity.vruntime);
+            let should_yield = s.queue.peek_min().is_some_and(|min| min < running_key);
             if !should_yield {
-                s.running.insert(id, entity);
+                s.running.insert(id, (group, weight, entity));
                 return;
             }
-            // Yield: release the slot and re-compete.
+            // Yield: release the slot and re-compete within its group.
             s.free += 1;
-            s.queue.enqueue(entity);
+            s.queue.enqueue(group, weight, entity);
             let notify = Arc::new(Notify::new());
             s.waiters.insert(id, notify.clone());
             self.dispatch(&mut s);
@@ -266,14 +287,16 @@ impl FairAdmit {
         self.dispatch(&mut s);
     }
 
-    /// Grant every free slot to the least-`vruntime` waiter and wake it.
+    /// Grant every free slot to the most-deserving waiter (least-`vruntime`
+    /// query of the least-`vruntime` group) and wake it.
     fn dispatch(&self, s: &mut State) {
         while s.free > 0 {
             match s.queue.pick_next() {
-                Some(entity) => {
-                    let id = entity.id;
+                Some(picked) => {
+                    let id = picked.entity.id;
                     s.free -= 1;
-                    s.running.insert(id, entity);
+                    s.running
+                        .insert(id, (picked.group, picked.group_weight, picked.entity));
                     if let Some(n) = s.waiters.get(&id) {
                         n.notify_one();
                     }
@@ -294,6 +317,11 @@ mod tests {
 
     use super::*;
 
+    /// A single test tenant group (equal weight) — most tests exercise one group,
+    /// so the class weighting and cancellation logic show without group effects.
+    const G: GroupId = 7;
+    const GW: u32 = crate::group_runqueue::DEFAULT_GROUP_WEIGHT;
+
     /// Unwrap a granted slot or fail the test loudly.
     fn slot(outcome: Admitted) -> u64 {
         match outcome {
@@ -313,7 +341,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let id = slot(
                     admit
-                        .admit(SchedClass::Bulk, std::future::pending::<()>())
+                        .admit(G, GW, SchedClass::Bulk, std::future::pending::<()>())
                         .await,
                 );
                 let now = admit.active();
@@ -353,7 +381,8 @@ mod tests {
             let ran = ran.clone();
             let served = served.clone();
             tokio::task::spawn_blocking(move || {
-                let id = slot(handle.block_on(admit.admit(class, std::future::pending::<()>())));
+                let id =
+                    slot(handle.block_on(admit.admit(G, GW, class, std::future::pending::<()>())));
                 while served.fetch_add(1, Ordering::SeqCst) < BUDGET {
                     *ran.lock().unwrap().entry(tag).or_insert(0) += 1;
                     admit.reschedule(&handle, id, 10);
@@ -386,9 +415,12 @@ mod tests {
             let handle = handle.clone();
             let ran = ran.clone();
             tasks.push(tokio::task::spawn_blocking(move || {
-                let id = slot(
-                    handle.block_on(admit.admit(SchedClass::Bulk, std::future::pending::<()>())),
-                );
+                let id = slot(handle.block_on(admit.admit(
+                    G,
+                    GW,
+                    SchedClass::Bulk,
+                    std::future::pending::<()>(),
+                )));
                 for _ in 0..600 {
                     *ran.lock().unwrap().entry(tag).or_insert(0) += 1;
                     admit.reschedule(&handle, id, 10);
@@ -407,6 +439,54 @@ mod tests {
         assert_eq!(admit.active(), 0);
     }
 
+    /// B3 — cross-tenant fairness through the LIVE admission path. Two tenants
+    /// contend for one slot: group 1 runs three scans, group 2 runs one, at equal
+    /// group weight. They get ~equal AGGREGATE service — the anti-gaming property
+    /// holds end-to-end through `admit`/`reschedule`, not just in the queue unit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn tenants_get_equal_share_regardless_of_query_count() {
+        let admit = Arc::new(FairAdmit::new(1, 0, 64));
+        let handle = tokio::runtime::Handle::current();
+        let served: Arc<Mutex<Map<GroupId, u64>>> = Arc::new(Mutex::new(Map::new()));
+        let total = Arc::new(AtomicUsize::new(0));
+        const BUDGET: usize = 6000;
+
+        let run = |group: GroupId| {
+            let admit = admit.clone();
+            let handle = handle.clone();
+            let served = served.clone();
+            let total = total.clone();
+            tokio::task::spawn_blocking(move || {
+                let id = slot(handle.block_on(admit.admit(
+                    group,
+                    GW,
+                    SchedClass::Bulk,
+                    std::future::pending::<()>(),
+                )));
+                while total.fetch_add(1, Ordering::SeqCst) < BUDGET {
+                    *served.lock().unwrap().entry(group).or_insert(0) += 1;
+                    admit.reschedule(&handle, id, 10);
+                }
+                admit.finish(id);
+            })
+        };
+        // Group 1: three scans (the "gaming" tenant); group 2: one scan.
+        let tasks = vec![run(1), run(1), run(1), run(2)];
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let served = served.lock().unwrap();
+        let (a, b) = (served[&1] as f64, served[&2] as f64);
+        let ratio = a / b;
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "tenants should get ~equal aggregate share regardless of query count: \
+             group1(3 scans)={a} group2(1 scan)={b} ratio={ratio:.2}"
+        );
+        assert_eq!(admit.active(), 0);
+    }
+
     /// A scan whose `cancel` fires before it is granted returns `Cancelled`,
     /// vacates the queue, and leaves NO phantom entry that would later steal a
     /// slot — the core of Ben's "dropped range stream leaks a queued admission".
@@ -415,12 +495,14 @@ mod tests {
         let admit = FairAdmit::new(1, 0, 16);
         let held = slot(
             admit
-                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .admit(G, GW, SchedClass::Bulk, std::future::pending::<()>())
                 .await,
         );
         // The single slot is held; a second scan whose cancel is already ready
         // must resolve to Cancelled rather than wait or grab a slot.
-        let outcome = admit.admit(SchedClass::Bulk, std::future::ready(())).await;
+        let outcome = admit
+            .admit(G, GW, SchedClass::Bulk, std::future::ready(()))
+            .await;
         assert_eq!(outcome, Admitted::Cancelled);
         // Releasing the held slot finds no waiter (no phantom) → fully free.
         admit.finish(held);
@@ -434,13 +516,13 @@ mod tests {
         let admit = FairAdmit::new(1, 0, 16);
         let held = slot(
             admit
-                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .admit(G, GW, SchedClass::Bulk, std::future::pending::<()>())
                 .await,
         );
         let mut cx = Context::from_waker(std::task::Waker::noop());
         {
             // Enqueues, then parks (no free slot). Poll once, then drop.
-            let mut fut = pin!(admit.admit(SchedClass::Bulk, std::future::pending::<()>()));
+            let mut fut = pin!(admit.admit(G, GW, SchedClass::Bulk, std::future::pending::<()>()));
             assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
         }
         admit.finish(held);
@@ -454,7 +536,7 @@ mod tests {
         let admit = FairAdmit::new(1, 0, 2); // 1 slot, at most 2 waiters
         let held = slot(
             admit
-                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .admit(G, GW, SchedClass::Bulk, std::future::pending::<()>())
                 .await,
         );
         let mut cx = Context::from_waker(std::task::Waker::noop());
@@ -462,13 +544,13 @@ mod tests {
             // Fill the waiter queue (poll once each). The `pin!`ed futures live
             // to the end of this block, so they must be scoped here — dropping
             // the `Pin<&mut _>` handle would not drop the future.
-            let mut w1 = pin!(admit.admit(SchedClass::Bulk, std::future::pending::<()>()));
-            let mut w2 = pin!(admit.admit(SchedClass::Bulk, std::future::pending::<()>()));
+            let mut w1 = pin!(admit.admit(G, GW, SchedClass::Bulk, std::future::pending::<()>()));
+            let mut w2 = pin!(admit.admit(G, GW, SchedClass::Bulk, std::future::pending::<()>()));
             assert!(matches!(w1.as_mut().poll(&mut cx), Poll::Pending));
             assert!(matches!(w2.as_mut().poll(&mut cx), Poll::Pending));
             // Third request: no slot, queue full → Overloaded (resolves at once).
             let outcome = admit
-                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .admit(G, GW, SchedClass::Bulk, std::future::pending::<()>())
                 .await;
             assert_eq!(outcome, Admitted::Overloaded);
         }
