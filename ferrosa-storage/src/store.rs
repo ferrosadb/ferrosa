@@ -2746,7 +2746,13 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
+        // Every scan through the bounded pool is an unbounded full-table range
+        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
+        // fair scheduler weights it as Bulk so it cedes to any Foreground work
+        // sharing the pool (interactive scans today bypass; B3 folds in
+        // compaction/repair, which this weighting then arbitrates).
         ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::SchedClass::Bulk,
             ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
             move |slot| {
                 let active_iter = view
@@ -2851,7 +2857,13 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
+        // Every scan through the bounded pool is an unbounded full-table range
+        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
+        // fair scheduler weights it as Bulk so it cedes to any Foreground work
+        // sharing the pool (interactive scans today bypass; B3 folds in
+        // compaction/repair, which this weighting then arbitrates).
         ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::SchedClass::Bulk,
             ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
             move |slot| {
                 // Build source iterators — these borrow from `view`
@@ -2954,7 +2966,13 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
+        // Every scan through the bounded pool is an unbounded full-table range
+        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
+        // fair scheduler weights it as Bulk so it cedes to any Foreground work
+        // sharing the pool (interactive scans today bypass; B3 folds in
+        // compaction/repair, which this weighting then arbitrates).
         ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::SchedClass::Bulk,
             ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
             move |slot| {
                 let active_iter = view
@@ -3041,7 +3059,13 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
+        // Every scan through the bounded pool is an unbounded full-table range
+        // scan (`ScanPlan::FullScan`-class work) — see ScanPlan::sched_class. The
+        // fair scheduler weights it as Bulk so it cedes to any Foreground work
+        // sharing the pool (interactive scans today bypass; B3 folds in
+        // compaction/repair, which this weighting then arbitrates).
         ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::SchedClass::Bulk,
             ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
             move |slot| {
                 let active_iter = view
