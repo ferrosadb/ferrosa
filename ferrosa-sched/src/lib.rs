@@ -29,6 +29,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+pub mod runqueue;
+pub mod scheduler;
+
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus
 // registry reads them); instantaneous gauges (`headroom_cores`, `active`) are
 // read live off the global pool.
