@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+pub mod fair_admit;
 pub mod runqueue;
 pub mod scheduler;
 
@@ -156,10 +156,12 @@ pub fn render_prometheus() -> String {
     out
 }
 
-/// Scheduling class of a unit of work. Phase 0 does not *act* on the class (the
-/// pool admits FIFO); it exists so B1 can attach fair-share weights without
-/// re-touching call sites. Consensus work never flows through [`SchedPool`] — it
-/// runs on its own reserved runtime — so it has no variant here by design.
+/// Scheduling class of a scan. Seeds the fair-share weight the live
+/// [`fair_admit::FairAdmit`] scheduler orders admission by: a `Foreground` scan
+/// (weight 1024) advances `vruntime` 4x slower than a `Bulk` scan (256), so it
+/// gets ~4x the slot turns under contention. Consensus work never flows through
+/// [`SchedPool`] — it runs on its own reserved runtime — so it has no variant
+/// here by design.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchedClass {
     /// Latency-sensitive client reads/writes.
@@ -200,44 +202,58 @@ impl Reservation {
     }
 }
 
-/// Bounded execution pool for CPU-bound background work.
+/// Bounded, vruntime-fair execution pool for CPU-bound scan work.
 ///
-/// [`submit`](SchedPool::submit) runs a blocking closure on tokio's blocking
-/// threads but admits at most [`capacity`](SchedPool::capacity) at once, so the
-/// reserved consensus cores are never oversubscribed. The admission permit is
-/// moved into the blocking task and dropped when it finishes — including on
-/// panic — so a slot is never leaked (RAII).
+/// Admission is governed by [`fair_admit::FairAdmit`]: at most
+/// [`capacity`](SchedPool::capacity) = `cores − reserved` scans hold a slot at
+/// once (so the reserved consensus cores are never oversubscribed), and a freed
+/// slot is granted to the least-`vruntime` waiter — weighted by
+/// [`SchedClass`], so a Foreground scan gets ~4x the slot
+/// turns of a Bulk scan under contention. B1.5 made this the live authority
+/// (replacing the earlier FIFO semaphore).
 #[derive(Clone)]
 pub struct SchedPool {
-    slots: Arc<Semaphore>,
+    admit: Arc<fair_admit::FairAdmit>,
     capacity: usize,
     reservation: Reservation,
 }
 
+/// Releases a held slot on drop — the RAII backstop so a panicking task never
+/// leaks its admission slot.
+struct SlotGuard {
+    admit: Arc<fair_admit::FairAdmit>,
+    id: u64,
+}
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.admit.finish(self.id);
+    }
+}
+
 impl SchedPool {
-    /// Build a pool admitting `reservation.available()` CPU-bound tasks at once.
+    /// Build a pool admitting `reservation.available()` scans at once.
     pub fn new(reservation: Reservation) -> Self {
         let capacity = reservation.available();
         Self {
-            slots: Arc::new(Semaphore::new(capacity)),
+            admit: Arc::new(fair_admit::FairAdmit::new(capacity, 0)),
             capacity,
             reservation,
         }
     }
 
-    /// Maximum number of closures admitted concurrently.
+    /// Maximum number of scans admitted concurrently.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Currently free admission slots (`capacity` minus in-flight).
     pub fn available_permits(&self) -> usize {
-        self.slots.available_permits()
+        self.capacity.saturating_sub(self.admit.active())
     }
 
-    /// Background closures currently admitted (running or on a blocking thread).
+    /// Scans currently admitted (holding a slot).
     pub fn active(&self) -> usize {
-        self.capacity.saturating_sub(self.slots.available_permits())
+        self.admit.active()
     }
 
     /// CPU cores currently NOT doing pool work — the consensus headroom
@@ -247,57 +263,41 @@ impl SchedPool {
         self.reservation.cores.saturating_sub(self.active())
     }
 
-    /// Admit and run `f` on a blocking thread once a slot is free, returning the
-    /// join handle. Awaiting this future blocks (asynchronously) until admission;
-    /// the returned handle resolves to `f`'s result (or a `JoinError` if `f`
-    /// panicked). The admission slot is released when the task ends.
+    /// Admit and run `f` on a blocking thread once a slot is granted (at `Bulk`
+    /// weight). Awaiting resolves once admitted; the returned handle resolves to
+    /// `f`'s result (or a `JoinError` on panic). The slot is released on return
+    /// OR unwind (RAII). Generic entry — the scan producers use
+    /// [`submit_scan`](Self::submit_scan).
     pub async fn submit<F, R>(&self, f: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let waited = Instant::now();
-        let permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("scheduler pool semaphore is never closed");
+        let id = self.admit.admit(SchedClass::Bulk).await;
         record_admission(waited.elapsed());
+        let admit = self.admit.clone();
         tokio::task::spawn_blocking(move || {
-            // RAII: the permit is released when this closure returns OR unwinds,
-            // so a panicking scan producer never leaks its admission slot.
-            let _permit = permit;
+            let _guard = SlotGuard { admit, id };
             f()
         })
     }
 
-    /// Sync entry point for producers that run *inside* a runtime but are not
-    /// themselves `async` (the storage scan producers: sync functions that fire a
-    /// blocking task and return a stream). Spawns a cheap async admitter that
-    /// acquires a slot and only then moves `f` onto a blocking thread — so at most
-    /// [`capacity`](Self::capacity) blocking threads ever exist. Excess producers
-    /// wait as async tasks, NOT as parked blocking threads (which is what
-    /// oversubscribed the cores and starved raft).
-    ///
-    /// Must be called from within a tokio runtime. The returned handle resolves to
-    /// `f`'s result; a panic in `f` surfaces as a `JoinError` (and, being detached
-    /// by the callers, is logged by tokio rather than crashing the process).
+    /// Sync entry for a generic blocking task (fires a cheap async admitter, then
+    /// moves `f` onto a blocking thread once admitted — so excess tasks wait as
+    /// async tasks, not parked blocking threads). Admits at `Bulk` weight.
     pub fn submit_blocking<F, R>(&self, f: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let slots = self.slots.clone();
+        let admit = self.admit.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
-            let permit = slots
-                .acquire_owned()
-                .await
-                .expect("scheduler pool semaphore is never closed");
+            let id = admit.admit(SchedClass::Bulk).await;
             record_admission(waited.elapsed());
             tokio::task::spawn_blocking(move || {
-                let _permit = permit;
+                let _guard = SlotGuard { admit, id };
                 f()
             })
             .await
@@ -305,43 +305,41 @@ impl SchedPool {
         })
     }
 
-    /// Sync entry for a *cooperative* scan producer (B1 T1.2). Like
-    /// [`submit_blocking`](Self::submit_blocking), but `f` receives a
-    /// [`ScanSlot`] and must call [`ScanSlot::tick`] after each produced chunk.
-    /// Every `chunk_budget` ticks the slot's pool permit is released and fairly
-    /// re-acquired, so a long full-table scan cedes the pool to waiting scans
-    /// instead of holding a slot for its whole duration — the fix for one scan
-    /// monopolizing the bounded pool (the residual B0 leaves).
+    /// Sync entry for a *cooperative* scan producer (B1). `f` receives a
+    /// [`ScanSlot`] and must call [`ScanSlot::tick`] after each produced chunk;
+    /// every `chunk_budget` ticks the scan re-competes for its slot in vruntime
+    /// order, so a long full-table scan cedes to more-deserving scans instead of
+    /// monopolizing the pool. `class` seeds the fair-share weight.
     ///
-    /// Deadlock-free: the permit is dropped BEFORE the blocking re-acquire, so a
-    /// slot is always available to a waiter; and a parked re-acquire consumes no
-    /// CPU (it does not oversubscribe the cores B0 protects).
-    pub fn submit_scan<F, R>(&self, chunk_budget: u32, f: F) -> JoinHandle<R>
+    /// The scan waits for its first slot as a cheap async task (B0 property); its
+    /// mid-scan re-competes block the scan's own blocking thread. Deadlock-free
+    /// (a yielding scan releases before re-competing) and the slot is released on
+    /// return OR unwind (RAII via [`ScanSlot`]'s drop).
+    pub fn submit_scan<F, R>(&self, class: SchedClass, chunk_budget: u32, f: F) -> JoinHandle<R>
     where
         F: FnOnce(&mut ScanSlot) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let slots = self.slots.clone();
+        let admit = self.admit.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
-            let permit = slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("scheduler pool semaphore is never closed");
+            let id = admit.admit(class).await;
             record_admission(waited.elapsed());
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
                 let mut slot = ScanSlot {
-                    slots,
-                    permit: Some(permit),
+                    admit,
+                    id,
                     chunk_budget: chunk_budget.max(1),
                     since_yield: 0,
                     yields: 0,
                     handle,
                     last_tick: Instant::now(),
+                    finished: false,
                 };
-                f(&mut slot)
+                let out = f(&mut slot);
+                slot.finish();
+                out
             })
             .await
             .expect("scheduler blocking task must not be cancelled")
@@ -349,15 +347,13 @@ impl SchedPool {
     }
 }
 
-/// The cooperative-yield handle a [`SchedPool::submit_scan`] producer holds for
-/// its lifetime. Call [`tick`](Self::tick) after each produced chunk; every
-/// `chunk_budget` ticks it yields the pool slot (release + fair re-acquire) so
-/// concurrent scans interleave instead of one monopolizing the pool.
+/// The fair-share handle a [`SchedPool::submit_scan`] producer holds for its
+/// lifetime. Call [`tick`](Self::tick) after each produced chunk; every
+/// `chunk_budget` ticks it re-competes for its slot in vruntime order, so a long
+/// scan cedes to more-deserving scans instead of monopolizing the pool.
 pub struct ScanSlot {
-    slots: Arc<Semaphore>,
-    /// The held admission permit. `None` only transiently, mid-yield, while the
-    /// slot is released and a replacement is being acquired.
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    admit: Arc<fair_admit::FairAdmit>,
+    id: u64,
     chunk_budget: u32,
     since_yield: u32,
     yields: u64,
@@ -365,49 +361,57 @@ pub struct ScanSlot {
     /// When the current chunk's work started (the last `tick` return). Used to
     /// measure per-chunk work time for the FM-2 yield-point-gap tripwire.
     last_tick: Instant,
+    finished: bool,
 }
 
 impl ScanSlot {
     /// Account one produced chunk. Records the chunk's work time for the FM-2
-    /// tripwire, and every `chunk_budget` calls releases the pool permit so a
-    /// waiting scan can run, then fairly (FIFO) re-acquires one.
+    /// tripwire, and every `chunk_budget` calls re-competes for the slot: the
+    /// scan's `vruntime` advances (weighted by class), and if a waiting scan is
+    /// now more deserving this scan yields and blocks until re-granted.
     ///
     /// Runs on a `spawn_blocking` thread (not an async context), so blocking on
-    /// the re-acquire via the runtime handle is sound.
+    /// the re-compete via the runtime handle is sound.
     ///
     /// # Deadlock safety (T1.7)
     ///
-    /// The caller must hold **no lock across `tick()`**. The re-acquire blocks
-    /// until the pool permit is granted, and the permit is only freed as *other*
-    /// scans yield or finish — so a storage/index lock held here could deadlock
-    /// those scans (FM-3/FM-7). The `store.rs` producers load shared state via
-    /// arc-swap (`load_full()` → owned `Arc`s), holding no guard; the
+    /// The caller must hold **no lock across `tick()`**. The re-compete blocks
+    /// until a slot is granted, and slots are freed only as *other* scans yield
+    /// or finish — so a storage/index lock held here could deadlock those scans
+    /// (FM-3/FM-7). The `store.rs` producers load shared state via arc-swap
+    /// (`load_full()` → owned `Arc`s), holding no guard; the
     /// `scan_cooperative_yield_guard` source test enforces it.
     pub fn tick(&mut self) {
-        // Work time of the chunk just produced (excludes any yield wait below,
-        // because `last_tick` is reset AFTER the re-acquire).
         record_chunk(self.last_tick.elapsed());
         self.since_yield += 1;
         if self.since_yield >= self.chunk_budget {
             self.since_yield = 0;
             self.yields += 1;
-            // Release BEFORE re-acquiring: a slot is always free for a waiter.
-            self.permit = None;
-            let slots = self.slots.clone();
-            let waited = Instant::now();
-            let permit = self
-                .handle
-                .block_on(async move { slots.acquire_owned().await })
-                .expect("scheduler pool semaphore is never closed");
-            record_admission(waited.elapsed());
-            self.permit = Some(permit);
+            // Account the budget's worth of service, then re-compete in vruntime
+            // order (may yield the slot to a more-deserving scan).
+            self.admit
+                .reschedule(&self.handle, self.id, u64::from(self.chunk_budget));
         }
         self.last_tick = Instant::now();
     }
 
-    /// How many times this slot has yielded and re-acquired its permit.
+    /// How many times this scan re-competed for its slot at a budget boundary.
     pub fn yields(&self) -> u64 {
         self.yields
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.admit.finish(self.id);
+        }
+    }
+}
+
+impl Drop for ScanSlot {
+    /// RAII backstop: release the slot even if the producer panicked.
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -538,7 +542,7 @@ mod tests {
 
         // 10 chunks, budget 3 => yields after ticks 3, 6, 9 => 3 yields.
         let yields = pool
-            .submit_scan(3, |slot| {
+            .submit_scan(SchedClass::Bulk, 3, |slot| {
                 for _ in 0..10 {
                     slot.tick();
                 }
@@ -553,7 +557,7 @@ mod tests {
 
         // A budget larger than the chunk count never yields.
         let yields = pool
-            .submit_scan(100, |slot| {
+            .submit_scan(SchedClass::Bulk, 100, |slot| {
                 for _ in 0..5 {
                     slot.tick();
                 }
@@ -572,7 +576,7 @@ mod tests {
         let before = over_budget_chunks_total();
         let pool = SchedPool::new(Reservation::new(1, 0));
         let over_by = Duration::from_micros(DEFAULT_CHUNK_BUDGET_MICROS + 20_000);
-        pool.submit_scan(1000, move |slot| {
+        pool.submit_scan(SchedClass::Bulk, 1000, move |slot| {
             // Simulate a pathologically slow chunk (a huge partition decode).
             std::thread::sleep(over_by);
             slot.tick();

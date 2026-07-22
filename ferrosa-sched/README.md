@@ -17,21 +17,23 @@ a CheckQuorum leader step-down.
 ## What
 
 - `Reservation { cores, reserved }` — `available() = cores − reserved` (floored at 1).
-- `SchedPool` — a semaphore-bounded pool. `submit(closure)` admits at most
-  `available()` CPU-bound closures at once and runs them on tokio's blocking
-  threads; the admission permit is moved into the task, so a slot is released on
-  completion **or panic** (RAII).
-- `SchedPool::submit_scan(chunk_budget, f)` + `ScanSlot` (**B1 T1.2**) — a
-  cooperative-yield scan entry: the producer calls `slot.tick()` after each
-  produced chunk and, every `chunk_budget` chunks, the pool permit is released
-  and fairly (FIFO) re-acquired, so a long full-table scan cedes the slot to
-  waiting scans. Deadlock-free (release before re-acquire) and no CPU
-  oversubscription (parked re-acquires don't run).
-- `SchedClass { Foreground, Bulk }` + `runqueue::{RunQueue, SchedEntity,
-  weight_for_class}` + `scheduler::{Scheduler, SchedTicket, advance_vruntime}`
-  (**B1 T1.1/T1.2**) — the CFS-inspired vruntime fair-share core: pick-min run
-  queue with a monotonic `min_vruntime` floor, `SchedTicket::reschedule` service
-  accounting, and weighted fairness (Foreground 1024 : Bulk 256).
+- `fair_admit::FairAdmit` (**B1.5**) — the live admission authority. At most
+  `available()` scans hold a slot at once, and a freed slot is granted to the
+  least-`vruntime` waiter, **weighted by `SchedClass`**: a Foreground scan (1024)
+  advances `vruntime` 4x slower than a Bulk scan (256), so under contention it
+  gets ~4x the slot turns. Admission is async (a waiter is a cheap task, never a
+  parked blocking thread — the B0 property); a scan's mid-scan re-competes block
+  its own blocking thread. Deadlock-free and slot-leak-free (RAII).
+- `SchedPool` — wraps `FairAdmit`. `submit_scan(class, chunk_budget, f)` + a
+  `ScanSlot`: the producer calls `slot.tick()` per produced chunk and every
+  `chunk_budget` chunks re-competes for its slot in vruntime order, so a long
+  full-table scan cedes to more-deserving scans. `submit`/`submit_blocking` are
+  the generic (Bulk-weight) entries.
+- `runqueue::{RunQueue, SchedEntity, weight_for_class}` +
+  `scheduler::{advance_vruntime, should_switch}` — the pure vruntime primitives
+  `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`
+  floor, service charged inversely to weight, and the strictly-more-deserving
+  yield rule.
 
 ## Dependencies / dependents
 
@@ -43,9 +45,15 @@ a CheckQuorum leader step-down.
 
 ## Status
 
-- **B0 (shipped, PR #286):** T0.1 pool, T0.2 `max_blocking_threads`, T0.3 route
-  scan producers, T0.5 headroom metrics, T0.6 live no-step-down regression.
-- **B1 (in progress, PR #287):** T1.1 run queue, T1.2 `Scheduler`/`SchedTicket`
-  + `submit_scan` cooperative yield wired into the `store.rs` producers, T1.4
-  `ScanPlan` classifier. Pending: T1.3 chunk-budget tripwire, T1.5 interactive
-  bypass, T1.6 fairness proptests, T1.7 no-lock audit, weighted per-scan budget.
+- **B0 (PR #286):** T0.1 pool, T0.2 `max_blocking_threads`, T0.3 route scan
+  producers, T0.5 headroom metrics, T0.6 live no-step-down regression.
+- **B1 (PR #287):** T1.1 run queue, T1.2 cooperative yield in the `store.rs`
+  producers, T1.3 chunk-budget tripwire, T1.4 `ScanPlan` classifier, T1.5
+  interactive bypass, T1.6 fairness proptests, T1.7 no-lock audit.
+- **B1.5 (PR #287):** `FairAdmit` — the vruntime scheduler is now the **live
+  admission authority** (replacing the FIFO semaphore); weighting is real and
+  proven by test (`foreground_gets_roughly_four_to_one_over_bulk`). The
+  standalone `Scheduler`/`SchedTicket` abstraction was removed as superseded.
+  Every scan through the pool is currently a full-table `Bulk` scan (Foreground
+  reads bypass — T1.5), so the 4:1 weighting is latent until B3 folds
+  mixed-weight background work (compaction/repair/ANN) into the pool.
