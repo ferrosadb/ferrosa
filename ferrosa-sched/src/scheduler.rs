@@ -18,7 +18,7 @@
 //! runs the smallest-vruntime unit, equal-weight units converge to equal
 //! service and unequal-weight units to service proportional to weight.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::runqueue::{RunQueue, SchedEntity};
 use crate::SchedClass;
@@ -105,11 +105,164 @@ impl Scheduler {
     pub fn waiting(&self) -> usize {
         self.queue.lock().expect("scheduler queue poisoned").len()
     }
+
+    /// Take the most-deserving waiting unit as a running [`SchedTicket`] bound to
+    /// this scheduler (`None` if idle). The scan holds the ticket while it runs
+    /// and calls [`SchedTicket::reschedule`] per chunk.
+    pub fn pick_ticket(self: &Arc<Self>) -> Option<SchedTicket> {
+        self.pick_next().map(|entity| SchedTicket {
+            scheduler: Arc::clone(self),
+            entity,
+        })
+    }
+}
+
+/// A running unit's scheduling handle — the fair-share accounting the store scan
+/// page loop drives. Holds the unit's [`SchedEntity`] and a handle back to its
+/// [`Scheduler`]. The store producer calls [`reschedule`](Self::reschedule) once
+/// per produced chunk; when it returns `true` the producer releases its pool
+/// slot and [`yield_back`](Self::yield_back)s so a more-deserving scan can run.
+#[derive(Debug)]
+pub struct SchedTicket {
+    scheduler: Arc<Scheduler>,
+    entity: SchedEntity,
+}
+
+impl SchedTicket {
+    /// The scheduled unit's id.
+    pub fn id(&self) -> u64 {
+        self.entity.id
+    }
+
+    /// The unit's accumulated virtual runtime.
+    pub fn vruntime(&self) -> u64 {
+        self.entity.vruntime
+    }
+
+    /// The unit's fair-share weight.
+    pub fn weight(&self) -> u32 {
+        self.entity.weight
+    }
+
+    /// Account `service` for the work just done and report whether this unit
+    /// should yield its slot to a more-deserving waiter. Does NOT itself release
+    /// any pool permit — the caller does that after [`yield_back`](Self::yield_back)
+    /// so no resource is held across the handoff (T1.7).
+    pub fn reschedule(&mut self, service: u64) -> bool {
+        self.scheduler.reschedule(&mut self.entity, service)
+    }
+
+    /// Yield the slot: re-enqueue this unit for a future turn (consumes the
+    /// ticket). The caller picks the next ticket after releasing its pool permit.
+    pub fn yield_back(self) {
+        self.scheduler.requeue(self.entity);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    /// A mock scan: produces `remaining` chunks. Stands in for a `store.rs`
+    /// `range_iter` producer without any real storage. (Keyed by id in the map.)
+    struct MockScan {
+        remaining: u64,
+        class: SchedClass,
+    }
+
+    /// T1.2 T2 — the MockStorage multi-scan fairness property: with a single pool
+    /// slot (capacity 1), three concurrent scans driven through the ticket API
+    /// interleave — no scan monopolizes the slot — and every scan completes.
+    #[test]
+    fn mock_storage_scans_share_the_slot_fairly_via_tickets() {
+        let sched = Arc::new(Scheduler::new(0));
+        let page_service = 10u64;
+
+        let mut scans: HashMap<u64, MockScan> = HashMap::new();
+        for id in [1u64, 2, 3] {
+            sched.admit(id, SchedClass::Bulk);
+            scans.insert(
+                id,
+                MockScan {
+                    remaining: 100,
+                    class: SchedClass::Bulk,
+                },
+            );
+        }
+
+        let mut ran: HashMap<u64, u64> = HashMap::new();
+        let mut last = 0u64;
+        let mut streak = 0u64;
+        let mut max_streak_while_contended = 0u64;
+
+        let mut ticket = sched.pick_ticket().expect("a scan to run");
+        loop {
+            let id = ticket.id();
+            // "Produce" one chunk of scan `id`.
+            *ran.entry(id).or_insert(0) += 1;
+            let scan = scans.get_mut(&id).expect("known scan");
+            scan.remaining -= 1;
+            let done = scan.remaining == 0;
+            let _ = scan.class; // (class would seed the weight in the real wiring)
+
+            // Only measure monopolization while >= 2 scans still have work — the
+            // lone tail necessarily runs alone and is not "monopolizing".
+            let contended = scans.values().filter(|s| s.remaining > 0).count() >= 2;
+            if id == last {
+                streak += 1;
+            } else {
+                streak = 1;
+                last = id;
+            }
+            if contended {
+                max_streak_while_contended = max_streak_while_contended.max(streak);
+            }
+
+            let should_yield = ticket.reschedule(page_service);
+            if done {
+                match sched.pick_ticket() {
+                    Some(t) => ticket = t,
+                    None => break,
+                }
+                last = 0;
+                streak = 0;
+            } else if should_yield {
+                ticket.yield_back();
+                ticket = sched.pick_ticket().expect("a scan to run");
+            }
+            // else: keep running the same ticket (nobody more deserving waits).
+        }
+
+        // Every scan ran all 100 chunks.
+        assert_eq!(ran[&1], 100);
+        assert_eq!(ran[&2], 100);
+        assert_eq!(ran[&3], 100);
+        // No scan monopolized the slot while others had work.
+        assert!(
+            max_streak_while_contended <= 2,
+            "a scan monopolized the slot: max consecutive run = {max_streak_while_contended}"
+        );
+    }
+
+    #[test]
+    fn ticket_reports_accounting_and_yields_back_to_the_queue() {
+        let sched = Arc::new(Scheduler::new(0));
+        // Foreground (weight 1024) so service advances vruntime one-for-one.
+        sched.admit(1, SchedClass::Foreground);
+        sched.admit(2, SchedClass::Foreground);
+        let mut t = sched.pick_ticket().unwrap();
+        assert_eq!(t.id(), 1);
+        assert_eq!(t.vruntime(), 0);
+        // Accounting advances vruntime and, with a waiter at 0, signals yield.
+        assert!(t.reschedule(10));
+        assert_eq!(t.vruntime(), 10);
+        assert_eq!(sched.waiting(), 1); // only id 2 waiting
+        t.yield_back();
+        assert_eq!(sched.waiting(), 2); // id 1 back in the queue
+        assert_eq!(sched.pick_ticket().unwrap().id(), 2); // id 2 now most deserving
+    }
 
     #[test]
     fn advance_charges_service_inversely_to_weight() {
