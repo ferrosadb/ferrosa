@@ -69,6 +69,9 @@ pub async fn get_metrics(
     // anti_entropy_refills_no_source_total being non-zero means quarantined data
     // is awaiting the periodic repair backstop and should alert (FMEA #10).
     body.push_str(&ferrosa_cluster::repair::trigger::render_prometheus());
+    // Query-scheduler pool gauges/counters (ferrosa_sched_*). The
+    // consensus-headroom gauge must stay > 0 under scan load (t_88223ad0).
+    body.push_str(&ferrosa_sched::render_prometheus());
     (
         StatusCode::OK,
         [(
