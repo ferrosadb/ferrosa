@@ -24,6 +24,7 @@
 //! reserved cores stay free for consensus. This crate is a leaf: it depends only
 //! on tokio, so nothing in the storage/cluster/cql stack leaks in (DSM guard).
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +34,8 @@ use tokio::task::JoinHandle;
 pub mod fair_admit;
 pub mod runqueue;
 pub mod scheduler;
+
+pub use fair_admit::Admitted;
 
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus
 // registry reads them); instantaneous gauges (`headroom_cores`, `active`) are
@@ -55,6 +58,22 @@ pub fn admit_wait_micros_total() -> u64 {
 fn record_admission(wait: Duration) {
     TASKS_ADMITTED_TOTAL.fetch_add(1, Ordering::Relaxed);
     ADMIT_WAIT_MICROS_TOTAL.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
+}
+
+static ADMISSIONS_REJECTED_OVERLOAD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Admission requests rejected because the waiter queue was already at its bound
+/// (`Admitted::Overloaded`). Non-zero means real overload — more scans arrived
+/// than the reservation can queue — and the caller shed them (fail-loud) rather
+/// than pile up unboundedly. A rising rate should alert.
+pub fn admissions_rejected_overload_total() -> u64 {
+    ADMISSIONS_REJECTED_OVERLOAD_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Called by [`fair_admit::FairAdmit::admit`] when it sheds a request under
+/// overload.
+pub(crate) fn record_overload_rejection() {
+    ADMISSIONS_REJECTED_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 // Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
@@ -153,6 +172,14 @@ pub fn render_prometheus() -> String {
         "ferrosa_sched_over_budget_chunks_total {}\n",
         over_budget_chunks_total()
     ));
+    out.push_str(
+        "# HELP ferrosa_sched_admissions_rejected_overload_total Admission requests shed because the waiter queue was at its bound; non-zero means real overload backpressure.\n\
+         # TYPE ferrosa_sched_admissions_rejected_overload_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_admissions_rejected_overload_total {}\n",
+        admissions_rejected_overload_total()
+    ));
     out
 }
 
@@ -231,11 +258,15 @@ impl Drop for SlotGuard {
 }
 
 impl SchedPool {
-    /// Build a pool admitting `reservation.available()` scans at once.
+    /// Build a pool admitting `reservation.available()` scans at once, and
+    /// queuing at most [`DEFAULT_MAX_WAITERS_PER_SLOT`] × capacity more before
+    /// shedding further requests as [`ScanOutcome::Overloaded`] (bounded
+    /// backpressure).
     pub fn new(reservation: Reservation) -> Self {
         let capacity = reservation.available();
+        let max_waiters = capacity.saturating_mul(DEFAULT_MAX_WAITERS_PER_SLOT);
         Self {
-            admit: Arc::new(fair_admit::FairAdmit::new(capacity, 0)),
+            admit: Arc::new(fair_admit::FairAdmit::new(capacity, 0, max_waiters)),
             capacity,
             reservation,
         }
@@ -265,28 +296,41 @@ impl SchedPool {
 
     /// Admit and run `f` on a blocking thread once a slot is granted (at `Bulk`
     /// weight). Awaiting resolves once admitted; the returned handle resolves to
-    /// `f`'s result (or a `JoinError` on panic). The slot is released on return
-    /// OR unwind (RAII). Generic entry — the scan producers use
+    /// `Some(f`'s result`)`, or `None` if the request was shed under overload
+    /// (the waiter queue was at its bound). The slot is released on return OR
+    /// unwind (RAII). Generic entry — the scan producers use
     /// [`submit_scan`](Self::submit_scan).
-    pub async fn submit<F, R>(&self, f: F) -> JoinHandle<R>
+    pub async fn submit<F, R>(&self, f: F) -> JoinHandle<Option<R>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let waited = Instant::now();
-        let id = self.admit.admit(SchedClass::Bulk).await;
-        record_admission(waited.elapsed());
-        let admit = self.admit.clone();
-        tokio::task::spawn_blocking(move || {
-            let _guard = SlotGuard { admit, id };
-            f()
-        })
+        // No cancellation signal for the generic entry — pass a never-firing
+        // future; overload is still surfaced as `None`.
+        match self
+            .admit
+            .admit(SchedClass::Bulk, std::future::pending::<()>())
+            .await
+        {
+            Admitted::Slot(id) => {
+                record_admission(waited.elapsed());
+                let admit = self.admit.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _guard = SlotGuard { admit, id };
+                    Some(f())
+                })
+            }
+            Admitted::Overloaded => tokio::task::spawn_blocking(|| None),
+            Admitted::Cancelled => unreachable!("submit passes a never-firing cancel"),
+        }
     }
 
     /// Sync entry for a generic blocking task (fires a cheap async admitter, then
     /// moves `f` onto a blocking thread once admitted — so excess tasks wait as
-    /// async tasks, not parked blocking threads). Admits at `Bulk` weight.
-    pub fn submit_blocking<F, R>(&self, f: F) -> JoinHandle<R>
+    /// async tasks, not parked blocking threads). Admits at `Bulk` weight;
+    /// resolves to `None` if shed under overload.
+    pub fn submit_blocking<F, R>(&self, f: F) -> JoinHandle<Option<R>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -294,14 +338,22 @@ impl SchedPool {
         let admit = self.admit.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
-            let id = admit.admit(SchedClass::Bulk).await;
-            record_admission(waited.elapsed());
-            tokio::task::spawn_blocking(move || {
-                let _guard = SlotGuard { admit, id };
-                f()
-            })
-            .await
-            .expect("scheduler blocking task must not be cancelled")
+            match admit
+                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .await
+            {
+                Admitted::Slot(id) => {
+                    record_admission(waited.elapsed());
+                    tokio::task::spawn_blocking(move || {
+                        let _guard = SlotGuard { admit, id };
+                        Some(f())
+                    })
+                    .await
+                    .expect("scheduler blocking task must not be cancelled")
+                }
+                Admitted::Overloaded => None,
+                Admitted::Cancelled => unreachable!("submit_blocking passes a never-firing cancel"),
+            }
         })
     }
 
@@ -315,36 +367,72 @@ impl SchedPool {
     /// mid-scan re-competes block the scan's own blocking thread. Deadlock-free
     /// (a yielding scan releases before re-competing) and the slot is released on
     /// return OR unwind (RAII via [`ScanSlot`]'s drop).
-    pub fn submit_scan<F, R>(&self, class: SchedClass, chunk_budget: u32, f: F) -> JoinHandle<R>
+    ///
+    /// `cancel` is the consumer-gone signal: when it fires *before admission*,
+    /// the scan is dropped from the queue without ever occupying a slot (a
+    /// dropped range stream no longer leaves a queued admission that later wakes,
+    /// grabs a slot, and does work just to find the closed channel). Pass the
+    /// consumer channel's closed-future; pass [`std::future::pending()`] if there
+    /// is nothing to cancel on. The returned handle resolves to a
+    /// [`ScanOutcome`]: `Ran(f`'s result`)`, `Overloaded` (shed — the producer
+    /// never ran; the caller must fail loud), or `Cancelled`.
+    pub fn submit_scan<F, R, C>(
+        &self,
+        class: SchedClass,
+        chunk_budget: u32,
+        cancel: C,
+        f: F,
+    ) -> JoinHandle<ScanOutcome<R>>
     where
         F: FnOnce(&mut ScanSlot) -> R + Send + 'static,
         R: Send + 'static,
+        C: Future<Output = ()> + Send + 'static,
     {
         let admit = self.admit.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
-            let id = admit.admit(class).await;
-            record_admission(waited.elapsed());
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                let mut slot = ScanSlot {
-                    admit,
-                    id,
-                    chunk_budget: chunk_budget.max(1),
-                    since_yield: 0,
-                    yields: 0,
-                    handle,
-                    last_tick: Instant::now(),
-                    finished: false,
-                };
-                let out = f(&mut slot);
-                slot.finish();
-                out
-            })
-            .await
-            .expect("scheduler blocking task must not be cancelled")
+            match admit.admit(class, cancel).await {
+                Admitted::Slot(id) => {
+                    record_admission(waited.elapsed());
+                    let handle = tokio::runtime::Handle::current();
+                    let out = tokio::task::spawn_blocking(move || {
+                        let mut slot = ScanSlot {
+                            admit,
+                            id,
+                            chunk_budget: chunk_budget.max(1),
+                            since_yield: 0,
+                            yields: 0,
+                            handle,
+                            last_tick: Instant::now(),
+                            finished: false,
+                        };
+                        let out = f(&mut slot);
+                        slot.finish();
+                        out
+                    })
+                    .await
+                    .expect("scheduler blocking task must not be cancelled");
+                    ScanOutcome::Ran(out)
+                }
+                Admitted::Overloaded => ScanOutcome::Overloaded,
+                Admitted::Cancelled => ScanOutcome::Cancelled,
+            }
         })
     }
+}
+
+/// Outcome of a [`SchedPool::submit_scan`] producer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanOutcome<R> {
+    /// The producer was admitted and ran to completion; carries its return value.
+    Ran(R),
+    /// Admission was shed under overload — the producer never ran. The caller
+    /// MUST surface this (fail-loud), e.g. as a read error, never a silent empty
+    /// result.
+    Overloaded,
+    /// The `cancel` signal fired before admission — the consumer went away, so
+    /// the producer never ran and never held a slot.
+    Cancelled,
 }
 
 /// The fair-share handle a [`SchedPool::submit_scan`] producer holds for its
@@ -429,6 +517,11 @@ pub const DEFAULT_RESERVED_CORES: usize = 1;
 /// this many chunks for its turn.
 pub const DEFAULT_SCAN_CHUNK_BUDGET: u32 = 64;
 
+/// Waiters allowed per admission slot before [`SchedPool`] sheds further scans
+/// as [`ScanOutcome::Overloaded`]. Bounds the queue so a flood of scans cannot
+/// grow it without limit; generous enough that only genuine overload trips it.
+pub const DEFAULT_MAX_WAITERS_PER_SLOT: usize = 256;
+
 static GLOBAL_POOL: std::sync::OnceLock<SchedPool> = std::sync::OnceLock::new();
 
 /// Initialize the process-global [`SchedPool`] with an explicit reservation.
@@ -492,7 +585,10 @@ mod tests {
             handles.push(h);
         }
         for h in handles {
-            h.await.expect("blocking task joined");
+            assert!(
+                h.await.expect("blocking task joined").is_some(),
+                "closure ran (not shed under overload)"
+            );
         }
 
         assert!(
@@ -524,11 +620,20 @@ mod tests {
                 .await
                 .await
                 .expect("second task joined")
+                .expect("admitted (not shed under overload)")
         })
         .await
         .expect("slot leaked after panic — second submit blocked");
         assert_eq!(ok, 42);
         assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// Unwrap a scan that ran, or fail loudly if it was shed/cancelled.
+    fn ran<R: std::fmt::Debug>(outcome: ScanOutcome<R>) -> R {
+        match outcome {
+            ScanOutcome::Ran(r) => r,
+            other => panic!("expected the scan to run, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -541,30 +646,35 @@ mod tests {
         assert_eq!(pool.capacity(), 1);
 
         // 10 chunks, budget 3 => yields after ticks 3, 6, 9 => 3 yields.
-        let yields = pool
-            .submit_scan(SchedClass::Bulk, 3, |slot| {
+        let yields = ran(pool
+            .submit_scan(SchedClass::Bulk, 3, std::future::pending::<()>(), |slot| {
                 for _ in 0..10 {
                     slot.tick();
                 }
                 slot.yields()
             })
             .await
-            .expect("scan task joined");
+            .expect("scan task joined"));
         assert_eq!(yields, 3, "expected floor(10/3)=3 slot yields");
 
         // The permit is fully restored after the scan ends (no leak).
         assert_eq!(pool.available_permits(), 1);
 
         // A budget larger than the chunk count never yields.
-        let yields = pool
-            .submit_scan(SchedClass::Bulk, 100, |slot| {
-                for _ in 0..5 {
-                    slot.tick();
-                }
-                slot.yields()
-            })
+        let yields = ran(pool
+            .submit_scan(
+                SchedClass::Bulk,
+                100,
+                std::future::pending::<()>(),
+                |slot| {
+                    for _ in 0..5 {
+                        slot.tick();
+                    }
+                    slot.yields()
+                },
+            )
             .await
-            .expect("scan task joined");
+            .expect("scan task joined"));
         assert_eq!(yields, 0);
         assert_eq!(pool.available_permits(), 1);
     }
@@ -576,13 +686,19 @@ mod tests {
         let before = over_budget_chunks_total();
         let pool = SchedPool::new(Reservation::new(1, 0));
         let over_by = Duration::from_micros(DEFAULT_CHUNK_BUDGET_MICROS + 20_000);
-        pool.submit_scan(SchedClass::Bulk, 1000, move |slot| {
-            // Simulate a pathologically slow chunk (a huge partition decode).
-            std::thread::sleep(over_by);
-            slot.tick();
-        })
-        .await
-        .expect("scan task joined");
+        ran(pool
+            .submit_scan(
+                SchedClass::Bulk,
+                1000,
+                std::future::pending::<()>(),
+                move |slot| {
+                    // Simulate a pathologically slow chunk (a huge partition decode).
+                    std::thread::sleep(over_by);
+                    slot.tick();
+                },
+            )
+            .await
+            .expect("scan task joined"));
 
         assert!(
             over_budget_chunks_total() > before,
@@ -618,7 +734,10 @@ mod tests {
         }
         let mut sum = 0u32;
         for h in handles {
-            sum += h.await.expect("submit_blocking task joined");
+            sum += h
+                .await
+                .expect("submit_blocking task joined")
+                .expect("admitted (not shed under overload)");
         }
         assert_eq!(
             sum,
@@ -705,7 +824,7 @@ mod tests {
             handles.push(pool.submit_blocking(|| {}));
         }
         for h in handles {
-            h.await.expect("task joined");
+            let _ = h.await.expect("task joined");
         }
         assert!(
             tasks_admitted_total() >= before_admitted + 5,
@@ -726,6 +845,7 @@ mod tests {
             "ferrosa_sched_pool_active",
             "ferrosa_sched_tasks_admitted_total",
             "ferrosa_sched_admit_wait_micros_total",
+            "ferrosa_sched_admissions_rejected_overload_total",
         ] {
             assert!(text.contains(metric), "missing metric {metric}");
         }
