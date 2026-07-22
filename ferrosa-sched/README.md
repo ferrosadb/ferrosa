@@ -24,6 +24,16 @@ a CheckQuorum leader step-down.
   gets ~4x the slot turns. Admission is async (a waiter is a cheap task, never a
   parked blocking thread — the B0 property); a scan's mid-scan re-competes block
   its own blocking thread. Deadlock-free and slot-leak-free (RAII).
+  `admit(class, cancel)` returns `Admitted::{Slot, Overloaded, Cancelled}`:
+  **cancellable** — if the `cancel` future fires (or the future is dropped)
+  before a slot is granted, a `WaitGuard` vacates the queue/waiter entry so a
+  scan whose consumer went away never occupies a slot; and **bounded** — with no
+  free slot and the waiter queue at `max_waiters`, admission is shed as
+  `Overloaded` (metric `ferrosa_sched_admissions_rejected_overload_total`)
+  rather than piling up. `submit_scan` takes the cancel signal and returns
+  `ScanOutcome`; storage's `range_iter*` producers route through
+  `spawn_bounded_range_scan`, passing the consumer channel's `closed()` as the
+  cancel signal and failing loud on overload (never a silent empty stream).
 - `SchedPool` — wraps `FairAdmit`. `submit_scan(class, chunk_budget, f)` + a
   `ScanSlot`: the producer calls `slot.tick()` per produced chunk and every
   `chunk_budget` chunks re-competes for its slot in vruntime order, so a long

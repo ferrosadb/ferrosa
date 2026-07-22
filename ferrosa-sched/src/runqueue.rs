@@ -120,6 +120,22 @@ impl RunQueue {
         self.tree.keys().next().map(|(vruntime, _seq)| *vruntime)
     }
 
+    /// Remove the queued unit with `id`, if present; returns whether one was
+    /// removed. O(n) over the *waiting* set (bounded by the admission waiter
+    /// cap), used by cancellation cleanup: a scan whose consumer went away must
+    /// vacate the queue so its slot is never granted to a dead id.
+    pub fn remove_by_id(&mut self, id: u64) -> bool {
+        let key = self
+            .tree
+            .iter()
+            .find(|(_, entity)| entity.id == id)
+            .map(|(key, _)| *key);
+        match key {
+            Some(key) => self.tree.remove(&key).is_some(),
+            None => false,
+        }
+    }
+
     /// Number of queued units.
     pub fn len(&self) -> usize {
         self.tree.len()
@@ -201,6 +217,22 @@ mod tests {
             assert!(q.min_vruntime() >= e.vruntime);
             prev = q.min_vruntime();
         }
+    }
+
+    #[test]
+    fn remove_by_id_vacates_a_waiting_unit() {
+        let mut q = RunQueue::new(0);
+        q.enqueue(ent(1, 10));
+        q.enqueue(ent(2, 20));
+        q.enqueue(ent(3, 30));
+        assert!(q.remove_by_id(2), "id 2 was queued");
+        assert_eq!(q.len(), 2);
+        assert!(!q.remove_by_id(2), "already removed");
+        assert!(!q.remove_by_id(99), "never queued");
+        // The survivors still pick in vruntime order.
+        assert_eq!(q.pick_next().unwrap().id, 1);
+        assert_eq!(q.pick_next().unwrap().id, 3);
+        assert!(q.pick_next().is_none());
     }
 
     #[test]

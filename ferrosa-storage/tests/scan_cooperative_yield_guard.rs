@@ -18,12 +18,14 @@
 
 use std::fs;
 
-/// Extract each `submit_scan` producer's closure body — from `submit_scan(` up
-/// to the `Box::pin(futures::stream::unfold` stream return that immediately
-/// follows every producer's closure. Bounds the body precisely so post-closure
-/// code isn't mis-attributed.
+/// Extract each range-scan producer's closure body. Producers route through the
+/// `spawn_bounded_range_scan(tx, ...)` helper (which wraps the raw `submit_scan`
+/// admission with cancellation + fail-loud overload); each body runs from that
+/// call up to the `Box::pin(futures::stream::unfold` stream return that
+/// immediately follows the producer's closure. Matching `spawn_bounded_range_scan(tx`
+/// picks the call sites, not the `spawn_bounded_range_scan<F>(tx:` definition.
 fn producer_bodies(src: &str) -> Vec<&str> {
-    src.match_indices("submit_scan(")
+    src.match_indices("spawn_bounded_range_scan(tx")
         .map(|(start, _)| {
             let rest = &src[start..];
             let end = rest
@@ -45,14 +47,14 @@ fn every_submit_scan_producer_calls_slot_tick() {
     let bodies = producer_bodies(&src);
     assert!(
         bodies.len() >= 4,
-        "expected >= 4 store.rs scan producers routed through submit_scan, found {} — \
+        "expected >= 4 store.rs scan producers routed through spawn_bounded_range_scan, found {} — \
          did a producer switch back to submit_blocking (no cooperative yield)?",
         bodies.len()
     );
     for (n, body) in bodies.iter().enumerate() {
         assert!(
             body.contains("slot.tick()"),
-            "submit_scan producer #{n} does not call slot.tick() in its page loop — a long \
+            "range-scan producer #{n} does not call slot.tick() in its page loop — a long \
              scan would monopolize the bounded pool and reintroduce the starvation B1 fixes \
              (T1.3 / FM-2)"
         );
@@ -60,27 +62,48 @@ fn every_submit_scan_producer_calls_slot_tick() {
 }
 
 #[test]
-fn scheduler_pool_is_only_used_by_range_scan_producers() {
-    // B1 T1.5 / FM-6 — interactive point-read bypass. Every `global_pool()` call
-    // must live inside a `range_iter*` scan producer. The point-read methods
-    // (`read` / `read_limited_rows` / `read_clustering_row`) therefore never
-    // touch the scheduler, so a `PartitionKeyLookup` has zero scheduler calls and
-    // is never queued behind a full-table scan. This fails if a future edit
-    // routes a point read through the pool.
+fn scheduler_pool_is_reached_only_through_the_range_scan_helper() {
+    // B1 T1.5 / FM-6 — interactive point-read bypass. Two invariants keep the
+    // scheduler off the point-read path:
+    //   (a) `global_pool()` is called ONLY inside `spawn_bounded_range_scan`, the
+    //       single helper that routes a scan through the pool; and
+    //   (b) every `spawn_bounded_range_scan(...)` CALL site is a `range_iter*`
+    //       scan producer.
+    // Together they guarantee the point-read methods (`read` /
+    // `read_limited_rows` / `read_clustering_row`) never touch the scheduler, so a
+    // `PartitionKeyLookup` has zero scheduler calls. Fails if a future edit routes
+    // a point read through the pool or calls the pool outside the helper.
     let src = store_src();
-    let mut checked = 0usize;
+
+    let mut pool_calls = 0usize;
     for (idx, _) in src.match_indices("global_pool()") {
         let name = enclosing_fn_name(&src, idx);
         assert!(
-            name.contains("range_iter"),
-            "global_pool() is called from `{name}` — only range_iter* scan producers may use \
-             the scheduler pool. A point read must have zero scheduler calls (T1.5 / FM-6)."
+            name == "spawn_bounded_range_scan",
+            "global_pool() is called from `{name}` — the scheduler pool must be reached only \
+             through spawn_bounded_range_scan. A point read must have zero scheduler calls \
+             (T1.5 / FM-6)."
         );
-        checked += 1;
+        pool_calls += 1;
     }
     assert!(
-        checked >= 4,
-        "expected >= 4 pool call sites, found {checked}"
+        pool_calls >= 1,
+        "expected spawn_bounded_range_scan to call global_pool(), found {pool_calls}"
+    );
+
+    let mut call_sites = 0usize;
+    for (idx, _) in src.match_indices("spawn_bounded_range_scan(tx") {
+        let name = enclosing_fn_name(&src, idx);
+        assert!(
+            name.contains("range_iter"),
+            "spawn_bounded_range_scan is called from `{name}` — only range_iter* scan producers \
+             may route work through the scheduler pool (T1.5 / FM-6)."
+        );
+        call_sites += 1;
+    }
+    assert!(
+        call_sites >= 4,
+        "expected >= 4 range scan producer call sites, found {call_sites}"
     );
 }
 
