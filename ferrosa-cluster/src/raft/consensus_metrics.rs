@@ -66,7 +66,7 @@ pub fn is_self_leader(current_leader: Option<u64>, my_id: u64) -> bool {
     current_leader == Some(my_id)
 }
 
-/// Poll Raft leadership once per [`POLL_INTERVAL`] and publish it, until
+/// Poll Raft leadership once per second (`POLL_INTERVAL`) and publish it, until
 /// cancelled. Spawned per cluster-mode node alongside — but independent of — the
 /// election guard, so the metric surface outlives the ADR-012 guard.
 ///
