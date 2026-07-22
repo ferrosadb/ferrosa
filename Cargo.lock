@@ -2226,6 +2226,7 @@ dependencies = [
  "ferrosa-index",
  "ferrosa-net",
  "ferrosa-row-bridge",
+ "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-session",
  "ferrosa-sstable",

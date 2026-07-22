@@ -19,6 +19,7 @@ ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-session = { path = "../ferrosa-session" }
+ferrosa-sched = { path = "../ferrosa-sched" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 ferrosa-udf = { path = "../ferrosa-udf" }
