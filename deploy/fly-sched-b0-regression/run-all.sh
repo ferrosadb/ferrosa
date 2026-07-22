@@ -23,27 +23,46 @@ mkdir -p "${OUT_DIR}"
 
 log "=== T0.6 regression: app=${FLY_APP} region=${FLY_REGION} nodes=${NODE_COUNT}x${VM_CPUS} ==="
 
-# ── 1. Build images ───────────────────────────────────────────────────────────
-log "building POST-FIX image (ref ${POSTFIX_REF})"
-POSTFIX_IMAGE="$("${HERE}/build-image.sh" "${POSTFIX_REF}" postfix "$@" | tail -n1)"
+# ── 0. App must exist before `deploy --build-only --push` can push to its
+#      registry (build-image runs before provision). Idempotent. ───────────────
+fly_do flyctl apps create "${FLY_APP}" --org "${FLY_ORG}" || true
+
+# Forward the billing flag EXPLICITLY to every sub-script. run_arm's own
+# positional args (arm/image/expect) must NOT be forwarded — they would pollute
+# lib.sh's `--i-will-pay` scan and silently drop the run to dry-run.
+PAY_FLAG=()
+[ "${I_WILL_PAY}" -eq 1 ] && PAY_FLAG=(--i-will-pay)
+
+# ── 1. Build images (reuse a prebuilt tag when POSTFIX_IMAGE/PREFIX_IMAGE is
+#      set in the env — skips the ~20-min remote compile on a re-run). ─────────
+if [ -n "${POSTFIX_IMAGE:-}" ]; then
+  log "reusing prebuilt POST-FIX image: ${POSTFIX_IMAGE}"
+else
+  log "building POST-FIX image (ref ${POSTFIX_REF})"
+  POSTFIX_IMAGE="$("${HERE}/build-image.sh" "${POSTFIX_REF}" postfix "${PAY_FLAG[@]}" | tail -n1)"
+fi
 log "post-fix image: ${POSTFIX_IMAGE}"
 
-PREFIX_IMAGE=""
+PREFIX_IMAGE="${PREFIX_IMAGE:-}"
 if [ "${RUN_PREFIX_ARM}" = "1" ]; then
-  log "building PRE-FIX image (ref ${PREFIX_REF})"
-  PREFIX_IMAGE="$("${HERE}/build-image.sh" "${PREFIX_REF}" prefix "$@" | tail -n1)"
+  if [ -n "${PREFIX_IMAGE}" ]; then
+    log "reusing prebuilt PRE-FIX image: ${PREFIX_IMAGE}"
+  else
+    log "building PRE-FIX image (ref ${PREFIX_REF})"
+    PREFIX_IMAGE="$("${HERE}/build-image.sh" "${PREFIX_REF}" prefix "${PAY_FLAG[@]}" | tail -n1)"
+  fi
   log "pre-fix image: ${PREFIX_IMAGE}"
 fi
 
 run_arm() {  # $1=arm $2=node_image $3=expect
   local arm="$1" node_image="$2" expect="$3"
   log "──────── ARM ${arm} (expect ${expect}) ────────"
-  NODE_IMAGE="${node_image}" CLIENT_IMAGE="${POSTFIX_IMAGE}" "${HERE}/provision.sh" "$@"
-  "${HERE}/run.sh" "${arm}" "$@"
+  NODE_IMAGE="${node_image}" CLIENT_IMAGE="${POSTFIX_IMAGE}" "${HERE}/provision.sh" "${PAY_FLAG[@]}"
+  "${HERE}/run.sh" "${arm}" "${PAY_FLAG[@]}"
   local rc=0
-  "${HERE}/assess.sh" "${arm}" "${expect}" "$@" || rc=$?
+  "${HERE}/assess.sh" "${arm}" "${expect}" "${PAY_FLAG[@]}" || rc=$?
   # Tear down this arm's machines before the next (keep the app + images).
-  "${HERE}/teardown.sh" "$@"
+  "${HERE}/teardown.sh" "${PAY_FLAG[@]}"
   return "${rc}"
 }
 

@@ -31,6 +31,11 @@ use std::time::{Duration, Instant};
 
 use crate::cluster::connect_authed;
 
+/// Upper bound on a single scan. A full-table `ALLOW FILTERING` scan on a
+/// starved node can hang; without this cap a worker could block well past the
+/// run deadline and inflate the reported elapsed.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How a single scan-storm run is parameterized.
 #[derive(Debug, Clone)]
 pub struct ScanStormConfig {
@@ -158,6 +163,9 @@ async fn run_scan_storm(nodes: &[SocketAddr], cfg: &ScanStormConfig) -> ScanStor
     let scans = Arc::new(AtomicU64::new(0));
     let scan_errors = Arc::new(AtomicU64::new(0));
     let connect_failures = Arc::new(AtomicU64::new(0));
+    // Fail-loud: surface the FIRST scan error once (not swallow all of them). A
+    // storm reporting millions of errors with no message hides a rejected query.
+    let first_error = Arc::new(std::sync::Mutex::new(Option::<String>::None));
 
     let mut handles = Vec::with_capacity(cfg.concurrency);
     for task_idx in 0..cfg.concurrency {
@@ -166,6 +174,7 @@ async fn run_scan_storm(nodes: &[SocketAddr], cfg: &ScanStormConfig) -> ScanStor
         let scans = scans.clone();
         let scan_errors = scan_errors.clone();
         let connect_failures = connect_failures.clone();
+        let first_error = first_error.clone();
         handles.push(tokio::spawn(async move {
             let mut client = match connect_retry(addr, 30).await {
                 Some(c) => c,
@@ -174,22 +183,48 @@ async fn run_scan_storm(nodes: &[SocketAddr], cfg: &ScanStormConfig) -> ScanStor
                     return;
                 }
             };
+            // Reconnect only when the session looks dead (many consecutive
+            // errors), not on every one-off query error — otherwise a rejected
+            // query becomes a tight query+reconnect thrash loop.
+            let mut consecutive_errors = 0u32;
             while Instant::now() < deadline {
-                match client.query_quorum(stmt.as_str()).await {
-                    Ok(_) => {
+                // Bound each scan so a single hung full-table scan under
+                // starvation cannot block a worker past the run deadline (which
+                // would inflate the reported elapsed far beyond `duration`).
+                let outcome =
+                    tokio::time::timeout(SCAN_TIMEOUT, client.query_quorum(stmt.as_str())).await;
+                match &outcome {
+                    Ok(Ok(_)) => {
                         scans.fetch_add(1, Ordering::Relaxed);
+                        consecutive_errors = 0;
                     }
-                    Err(_) => {
-                        // A step-down can drop the coordinator connection; count
-                        // the error and try to re-establish so the storm keeps
-                        // pressure on across the very event we aim to observe.
+                    Ok(Err(_)) | Err(_) => {
+                        // Err(_) is the scan-timeout; Ok(Err(_)) is a CQL error.
                         scan_errors.fetch_add(1, Ordering::Relaxed);
-                        match connect_retry(addr, 5).await {
-                            Some(c) => client = c,
-                            None => {
-                                connect_failures.fetch_add(1, Ordering::Relaxed);
-                                tokio::time::sleep(Duration::from_millis(250)).await;
+                        consecutive_errors += 1;
+                        if let Ok(mut slot) = first_error.lock() {
+                            if slot.is_none() {
+                                let msg = match &outcome {
+                                    Ok(Err(e)) => format!("cql error: {e}"),
+                                    _ => format!("scan timed out after {SCAN_TIMEOUT:?}"),
+                                };
+                                eprintln!("scan-storm: first scan error: {msg}");
+                                *slot = Some(msg);
                             }
+                        }
+                        if consecutive_errors >= 10 {
+                            // Session likely dropped (e.g. a step-down); rebuild
+                            // it so the storm keeps pressure across the event.
+                            consecutive_errors = 0;
+                            match connect_retry(addr, 5).await {
+                                Some(c) => client = c,
+                                None => {
+                                    connect_failures.fetch_add(1, Ordering::Relaxed);
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     }
                 }

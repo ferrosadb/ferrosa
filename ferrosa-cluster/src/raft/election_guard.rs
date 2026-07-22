@@ -222,12 +222,6 @@ pub async fn run_election_guard<C>(
         let current_log_index = metrics.last_log_index;
         let state = metrics.state;
 
-        // Publish the term + leadership sample to the Prometheus surface. This
-        // is the guard's role as the process's de-facto raft-metrics poller;
-        // per ADR-012 the metric *home* is `consensus_metrics`, not this guard,
-        // so retiring the guard only relocates this one publish call.
-        super::consensus_metrics::record_raft_state(current_term, state == ServerState::Leader);
-
         // --- Re-enable elections if suppress window expired ---
         if suppressing && tokio::time::Instant::now() >= suppress_until {
             suppressing = false;
