@@ -11,6 +11,7 @@ pub mod integrity;
 pub mod orchestrator;
 pub mod profile;
 pub mod resource_monitor;
+pub mod scan_storm;
 pub mod stats;
 pub mod tui;
 

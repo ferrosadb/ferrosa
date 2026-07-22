@@ -90,6 +90,17 @@ struct Args {
     /// Number of compaction-soak iterations to run.
     #[arg(long, default_value_t = 1000)]
     soak_iterations: usize,
+
+    /// Run a full-table `ALLOW FILTERING` scan storm against the cluster
+    /// (requires --node). Reproduces the viz consolidation workload that starved
+    /// the raft leader (t_88223ad0 / T0.6). Uses --duration and the scan flags
+    /// below; ignores the load profile.
+    #[arg(long)]
+    scan_storm: bool,
+
+    /// Concurrent scan workers for --scan-storm.
+    #[arg(long, default_value_t = 32)]
+    scan_concurrency: usize,
 }
 
 fn main() {
@@ -131,6 +142,32 @@ fn main() {
                 eprintln!("Soak FAILED: {err}");
                 std::process::exit(1);
             }
+        }
+        return;
+    }
+
+    // ── Scan-storm mode (cluster only) ────────────────────────────────
+    if args.scan_storm {
+        let Some(ref node_str) = args.node else {
+            eprintln!("--scan-storm requires --node <addr,...> (it drives a cluster over CQL)");
+            std::process::exit(1);
+        };
+        let nodes = ferrosa_loadgen::cluster::parse_nodes(node_str);
+        if nodes.is_empty() {
+            eprintln!("No valid node addresses in '{node_str}'");
+            std::process::exit(1);
+        }
+        let duration = Duration::from_secs(args.duration.unwrap_or(120));
+        let cfg = ferrosa_loadgen::scan_storm::ScanStormConfig::for_seed_table(
+            args.scan_concurrency,
+            duration,
+        );
+        let stats = ferrosa_loadgen::scan_storm::run_scan_storm_blocking(&nodes, &cfg);
+        println!("{stats}");
+        // Fail loud: a storm where no worker ever ran a scan proved nothing.
+        if stats.scans_completed == 0 {
+            eprintln!("scan-storm completed 0 scans — cluster unreachable or wrong schema");
+            std::process::exit(2);
         }
         return;
     }
