@@ -146,6 +146,67 @@ impl SchedPool {
             f()
         })
     }
+
+    /// Sync entry point for producers that run *inside* a runtime but are not
+    /// themselves `async` (the storage scan producers: sync functions that fire a
+    /// blocking task and return a stream). Spawns a cheap async admitter that
+    /// acquires a slot and only then moves `f` onto a blocking thread — so at most
+    /// [`capacity`](Self::capacity) blocking threads ever exist. Excess producers
+    /// wait as async tasks, NOT as parked blocking threads (which is what
+    /// oversubscribed the cores and starved raft).
+    ///
+    /// Must be called from within a tokio runtime. The returned handle resolves to
+    /// `f`'s result; a panic in `f` surfaces as a `JoinError` (and, being detached
+    /// by the callers, is logged by tokio rather than crashing the process).
+    pub fn submit_blocking<F, R>(&self, f: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let slots = self.slots.clone();
+        tokio::spawn(async move {
+            let permit = slots
+                .acquire_owned()
+                .await
+                .expect("scheduler pool semaphore is never closed");
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                f()
+            })
+            .await
+            .expect("scheduler blocking task must not be cancelled")
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process-global pool
+// ---------------------------------------------------------------------------
+
+/// Default cores reserved for consensus when the global pool is not explicitly
+/// initialized. Overridable at [`init_global_pool`] time.
+pub const DEFAULT_RESERVED_CORES: usize = 1;
+
+static GLOBAL_POOL: std::sync::OnceLock<SchedPool> = std::sync::OnceLock::new();
+
+/// Initialize the process-global [`SchedPool`] with an explicit reservation.
+///
+/// Call once at boot BEFORE any scan runs. Idempotent via `OnceLock`: the first
+/// caller wins, so a later [`global_pool`] fallback never overrides the boot
+/// reservation. Returns the installed pool.
+pub fn init_global_pool(reservation: Reservation) -> &'static SchedPool {
+    GLOBAL_POOL.get_or_init(|| SchedPool::new(reservation))
+}
+
+/// The process-global bounded pool. If boot never called [`init_global_pool`],
+/// lazily initializes from detected parallelism reserving [`DEFAULT_RESERVED_CORES`]
+/// — so the pool is always bounded, never the unbounded default.
+pub fn global_pool() -> &'static SchedPool {
+    GLOBAL_POOL.get_or_init(|| {
+        SchedPool::new(Reservation::from_available_parallelism(
+            DEFAULT_RESERVED_CORES,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -227,5 +288,57 @@ mod tests {
         .expect("slot leaked after panic — second submit blocked");
         assert_eq!(ok, 42);
         assert_eq!(pool.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn submit_blocking_bounds_concurrency_and_yields_results() {
+        // Sync entry (the scan-producer shape): fire many, only cap run at once.
+        let pool = SchedPool::new(Reservation::new(4, 2)); // capacity 2
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for i in 0..16u32 {
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            // Note: submit_blocking is SYNC (no .await on the call) — the producer
+            // call-site shape.
+            let h = pool.submit_blocking(move || {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                active.fetch_sub(1, Ordering::SeqCst);
+                i
+            });
+            handles.push(h);
+        }
+        let mut sum = 0u32;
+        for h in handles {
+            sum += h.await.expect("submit_blocking task joined");
+        }
+        assert_eq!(
+            sum,
+            (0..16).sum(),
+            "every submitted closure ran and returned"
+        );
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= pool.capacity(),
+            "submit_blocking admitted {} concurrently, exceeding capacity {}",
+            max_seen.load(Ordering::SeqCst),
+            pool.capacity()
+        );
+    }
+
+    #[test]
+    fn global_pool_is_bounded_and_stable() {
+        // Lazy init (boot did not run) must still yield a bounded pool, and the
+        // same instance every call.
+        let p1 = global_pool();
+        let p2 = global_pool();
+        assert!(
+            std::ptr::eq(p1, p2),
+            "global pool must be a stable singleton"
+        );
+        assert!(p1.capacity() >= 1, "global pool is always bounded (>= 1)");
     }
 }
