@@ -57,6 +57,39 @@ fn record_admission(wait: Duration) {
     ADMIT_WAIT_MICROS_TOTAL.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
 }
 
+// Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
+// two `ScanSlot::tick`s; a chunk longer than the budget is a *yield-point gap* —
+// the producer held the pool slot too long without a chance to cede it, which
+// reintroduces the monopolization B1 fixes.
+static SCHED_MAX_CHUNK_MICROS: AtomicU64 = AtomicU64::new(0);
+static SCHED_OVER_BUDGET_CHUNKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-chunk work-time budget in microseconds (default 50 ms). A scan chunk
+/// longer than this trips [`over_budget_chunks_total`] — an FM-2 signal that a
+/// producer needs to chunk more finely (e.g. a pathologically large partition
+/// decoded without an intervening yield).
+pub const DEFAULT_CHUNK_BUDGET_MICROS: u64 = 50_000;
+
+/// Longest scan chunk observed (work between cooperative yields), microseconds.
+pub fn sched_max_chunk_micros() -> u64 {
+    SCHED_MAX_CHUNK_MICROS.load(Ordering::Relaxed)
+}
+
+/// Count of scan chunks that exceeded [`DEFAULT_CHUNK_BUDGET_MICROS`]. Non-zero
+/// in steady state means a scan producer is holding the pool slot too long
+/// between yields and should alert.
+pub fn over_budget_chunks_total() -> u64 {
+    SCHED_OVER_BUDGET_CHUNKS_TOTAL.load(Ordering::Relaxed)
+}
+
+fn record_chunk(elapsed: Duration) {
+    let micros = elapsed.as_micros() as u64;
+    SCHED_MAX_CHUNK_MICROS.fetch_max(micros, Ordering::Relaxed);
+    if micros > DEFAULT_CHUNK_BUDGET_MICROS {
+        SCHED_OVER_BUDGET_CHUNKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Render the scheduler's Prometheus metrics (text exposition format), reading
 /// the live gauges off the process-global pool plus the cumulative counters.
 /// Concatenated into `/metrics` by the web layer.
@@ -103,6 +136,22 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_sched_admit_wait_micros_total {}\n",
         admit_wait_micros_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_max_chunk_micros Longest scan chunk (work between cooperative yields), microseconds.\n\
+         # TYPE ferrosa_sched_max_chunk_micros gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_max_chunk_micros {}\n",
+        sched_max_chunk_micros()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_over_budget_chunks_total Scan chunks exceeding the per-chunk work budget (FM-2 yield-point gap); non-zero should alert.\n\
+         # TYPE ferrosa_sched_over_budget_chunks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_over_budget_chunks_total {}\n",
+        over_budget_chunks_total()
     ));
     out
 }
@@ -290,6 +339,7 @@ impl SchedPool {
                     since_yield: 0,
                     yields: 0,
                     handle,
+                    last_tick: Instant::now(),
                 };
                 f(&mut slot)
             })
@@ -312,31 +362,38 @@ pub struct ScanSlot {
     since_yield: u32,
     yields: u64,
     handle: tokio::runtime::Handle,
+    /// When the current chunk's work started (the last `tick` return). Used to
+    /// measure per-chunk work time for the FM-2 yield-point-gap tripwire.
+    last_tick: Instant,
 }
 
 impl ScanSlot {
-    /// Account one produced chunk. Every `chunk_budget` calls, release the pool
-    /// permit so a waiting scan can run, then fairly (FIFO) re-acquire one.
+    /// Account one produced chunk. Records the chunk's work time for the FM-2
+    /// tripwire, and every `chunk_budget` calls releases the pool permit so a
+    /// waiting scan can run, then fairly (FIFO) re-acquires one.
     ///
     /// Runs on a `spawn_blocking` thread (not an async context), so blocking on
     /// the re-acquire via the runtime handle is sound.
     pub fn tick(&mut self) {
+        // Work time of the chunk just produced (excludes any yield wait below,
+        // because `last_tick` is reset AFTER the re-acquire).
+        record_chunk(self.last_tick.elapsed());
         self.since_yield += 1;
-        if self.since_yield < self.chunk_budget {
-            return;
+        if self.since_yield >= self.chunk_budget {
+            self.since_yield = 0;
+            self.yields += 1;
+            // Release BEFORE re-acquiring: a slot is always free for a waiter.
+            self.permit = None;
+            let slots = self.slots.clone();
+            let waited = Instant::now();
+            let permit = self
+                .handle
+                .block_on(async move { slots.acquire_owned().await })
+                .expect("scheduler pool semaphore is never closed");
+            record_admission(waited.elapsed());
+            self.permit = Some(permit);
         }
-        self.since_yield = 0;
-        self.yields += 1;
-        // Release BEFORE re-acquiring: a slot is always free for a waiter.
-        self.permit = None;
-        let slots = self.slots.clone();
-        let waited = Instant::now();
-        let permit = self
-            .handle
-            .block_on(async move { slots.acquire_owned().await })
-            .expect("scheduler pool semaphore is never closed");
-        record_admission(waited.elapsed());
-        self.permit = Some(permit);
+        self.last_tick = Instant::now();
     }
 
     /// How many times this slot has yielded and re-acquired its permit.
@@ -497,6 +554,31 @@ mod tests {
             .expect("scan task joined");
         assert_eq!(yields, 0);
         assert_eq!(pool.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn over_budget_chunk_trips_the_fm2_tripwire() {
+        // A chunk whose work exceeds the per-chunk budget must increment the
+        // over-budget counter and be reflected in the max-chunk gauge.
+        let before = over_budget_chunks_total();
+        let pool = SchedPool::new(Reservation::new(1, 0));
+        let over_by = Duration::from_micros(DEFAULT_CHUNK_BUDGET_MICROS + 20_000);
+        pool.submit_scan(1000, move |slot| {
+            // Simulate a pathologically slow chunk (a huge partition decode).
+            std::thread::sleep(over_by);
+            slot.tick();
+        })
+        .await
+        .expect("scan task joined");
+
+        assert!(
+            over_budget_chunks_total() > before,
+            "an over-budget chunk must increment over_budget_chunks_total"
+        );
+        assert!(
+            sched_max_chunk_micros() >= DEFAULT_CHUNK_BUDGET_MICROS,
+            "max_chunk_micros must reflect the slow chunk"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
