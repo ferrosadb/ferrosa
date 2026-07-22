@@ -24,11 +24,19 @@ pub const BASE_WEIGHT: u64 = 1024;
 
 /// Advance `vruntime` by `service` charged inversely to `weight`. Pure.
 ///
-/// `delta = service × BASE_WEIGHT / weight`. Saturating so a pathological
+/// `delta = service × BASE_WEIGHT / weight`, **floored at 1 for any positive
+/// service** so a unit whose weighted service rounds down to zero (a group whose
+/// `weight` exceeds `service × BASE_WEIGHT` — reachable once B3 allows per-tenant
+/// weights above [`BASE_WEIGHT`]) still advances and cannot monopolize the queue
+/// via integer-division rounding. For realistic service (microseconds) the floor
+/// never binds — `delta` is already `≥ service`. Saturating so a pathological
 /// service value can never wrap the counter.
 pub fn advance_vruntime(vruntime: u64, service: u64, weight: u32) -> u64 {
     let weight = u64::from(weight.max(1));
-    let delta = service.saturating_mul(BASE_WEIGHT) / weight;
+    let mut delta = service.saturating_mul(BASE_WEIGHT) / weight;
+    if service > 0 {
+        delta = delta.max(1);
+    }
     vruntime.saturating_add(delta)
 }
 
@@ -54,6 +62,16 @@ mod tests {
         assert_eq!(advance_vruntime(0, 100, 256), 400);
         // Zero weight is treated as 1 (no divide-by-zero).
         assert_eq!(advance_vruntime(0, 1, 0), 1024);
+    }
+
+    #[test]
+    fn positive_service_always_advances_at_least_one() {
+        // A high-weight group whose weighted service would round to 0 still
+        // advances by 1 — it cannot monopolize via integer-division rounding.
+        assert_eq!(advance_vruntime(0, 1, 3072), 1); // 1×1024/3072 = 0 → floored to 1
+        assert_eq!(advance_vruntime(5, 1, u32::MAX), 6);
+        // Zero service does not advance.
+        assert_eq!(advance_vruntime(7, 0, 1024), 7);
     }
 
     #[test]

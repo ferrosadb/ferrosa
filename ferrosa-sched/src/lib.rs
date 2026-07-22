@@ -32,11 +32,13 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub mod fair_admit;
+pub mod group_runqueue;
 pub mod io_permits;
 pub mod runqueue;
 pub mod scheduler;
 
 pub use fair_admit::Admitted;
+pub use group_runqueue::{GroupId, GroupRunQueue, Picked};
 pub use io_permits::{IoPermit, IoPermits};
 
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus

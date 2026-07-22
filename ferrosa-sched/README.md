@@ -44,6 +44,13 @@ a CheckQuorum leader step-down.
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`
   floor, service charged inversely to weight, and the strictly-more-deserving
   yield rule.
+- `group_runqueue::GroupRunQueue` (**B3**) — the **hierarchical** (per-tenant)
+  dimension. A two-level fair queue: the outer level schedules groups (tenants)
+  by group `vruntime`, the inner level schedules a group's queries (a nested
+  `RunQueue`). A group's `vruntime` advances by the service of *any* of its
+  queries, so a tenant's aggregate share is independent of how many queries it
+  runs (`GroupId` is an opaque `u64` — the caller maps `TenantContext` → id,
+  keeping the crate leaf).
 - `io_permits::IoPermits` (**B2**) — the **I/O** resource dimension. Where
   `FairAdmit` bounds concurrent scan *compute*, this bounds concurrent bulk
   *I/O* (`Lane::Bulk`): at most `capacity` `IoPermit`s are held at once, so a
@@ -91,3 +98,12 @@ a CheckQuorum leader step-down.
   - Remaining refinement: acquire the I/O permit at the *per-I/O operation*
     (release the CPU slot while blocked on S3) rather than per-scan — the deeper
     `ferrosa-net`/storage seam integration.
+- **B3 (in progress):** `group_runqueue::GroupRunQueue` — T3.1 two-level
+  (group→query) fair queue with the T3.9 anti-gaming property (1 tenant × 100
+  queries == 1 tenant × 1 query) and a T3.2 weight preview (share ∝ weight),
+  plus an `advance_vruntime` floor so a high-weight group can't monopolize via
+  integer-division rounding. T3.8 (bounded runqueue + `Overloaded`) already
+  shipped in B1.5. Next: make it live in `FairAdmit` (thread the tenant group
+  through `submit_scan`), per-tenant weights from TOML (T3.2), and fold the
+  background work — compaction/repair/index-build/ANN — into the pool as the
+  `system` group (T3.3–T3.6), where the weighting finally arbitrates.
