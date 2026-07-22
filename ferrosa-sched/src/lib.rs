@@ -32,10 +32,12 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub mod fair_admit;
+pub mod io_permits;
 pub mod runqueue;
 pub mod scheduler;
 
 pub use fair_admit::Admitted;
+pub use io_permits::{IoPermit, IoPermits};
 
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus
 // registry reads them); instantaneous gauges (`headroom_cores`, `active`) are
@@ -74,6 +76,20 @@ pub fn admissions_rejected_overload_total() -> u64 {
 /// overload.
 pub(crate) fn record_overload_rejection() {
     ADMISSIONS_REJECTED_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static IO_PERMITS_ACQUIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bulk-I/O permits ([`io_permits::IoPermits`]) acquired since process start —
+/// the throughput of the I/O resource dimension (B2). Paired with a live
+/// `in_flight` gauge once a pool is wired into the Bulk lane.
+pub fn io_permits_acquired_total() -> u64 {
+    IO_PERMITS_ACQUIRED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Called by [`io_permits::IoPermits`] when a bulk-I/O permit is granted.
+pub(crate) fn record_io_permit_acquired() {
+    IO_PERMITS_ACQUIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 // Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
@@ -179,6 +195,14 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_sched_admissions_rejected_overload_total {}\n",
         admissions_rejected_overload_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_io_permits_acquired_total Bulk-I/O permits granted since start (the I/O resource dimension, B2).\n\
+         # TYPE ferrosa_sched_io_permits_acquired_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_io_permits_acquired_total {}\n",
+        io_permits_acquired_total()
     ));
     out
 }
@@ -846,6 +870,7 @@ mod tests {
             "ferrosa_sched_tasks_admitted_total",
             "ferrosa_sched_admit_wait_micros_total",
             "ferrosa_sched_admissions_rejected_overload_total",
+            "ferrosa_sched_io_permits_acquired_total",
         ] {
             assert!(text.contains(metric), "missing metric {metric}");
         }

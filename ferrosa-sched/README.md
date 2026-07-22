@@ -44,6 +44,12 @@ a CheckQuorum leader step-down.
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`
   floor, service charged inversely to weight, and the strictly-more-deserving
   yield rule.
+- `io_permits::IoPermits` (**B2**) — the **I/O** resource dimension. Where
+  `FairAdmit` bounds concurrent scan *compute*, this bounds concurrent bulk
+  *I/O* (`Lane::Bulk`): at most `capacity` `IoPermit`s are held at once, so a
+  fan-out of S3-reading scans cannot saturate the shared I/O path and starve the
+  reserved lanes. Async acquire (an I/O-bound waiter is a cheap task, the B0
+  property); RAII permits returned on drop, including panic/cancel unwind.
 
 ## Dependencies / dependents
 
@@ -67,3 +73,9 @@ a CheckQuorum leader step-down.
   Every scan through the pool is currently a full-table `Bulk` scan (Foreground
   reads bypass — T1.5), so the 4:1 weighting is latent until B3 folds
   mixed-weight background work (compaction/repair/ANN) into the pool.
+  Admission is cancellable + bounded (`Overloaded` backpressure), and range-scan
+  readers open only after a slot is granted.
+- **B2 (in progress):** `io_permits::IoPermits` — T2.1 bounded bulk-I/O permit
+  pool + T2.4 leak invariant (RAII returns the permit on panic/cancel). Next:
+  wire it into the `Lane::Bulk` I/O path (`ferrosa-net`), and T2.2 (vruntime
+  advances on I/O wait) so an I/O-bound scan is throttled to its fair share.
