@@ -374,6 +374,15 @@ impl ScanSlot {
     ///
     /// Runs on a `spawn_blocking` thread (not an async context), so blocking on
     /// the re-acquire via the runtime handle is sound.
+    ///
+    /// # Deadlock safety (T1.7)
+    ///
+    /// The caller must hold **no lock across `tick()`**. The re-acquire blocks
+    /// until the pool permit is granted, and the permit is only freed as *other*
+    /// scans yield or finish — so a storage/index lock held here could deadlock
+    /// those scans (FM-3/FM-7). The `store.rs` producers load shared state via
+    /// arc-swap (`load_full()` → owned `Arc`s), holding no guard; the
+    /// `scan_cooperative_yield_guard` source test enforces it.
     pub fn tick(&mut self) {
         // Work time of the chunk just produced (excludes any yield wait below,
         // because `last_tick` is reset AFTER the re-acquire).
