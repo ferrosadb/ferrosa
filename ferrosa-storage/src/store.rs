@@ -2746,53 +2746,58 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
-        ferrosa_sched::global_pool().submit_blocking(move || {
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
-                .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &sst_readers[..];
+        ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+            move |slot| {
+                let active_iter = view
+                    .active
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref());
+                let flushing_iter = view
+                    .flushing
+                    .as_ref()
+                    .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                let sstables_slice = &sst_readers[..];
 
-            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
-                active_iter,
-                flushing_iter,
-                sstables_slice,
-                &column_mappings,
-                &wanted_owned,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
-            };
-
-            let cap = partition_limit.unwrap_or(usize::MAX);
-            let mut emitted: usize = 0;
-            loop {
-                if emitted >= cap {
-                    return;
-                }
-                match merger.next_merged_partition() {
-                    Ok(Some(partition)) => {
-                        if tx.blocking_send(Ok(partition)).is_err() {
+                let mut merger =
+                    match crate::range_merger::merger_for_projected_sources_with_mappings(
+                        active_iter,
+                        flushing_iter,
+                        sstables_slice,
+                        &column_mappings,
+                        &wanted_owned,
+                        start_owned,
+                        end_owned,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
                             return;
                         }
-                        emitted += 1;
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
+                    };
+
+                let cap = partition_limit.unwrap_or(usize::MAX);
+                let mut emitted: usize = 0;
+                loop {
+                    if emitted >= cap {
                         return;
                     }
+                    match merger.next_merged_partition() {
+                        Ok(Some(partition)) => {
+                            if tx.blocking_send(Ok(partition)).is_err() {
+                                return;
+                            }
+                            emitted += 1;
+                            slot.tick(); // B1 T1.2 cooperative yield
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    }
                 }
-            }
-        });
+            },
+        );
 
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -2846,51 +2851,58 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
-        ferrosa_sched::global_pool().submit_blocking(move || {
-            // Build source iterators — these borrow from `view`
-            // (memtable Arcs) and from the opened SSTable reader Arcs, both
-            // of which the closure owns for the task's full lifetime, so there
-            // is no self-referential lifetime problem.
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
-                .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &sst_readers[..];
+        ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+            move |slot| {
+                // Build source iterators — these borrow from `view`
+                // (memtable Arcs) and from the opened SSTable reader Arcs, both
+                // of which the closure owns for the task's full lifetime, so there
+                // is no self-referential lifetime problem.
+                let active_iter = view
+                    .active
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref());
+                let flushing_iter = view
+                    .flushing
+                    .as_ref()
+                    .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                let sstables_slice = &sst_readers[..];
 
-            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
-                active_iter,
-                flushing_iter,
-                sstables_slice,
-                &column_mappings,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
-            };
-
-            loop {
-                match merger.next_merged_partition() {
-                    Ok(Some(partition)) => {
-                        if tx.blocking_send(Ok(partition)).is_err() {
-                            // Consumer dropped (cancelled stream).
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
+                let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
+                    active_iter,
+                    flushing_iter,
+                    sstables_slice,
+                    &column_mappings,
+                    start_owned,
+                    end_owned,
+                ) {
+                    Ok(m) => m,
                     Err(e) => {
                         let _ = tx.blocking_send(Err(e));
                         return;
                     }
+                };
+
+                loop {
+                    match merger.next_merged_partition() {
+                        Ok(Some(partition)) => {
+                            if tx.blocking_send(Ok(partition)).is_err() {
+                                // Consumer dropped (cancelled stream).
+                                return;
+                            }
+                            // B1 T1.2: account the chunk and cooperatively yield the
+                            // pool slot every budget partitions so a concurrent scan
+                            // isn't starved for this scan's whole duration.
+                            slot.tick();
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    }
                 }
-            }
-        });
+            },
+        );
 
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -2942,47 +2954,51 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
-        ferrosa_sched::global_pool().submit_blocking(move || {
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
-                .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &sst_readers[..];
+        ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+            move |slot| {
+                let active_iter = view
+                    .active
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref());
+                let flushing_iter = view
+                    .flushing
+                    .as_ref()
+                    .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                let sstables_slice = &sst_readers[..];
 
-            let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
-                active_iter,
-                flushing_iter,
-                sstables_slice,
-                &column_mappings,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
-            };
-
-            let k = crate::range_merger::rows_per_fragment();
-            loop {
-                match merger.next_fragment(k) {
-                    Ok(Some(fragment)) => {
-                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
+                let mut merger = match crate::range_merger::merger_for_sources_with_mappings(
+                    active_iter,
+                    flushing_iter,
+                    sstables_slice,
+                    &column_mappings,
+                    start_owned,
+                    end_owned,
+                ) {
+                    Ok(m) => m,
                     Err(e) => {
                         let _ = tx.blocking_send(Err(e));
                         return;
                     }
+                };
+
+                let k = crate::range_merger::rows_per_fragment();
+                loop {
+                    match merger.next_fragment(k) {
+                        Ok(Some(fragment)) => {
+                            if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                                return;
+                            }
+                            slot.tick(); // B1 T1.2 cooperative yield
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    }
                 }
-            }
-        });
+            },
+        );
 
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -3025,48 +3041,53 @@ impl<F: FlushTarget> TableStore<F> {
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
         // scan cannot oversubscribe the cores and starve raft heartbeats.
-        ferrosa_sched::global_pool().submit_blocking(move || {
-            let active_iter = view
-                .active
-                .range_iter(start_owned.as_ref(), end_owned.as_ref());
-            let flushing_iter = view
-                .flushing
-                .as_ref()
-                .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
-            let sstables_slice = &sst_readers[..];
+        ferrosa_sched::global_pool().submit_scan(
+            ferrosa_sched::DEFAULT_SCAN_CHUNK_BUDGET,
+            move |slot| {
+                let active_iter = view
+                    .active
+                    .range_iter(start_owned.as_ref(), end_owned.as_ref());
+                let flushing_iter = view
+                    .flushing
+                    .as_ref()
+                    .map(|f| f.range_iter(start_owned.as_ref(), end_owned.as_ref()));
+                let sstables_slice = &sst_readers[..];
 
-            let mut merger = match crate::range_merger::merger_for_projected_sources_with_mappings(
-                active_iter,
-                flushing_iter,
-                sstables_slice,
-                &column_mappings,
-                &wanted_owned,
-                start_owned,
-                end_owned,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
-            };
+                let mut merger =
+                    match crate::range_merger::merger_for_projected_sources_with_mappings(
+                        active_iter,
+                        flushing_iter,
+                        sstables_slice,
+                        &column_mappings,
+                        &wanted_owned,
+                        start_owned,
+                        end_owned,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    };
 
-            let k = crate::range_merger::rows_per_fragment();
-            loop {
-                match merger.next_fragment(k) {
-                    Ok(Some(fragment)) => {
-                        if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                let k = crate::range_merger::rows_per_fragment();
+                loop {
+                    match merger.next_fragment(k) {
+                        Ok(Some(fragment)) => {
+                            if tx.blocking_send(Ok(fragment.into_partition())).is_err() {
+                                return;
+                            }
+                            slot.tick(); // B1 T1.2 cooperative yield
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
                             return;
                         }
                     }
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ = tx.blocking_send(Err(e));
-                        return;
-                    }
                 }
-            }
-        });
+            },
+        );
 
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
