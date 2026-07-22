@@ -2510,6 +2510,7 @@ dependencies = [
 name = "ferrosa-sched"
 version = "0.17.0"
 dependencies = [
+ "proptest",
  "tokio",
 ]
 
