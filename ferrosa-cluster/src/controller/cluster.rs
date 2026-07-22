@@ -1662,6 +1662,21 @@ impl ModeController {
                 });
             }
 
+            // Publish Raft leadership/term as Prometheus gauges. A dedicated
+            // poller (NOT the election guard — the guard is ADR-012-deprecated)
+            // derives leadership from `current_leader()`, the same reliable
+            // source `/readyz` uses.
+            {
+                use crate::raft::consensus_metrics::run_consensus_metrics_poller;
+                let metrics_raft = raft_arc.clone();
+                let metrics_cancel = election_guard_cancel.clone();
+                ferrosa_net::task_pool::TaskPool::current("raft-consensus-metrics").spawn(
+                    async move {
+                        run_consensus_metrics_poller(metrics_raft, metrics_cancel).await;
+                    },
+                );
+            }
+
             // Spawn the leader-side snapshot-push sweep (P0-20 fix, path b).
             //
             // When this node is the leader, the sweep periodically detects
