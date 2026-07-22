@@ -468,7 +468,10 @@ pub struct TableStore<F: FlushTarget> {
     /// genuinely corrupt/missing file (not a transient compaction swap) and a
     /// read may have returned an incomplete result — alert on it.
     pub view_retry_exhausted: std::sync::atomic::AtomicU64,
-    pub(crate) flush_target: F,
+    /// Wrapped in `Arc` so a scan producer can capture a cheap clone and open
+    /// its SSTable readers *after* admission (t_6d0553ee): `F` itself is neither
+    /// `Clone` nor `'static`-movable, but `Arc<F>` is.
+    pub(crate) flush_target: Arc<F>,
     options: WriteOptions,
     /// Secondary index declarations: `(index_name, column_position)` pairs.
     /// Column position is the index into `Row.cells` by column ordinal
@@ -630,6 +633,43 @@ where
             )));
         }
     });
+}
+
+/// Open (pooled) the readers for every descriptor whose byte-comparable key
+/// range overlaps `[start, end]`, newest-first. Same logic as
+/// [`TableStore::open_readers_for_key_range`] but over cloned, `'static`-owned
+/// pool inputs (`Arc<ReaderPool>`, the table key, `Arc<F>`), so a scan producer
+/// can open its readers *after* admission — a cancelled or overloaded scan then
+/// never opens readers (t_6d0553ee). Pruning stays conservative (FMEA #2): a
+/// descriptor is skipped only when its key range is provably disjoint.
+fn open_pooled_readers<T: FlushTarget>(
+    reader_pool: &SharedReaderPool<T::Reader>,
+    pool_table_key: &str,
+    flush_target: &T,
+    descriptors: &[SstableDescriptor],
+    start: Option<&DecoratedKey>,
+    end: Option<&DecoratedKey>,
+) -> Result<Vec<Arc<SSTableReader<T::Reader>>>> {
+    let start_bytes = start.map(ferrosa_sstable::byte_comparable::encode);
+    let end_bytes = end.map(ferrosa_sstable::byte_comparable::encode);
+    let mut readers = Vec::new();
+    for desc in descriptors.iter() {
+        if let Some(ref sb) = start_bytes {
+            if sb.as_slice() > desc.max_key.as_slice() {
+                continue;
+            }
+        }
+        if let Some(ref eb) = end_bytes {
+            if eb.as_slice() < desc.min_key.as_slice() {
+                continue;
+            }
+        }
+        let dir = desc.dir.clone();
+        let gen = desc.gen_num();
+        let key = (pool_table_key.to_string(), gen);
+        readers.push(reader_pool.get_or_open(key, || flush_target.open_reader(&dir, gen))?);
+    }
+    Ok(readers)
 }
 
 fn sstable_column_mappings<R: ReadAt + Send + Sync + 'static>(
@@ -899,7 +939,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
-            flush_target,
+            flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
@@ -974,26 +1014,14 @@ impl<F: FlushTarget> TableStore<F> {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> Result<Vec<Arc<SSTableReader<F::Reader>>>> {
-        let start_bytes = start.map(ferrosa_sstable::byte_comparable::encode);
-        let end_bytes = end.map(ferrosa_sstable::byte_comparable::encode);
-        let mut readers = Vec::new();
-        for desc in descriptors.iter() {
-            // Skip only on provable disjointness:
-            //   start > desc.max_key  → window begins after this SSTable ends
-            //   end   < desc.min_key  → window ends before this SSTable begins
-            if let Some(ref sb) = start_bytes {
-                if sb.as_slice() > desc.max_key.as_slice() {
-                    continue;
-                }
-            }
-            if let Some(ref eb) = end_bytes {
-                if eb.as_slice() < desc.min_key.as_slice() {
-                    continue;
-                }
-            }
-            readers.push(self.open_reader(desc)?);
-        }
-        Ok(readers)
+        open_pooled_readers(
+            &self.reader_pool,
+            &self.pool_table_key,
+            &*self.flush_target,
+            descriptors,
+            start,
+            end,
+        )
     }
 
     /// Seed the pool with an already-open reader for `desc` (e.g. just-flushed
@@ -1106,7 +1134,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
-            flush_target,
+            flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
@@ -1185,7 +1213,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
-            flush_target,
+            flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
             index_filter_predicates: HashMap::new(),
@@ -2743,7 +2771,10 @@ impl<F: FlushTarget> TableStore<F> {
         partition_limit: Option<usize>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
         // Buffer is intentionally small. The producer runs on a
         // spawn_blocking thread and per-partition body decode on cold
         // cache is the dominant cost (wide rows + embedding cells +
@@ -2766,20 +2797,13 @@ impl<F: FlushTarget> TableStore<F> {
         // Open the overlapping readers (pooled) up front and move the `Arc`s
         // into the blocking task. The readers stay resident only while the
         // stream runs; the pool cap (soft when in use) bounds total residency.
-        let sst_readers = match self.open_readers_for_key_range(
-            &view.sstables,
-            start_owned.as_ref(),
-            end_owned.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.try_send(Err(e));
-                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
-                }));
-            }
-        };
-        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+        // Capture the pooled-reader inputs so the producer opens its SSTable
+        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
+        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
+        // clone moves into the 'static closure.
+        let reader_pool = self.reader_pool.clone();
+        let pool_table_key = self.pool_table_key.clone();
+        let flush_target = self.flush_target.clone();
 
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
@@ -2790,6 +2814,23 @@ impl<F: FlushTarget> TableStore<F> {
         // sharing the pool (interactive scans today bypass; B3 folds in
         // compaction/repair, which this weighting then arbitrates).
         spawn_bounded_range_scan(tx.clone(), move |slot| {
+            // Open the overlapping SSTable readers now that a slot is held —
+            // gated by admission, not before it.
+            let sst_readers = match open_pooled_readers(
+                &reader_pool,
+                &pool_table_key,
+                &*flush_target,
+                &view.sstables,
+                start_owned.as_ref(),
+                end_owned.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -2857,7 +2898,10 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
         /// Per-stream channel buffer. Kept small because per-partition
         /// decode on cold cache is expensive (wide rows + cell decode)
         /// and a `LIMIT N` consumer should pay for ~N body decodes,
@@ -2872,20 +2916,13 @@ impl<F: FlushTarget> TableStore<F> {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
         // Open overlapping readers (pooled) and move the Arcs into the task.
-        let sst_readers = match self.open_readers_for_key_range(
-            &view.sstables,
-            start_owned.as_ref(),
-            end_owned.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.try_send(Err(e));
-                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
-                }));
-            }
-        };
-        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+        // Capture the pooled-reader inputs so the producer opens its SSTable
+        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
+        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
+        // clone moves into the 'static closure.
+        let reader_pool = self.reader_pool.clone();
+        let pool_table_key = self.pool_table_key.clone();
+        let flush_target = self.flush_target.clone();
 
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
@@ -2896,6 +2933,23 @@ impl<F: FlushTarget> TableStore<F> {
         // sharing the pool (interactive scans today bypass; B3 folds in
         // compaction/repair, which this weighting then arbitrates).
         spawn_bounded_range_scan(tx.clone(), move |slot| {
+            // Open the overlapping SSTable readers now that a slot is held —
+            // gated by admission, not before it.
+            let sst_readers = match open_pooled_readers(
+                &reader_pool,
+                &pool_table_key,
+                &*flush_target,
+                &view.sstables,
+                start_owned.as_ref(),
+                end_owned.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
             // Build source iterators — these borrow from `view`
             // (memtable Arcs) and from the opened SSTable reader Arcs, both
             // of which the closure owns for the task's full lifetime, so there
@@ -2969,7 +3023,10 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
         const STREAM_BUFFER: usize = 4;
         let view = self.view.load_full();
         let schema = self.schema.load_full();
@@ -2977,20 +3034,13 @@ impl<F: FlushTarget> TableStore<F> {
         let end_owned = end.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        let sst_readers = match self.open_readers_for_key_range(
-            &view.sstables,
-            start_owned.as_ref(),
-            end_owned.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.try_send(Err(e));
-                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
-                }));
-            }
-        };
-        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+        // Capture the pooled-reader inputs so the producer opens its SSTable
+        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
+        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
+        // clone moves into the 'static closure.
+        let reader_pool = self.reader_pool.clone();
+        let pool_table_key = self.pool_table_key.clone();
+        let flush_target = self.flush_target.clone();
 
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
@@ -3001,6 +3051,23 @@ impl<F: FlushTarget> TableStore<F> {
         // sharing the pool (interactive scans today bypass; B3 folds in
         // compaction/repair, which this weighting then arbitrates).
         spawn_bounded_range_scan(tx.clone(), move |slot| {
+            // Open the overlapping SSTable readers now that a slot is held —
+            // gated by admission, not before it.
+            let sst_readers = match open_pooled_readers(
+                &reader_pool,
+                &pool_table_key,
+                &*flush_target,
+                &view.sstables,
+                start_owned.as_ref(),
+                end_owned.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -3057,7 +3124,10 @@ impl<F: FlushTarget> TableStore<F> {
         wanted: Vec<u16>,
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
-    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<Partition>> + Send>>
+    where
+        F: Send + Sync + 'static,
+    {
         const STREAM_BUFFER: usize = 4;
         let view = self.view.load_full();
         let schema = self.schema.load_full();
@@ -3066,20 +3136,13 @@ impl<F: FlushTarget> TableStore<F> {
         let wanted_owned = wanted;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Partition>>(STREAM_BUFFER);
 
-        let sst_readers = match self.open_readers_for_key_range(
-            &view.sstables,
-            start_owned.as_ref(),
-            end_owned.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = tx.try_send(Err(e));
-                return Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|item| (item, rx))
-                }));
-            }
-        };
-        let column_mappings = sstable_column_mappings(&schema, &sst_readers);
+        // Capture the pooled-reader inputs so the producer opens its SSTable
+        // readers AFTER admission (t_6d0553ee): a cancelled or overloaded scan
+        // then never opens readers. `flush_target` is Arc-wrapped so a cheap
+        // clone moves into the 'static closure.
+        let reader_pool = self.reader_pool.clone();
+        let pool_table_key = self.pool_table_key.clone();
+        let flush_target = self.flush_target.clone();
 
         // t_88223ad0: route the scan producer through the bounded scheduler pool
         // (cores - reserved) instead of the unbounded blocking pool, so a broad
@@ -3090,6 +3153,23 @@ impl<F: FlushTarget> TableStore<F> {
         // sharing the pool (interactive scans today bypass; B3 folds in
         // compaction/repair, which this weighting then arbitrates).
         spawn_bounded_range_scan(tx.clone(), move |slot| {
+            // Open the overlapping SSTable readers now that a slot is held —
+            // gated by admission, not before it.
+            let sst_readers = match open_pooled_readers(
+                &reader_pool,
+                &pool_table_key,
+                &*flush_target,
+                &view.sstables,
+                start_owned.as_ref(),
+                end_owned.as_ref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let column_mappings = sstable_column_mappings(&schema, &sst_readers);
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
