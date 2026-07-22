@@ -2505,6 +2505,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-sched"
+version = "0.17.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "ferrosa-schema"
 version = "0.17.0"
 dependencies = [
