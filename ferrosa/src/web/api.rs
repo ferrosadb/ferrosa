@@ -72,6 +72,11 @@ pub async fn get_metrics(
     // Query-scheduler pool gauges/counters (ferrosa_sched_*). The
     // consensus-headroom gauge must stay > 0 under scan load (t_88223ad0).
     body.push_str(&ferrosa_sched::render_prometheus());
+    // Raft consensus liveness (ferrosa_raft_current_term / _is_leader /
+    // _election_storm_term_jumps_total). The scan-storm regression (t_88223ad0
+    // T0.6) asserts the term stays stable and the storm counter stays 0 under
+    // full-table ALLOW FILTERING load; a non-zero storm counter should alert.
+    body.push_str(&ferrosa_cluster::raft::consensus_metrics::render_prometheus());
     (
         StatusCode::OK,
         [(
