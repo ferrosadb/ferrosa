@@ -2127,6 +2127,7 @@ dependencies = [
  "ferrosa-graph",
  "ferrosa-net",
  "ferrosa-postgres",
+ "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-session",
  "ferrosa-sparql",
@@ -2505,6 +2506,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-sched"
+version = "0.17.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "ferrosa-schema"
 version = "0.17.0"
 dependencies = [
@@ -2617,6 +2625,7 @@ dependencies = [
  "ferrosa-common",
  "ferrosa-index",
  "ferrosa-row-bridge",
+ "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-sstable",
  "ferrosa-storage",

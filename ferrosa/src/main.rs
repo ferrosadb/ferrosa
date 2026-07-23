@@ -962,6 +962,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // "Cannot drop a runtime …" panic (issue #172). Must precede any `?` below.
     runtimes.leak_for_process_lifetime();
 
+    // Bound the storage scan-producer pool (t_88223ad0): reserve cores for
+    // consensus so a full-table ALLOW FILTERING scan cannot oversubscribe the
+    // CPUs and starve raft heartbeats into a CheckQuorum step-down. Init here,
+    // before any scan can lazily default it. `FERROSA_SCHED_RESERVED_CORES`
+    // (default 1) tunes the headroom.
+    let sched_reserved = std::env::var("FERROSA_SCHED_RESERVED_CORES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(ferrosa_sched::DEFAULT_RESERVED_CORES);
+    let sched_pool = ferrosa_sched::init_global_pool(
+        ferrosa_sched::Reservation::from_available_parallelism(sched_reserved),
+    );
+    tracing::info!(
+        capacity = sched_pool.capacity(),
+        reserved = sched_reserved,
+        "scheduler: bounded scan-producer pool initialized (consensus headroom reserved)"
+    );
+
     // 4a. Seed default roles if auth is enabled.
     //
     // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`

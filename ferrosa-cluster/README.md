@@ -55,6 +55,15 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.
+- `consensus_metrics.rs` — Prometheus surface for Raft liveness:
+  `ferrosa_raft_current_term` / `_is_leader` / `_has_leader` (fed by
+  `run_consensus_metrics_poller`, a per-cluster-node task that derives leadership
+  from `current_leader()` — the reliable `/readyz` source — not the raw
+  `metrics().state` snapshot which read 0 for the leader) plus
+  `_election_storm_term_jumps_total`. Rendered onto the main binary's
+  `/metrics`. Kept separate from `election_guard` per ADR-012 so the metric home
+  and its poller outlive the guard. The scan-storm regression (t_88223ad0 / T0.6)
+  asserts the storm counter stays 0 under full-table `ALLOW FILTERING` load.
 - `snapshot_pusher.rs` — leader-side sweep (P0-20) that triggers snapshot +
   heartbeat to lagging followers; `INSTALLSNAPSHOT_PUSHES_TOTAL`.
 - `snapshot_transport.rs` — snapshots travel on `Lane::Bulk` (not `Lane::Raft`),

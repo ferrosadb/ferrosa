@@ -21,6 +21,7 @@ ferrosa-graph = { path = "../ferrosa-graph" }
 ferrosa-sparql = { path = "../ferrosa-sparql" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-postgres = { path = "../ferrosa-postgres" }
+ferrosa-sched = { path = "../ferrosa-sched" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-session = { path = "../ferrosa-session" }
 ferrosa-storage = { path = "../ferrosa-storage" }
