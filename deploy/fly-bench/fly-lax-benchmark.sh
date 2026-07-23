@@ -815,14 +815,19 @@ run_ferrosa_ramp() {
 run_ferrosa_t128() {
   local size_label
   size_label="$(ferrosa_size_label)"
+  # Env-overridable so a harsher A/B can drive more threads / cycles without a
+  # code change (the O_DIRECT freeze-repro needs sustained heavy write load).
+  local threads="${THREADS:-128}"
+  local warmup="${WARMUP_CYCLES:-1000000}"
+  local measure="${MEASURE_CYCLES:-1000000}"
   (
     WORKLOAD="$RAMP_WORKLOAD"
     SCENARIO=default
-    THREADS=128
-    WARMUP_CYCLES=1000000
-    MEASURE_CYCLES=1000000
+    THREADS="$threads"
+    WARMUP_CYCLES="$warmup"
+    MEASURE_CYCLES="$measure"
     REPEATS=1
-    run_target "ferrosa-${size_label}-t128-c1000000" "$FERROSA_APP" "ferrosa-"
+    run_target "ferrosa-${size_label}-t${threads}-c${measure}" "$FERROSA_APP" "ferrosa-"
   )
 }
 
