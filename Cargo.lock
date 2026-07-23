@@ -2131,6 +2131,7 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-session",
  "ferrosa-sparql",
+ "ferrosa-sstable",
  "ferrosa-storage",
  "ferrosa-udf",
  "futures",

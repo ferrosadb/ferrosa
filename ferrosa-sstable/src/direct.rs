@@ -78,6 +78,39 @@ pub fn direct_write_bytes_total() -> u64 {
     DIRECT_WRITE_BYTES_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Render the direct-writer metrics (Prometheus text exposition). Concatenated
+/// into `/metrics` by the web layer. `direct_write_fallbacks_total` is the
+/// load-bearing signal: it MUST stay 0 when `FERROSA_SSTABLE_DIRECT_IO=1` — a
+/// non-zero value means the file system rejected O_DIRECT and Data.db is being
+/// page-cached after all (the freeze mitigation is inert, e.g. an overlay
+/// rootfs instead of a real ext4 volume).
+pub fn render_prometheus(out: &mut String) {
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_write_fallbacks_total Data.db files where O_DIRECT was rejected and the writer fell back to buffered I/O; non-zero means the page-cache-bypass mitigation is INACTIVE for those files and should alert.\n\
+         # TYPE ferrosa_sstable_direct_write_fallbacks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_write_fallbacks_total {}\n",
+        direct_write_fallbacks_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_write_files_total Immutable files completed through the direct writer since start.\n\
+         # TYPE ferrosa_sstable_direct_write_files_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_write_files_total {}\n",
+        direct_write_files_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_write_bytes_total Logical bytes written through the direct writer since start.\n\
+         # TYPE ferrosa_sstable_direct_write_bytes_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_write_bytes_total {}\n",
+        direct_write_bytes_total()
+    ));
+}
+
 /// How the OS page cache is being bypassed for a given file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectMode {
