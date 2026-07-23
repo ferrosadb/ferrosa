@@ -64,18 +64,23 @@ echo "   percentiles in the CSV's duration_unit (usually ms); p100 = max = the o
 # header cols include count,max,mean,p95,p99,p999,duration_unit — locate by name.
 parse_nb_csv() {  # $1 = arm results dir
   local dir="$1" tgz tmp csv
-  tgz=$(ls "${dir}"/*.tgz 2>/dev/null | head -1 || true)
+  tgz=$(ls -t "${dir}"/*.tgz 2>/dev/null | head -1 || true)  # newest = this run's
   [ -z "${tgz}" ] && { echo "no nb bundle"; return; }
   tmp="$(mktemp -d)"; tar xzf "${tgz}" -C "${tmp}" 2>/dev/null || true
-  # Prefer result-success; fall back to result. Take the deepest match.
-  csv=$(find "${tmp}" -name "result-success.csv" 2>/dev/null | head -1)
+  # nb5 (this version) names the op-latency timer '*cycles_servicetime*.csv'
+  # (columns: t,count,max,mean,...,p95,p98,p99,p999,...,duration_unit=NANOSECONDS).
+  # Fall back to the older result-success/result names.
+  csv=$(find "${tmp}" -name "*cycles_servicetime*.csv" 2>/dev/null | head -1)
+  [ -z "${csv}" ] && csv=$(find "${tmp}" -name "result-success.csv" 2>/dev/null | head -1)
   [ -z "${csv}" ] && csv=$(find "${tmp}" -name "result.csv" 2>/dev/null | head -1)
-  [ -z "${csv}" ] && { echo "no result CSV in bundle ($(find "${tmp}" -name '*.csv' | wc -l | tr -d ' ') csv files: $(find "${tmp}" -name '*.csv' -exec basename {} \; | tr '\n' ' '))"; return; }
+  [ -z "${csv}" ] && { echo "no latency CSV in bundle ($(find "${tmp}" -name '*.csv' | wc -l | tr -d ' ') csv files)"; return; }
+  # Report in ms (÷1e6 when the unit is NANOSECONDS, else raw).
   awk -F, 'NR==1{for(i=1;i<=NF;i++)h[$i]=i} END{
-      printf "count=%s  mean=%.2f  p95=%.2f  p99=%.2f  p999=%.2f  p100(max)=%.2f  unit=%s",
-      $h["count"], $h["mean"], $h["p95"], $h["p99"], $h["p999"], $h["max"], $h["duration_unit"]
+      u=$h["duration_unit"]; d=(u=="NANOSECONDS")?1e6:((u=="MICROSECONDS")?1e3:1);
+      printf "count=%s  mean=%.1fms  p95=%.1fms  p99=%.1fms  p999=%.1fms  p100(max)=%.1fms",
+      $h["count"], $h["mean"]/d, $h["p95"]/d, $h["p99"]/d, $h["p999"]/d, $h["max"]/d
     }' "${csv}"
-  echo "   [${csv#${tmp}/}]"
+  echo "   [$(basename "${csv%.csv}")]"
 }
 printf 'buffered | '; parse_nb_csv "${BUF_DIR}"
 printf 'direct   | '; parse_nb_csv "${DIR_DIR}"

@@ -539,10 +539,16 @@ EOF
 }
 
 set_ferrosa_secrets() {
-  flyctl secrets set --app "$FERROSA_APP" \
+  # --stage: set secrets WITHOUT a deploy. Plain `secrets set` tries to grab the
+  # app config from a running machine to redeploy it; right after recreate-ferrosa
+  # the app has zero machines, so it dies with "could not create a fly.toml from
+  # any machines". Staged secrets are applied to the machines created next. The
+  # `|| true` is a backstop: these S3 secrets are idempotent and already persist
+  # on the app from the first deploy, so a transient failure must not abort.
+  flyctl secrets set --stage --app "$FERROSA_APP" \
     FERROSA_S3_ENDPOINT="https://fly.storage.tigris.dev" \
     FERROSA_S3_BUCKET="$TIGRIS_BUCKET" \
-    FERROSA_S3_REGION="auto"
+    FERROSA_S3_REGION="auto" || true
 }
 
 create_ferrosa_cluster() {
