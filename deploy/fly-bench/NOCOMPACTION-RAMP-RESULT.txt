@@ -1,0 +1,29 @@
+======== Validation: is compaction the write-throughput floor? (2026-07-23) ========
+Ramp with compaction SUPPRESSED (FERROSA_COMPACTION_MIN_THRESHOLD=1000; note
+FERROSA_COMPACTION_WORKERS clamps to min 1 so it can't disable compaction).
+Validity confirmed: 56-92 SSTables flushed but compaction_started stayed 2-5
+(startup/system only) -> user-table compaction genuinely off.
+
+offered | DEFAULT (compaction)      | NOCOMPACT
+4000    | 3991/s 100% p99=88ms      | 3987/s 100% p99=87ms
+8000    | 7961/s 100% p99=56ms      | 7969/s 100% p99=50ms
+16000   | (not captured)            | 11891/s 74% p99=25426ms
+32000   | 12861/s 40% p99=111363ms  | 11266/s 35% p99=137590ms
+
+VERDICT: removing compaction did NOT raise the write floor -- it was the SAME or
+marginally LOWER (~11.3k vs ~12.9k at 32k), same knee (~8-16k). Compaction is NOT
+the write-throughput ceiling. Corroborated: the memtable pinned at the 512MB
+backpressure cap and REJECTED writes (921 on one node) EVEN WITHOUT compaction ->
+flush couldn't drain the memtable on its own.
+
+=> THE WRITE FLOOR IS FLUSH THROUGHPUT (commitlog fsync durability + SSTable write
+bandwidth), upstream of compaction. Offloading compaction will NOT raise peak
+write throughput.
+
+IMPLICATIONS for the disaggregated worker (t_60b40848): still worth building, but
+NOT for peak write throughput. Real benefits: removes compaction READ+WRITE I/O
+from serving nodes (mixed read/write workloads -- untested here, write-only),
+bounds read amplification (SSTables piled up with compaction off), elastic
+background scaling (DBaaS ephemeral compute). To raise the WRITE ceiling, attack
+FLUSH: commitlog batching (modest win, measured), parallel flush, group commit,
+faster-sync storage.
