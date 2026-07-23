@@ -1,0 +1,28 @@
+======== O_DIRECT load-ramp + concurrent-scan A/B (2026-07-23) ========
+3x performance-2x/4GB, ext4 volumes, 64MB block cache, concurrent full-table
+scan load (8 threads), write-only ramp via nb direct-run (tags=block:main_write).
+
+offered  | buffered keep/p50/p99      | direct keep/p50/p99
+1000     | 100% / 259 / 282ms         | 100% / 259 / 282ms
+2000     |  99% / 133 / 279ms         | 100% / 135 / 150ms
+4000     | 100% /  67 /  88ms         | 100% /  67 /  88ms
+8000     | 100% /  37 /  56ms         |  99% /  37 /  91ms
+16000    | (not captured)             |  83% / 15115 / 15386ms
+32000    |  40% / 108918 / 111363ms   |  36% / 133681 / 133945ms
+
+VERDICT: the two curves are ESSENTIALLY IDENTICAL. Same knee (~8-16k ops/s),
+same sustainable throughput, matching p50 at every clean stage, same
+catastrophic collapse at 32k (direct marginally WORSE, within meltdown noise).
+O_DIRECT does not move the knee or shift the curve -> NO throughput/latency
+benefit on fly fast NVMe. This is the most robust result (compares whole curves,
+not single placement-sensitive points).
+
+LIMITATION: concurrent full-table scans provided read PRESSURE (elevated write
+latency vs unloaded) but 0 completed (a full-table ALLOW FILTERING scan of the
+growing table exceeds the ~10min ramp), so scan/read latency (the cache-
+preservation hypothesis) is UNMEASURED. Needs bounded/token-range scans.
+
+RECOMMENDATION: keep FERROSA_SSTABLE_DIRECT_IO OFF by default. Correctness is
+validated (engages, no fallback, no corruption, no throughput regression) but
+across saturation, harsh, and now ramp experiments there is NO demonstrated
+performance benefit on this hardware.
