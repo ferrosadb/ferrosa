@@ -2604,12 +2604,14 @@ version = "0.17.0"
 dependencies = [
  "crc32fast",
  "ferrosa-common",
+ "libc",
  "lru",
  "lz4_flex",
  "memmap2",
  "proptest",
  "rayon",
  "tempfile",
+ "tracing",
  "zstd",
 ]
 
