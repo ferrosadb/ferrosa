@@ -427,17 +427,29 @@ wait_for_ferrosa_http() {
   local label="$2"
 
   echo "waiting for Ferrosa ${label} (${machine_id})"
-  flyctl ssh console --app "$FERROSA_APP" --machine "$machine_id" --command "sh -lc '
-    for i in \$(seq 1 90); do
-      if curl --max-time 5 -g -fsS http://[::1]:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
-        cat /tmp/ferrosa-status.json
-        exit 0
-      fi
-      sleep 2
-    done
-    cat /tmp/ferrosa-status.err >&2 || true
-    exit 1
-  '"
+  # Outer retry so a transient `flyctl ssh` TRANSPORT drop during node startup
+  # (curl "Could not connect" then "ssh shell: Process exited with status 1")
+  # retries the whole ssh instead of killing the run under set -e. Each inner
+  # attempt polls for up to 60s; up to 10 attempts (~11 min) of patience.
+  local attempt
+  for attempt in $(seq 1 10); do
+    if flyctl ssh console --app "$FERROSA_APP" --machine "$machine_id" --command "sh -lc '
+        for i in \$(seq 1 20); do
+          if curl --max-time 5 -g -fsS http://[::1]:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
+            cat /tmp/ferrosa-status.json
+            exit 0
+          fi
+          sleep 3
+        done
+        exit 1
+      '"; then
+      return 0
+    fi
+    echo "  ${label} readiness attempt ${attempt}/10 failed (transient ssh/curl or still starting); retrying in 6s"
+    sleep 6
+  done
+  echo "ferrosa ${label} not ready after retries" >&2
+  return 1
 }
 
 validate_ferrosa_membership() {
