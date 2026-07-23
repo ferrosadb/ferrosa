@@ -190,6 +190,14 @@ impl DirectWriter {
         self.mode
     }
 
+    /// The current logical write offset — bytes accepted by [`write_all`] so far
+    /// (flushed + still staged). Equals the offset the next byte will occupy in
+    /// the finished file, so it substitutes exactly for `Seek::stream_position`
+    /// when recording chunk offsets.
+    pub fn position(&self) -> u64 {
+        self.physical + self.filled as u64
+    }
+
     /// Stage `data`, flushing full aligned blocks to the device as the buffer
     /// fills. Bounded per call by `data.len()` (Power-of-10 rule 2).
     pub fn write_all(&mut self, mut data: &[u8]) -> Result<()> {
@@ -473,6 +481,24 @@ mod tests {
         }
         assert_eq!(w.finish().expect("finish"), expected.len() as u64);
         assert_eq!(read_back(&path), expected);
+    }
+
+    #[test]
+    fn position_tracks_logical_bytes_written() {
+        let dir = tmp();
+        let path = dir.path().join("pos.db");
+        let mut w = DirectWriter::create(&path).expect("create");
+        assert_eq!(w.position(), 0);
+        w.write_all(&[0u8; 100]).expect("write");
+        assert_eq!(
+            w.position(),
+            100,
+            "position counts staged bytes before any flush"
+        );
+        // Cross the staging boundary so some bytes are flushed and some staged.
+        w.write_all(&vec![1u8; STAGING_CAPACITY]).expect("write");
+        assert_eq!(w.position(), 100 + STAGING_CAPACITY as u64);
+        assert_eq!(w.finish().expect("finish"), 100 + STAGING_CAPACITY as u64);
     }
 
     #[test]
