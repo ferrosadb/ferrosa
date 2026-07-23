@@ -35,6 +35,7 @@ pub mod fair_admit;
 pub mod group_runqueue;
 pub mod io_permits;
 pub mod runqueue;
+pub mod runtime_monitor;
 pub mod scheduler;
 
 pub use fair_admit::Admitted;
@@ -222,6 +223,10 @@ pub fn render_prometheus() -> String {
         "ferrosa_sched_io_permits_in_flight {}\n",
         pool.io_permits().in_flight()
     ));
+    // Runtime-stall detector (Phase 3): async-runtime freeze visibility. Kept as
+    // its own module (process-global counters, no dependence on the pool) so it
+    // reports even before any scan runs.
+    runtime_monitor::render_prometheus(&mut out);
     out
 }
 
@@ -960,6 +965,9 @@ mod tests {
             "ferrosa_sched_io_permits_acquired_total",
             "ferrosa_sched_io_permits_capacity",
             "ferrosa_sched_io_permits_in_flight",
+            "ferrosa_sched_runtime_stall_events_total",
+            "ferrosa_sched_runtime_stall_micros_total",
+            "ferrosa_sched_runtime_stall_max_micros",
         ] {
             assert!(text.contains(metric), "missing metric {metric}");
         }

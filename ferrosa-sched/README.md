@@ -57,6 +57,17 @@ a CheckQuorum leader step-down.
   fan-out of S3-reading scans cannot saturate the shared I/O path and starve the
   reserved lanes. Async acquire (an I/O-bound waiter is a cheap task, the B0
   property); RAII permits returned on drop, including panic/cancel unwind.
+- `runtime_monitor` (**Phase 3**) — a **runtime-stall detector**, orthogonal to
+  admission. A liveness task wakes every `tick` (~100 ms) and measures the
+  runtime's actual scheduling gap; a wake `>= threshold` late means a worker was
+  blocked (D-state on saturated disk — the multi-second freeze the 2026-07-22 Fly
+  A/B caught only under gdb). Recorded as
+  `ferrosa_sched_runtime_stall_{events_total,micros_total,max_micros}` so the
+  freeze is visible in prod metrics/logs (and the coming I/O-pacing / O_DIRECT
+  fixes can be *verified*). Spawned on the CQL request runtime at boot, so it
+  measures what interactive clients experience. Pure `stall_overrun(gap, tick,
+  threshold)` decision is unit-tested; a current-thread blocking-sleep test
+  proves end-to-end detection.
 
 ## Dependencies / dependents
 
@@ -113,3 +124,7 @@ a CheckQuorum leader step-down.
   and fold background work — compaction/repair/index-build/ANN — into the pool
   as the `system` group (T3.3–T3.6), where the weighting finally arbitrates
   real mixed-weight contention.
+- **Phase 3 (O_DIRECT + I/O, epic `t_29f6b948`):** `runtime_monitor` — the
+  runtime-stall detector metric (this crate's first Phase 3 piece), making the
+  disk-saturation freeze a first-class signal ahead of the durability-critical
+  I/O-pacing / O_DIRECT changes it will verify.
