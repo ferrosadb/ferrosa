@@ -2641,6 +2641,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
  "serial_test",

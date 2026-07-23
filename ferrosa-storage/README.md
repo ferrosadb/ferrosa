@@ -31,7 +31,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`. Flush is
   serialized by a per-table `Mutex`; reads/writes are never blocked. Optional
-  `write_verify` self-readback after every flush.
+  `write_verify` self-readback after every flush. The durability barrier
+  (`fsync_components`) fsyncs a generation's component files **concurrently** on
+  a shared, bounded flush pool (`flush_executor`, a rayon `ThreadPool` whose
+  width is `FERROSA_FLUSH_PARALLELISM`, default = host parallelism), then
+  barriers all before the single directory fsync — the barrier ordering
+  (component bytes durable before the rename entry) is preserved, and any
+  component fsync failure fails loud without the directory fsync. The pool caps
+  concurrency across *all* concurrent flushes, so flush parallelism is a
+  capacity-aware knob rather than a per-flush thread count. Serial-fsync-
+  per-component was the single-stream write-throughput floor.
 - **Compaction** (`compaction/`) — `CompactionExecutor` on dedicated
   `std::thread` workers behind a global `CompactionGate`. STCS (default) and UCS
   (CEP-26 density-based) strategies. A compaction validator (oracle + differential

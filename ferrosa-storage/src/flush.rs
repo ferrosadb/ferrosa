@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ferrosa_index::{IndexKey, RowPosition};
+use rayon::prelude::*;
 
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::{Result, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
@@ -891,14 +892,39 @@ impl FileFlushTarget {
         if has_compression_info {
             components.push(&paths.compression_info);
         }
-        for component in components {
-            Self::fsync_path(component).map_err(|e| {
-                ferrosa_common::Error::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("fsync of component {} failed: {e}", component.display()),
-                ))
-            })?;
-        }
+
+        // Issue every component fsync CONCURRENTLY so their device flushes fill
+        // the storage queue depth instead of serializing at QD1. The single
+        // serial fsync stream is the measured write-throughput floor: the device
+        // has ~4x idle queue depth over one serial fsync stream (fio: 17000 raw
+        // IOPS at QD128 vs ~4090 single-stream fdatasync). Each `sync_all()` is
+        // an independent blocking syscall on a distinct component file.
+        //
+        // The fsyncs run on the shared, BOUNDED flush pool
+        // (`crate::flush_executor`), whose width is configurable
+        // (`FERROSA_FLUSH_PARALLELISM`, default = host parallelism). The pool
+        // caps concurrency across ALL concurrent flushes, so parallelism is a
+        // tunable, not a hard-coded per-flush thread count.
+        //
+        // BARRIER ORDERING (crash-safety — do NOT weaken): `install` blocks
+        // until every component fsync completes, so all component bytes are
+        // durable BEFORE the single directory fsync below. The directory fsync
+        // makes the rename entries durable / claims the SSTable complete, so it
+        // must happen strictly after. `try_for_each` short-circuits on the first
+        // failure and we return it WITHOUT reaching the directory fsync — no
+        // false-durability claim. Guarded by
+        // `fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing`.
+        crate::flush_executor::pool().install(|| {
+            components.par_iter().try_for_each(|component| {
+                Self::fsync_path(component).map_err(|e| {
+                    ferrosa_common::Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("fsync of component {} failed: {e}", component.display()),
+                    ))
+                })
+            })
+        })?;
+
         // One directory fsync after all component fsyncs makes the rename
         // entries durable. This is the most important step in the barrier.
         Self::fsync_dir(&self.base_dir).map_err(|e| {
@@ -1946,6 +1972,52 @@ mod tests {
         assert!(
             fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
             "containing directory was not fsynced"
+        );
+    }
+
+    #[test]
+    fn fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing() {
+        // Guards the fail-loud barrier that the parallel-fsync refactor must
+        // preserve: if ANY component fsync fails (here, a missing file), the
+        // call returns Err AND the containing directory is NOT fsynced. Fsyncing
+        // the directory is what makes the rename entries durable / claims the
+        // SSTable is complete — doing it after a component fsync failed would be
+        // a false-durability claim (the worst outcome). Present components may or
+        // may not have been fsynced by the time the failure is observed (with
+        // parallel fsyncs some will have completed); the invariant under test is
+        // narrowly: Err is returned and the dir barrier did not fire.
+        let _fsync_probe = fsync_probe::exclusive();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        // Create every component file EXCEPT `statistics`, which stays missing so
+        // its fsync_path() (File::open) fails.
+        let base = dir.path();
+        let touch = |name: &str| {
+            let p = base.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let paths = FileComponentPaths {
+            data: touch("9-Data.db"),
+            partitions: touch("9-Partitions.db"),
+            rows: touch("9-Rows.db"),
+            filter: touch("9-Filter.db"),
+            statistics: base.join("9-Statistics.db"), // intentionally NOT created
+            toc: touch("9-TOC.txt"),
+            compression_info: base.join("9-CompressionInfo.db"),
+        };
+
+        let result = target.fsync_components(&paths, /* has_compression_info */ false);
+        assert!(
+            result.is_err(),
+            "fsync_components must fail loud when a component is missing"
+        );
+        assert!(
+            !fsync_probe::synced_dirs().contains(&base.to_path_buf()),
+            "directory must NOT be fsynced after a component fsync failed \
+             (that would falsely claim the SSTable is durable)"
         );
     }
 
