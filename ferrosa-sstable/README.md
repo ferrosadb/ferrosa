@@ -82,6 +82,7 @@ resolution beyond the serialization header, or cluster routing.
 | Module | Responsibility |
 |--------|----------------|
 | `io` | `ReadAt`/`WriteAt` positional traits, `FileReadAt`/`FileWriteAt`, bounded block cache (`CachedReadAt`) |
+| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. Gated into `writer.rs` by `FERROSA_SSTABLE_DIRECT_IO` (default off, buffered); byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`) |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |
 | `writer` | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]` |
 | `data` | Data.db row/cell codec (delta-encoded against the header) |
