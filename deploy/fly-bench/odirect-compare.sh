@@ -87,3 +87,30 @@ printf 'direct   | '; parse_nb_csv "${DIR_DIR}"
 echo
 echo "Read the tail: compare p99 / p999 / p100(max). If O_DIRECT helps under disk"
 echo "saturation, the buffered arm should show larger outlier p100/p999 than direct."
+echo
+echo "── Write-amplification mechanism (summed across nodes, post-workload) ──"
+echo "   Tests the 'O_DIRECT -> less memory pressure -> fewer premature flushes ->"
+echo "   less compaction -> less write-amp' hypothesis. Only comparable when both"
+echo "   arms ingested the SAME data (rate-limited run: same main_cyclerate+cycles)."
+wa_row() {  # $1 arm, $2 results dir
+  local arm="$1" dir="$2"
+  # newest run's per-node after-snapshots only (a dir may hold several runs)
+  local nd; nd=$(ls -dt "${dir}"/*-after/nodes 2>/dev/null | head -1)
+  [ -z "${nd}" ] && { printf '%-10s (no node snapshots)\n' "${arm}"; return; }
+  awk -v arm="${arm}" '
+    /^ferrosa_storage_flush_bytes_total /{fb+=$2}
+    /^ferrosa_storage_flushes_total /{fn+=$2}
+    /^ferrosa_storage_write_inline_flush_total /{inl+=$2}
+    /reason="memtable_backpressure"/{bp+=$2}
+    /device="vdc",direction="write"/ && /io_bytes_total/{vw+=$2}
+    /device="vdc",direction="read"/ && /io_bytes_total/{vr+=$2}
+    /^ferrosa_storage_compaction_input_bytes_total /{ci+=$2}
+    END{printf "%-10s | flushes=%-5s flush=%.1fGB inline_flush=%-4s backpressure_fails=%-6s | vdc_write=%.1fGB vdc_read=%.1fGB compaction_in=%.1fGB\n",
+        arm, fn, fb/1e9, inl, bp, vw/1e9, vr/1e9, ci/1e9}
+  ' "${nd}"/*.txt 2>/dev/null
+}
+wa_row buffered "${BUF_DIR}"
+wa_row direct   "${DIR_DIR}"
+echo "   Hypothesis holds iff (at equal ingest) direct shows fewer inline_flushes +"
+echo "   lower vdc_write + lower compaction_in than buffered. If they match, write-amp"
+echo "   is NOT an O_DIRECT effect (the earlier 88GB vs 43GB was saturation divergence)."

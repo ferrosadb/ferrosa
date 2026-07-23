@@ -6,8 +6,15 @@ description: |
 scenarios:
   default:
     schema: run driver=cql tags==block:schema threads==1 cycles==UNDEF
-    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10000000) threads=auto
-    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10000000) threads=auto
+    rampup: run driver=cql tags==block:rampup cycles===TEMPLATE(rampup-cycles,10000000) threads=auto cyclerate=TEMPLATE(rampup_cyclerate,1000000)
+    # cyclerate bounds the OFFERED op rate so an A/B can run BELOW saturation:
+    # both arms then ingest the same data in the same time, making compaction /
+    # write-amplification directly comparable (default 1e6/s = effectively
+    # unlimited; set main_cyclerate=<N> to rate-limit).
+    main: run driver=cql tags==block:"main.*" cycles===TEMPLATE(main-cycles,10000000) threads=auto cyclerate=TEMPLATE(main_cyclerate,1000000)
+  # Concurrent full-table scan load (reads-under-write). Run alongside `main`.
+  scanonly:
+    scan: run driver=cql tags==block:scan cycles===TEMPLATE(scan-cycles,1000000) threads=TEMPLATE(scan_threads,4) cyclerate=TEMPLATE(scan_cyclerate,1000000)
   init:
     schema: run driver=cql tags==block:schema threads==1 cycles==UNDEF
   basic_check:
@@ -92,3 +99,18 @@ blocks:
         (machine_id, sensor_name, time, sensor_value, station_id, data)
         values ({machine_id}, {sensor_name}, {time}, {sensor_value}, {station_id}, {data})
         using timestamp {cell_timestamp}
+  # Full-table ALLOW FILTERING scan of the WRITTEN table (baselines.iot). The
+  # predicate matches nothing (sensor_value is Normal(100,5)), so the server scans
+  # every row and returns empty — a true full-table read whose latency depends on
+  # how much of the table stays in the OS page cache. Run concurrently with the
+  # write ramp (scenario `scanonly`) to measure reads-under-write-load: O_DIRECT's
+  # plausible benefit is keeping the page cache free of write data so scans stay
+  # cached. NOT tagged block:main.* so the write ramp never runs it.
+  scan:
+    params:
+      cl: TEMPLATE(scan_cl,LOCAL_ONE)
+      timeout: TEMPLATE(scan_timeout,120.0)
+    ops:
+      full_scan: |
+        select * from TEMPLATE(keyspace,baselines).TEMPLATE(table,iot)
+        where sensor_value > 1000000.0 ALLOW FILTERING limit 100
