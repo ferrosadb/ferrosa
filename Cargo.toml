@@ -13,6 +13,7 @@ members = [
     "ferrosa-net",
     "ferrosa-postgres",
     "ferrosa-row-bridge",
+    "ferrosa-sched",
     "ferrosa-schema",
     "ferrosa-session",
     "ferrosa-sql",

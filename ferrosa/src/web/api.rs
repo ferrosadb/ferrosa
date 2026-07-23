@@ -69,6 +69,15 @@ pub async fn get_metrics(
     // anti_entropy_refills_no_source_total being non-zero means quarantined data
     // is awaiting the periodic repair backstop and should alert (FMEA #10).
     body.push_str(&ferrosa_cluster::repair::trigger::render_prometheus());
+    // Query-scheduler pool gauges/counters (ferrosa_sched_*). The
+    // consensus-headroom gauge must stay > 0 under scan load (t_88223ad0).
+    body.push_str(&ferrosa_sched::render_prometheus());
+    // Raft consensus liveness: ferrosa_raft_current_term / _is_leader /
+    // _has_leader (fed by a current_leader() poller) + the election-storm counter
+    // (_election_storm_term_jumps_total). The scan-storm regression (t_88223ad0
+    // T0.6) asserts the storm counter stays 0 under full-table ALLOW FILTERING
+    // load; a non-zero value should alert (P0-17).
+    body.push_str(&ferrosa_cluster::raft::consensus_metrics::render_prometheus());
     (
         StatusCode::OK,
         [(

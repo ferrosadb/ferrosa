@@ -21,7 +21,6 @@ use parking_lot::Mutex;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
-use ferrosa_common::task_pool::TaskPool;
 use ferrosa_common::Result;
 use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
@@ -2744,7 +2743,10 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let column_mappings = sstable_column_mappings(&schema, &sst_readers);
 
-        TaskPool::current("table-store-stream").spawn_blocking(move || {
+        // t_88223ad0: route the scan producer through the bounded scheduler pool
+        // (cores - reserved) instead of the unbounded blocking pool, so a broad
+        // scan cannot oversubscribe the cores and starve raft heartbeats.
+        ferrosa_sched::global_pool().submit_blocking(move || {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -2841,7 +2843,10 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let column_mappings = sstable_column_mappings(&schema, &sst_readers);
 
-        TaskPool::current("table-store-stream").spawn_blocking(move || {
+        // t_88223ad0: route the scan producer through the bounded scheduler pool
+        // (cores - reserved) instead of the unbounded blocking pool, so a broad
+        // scan cannot oversubscribe the cores and starve raft heartbeats.
+        ferrosa_sched::global_pool().submit_blocking(move || {
             // Build source iterators — these borrow from `view`
             // (memtable Arcs) and from the opened SSTable reader Arcs, both
             // of which the closure owns for the task's full lifetime, so there
@@ -2934,7 +2939,10 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let column_mappings = sstable_column_mappings(&schema, &sst_readers);
 
-        TaskPool::current("table-store-stream").spawn_blocking(move || {
+        // t_88223ad0: route the scan producer through the bounded scheduler pool
+        // (cores - reserved) instead of the unbounded blocking pool, so a broad
+        // scan cannot oversubscribe the cores and starve raft heartbeats.
+        ferrosa_sched::global_pool().submit_blocking(move || {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());
@@ -3014,7 +3022,10 @@ impl<F: FlushTarget> TableStore<F> {
         };
         let column_mappings = sstable_column_mappings(&schema, &sst_readers);
 
-        TaskPool::current("table-store-stream").spawn_blocking(move || {
+        // t_88223ad0: route the scan producer through the bounded scheduler pool
+        // (cores - reserved) instead of the unbounded blocking pool, so a broad
+        // scan cannot oversubscribe the cores and starve raft heartbeats.
+        ferrosa_sched::global_pool().submit_blocking(move || {
             let active_iter = view
                 .active
                 .range_iter(start_owned.as_ref(), end_owned.as_ref());

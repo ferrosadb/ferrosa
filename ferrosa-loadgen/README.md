@@ -29,6 +29,14 @@ It is a leaf of the dependency graph: **nothing depends on it**.
   `write_heavy`, `delete_update_heavy`, `compaction_stress` — each a fixed set of
   read/write/update/delete ratios, key-space size, worker counts, flush/cache
   thresholds, and fan factor. `--duration` / `--cache-max-bytes` override.
+- **Scan storm** (`--scan-storm`, `src/scan_storm.rs`): a cluster-only mode
+  (requires `--node`) that fires `--scan-concurrency` concurrent full-table
+  `SELECT … WHERE val = 0x… ALLOW FILTERING` scans over the seeded
+  `load_test.data` for `--duration`. The predicate matches (almost) nothing, so
+  each scan reads the whole table — pure scan pressure. Reproduces the viz
+  consolidation workload that starved the Raft leader (t_88223ad0 / T0.6); the
+  ratio-based profiles cannot (they are all primary-key point ops). Exits
+  non-zero if no worker ever completed a scan (fail-loud, never a fake success).
 - **Compaction soak** (`--compaction-soak`): instead of a load test, runs
   `ferrosa_storage::compaction::validator::soak` for N reproducible iterations
   (per `--soak-seed`), compacting deterministic corpora and diffing each against

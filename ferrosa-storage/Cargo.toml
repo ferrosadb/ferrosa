@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-sched = { path = "../ferrosa-sched" }
 ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-index = { path = "../ferrosa-index" }
 ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
