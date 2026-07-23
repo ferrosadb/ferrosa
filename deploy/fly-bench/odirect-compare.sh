@@ -58,15 +58,27 @@ echo "  files==0    ⇒ no SSTable was written through the direct writer (no flu
 echo "Expected win: direct arm stall_events / stall_max_us materially LOWER than buffered."
 echo
 
-echo "── nosqlbench latency (from result bundles) ──"
-for arm in buffered direct; do
-  tgz=$(ls "${FLYBENCH_RESULTS}/${BASE}-${arm}"/*.tgz 2>/dev/null | head -1 || true)
-  if [ -z "${tgz}" ]; then echo "${arm}: no nb bundle"; continue; fi
+echo "── nosqlbench op latency (result-success timer, from --report-csv-to) ──"
+echo "   percentiles in the CSV's duration_unit (usually ms); p100 = max = the outlier tail."
+# Parse the last cumulative row of result-success.csv (dropwizard CsvReporter):
+# header cols include count,max,mean,p95,p99,p999,duration_unit — locate by name.
+parse_nb_csv() {  # $1 = arm results dir
+  local dir="$1" tgz tmp csv
+  tgz=$(ls "${dir}"/*.tgz 2>/dev/null | head -1 || true)
+  [ -z "${tgz}" ] && { echo "no nb bundle"; return; }
   tmp="$(mktemp -d)"; tar xzf "${tgz}" -C "${tmp}" 2>/dev/null || true
-  echo "── ${arm} (${tgz##*/}) ──"
-  # nosqlbench summary lines: service_time / result latency percentiles. Grep the
-  # common HDR/summary keys; fall back to listing files if the schema differs.
-  grep -rhiE 'p99|p100|percentile|service_time|result.*(mean|max)' "${tmp}" 2>/dev/null \
-    | grep -iE 'p99|p100|max|mean' | head -20 || true
-  echo "   (full bundle extracted at ${tmp})"
-done
+  # Prefer result-success; fall back to result. Take the deepest match.
+  csv=$(find "${tmp}" -name "result-success.csv" 2>/dev/null | head -1)
+  [ -z "${csv}" ] && csv=$(find "${tmp}" -name "result.csv" 2>/dev/null | head -1)
+  [ -z "${csv}" ] && { echo "no result CSV in bundle ($(find "${tmp}" -name '*.csv' | wc -l | tr -d ' ') csv files: $(find "${tmp}" -name '*.csv' -exec basename {} \; | tr '\n' ' '))"; return; }
+  awk -F, 'NR==1{for(i=1;i<=NF;i++)h[$i]=i} END{
+      printf "count=%s  mean=%.2f  p95=%.2f  p99=%.2f  p999=%.2f  p100(max)=%.2f  unit=%s",
+      $h["count"], $h["mean"], $h["p95"], $h["p99"], $h["p999"], $h["max"], $h["duration_unit"]
+    }' "${csv}"
+  echo "   [${csv#${tmp}/}]"
+}
+printf 'buffered | '; parse_nb_csv "${BUF_DIR}"
+printf 'direct   | '; parse_nb_csv "${DIR_DIR}"
+echo
+echo "Read the tail: compare p99 / p999 / p100(max). If O_DIRECT helps under disk"
+echo "saturation, the buffered arm should show larger outlier p100/p999 than direct."
