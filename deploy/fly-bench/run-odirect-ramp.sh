@@ -132,8 +132,11 @@ run_arm(){ # $1 arm, $2 direct(0/1)
 
 log "app=${FERROSA_APP} tag=${FERROSA_IMAGE_TAG} stages=[${STAGES[*]}] stage_secs=${STAGE_SECS} scan_conc=${SCAN_CONCURRENCY}"
 RUN_ID="${BUILD_RUN_ID}" fly "$BENCH" create-bench
-run_arm buffered 0
-run_arm direct 1
+# RAMP_ARMS selects which arms to run (default both). Set to "buffered" to test a
+# single-variable change (e.g. commitlog batching) without the O_DIRECT arm.
+RAMP_ARMS="${RAMP_ARMS:-buffered direct}"
+case " $RAMP_ARMS " in *" buffered "*) run_arm buffered 0;; esac
+case " $RAMP_ARMS " in *" direct "*)   run_arm direct 1;;   esac
 # tear the shared bench driver down (not arm-scoped)
 if [ "$PAY" -eq 1 ]; then bid="$(mid "$BENCH_APP" nosqlbench-1)"; [ -n "$bid" ] && flyctl machine destroy "$bid" --app "$BENCH_APP" --force || true
   "${HERE}/ramp-analyze.sh" | tee "${OUT}/RAMP-COMPARISON.txt"
