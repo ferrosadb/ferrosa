@@ -111,7 +111,10 @@ ensure_ferrosa_volume() {
   local name="$1"
   local ids=()
 
-  mapfile -t ids < <(
+  # bash 3.2 (macOS default) has no `mapfile`; read the ids with a while loop.
+  while IFS= read -r _id; do
+    [ -n "$_id" ] && ids+=("$_id")
+  done < <(
     flyctl volumes list --app "$FERROSA_APP" --json \
       | jq -r --arg name "$name" '.[] | select(.name == $name) | .id'
   )
@@ -135,7 +138,16 @@ write_snapshot() {
   mkdir -p "${RESULTS_DIR}/${label}"
   flyctl machines list --app "$app" --json > "${RESULTS_DIR}/${label}/machines.json" || true
   flyctl status --app "$app" > "${RESULTS_DIR}/${label}/status.txt" || true
-  flyctl logs --app "$app" --no-tail > "${RESULTS_DIR}/${label}/logs.txt" || true
+  # `flyctl logs --no-tail` HANGS FOREVER on an app with no machines (it blocks on
+  # a log stream that never initializes), and `|| true` cannot rescue a hang — it
+  # only handles a non-zero exit. Bound it (macOS has no `timeout`): run detached,
+  # hard-kill after 30s so an empty-app teardown snapshot can never wedge the run.
+  ( flyctl logs --app "$app" --no-tail > "${RESULTS_DIR}/${label}/logs.txt" 2>&1 ) &
+  local _lp=$!
+  ( sleep 30; kill "$_lp" 2>/dev/null ) &
+  local _kp=$!
+  wait "$_lp" 2>/dev/null || true
+  kill "$_kp" 2>/dev/null || true
 }
 
 collect_node_metrics() {
@@ -515,7 +527,11 @@ EOF
     --push \
     --image-label "bench-${RUN_ID}"
 
+  # fly machines are linux/amd64; force that platform so a local build on an
+  # arm64 host (Apple Silicon + podman) does not produce an arm64 image that
+  # exits -1 (exec format error) on fly.
   docker build \
+    --platform linux/amd64 \
     -t "registry.fly.io/${BENCH_APP}:bench-${RUN_ID}" \
     "${ROOT_DIR}/deploy/fly-bench/nosqlbench"
   flyctl auth docker
@@ -732,23 +748,28 @@ run_target() {
   elif [[ "$target" == cassandra-* ]]; then
     collect_node_metrics "$app" "${target}-before" cassandra
   fi
+  # NB: start_ferrosa_{profiles,memory_snapshots} use bash-4.3 `local -n`
+  # namerefs, which the macOS default bash 3.2 rejects. Guard the CALL SITES on
+  # the enable flags (default false here) so the nameref code never executes when
+  # the feature is off. (If you enable either on a bash-3.2 host, convert those
+  # four functions off namerefs first.)
   local profile_pids=()
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$PROFILE_FERROSA" == "true" ]]; then
     start_ferrosa_profiles "$target" profile_pids
   fi
   local memory_snapshot_pids=()
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$FERROSA_MEMORY_SNAPSHOTS" == "true" ]]; then
     start_ferrosa_memory_snapshots "$target" memory_snapshot_pids
   fi
   local bench_status=0
   flyctl ssh console --app "$BENCH_APP" --machine "$bench_machine" --command \
     "sh -lc \"TARGET_NAME='${target}' CONTACT_POINTS='${contact_points}' RUN_ID='${RUN_ID}' WORKLOAD='${WORKLOAD}' SCENARIO='${SCENARIO}' THREADS='${THREADS}' WARMUP_CYCLES='${WARMUP_CYCLES}' MEASURE_CYCLES='${MEASURE_CYCLES}' REPEATS='${REPEATS}' RF='${RF}' READ_CL='${READ_CL}' WRITE_CL='${WRITE_CL}' NB_JAVA_MAX_HEAP='${NB_JAVA_MAX_HEAP}' REQUEST_TIMEOUT_SECONDS='${REQUEST_TIMEOUT_SECONDS}' CQL_PROTOCOL_COMPRESSION='${CQL_PROTOCOL_COMPRESSION}' EXTRA_NB_ARGS='${EXTRA_NB_ARGS}' run-nb\"" \
     || bench_status=$?
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$FERROSA_MEMORY_SNAPSHOTS" == "true" ]]; then
     stop_ferrosa_memory_snapshots memory_snapshot_pids
     fetch_ferrosa_memory_snapshots "$target"
   fi
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$PROFILE_FERROSA" == "true" ]]; then
     wait_for_profiles profile_pids
     fetch_ferrosa_profiles "$target"
   fi

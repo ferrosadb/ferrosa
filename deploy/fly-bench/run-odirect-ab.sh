@@ -66,8 +66,14 @@ log "build tag=${IMAGE_TAG} region=${REGION} cpus=${FERROSA_CPUS}x${FERROSA_CPU_
 log "workload=${RAMP_WORKLOAD} (write-heavy, t128)"
 
 # ── 0. Preflight + one shared image build (the ~20 min pole) ──────────────────
-RUN_ID="${BUILD_RUN_ID}" run preflight
-RUN_ID="${BUILD_RUN_ID}" run build-images
+# SKIP_BUILD=1 reuses an already-pushed ferrosa+nosqlbench image of the same tag
+# (e.g. re-running after a create-bench failure — avoids the 20-min recompile).
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  RUN_ID="${BUILD_RUN_ID}" run preflight
+  RUN_ID="${BUILD_RUN_ID}" run build-images
+else
+  log "SKIP_BUILD=1 — reusing pushed image tag ${IMAGE_TAG} (no preflight, no rebuild)"
+fi
 # Bench driver node (separate app), built + created once, reused by both arms.
 RUN_ID="${BUILD_RUN_ID}" run create-bench
 
@@ -88,7 +94,16 @@ run_arm buffered 0
 # ── 2. Direct arm (the change under test) ─────────────────────────────────────
 run_arm direct 1
 
-# ── 3. Extract the comparison from the collected node /metrics + nb bundles ───
+# ── 3. Tear down the shared bench driver (it is NOT arm-scoped, so the arm
+#      teardowns leave it running — a performance-8x/32G machine that bills until
+#      destroyed). Best-effort; the app itself is free to keep. ─────────────────
+if [ "${PAY}" -eq 1 ]; then
+  log "tearing down the bench driver (nosqlbench-1)"
+  _bid="$(flyctl machines list --app "${BENCH_APP:-ferrosa-bench-lax}" --json 2>/dev/null | jq -r '.[0].id // empty')"
+  [ -n "${_bid}" ] && flyctl machine destroy "${_bid}" --app "${BENCH_APP:-ferrosa-bench-lax}" --force || true
+fi
+
+# ── 4. Extract the comparison from the collected node /metrics + nb bundles ───
 if [ "${PAY}" -eq 1 ]; then
   log "extracting comparison → ${RESULTS_ROOT}/COMPARISON.txt"
   "${HERE}/odirect-compare.sh" "${BUILD_RUN_ID}" | tee "${RESULTS_ROOT}/COMPARISON.txt"

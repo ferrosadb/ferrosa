@@ -1,0 +1,31 @@
+======== O_DIRECT A/B COMPARISON (odirect-ab-cc3dee00) ========
+
+── Node metrics (summed across nodes, post-workload) ──
+buffered   | fallbacks=0      files=0      bytes=0            | stall_events=0      stall_max_us=0         stall_total_us=0         
+direct     | fallbacks=0      files=113    bytes=5063326441   | stall_events=0      stall_max_us=0         stall_total_us=0         
+
+Validity gate: the DIRECT arm must show fallbacks=0 AND files>0.
+  fallbacks>0 ⇒ the volume fs rejected O_DIRECT (arm INVALID, fell back to buffered).
+  files==0    ⇒ no SSTable was written through the direct writer (no flush happened — workload too light).
+Expected win: direct arm stall_events / stall_max_us materially LOWER than buffered.
+
+── nosqlbench latency (from result bundles) ──
+── buffered (odirect-ab-cc3dee00-buffered-ferrosa-4g-t128-c1000000.tgz) ──
+   (full bundle extracted at /var/folders/6g/89pl_cm11sn5r710q43nxcp80000gn/T/tmp.Po3vyOxMvX)
+── direct (odirect-ab-cc3dee00-direct-ferrosa-4g-t128-c1000000.tgz) ──
+   (full bundle extracted at /var/folders/6g/89pl_cm11sn5r710q43nxcp80000gn/T/tmp.BQMbHv0DhM)
+
+── nb wall time (main-cycles=1,000,000, t128) ──
+buffered: 3:50.51   direct: 3:52.43   (identical within noise — O_DIRECT did not regress throughput)
+Both arms exit status 0 (workload completed, no errors/corruption).
+
+── Verdict (t_d1af57de) ──
+PRIMARY GOAL ACHIEVED: O_DIRECT engages on fly ext4 volumes — direct arm wrote 113
+Data.db files (~5.06 GB) through DirectWriter with fallbacks=0 (never fell back to
+buffered). Validated on real Linux (macOS only exercises F_NOCACHE). No throughput
+regression; no corruption.
+NOT DEMONSTRATED: the freeze/stall reduction. runtime_stall_events=0 in BOTH arms —
+performance-2x/4GB did not reproduce the writeback-storm freeze. Showing the win needs
+a disk-starved config (smaller RAM + concurrent scan storm + shared-cpu throttle).
+HARNESS GAP: run-nb.sh preserves /usr/bin/time -v output but not nosqlbench's latency
+histograms, so p99/p100 were unavailable.
