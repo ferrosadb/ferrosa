@@ -1,0 +1,31 @@
+======== O_DIRECT harsh A/B (2026-07-23) — 10M cycles, 32MB flush, 64MB cache, 128 threads ========
+
+                       buffered      direct(O_DIRECT)
+nb p100 (max)          46.1 ms       45.7 ms
+nb p999                23.2 ms       22.8 ms
+nb p99                 16.7 ms       15.2 ms
+nb p95                 10.5 ms        9.0 ms
+nb mean                 6.0 ms        5.2 ms
+successful ops         160,762       633,352
+runtime_stall max       228 ms        1,440 ms
+O_DIRECT files/fallbacks  0 / 0        175 / 0
+
+VERDICT (corrects an earlier over-claim that "O_DIRECT is worse"):
+- CLIENT-OBSERVED tail latency is INDISTINGUISHABLE (p100 46.1 vs 45.7 ms; direct
+  marginally better at every percentile). No O_DIRECT tail penalty OR win.
+- The 1.44s runtime_stall on the direct arm did NOT translate into any client
+  latency outlier (nb p100 stayed 46 ms). => the runtime-stall detector is an
+  UNRELIABLE proxy for request blocking: it times ONE liveness task on ONE CQL
+  worker; that worker can be starved while the other keeps serving, so no client
+  op is actually delayed. Over-trusting it produced the wrong conclusion.
+- Device NEVER saturated in EITHER arm (vdc %util ~8%, w_await 2-3ms, %steal ~0),
+  so the writeback-storm freeze O_DIRECT targets did not occur — nothing to fix.
+- The 4x throughput gap (633k vs 160k ops) at identical latency is run-to-run /
+  placement variance between the two SEQUENTIAL arms, not an O_DIRECT effect.
+
+RECOMMENDATION: keep FERROSA_SSTABLE_DIRECT_IO gated OFF (correctness validated,
+no demonstrated tail benefit on fly fast NVMe). Before any future A/B: (1) fix the
+stall detector to probe per-worker + snapshot device io-wait at stall time so
+stalls are attributable; (2) run interleaved repeated trials to cancel placement
+variance. On fast NVMe the device does not saturate, so O_DIRECT's writeback-freeze
+benefit may simply not be reproducible here.
