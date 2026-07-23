@@ -58,14 +58,26 @@ log(){ printf '\033[35m[ramp %s]\033[0m %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fly(){ if [ "$PAY" -eq 1 ]; then "$@"; else echo "DRY: $*"; fi; }
 
 mid(){ flyctl machines list --app "$1" --json 2>/dev/null | jq -r ".[]|select(.name==\"$2\")|.id"; }
+# Bare .internal DNS, NO :port — nb5's driver treats host:port as an IPv6 literal
+# ("invalid IPv6 address literal") and never connects. Default CQL port 9042 is used.
 node_dns(){ flyctl machines list --app "$FERROSA_APP" --json 2>/dev/null \
-  | jq -r "[.[]|select(.name|startswith(\"ferrosa-\"))|.id+\".vm.${FERROSA_APP}.internal:${CONTACT_PORT}\"]|join(\",\")"; }
+  | jq -r "[.[]|select(.name|startswith(\"ferrosa-\"))|.id+\".vm.${FERROSA_APP}.internal\"]|join(\",\")"; }
 
-# Run an nb command on the bench node (blocking).
-nb_on_bench(){ # $1 = extra nb args string
+# Run an nb command on the bench node (blocking). $1 = scenario, $2 = extra args.
+nb_on_bench(){ # $1 = scenario, $2 = extra nb args string
   local bid; bid="$(mid "$BENCH_APP" nosqlbench-1)"
   flyctl ssh console --app "$BENCH_APP" --machine "$bid" --command \
-    "sh -lc \"nb5 /usr/local/share/nosqlbench/cql_iot_append.yaml default hosts=$(node_dns) localdc=datacenter1 threads=${THREADS} rf=3 read_cl=LOCAL_ONE write_cl=LOCAL_QUORUM errors=count driver.advanced.protocol.compression=lz4 $1\"" </dev/null
+    "sh -lc \"nb5 /usr/local/share/nosqlbench/cql_iot_append.yaml $1 hosts=$(node_dns) localdc=datacenter1 threads=${THREADS} rf=3 read_cl=LOCAL_ONE write_cl=LOCAL_QUORUM errors=count driver.advanced.protocol.compression=lz4 $2\"" </dev/null
+}
+
+# One ramp stage as a DIRECT nb activity (no scenario/template indirection — the
+# extracted `mainonly` scenario ran 0 cycles for reasons nb5's scenario DSL made
+# opaque). Exact tag `block:main_write` (write-only ramp; reads come from the
+# concurrent scan), explicit cycles + cyclerate. $1=cyclerate $2=cycles $3=csvdir
+nb_stage(){
+  local bid; bid="$(mid "$BENCH_APP" nosqlbench-1)"
+  flyctl ssh console --app "$BENCH_APP" --machine "$bid" --command \
+    "sh -lc \"nb5 run driver=cql workload=/usr/local/share/nosqlbench/cql_iot_append.yaml tags=block:main_write cycles=$2 cyclerate=$1 threads=${THREADS} hosts=$(node_dns) localdc=datacenter1 write_cl=LOCAL_QUORUM errors=count driver.advanced.protocol.compression=lz4 --report-csv-to $3\"" </dev/null
 }
 
 # Reads-under-load via a SECOND, detached nosqlbench activity on the bench node
@@ -97,13 +109,13 @@ run_arm(){ # $1 arm, $2 direct(0/1)
   log "════════ ARM ${arm} (DIRECT_IO=${direct}) ════════"
   RUN_ID="${BUILD_RUN_ID}-${arm}" FERROSA_SSTABLE_DIRECT_IO="${direct}" fly "$BENCH" recreate-ferrosa
   if [ "$PAY" -eq 1 ]; then
-    log "seeding ${SEED_CYCLES} rows"; nb_on_bench "rampup-cycles=${SEED_CYCLES} main-cycles=0 main_cyclerate=20000" || true
+    log "seeding ${SEED_CYCLES} rows"; nb_on_bench default "rampup-cycles=${SEED_CYCLES} main-cycles=1 main_cyclerate=20000" || true
     snapshot_nodes preseed "$adir"
     log "starting concurrent full-table scan load (${SCAN_CONCURRENCY} threads) across the ramp"
     start_scan "$arm"
     for X in "${STAGES[@]}"; do
       log "ramp stage: offered ${X} ops/s for ${STAGE_SECS}s"
-      nb_on_bench "rampup-cycles=0 main-cycles=$(( X * STAGE_SECS )) main_cyclerate=${X} --report-csv-to /results/ramp-${arm}-${X}" \
+      nb_stage "${X}" "$(( X * STAGE_SECS ))" "/results/ramp-${arm}-${X}" \
         > "${adir}/stage-${X}.log" 2>&1 || true
       # pull this stage's servicetime CSV + a node metric snapshot
       local bid; bid="$(mid "$BENCH_APP" nosqlbench-1)"
