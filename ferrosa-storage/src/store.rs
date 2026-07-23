@@ -26,8 +26,9 @@ use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
 use ferrosa_sstable::types::{Partition, Row};
-use ferrosa_sstable::writer::SSTableWriter;
+use ferrosa_sstable::writer::{SSTableOutput, SSTableWriter};
 use ferrosa_sstable::WriteOptions;
+use rayon::prelude::*;
 
 use ferrosa_index::DistanceMetric;
 
@@ -2335,6 +2336,32 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(());
         }
 
+        // Parallel sharded flush (slice #3): when the table has NO secondary
+        // indexes, split the token-sorted partitions into shards and encode each
+        // into its own SSTable in parallel. Encode is ~98% of flush time and is
+        // single-threaded per SSTable, so this parallelizes the write-throughput
+        // floor. Indexed tables fall through to the single-SSTable path below
+        // (per-shard index splitting is a later increment); their sidecar/
+        // fulltext/vector steps stay exactly as-is.
+        let can_shard = self.indexed_columns.is_empty()
+            && self.indexed_clustering_columns.is_empty()
+            && self.fulltext_indexes.is_empty()
+            && self.vector_index_configs.is_empty();
+        let num_shards = flush::desired_flush_shards(
+            partitions.len(),
+            can_shard,
+            crate::flush_executor::width(),
+        );
+        if num_shards > 1 {
+            return self.flush_sharded(
+                partitions,
+                num_shards,
+                total_rows,
+                total_start,
+                &old_active,
+            );
+        }
+
         let header = flush::build_serialization_header(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
@@ -2680,6 +2707,161 @@ impl<F: FlushTarget> TableStore<F> {
         new_view.check_invariants("flush:install_new_sstable");
         self.view.store(Arc::new(new_view));
 
+        Ok(())
+    }
+
+    /// Parallel sharded flush (slice #3). Split the token-sorted `partitions`
+    /// into `num_shards` contiguous token-range shards, ENCODE each into its own
+    /// SSTable in parallel on the flush pool (encode is ~98% of flush time and
+    /// single-threaded per SSTable — this parallelizes the write-throughput
+    /// floor), then publish all shard SSTables into the view together.
+    ///
+    /// Only called by `flush()` for tables with NO secondary indexes (its
+    /// `can_shard` gate), so there are no sidecar / fulltext / vector artifacts
+    /// to split per shard. The shards partition the token space disjointly and
+    /// contiguously, so the resulting SSTables are non-overlapping-by-
+    /// construction and read/compact exactly like any other SSTable set.
+    ///
+    /// Preconditions: `partitions` is sorted by `DecoratedKey` and non-empty;
+    /// the active/flushing view swap (`flush()` step 1) already happened, and
+    /// `old_active` is the flushing memtable (for late-writer replay).
+    fn flush_sharded(
+        &self,
+        partitions: Vec<Partition>,
+        num_shards: usize,
+        total_rows: usize,
+        total_start: Instant,
+        old_active: &Arc<dyn Memtable>,
+    ) -> Result<()> {
+        let options = self.options.clone();
+        // Arc<TableSchema> (owned, Send+Sync) so the encode closures can share it
+        // across the rayon pool without borrowing a non-Sync arc_swap guard.
+        let schema = self.schema.load_full();
+        let shards = flush::split_sorted_partitions_into_shards(partitions, num_shards);
+
+        // Parallel ENCODE — the ~98% cost. Each shard is independent (disjoint
+        // token range, its own writer). In-memory `finish()` keeps shards
+        // independent; each holds <= 1/N of the memtable, so transient encoded
+        // bytes stay bounded.
+        let phase_start = Instant::now();
+        let encoded: Vec<Result<SSTableOutput>> = crate::flush_executor::pool().install(|| {
+            shards
+                .par_iter()
+                .map(|shard| {
+                    let header = flush::build_serialization_header(&schema, shard);
+                    let mut writer = SSTableWriter::new(options.clone(), header);
+                    for p in shard {
+                        writer.add_partition(p)?;
+                    }
+                    writer.finish()
+                })
+                .collect()
+        });
+        let outputs: Vec<SSTableOutput> = encoded.into_iter().collect::<Result<_>>()?;
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::EncodeSstable,
+            phase_start.elapsed(),
+        );
+
+        // Sequential PUBLISH-TO-DISK — the flush target's generation counter is
+        // shared/serial, so write each encoded shard with its own fresh gen.
+        // This is the cheap (~0.3%) part.
+        let phase_start = Instant::now();
+        let flush_dir = self.flush_target.base_dir().to_path_buf();
+        let mut published: Vec<(u64, Arc<SSTableReader<F::Reader>>)> =
+            Vec::with_capacity(outputs.len());
+        let mut total_output_bytes = 0u64;
+        for output in outputs {
+            total_output_bytes += (output.data.len()
+                + output.partitions.len()
+                + output.rows.len()
+                + output.filter.len()
+                + output.statistics.len()
+                + output.toc.len()
+                + output
+                    .compression_info
+                    .as_ref()
+                    .map(|ci| ci.len())
+                    .unwrap_or(0)) as u64;
+            let reader = self.flush_target.flush(output)?;
+            let gen = self.flush_target.last_generation();
+            self.next_gen
+                .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
+            published.push((gen, Arc::new(reader)));
+        }
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::LocalWriteSstable,
+            phase_start.elapsed(),
+        );
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::Total,
+            total_start.elapsed(),
+        );
+        let total_partitions: usize = shards.iter().map(|s| s.len()).sum();
+        crate::metrics::observe_flush_output(
+            total_output_bytes,
+            total_rows as u64,
+            total_partitions as u64,
+        );
+
+        // Step 5d (late-writer replay) — identical semantics to the single-
+        // SSTable path: writes that landed in `old_active` after our snapshot
+        // must be replayed into the new active memtable or they are lost when
+        // `flushing` is cleared. `shards` is still owned here, so we can compare
+        // late writes against the full flushed partitions.
+        let flushed_by_key: std::collections::BTreeMap<
+            ferrosa_common::key::DecoratedKey,
+            &Partition,
+        > = shards
+            .iter()
+            .flatten()
+            .map(|p| (p.key.clone(), p))
+            .collect();
+        let late_partitions = old_active.snapshot();
+        if !late_partitions.is_empty() {
+            let current_view = self.view.load();
+            for p in &late_partitions {
+                if late_partition_needs_replay(&flushed_by_key, p) {
+                    for row in &p.rows {
+                        if let Err(e) = current_view.active.put(&p.key, row.clone(), &schema) {
+                            tracing::error!(%e, "flush(sharded): late-writer replay put failed");
+                        }
+                    }
+                }
+            }
+            drop(current_view);
+        }
+
+        // Step 6 (publish) — prepend ALL shard SSTables to the view, clear
+        // flushing. Each shard carries an empty sidecar map (no secondary
+        // indexes on a shardable table).
+        let current_view = self.view.load();
+        let mut new_sstables = Vec::with_capacity(published.len() + current_view.sstables.len());
+        let mut new_ids = Vec::with_capacity(published.len() + current_view.sstable_ids.len());
+        let mut new_sidecars =
+            Vec::with_capacity(published.len() + current_view.sidecar_indexes.len());
+        for (gen, reader) in &published {
+            let desc = SstableDescriptor::from_reader(format!("{gen}"), flush_dir.clone(), reader);
+            self.seed_reader(&desc, Arc::clone(reader));
+            new_sstables.push(desc);
+            new_ids.push((format!("{gen}"), flush_dir.clone()));
+            new_sidecars.push(Arc::new(HashMap::<String, SidecarReader>::new()));
+        }
+        new_sstables.extend(current_view.sstables.iter().cloned());
+        new_ids.extend(current_view.sstable_ids.iter().cloned());
+        new_sidecars.extend(current_view.sidecar_indexes.iter().cloned());
+
+        let new_view = StoreView {
+            active: Arc::clone(&current_view.active),
+            flushing: None,
+            sstables: Arc::new(new_sstables),
+            sstable_ids: Arc::new(new_ids),
+            indexes: Arc::clone(&current_view.indexes),
+            sidecar_indexes: Arc::new(new_sidecars),
+            vector_indexes: Arc::clone(&current_view.vector_indexes),
+        };
+        new_view.check_invariants("flush:install_sharded_sstables");
+        self.view.store(Arc::new(new_view));
         Ok(())
     }
 
@@ -9290,6 +9472,74 @@ mod tests {
             "results must remain top-k sorted: {:?}",
             results
         );
+    }
+
+    #[test]
+    fn sharded_flush_reads_back_every_partition_without_loss() {
+        // Slice #3 data-loss guard: a no-secondary-index table flushed with the
+        // sharded encode path must read back EVERY partition exactly, and the
+        // number of SSTables must equal the shard decision for the live pool
+        // width (deterministic on any machine — 1 shard if width==1).
+        let flush_target = InMemoryFlushTarget::new();
+        let store: TableStore<InMemoryFlushTarget> = TableStore::new(
+            test_schema(),
+            flush_target,
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        // Enough partitions to cross the sharding threshold (2 * MIN=512).
+        let n = 1100usize;
+        for i in 0..n {
+            let key = format!("key{i:05}");
+            let val = format!("val{i:05}");
+            store
+                .write(&make_key(&key), make_row(val.as_bytes(), 1000 + i as i64))
+                .unwrap();
+        }
+
+        let expected_shards = crate::flush::desired_flush_shards(
+            n,
+            /* can_shard (no indexes) */ true,
+            crate::flush_executor::width(),
+        );
+        store.flush().unwrap();
+
+        assert_eq!(
+            store.sstable_count(),
+            expected_shards,
+            "flush must produce exactly the decided number of shard SSTables"
+        );
+
+        // Read every partition back and verify none were lost or corrupted.
+        let read = store.read_range(None, None, n * 2).unwrap();
+        let got: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = read
+            .iter()
+            .map(|p| {
+                let v = p.rows[0].cells[0]
+                    .1
+                    .value
+                    .clone()
+                    .expect("row cell must have a value");
+                (p.key.key.as_bytes().to_vec(), v)
+            })
+            .collect();
+        assert_eq!(
+            got.len(),
+            n,
+            "every written partition must be readable back"
+        );
+        for i in 0..n {
+            let key = format!("key{i:05}");
+            let val = format!("val{i:05}");
+            assert_eq!(
+                got.get(key.as_bytes()).map(|v| v.as_slice()),
+                Some(val.as_bytes()),
+                "partition {key} lost or corrupted across the sharded flush"
+            );
+        }
     }
 
     #[test]

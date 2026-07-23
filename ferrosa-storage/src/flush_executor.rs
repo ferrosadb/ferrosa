@@ -82,6 +82,13 @@ pub(crate) fn pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| build_pool(default_parallelism()))
 }
 
+/// Current flush pool width (thread count). Used to bound how many SSTable
+/// shards a single flush produces — no point making more shards than the pool
+/// can encode concurrently.
+pub(crate) fn width() -> usize {
+    pool().current_num_threads().max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

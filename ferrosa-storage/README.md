@@ -39,8 +39,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (component bytes durable before the rename entry) is preserved, and any
   component fsync failure fails loud without the directory fsync. The pool caps
   concurrency across *all* concurrent flushes, so flush parallelism is a
-  capacity-aware knob rather than a per-flush thread count. Serial-fsync-
-  per-component was the single-stream write-throughput floor.
+  capacity-aware knob rather than a per-flush thread count.
+
+  The dominant flush cost is **SSTable encoding** (BTI trie build + serialize +
+  compress) — ~97% of flush wall time, historically single-threaded per SSTable
+  and the real write-throughput floor (fsync was only ~0.3%). For tables with
+  **no secondary indexes**, `flush_sharded` splits the token-sorted memtable
+  snapshot into contiguous token-range shards and encodes each into its own
+  SSTable **in parallel** on the `flush_executor` pool, then publishes all shard
+  SSTables together (they are non-overlapping by construction, so they read and
+  compact like any other SSTable set). Measured ~3× sustained write throughput
+  vs. single-threaded encode; the sharded flush is gated to no-index tables for
+  now (per-shard index splitting is a later increment). Indexed tables keep the
+  single-SSTable path. Shard count = `desired_flush_shards` (≥512 partitions per
+  shard, capped at pool width).
 - **Compaction** (`compaction/`) — `CompactionExecutor` on dedicated
   `std::thread` workers behind a global `CompactionGate`. STCS (default) and UCS
   (CEP-26 density-based) strategies. A compaction validator (oracle + differential
