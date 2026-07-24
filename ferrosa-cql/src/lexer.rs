@@ -720,18 +720,35 @@ impl<'input> Lexer<'input> {
             self.pos = saved_pos;
         }
 
-        // Case-insensitive keyword lookup
-        let upper = text.to_ascii_uppercase();
-        if let Some(&kw) = KEYWORDS.get(upper.as_str()) {
-            Token {
-                kind: TokenKind::Keyword(kw),
-                pos: start,
+        // Case-insensitive keyword lookup WITHOUT a heap allocation.
+        //
+        // The old `text.to_ascii_uppercase()` allocated a String on EVERY
+        // identifier and keyword — the dominant unprepared-write lexer cost in
+        // the perf flamegraph (t_48d5eeaa). Instead: only an identifier no
+        // longer than the longest keyword (DURABLE_WRITES = 14) can match, so
+        // uppercase into a fixed stack buffer and look that up; longer
+        // identifiers skip the lookup entirely. `text` is ASCII by construction
+        // (this fn only consumed `[A-Za-z0-9_]`), so `from_utf8` is the cheap
+        // ASCII fast path and never fails.
+        const KW_BUF: usize = 32; // >= longest keyword; an ident longer than this cannot be one
+        let n = text.len();
+        if n <= KW_BUF {
+            let mut buf = [0u8; KW_BUF];
+            for (dst, &b) in buf[..n].iter_mut().zip(text.as_bytes()) {
+                *dst = b.to_ascii_uppercase();
             }
-        } else {
-            Token {
-                kind: TokenKind::Ident(text),
-                pos: start,
+            if let Ok(upper) = std::str::from_utf8(&buf[..n]) {
+                if let Some(&kw) = KEYWORDS.get(upper) {
+                    return Token {
+                        kind: TokenKind::Keyword(kw),
+                        pos: start,
+                    };
+                }
             }
+        }
+        Token {
+            kind: TokenKind::Ident(text),
+            pos: start,
         }
     }
 
@@ -847,16 +864,11 @@ impl<'input> Lexer<'input> {
                 self.pos = saved_pos;
             }
 
-            // Not a UUID — return as identifier (keyword lookup won't match
-            // anything starting with a digit, so it'll be Ident).
+            // Not a UUID — return as identifier. This token starts with a digit
+            // (we're in read_number), and no CQL keyword starts with a digit, so
+            // the keyword lookup can never match: skip it entirely (the old code
+            // heap-allocated an uppercased String just to look up nothing).
             let text = &self.input[start..self.pos];
-            let upper = text.to_ascii_uppercase();
-            if let Some(&kw) = KEYWORDS.get(upper.as_str()) {
-                return Ok(Token {
-                    kind: TokenKind::Keyword(kw),
-                    pos: start,
-                });
-            }
             return Ok(Token {
                 kind: TokenKind::Ident(text),
                 pos: start,
