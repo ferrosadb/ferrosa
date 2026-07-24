@@ -44,14 +44,14 @@ use ferrosa_storage::StorageEngine;
 /// Configuration for the web observability server.
 #[derive(Debug, Clone)]
 pub struct WebConfig {
-    /// Address to bind the HTTP server on. Default: `0.0.0.0:9090`.
+    /// Address to bind the HTTP server on. Default: `127.0.0.1:9090`.
     pub bind_addr: SocketAddr,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:9090".parse().expect("hardcoded addr is valid"),
+            bind_addr: "127.0.0.1:9090".parse().expect("hardcoded addr is valid"),
         }
     }
 }

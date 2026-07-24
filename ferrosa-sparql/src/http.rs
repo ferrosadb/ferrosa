@@ -31,7 +31,7 @@ pub struct SparqlHttpConfig {
 impl Default for SparqlHttpConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
         }
     }
 }
@@ -348,6 +348,14 @@ mod auth_tests {
             mode: DeploymentMode::Development,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn default_listener_is_loopback_only() {
+        assert_eq!(
+            SparqlHttpConfig::default().bind_addr,
+            SocketAddr::from(([127, 0, 0, 1], 8080))
+        );
     }
 
     /// The kill-switch: when auth is disabled, requests are served as superuser
