@@ -230,15 +230,23 @@ jobs:
           docker build -t ferrosa-test-node:latest node-bin
           docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
       - name: Push image to GHCR (cross-workflow reuse)
-        # Lets the separate, path-filtered driver-smoke workflow pull this exact
-        # image by commit SHA instead of recompiling. Best-effort: fork PRs lack
-        # packages:write, so the driver workflow falls back to building.
+        # Lets the separate, path-filtered driver-smoke workflow and paired
+        # repositories pull this image by commit SHA instead of recompiling.
+        # Pull-request workflows run on a synthetic merge SHA, while a paired
+        # repository resolves this branch's head SHA, so publish both tags.
+        # Best-effort: fork PRs lack packages:write, so consumers fall back to
+        # building.
         continue-on-error: true
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node"
+          MERGE_SHA="${{ github.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker tag ferrosa-test-node:latest "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:${{ github.sha }}"
+          for SHA in "$MERGE_SHA" "$HEAD_SHA"; do
+            [ -n "$SHA" ] || continue
+            docker tag ferrosa-test-node:latest "$IMAGE:$SHA"
+            docker push "$IMAGE:$SHA"
+          done
       - name: Upload node image
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
