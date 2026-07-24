@@ -1444,6 +1444,13 @@ pub struct SharedState {
     /// Accord clock, peer manager), shared with other front-ends via `Deref`.
     pub core: Arc<SessionCore>,
     pub prepared_cache: Arc<PreparedCache>,
+    /// Transparent auto-parameterization cache for inline-literal unprepared
+    /// queries (INSERT slice 1, t_48d5eeaa). `None` disables the fast path —
+    /// the DEFAULT — so `handle_query` always full-parses; `Some` opts a shape
+    /// into skeleton caching after a verified first parse. Gated by
+    /// `FERROSA_TRANSPARENT_PARAM_CACHE` at server construction, never per
+    /// request (so no test-time env race), and never changes query semantics.
+    pub param_cache: Option<Arc<crate::param_cache::TransparentCache>>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
     /// Records full-scan occurrences for `system_observability.full_scan_reasons`.
@@ -13498,6 +13505,7 @@ mod tests {
                 accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
             }),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            param_cache: None,
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
@@ -27382,6 +27390,106 @@ mod tests {
         assert_eq!(
             row_count, 2,
             "declared BTree range predicate must stream-filter instead of hitting the OOM guard"
+        );
+    }
+
+    /// End-to-end safety gate for transparent-cache slice 1 (t_48d5eeaa): a
+    /// cache-HIT INSERT executed through the BORROWED fast path
+    /// (`route_prepared_insert_fast` with a bind-marker skeleton + decoded
+    /// values) must store byte-for-byte what a full parse -> `route` of the same
+    /// literal values stores. Proven by inserting identical `(n, b)` under two
+    /// pks — one via the fast path, one via the normal path — and asserting the
+    /// two `SELECT n, b` result bodies are identical.
+    #[tokio::test]
+    async fn transparent_fast_insert_matches_full_parse_route() {
+        use crate::param_cache::{Outcome, Resolved, TransparentCache};
+
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ks = None;
+        let ctx = test_ctx(&auth, &ks);
+
+        for cql in [
+            "CREATE KEYSPACE tpc WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE tpc.t (pk text PRIMARY KEY, n int, b blob)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let cache = TransparentCache::new(64);
+
+        // Warm the skeleton: first sight of the shape is a MISS (full-parse +
+        // cache the verified skeleton). Execute it normally.
+        let warm = "INSERT INTO tpc.t (pk, n, b) VALUES ('warm', 1, 0xAA)";
+        let (warm_res, warm_out) = cache.resolve(warm, crate::parser::parse);
+        assert_eq!(warm_out, Outcome::Miss, "first sight must miss");
+        route(&state, &ctx, warm_res.into_statement().unwrap())
+            .await
+            .unwrap();
+
+        // A same-shape INSERT now HITS -> FastInsert. Execute via the fast path.
+        let fast = "INSERT INTO tpc.t (pk, n, b) VALUES ('alpha', 42, 0xDEADBEEF)";
+        let (resolved, out) = cache.resolve(fast, crate::parser::parse);
+        assert_eq!(out, Outcome::Hit, "same-shape second insert must hit");
+        let (skeleton, values) = match resolved {
+            Resolved::FastInsert { skeleton, values } => (skeleton, values),
+            _ => panic!("a hit must be a FastInsert"),
+        };
+        route_prepared_insert_fast(&state, &ctx, &skeleton, &values)
+            .await
+            .expect("verified scalar INSERT must take the fast path")
+            .unwrap();
+
+        // Control: the SAME literal values written to a DIFFERENT pk via the
+        // ordinary full-parse -> route path.
+        let control = "INSERT INTO tpc.t (pk, n, b) VALUES ('beta', 42, 0xDEADBEEF)";
+        route(&state, &ctx, crate::parser::parse(control).unwrap())
+            .await
+            .unwrap();
+
+        // All three rows present.
+        let count = match route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT pk FROM tpc.t").unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(count, 3, "warm + fast-path alpha + control beta");
+
+        // The fast-path row and the full-parse row must be byte-identical in
+        // their (n, b) columns: identical SELECT projections => identical bodies.
+        let alpha = match route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT n, b FROM tpc.t WHERE pk = 'alpha'").unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected rows"),
+        };
+        let beta = match route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT n, b FROM tpc.t WHERE pk = 'beta'").unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => b,
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(
+            alpha, beta,
+            "fast-path INSERT must store the same (n, b) as a full-parse INSERT"
         );
     }
 
