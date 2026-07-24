@@ -29,6 +29,7 @@ pub mod frame;
 pub mod lexer;
 pub mod observability;
 pub mod paging;
+pub mod param_cache;
 pub mod parser;
 pub mod planner;
 pub mod prepared;

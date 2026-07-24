@@ -15,6 +15,7 @@ ferrosa-cdc = { path = "../ferrosa-cdc" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-net = { path = "../ferrosa-net" }
+ahash = "0.8"
 ferrosa-index = { path = "../ferrosa-index" }
 memchr = "2.8"
 ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
@@ -66,4 +67,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
 name = "lexer_bench"
+harness = false
+
+[[bench]]
+name = "param_cache_bench"
 harness = false

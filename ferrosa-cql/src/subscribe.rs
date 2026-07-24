@@ -543,6 +543,7 @@ mod tests {
                 accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
             }),
             prepared_cache: Arc::new(crate::prepared::PreparedCache::new(10 * 1024 * 1024)),
+            param_cache: None,
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
