@@ -214,6 +214,39 @@ impl TestClusterNode {
         }
     }
 
+    /// Number of voters in this node's *committed* openraft membership.
+    ///
+    /// This is exactly what the `/cluster/topology` web endpoint reports as
+    /// `committed_cluster_size` / `openraft_voters` (see `ferrosa/src/web/api.rs`).
+    /// A node that never initialized (non-seed) and never received the
+    /// membership via AppendEntries reports 0 here — the Fly formation-failure
+    /// symptom.
+    fn committed_voter_count(&self) -> usize {
+        match self.controller.raft() {
+            Some(raft) => {
+                let m = raft.metrics().borrow().clone();
+                m.membership_config.membership().voter_ids().count()
+            }
+            None => 0,
+        }
+    }
+
+    /// Poll until this node's committed membership reaches `expected` voters or
+    /// the timeout elapses, returning the last observed count.
+    async fn wait_for_voters(&self, expected: usize, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let n = self.committed_voter_count();
+            if n >= expected {
+                return n;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn shutdown(&self) {
         self.controller.shutdown().await;
     }
@@ -503,4 +536,89 @@ async fn progressive_join_mode_transitions() {
     }
 
     controller.shutdown().await;
+}
+
+/// Organic-path formation where the **Raft seed is a laggard**.
+///
+/// The deterministic `three_node_cluster_elects_raft_leader` test always makes
+/// node1 (highest UUID) both the first-transitioner *and* the seed, and it
+/// manually drives `on_peer_connected` on every node. That masks the organic
+/// Fly failure, where:
+///   - the node that first observes 2 connected peers (and therefore
+///     broadcasts `ClusterInvite`s) is **not** the seed, and
+///   - the seed (highest UUID) transitions to cluster mode *only* by receiving
+///     that invite (`controller/cluster.rs` — the Pair/Standalone invite
+///     handler), then calls `raft.initialize()`.
+///
+/// Here node3 has the highest UUID (seed) but we only drive `on_peer_connected`
+/// on node1 (lowest UUID, non-seed). node1 transitions Pair→Forming→Cluster,
+/// skips `initialize()` (not seed), and must deliver the invite to node3 for
+/// the cluster to ever get a committed membership. Every node must end with all
+/// 3 voters committed — mirroring the `/cluster/topology` health check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_forms_when_seed_is_laggard() {
+    let _slot = harness_slot::acquire_harness_slot().await;
+    // node3 has the HIGHEST UUID → it is the Raft seed. node1 is lowest.
+    let id1 = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let id2 = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let id3 = Uuid::from_bytes([0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+
+    let node1 = TestClusterNode::start(id1).await;
+    let node2 = TestClusterNode::start(id2).await;
+    let node3 = TestClusterNode::start(id3).await;
+
+    // Establish the full outbound TCP mesh so ClusterInvite / Raft RPCs can flow
+    // in every direction, exactly as the real PeerManager would after handshake.
+    node1.connect_to(&node2).await;
+    node2.connect_to(&node1).await;
+    node1.connect_to(&node3).await;
+    node3.connect_to(&node1).await;
+    node2.connect_to(&node3).await;
+    node3.connect_to(&node2).await;
+
+    // Drive the state machine ONLY on node1 (the non-seed initiator). node1
+    // sees peer2 (→ Pair) then peer3 (→ Forming → Cluster) and broadcasts the
+    // ClusterInvite. node2 and node3 must form purely via invite delivery — we
+    // intentionally do NOT call on_peer_connected on them (unlike the
+    // deterministic test's manual laggard-assist).
+    node1.controller.on_peer_connected((id2, node2.bound_addr));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    node1.controller.on_peer_connected((id3, node3.bound_addr));
+
+    // Give the invite path + election time to converge.
+    let leader1 = node1.wait_for_leader(Duration::from_secs(30)).await;
+    let leader2 = node2.wait_for_leader(Duration::from_secs(10)).await;
+    let leader3 = node3.wait_for_leader(Duration::from_secs(10)).await;
+
+    let v1 = node1.wait_for_voters(3, Duration::from_secs(10)).await;
+    let v2 = node2.wait_for_voters(3, Duration::from_secs(10)).await;
+    let v3 = node3.wait_for_voters(3, Duration::from_secs(10)).await;
+
+    eprintln!(
+        "seed-laggard formation: leaders=({leader1:?},{leader2:?},{leader3:?}) \
+         voters=({v1},{v2},{v3}) modes=({:?},{:?},{:?})",
+        node1.mode(),
+        node2.mode(),
+        node3.mode()
+    );
+
+    assert!(
+        leader1.is_some() && leader2.is_some() && leader3.is_some(),
+        "no leader elected when the seed formed via ClusterInvite: \
+         leaders=({leader1:?},{leader2:?},{leader3:?}) — the seed never called \
+         raft.initialize() because its invite-triggered transition raced"
+    );
+    let leader = leader1.unwrap();
+    assert_eq!(leader2, Some(leader), "node2 must agree on the leader");
+    assert_eq!(leader3, Some(leader), "node3 must agree on the leader");
+
+    // Every node's committed membership must include all 3 voters — this is the
+    // `committed_cluster_size:0, openraft_voters:[]` Fly symptom guard.
+    assert_eq!(v1, 3, "node1 committed voter count");
+    assert_eq!(v2, 3, "node2 committed voter count");
+    assert_eq!(v3, 3, "node3 (seed) committed voter count");
+
+    node1.shutdown().await;
+    node2.shutdown().await;
+    node3.shutdown().await;
 }

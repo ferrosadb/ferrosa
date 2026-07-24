@@ -52,6 +52,13 @@ run_nb() {
   local logfile="$2"
   shift 2
 
+  # Capture nosqlbench's own latency metrics, not just /usr/bin/time -v:
+  #   --report-csv-to  → per-metric CSV incl. HdrHistogram percentiles
+  #                      (result-success.csv: count,max,mean,...,p95,p98,p99,p999)
+  #   --report-summary-to → the human-readable end-of-run metrics table
+  # These land under OUT_DIR so they are included in the result tarball; the A/B
+  # comparison parses result-success.csv for p95/p99/p100(=max).
+  local csv_dir="${OUT_DIR}/metrics-${repeat}"
   /usr/bin/time -v \
     nb5 "$WORKLOAD" "$SCENARIO" \
       "hosts=${CONTACT_POINTS}" \
@@ -65,6 +72,7 @@ run_nb() {
       "request_timeout_seconds=${REQUEST_TIMEOUT_SECONDS}.0" \
       "rampup-cycles=${WARMUP_CYCLES}" \
       "main-cycles=${MEASURE_CYCLES}" \
+      --report-csv-to "${csv_dir}" \
       $EXTRA_NB_ARGS "$@" \
     >"$logfile" 2>&1
 }

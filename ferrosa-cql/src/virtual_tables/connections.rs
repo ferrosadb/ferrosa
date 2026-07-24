@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,7 +27,15 @@ pub struct ConnectionInfo {
     /// When the connection was first registered.
     pub connected_at: Instant,
     /// Total requests processed on this connection.
-    pub requests_served: u64,
+    ///
+    /// A shared atomic so the per-request increment on the hot path is a single
+    /// `fetch_add` with no map mutation — the tracker's `ArcSwap<HashMap>` is
+    /// snapshotted (a cheap `Arc` load) and the counter bumped in place. The old
+    /// per-request `rcu` cloned the entire connection map on every query, which
+    /// profiled at ~22% of write-path CPU under concurrency (t_f0f17a55).
+    /// Cloning `ConnectionInfo` (register / lifecycle `rcu`) shares the same
+    /// atomic via the `Arc`, so counts survive state/username updates.
+    pub requests_served: Arc<AtomicU64>,
     /// CQL native protocol version negotiated (e.g. `5`).
     pub protocol_version: u8,
 }
@@ -89,14 +98,16 @@ impl ConnectionTracker {
     }
 
     /// Atomically increment the request counter for a connection.
+    ///
+    /// Hot path (called per query): snapshot the map (`Arc` load, lock-free) and
+    /// `fetch_add` the connection's shared atomic. NO map clone / `rcu` — see the
+    /// `requests_served` field doc. A concurrent `deregister` that drops the
+    /// entry just means the increment lands on an orphaned atomic (the
+    /// connection is gone) — harmless.
     pub fn increment_requests(&self, addr: &SocketAddr) {
-        self.connections.rcu(|current| {
-            let mut next = (**current).clone();
-            if let Some(info) = next.get_mut(addr) {
-                info.requests_served = info.requests_served.saturating_add(1);
-            }
-            Arc::new(next)
-        });
+        if let Some(info) = self.connections.load().get(addr) {
+            info.requests_served.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Return the number of currently tracked connections.
@@ -234,8 +245,12 @@ impl VirtualTable for ConnectionsTable {
                 let idle_seconds = CellValue::live(idle_secs.to_be_bytes().to_vec(), 0);
 
                 // Column 5: requests_served (BigInt — 8 bytes big-endian)
-                let requests_served =
-                    CellValue::live((info.requests_served as i64).to_be_bytes().to_vec(), 0);
+                let requests_served = CellValue::live(
+                    (info.requests_served.load(Ordering::Relaxed) as i64)
+                        .to_be_bytes()
+                        .to_vec(),
+                    0,
+                );
 
                 // Column 6: protocol_version (Int)
                 let protocol_version =
@@ -281,7 +296,7 @@ mod tests {
             state: "ready".to_owned(),
             username: Some("alice".to_owned()),
             connected_at: Instant::now(),
-            requests_served: 42,
+            requests_served: Arc::new(AtomicU64::new(42)),
             protocol_version: 5,
         }
     }
@@ -409,7 +424,7 @@ mod tests {
                 state: "startup".to_owned(),
                 username: None,
                 connected_at: Instant::now(),
-                requests_served: 0,
+                requests_served: Arc::new(AtomicU64::new(0)),
                 protocol_version: 5,
             },
         );
@@ -448,6 +463,36 @@ mod tests {
         let req_bytes = rows[0].cells[5].value.as_deref().expect("requests_served");
         let req: i64 = i64::from_be_bytes(req_bytes.try_into().unwrap());
         assert_eq!(req, 44);
+    }
+
+    #[test]
+    fn tracker_increment_requests_is_correct_under_concurrency() {
+        // The hot-path increment is a single atomic fetch_add on a shared
+        // counter (no map clone/rcu). Many threads bumping the same connection
+        // must produce an exact total — this both proves correctness and pins
+        // the no-clone contract that reclaimed ~22% of write CPU (t_f0f17a55).
+        let tracker = Arc::new(make_tracker());
+        let addr = sample_addr(9042);
+        tracker.register(addr, sample_info(9042)); // starts at 42
+
+        let threads = 8usize;
+        let per_thread = 10_000usize;
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                let t = Arc::clone(&tracker);
+                scope.spawn(move || {
+                    for _ in 0..per_thread {
+                        t.increment_requests(&addr);
+                    }
+                });
+            }
+        });
+
+        let table = ConnectionsTable::new(Arc::clone(&tracker));
+        let rows = table.read(None);
+        let req_bytes = rows[0].cells[5].value.as_deref().expect("requests_served");
+        let req: i64 = i64::from_be_bytes(req_bytes.try_into().unwrap());
+        assert_eq!(req, 42 + (threads * per_thread) as i64);
     }
 
     #[test]

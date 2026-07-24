@@ -82,6 +82,7 @@ resolution beyond the serialization header, or cluster routing.
 | Module | Responsibility |
 |--------|----------------|
 | `io` | `ReadAt`/`WriteAt` positional traits, `FileReadAt`/`FileWriteAt`, bounded block cache (`CachedReadAt`) |
+| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. Gated into `writer.rs` by `FERROSA_SSTABLE_DIRECT_IO` (default off, buffered); byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`) |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |
 | `writer` | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]` |
 | `data` | Data.db row/cell codec (delta-encoded against the header) |
@@ -110,6 +111,7 @@ constant per-partition memory.
 | Area | Items |
 |------|-------|
 | I/O traits | `ReadAt`, `WriteAt`, `FileReadAt`, `FileWriteAt` |
+| Direct I/O | `direct::DirectWriter` (page-cache-bypassing sequential writer: O_DIRECT/`F_NOCACHE`), `DirectMode`, `direct_write_{fallbacks,files,bytes}_total` |
 | Reader | `SSTableReader::{open, get_partition, get_clustering_row, may_contain_key, partitions_iter, seek_to_token, salvage, validate_data_extent}`, `SSTableComponents` |
 | Writer | `SSTableWriter::{new, new_file_backed, add_partition, finish, finish_to_directory}`, `WriteOptions`, `SSTableOutput`, `SSTableOutputFiles` |
 | Types | `Partition`, `Row`, `LivenessInfo`, `DeletionTime`, `Compression` |
@@ -121,8 +123,10 @@ constant per-partition memory.
 - **`ferrosa-common`** — `Token`, `DecoratedKey`, `PartitionKey`, `CellValue`,
   Murmur3 hashing, `Error`/`Result` (the shared types the format encodes).
 
-External: `crc32fast`, `lru`, `lz4_flex`, `memmap2`, `rayon`, `zstd`. **No async
-runtime** — positional I/O is synchronous; S3 wrappers live in `ferrosa-storage`.
+External: `crc32fast`, `libc` (O_DIRECT/`F_NOCACHE`/`posix_fadvise` for
+`direct::DirectWriter`), `lru`, `lz4_flex`, `memmap2`, `rayon`, `tracing`
+(loud fallback logging), `zstd`. **No async runtime** — positional I/O is
+synchronous; S3 wrappers live in `ferrosa-storage`.
 
 **Called by** (crates that depend on this):
 

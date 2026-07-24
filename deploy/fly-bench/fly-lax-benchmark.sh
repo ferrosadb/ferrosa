@@ -111,7 +111,10 @@ ensure_ferrosa_volume() {
   local name="$1"
   local ids=()
 
-  mapfile -t ids < <(
+  # bash 3.2 (macOS default) has no `mapfile`; read the ids with a while loop.
+  while IFS= read -r _id; do
+    [ -n "$_id" ] && ids+=("$_id")
+  done < <(
     flyctl volumes list --app "$FERROSA_APP" --json \
       | jq -r --arg name "$name" '.[] | select(.name == $name) | .id'
   )
@@ -135,7 +138,16 @@ write_snapshot() {
   mkdir -p "${RESULTS_DIR}/${label}"
   flyctl machines list --app "$app" --json > "${RESULTS_DIR}/${label}/machines.json" || true
   flyctl status --app "$app" > "${RESULTS_DIR}/${label}/status.txt" || true
-  flyctl logs --app "$app" --no-tail > "${RESULTS_DIR}/${label}/logs.txt" || true
+  # `flyctl logs --no-tail` HANGS FOREVER on an app with no machines (it blocks on
+  # a log stream that never initializes), and `|| true` cannot rescue a hang — it
+  # only handles a non-zero exit. Bound it (macOS has no `timeout`): run detached,
+  # hard-kill after 30s so an empty-app teardown snapshot can never wedge the run.
+  ( flyctl logs --app "$app" --no-tail > "${RESULTS_DIR}/${label}/logs.txt" 2>&1 ) &
+  local _lp=$!
+  ( sleep 30; kill "$_lp" 2>/dev/null ) &
+  local _kp=$!
+  wait "$_lp" 2>/dev/null || true
+  kill "$_kp" 2>/dev/null || true
 }
 
 collect_node_metrics() {
@@ -415,17 +427,29 @@ wait_for_ferrosa_http() {
   local label="$2"
 
   echo "waiting for Ferrosa ${label} (${machine_id})"
-  flyctl ssh console --app "$FERROSA_APP" --machine "$machine_id" --command "sh -lc '
-    for i in \$(seq 1 90); do
-      if curl --max-time 5 -g -fsS http://[::1]:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
-        cat /tmp/ferrosa-status.json
-        exit 0
-      fi
-      sleep 2
-    done
-    cat /tmp/ferrosa-status.err >&2 || true
-    exit 1
-  '"
+  # Outer retry so a transient `flyctl ssh` TRANSPORT drop during node startup
+  # (curl "Could not connect" then "ssh shell: Process exited with status 1")
+  # retries the whole ssh instead of killing the run under set -e. Each inner
+  # attempt polls for up to 60s; up to 10 attempts (~11 min) of patience.
+  local attempt
+  for attempt in $(seq 1 10); do
+    if flyctl ssh console --app "$FERROSA_APP" --machine "$machine_id" --command "sh -lc '
+        for i in \$(seq 1 20); do
+          if curl --max-time 5 -g -fsS http://[::1]:9090/admin/membership-snapshot >/tmp/ferrosa-status.json 2>/tmp/ferrosa-status.err; then
+            cat /tmp/ferrosa-status.json
+            exit 0
+          fi
+          sleep 3
+        done
+        exit 1
+      '"; then
+      return 0
+    fi
+    echo "  ${label} readiness attempt ${attempt}/10 failed (transient ssh/curl or still starting); retrying in 6s"
+    sleep 6
+  done
+  echo "ferrosa ${label} not ready after retries" >&2
+  return 1
 }
 
 validate_ferrosa_membership() {
@@ -515,7 +539,11 @@ EOF
     --push \
     --image-label "bench-${RUN_ID}"
 
+  # fly machines are linux/amd64; force that platform so a local build on an
+  # arm64 host (Apple Silicon + podman) does not produce an arm64 image that
+  # exits -1 (exec format error) on fly.
   docker build \
+    --platform linux/amd64 \
     -t "registry.fly.io/${BENCH_APP}:bench-${RUN_ID}" \
     "${ROOT_DIR}/deploy/fly-bench/nosqlbench"
   flyctl auth docker
@@ -523,10 +551,16 @@ EOF
 }
 
 set_ferrosa_secrets() {
-  flyctl secrets set --app "$FERROSA_APP" \
+  # --stage: set secrets WITHOUT a deploy. Plain `secrets set` tries to grab the
+  # app config from a running machine to redeploy it; right after recreate-ferrosa
+  # the app has zero machines, so it dies with "could not create a fly.toml from
+  # any machines". Staged secrets are applied to the machines created next. The
+  # `|| true` is a backstop: these S3 secrets are idempotent and already persist
+  # on the app from the first deploy, so a transient failure must not abort.
+  flyctl secrets set --stage --app "$FERROSA_APP" \
     FERROSA_S3_ENDPOINT="https://fly.storage.tigris.dev" \
     FERROSA_S3_BUCKET="$TIGRIS_BUCKET" \
-    FERROSA_S3_REGION="auto"
+    FERROSA_S3_REGION="auto" || true
 }
 
 create_ferrosa_cluster() {
@@ -557,6 +591,10 @@ create_ferrosa_cluster() {
     --env "FERROSA_COMPACTION_VERIFY_OUTPUT=${FERROSA_COMPACTION_VERIFY_OUTPUT:-false}"
     --env "FERROSA_WRITE_VERIFY=${FERROSA_WRITE_VERIFY:-false}"
     --env "FERROSA_SSTABLE_COMPRESSION_THREADS=${FERROSA_SSTABLE_COMPRESSION_THREADS:-$((FERROSA_CPUS <= 2 ? 1 : 4))}"
+    --env "FERROSA_SSTABLE_DIRECT_IO=${FERROSA_SSTABLE_DIRECT_IO:-0}"
+    --env "FERROSA_FLUSH_PARALLELISM=${FERROSA_FLUSH_PARALLELISM:-}"
+    --env "FERROSA_WRITE_CONCURRENCY_LIMIT=${FERROSA_WRITE_CONCURRENCY_LIMIT:-}"
+    --env "FERROSA_RUNTIME_STALL_THRESHOLD_MS=${FERROSA_RUNTIME_STALL_THRESHOLD_MS:-300}"
     --env "FERROSA_S3_UPLOAD_WORKERS=${FERROSA_S3_UPLOAD_WORKERS:-8}"
     --env "FERROSA_S3_COMPACTION_UPLOAD_WORKERS=${FERROSA_S3_COMPACTION_UPLOAD_WORKERS:-4}"
     --env "FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH=${FERROSA_S3_COMPACTION_UPLOAD_QUEUE_DEPTH:-16}"
@@ -730,23 +768,28 @@ run_target() {
   elif [[ "$target" == cassandra-* ]]; then
     collect_node_metrics "$app" "${target}-before" cassandra
   fi
+  # NB: start_ferrosa_{profiles,memory_snapshots} use bash-4.3 `local -n`
+  # namerefs, which the macOS default bash 3.2 rejects. Guard the CALL SITES on
+  # the enable flags (default false here) so the nameref code never executes when
+  # the feature is off. (If you enable either on a bash-3.2 host, convert those
+  # four functions off namerefs first.)
   local profile_pids=()
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$PROFILE_FERROSA" == "true" ]]; then
     start_ferrosa_profiles "$target" profile_pids
   fi
   local memory_snapshot_pids=()
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$FERROSA_MEMORY_SNAPSHOTS" == "true" ]]; then
     start_ferrosa_memory_snapshots "$target" memory_snapshot_pids
   fi
   local bench_status=0
   flyctl ssh console --app "$BENCH_APP" --machine "$bench_machine" --command \
     "sh -lc \"TARGET_NAME='${target}' CONTACT_POINTS='${contact_points}' RUN_ID='${RUN_ID}' WORKLOAD='${WORKLOAD}' SCENARIO='${SCENARIO}' THREADS='${THREADS}' WARMUP_CYCLES='${WARMUP_CYCLES}' MEASURE_CYCLES='${MEASURE_CYCLES}' REPEATS='${REPEATS}' RF='${RF}' READ_CL='${READ_CL}' WRITE_CL='${WRITE_CL}' NB_JAVA_MAX_HEAP='${NB_JAVA_MAX_HEAP}' REQUEST_TIMEOUT_SECONDS='${REQUEST_TIMEOUT_SECONDS}' CQL_PROTOCOL_COMPRESSION='${CQL_PROTOCOL_COMPRESSION}' EXTRA_NB_ARGS='${EXTRA_NB_ARGS}' run-nb\"" \
     || bench_status=$?
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$FERROSA_MEMORY_SNAPSHOTS" == "true" ]]; then
     stop_ferrosa_memory_snapshots memory_snapshot_pids
     fetch_ferrosa_memory_snapshots "$target"
   fi
-  if [[ "$target" == ferrosa-* ]]; then
+  if [[ "$target" == ferrosa-* && "$PROFILE_FERROSA" == "true" ]]; then
     wait_for_profiles profile_pids
     fetch_ferrosa_profiles "$target"
   fi
@@ -792,14 +835,19 @@ run_ferrosa_ramp() {
 run_ferrosa_t128() {
   local size_label
   size_label="$(ferrosa_size_label)"
+  # Env-overridable so a harsher A/B can drive more threads / cycles without a
+  # code change (the O_DIRECT freeze-repro needs sustained heavy write load).
+  local threads="${THREADS:-128}"
+  local warmup="${WARMUP_CYCLES:-1000000}"
+  local measure="${MEASURE_CYCLES:-1000000}"
   (
     WORKLOAD="$RAMP_WORKLOAD"
     SCENARIO=default
-    THREADS=128
-    WARMUP_CYCLES=1000000
-    MEASURE_CYCLES=1000000
+    THREADS="$threads"
+    WARMUP_CYCLES="$warmup"
+    MEASURE_CYCLES="$measure"
     REPEATS=1
-    run_target "ferrosa-${size_label}-t128-c1000000" "$FERROSA_APP" "ferrosa-"
+    run_target "ferrosa-${size_label}-t${threads}-c${measure}" "$FERROSA_APP" "ferrosa-"
   )
 }
 

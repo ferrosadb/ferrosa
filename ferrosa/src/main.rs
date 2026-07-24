@@ -980,6 +980,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "scheduler: bounded scan-producer pool initialized (consensus headroom reserved)"
     );
 
+    // Runtime-stall detector (Phase 3, O_DIRECT + I/O). Watches the CQL request
+    // runtime's own scheduling latency: a healthy runtime wakes this liveness
+    // task every ~tick, but when a worker blocks on saturated disk (D-state,
+    // `rq_qos_wait`/`folio_wait` — the multi-second freeze the 2026-07-22 Fly A/B
+    // caught only under gdb) the wake is delayed, and the overrun is recorded as
+    // `ferrosa_sched_runtime_stall_*`. Runs ON `runtimes.cql` so it measures what
+    // interactive clients experience; the runtime is leaked for process lifetime,
+    // so the task lives forever (handle intentionally dropped).
+    let stall_threshold_ms = std::env::var("FERROSA_RUNTIME_STALL_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(ferrosa_sched::runtime_monitor::DEFAULT_THRESHOLD.as_millis() as u64);
+    let _stall_monitor = runtimes.cql.spawn(async move {
+        ferrosa_sched::runtime_monitor::spawn(
+            ferrosa_sched::runtime_monitor::DEFAULT_TICK,
+            std::time::Duration::from_millis(stall_threshold_ms),
+            |overrun| {
+                tracing::warn!(
+                    stall_ms = overrun.as_millis() as u64,
+                    "runtime scheduling stall: the CQL request runtime was frozen \
+                     — a worker blocked (likely saturated disk I/O). Interactive \
+                     latency degraded for this window. See ferrosa_sched_runtime_stall_* \
+                     and specs/decisions/022-scheduler-vruntime-unit.md (Phase 3)."
+                );
+            },
+        );
+    });
+    tracing::info!(
+        threshold_ms = stall_threshold_ms,
+        "runtime-stall detector armed on the CQL request runtime"
+    );
+
     // 4a. Seed default roles if auth is enabled.
     //
     // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`

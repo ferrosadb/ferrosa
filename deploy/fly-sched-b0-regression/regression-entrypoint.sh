@@ -22,4 +22,8 @@ fi
 [ -n "${AWS_ACCESS_KEY_ID:-}" ]     && export FERROSA_S3_ACCESS_KEY_ID="${FERROSA_S3_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID}}"
 [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && export FERROSA_S3_SECRET_ACCESS_KEY="${FERROSA_S3_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY}}"
 
-exec "$@"
+# Tee ferrosa's stdout+stderr to a file so the harness can fetch COMPLETE logs
+# via `fly ssh sftp get` (the streaming `fly logs` capture was lossy and, on the
+# macOS harness host, silently no-op'd because `timeout` is absent). No `exec`
+# so the log survives; the machine is torn down by destroy, not signals.
+"$@" 2>&1 | tee /tmp/ferrosa.log

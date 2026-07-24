@@ -101,6 +101,15 @@ struct Args {
     /// Concurrent scan workers for --scan-storm.
     #[arg(long, default_value_t = 32)]
     scan_concurrency: usize,
+
+    /// Override the profile's writer count (client write concurrency). Used to
+    /// sweep concurrency and find the real cluster write ceiling.
+    #[arg(long)]
+    writers: Option<usize>,
+
+    /// Override the profile's reader count (client read concurrency).
+    #[arg(long)]
+    readers: Option<usize>,
 }
 
 fn main() {
@@ -189,6 +198,12 @@ fn main() {
     }
     if let Some(cache) = args.cache_max_bytes {
         profile.local_cache_max_bytes = cache;
+    }
+    if let Some(w) = args.writers {
+        profile.num_writers = w;
+    }
+    if let Some(r) = args.readers {
+        profile.num_readers = r;
     }
 
     // ── Cluster mode ──────────────────────────────────────────────────

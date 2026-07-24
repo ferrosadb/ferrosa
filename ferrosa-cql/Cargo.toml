@@ -16,6 +16,7 @@ ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-net = { path = "../ferrosa-net" }
 ferrosa-index = { path = "../ferrosa-index" }
+memchr = "2.8"
 ferrosa-row-bridge = { path = "../ferrosa-row-bridge" }
 ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-session = { path = "../ferrosa-session" }
@@ -55,9 +56,14 @@ live-infra-tests = []
 test-util = []
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
 rcgen = "0.14"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "lexer_bench"
+harness = false
