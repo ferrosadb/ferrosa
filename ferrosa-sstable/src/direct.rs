@@ -223,7 +223,7 @@ impl DirectWriter {
         self.mode
     }
 
-    /// The current logical write offset — bytes accepted by [`write_all`] so far
+    /// The current logical write offset — bytes accepted by [`Self::write_all`] so far
     /// (flushed + still staged). Equals the offset the next byte will occupy in
     /// the finished file, so it substitutes exactly for `Seek::stream_position`
     /// when recording chunk offsets.

@@ -69,7 +69,7 @@ pub const DEFAULT_THRESHOLD: Duration = Duration::from_millis(300);
 /// `tick` and, on any wake that is `>= threshold` late, records the stall and
 /// invokes `on_stall(overrun)` (the caller logs — this leaf crate stays free of
 /// a logging dependency). Call once at boot from within the runtime being
-/// watched. The returned [`JoinHandle`] can be dropped (fire-and-forget).
+/// watched. The returned [`tokio::task::JoinHandle`] can be dropped (fire-and-forget).
 pub fn spawn<F>(tick: Duration, threshold: Duration, on_stall: F) -> tokio::task::JoinHandle<()>
 where
     F: Fn(Duration) + Send + 'static,
