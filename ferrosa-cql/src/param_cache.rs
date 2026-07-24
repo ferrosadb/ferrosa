@@ -425,7 +425,7 @@ pub enum Outcome {
 /// another's template. The skeleton is bounded by [`MAX_NORMALIZE_LEN`] and the
 /// cache is size-bounded by moka.
 pub struct TransparentCache {
-    cache: moka::sync::Cache<String, std::sync::Arc<Entry>>,
+    cache: moka::sync::Cache<String, std::sync::Arc<Entry>, ahash::RandomState>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
     uncacheable: std::sync::atomic::AtomicU64,
@@ -434,9 +434,16 @@ pub struct TransparentCache {
 
 impl TransparentCache {
     /// Create a cache holding up to `max_entries` distinct skeletons.
+    ///
+    /// Uses `ahash` for the skeleton key: it hashes the ~50-byte skeleton on
+    /// EVERY hit, and ahash is several times faster than moka's default SipHash
+    /// there while staying DoS-resistant (seeded) — which matters because the
+    /// key is derived from client-supplied query text.
     pub fn new(max_entries: u64) -> Self {
         Self {
-            cache: moka::sync::Cache::new(max_entries),
+            cache: moka::sync::Cache::builder()
+                .max_capacity(max_entries)
+                .build_with_hasher(ahash::RandomState::new()),
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
             uncacheable: std::sync::atomic::AtomicU64::new(0),

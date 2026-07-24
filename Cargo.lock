@@ -2292,6 +2292,7 @@ dependencies = [
 name = "ferrosa-cql"
 version = "0.17.0"
 dependencies = [
+ "ahash 0.8.12",
  "arc-swap",
  "bytes",
  "chrono",
