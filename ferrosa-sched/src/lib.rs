@@ -32,11 +32,13 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub mod fair_admit;
+pub mod group_runqueue;
 pub mod io_permits;
 pub mod runqueue;
 pub mod scheduler;
 
 pub use fair_admit::Admitted;
+pub use group_runqueue::{GroupId, GroupRunQueue, Picked};
 pub use io_permits::{IoPermit, IoPermits};
 
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus
@@ -364,7 +366,12 @@ impl SchedPool {
         // future; overload is still surfaced as `None`.
         match self
             .admit
-            .admit(SchedClass::Bulk, std::future::pending::<()>())
+            .admit(
+                DEFAULT_TENANT_GROUP,
+                group_runqueue::DEFAULT_GROUP_WEIGHT,
+                SchedClass::Bulk,
+                std::future::pending::<()>(),
+            )
             .await
         {
             Admitted::Slot(id) => {
@@ -393,7 +400,12 @@ impl SchedPool {
         tokio::spawn(async move {
             let waited = Instant::now();
             match admit
-                .admit(SchedClass::Bulk, std::future::pending::<()>())
+                .admit(
+                    DEFAULT_TENANT_GROUP,
+                    group_runqueue::DEFAULT_GROUP_WEIGHT,
+                    SchedClass::Bulk,
+                    std::future::pending::<()>(),
+                )
                 .await
             {
                 Admitted::Slot(id) => {
@@ -446,7 +458,15 @@ impl SchedPool {
         let io_permits = self.io_permits.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
-            match admit.admit(class, cancel).await {
+            match admit
+                .admit(
+                    DEFAULT_TENANT_GROUP,
+                    group_runqueue::DEFAULT_GROUP_WEIGHT,
+                    class,
+                    cancel,
+                )
+                .await
+            {
                 Admitted::Slot(id) => {
                     record_admission(waited.elapsed());
                     // B2 T2.1: hold a bulk-I/O permit for the scan's producing
@@ -605,6 +625,13 @@ pub const DEFAULT_SCAN_CHUNK_BUDGET: u32 = 64;
 /// as [`ScanOutcome::Overloaded`]. Bounds the queue so a flood of scans cannot
 /// grow it without limit; generous enough that only genuine overload trips it.
 pub const DEFAULT_MAX_WAITERS_PER_SLOT: usize = 256;
+
+/// The tenant group every pool scan is charged to today (B3). Until per-query
+/// `TenantContext` is threaded through the read path, all interactive scan work
+/// shares one group, so the hierarchical [`GroupRunQueue`] is behavior-preserving;
+/// folded background work (compaction/repair/index) joins as its *own* group,
+/// which is what makes cross-group fair-share arbitration live.
+pub const DEFAULT_TENANT_GROUP: GroupId = 0;
 
 static GLOBAL_POOL: std::sync::OnceLock<SchedPool> = std::sync::OnceLock::new();
 
