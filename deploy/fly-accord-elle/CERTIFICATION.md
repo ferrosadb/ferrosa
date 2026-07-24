@@ -39,13 +39,45 @@ cd ferrosa-jepsen/elle-checker
 lein run "$OUT_EDN"           # prints valid? + anomaly-types; exit 0 iff valid? true
 ```
 
+## Fault-injected certification — `valid? true` under partition + latency
+
+The classic Jepsen strict-serializability-under-fault test, same RF=3 pipeline
+with a live nemesis schedule (`certify-nemesis.sh`, preflight `NEM_OK` confirming
+the faults actually applied — not silent no-ops).
+
+- **Verdict:** `valid? true`, `anomaly-types: nil`.
+- **Build:** `14bb8ce8` — `main` (`e860ec88`) plus a docs-only commit; the Rust
+  binary is byte-identical to `e860ec88`.
+- **Date:** 2026-07-24. **Cluster:** 3-node RF=3 on Fly.io.
+- **Nemesis schedule** (fired in parallel with the generator): (1) isolate node3
+  into the minority — node1+node2 keep quorum and keep committing; (2) heal;
+  (3) isolate the coordinator (node1) into the minority — its in-flight commits
+  MUST go `:info`, not fabricate a result; (4) heal; (5) 200 ms netem latency on
+  node2+node3 — ordering under WAN latency; (6) heal.
+- **Workload:** `elle_list_append` args `8 700 8 3` (5,600 ops, sized to outlast
+  the ~155 s nemesis schedule).
+- **History outcome:** **5,295 `:ok`, 66 `:info`, 239 `:fail`** — every op lost to
+  the faults was correctly recorded indeterminate (`:info`) or not-applied
+  (`:fail`); the DB refused rather than inventing a commit. 11,200 ops checked.
+- **Evidence:** `elle-cert-nemesis-14bb8ce8-20260724T200144Z.edn` (+
+  `.anomalies.edn` = `nil`).
+
+Reproduce: `GEN_ARGS="8 700 8 3" ./deploy/fly-accord-elle/certify-nemesis.sh`,
+then `lein run` the history as above.
+
+**Minor finding (not a safety issue):** under load the driver logged *"Malformed
+error field CONSISTENCY of DB error WRITE_TIMEOUT"* — ferrosa's `WRITE_TIMEOUT`
+error frame appears to mis-encode the `CONSISTENCY` field. It is correctly
+classified `:info` (indeterminate) so it does not affect the verdict, but the
+error-frame encoding is worth fixing (tracked separately).
+
 ## Scope and honest limits
 
 - This certifies the **single-DC, RF=3, Accord list-append** transaction path
-  under a **fault-free** run. Fault-injected certification
-  (`certify-nemesis.sh`: minority partition + 200 ms WAN) and **dual-DC**
-  (`certify-dc.sh`, still gated on cross-DC replication) are separate and not
-  covered by this artifact.
+  both fault-free and under the recorded fault schedule: minority partition,
+  coordinator isolation, and 200 ms latency. It does **not** cover other fault
+  schedules or **dual-DC** certification (`certify-dc.sh` remains gated on
+  cross-DC replication).
 - The Elle checker is **not** wired into CI; CI checks the bank conservation
   invariant nightly. This certification is a **manual, reproducible** run.
 
