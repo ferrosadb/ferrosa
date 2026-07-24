@@ -30,7 +30,7 @@
 //! hit rate, never a wrong bind. A skeleton whose masked literals do not match
 //! the real parse's literal Terms is marked uncacheable and always full-parsed.
 
-use crate::ast::{InsertStatement, Term};
+use crate::ast::{InsertStatement, Statement, Term};
 use crate::error::CqlError;
 
 /// The kind of a masked scalar literal — enough to reconstruct its typed value
@@ -243,6 +243,11 @@ pub struct InsertTemplate {
     table: String,
     columns: Vec<String>,
     if_not_exists: bool,
+    /// Number of masked scalar values this template expects on every bind —
+    /// equal to `columns.len()` and to the masked-span count of any sibling
+    /// sharing the skeleton. Stored explicitly so the hit path can defensively
+    /// reject a span-count mismatch (which the fixed skeleton makes impossible).
+    value_count: usize,
 }
 
 impl InsertTemplate {
@@ -301,6 +306,12 @@ pub fn verify_insert(
     if ins.using_timestamp.is_some() || ins.using_ttl.is_some() {
         return None;
     }
+    // Require an explicit column list matching the value arity. Rejects the
+    // JSON-insert / column-less shapes whose `build` reconstruction would be
+    // malformed, and pins `value_count == columns.len()`.
+    if ins.columns.is_empty() || ins.columns.len() != ins.values.len() {
+        return None;
+    }
     if ins.values.len() != normalized.literals.len() {
         return None;
     }
@@ -320,7 +331,152 @@ pub fn verify_insert(
         table: ins.table.clone(),
         columns: ins.columns.clone(),
         if_not_exists: ins.if_not_exists,
+        value_count: ins.values.len(),
     })
+}
+
+/// What a cached skeleton resolves to.
+#[derive(Debug)]
+enum Entry {
+    /// A verified INSERT template — the fast path binds this hit's spans into it.
+    Insert(InsertTemplate),
+    /// This skeleton was parsed once and could not be safely templated
+    /// (non-INSERT, USING clause, collection value, verification mismatch, …).
+    /// Cached so we skip re-verifying it; the caller always full-parses.
+    Uncacheable,
+}
+
+/// Per-call outcome of [`TransparentCache::resolve`], for metrics + tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Fast path: reconstructed from a cached template, no full parse.
+    Hit,
+    /// First sight of this skeleton: full-parsed, then cached (as template or
+    /// uncacheable).
+    Miss,
+    /// Known-uncacheable skeleton: full-parsed, no re-verification.
+    Uncacheable,
+    /// Not normalizable (bind markers, over-length, unterminated): full-parsed,
+    /// never cached.
+    Bypass,
+}
+
+/// Transparent auto-parameterization cache: maps a normalized query skeleton to
+/// a verified [`InsertTemplate`] so repeated inline-literal INSERTs of the same
+/// shape skip lex + parse + AST allocation on every hit.
+///
+/// Keyed by the full skeleton STRING (not a hash) — this is a correctness-
+/// critical path and a hash collision would bind one shape's values into
+/// another's template. The skeleton is bounded by [`MAX_NORMALIZE_LEN`] and the
+/// cache is size-bounded by moka.
+pub struct TransparentCache {
+    cache: moka::sync::Cache<String, std::sync::Arc<Entry>>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    uncacheable: std::sync::atomic::AtomicU64,
+    bypass: std::sync::atomic::AtomicU64,
+}
+
+impl TransparentCache {
+    /// Create a cache holding up to `max_entries` distinct skeletons.
+    pub fn new(max_entries: u64) -> Self {
+        Self {
+            cache: moka::sync::Cache::new(max_entries),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            uncacheable: std::sync::atomic::AtomicU64::new(0),
+            bypass: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Resolve `query` to a [`Statement`], using the cache when it safely can
+    /// and falling back to `parse` (the real parser) otherwise. The returned
+    /// [`Outcome`] classifies the path taken.
+    ///
+    /// A cache HIT reconstructs the INSERT by binding this query's extracted
+    /// literal spans into the verified template — no full parse. Every other
+    /// path calls `parse`, and its result is byte-for-byte what the caller would
+    /// have gotten without the cache: the cache never changes semantics, only
+    /// skips work on the repeated-shape hot path.
+    pub fn resolve<F>(&self, query: &str, parse: F) -> (Result<Statement, CqlError>, Outcome)
+    where
+        F: FnOnce(&str) -> Result<Statement, CqlError>,
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(norm) = normalize(query) else {
+            self.bypass.fetch_add(1, Relaxed);
+            return (parse(query), Outcome::Bypass);
+        };
+        match self.cache.get(&norm.skeleton) {
+            Some(entry) => match entry.as_ref() {
+                Entry::Insert(tmpl) => match bind_template(query, tmpl, &norm) {
+                    Some(stmt) => {
+                        self.hits.fetch_add(1, Relaxed);
+                        (Ok(stmt), Outcome::Hit)
+                    }
+                    // A span failed to re-parse (a malformed literal that a full
+                    // parse would also reject): fall back so the client gets the
+                    // real error, never a silently wrong bind.
+                    None => (parse(query), Outcome::Bypass),
+                },
+                Entry::Uncacheable => {
+                    self.uncacheable.fetch_add(1, Relaxed);
+                    (parse(query), Outcome::Uncacheable)
+                }
+            },
+            None => {
+                self.misses.fetch_add(1, Relaxed);
+                let parsed = parse(query);
+                if let Ok(Statement::Insert(ins)) = &parsed {
+                    let entry = match verify_insert(query, ins, &norm) {
+                        Some(tmpl) => Entry::Insert(tmpl),
+                        None => Entry::Uncacheable,
+                    };
+                    self.cache.insert(norm.skeleton, std::sync::Arc::new(entry));
+                } else if parsed.is_ok() {
+                    // A well-formed non-INSERT: remember it is uncacheable so we
+                    // do not re-attempt templating it every time.
+                    self.cache
+                        .insert(norm.skeleton, std::sync::Arc::new(Entry::Uncacheable));
+                }
+                // A parse ERROR is never cached (a later identical skeleton is
+                // still a parse error, and caching Err would be wrong).
+                (parsed, Outcome::Miss)
+            }
+        }
+    }
+
+    /// `(hits, misses, uncacheable, bypass)` since construction.
+    pub fn stats(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.hits.load(Relaxed),
+            self.misses.load(Relaxed),
+            self.uncacheable.load(Relaxed),
+            self.bypass.load(Relaxed),
+        )
+    }
+
+    /// Drop every cached skeleton (e.g. after a schema change that could alter
+    /// how a shape resolves). Bounded, best-effort.
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
+}
+
+/// Bind a hit's extracted literal spans into a verified template, producing the
+/// concrete INSERT. Returns `None` if a span fails to re-parse (caller falls
+/// back to a full parse) or the span count no longer matches the template — the
+/// latter cannot happen for a matching skeleton but is checked defensively.
+fn bind_template(query: &str, tmpl: &InsertTemplate, norm: &Normalized) -> Option<Statement> {
+    if norm.literals.len() != tmpl.value_count {
+        return None;
+    }
+    let mut values = Vec::with_capacity(norm.literals.len());
+    for lit in &norm.literals {
+        values.push(lit.to_term(query).ok()?);
+    }
+    Some(Statement::Insert(tmpl.build(values)))
 }
 
 #[cfg(test)]
@@ -474,8 +630,6 @@ mod tests {
         }
     }
 
-    use crate::ast::Statement;
-
     /// Parse a query and unwrap its INSERT, panicking otherwise.
     fn insert_of(q: &str) -> InsertStatement {
         match crate::parser::parse(q).expect("parse") {
@@ -541,6 +695,83 @@ mod tests {
         let q = "INSERT INTO t (k, id) VALUES ('x', now())";
         let n = norm(q);
         assert_eq!(verify_insert(q, &insert_of(q), &n), None);
+    }
+
+    /// The end-to-end cache contract: for a repeated INSERT shape, a HIT
+    /// returns exactly what a full parse of that specific query would, and
+    /// every path's Statement equals the real parse.
+    #[test]
+    fn cache_hit_reconstructs_the_exact_full_parse() {
+        let cache = TransparentCache::new(64);
+        let shape = [
+            "INSERT INTO ks.t (a, b, c) VALUES ('first', 1, 0xAA)",
+            "INSERT INTO ks.t (a, b, c) VALUES ('second-value', 22, 0xBBCC)",
+            "INSERT INTO ks.t (a, b, c) VALUES ('third', 333, 0xDEADBEEF)",
+        ];
+        // First query: MISS (parsed + cached as template).
+        let (r0, o0) = cache.resolve(shape[0], crate::parser::parse);
+        assert_eq!(o0, Outcome::Miss);
+        assert_eq!(r0.unwrap(), crate::parser::parse(shape[0]).unwrap());
+        // Subsequent same-shape queries: HIT, and byte-identical to a full parse.
+        for q in &shape[1..] {
+            let (r, o) = cache.resolve(q, crate::parser::parse);
+            assert_eq!(o, Outcome::Hit, "second+ sighting of a shape must hit");
+            assert_eq!(
+                r.unwrap(),
+                crate::parser::parse(q).unwrap(),
+                "hit must equal a full parse of `{q}`"
+            );
+        }
+        let (hits, misses, _unc, _byp) = cache.stats();
+        assert_eq!((hits, misses), (2, 1));
+    }
+
+    #[test]
+    fn non_insert_is_cached_uncacheable_but_still_parsed_correctly() {
+        let cache = TransparentCache::new(64);
+        let q = "SELECT a, b FROM t WHERE k = 'x' LIMIT 10";
+        let (r1, o1) = cache.resolve(q, crate::parser::parse);
+        assert_eq!(o1, Outcome::Miss);
+        assert_eq!(r1.unwrap(), crate::parser::parse(q).unwrap());
+        // A different SELECT of the same shape: known-uncacheable, still correct.
+        let q2 = "SELECT a, b FROM t WHERE k = 'y' LIMIT 99";
+        let (r2, o2) = cache.resolve(q2, crate::parser::parse);
+        assert_eq!(o2, Outcome::Uncacheable);
+        assert_eq!(r2.unwrap(), crate::parser::parse(q2).unwrap());
+    }
+
+    #[test]
+    fn bind_marker_query_bypasses_the_cache() {
+        let cache = TransparentCache::new(64);
+        let q = "INSERT INTO t (k, v) VALUES (?, ?)";
+        let (r, o) = cache.resolve(q, crate::parser::parse);
+        assert_eq!(o, Outcome::Bypass);
+        assert_eq!(r.unwrap(), crate::parser::parse(q).unwrap());
+        assert_eq!(cache.stats().3, 1, "one bypass counted");
+    }
+
+    #[test]
+    fn parse_error_is_returned_and_never_cached() {
+        let cache = TransparentCache::new(64);
+        let bad = "INSERT INTO t (k) VALUES ('x'"; // unterminated ) — parse error
+        let (r, _o) = cache.resolve(bad, crate::parser::parse);
+        assert!(r.is_err(), "a parse error must propagate");
+    }
+
+    #[test]
+    fn uncacheable_insert_shape_falls_back_every_time() {
+        // An INSERT with a collection value can't be templated (slice 1): first
+        // sight caches it Uncacheable, later same-shape queries take that path.
+        // Same set CARDINALITY so both share one skeleton (differing element
+        // counts would mask to different skeletons and each be its own miss).
+        let cache = TransparentCache::new(64);
+        let a = "INSERT INTO t (k, s) VALUES ('x', {1, 2})";
+        let b = "INSERT INTO t (k, s) VALUES ('y', {3, 4})";
+        let (_ra, oa) = cache.resolve(a, crate::parser::parse);
+        assert_eq!(oa, Outcome::Miss);
+        let (rb, ob) = cache.resolve(b, crate::parser::parse);
+        assert_eq!(ob, Outcome::Uncacheable);
+        assert_eq!(rb.unwrap(), crate::parser::parse(b).unwrap());
     }
 
     #[test]
