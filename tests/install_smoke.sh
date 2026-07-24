@@ -206,12 +206,12 @@ build_memory_tarball() {
   log "building ferrosa-memory-mcp from $MEMORY_REPO"
   ( cd "$MEMORY_REPO" && cargo build $profile_flag -p ferrosa-memory-mcp --bin ferrosa-memory-mcp >/dev/null )
   [ -x "$bindir/ferrosa-memory-mcp" ] || fail "ferrosa-memory-mcp not built at $bindir"
-  # Stage a tarball in the layout install-memory.sh expects: top-level binary +
-  # config/ferrosa-memory.example.toml.
+  # Stage the same binary/config/template layout shipped by a memory release.
   local stage; stage="$(mktemp -d)"
   cp "$bindir/ferrosa-memory-mcp" "$stage/"
   mkdir -p "$stage/config"
   cp "$MEMORY_REPO/config/ferrosa-memory.example.toml" "$stage/config/"
+  cp -R "$MEMORY_REPO/examples" "$stage/examples"
   MEMORY_TARBALL="$WORK/ferrosa-memory-v0.0.0-smoke.tar.gz"
   ( cd "$stage" && tar czf "$MEMORY_TARBALL" . )
   rm -rf "$stage"
@@ -337,6 +337,8 @@ run_memory_smoke() {
     > "$LOGDIR/install-memory.log" 2>&1 \
     || { cat "$LOGDIR/install-memory.log" >&2; fail "install-memory.sh failed"; }
   [ -x "$INSTALL/bin/ferrosa-memory-mcp" ] || fail "ferrosa-memory-mcp not installed"
+  [ -f "$INSTALL/share/ferrosa-memory/examples/http-auth.toml" ] \
+    || fail "install-memory.sh did not retain bundled HTTP/auth templates"
   ok "ferrosa-memory installed via install/install-memory.sh to $INSTALL/bin"
   write_memory_config
   start_memory
