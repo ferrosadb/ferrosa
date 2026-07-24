@@ -9,10 +9,11 @@ executive_summary: >
   DC partition+slow passes, native linearizability + membership checks run in
   CI, and the Elle pipeline found and drove fixes for real Accord ordering
   bugs. The Accord list-append path is strict-serializable — CERTIFIED with Elle
-  on a current RF=3 build (2026-07-24, e860ec88): fault-free, valid?=true, 0
-  anomalies over 2,400 committed transactions (0 indeterminate). Scope: single-DC
-  fault-free; fault-injected and multi-DC Elle certification are the next runs
-  (not yet committed). (2) Performance: a week of
+  on a current RF=3 build (2026-07-24): fault-free (valid?=true, 0 anomalies /
+  2,400 committed txns, 0 indeterminate) AND under faults (valid?=true, 0
+  anomalies / 11,200 ops under a minority partition + coordinator isolation +
+  200 ms latency, lost-quorum ops correctly refused). Scope: single-DC; dual-DC
+  and CI-wired Elle are next. (2) Performance: a week of
   write-path work, validated by a Fly perf-4x A/B, improved steady write
   throughput +48% (7.5k -> 11.1k w/s) and cut write latency ~3x (p99 44 ->
   16.5 ms). The dominant driver is removing a per-request connection-map clone
@@ -95,7 +96,8 @@ files a GitHub issue on failure, and uploads logs (30-day retention).
 | Bank conservation under `dc-partition+dc-slow` | **Passes** | Nightly CI workflow + dev-reproduced on a 6-node T3 podman cluster after harness-bug fix `3cb39a31`. |
 | Native register linearizability + membership | **Run in CI** | `ferrosa-jepsen` unit + integration tests. |
 | Elle checker self-validation | **Valid** | Catches injected anomalies; passes known-good histories (`d581b529`). Validates the *checker*, not the DB. |
-| **Elle strict-serializability, single-DC RF=3, current build** | **`valid? true`, `anomaly-types: nil`** — **committed evidence artifact** | Certified 2026-07-24 on build `e860ec88`. 2,400 `:ok` / 0 `:info` / 0 `:fail`; 4,800 ops. See `deploy/fly-accord-elle/CERTIFICATION.md` + `elle-cert-e860ec88-20260724T181744Z.edn`. |
+| **Elle strict-serializability, single-DC RF=3, fault-free** | **`valid? true`, `anomaly-types: nil`** — **committed evidence** | Certified 2026-07-24 on build `e860ec88`. 2,400 `:ok` / 0 `:info` / 0 `:fail`; 4,800 ops. See `deploy/fly-accord-elle/CERTIFICATION.md`. |
+| **Elle strict-serializability, single-DC RF=3, UNDER FAULTS** (minority partition + coordinator isolation + 200 ms latency) | **`valid? true`, `anomaly-types: nil`** — **committed evidence** | Certified 2026-07-24 (`certify-nemesis.sh`, `NEM_OK` preflight). 5,295 `:ok` / 66 `:info` / 239 `:fail`; 11,200 ops checked. Lost-quorum ops correctly refused (`:info`/`:fail`), never fabricated. |
 | Server-minted transaction id | Drove strict-serializable `:info` from ~24% → **0** | Confirmed in the 2026-07-24 cert (0 of 2,400 indeterminate); commits `d485dd85` / `587f7926`. |
 
 **Real Accord bugs found and fixed through this pipeline** (the pipeline's main
@@ -114,19 +116,23 @@ demonstrated value to date):
 
 ### 1.3 Certification scope and remaining gaps
 
-**Certified (2026-07-24, build `e860ec88`):** single-DC, RF=3, fault-free Accord
-`list-append` is **strict-serializable** — `valid? true`, no anomalies, over a
-2,400-op history with 0 indeterminate outcomes. This is a reproducible run with a
-committed evidence artifact (`deploy/fly-accord-elle/CERTIFICATION.md`). It
-supersedes the pre-fix `valid? false` run (`t_68f226b5`), retained as
+**Certified (2026-07-24, current build):** single-DC, RF=3 Accord `list-append`
+is **strict-serializable**, both fault-free and under faults, with committed
+evidence (`deploy/fly-accord-elle/CERTIFICATION.md`):
+
+- **Fault-free** (build `e860ec88`): `valid? true`, no anomalies, 2,400-op
+  history, 0 indeterminate.
+- **Under faults** (build `14bb8ce8`, code-identical): `valid? true`, no
+  anomalies, under a live nemesis schedule — minority partition, coordinator
+  isolation, and 200 ms WAN latency (`NEM_OK` preflight confirmed the faults
+  applied). Lost-quorum ops were correctly refused (66 `:info` / 239 `:fail`),
+  never fabricated; 11,200 ops checked.
+
+This supersedes the pre-fix `valid? false` run (`t_68f226b5`), retained as
 `elle-fly-history-2026-07-20-PREFIX-valid-false.edn`.
 
 Still **not** covered — do not overclaim these:
 
-- **Fault-injected Elle certification is not yet committed.** `certify-nemesis.sh`
-  (minority partition + 200 ms WAN) has a commit-message `valid? true` claim
-  (`587f7926`) but no committed history artifact. The 2026-07-24 cert above is
-  **fault-free**.
 - **Dual-DC (T3/T4) Elle** is scaffold-only (`certify-dc.sh`, gated on cross-DC
   replication). Real 24 h multi-DC endurance runs on the *simulator*, not a live
   cluster.
@@ -144,10 +150,12 @@ Still **not** covered — do not overclaim these:
 
 **Bottom line for a release:** it is accurate to say ferrosa's Accord transaction
 path is **strict-serializable — certified with Elle on a current RF=3 build
-(2026-07-24), fault-free, 0 anomalies over 2,400 committed transactions**, that
-the pipeline **found and fixed real transaction-ordering bugs**, and that **bank
-conservation holds under DC partition + slow**. Scope the claim to single-DC
-fault-free; fault-injected and multi-DC Elle certification are the next runs.
+(2026-07-24), both fault-free (0 anomalies / 2,400 committed transactions) and
+under a minority partition + coordinator isolation + 200 ms latency (0 anomalies
+/ 11,200 ops, lost-quorum ops correctly refused)**, that the pipeline **found and
+fixed real transaction-ordering bugs**, and that **bank conservation holds under
+DC partition + slow**. Scope the claim to single-DC; dual-DC Elle and CI-wired
+Elle are the next runs.
 
 ---
 
