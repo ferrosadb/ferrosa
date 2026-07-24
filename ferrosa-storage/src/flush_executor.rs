@@ -38,9 +38,12 @@ static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 /// non-numeric value, or an absent var falls back to `available_parallelism()`.
 pub(crate) fn parse_parallelism(env_val: Option<String>) -> usize {
     if let Some(v) = env_val {
-        if let Ok(n) = v.trim().parse::<usize>() {
-            if n >= 1 {
-                return n.min(MAX_FLUSH_PARALLELISM);
+        // Named `requested` (not `n`): this is an operator-set thread-count
+        // config, not a query result bound — the OOM-audit `.min(.., CAP)`
+        // result-cap heuristic keys off a receiver literally named `n`.
+        if let Ok(requested) = v.trim().parse::<usize>() {
+            if requested >= 1 {
+                return requested.min(MAX_FLUSH_PARALLELISM);
             }
         }
     }
