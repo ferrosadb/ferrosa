@@ -323,7 +323,7 @@ fn open_bypassing(path: &Path) -> Result<(File, DirectMode)> {
             .custom_flags(libc::O_DIRECT)
             .open(path)
         {
-            Ok(file) => return Ok((file, DirectMode::Direct)),
+            Ok(file) => Ok((file, DirectMode::Direct)),
             Err(err) => {
                 DIRECT_WRITE_FALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -338,7 +338,7 @@ fn open_bypassing(path: &Path) -> Result<(File, DirectMode)> {
                     .create(true)
                     .truncate(true)
                     .open(path)?;
-                return Ok((file, DirectMode::Buffered));
+                Ok((file, DirectMode::Buffered))
             }
         }
     }
