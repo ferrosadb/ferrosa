@@ -62,12 +62,35 @@ impl Literal {
         &query[self.start..self.end]
     }
 
-    /// Reconstruct this literal's typed [`Term`] on the cache-hit path, reusing
-    /// the parser's single-term logic (see [`crate::parser::parse_term`]) so the
-    /// bound value is byte-for-byte what a full parse of the original query would
-    /// have produced. No duplicated unescape/hex/UUID logic lives here.
+    /// Reconstruct this literal's typed [`Term`] on the cache-hit path by lexing
+    /// the span directly: the LEXER already decodes each scalar literal
+    /// (`''`-unescape, hex/UUID/number), so mapping its single token to a `Term`
+    /// reuses that exact logic with NO duplication and skips the whole parser/
+    /// term-grammar layer (measurably cheaper than `parser::parse_term` on the
+    /// hot path). Requires the span to be exactly ONE scalar-literal token so a
+    /// mis-scanned multi-token span can never bind a truncated value; the
+    /// miss-path verification checks this result equals a full parse's Term.
     pub fn to_term(&self, query: &str) -> Result<Term, CqlError> {
-        crate::parser::parse_term(self.text(query))
+        use crate::lexer::{Lexer, TokenKind};
+        let mut lexer = Lexer::new(self.text(query))?;
+        let term = match lexer.next_token()?.kind {
+            TokenKind::StringLiteral(s) => Term::StringLiteral(s),
+            TokenKind::IntegerLiteral(n) => Term::IntegerLiteral(n),
+            TokenKind::FloatLiteral(f) => Term::FloatLiteral(f),
+            TokenKind::UuidLiteral(u) => Term::UuidLiteral(u),
+            TokenKind::BlobLiteral(b) => Term::BlobLiteral(b),
+            other => {
+                return Err(CqlError::SyntaxError(format!(
+                    "param-cache span is not a scalar literal token: {other:?}"
+                )));
+            }
+        };
+        if lexer.next_token()?.kind != TokenKind::Eof {
+            return Err(CqlError::SyntaxError(
+                "param-cache span holds more than one token".into(),
+            ));
+        }
+        Ok(term)
     }
 }
 
