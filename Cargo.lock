@@ -2315,6 +2315,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "md-5 0.11.0",
+ "memchr",
  "moka",
  "num-bigint",
  "parking_lot 0.12.5",
