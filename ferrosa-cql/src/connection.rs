@@ -1539,8 +1539,16 @@ async fn handle_query(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Parse the CQL statement.
-    let mut stmt = match parser::parse(query) {
+    // Parse the CQL statement. When the transparent param cache is enabled, a
+    // repeated inline-literal INSERT shape is reconstructed from a verified
+    // skeleton template instead of re-lexing+parsing; the result is byte-for-
+    // byte what `parser::parse` would return (see `param_cache`). Disabled by
+    // default => straight `parser::parse`.
+    let parsed = match &state.param_cache {
+        Some(cache) => cache.resolve(query, parser::parse).0,
+        None => parser::parse(query),
+    };
+    let mut stmt = match parsed {
         Ok(s) => s,
         Err(e) => {
             return HandleResult::Reply(Opcode::Error, e.encode_body());
@@ -3375,6 +3383,7 @@ mod tests {
                     accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
                 }),
                 prepared_cache: Arc::new(PreparedCache::new(1024 * 1024)),
+                param_cache: None,
                 connection_tracker: Arc::new(ConnectionTracker::new()),
                 query_tracker: Arc::new(crate::virtual_tables::QueryTracker::new()),
                 full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),

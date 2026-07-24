@@ -335,6 +335,38 @@ pub fn verify_insert(
     })
 }
 
+/// Default number of distinct skeletons the transparent cache retains when
+/// enabled. A production write mix repeats a small set of INSERT shapes, so a
+/// few thousand skeletons cover it with a bounded footprint.
+const DEFAULT_MAX_SKELETONS: u64 = 4096;
+
+/// Environment variable that opts the transparent param cache in. Absent (the
+/// default) leaves it OFF and `handle_query` always full-parses.
+pub const ENABLE_ENV: &str = "FERROSA_TRANSPARENT_PARAM_CACHE";
+
+/// Pure enable check — `true` only for an explicit truthy value. Takes the env
+/// value as an argument so it is testable without mutating the process
+/// environment (a `set_var` race, per the rust skill).
+pub fn cache_enabled(env_val: Option<String>) -> bool {
+    matches!(
+        env_val.as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// Build the transparent cache from the environment: `Some` when [`ENABLE_ENV`]
+/// is truthy, else `None` (disabled — the default). Called once at CQL server
+/// construction, never per request.
+pub fn from_env() -> Option<std::sync::Arc<TransparentCache>> {
+    if cache_enabled(std::env::var(ENABLE_ENV).ok()) {
+        Some(std::sync::Arc::new(TransparentCache::new(
+            DEFAULT_MAX_SKELETONS,
+        )))
+    } else {
+        None
+    }
+}
+
 /// What a cached skeleton resolves to.
 #[derive(Debug)]
 enum Entry {

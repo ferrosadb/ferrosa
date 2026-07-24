@@ -1564,6 +1564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             accord_state: mode_controller.accord_state_slot(),
         }),
         prepared_cache: Arc::new(ferrosa_cql::prepared::PreparedCache::new(64 * 1024 * 1024)),
+        param_cache: ferrosa_cql::param_cache::from_env(),
         connection_tracker,
         query_tracker,
         full_scan_tracker: full_scan_tracker.clone(),
