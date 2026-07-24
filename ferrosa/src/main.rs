@@ -116,6 +116,7 @@ const DEFAULT_CQL_BIND: &str = "127.0.0.1:9042";
 const DEFAULT_GRAPH_HTTP_BIND: &str = "127.0.0.1:7474";
 const DEFAULT_GRAPH_BOLT_PORT: &str = "7687";
 const DEFAULT_SPARQL_BIND: &str = "127.0.0.1:8080";
+#[cfg(any(feature = "flight", test))]
 const DEFAULT_FLIGHT_BIND: &str = "127.0.0.1:8815";
 const DEFAULT_POSTGRES_BIND: &str = "127.0.0.1:5432";
 
@@ -236,6 +237,7 @@ fn resolve_cql_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     parse_bind_addr("CQL", "FERROSA_CQL_BIND", &cql_bind)
 }
 
+#[cfg(any(feature = "flight", test))]
 fn resolve_flight_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     let flight_bind = config_val(
         "FERROSA_FLIGHT_BIND",
