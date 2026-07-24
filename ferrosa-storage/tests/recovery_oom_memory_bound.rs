@@ -201,12 +201,25 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
 
     let table_dir = dir.path().join("sstables").join(tid.to_string());
     let gens = StorageEngine::list_generations_in_dir(&table_dir);
-    assert_eq!(
-        gens.len(),
-        1,
-        "a single manual flush must produce exactly one generation, got {gens:?}"
+    assert!(
+        !gens.is_empty(),
+        "a manual flush must produce at least one generation, got {gens:?}"
     );
-    let gen = gens[0];
+    // A large memtable flush may SHARD into several non-overlapping SSTables
+    // (flush_sharded, slice #3): `partition_count >= 2 * MIN_PARTITIONS_PER_FLUSH_SHARD`
+    // with a flush pool wider than 1 splits the flush (e.g. 1024 partitions ->
+    // 2 x 512). The recovery OOM guard is per-SSTable, so measure the LARGEST
+    // generation the flush actually produced — recovery must stay bounded on the
+    // biggest single SSTable regardless of how many shards the flush emitted.
+    let gen = *gens
+        .iter()
+        .max_by_key(|g| {
+            open_vec_reader(&table_dir, &g.to_string())
+                .read_partitions_limited(usize::MAX)
+                .map(|p| p.len())
+                .unwrap_or(0)
+        })
+        .expect("at least one generation");
     let gen_str = gen.to_string();
 
     // Open once, before arming, so the reader's fixed structures (and the
@@ -220,10 +233,11 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
             .read_partitions_limited(usize::MAX)
             .expect("materialize all partitions")
     });
-    assert_eq!(
-        materialized.len(),
-        n,
-        "the fixture must hold every partition in one generation"
+    assert!(
+        !materialized.is_empty() && materialized.len() <= n,
+        "the largest generation must hold a non-empty subset of the {n} written partitions \
+         (all {n} when unsharded, ~n/shards when the flush sharded), got {}",
+        materialized.len()
     );
     drop(materialized);
 
