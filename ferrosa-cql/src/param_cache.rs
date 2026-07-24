@@ -287,7 +287,7 @@ fn is_maskable_scalar(t: &Term) -> bool {
 }
 
 /// Verify a parsed INSERT against its normalization and, if the fast path can
-/// provably reconstruct its siblings, return a cacheable [`InsertTemplate`].
+/// provably reconstruct its siblings, return a cacheable skeleton `InsertStatement`.
 ///
 /// This is the safety spine: a skeleton is trusted for fast-path binding ONLY
 /// after this returns `Some` for the first (cache-miss) query that produced it.
@@ -429,12 +429,12 @@ pub enum Outcome {
 }
 
 /// Transparent auto-parameterization cache: maps a normalized query skeleton to
-/// a verified [`InsertTemplate`] so repeated inline-literal INSERTs of the same
+/// a verified skeleton `InsertStatement` so repeated inline-literal INSERTs of the same
 /// shape skip lex + parse + AST allocation on every hit.
 ///
 /// Keyed by the full skeleton STRING (not a hash) — this is a correctness-
 /// critical path and a hash collision would bind one shape's values into
-/// another's template. The skeleton is bounded by [`MAX_NORMALIZE_LEN`] and the
+/// another's template. The skeleton is length-bounded (see `MAX_NORMALIZE_LEN`) and the
 /// cache is size-bounded by moka.
 pub struct TransparentCache {
     cache: moka::sync::Cache<String, std::sync::Arc<Entry>, ahash::RandomState>,
