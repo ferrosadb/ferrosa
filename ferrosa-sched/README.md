@@ -44,6 +44,12 @@ a CheckQuorum leader step-down.
   `FairAdmit` is built from: a pick-min run queue with a monotonic `min_vruntime`
   floor, service charged inversely to weight, and the strictly-more-deserving
   yield rule.
+- `io_permits::IoPermits` (**B2**) — the **I/O** resource dimension. Where
+  `FairAdmit` bounds concurrent scan *compute*, this bounds concurrent bulk
+  *I/O* (`Lane::Bulk`): at most `capacity` `IoPermit`s are held at once, so a
+  fan-out of S3-reading scans cannot saturate the shared I/O path and starve the
+  reserved lanes. Async acquire (an I/O-bound waiter is a cheap task, the B0
+  property); RAII permits returned on drop, including panic/cancel unwind.
 
 ## Dependencies / dependents
 
@@ -67,3 +73,21 @@ a CheckQuorum leader step-down.
   Every scan through the pool is currently a full-table `Bulk` scan (Foreground
   reads bypass — T1.5), so the 4:1 weighting is latent until B3 folds
   mixed-weight background work (compaction/repair/ANN) into the pool.
+  Admission is cancellable + bounded (`Overloaded` backpressure), and range-scan
+  readers open only after a slot is granted.
+- **B2 (PR #288):** the I/O dimension.
+  - T2.1 — `io_permits::IoPermits` bounded bulk-I/O permit pool, now a
+    first-class `SchedPool` member: an admitted scan holds one permit for its
+    producing life (the `Lane::Bulk` reservation, sized to CPU capacity by
+    default, lower it to reserve I/O headroom). Gauges
+    `ferrosa_sched_io_permits_{capacity,in_flight,acquired_total}`.
+  - T2.2 — `vruntime` advances on **I/O wait**: `ScanSlot::tick` charges
+    `vruntime` by the chunk window's measured **wall-elapsed µs** (CPU + I/O),
+    not a chunk count, so an I/O-bound scan is throttled to equal *total
+    service* (test `service_time_accounting_equalizes_io_bound_and_cpu_light_scans`).
+  - T2.3 — DD-1 pinned to weighted wall-elapsed (`ADR-022`) with a microbench
+    (`examples/vruntime_unit_bench.rs`; ~30 ns/chunk).
+  - T2.4 — permit-leak invariant (RAII returns the permit on panic/cancel).
+  - Remaining refinement: acquire the I/O permit at the *per-I/O operation*
+    (release the CPU slot while blocked on S3) rather than per-scan — the deeper
+    `ferrosa-net`/storage seam integration.
