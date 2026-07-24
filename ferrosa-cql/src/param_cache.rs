@@ -252,43 +252,21 @@ fn scan_quoted_ident(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// A verified, cacheable INSERT template: the structural skeleton of an INSERT
-/// (everything except its masked scalar values), from which any sibling INSERT
-/// sharing the same normalized skeleton is reconstructed by binding that
-/// sibling's extracted literal spans in order.
-///
-/// Built ONLY by [`verify_insert`], which proves — against a real parse — that
-/// the normalizer masked exactly this INSERT's value Terms. It therefore holds
-/// no values of its own; each cache hit supplies its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InsertTemplate {
-    keyspace: Option<String>,
-    table: String,
-    columns: Vec<String>,
-    if_not_exists: bool,
-    /// Number of masked scalar values this template expects on every bind —
-    /// equal to `columns.len()` and to the masked-span count of any sibling
-    /// sharing the skeleton. Stored explicitly so the hit path can defensively
-    /// reject a span-count mismatch (which the fixed skeleton makes impossible).
-    value_count: usize,
-}
-
-impl InsertTemplate {
-    /// Reconstruct a concrete INSERT by binding `values` (this hit's extracted
-    /// literals, converted via [`Literal::to_term`]) into the template. The
-    /// caller guarantees `values.len()` equals the template's masked-value count
-    /// (the skeleton fixes it), so the result is structurally identical to a
-    /// full parse of the original query, differing only in the bound values.
-    pub fn build(&self, values: Vec<Term>) -> InsertStatement {
-        InsertStatement {
-            keyspace: self.keyspace.clone(),
-            table: self.table.clone(),
-            columns: self.columns.clone(),
-            values,
-            if_not_exists: self.if_not_exists,
-            using_timestamp: None,
-            using_ttl: None,
-        }
+/// Build a fast-INSERT SKELETON from a verified parse: the same structure with
+/// every scalar value replaced by a `BindMarker(None)`. The skeleton is cached
+/// behind an `Arc` and executed per hit via the router's BORROWED fast-insert
+/// path (`route_prepared_insert_fast`) with the hit's decoded values — so a hit
+/// materializes no owned `InsertStatement` and clones nothing but an `Arc`
+/// refcount. `USING TIMESTAMP`/`TTL` are dropped (verification rejects them).
+fn skeleton_of(ins: &InsertStatement) -> InsertStatement {
+    InsertStatement {
+        keyspace: ins.keyspace.clone(),
+        table: ins.table.clone(),
+        columns: ins.columns.clone(),
+        values: vec![Term::BindMarker(None); ins.values.len()],
+        if_not_exists: ins.if_not_exists,
+        using_timestamp: None,
+        using_ttl: None,
     }
 }
 
@@ -321,11 +299,13 @@ fn is_maskable_scalar(t: &Term) -> bool {
 /// - each masked span, re-parsed via [`Literal::to_term`], equals the parse's
 ///   value Term at the same position — i.e. the normalizer and the real parser
 ///   agree, byte-for-byte, on every literal.
+///
+/// Returns the cacheable skeleton (bind-marker values) on success.
 pub fn verify_insert(
     query: &str,
     ins: &InsertStatement,
     normalized: &Normalized,
-) -> Option<InsertTemplate> {
+) -> Option<InsertStatement> {
     if ins.using_timestamp.is_some() || ins.using_ttl.is_some() {
         return None;
     }
@@ -349,13 +329,7 @@ pub fn verify_insert(
             _ => return None,
         }
     }
-    Some(InsertTemplate {
-        keyspace: ins.keyspace.clone(),
-        table: ins.table.clone(),
-        columns: ins.columns.clone(),
-        if_not_exists: ins.if_not_exists,
-        value_count: ins.values.len(),
-    })
+    Some(skeleton_of(ins))
 }
 
 /// Default number of distinct skeletons the transparent cache retains when
@@ -393,12 +367,50 @@ pub fn from_env() -> Option<std::sync::Arc<TransparentCache>> {
 /// What a cached skeleton resolves to.
 #[derive(Debug)]
 enum Entry {
-    /// A verified INSERT template — the fast path binds this hit's spans into it.
-    Insert(InsertTemplate),
+    /// A verified INSERT skeleton (bind-marker values), shared behind an `Arc`.
+    /// A hit clones only the `Arc` and supplies its own decoded values.
+    Insert(std::sync::Arc<InsertStatement>),
     /// This skeleton was parsed once and could not be safely templated
     /// (non-INSERT, USING clause, collection value, verification mismatch, …).
     /// Cached so we skip re-verifying it; the caller always full-parses.
     Uncacheable,
+}
+
+/// What [`TransparentCache::resolve`] hands back. A `FastInsert` lets the caller
+/// execute the INSERT through the router's BORROWED fast path with no owned
+/// `Statement` materialization; `Full` is an ordinary parsed statement (or parse
+/// error) for every non-fast path.
+pub enum Resolved {
+    /// A cache HIT on a verified INSERT: run `route_prepared_insert_fast` with
+    /// the borrowed `skeleton` (bind-marker values) and these decoded `values`.
+    FastInsert {
+        skeleton: std::sync::Arc<InsertStatement>,
+        values: Vec<Term>,
+    },
+    /// A full parsed statement (miss / uncacheable / bypass / decode fallback),
+    /// or the parse error. Semantically identical to calling the parser directly.
+    /// Boxed because `Statement` is large: keeping the two `Resolved` variants a
+    /// similar size means a hit (the small `FastInsert`) does not pay for the big
+    /// one, and the single box allocation lands only on the rarer non-hit paths.
+    Full(Box<Result<Statement, CqlError>>),
+}
+
+impl Resolved {
+    /// Materialize to an owned `Statement` — the fallback when the borrowed fast
+    /// path is unavailable (frame carries bound values, connection is mid-
+    /// transaction, or the router declines), and what tests compare. For a
+    /// `FastInsert` this binds the decoded values into a clone of the skeleton;
+    /// the result is byte-for-byte a full parse of the original query.
+    pub fn into_statement(self) -> Result<Statement, CqlError> {
+        match self {
+            Resolved::FastInsert { skeleton, values } => {
+                let mut ins = (*skeleton).clone();
+                ins.values = values;
+                Ok(Statement::Insert(ins))
+            }
+            Resolved::Full(result) => *result,
+        }
+    }
 }
 
 /// Per-call outcome of [`TransparentCache::resolve`], for metrics + tests.
@@ -460,30 +472,38 @@ impl TransparentCache {
     /// path calls `parse`, and its result is byte-for-byte what the caller would
     /// have gotten without the cache: the cache never changes semantics, only
     /// skips work on the repeated-shape hot path.
-    pub fn resolve<F>(&self, query: &str, parse: F) -> (Result<Statement, CqlError>, Outcome)
+    pub fn resolve<F>(&self, query: &str, parse: F) -> (Resolved, Outcome)
     where
         F: FnOnce(&str) -> Result<Statement, CqlError>,
     {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(norm) = normalize(query) else {
             self.bypass.fetch_add(1, Relaxed);
-            return (parse(query), Outcome::Bypass);
+            return (Resolved::Full(Box::new(parse(query))), Outcome::Bypass);
         };
         match self.cache.get(&norm.skeleton) {
             Some(entry) => match entry.as_ref() {
-                Entry::Insert(tmpl) => match bind_template(query, tmpl, &norm) {
-                    Some(stmt) => {
-                        self.hits.fetch_add(1, Relaxed);
-                        (Ok(stmt), Outcome::Hit)
+                Entry::Insert(skeleton) => {
+                    match decode_values(query, &norm, skeleton.values.len()) {
+                        Some(values) => {
+                            self.hits.fetch_add(1, Relaxed);
+                            (
+                                Resolved::FastInsert {
+                                    skeleton: skeleton.clone(),
+                                    values,
+                                },
+                                Outcome::Hit,
+                            )
+                        }
+                        // A span failed to re-lex (a malformed literal that a
+                        // full parse would also reject): fall back so the client
+                        // gets the real error, never a silently wrong bind.
+                        None => (Resolved::Full(Box::new(parse(query))), Outcome::Bypass),
                     }
-                    // A span failed to re-parse (a malformed literal that a full
-                    // parse would also reject): fall back so the client gets the
-                    // real error, never a silently wrong bind.
-                    None => (parse(query), Outcome::Bypass),
-                },
+                }
                 Entry::Uncacheable => {
                     self.uncacheable.fetch_add(1, Relaxed);
-                    (parse(query), Outcome::Uncacheable)
+                    (Resolved::Full(Box::new(parse(query))), Outcome::Uncacheable)
                 }
             },
             None => {
@@ -491,7 +511,7 @@ impl TransparentCache {
                 let parsed = parse(query);
                 if let Ok(Statement::Insert(ins)) = &parsed {
                     let entry = match verify_insert(query, ins, &norm) {
-                        Some(tmpl) => Entry::Insert(tmpl),
+                        Some(skeleton) => Entry::Insert(std::sync::Arc::new(skeleton)),
                         None => Entry::Uncacheable,
                     };
                     self.cache.insert(norm.skeleton, std::sync::Arc::new(entry));
@@ -503,7 +523,7 @@ impl TransparentCache {
                 }
                 // A parse ERROR is never cached (a later identical skeleton is
                 // still a parse error, and caching Err would be wrong).
-                (parsed, Outcome::Miss)
+                (Resolved::Full(Box::new(parsed)), Outcome::Miss)
             }
         }
     }
@@ -526,19 +546,20 @@ impl TransparentCache {
     }
 }
 
-/// Bind a hit's extracted literal spans into a verified template, producing the
-/// concrete INSERT. Returns `None` if a span fails to re-parse (caller falls
-/// back to a full parse) or the span count no longer matches the template — the
-/// latter cannot happen for a matching skeleton but is checked defensively.
-fn bind_template(query: &str, tmpl: &InsertTemplate, norm: &Normalized) -> Option<Statement> {
-    if norm.literals.len() != tmpl.value_count {
+/// Decode a hit's extracted literal spans into the ordered bind values for the
+/// cached skeleton. Returns `None` if a span fails to re-lex (caller falls back
+/// to a full parse — real error, never a wrong bind) or the span count no longer
+/// matches the skeleton's bind arity (impossible for a matching skeleton, but
+/// checked defensively).
+fn decode_values(query: &str, norm: &Normalized, expected: usize) -> Option<Vec<Term>> {
+    if norm.literals.len() != expected {
         return None;
     }
-    let mut values = Vec::with_capacity(norm.literals.len());
+    let mut values = Vec::with_capacity(expected);
     for lit in &norm.literals {
         values.push(lit.to_term(query).ok()?);
     }
-    Some(Statement::Insert(tmpl.build(values)))
+    Some(values)
 }
 
 #[cfg(test)]
@@ -703,29 +724,28 @@ mod tests {
     #[test]
     fn verify_then_build_round_trips_to_the_full_parse() {
         // The end-to-end fast-path contract: for the SAME shape with different
-        // values, template.build(bound spans) must equal a full parse.
+        // values, skeleton + decoded values must equal a full parse.
         let seed = "INSERT INTO ks.t (a, b, c) VALUES ('seed', 1, 0xAA)";
         let n_seed = norm(seed);
         let ins_seed = insert_of(seed);
-        let tmpl = verify_insert(seed, &ins_seed, &n_seed).expect("seed is cacheable");
+        let skeleton =
+            std::sync::Arc::new(verify_insert(seed, &ins_seed, &n_seed).expect("seed cacheable"));
 
-        // A sibling of the same shape — must reconstruct via the cached template.
+        // A sibling of the same shape — reconstruct via the cached skeleton.
         let sib = "INSERT INTO ks.t (a, b, c) VALUES ('machine-x', 999, 0xDEADBEEF)";
         let n_sib = norm(sib);
         assert_eq!(
             n_sib.skeleton, n_seed.skeleton,
             "same shape => same skeleton"
         );
-        let bound: Vec<Term> = n_sib
-            .literals
-            .iter()
-            .map(|l| l.to_term(sib).unwrap())
-            .collect();
-        let rebuilt = Statement::Insert(tmpl.build(bound));
+        let values = decode_values(sib, &n_sib, skeleton.values.len()).expect("decode");
+        let rebuilt = Resolved::FastInsert { skeleton, values }
+            .into_statement()
+            .unwrap();
         assert_eq!(
             rebuilt,
             crate::parser::parse(sib).expect("parse sibling"),
-            "template.build must equal a full parse of the sibling"
+            "skeleton + decoded values must equal a full parse of the sibling"
         );
     }
 
@@ -773,13 +793,16 @@ mod tests {
         // First query: MISS (parsed + cached as template).
         let (r0, o0) = cache.resolve(shape[0], crate::parser::parse);
         assert_eq!(o0, Outcome::Miss);
-        assert_eq!(r0.unwrap(), crate::parser::parse(shape[0]).unwrap());
+        assert_eq!(
+            r0.into_statement().unwrap(),
+            crate::parser::parse(shape[0]).unwrap()
+        );
         // Subsequent same-shape queries: HIT, and byte-identical to a full parse.
         for q in &shape[1..] {
             let (r, o) = cache.resolve(q, crate::parser::parse);
             assert_eq!(o, Outcome::Hit, "second+ sighting of a shape must hit");
             assert_eq!(
-                r.unwrap(),
+                r.into_statement().unwrap(),
                 crate::parser::parse(q).unwrap(),
                 "hit must equal a full parse of `{q}`"
             );
@@ -794,12 +817,18 @@ mod tests {
         let q = "SELECT a, b FROM t WHERE k = 'x' LIMIT 10";
         let (r1, o1) = cache.resolve(q, crate::parser::parse);
         assert_eq!(o1, Outcome::Miss);
-        assert_eq!(r1.unwrap(), crate::parser::parse(q).unwrap());
+        assert_eq!(
+            r1.into_statement().unwrap(),
+            crate::parser::parse(q).unwrap()
+        );
         // A different SELECT of the same shape: known-uncacheable, still correct.
         let q2 = "SELECT a, b FROM t WHERE k = 'y' LIMIT 99";
         let (r2, o2) = cache.resolve(q2, crate::parser::parse);
         assert_eq!(o2, Outcome::Uncacheable);
-        assert_eq!(r2.unwrap(), crate::parser::parse(q2).unwrap());
+        assert_eq!(
+            r2.into_statement().unwrap(),
+            crate::parser::parse(q2).unwrap()
+        );
     }
 
     #[test]
@@ -808,7 +837,10 @@ mod tests {
         let q = "INSERT INTO t (k, v) VALUES (?, ?)";
         let (r, o) = cache.resolve(q, crate::parser::parse);
         assert_eq!(o, Outcome::Bypass);
-        assert_eq!(r.unwrap(), crate::parser::parse(q).unwrap());
+        assert_eq!(
+            r.into_statement().unwrap(),
+            crate::parser::parse(q).unwrap()
+        );
         assert_eq!(cache.stats().3, 1, "one bypass counted");
     }
 
@@ -817,7 +849,7 @@ mod tests {
         let cache = TransparentCache::new(64);
         let bad = "INSERT INTO t (k) VALUES ('x'"; // unterminated ) — parse error
         let (r, _o) = cache.resolve(bad, crate::parser::parse);
-        assert!(r.is_err(), "a parse error must propagate");
+        assert!(r.into_statement().is_err(), "a parse error must propagate");
     }
 
     #[test]
@@ -833,7 +865,10 @@ mod tests {
         assert_eq!(oa, Outcome::Miss);
         let (rb, ob) = cache.resolve(b, crate::parser::parse);
         assert_eq!(ob, Outcome::Uncacheable);
-        assert_eq!(rb.unwrap(), crate::parser::parse(b).unwrap());
+        assert_eq!(
+            rb.into_statement().unwrap(),
+            crate::parser::parse(b).unwrap()
+        );
     }
 
     #[test]

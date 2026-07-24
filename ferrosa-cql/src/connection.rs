@@ -1539,20 +1539,62 @@ async fn handle_query(
         ferrosa_cluster::consistency::ConsistencyLevel::One
     };
 
-    // Parse the CQL statement. When the transparent param cache is enabled, a
-    // repeated inline-literal INSERT shape is reconstructed from a verified
-    // skeleton template instead of re-lexing+parsing; the result is byte-for-
-    // byte what `parser::parse` would return (see `param_cache`). Disabled by
-    // default => straight `parser::parse`.
-    let parsed = match &state.param_cache {
-        Some(cache) => cache.resolve(query, parser::parse).0,
-        None => parser::parse(query),
-    };
-    let mut stmt = match parsed {
-        Ok(s) => s,
-        Err(e) => {
-            return HandleResult::Reply(Opcode::Error, e.encode_body());
-        }
+    // Parse the CQL statement. Disabled by default => a straight `parser::parse`
+    // with zero cache machinery. When the transparent param cache is enabled, a
+    // repeated inline-literal INSERT shape resolves to a cached skeleton +
+    // decoded values instead of a full lex+parse (see `param_cache`); both arms
+    // produce `stmt` (or a fast-path early return) and share the flow below.
+    let mut stmt = match &state.param_cache {
+        None => match parser::parse(query) {
+            Ok(s) => s,
+            Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
+        },
+        // Cache HIT on a verified INSERT. When the frame carries no query-
+        // parameters (pure inline literals — no bound values, no paging) AND the
+        // connection is not mid-transaction, execute through the router's
+        // BORROWED fast-insert path with the decoded values — no owned Statement
+        // materialization, no clone but an Arc refcount. This is the same path a
+        // prepared EXECUTE takes. Any other case falls back to materializing the
+        // full statement and continuing the normal flow (bound-terms, txn,
+        // route) below, so semantics never change.
+        Some(cache) => match cache.resolve(query, parser::parse).0 {
+            crate::param_cache::Resolved::FastInsert { skeleton, values } => {
+                let eligible = cursor.remaining() == 0 && conn_txn.lock().await.is_none();
+                if eligible {
+                    let ctx = build_request_context(
+                        auth_context,
+                        current_keyspace,
+                        cl,
+                        peer,
+                        protocol_version,
+                        crate::paging::PagingParams::default(),
+                    );
+                    if let Some(result) =
+                        crate::router::route_prepared_insert_fast(state, &ctx, &skeleton, &values)
+                            .await
+                    {
+                        return match result {
+                            Ok(RouteResult::Result(body)) => {
+                                HandleResult::Reply(Opcode::Result, body)
+                            }
+                            Ok(_) => {
+                                HandleResult::Reply(Opcode::Result, crate::result::encode_void())
+                            }
+                            Err(e) => HandleResult::Reply(Opcode::Error, e.encode_body()),
+                        };
+                    }
+                }
+                // Fast path unavailable or the router declined (e.g. IF NOT
+                // EXISTS / LWT): materialize the full INSERT and continue below.
+                let mut ins = (*skeleton).clone();
+                ins.values = values;
+                crate::ast::Statement::Insert(ins)
+            }
+            crate::param_cache::Resolved::Full(boxed) => match *boxed {
+                Ok(s) => s,
+                Err(e) => return HandleResult::Reply(Opcode::Error, e.encode_body()),
+            },
+        },
     };
 
     // Parse the QUERY frame's <query_parameters> section: bound values AND the
