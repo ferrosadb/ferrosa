@@ -32,10 +32,12 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 pub mod fair_admit;
+pub mod io_permits;
 pub mod runqueue;
 pub mod scheduler;
 
 pub use fair_admit::Admitted;
+pub use io_permits::{IoPermit, IoPermits};
 
 // Process-wide pool metrics. Cumulative counters live here (the Prometheus
 // registry reads them); instantaneous gauges (`headroom_cores`, `active`) are
@@ -74,6 +76,20 @@ pub fn admissions_rejected_overload_total() -> u64 {
 /// overload.
 pub(crate) fn record_overload_rejection() {
     ADMISSIONS_REJECTED_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+static IO_PERMITS_ACQUIRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bulk-I/O permits ([`io_permits::IoPermits`]) acquired since process start —
+/// the throughput of the I/O resource dimension (B2). Paired with a live
+/// `in_flight` gauge once a pool is wired into the Bulk lane.
+pub fn io_permits_acquired_total() -> u64 {
+    IO_PERMITS_ACQUIRED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Called by [`io_permits::IoPermits`] when a bulk-I/O permit is granted.
+pub(crate) fn record_io_permit_acquired() {
+    IO_PERMITS_ACQUIRED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 // Chunk-budget tripwire (B1 T1.3 / FMEA FM-2). A scan chunk is the work between
@@ -180,6 +196,30 @@ pub fn render_prometheus() -> String {
         "ferrosa_sched_admissions_rejected_overload_total {}\n",
         admissions_rejected_overload_total()
     ));
+    out.push_str(
+        "# HELP ferrosa_sched_io_permits_acquired_total Bulk-I/O permits granted since start (the I/O resource dimension, B2).\n\
+         # TYPE ferrosa_sched_io_permits_acquired_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_io_permits_acquired_total {}\n",
+        io_permits_acquired_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_io_permits_capacity Max concurrent bulk-I/O permits (the Lane::Bulk reservation).\n\
+         # TYPE ferrosa_sched_io_permits_capacity gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_io_permits_capacity {}\n",
+        pool.io_permits().capacity()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sched_io_permits_in_flight Bulk-I/O permits currently held (in-flight bulk I/O).\n\
+         # TYPE ferrosa_sched_io_permits_in_flight gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sched_io_permits_in_flight {}\n",
+        pool.io_permits().in_flight()
+    ));
     out
 }
 
@@ -243,6 +283,12 @@ pub struct SchedPool {
     admit: Arc<fair_admit::FairAdmit>,
     capacity: usize,
     reservation: Reservation,
+    /// The I/O resource dimension (B2): a bounded set of bulk-I/O permits an
+    /// admitted scan holds while it produces (the `Lane::Bulk` reservation).
+    /// Sized to `capacity` by default (1:1 with CPU slots — non-constraining);
+    /// lowering it reserves I/O concurrency for the other lanes. Cloneable — it
+    /// shares one semaphore.
+    io_permits: io_permits::IoPermits,
 }
 
 /// Releases a held slot on drop — the RAII backstop so a panicking task never
@@ -269,7 +315,15 @@ impl SchedPool {
             admit: Arc::new(fair_admit::FairAdmit::new(capacity, 0, max_waiters)),
             capacity,
             reservation,
+            io_permits: io_permits::IoPermits::new(capacity),
         }
+    }
+
+    /// The bulk-I/O permit pool (the B2 I/O dimension). A scan submitted via
+    /// [`submit_scan`](Self::submit_scan) holds one permit while it produces;
+    /// bulk-I/O seams can also acquire from it directly.
+    pub fn io_permits(&self) -> &io_permits::IoPermits {
+        &self.io_permits
     }
 
     /// Maximum number of scans admitted concurrently.
@@ -389,11 +443,18 @@ impl SchedPool {
         C: Future<Output = ()> + Send + 'static,
     {
         let admit = self.admit.clone();
+        let io_permits = self.io_permits.clone();
         tokio::spawn(async move {
             let waited = Instant::now();
             match admit.admit(class, cancel).await {
                 Admitted::Slot(id) => {
                     record_admission(waited.elapsed());
+                    // B2 T2.1: hold a bulk-I/O permit for the scan's producing
+                    // life (the Lane::Bulk reservation). Acquired as a cheap
+                    // async task after the CPU slot; at the default 1:1 sizing it
+                    // is immediate, and it becomes the tighter bound when the I/O
+                    // reservation is lowered below CPU capacity.
+                    let io_permit = io_permits.acquire().await;
                     let handle = tokio::runtime::Handle::current();
                     let out = tokio::task::spawn_blocking(move || {
                         let mut slot = ScanSlot {
@@ -404,6 +465,8 @@ impl SchedPool {
                             yields: 0,
                             handle,
                             last_tick: Instant::now(),
+                            window_micros: 0,
+                            _io_permit: io_permit,
                             finished: false,
                         };
                         let out = f(&mut slot);
@@ -447,8 +510,19 @@ pub struct ScanSlot {
     yields: u64,
     handle: tokio::runtime::Handle,
     /// When the current chunk's work started (the last `tick` return). Used to
-    /// measure per-chunk work time for the FM-2 yield-point-gap tripwire.
+    /// measure per-chunk work time for the FM-2 yield-point-gap tripwire and to
+    /// accumulate [`window_micros`](Self::window_micros).
     last_tick: Instant,
+    /// Elapsed microseconds accumulated over the current budget window — the
+    /// scan's *service time* (B2 T2.2 / DD-1). Elapsed spans both CPU compute
+    /// and I/O wait (a chunk blocked on S3 still accrues wall-time here), so
+    /// charging `vruntime` by this throttles an I/O-bound scan to its fair share
+    /// even when it burns little CPU. Reset at each budget boundary.
+    window_micros: u64,
+    /// The bulk-I/O permit (B2 T2.1) this scan holds for its producing lifetime,
+    /// bounding concurrent bulk I/O on the `Lane::Bulk` reservation. Held only
+    /// for its `Drop` (returned when the scan ends, panics, or is cancelled).
+    _io_permit: io_permits::IoPermit,
     finished: bool,
 }
 
@@ -470,15 +544,25 @@ impl ScanSlot {
     /// (`load_full()` → owned `Arc`s), holding no guard; the
     /// `scan_cooperative_yield_guard` source test enforces it.
     pub fn tick(&mut self) {
-        record_chunk(self.last_tick.elapsed());
+        let elapsed = self.last_tick.elapsed();
+        record_chunk(elapsed);
+        // Accumulate the chunk's wall-time (CPU + any I/O wait) as service.
+        self.window_micros = self
+            .window_micros
+            .saturating_add(elapsed.as_micros() as u64);
         self.since_yield += 1;
         if self.since_yield >= self.chunk_budget {
             self.since_yield = 0;
             self.yields += 1;
-            // Account the budget's worth of service, then re-compete in vruntime
-            // order (may yield the slot to a more-deserving scan).
-            self.admit
-                .reschedule(&self.handle, self.id, u64::from(self.chunk_budget));
+            // B2 T2.2 / DD-1: charge `vruntime` by the window's measured elapsed
+            // time (CPU compute + I/O wait), weighted by class — so an I/O-bound
+            // scan (slow chunks blocked on S3) accrues `vruntime` and is
+            // throttled to its fair share instead of getting unlimited free
+            // turns for burning no CPU. Floor at 1 so a sub-microsecond window
+            // still advances the clock.
+            let service = self.window_micros.max(1);
+            self.window_micros = 0;
+            self.admit.reschedule(&self.handle, self.id, service);
         }
         self.last_tick = Instant::now();
     }
@@ -846,6 +930,9 @@ mod tests {
             "ferrosa_sched_tasks_admitted_total",
             "ferrosa_sched_admit_wait_micros_total",
             "ferrosa_sched_admissions_rejected_overload_total",
+            "ferrosa_sched_io_permits_acquired_total",
+            "ferrosa_sched_io_permits_capacity",
+            "ferrosa_sched_io_permits_in_flight",
         ] {
             assert!(text.contains(metric), "missing metric {metric}");
         }

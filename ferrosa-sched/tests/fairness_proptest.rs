@@ -106,3 +106,45 @@ proptest! {
         }
     }
 }
+
+/// B2 T2.2 — service-time (elapsed) accounting throttles an I/O-bound scan to
+/// its fair share. Both scans are equal-weight `Bulk`, but each of scan 0's
+/// chunks costs `IO_COST` service (elapsed *including* S3 wait) while scan 1's
+/// cost 1 (CPU-light). This is exactly what `ScanSlot::tick` now feeds
+/// `reschedule`: the window's measured elapsed µs, not a chunk count. Charging
+/// `vruntime` by service makes the two converge to equal TOTAL SERVICE — the
+/// I/O-bound scan gets proportionally FEWER turns, so it cannot hog the pool by
+/// being slow (the pre-T2.2 chunk-count accounting would have given it EQUAL
+/// turns, i.e. `IO_COST`× more wall-time).
+#[test]
+fn service_time_accounting_equalizes_io_bound_and_cpu_light_scans() {
+    const IO_COST: u64 = 50;
+    let mut q = RunQueue::new(0);
+    q.enqueue(SchedEntity::new(0, SchedClass::Bulk)); // I/O-bound
+    q.enqueue(SchedEntity::new(1, SchedClass::Bulk)); // CPU-light
+    let cost = |id: u64| if id == 0 { IO_COST } else { 1 };
+
+    let mut service = [0u64; 2];
+    let mut turns = [0u64; 2];
+    let mut cur = q.pick_next().expect("a scan to run");
+    for _ in 0..8000 {
+        let c = cost(cur.id);
+        service[cur.id as usize] += c;
+        turns[cur.id as usize] += 1;
+        cur = step(&mut q, cur, c);
+    }
+
+    // Equal weight + service accounting → total SERVICE converges within about
+    // one chunk cost, regardless of how that service splits into turns.
+    let spread = service[0].abs_diff(service[1]);
+    assert!(
+        spread <= IO_COST * 2,
+        "service not equalized: {service:?} (spread {spread})"
+    );
+    // ...and the I/O-bound scan takes far fewer turns — throttled by its elapsed
+    // cost rather than getting equal turns for burning no CPU.
+    assert!(
+        turns[1] > turns[0] * 10,
+        "the CPU-light scan should get ~IO_COST× more turns: {turns:?}"
+    );
+}
