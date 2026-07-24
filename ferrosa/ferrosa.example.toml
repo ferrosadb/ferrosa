@@ -1,9 +1,9 @@
 # Ferrosa Configuration
-# Environment variables override all settings below.
+# Config-file values override environment variables.
 # Copy to /etc/ferrosa/ferrosa.toml or specify with FERROSA_CONFIG env var.
 
 [cql]
-bind = "0.0.0.0:9042"
+bind = "127.0.0.1:9042"
 auth_disabled = false
 max_connections = 1024
 max_connections_per_ip = 64
@@ -12,7 +12,7 @@ max_connections_per_ip = 64
 # require_tls = false
 
 [internode]
-bind = "0.0.0.0:17000"
+bind = "127.0.0.1:17000"
 # broadcast = "192.168.1.1:17000"
 # seed = "192.168.1.2:17000"
 cluster_name = "ferrosa"
@@ -36,17 +36,23 @@ memtable_num_shards = 64
 # allow_http = false
 
 # ── User-facing endpoints ────────────────────────────────────────────────────
-# All standard endpoints are ON by default so a fresh install exposes the full
-# feature set. To REDUCE THE ATTACK SURFACE, explicitly disable the ones you
-# don't need by setting `enabled = false` below (absence = enabled).
-#   Always-on (no toggle): CQL 9042 · Postgres 5432 · web/observability 9090
+# All standard endpoints are ON by default and bind to localhost. To expose an
+# endpoint to a LAN or cluster, explicitly set its bind address to a non-loopback
+# value and configure authentication before doing so.
 
 [graph]
 enabled = true                    # graph HTTP (7474) + Bolt (7687); set false to disable
-bind = "0.0.0.0:7474"
+bind = "127.0.0.1:7474"
 
 [sparql]
 enabled = true                    # SPARQL 1.1 endpoint (8080); set false to disable
+bind = "127.0.0.1:8080"
 
 [web]
-bind = "0.0.0.0:9090"
+bind = "127.0.0.1:9090"
+
+[postgres]
+bind = "127.0.0.1:5432"
+
+[flight]
+bind = "127.0.0.1:8815"

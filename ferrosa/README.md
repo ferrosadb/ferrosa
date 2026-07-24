@@ -34,19 +34,20 @@ listeners are owned by their subsystem crates and merely started here.
 
 ## Listeners & ports
 
-Ports are resolved as **env var → TOML (`/etc/ferrosa/ferrosa.toml`) → default**.
-Defaults below are what ships with no config.
+Ports are resolved as **TOML (`/etc/ferrosa/ferrosa.toml`) → env var → built-in
+default**. The config file is authoritative when it sets a value. Defaults below
+apply when neither source sets the listener.
 
 | Listener | Default bind | Owning crate | Enable / config |
 |----------|--------------|--------------|-----------------|
 | Internode RPC | `0.0.0.0:17000` | `ferrosa-net` | `FERROSA_INTERNODE_BIND` / `[internode].bind` — note **17000**, not Cassandra's 7000 (BUG-001: 7000 collides with macOS ControlCenter) |
-| CQL native v5 | `0.0.0.0:9042` | `ferrosa-cql` | `FERROSA_CQL_BIND` / `[cql].bind` |
-| Postgres wire | `0.0.0.0:5432` | `ferrosa-postgres` | `FERROSA_POSTGRES_BIND` — always started; query execution is a fail-loud stub until the relational engine lands |
-| Arrow Flight (gRPC) | `0.0.0.0:8815` | `ferrosa-flight` | **`--features flight`** + `FERROSA_FLIGHT_BIND`; per-RPC signed bearer tokens |
-| Graph HTTP | `:7474` | `ferrosa-graph` | only if graph enabled (`FERROSA_GRAPH_ENABLED` / `[graph].enabled`) |
-| Bolt v5 | `0.0.0.0:7687` | `ferrosa-graph` | only if graph enabled; `FERROSA_BOLT_PORT` / `[graph].bolt_port` |
-| SPARQL HTTP | `0.0.0.0:8080` | `ferrosa-sparql` | only if `FERROSA_SPARQL_ENABLED=true`; `FERROSA_SPARQL_BIND` |
-| Web console + `/metrics` | `0.0.0.0:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` |
+| CQL native v5 | `127.0.0.1:9042` | `ferrosa-cql` | `FERROSA_CQL_BIND` / `[cql].bind` |
+| Postgres wire | `127.0.0.1:5432` | `ferrosa-postgres` | `FERROSA_POSTGRES_BIND` / `[postgres].bind` — always started; query execution is a fail-loud stub until the relational engine lands |
+| Arrow Flight (gRPC) | `127.0.0.1:8815` | `ferrosa-flight` | **`--features flight`** + `FERROSA_FLIGHT_BIND` / `[flight].bind`; per-RPC signed bearer tokens |
+| Graph HTTP | `127.0.0.1:7474` | `ferrosa-graph` | only if graph enabled; `FERROSA_GRAPH_BIND` / `[graph].bind` |
+| Bolt v5 | `127.0.0.1:7687` | `ferrosa-graph` | only if graph enabled; `FERROSA_BOLT_PORT` / `[graph].bolt_port`; uses the host resolved for Graph HTTP |
+| SPARQL HTTP | `127.0.0.1:8080` | `ferrosa-sparql` | enabled by default; `FERROSA_SPARQL_BIND` / `[sparql].bind` |
+| Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind` |
 
 ## Startup order (`main`)
 
@@ -56,7 +57,7 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 [specs/data-flow.md](specs/data-flow.md) for the full diagram.
 
 1. **Tracing** — non-blocking writer (`tracing-appender`); optional OTel layer when `FERROSA_TELEMETRY_ENABLED=true` (`--features otel`).
-2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); env always wins over file.
+2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); file values win over environment values, which win over built-in defaults.
 3. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
 4. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; probe S3 CAS; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables; replay pending S3 uploads.
 5. **Schema** — `Schema::new` (composes audit sinks); seed default roles if auth enabled; restore schema from local `schema.json` → S3 bootstrap → fresh; re-register secondary indexes, UDTs, UDFs, role permissions from `system_schema.*`; replay pending commit-log mutations.
@@ -107,7 +108,7 @@ flat under tight cgroups; override with `MALLOC_CONF`).
 | `FERROSA_CONFIG` | TOML config path (default `/etc/ferrosa/ferrosa.toml`) |
 | `FERROSA_DATA_DIR` | data directory (default `/var/lib/ferrosa`) — holds `host_id`, `schema.json`, commit log, hints |
 | `FERROSA_HOST_ID` | authoritative host-id override (wins over disk) |
-| `FERROSA_AUTH_ENABLED` | single source of truth for CQL role auth (TOML `[cql].auth_enabled` as fallback) |
+| `FERROSA_AUTH_ENABLED` | single source of truth for CQL role auth; `[cql].auth_enabled` is authoritative when configured |
 | `FERROSA_AUTH_DISABLED` | **deprecated** direct override — honored with a warning |
 | `FERROSA_SEED` | comma-separated seed peers (`host:port`, DNS-resolved) |
 | `FERROSA_GRAPH_ENABLED` / `FERROSA_SPARQL_ENABLED` | enable graph (HTTP+Bolt) / SPARQL front-ends |
@@ -133,7 +134,7 @@ See `ferrosa.example.toml` for the file form (`[cql] [internode] [storage] [s3]
 
 ~265 in-crate tests (`src/main.rs` + `web/*` + `cql_broadcast.rs` +
 `repair_wiring.rs`). They cover the *pure* composition helpers — config
-precedence (env → TOML → default), `host_id` classification, internode/graph/auth
+precedence (TOML → env → default), `host_id` classification, internode/graph/auth
 TOML resolution, hinted-handoff dir resolution, schema local persist/load, web
 config and auth bypass. The end-to-end boot path itself is exercised by the
 cluster/integration suites, not from here. One in-code `TODO` remains

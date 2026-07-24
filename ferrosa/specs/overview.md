@@ -72,7 +72,7 @@ replication uniform.
 2. **Single CdcBus, attached pre-listener.** The change bus is attached to the
    commit log in step 4, before any front-end binds, so no early write is missed
    by `SUBSCRIBE`/Flight consumers.
-3. **Config precedence is env → TOML → default, everywhere.** All resolvers
+3. **Config precedence is TOML → env → default, everywhere.** All resolvers
    (`config_val`, `apply_internode_toml_overrides`, `resolve_graph_enabled`,
    `resolve_auth_enabled_toml`) honor this order; BUG-006 was TOML being ignored
    for internode/graph/auth.
@@ -86,12 +86,18 @@ replication uniform.
 
 ## Configuration resolution
 
-`config_val` / `config_val_opt` implement the env→TOML→default ladder and are
+`config_val` / `config_val_opt` implement the TOML→env→default ladder and are
 the most-tested code here. `host_id` resolution is a pure state machine
 (`classify_host_id_state` → `HostIdResolution`) so a corrupt/empty/missing id
 file produces an actionable log line instead of a silent identity change
 (BUG-008). Internode, graph-enabled, and auth-enabled each have a dedicated
 TOML-aware resolver (BUG-006).
+
+The binary resolves `[web].bind` and `[graph].bind` through that same ladder.
+Their built-in defaults are loopback-only (`127.0.0.1:9090` and
+`127.0.0.1:7474`). Bolt derives its host from the resolved graph HTTP bind and
+uses `[graph].bolt_port` / `FERROSA_BOLT_PORT` for its port, defaulting to
+`127.0.0.1:7687` when neither source is configured.
 
 ## Lifecycle
 

@@ -81,6 +81,17 @@ bolt_port = 7687                  # Bolt v5 (Neo4j drivers)
 # ---------------------------------------------------------------------------
 [sparql]
 enabled = true                    # SPARQL HTTP endpoint (8080)
+bind = "127.0.0.1:8080"
+
+# ---------------------------------------------------------------------------
+# Postgres wire protocol and Arrow Flight are always local by default.
+# Set a non-loopback bind explicitly only for a deliberate remote deployment.
+# ---------------------------------------------------------------------------
+[postgres]
+bind = "127.0.0.1:5432"
+
+[flight]
+bind = "127.0.0.1:8815"
 
 # ---------------------------------------------------------------------------
 # Web admin console — also serves Prometheus metrics at /metrics.

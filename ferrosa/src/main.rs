@@ -111,6 +111,14 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .or_else(|| std::env::var(env_key).ok())
 }
 
+const DEFAULT_WEB_BIND: &str = "127.0.0.1:9090";
+const DEFAULT_CQL_BIND: &str = "127.0.0.1:9042";
+const DEFAULT_GRAPH_HTTP_BIND: &str = "127.0.0.1:7474";
+const DEFAULT_GRAPH_BOLT_PORT: &str = "7687";
+const DEFAULT_SPARQL_BIND: &str = "127.0.0.1:8080";
+const DEFAULT_FLIGHT_BIND: &str = "127.0.0.1:8815";
+const DEFAULT_POSTGRES_BIND: &str = "127.0.0.1:5432";
+
 /// Parse a `SocketAddr` from a resolved config string, failing **loud and
 /// clean** on a malformed value.
 ///
@@ -133,6 +141,121 @@ fn parse_bind_addr(label: &str, env_key: &str, value: &str) -> std::net::SocketA
             std::process::exit(1);
         }
     }
+}
+
+/// Parse a listener port from a resolved config value, failing loudly rather
+/// than silently replacing an operator-provided value with the default.
+fn parse_listener_port(label: &str, env_key: &str, value: &str) -> u16 {
+    match value.parse() {
+        Ok(port) => port,
+        Err(e) => {
+            eprintln!(
+                "FATAL: invalid {label} port {value:?}: {e}\n\
+                 Fix the config-file value or the {env_key} environment variable \
+                 (expected an integer from 0 through 65535)."
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn resolve_web_config(file_config: &toml::Value) -> web::WebConfig {
+    let web_bind = config_val(
+        "FERROSA_WEB_BIND",
+        file_config,
+        "web",
+        "bind",
+        DEFAULT_WEB_BIND,
+    );
+    web::WebConfig {
+        bind_addr: parse_bind_addr("web console", "FERROSA_WEB_BIND", &web_bind),
+    }
+}
+
+fn resolve_graph_http_config(file_config: &toml::Value) -> ferrosa_graph::http::GraphHttpConfig {
+    let graph_bind = config_val(
+        "FERROSA_GRAPH_BIND",
+        file_config,
+        "graph",
+        "bind",
+        DEFAULT_GRAPH_HTTP_BIND,
+    );
+    ferrosa_graph::http::GraphHttpConfig {
+        require_tls: false,
+        bind_addr: parse_bind_addr("graph HTTP", "FERROSA_GRAPH_BIND", &graph_bind),
+        ..ferrosa_graph::http::GraphHttpConfig::default()
+    }
+}
+
+fn resolve_graph_bolt_config(
+    file_config: &toml::Value,
+    graph_http_bind: std::net::SocketAddr,
+    auth_disabled: bool,
+) -> ferrosa_graph::bolt::server::BoltConfig {
+    let bolt_port = parse_listener_port(
+        "Bolt",
+        "FERROSA_BOLT_PORT",
+        &config_val(
+            "FERROSA_BOLT_PORT",
+            file_config,
+            "graph",
+            "bolt_port",
+            DEFAULT_GRAPH_BOLT_PORT,
+        ),
+    );
+    let bind_addr = std::net::SocketAddr::new(graph_http_bind.ip(), bolt_port);
+
+    ferrosa_graph::bolt::server::BoltConfig {
+        bind_addr,
+        auth_disabled,
+        ..ferrosa_graph::bolt::server::BoltConfig::default()
+    }
+}
+
+/// Resolve the SPARQL listener with the same explicit opt-in remote exposure
+/// contract as the other HTTP front-ends.
+fn resolve_sparql_bind(file_config: &toml::Value) -> std::net::SocketAddr {
+    let sparql_bind = config_val(
+        "FERROSA_SPARQL_BIND",
+        file_config,
+        "sparql",
+        "bind",
+        DEFAULT_SPARQL_BIND,
+    );
+    parse_bind_addr("SPARQL", "FERROSA_SPARQL_BIND", &sparql_bind)
+}
+
+fn resolve_cql_bind(file_config: &toml::Value) -> std::net::SocketAddr {
+    let cql_bind = config_val(
+        "FERROSA_CQL_BIND",
+        file_config,
+        "cql",
+        "bind",
+        DEFAULT_CQL_BIND,
+    );
+    parse_bind_addr("CQL", "FERROSA_CQL_BIND", &cql_bind)
+}
+
+fn resolve_flight_bind(file_config: &toml::Value) -> std::net::SocketAddr {
+    let flight_bind = config_val(
+        "FERROSA_FLIGHT_BIND",
+        file_config,
+        "flight",
+        "bind",
+        DEFAULT_FLIGHT_BIND,
+    );
+    parse_bind_addr("Arrow Flight", "FERROSA_FLIGHT_BIND", &flight_bind)
+}
+
+fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
+    let postgres_bind = config_val(
+        "FERROSA_POSTGRES_BIND",
+        file_config,
+        "postgres",
+        "bind",
+        DEFAULT_POSTGRES_BIND,
+    );
+    parse_bind_addr("Postgres", "FERROSA_POSTGRES_BIND", &postgres_bind)
 }
 
 /// Apply TOML `[internode]` overrides to a `NetConfig`.
@@ -1362,14 +1485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ferrosa_cql::paging::init_paging_hmac_key(net_config.psk.as_deref(), &net_config.cluster_name);
 
     // 8. Start CQL server
-    let cql_bind: std::net::SocketAddr = config_val(
-        "FERROSA_CQL_BIND",
-        &file_config,
-        "cql",
-        "bind",
-        "0.0.0.0:9042",
-    )
-    .parse()?;
+    let cql_bind = resolve_cql_bind(&file_config);
     // Deprecated direct override: prefer driving auth from FERROSA_AUTH_ENABLED.
     // Set to None when neither env nor file specifies; resolver below
     // defaults to `!storage_auth_enabled` in that case.
@@ -1703,56 +1819,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // anonymous-safe because every read RPC requires a verified token.
     #[cfg(feature = "flight")]
     {
-        let flight_bind =
-            std::env::var("FERROSA_FLIGHT_BIND").unwrap_or_else(|_| "0.0.0.0:8815".to_string());
-        match flight_bind.parse::<std::net::SocketAddr>() {
-            Ok(flight_addr) => {
-                let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
-                    Ok(k) if !k.is_empty() => k.into_bytes(),
-                    _ => {
-                        tracing::warn!(
-                            "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
+        let flight_addr = resolve_flight_bind(&file_config);
+        {
+            let signing_key = match std::env::var("FERROSA_FLIGHT_SIGNING_KEY") {
+                Ok(k) if !k.is_empty() => k.into_bytes(),
+                _ => {
+                    tracing::warn!(
+                        "FERROSA_FLIGHT_SIGNING_KEY unset — using an ephemeral Flight token \
                              key; bearer tokens will not survive a restart or work across nodes. \
                              Set FERROSA_FLIGHT_SIGNING_KEY for stable auth."
-                        );
-                        uuid::Uuid::new_v4().into_bytes().to_vec()
-                    }
-                };
-                let previous_keys: Vec<Vec<u8>> =
-                    std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
-                        .ok()
-                        .into_iter()
-                        .flat_map(|v| {
-                            v.split(',')
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.as_bytes().to_vec())
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
-                let token_ttl_secs: u64 = std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(3600);
-                let mut service =
-                    ferrosa_flight::service::FerrosaFlight::new(flight_state, signing_key)
-                        .with_token_ttl(token_ttl_secs);
-                if !previous_keys.is_empty() {
-                    service = service.with_previous_keys(previous_keys);
+                    );
+                    uuid::Uuid::new_v4().into_bytes().to_vec()
                 }
-                runtimes.background.spawn(async move {
-                    if let Err(e) =
-                        ferrosa_flight::server::serve_service(flight_addr, service).await
-                    {
-                        tracing::error!(error = %e, "Arrow Flight server exited");
-                    }
-                });
-                tracing::info!(%flight_addr, "Arrow Flight server listening");
+            };
+            let previous_keys: Vec<Vec<u8>> = std::env::var("FERROSA_FLIGHT_SIGNING_KEY_PREVIOUS")
+                .ok()
+                .into_iter()
+                .flat_map(|v| {
+                    v.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.as_bytes().to_vec())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let token_ttl_secs: u64 = std::env::var("FERROSA_FLIGHT_TOKEN_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600);
+            let mut service =
+                ferrosa_flight::service::FerrosaFlight::new(flight_state, signing_key)
+                    .with_token_ttl(token_ttl_secs);
+            if !previous_keys.is_empty() {
+                service = service.with_previous_keys(previous_keys);
             }
-            Err(e) => tracing::error!(
-                bind = %flight_bind,
-                error = %e,
-                "invalid FERROSA_FLIGHT_BIND — Flight server not started"
-            ),
+            runtimes.background.spawn(async move {
+                if let Err(e) = ferrosa_flight::server::serve_service(flight_addr, service).await {
+                    tracing::error!(error = %e, "Arrow Flight server exited");
+                }
+            });
+            tracing::info!(%flight_addr, "Arrow Flight server listening");
         }
     }
 
@@ -1766,21 +1871,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
     };
-    // Web console bind: `[web] bind` in the config file wins over
-    // `FERROSA_WEB_BIND`, then the default. Previously this read only the env
-    // var and defaulted to 0.0.0.0:9090 — so every co-located node collided on
-    // 9090, the second binder hit EADDRINUSE, and the resulting `?` return
-    // masked the real error via the runtime-drop panic (issue #172).
-    let web_bind = config_val(
-        "FERROSA_WEB_BIND",
-        &file_config,
-        "web",
-        "bind",
-        "0.0.0.0:9090",
-    );
-    let web_config = web::WebConfig {
-        bind_addr: parse_bind_addr("web console", "FERROSA_WEB_BIND", &web_bind),
-    };
+    // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
+    // default. The resolved address is the one passed to the listener.
+    let web_config = resolve_web_config(&file_config);
+    tracing::info!(bind_addr = %web_config.bind_addr, "web console bind configured");
     let web_addr = web::start_web_server(&web_config, web_state).await?;
     tracing::info!(%web_addr, "web console listening");
 
@@ -1882,29 +1976,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_cluster::AutoRepairScheduler::spawn(scheduler, shutdown_rx.clone());
     }
 
-    // Graph HTTP bind: `[graph] bind` in the config file wins over
-    // `FERROSA_GRAPH_BIND`, then the default. Previously this was hardcoded to
-    // the 7474 default, so co-located nodes collided (the second binder logged
-    // "graph HTTP server failed … Address already in use" and served no graph
-    // endpoint) — the same class of bug as the web-console 9090 collision, just
-    // non-fatal because the listener runs in a background task.
-    let graph_bind = config_val(
-        "FERROSA_GRAPH_BIND",
-        &file_config,
-        "graph",
-        "bind",
-        "0.0.0.0:7474",
-    );
-    let graph_bind_addr = parse_bind_addr("graph HTTP", "FERROSA_GRAPH_BIND", &graph_bind);
+    // `[graph] bind` is authoritative over FERROSA_GRAPH_BIND, then the
+    // loopback default. Bolt shares its host and resolves its port separately.
+    let graph_http_config = resolve_graph_http_config(&file_config);
 
     if graph_enabled {
         let graph_config = ferrosa_graph::engine::GraphConfig {
             enabled: true,
-            http: ferrosa_graph::http::GraphHttpConfig {
-                require_tls: false,
-                bind_addr: graph_bind_addr,
-                ..ferrosa_graph::http::GraphHttpConfig::default()
-            },
+            http: graph_http_config.clone(),
             ..ferrosa_graph::engine::GraphConfig::default()
         };
 
@@ -1945,22 +2024,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // 10b. Bolt server (port 7687)
-        let bolt_port: u16 = config_val(
-            "FERROSA_BOLT_PORT",
-            &file_config,
-            "graph",
-            "bolt_port",
-            "7687",
-        )
-        .parse()
-        .unwrap_or(7687);
-        let bolt_bind: std::net::SocketAddr = std::net::SocketAddr::from(([0, 0, 0, 0], bolt_port));
-        let bolt_config = ferrosa_graph::bolt::server::BoltConfig {
-            bind_addr: bolt_bind,
-            auth_disabled,
-            ..ferrosa_graph::bolt::server::BoltConfig::default()
-        };
+        // 10b. Bolt server — `[graph] bolt_port` uses the same configured host
+        // as graph HTTP, so one explicit graph bind controls both listeners.
+        let bolt_config =
+            resolve_graph_bolt_config(&file_config, graph_config.http.bind_addr, auth_disabled);
+        tracing::info!(
+            graph_http_bind = %graph_config.http.bind_addr,
+            bolt_bind = %bolt_config.bind_addr,
+            "graph listener binds configured"
+        );
+        let bolt_bind = bolt_config.bind_addr;
         let bolt_engine = graph_engine;
         let bolt_schema = schema.clone();
         let bolt_shutdown = shutdown_rx.clone();
@@ -1983,14 +2056,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a misleading missing-table error), serve a thin endpoint that returns
         // a clear "graph engine disabled" error + remediation on every request.
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
-        let disabled_http_config = ferrosa_graph::http::GraphHttpConfig {
-            require_tls: false,
-            bind_addr: graph_bind_addr,
-            ..ferrosa_graph::http::GraphHttpConfig::default()
-        };
         runtimes.background.spawn(async move {
-            if let Err(e) =
-                ferrosa_graph::http::start_graph_disabled_http(&disabled_http_config).await
+            if let Err(e) = ferrosa_graph::http::start_graph_disabled_http(&graph_http_config).await
             {
                 tracing::error!(%e, "graph disabled-engine HTTP stub failed");
             }
@@ -2001,16 +2068,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sparql_enabled = resolve_sparql_enabled(&file_config, |k| std::env::var(k).ok());
 
     if sparql_enabled {
-        // `[sparql] bind` in the config file wins over `FERROSA_SPARQL_BIND`.
-        let sparql_bind_str = config_val(
-            "FERROSA_SPARQL_BIND",
-            &file_config,
-            "sparql",
-            "bind",
-            "0.0.0.0:8080",
-        );
-        let sparql_bind: std::net::SocketAddr =
-            parse_bind_addr("SPARQL", "FERROSA_SPARQL_BIND", &sparql_bind_str);
+        let sparql_bind = resolve_sparql_bind(&file_config);
 
         let sparql_write_path = std::sync::Arc::new(
             ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
@@ -2049,16 +2107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the other front-ends. Query execution is a fail-loud stub until the
     // relational engine (ferrosa-sql) is wired in (M1).
     {
-        // `[postgres] bind` in the config file wins over `FERROSA_POSTGRES_BIND`.
-        let pg_bind_str = config_val(
-            "FERROSA_POSTGRES_BIND",
-            &file_config,
-            "postgres",
-            "bind",
-            "0.0.0.0:5432",
-        );
-        let pg_bind: std::net::SocketAddr =
-            parse_bind_addr("Postgres", "FERROSA_POSTGRES_BIND", &pg_bind_str);
+        let pg_bind = resolve_postgres_bind(&file_config);
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
@@ -3269,22 +3318,20 @@ mod tests {
         assert!(config.is_table(), "empty TOML file must parse as a table");
     }
 
-    /// BT-005e: WebConfig::default() — the bind address defaults to 0.0.0.0:9090.
+    /// BT-005e: WebConfig::default() is loopback-only by default.
     /// Uses Default impl directly to avoid env var race conditions in parallel tests.
     #[test]
     fn bt005_web_config_default_bind() {
         let wc = crate::web::WebConfig::default();
         assert_eq!(
             wc.bind_addr.to_string(),
-            "0.0.0.0:9090",
-            "default web bind must be 0.0.0.0:9090"
+            "127.0.0.1:9090",
+            "default web bind must be loopback-only"
         );
     }
 
-    /// BT-005f: the web-console bind resolves via `config_val` — `[web] bind`
-    /// in the config file wins over `FERROSA_WEB_BIND`, which wins over the
-    /// default. (Regression: the old path read only the env var and defaulted
-    /// to 0.0.0.0:9090, so co-located nodes collided on 9090.)
+    /// `[web] bind` in the config file wins over `FERROSA_WEB_BIND`, which
+    /// wins over the loopback default.
     #[test]
     #[serial_test::serial(env)]
     fn bt005_web_bind_resolves_toml_over_env() {
@@ -3292,38 +3339,161 @@ mod tests {
 
         // Default when neither source sets it.
         assert_eq!(
-            config_val(
-                "FERROSA_WEB_BIND",
-                &empty_config(),
-                "web",
-                "bind",
-                "0.0.0.0:9090"
-            ),
-            "0.0.0.0:9090"
+            resolve_web_config(&empty_config()).bind_addr.to_string(),
+            DEFAULT_WEB_BIND
         );
 
         // Env var is the fallback when the config file is silent.
         std::env::set_var("FERROSA_WEB_BIND", "127.0.0.1:8080");
         assert_eq!(
-            config_val(
-                "FERROSA_WEB_BIND",
-                &empty_config(),
-                "web",
-                "bind",
-                "0.0.0.0:9090"
-            ),
+            resolve_web_config(&empty_config()).bind_addr.to_string(),
             "127.0.0.1:8080"
         );
 
         // Config file wins over the env var.
         let cfg: toml::Value = toml::from_str("[web]\nbind = \"127.0.0.1:19091\"\n").unwrap();
         assert_eq!(
-            config_val("FERROSA_WEB_BIND", &cfg, "web", "bind", "0.0.0.0:9090"),
+            resolve_web_config(&cfg).bind_addr.to_string(),
             "127.0.0.1:19091",
             "config file [web] bind must win over FERROSA_WEB_BIND"
         );
 
         std::env::remove_var("FERROSA_WEB_BIND");
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn graph_listener_binds_resolve_toml_over_env() {
+        std::env::remove_var("FERROSA_GRAPH_BIND");
+        std::env::remove_var("FERROSA_BOLT_PORT");
+
+        let default_http = resolve_graph_http_config(&empty_config());
+        let default_bolt =
+            resolve_graph_bolt_config(&empty_config(), default_http.bind_addr, false);
+        assert_eq!(default_http.bind_addr.to_string(), DEFAULT_GRAPH_HTTP_BIND);
+        assert_eq!(default_bolt.bind_addr.to_string(), "127.0.0.1:7687");
+
+        std::env::set_var("FERROSA_GRAPH_BIND", "127.0.0.1:17474");
+        std::env::set_var("FERROSA_BOLT_PORT", "17687");
+        let env_http = resolve_graph_http_config(&empty_config());
+        let env_bolt = resolve_graph_bolt_config(&empty_config(), env_http.bind_addr, false);
+        assert_eq!(env_http.bind_addr.to_string(), "127.0.0.1:17474");
+        assert_eq!(env_bolt.bind_addr.to_string(), "127.0.0.1:17687");
+
+        let config: toml::Value = toml::from_str(
+            r#"
+            [graph]
+            bind = "127.0.0.1:27474"
+            bolt_port = 27687
+            "#,
+        )
+        .unwrap();
+        let toml_http = resolve_graph_http_config(&config);
+        let toml_bolt = resolve_graph_bolt_config(&config, toml_http.bind_addr, false);
+        assert_eq!(toml_http.bind_addr.to_string(), "127.0.0.1:27474");
+        assert_eq!(toml_bolt.bind_addr.to_string(), "127.0.0.1:27687");
+
+        std::env::remove_var("FERROSA_GRAPH_BIND");
+        std::env::remove_var("FERROSA_BOLT_PORT");
+    }
+
+    /// SPARQL stays private by default; an explicit config entry remains the
+    /// supported way to expose it beyond loopback.
+    #[test]
+    #[serial_test::serial(env)]
+    fn sparql_bind_resolves_toml_over_env() {
+        std::env::remove_var("FERROSA_SPARQL_BIND");
+        assert_eq!(
+            resolve_sparql_bind(&empty_config()).to_string(),
+            DEFAULT_SPARQL_BIND
+        );
+
+        std::env::set_var("FERROSA_SPARQL_BIND", "127.0.0.1:18080");
+        assert_eq!(
+            resolve_sparql_bind(&empty_config()).to_string(),
+            "127.0.0.1:18080"
+        );
+
+        let config: toml::Value = toml::from_str(
+            r#"
+            [sparql]
+            bind = "0.0.0.0:28080"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_sparql_bind(&config).to_string(),
+            "0.0.0.0:28080",
+            "config file [sparql] bind must win over FERROSA_SPARQL_BIND"
+        );
+
+        std::env::remove_var("FERROSA_SPARQL_BIND");
+    }
+
+    /// A local install must not expose database/query listeners unless the
+    /// operator deliberately configures a non-loopback address.
+    #[test]
+    #[serial_test::serial(env)]
+    fn core_listener_binds_resolve_toml_over_env() {
+        for key in [
+            "FERROSA_CQL_BIND",
+            "FERROSA_FLIGHT_BIND",
+            "FERROSA_POSTGRES_BIND",
+        ] {
+            std::env::remove_var(key);
+        }
+
+        assert_eq!(
+            resolve_cql_bind(&empty_config()).to_string(),
+            DEFAULT_CQL_BIND
+        );
+        assert_eq!(
+            resolve_flight_bind(&empty_config()).to_string(),
+            DEFAULT_FLIGHT_BIND
+        );
+        assert_eq!(
+            resolve_postgres_bind(&empty_config()).to_string(),
+            DEFAULT_POSTGRES_BIND
+        );
+
+        std::env::set_var("FERROSA_CQL_BIND", "127.0.0.1:19042");
+        std::env::set_var("FERROSA_FLIGHT_BIND", "127.0.0.1:18815");
+        std::env::set_var("FERROSA_POSTGRES_BIND", "127.0.0.1:15432");
+        assert_eq!(
+            resolve_cql_bind(&empty_config()).to_string(),
+            "127.0.0.1:19042"
+        );
+        assert_eq!(
+            resolve_flight_bind(&empty_config()).to_string(),
+            "127.0.0.1:18815"
+        );
+        assert_eq!(
+            resolve_postgres_bind(&empty_config()).to_string(),
+            "127.0.0.1:15432"
+        );
+
+        let config: toml::Value = toml::from_str(
+            r#"
+            [cql]
+            bind = "0.0.0.0:29042"
+            [flight]
+            bind = "0.0.0.0:28815"
+            [postgres]
+            bind = "0.0.0.0:25432"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(resolve_cql_bind(&config).to_string(), "0.0.0.0:29042");
+        assert_eq!(resolve_flight_bind(&config).to_string(), "0.0.0.0:28815");
+        assert_eq!(resolve_postgres_bind(&config).to_string(), "0.0.0.0:25432");
+
+        for key in [
+            "FERROSA_CQL_BIND",
+            "FERROSA_FLIGHT_BIND",
+            "FERROSA_POSTGRES_BIND",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     /// BT-005h: an env var set to the empty string is treated as a set value

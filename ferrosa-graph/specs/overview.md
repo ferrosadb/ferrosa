@@ -8,7 +8,8 @@ executive_summary: >
   CQL tables tagged graph.type=vertex|edge, and keeps a per-keyspace adjacency
   index (system_graph_<ks>.adjacency) consistent with the edge tables via a
   synchronous WriteObserver, with a background reconciler as the fallback. Served
-  over HTTP/JSON (7474) and Bolt v5 (7687).
+  over HTTP/JSON (7474) and Bolt v5 (7687). Its transport config defaults to
+  loopback-only binds; the ferrosa binary owns TOML/environment precedence.
 ---
 
 # ferrosa-graph — Architecture Overview
@@ -28,6 +29,15 @@ contract, and the two graph transports. It does **not** own storage durability,
 replication, consensus, or the CQL value codec — it delegates all reads and
 writes to `ferrosa-cluster`'s `WritePath` and the `ferrosa-storage`
 `StorageEngine`, and all DDL to the same `DdlPath` regular CQL uses.
+
+## Transport configuration
+
+`GraphHttpConfig` defaults to `127.0.0.1:7474` and `BoltConfig` defaults to
+`127.0.0.1:7687`. The `ferrosa` composition root resolves `[graph].bind` and
+`[graph].bolt_port`: TOML takes precedence over the matching environment
+variables, then the loopback defaults. It passes the resolved HTTP config to
+this crate and constructs Bolt with the resolved Graph HTTP host plus the
+resolved Bolt port.
 
 ## Module map
 
