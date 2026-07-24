@@ -30,6 +30,9 @@
 //! hit rate, never a wrong bind. A skeleton whose masked literals do not match
 //! the real parse's literal Terms is marked uncacheable and always full-parsed.
 
+use crate::ast::{InsertStatement, Term};
+use crate::error::CqlError;
+
 /// The kind of a masked scalar literal — enough to reconstruct its typed value
 /// on a cache hit without re-lexing the whole statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,21 @@ pub struct Literal {
     pub start: usize,
     pub end: usize,
     pub kind: LiteralKind,
+}
+
+impl Literal {
+    /// The masked literal's source text, `query[start..end]`.
+    pub fn text<'a>(&self, query: &'a str) -> &'a str {
+        &query[self.start..self.end]
+    }
+
+    /// Reconstruct this literal's typed [`Term`] on the cache-hit path, reusing
+    /// the parser's single-term logic (see [`crate::parser::parse_term`]) so the
+    /// bound value is byte-for-byte what a full parse of the original query would
+    /// have produced. No duplicated unescape/hex/UUID logic lives here.
+    pub fn to_term(&self, query: &str) -> Result<Term, CqlError> {
+        crate::parser::parse_term(self.text(query))
+    }
 }
 
 /// A normalized query: the skeleton (literals replaced by `?`) plus the ordered
@@ -211,6 +229,100 @@ fn scan_quoted_ident(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// A verified, cacheable INSERT template: the structural skeleton of an INSERT
+/// (everything except its masked scalar values), from which any sibling INSERT
+/// sharing the same normalized skeleton is reconstructed by binding that
+/// sibling's extracted literal spans in order.
+///
+/// Built ONLY by [`verify_insert`], which proves — against a real parse — that
+/// the normalizer masked exactly this INSERT's value Terms. It therefore holds
+/// no values of its own; each cache hit supplies its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertTemplate {
+    keyspace: Option<String>,
+    table: String,
+    columns: Vec<String>,
+    if_not_exists: bool,
+}
+
+impl InsertTemplate {
+    /// Reconstruct a concrete INSERT by binding `values` (this hit's extracted
+    /// literals, converted via [`Literal::to_term`]) into the template. The
+    /// caller guarantees `values.len()` equals the template's masked-value count
+    /// (the skeleton fixes it), so the result is structurally identical to a
+    /// full parse of the original query, differing only in the bound values.
+    pub fn build(&self, values: Vec<Term>) -> InsertStatement {
+        InsertStatement {
+            keyspace: self.keyspace.clone(),
+            table: self.table.clone(),
+            columns: self.columns.clone(),
+            values,
+            if_not_exists: self.if_not_exists,
+            using_timestamp: None,
+            using_ttl: None,
+        }
+    }
+}
+
+/// True for the scalar literal Terms this cache masks and can reconstruct from a
+/// span. Deliberately narrow for slice 1: `bool`/`null` are keyword-literals the
+/// normalizer leaves in the skeleton (so they never appear as masked spans), and
+/// collections/functions/bind-markers/durations are rejected outright — an
+/// INSERT containing any of them is never templated and always full-parsed.
+fn is_maskable_scalar(t: &Term) -> bool {
+    matches!(
+        t,
+        Term::StringLiteral(_)
+            | Term::IntegerLiteral(_)
+            | Term::FloatLiteral(_)
+            | Term::UuidLiteral(_)
+            | Term::BlobLiteral(_)
+    )
+}
+
+/// Verify a parsed INSERT against its normalization and, if the fast path can
+/// provably reconstruct its siblings, return a cacheable [`InsertTemplate`].
+///
+/// This is the safety spine: a skeleton is trusted for fast-path binding ONLY
+/// after this returns `Some` for the first (cache-miss) query that produced it.
+/// It returns `None` (→ never cache, always full-parse) unless ALL hold:
+/// - no `USING TIMESTAMP`/`USING TTL` (their literal would be masked but is not
+///   in `values`, so it cannot be reconstructed by position);
+/// - every value is a maskable scalar literal (so masked-count == value-count);
+/// - the masked-span count equals the value count; and
+/// - each masked span, re-parsed via [`Literal::to_term`], equals the parse's
+///   value Term at the same position — i.e. the normalizer and the real parser
+///   agree, byte-for-byte, on every literal.
+pub fn verify_insert(
+    query: &str,
+    ins: &InsertStatement,
+    normalized: &Normalized,
+) -> Option<InsertTemplate> {
+    if ins.using_timestamp.is_some() || ins.using_ttl.is_some() {
+        return None;
+    }
+    if ins.values.len() != normalized.literals.len() {
+        return None;
+    }
+    for (lit, value) in normalized.literals.iter().zip(ins.values.iter()) {
+        if !is_maskable_scalar(value) {
+            return None;
+        }
+        // The airtight check: the normalizer's span and the parser's Term must
+        // be the same value. Runs once per skeleton (miss path); never on hits.
+        match lit.to_term(query) {
+            Ok(reparsed) if &reparsed == value => {}
+            _ => return None,
+        }
+    }
+    Some(InsertTemplate {
+        keyspace: ins.keyspace.clone(),
+        table: ins.table.clone(),
+        columns: ins.columns.clone(),
+        if_not_exists: ins.if_not_exists,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +440,107 @@ mod tests {
             "x".repeat(MAX_NORMALIZE_LEN)
         );
         assert_eq!(normalize(&big), None);
+    }
+
+    /// Safety spine: for a set of INSERTs, each masked span converted via
+    /// `to_term` must equal, in order, the value Terms a full parse produced.
+    /// This is what lets the cache-hit path bind extracted spans and get a
+    /// value identical to full parsing — with no duplicated literal logic.
+    #[test]
+    fn extracted_spans_reparse_to_the_full_parses_value_terms() {
+        use crate::ast::Statement;
+        for q in [
+            "INSERT INTO ks.t (a, b, c) VALUES ('machine-abc-000012345', 1, 0xDEADBEEF)",
+            "INSERT INTO t (k, v) VALUES ('O''Brien', 42)",
+            "INSERT INTO t (x, y) VALUES (3.14159, 550e8400-e29b-41d4-a716-446655440000)",
+            "INSERT INTO t (k) VALUES ('a, b) c')",
+        ] {
+            let stmt = crate::parser::parse(q).expect("parse");
+            let Statement::Insert(ins) = stmt else {
+                panic!("expected INSERT");
+            };
+            // The parse's literal value Terms (all scalar in these fixtures).
+            let parsed_terms = ins.values;
+            let n = norm(q);
+            let extracted: Vec<Term> = n
+                .literals
+                .iter()
+                .map(|l| l.to_term(q).expect("span re-parses to a term"))
+                .collect();
+            assert_eq!(
+                extracted, parsed_terms,
+                "extracted spans must reconstruct the full parse's value Terms for `{q}`"
+            );
+        }
+    }
+
+    use crate::ast::Statement;
+
+    /// Parse a query and unwrap its INSERT, panicking otherwise.
+    fn insert_of(q: &str) -> InsertStatement {
+        match crate::parser::parse(q).expect("parse") {
+            Statement::Insert(i) => i,
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_then_build_round_trips_to_the_full_parse() {
+        // The end-to-end fast-path contract: for the SAME shape with different
+        // values, template.build(bound spans) must equal a full parse.
+        let seed = "INSERT INTO ks.t (a, b, c) VALUES ('seed', 1, 0xAA)";
+        let n_seed = norm(seed);
+        let ins_seed = insert_of(seed);
+        let tmpl = verify_insert(seed, &ins_seed, &n_seed).expect("seed is cacheable");
+
+        // A sibling of the same shape — must reconstruct via the cached template.
+        let sib = "INSERT INTO ks.t (a, b, c) VALUES ('machine-x', 999, 0xDEADBEEF)";
+        let n_sib = norm(sib);
+        assert_eq!(
+            n_sib.skeleton, n_seed.skeleton,
+            "same shape => same skeleton"
+        );
+        let bound: Vec<Term> = n_sib
+            .literals
+            .iter()
+            .map(|l| l.to_term(sib).unwrap())
+            .collect();
+        let rebuilt = Statement::Insert(tmpl.build(bound));
+        assert_eq!(
+            rebuilt,
+            crate::parser::parse(sib).expect("parse sibling"),
+            "template.build must equal a full parse of the sibling"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_using_timestamp() {
+        let q = "INSERT INTO t (k, v) VALUES ('x', 1) USING TIMESTAMP 12345";
+        let n = norm(q);
+        assert_eq!(verify_insert(q, &insert_of(q), &n), None);
+    }
+
+    #[test]
+    fn verify_rejects_bool_and_null_values() {
+        // Normalizer leaves true/null in the skeleton, so masked-count (1) !=
+        // value-count (3): the count guard rejects — always full-parse instead.
+        let q = "INSERT INTO t (k, b, n) VALUES ('x', true, null)";
+        let n = norm(q);
+        assert_eq!(verify_insert(q, &insert_of(q), &n), None);
+    }
+
+    #[test]
+    fn verify_rejects_collection_value() {
+        let q = "INSERT INTO t (k, s) VALUES ('x', {1, 2, 3})";
+        let n = norm(q);
+        assert_eq!(verify_insert(q, &insert_of(q), &n), None);
+    }
+
+    #[test]
+    fn verify_rejects_function_call_value() {
+        let q = "INSERT INTO t (k, id) VALUES ('x', now())";
+        let n = norm(q);
+        assert_eq!(verify_insert(q, &insert_of(q), &n), None);
     }
 
     #[test]

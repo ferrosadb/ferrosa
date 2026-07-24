@@ -69,6 +69,27 @@ pub fn parse(input: &str) -> Result<Statement, CqlError> {
     Ok(stmt)
 }
 
+/// Parse a single CQL term (a literal, collection, function call, or bind
+/// marker) from `input`, requiring `input` to be exactly one term with nothing
+/// trailing. Used by transparent auto-parameterization ([`crate::param_cache`])
+/// to reconstruct the typed value of one extracted literal span on a cache hit
+/// WITHOUT re-parsing the whole statement — reusing the parser's exact literal
+/// handling (string `''`-unescape, hex/UUID decode, signed numbers) so the
+/// fast-path value is byte-for-byte identical to what a full parse would yield.
+pub fn parse_term(input: &str) -> Result<Term, CqlError> {
+    let lexer = Lexer::new(input)?;
+    let mut parser = Parser::new(lexer);
+    let term = parser.parse_term()?;
+    let tok = parser.lexer.peek()?;
+    if tok.kind != TokenKind::Eof {
+        return Err(CqlError::SyntaxError(format!(
+            "unexpected token {:?} after term at position {}",
+            tok.kind, tok.pos
+        )));
+    }
+    Ok(term)
+}
+
 /// Returns a short name for the statement variant (e.g. "SELECT", "INSERT").
 fn statement_type_name(stmt: &Statement) -> &'static str {
     match stmt {
