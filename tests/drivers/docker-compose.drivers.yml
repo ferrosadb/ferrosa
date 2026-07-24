@@ -88,6 +88,9 @@ services:
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
+      # Driver containers access Graph HTTP and Bolt over the Compose network.
+      # Make that exposure explicit now that Ferrosa defaults to loopback-only.
+      FERROSA_GRAPH_BIND: "0.0.0.0:7474"
       FERROSA_CLUSTER_NAME: "ferrosa-driver-test"
       FERROSA_GRAPH_ENABLED: "true"
       RUST_LOG: "ferrosa_cql=debug,info"
@@ -124,6 +127,8 @@ services:
       FERROSA_AUTH_ENABLED: "true"
       FERROSA_CQL_BIND: "0.0.0.0:9042"
       FERROSA_WEB_BIND: "0.0.0.0:9090"
+      # The auth-enforcement driver runs from a separate Compose container.
+      FERROSA_GRAPH_BIND: "0.0.0.0:7474"
       FERROSA_CLUSTER_NAME: "ferrosa-driver-test-auth"
       FERROSA_GRAPH_ENABLED: "true"
       FERROSA_S3_ENDPOINT: "http://rustfs:9000"

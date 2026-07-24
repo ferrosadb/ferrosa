@@ -24,7 +24,7 @@ use crate::executor::result::GraphResult;
 /// Configuration for the Bolt server.
 #[derive(Debug, Clone)]
 pub struct BoltConfig {
-    /// Address to bind to (default: 0.0.0.0:7687).
+    /// Address to bind to (default: 127.0.0.1:7687).
     pub bind_addr: SocketAddr,
     /// Maximum message size in bytes.
     pub max_message_size: usize,
@@ -37,7 +37,7 @@ pub struct BoltConfig {
 impl Default for BoltConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:7687".parse().unwrap(),
+            bind_addr: "127.0.0.1:7687".parse().unwrap(),
             max_message_size: 16 * 1024 * 1024, // 16MB
             max_connections: 256,
             auth_disabled: false,
@@ -726,7 +726,7 @@ mod tests {
         let config = BoltConfig::default();
         assert_eq!(
             config.bind_addr,
-            "0.0.0.0:7687".parse::<SocketAddr>().unwrap()
+            "127.0.0.1:7687".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(config.max_message_size, 16 * 1024 * 1024);
         assert_eq!(config.max_connections, 256);

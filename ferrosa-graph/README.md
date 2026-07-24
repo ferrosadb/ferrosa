@@ -20,6 +20,13 @@ three transports: an **HTTP/JSON** endpoint (port 7474), the **Bolt v5** wire
 protocol (port 7687, Neo4j-driver compatible), and direct in-process calls from
 the `ferrosa` binary.
 
+`GraphHttpConfig` and `BoltConfig` default to loopback-only binds
+(`127.0.0.1:7474` and `127.0.0.1:7687`). The `ferrosa` binary resolves the
+runtime graph settings with `[graph]` TOML values taking precedence over the
+matching environment variables, then supplies these config objects to the HTTP
+and Bolt servers. Bolt uses the resolved Graph HTTP host with its separately
+resolved port.
+
 ## What's implemented
 
 - **Cypher parser** — lexer + recursive-descent parser (`parser/`) covering
