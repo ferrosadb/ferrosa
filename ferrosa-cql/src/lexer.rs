@@ -323,6 +323,21 @@ fn kind_matches(actual: &TokenKind<'_>, expected: &TokenKind<'_>) -> bool {
     }
 }
 
+/// Identifier-byte classification table: `true` for `[A-Za-z0-9_]`, the byte
+/// class an unquoted identifier / keyword may contain. A single indexed load
+/// replaces the `is_ascii_alphanumeric() || b == b'_'` range-check chain in the
+/// identifier scan (the hottest lexer leaf); `const` so it lives in `.rodata`.
+const IDENT_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        t[i] = b.is_ascii_alphanumeric() || b == b'_';
+        i += 1;
+    }
+    t
+};
+
 /// Zero-allocation lexer for CQL queries.
 ///
 /// Yields `Token<'input>` values that borrow from the source string.
@@ -689,14 +704,18 @@ impl<'input> Lexer<'input> {
     #[inline]
     fn read_identifier(&mut self) -> Token<'input> {
         let start = self.pos;
-        while self.pos < self.bytes.len() {
-            let b = self.bytes[self.pos];
-            if b.is_ascii_alphanumeric() || b == b'_' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
+        // Scan the `[A-Za-z0-9_]` run via a branchless classification-table
+        // lookup + `position()` (one table load per byte, no range-check
+        // branch chain) instead of `is_ascii_alphanumeric() || b == b'_'`.
+        // `position` stops at the first non-ident byte; `unwrap_or` handles an
+        // identifier that runs to end-of-input. This is the dominant `advance`
+        // leaf in the write-path flamegraph (t_48d5eeaa).
+        let rest = &self.bytes[self.pos..];
+        let run = rest
+            .iter()
+            .position(|&b| !IDENT_BYTE[b as usize])
+            .unwrap_or(rest.len());
+        self.pos += run;
 
         let text = &self.input[start..self.pos];
 
@@ -989,20 +1008,23 @@ impl<'input> Lexer<'input> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
         let content_start = self.pos;
-        while self.pos < self.bytes.len() {
-            if self.bytes[self.pos] == b'\'' {
-                if self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == b'\'' {
-                    return self.read_escaped_string(start, content_start);
-                }
-                let content = self.input[content_start..self.pos].to_owned();
-                self.pos += 1; // consume closing quote
-                return Ok(Token {
-                    kind: TokenKind::StringLiteral(content),
-                    pos: start,
-                });
+        // memchr jumps (SIMD) straight to the next single-quote instead of
+        // testing every content byte. The byte after it disambiguates a `''`
+        // escape (slow path) from the closing quote (fast bulk copy).
+        if let Some(rel) = memchr::memchr(b'\'', &self.bytes[content_start..]) {
+            let quote = content_start + rel;
+            if quote + 1 < self.bytes.len() && self.bytes[quote + 1] == b'\'' {
+                self.pos = quote;
+                return self.read_escaped_string(start, content_start);
             }
-            self.pos += 1;
+            let content = self.input[content_start..quote].to_owned();
+            self.pos = quote + 1; // consume closing quote
+            return Ok(Token {
+                kind: TokenKind::StringLiteral(content),
+                pos: start,
+            });
         }
+        self.pos = self.bytes.len();
         Err(CqlError::SyntaxError(format!(
             "unterminated string literal starting at position {start}"
         )))
