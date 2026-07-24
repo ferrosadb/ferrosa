@@ -16,6 +16,11 @@ durability.
 > formats, and configuration may change before a stable 1.0. Don't run it on data you
 > can't lose. Please report issues — we want to hear them.
 
+## Community and support
+
+Join the [Ferrosa Discord](https://discord.gg/BTpKMp9HRM) to discuss deployments,
+ask questions, and report issues with the community and maintainers.
+
 ## Quick Install
 
 ```bash
