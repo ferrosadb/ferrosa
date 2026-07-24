@@ -59,7 +59,7 @@ PY
 make_tarballs() {
   local db_stage="$WORK/db-stage" memory_stage="$WORK/memory-stage"
   mkdir -p "$db_stage/config" "$db_stage/launchd" "$db_stage/systemd"
-  mkdir -p "$memory_stage/config" "$memory_stage/launchd"
+  mkdir -p "$memory_stage/config" "$memory_stage/examples" "$memory_stage/launchd"
 
   printf '#!/usr/bin/env bash\nexit 0\n' > "$db_stage/ferrosa"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$db_stage/ferrosa-ctl"
@@ -76,6 +76,7 @@ printf started > "$MCP_STARTED_FILE"
 EOF
   chmod +x "$memory_stage/ferrosa-memory-mcp"
   printf '[server]\ntransport = "stdio"\n' > "$memory_stage/config/ferrosa-memory.example.toml"
+  printf '# shared HTTP auth template\n' > "$memory_stage/examples/http-auth.toml"
   printf '<plist>ferrosa-memory-mcp __BINARY_PATH__</plist>\n' > "$memory_stage/launchd/com.ferrosa-memory.mcp.plist"
   tar -czf "$WORK/ferrosa-memory.tar.gz" -C "$memory_stage" .
 }
@@ -214,6 +215,8 @@ grep -F "enable --now ferrosa.service" "$WORK/systemctl-ready.log" >/dev/null \
   || fail "quick start did not use the canonical systemd DB start path"
 grep -F "database ready on 127.0.0.1:$ready_port" "$ready_log" >/dev/null \
   || fail "quick start did not wait for the DB readiness probe"
+[ -f "$ready_home/.ferrosa/share/ferrosa-memory/examples/http-auth.toml" ] \
+  || fail "quick start did not retain the bundled HTTP/auth templates"
 assert_outcome "$ready_home" ready skipped \
   || fail "quick start did not record its skipped MCP start outcome"
 [ ! -e "$WORK/mcp-ready.started" ] \
