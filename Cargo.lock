@@ -2226,6 +2226,7 @@ dependencies = [
  "ferrosa-index",
  "ferrosa-net",
  "ferrosa-row-bridge",
+ "ferrosa-sched",
  "ferrosa-schema",
  "ferrosa-session",
  "ferrosa-sstable",
@@ -2509,6 +2510,7 @@ dependencies = [
 name = "ferrosa-sched"
 version = "0.17.0"
 dependencies = [
+ "proptest",
  "tokio",
 ]
 
