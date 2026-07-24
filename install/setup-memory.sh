@@ -35,6 +35,8 @@ CONFIG_DIR="${INSTALL_ROOT}/config"
 DATA_DIR="${INSTALL_ROOT}/data"
 LOG_DIR="${INSTALL_ROOT}/logs"
 NOMIC_MODEL="${NOMIC_MODEL:-nomic-embed-text-v2-moe}"
+DB_HOST="${FERROSA_SETUP_CQL_HOST:-127.0.0.1}"
+DB_PORT="${FERROSA_SETUP_CQL_PORT:-9042}"
 
 VERSION=""
 WANT_CLONE=""    # ask|yes|no
@@ -49,6 +51,8 @@ MCP_URL="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
 # Populated in Stage 1 (before the extract dir is cleaned) and consumed by the
 # server-start stage. Empty means "write the plist inline".
 LAUNCHD_TEMPLATE=""
+DB_LAUNCHD_TEMPLATE=""
+DB_SYSTEMD_TEMPLATE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -145,6 +149,21 @@ cp "$F_TMP/ferrosa-ctl" "$BIN_DIR/"
 chmod +x "$BIN_DIR/ferrosa" "$BIN_DIR/ferrosa-ctl"
 if [ ! -f "$CONFIG_DIR/ferrosa.toml" ]; then
   cp "$F_TMP/config/ferrosa.example.toml" "$CONFIG_DIR/ferrosa.toml"
+fi
+# Keep the DB service templates before the extracted release is removed. The
+# quick-start start path matches install.sh: launchd on macOS, systemd --user on
+# Linux, and a foreground command when neither can run the service.
+if [ -f "$F_TMP/launchd/com.ferrosadb.ferrosa.plist" ]; then
+  mkdir -p "$INSTALL_ROOT/share/ferrosa/launchd"
+  cp "$F_TMP/launchd/com.ferrosadb.ferrosa.plist" \
+     "$INSTALL_ROOT/share/ferrosa/launchd/com.ferrosadb.ferrosa.plist"
+  DB_LAUNCHD_TEMPLATE="$INSTALL_ROOT/share/ferrosa/launchd/com.ferrosadb.ferrosa.plist"
+fi
+if [ -f "$F_TMP/systemd/ferrosa.service" ]; then
+  mkdir -p "$INSTALL_ROOT/share/ferrosa/systemd"
+  cp "$F_TMP/systemd/ferrosa.service" \
+     "$INSTALL_ROOT/share/ferrosa/systemd/ferrosa.service"
+  DB_SYSTEMD_TEMPLATE="$INSTALL_ROOT/share/ferrosa/systemd/ferrosa.service"
 fi
 rm -rf "$F_TMP"
 
@@ -284,16 +303,89 @@ case "$WANT_NOMIC" in
        fi ;;
 esac
 
+# ── Stage 4a: configure, start, and verify the local Ferrosa DB ─────────────
+# The hosted quick start installs the DB artifact itself, so it must also apply
+# the canonical install.sh lifecycle before it starts or advertises MCP.
+db_reachable() {
+  (: > "/dev/tcp/$DB_HOST/$DB_PORT") 2>/dev/null
+}
+
+wait_for_db() {
+  for _ in $(seq 1 30); do
+    db_reachable && return 0
+    sleep 1
+  done
+  return 1
+}
+
+manual_db_action_required() {
+  say "manual_action_required: local Ferrosa is configured but not running"
+  say "Start the database, then re-run this installer:"
+  say "  FERROSA_CONFIG=\"$CONFIG_DIR/ferrosa.toml\" \"$BIN_DIR/ferrosa\""
+  exit 1
+}
+
+start_db_macos() {
+  local domain plist
+  command -v launchctl >/dev/null 2>&1 || return 1
+  [ -n "$DB_LAUNCHD_TEMPLATE" ] && [ -f "$DB_LAUNCHD_TEMPLATE" ] || return 1
+
+  domain="gui/$(id -u)"
+  plist="$HOME/Library/LaunchAgents/com.ferrosadb.ferrosa.plist"
+  mkdir -p "$(dirname "$plist")"
+  sed "s|__HOME__|$HOME|g" "$DB_LAUNCHD_TEMPLATE" > "$plist"
+  launchctl bootout "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
+  if launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+    launchctl enable "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
+    launchctl kickstart -k "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
+  else
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load "$plist" 2>/dev/null || return 1
+  fi
+  say "launchd: ferrosa.service loaded; waiting for database readiness"
+}
+
+start_db_linux() {
+  local unit="$HOME/.config/systemd/user/ferrosa.service"
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -n "$DB_SYSTEMD_TEMPLATE" ] && [ -f "$DB_SYSTEMD_TEMPLATE" ] || return 1
+
+  mkdir -p "$(dirname "$unit")"
+  cp "$DB_SYSTEMD_TEMPLATE" "$unit"
+  systemctl --user daemon-reload || return 1
+  systemctl --user enable --now ferrosa.service || return 1
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "$USER" 2>/dev/null \
+      && say "systemd: lingering enabled (boot-time start without login)"
+  fi
+  say "systemd: ferrosa.service enabled; waiting for database readiness"
+}
+
+ensure_local_db_ready() {
+  if db_reachable; then
+    say "database ready on $DB_HOST:$DB_PORT"
+    return 0
+  fi
+
+  case "$(uname -s)" in
+    Darwin) start_db_macos || manual_db_action_required ;;
+    Linux)  start_db_linux || manual_db_action_required ;;
+    *)      manual_db_action_required ;;
+  esac
+
+  if wait_for_db; then
+    say "database ready on $DB_HOST:$DB_PORT"
+  else
+    manual_db_action_required
+  fi
+}
+
+ensure_local_db_ready
+
 # ── Stage 4b: start the MCP server (macOS LaunchAgent) ──────────────────────
 # A fresh install lays down a binary + config but no running process, so nothing
-# is listening on :18765. Install a per-user LaunchAgent so the server comes up
-# now and on every login.
-#
-# IMPORTANT CAVEAT: a brand-new install has no ferrosa DB (CQL backend) yet, so
-# the server starts in *reconnecting/degraded* mode — it serves /healthz and
-# tools/list, but memory operations fail — until the agent's ONBOARDING.md flow
-# brings up the DB (native single-node or Compose). So "running" here means the
-# process is up and the endpoint is reachable, NOT that memory is fully ready.
+# is listening on :18765. The database readiness gate above must pass before
+# this service is started or described as available.
 LAUNCH_AGENT_LABEL="com.ferrosa-memory.mcp"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
 LAUNCH_AGENT_LOG="/tmp/ferrosa-memory-mcp.log"
@@ -369,7 +461,7 @@ start_server() {
   fi
   say "MCP server started via LaunchAgent ($LAUNCH_AGENT_PLIST)"
   say "  log: $LAUNCH_AGENT_LOG"
-  say "  note: reconnecting/degraded until a ferrosa DB is configured during onboarding"
+  say "  database: ready on $DB_HOST:$DB_PORT"
 }
 
 if [ "$WANT_START" = "no" ]; then
@@ -387,7 +479,7 @@ fi
 
 # ── Stage 5: hand off to LLM harness ────────────────────────────────────────
 case "$STARTED" in
-  yes)    SERVER_LINE="server:   started via LaunchAgent (reconnecting until the DB is configured during onboarding)
+  yes)    SERVER_LINE="server:   started via LaunchAgent after DB readiness verification
   log:      $LAUNCH_AGENT_LOG" ;;
   failed) SERVER_LINE="server:   LaunchAgent install FAILED — start manually: FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp" ;;
   manual) SERVER_LINE="server:   not started (macOS-only auto-start) — run: FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp" ;;
@@ -424,10 +516,8 @@ Hermes:
 Claude Code / Codex / another harness — paste at the prompt:
   onboard me using $ONBOARDING_PATH
 
-The onboarding prompt walks through native vs Compose runtime, skills, hooks,
-credentials, and ports.
+The onboarding prompt walks through skills, hooks, credentials, and ports.
 
-Note: the memory server is started, but it stays in reconnecting/degraded mode
-(serving /healthz + tools/list, memory ops failing) until the onboarding flow
-brings up a ferrosa DB. The MCP endpoint is at $MCP_URL once the DB is up.
+Database readiness was verified on $DB_HOST:$DB_PORT before MCP handling. The
+MCP endpoint is at $MCP_URL when the selected MCP transport serves HTTP.
 EOF

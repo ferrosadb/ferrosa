@@ -36,7 +36,7 @@ use crate::error::GraphError;
 /// Configuration for the graph HTTP server.
 #[derive(Debug, Clone)]
 pub struct GraphHttpConfig {
-    /// Bind address (default: 0.0.0.0:7474).
+    /// Bind address (default: 127.0.0.1:7474).
     pub bind_addr: SocketAddr,
     /// Path to TLS certificate file (PEM).
     pub tls_cert_path: Option<String>,
@@ -51,7 +51,7 @@ pub struct GraphHttpConfig {
 impl Default for GraphHttpConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from(([0, 0, 0, 0], 7474)),
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 7474)),
             tls_cert_path: None,
             tls_key_path: None,
             require_tls: false,
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn default_config() {
         let config = GraphHttpConfig::default();
-        assert_eq!(config.bind_addr, SocketAddr::from(([0, 0, 0, 0], 7474)));
+        assert_eq!(config.bind_addr, SocketAddr::from(([127, 0, 0, 1], 7474)));
         assert!(config.tls_cert_path.is_none());
         assert!(config.tls_key_path.is_none());
         assert!(!config.require_tls);
