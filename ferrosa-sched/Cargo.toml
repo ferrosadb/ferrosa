@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Query QoS scheduler core: bounded execution pool that reserves CPU headroom for consensus (Phase 0 of the fair scheduler)."
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

@@ -44,7 +44,9 @@ RUN cargo build --release -p ferrosa 2>&1 || true
 
 COPY . .
 RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
-RUN cargo build --release -p ferrosa
+# Build ferrosa-loadgen too — its --scan-storm mode drives the concurrent
+# full-table ALLOW FILTERING scans for the reads-under-load / ramp experiment.
+RUN cargo build --release -p ferrosa -p ferrosa-loadgen
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -56,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         sysstat \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
+COPY --from=builder /build/target/release/ferrosa-loadgen /usr/local/bin/
 COPY deploy/fly-bench/ferrosa-entrypoint.sh /usr/local/bin/
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa

@@ -34,7 +34,7 @@
 //! per-column complex `DeletionTime` on write are still deferred (Ferrosa's
 //! collection ops are element add/remove, not whole-collection clears).
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -85,6 +85,89 @@ fn compression_batch_chunks() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|chunks| *chunks > 0)
         .unwrap_or(DEFAULT_COMPRESSION_BATCH_CHUNKS)
+}
+
+/// Whether Data.db is written through the page-cache-bypassing
+/// [`DirectWriter`](crate::direct::DirectWriter) (O_DIRECT on Linux, `F_NOCACHE`
+/// on macOS).
+///
+/// Opt-in (`FERROSA_SSTABLE_DIRECT_IO=1`) for a **safe rollout** of a
+/// durability-critical I/O change (Phase 3, epic `t_29f6b948`): the default OFF
+/// preserves the existing buffered path byte-for-byte, so the change ships dark
+/// and can be A/B'd on a real Linux file system — where the actual O_DIRECT
+/// syscall path (never exercised on the macOS dev host) runs — to confirm the
+/// disk-saturation tail shrinks before the default is flipped.
+fn sstable_direct_io_enabled() -> bool {
+    parse_direct_io_flag(std::env::var("FERROSA_SSTABLE_DIRECT_IO").ok())
+}
+
+/// Parse the `FERROSA_SSTABLE_DIRECT_IO` value (pure, so it is tested without the
+/// `set_var` parallel-test race). Absent/unrecognized ⇒ `false` (safe default).
+fn parse_direct_io_flag(value: Option<String>) -> bool {
+    value
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "on"))
+        .unwrap_or(false)
+}
+
+/// A Data.db sink that is either the cache-bypassing
+/// [`DirectWriter`](crate::direct::DirectWriter) or the original buffered
+/// [`std::fs::File`], selected by [`sstable_direct_io_enabled`]. Presents a
+/// uniform `write_all` / `position` / `finish` surface so the compressed and
+/// uncompressed build paths are written once, mode-agnostic. `position` returns
+/// the logical write offset (substituting for `Seek::stream_position`, which
+/// O_DIRECT's staging buffer cannot answer from the OS file offset).
+enum DataDbWriter {
+    Direct(crate::direct::DirectWriter),
+    Buffered { file: std::fs::File, written: u64 },
+}
+
+impl DataDbWriter {
+    /// Open `data_path`. `direct` (from [`sstable_direct_io_enabled`] at the call
+    /// site) is an explicit parameter — not read from the environment here — so
+    /// both modes are unit-testable without the `set_var` parallel-test race.
+    fn create(path: &Path, direct: bool) -> Result<Self> {
+        if direct {
+            Ok(Self::Direct(crate::direct::DirectWriter::create(path)?))
+        } else {
+            Ok(Self::Buffered {
+                file: std::fs::File::create(path)?,
+                written: 0,
+            })
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Direct(writer) => writer.write_all(bytes),
+            Self::Buffered { file, written } => {
+                file.write_all(bytes)?;
+                *written += bytes.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    /// Logical offset of the next byte — substitutes for `stream_position()`.
+    fn position(&self) -> u64 {
+        match self {
+            Self::Direct(writer) => writer.position(),
+            Self::Buffered { written, .. } => *written,
+        }
+    }
+
+    /// Durably persist the Data.db content and consume the writer.
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Direct(writer) => {
+                writer.finish()?;
+                Ok(())
+            }
+            Self::Buffered { file, .. } => {
+                file.sync_data()?;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn write_component_file(path: &Path, bytes: &[u8]) -> Result<u64> {
@@ -1329,10 +1412,10 @@ impl SSTableWriter {
                 let mut max_compressed_size: usize = 0;
                 let batch_chunks = compression_batch_chunks();
                 let mut batch: Vec<&[u8]> = Vec::with_capacity(batch_chunks);
-                let mut file = std::fs::File::create(data_path)?;
+                let mut file = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
 
                 let flush_batch = |batch: &mut Vec<&[u8]>,
-                                   file: &mut std::fs::File,
+                                   file: &mut DataDbWriter,
                                    chunk_offsets: &mut Vec<u64>,
                                    max_compressed_size: &mut usize|
                  -> Result<()> {
@@ -1357,7 +1440,7 @@ impl SSTableWriter {
                         });
 
                     for chunk in compressed_chunks? {
-                        chunk_offsets.push(file.stream_position()?);
+                        chunk_offsets.push(file.position());
                         *max_compressed_size = (*max_compressed_size).max(chunk.stored_size);
                         file.write_all(&chunk.payload)?;
                         file.write_all(&chunk.crc)?;
@@ -1383,7 +1466,7 @@ impl SSTableWriter {
                     &mut chunk_offsets,
                     &mut max_compressed_size,
                 )?;
-                file.sync_data()?;
+                file.finish()?;
 
                 let info = CompressionInfo {
                     compression: compression.clone(),
@@ -1395,9 +1478,9 @@ impl SSTableWriter {
                 info.write().map(Some)
             }
             _ => {
-                let mut file = std::fs::File::create(data_path)?;
+                let mut file = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
                 file.write_all(&data_buf)?;
-                file.sync_data()?;
+                file.finish()?;
                 Ok(None)
             }
         }
@@ -1442,7 +1525,7 @@ impl SSTableWriter {
                 let mut max_compressed_size: usize = 0;
                 let batch_chunks = compression_batch_chunks();
                 let mut raw = std::fs::File::open(raw_path)?;
-                let mut out = std::fs::File::create(data_path)?;
+                let mut out = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
 
                 loop {
                     let mut batch = Vec::with_capacity(batch_chunks);
@@ -1484,13 +1567,13 @@ impl SSTableWriter {
                         });
 
                     for chunk in compressed_chunks? {
-                        chunk_offsets.push(out.stream_position()?);
+                        chunk_offsets.push(out.position());
                         max_compressed_size = max_compressed_size.max(chunk.stored_size);
                         out.write_all(&chunk.payload)?;
                         out.write_all(&chunk.crc)?;
                     }
                 }
-                out.sync_data()?;
+                out.finish()?;
 
                 let info = CompressionInfo {
                     compression: compression.clone(),
@@ -1747,6 +1830,64 @@ mod tests {
     use crate::data::DataReader;
     use crate::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+
+    #[test]
+    fn parse_direct_io_flag_defaults_off_and_accepts_truthy() {
+        assert!(!parse_direct_io_flag(None), "absent ⇒ off (safe default)");
+        assert!(!parse_direct_io_flag(Some("0".into())));
+        assert!(!parse_direct_io_flag(Some("no".into())));
+        assert!(!parse_direct_io_flag(Some(String::new())));
+        for truthy in ["1", "true", "TRUE", "on", " 1 "] {
+            assert!(parse_direct_io_flag(Some(truthy.into())), "{truthy} ⇒ on");
+        }
+    }
+
+    /// The load-bearing wiring invariant: writing the same byte stream through a
+    /// direct (O_DIRECT/F_NOCACHE) Data.db writer and the buffered writer yields
+    /// byte-for-byte identical files AND identical recorded chunk offsets —
+    /// otherwise CompressionInfo offsets would point the reader at the wrong
+    /// chunk. Explicit `direct` bool ⇒ no env-var race. This transitively proves
+    /// direct-mode SSTable output matches the buffered path the binary-exact
+    /// Cassandra oracle already pins.
+    #[test]
+    fn data_db_writer_direct_matches_buffered_bytes_and_offsets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Irregular sizes mimic compressed payload+crc writes; spans the 4096
+        // block boundary and the direct writer's staging buffer.
+        let writes: Vec<Vec<u8>> = (0..600usize)
+            .map(|i| {
+                let n = 1 + (i * 37) % 5000;
+                (0..n).map(|j| ((i + j) % 256) as u8).collect()
+            })
+            .collect();
+
+        let mut offsets: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+        let paths = [dir.path().join("buffered.db"), dir.path().join("direct.db")];
+        for (idx, direct) in [false, true].into_iter().enumerate() {
+            let mut w = DataDbWriter::create(&paths[idx], direct).expect("create");
+            for chunk in &writes {
+                offsets[idx].push(w.position());
+                w.write_all(chunk).expect("write_all");
+            }
+            w.finish().expect("finish");
+        }
+
+        assert_eq!(
+            offsets[0], offsets[1],
+            "chunk offsets must be mode-independent"
+        );
+        let buffered = std::fs::read(&paths[0]).expect("read buffered");
+        let direct = std::fs::read(&paths[1]).expect("read direct");
+        assert_eq!(
+            buffered.len(),
+            direct.len(),
+            "Data.db length differs between buffered and direct modes"
+        );
+        assert_eq!(
+            buffered, direct,
+            "Data.db bytes differ between buffered and direct modes"
+        );
+    }
 
     /// Build a minimal serialization header for testing.
     fn test_header() -> SerializationHeader {

@@ -1,0 +1,33 @@
+======== Commitlog batch sweep: 64KB/1ms vs 1MB/5ms (2026-07-23) ========
+Same cluster shape (3x perf-2x/4GB, ext4 volume, concurrent full-table scan load).
+buffered-only ramp; 1MB run done MANUALLY against a healthy cluster after a
+transient provisioning race killed the harness relaunch.
+
+offered | DEFAULT 64KB/1ms          | 1MB/5ms batch
+1000    |  997/s 100% p99=282ms     |  997/s 100% p99=281ms
+2000    | 1990/s  99% p99=279ms     | 1993/s 100% p99=148ms
+4000    | 3991/s 100% p99=88ms      | 3970/s  99% p99=82ms
+8000    | 7961/s 100% p99=56ms      | 7956/s  99% p99=60ms
+16000   | (csv not captured)        | 15065/s 94% p99=4268ms
+32000   | 12861/s 40% p99=111363ms  | 12989/s 41% p99=109262ms
+
+device write IOPS at the 16k stage: default ~9569/s vs 1MB ~8004/s.
+
+FINDINGS:
+- Clean range (1k-8k): identical (batching only matters near the knee).
+- Batching is more I/O-EFFICIENT: fewer, fatter fsyncs -> fewer device IOPS
+  (8004 vs 9569) for equal-or-more CQL throughput. Confirms the bottleneck in
+  the moderate regime was fsync COUNT, not raw device IOPS (both < 17k ceiling).
+- 1MB held 16k at 94% keep (15065/s) where the default had degraded -> extends
+  the SUSTAINABLE range. (Default 16k CSV didn't capture; inferred from its
+  8k-clean / 32k-collapsed trajectory, not a clean head-to-head.)
+- BUT the ultimate overload floor is UNCHANGED: both collapse at 32k to ~13k/s,
+  ~40% keep, ~110s latency. Under extreme overload the limiter shifts to
+  compaction thrashing / memtable backpressure (memtable pinned at 208MB near
+  the 256MB cap) -- which commitlog batching does not touch.
+
+VERDICT: commitlog batching is a genuine but MODEST efficiency win (fewer IOPS,
+more headroom before degradation) -- worth a moderate default bump -- but NOT a
+ceiling-changer. The saturation floor (~13k) is compaction-bound. Next probe to
+move the floor: compaction throughput / flush threshold, not batch size.
+Reads-under-load still unmeasured (0 full-table scans completed in the window).

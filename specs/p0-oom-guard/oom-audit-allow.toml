@@ -840,3 +840,23 @@ symbol = "cells"
 reason = "column-meta assembly: `.copied()` flattens a grouped column's `&CellValue` cells for max_by_key; copies the reference, not the CellValue."
 owner = "bkearns"
 expires = "2027-07-01"
+
+# ---------------------------------------------------------------------------
+# Flush sharding — parallel encode of an already-materialized memtable snapshot
+# ---------------------------------------------------------------------------
+# `split_sorted_partitions_into_shards` receives an ALREADY-materialized,
+# bounded `Vec<Partition>` (the memtable's flush working set, bounded by the
+# flush threshold — the caller `TableStore::flush` sorts and owns it) and
+# re-chunks it into disjoint per-shard `Vec<Partition>` so each shard's SSTable
+# encode runs on its own rayon worker (the flush-encode parallelism win). The
+# `collect()` introduces no new scan materialization beyond the caller's
+# already-bounded Vec; owned per-shard Vecs are inherent to handing chunks to
+# separate threads (rayon has no borrow-across-threads streaming alternative
+# here). Bounded + intentional.
+[[allow]]
+path = "ferrosa-storage/src/flush.rs"
+rule = "collect-vec-partition-or-row"
+symbol = "split_sorted_partitions_into_shards"
+reason = "re-chunks an already-materialized, flush-threshold-bounded Vec<Partition> into disjoint per-shard owned Vecs for parallel rayon SSTable encode; no new scan materialization, owned chunks inherent to cross-thread hand-off."
+owner = "bkearns"
+expires = "2027-07-01"

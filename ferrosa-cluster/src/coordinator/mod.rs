@@ -36,9 +36,28 @@ use crate::pair::coordinator::decode_mutation;
 use crate::raft::state_machine::RaftState;
 use crate::ring::TokenRing;
 
-/// Maximum concurrent in-flight writes. Provides backpressure when the cluster
-/// is saturated, preventing runtime starvation of Raft heartbeat processing.
-const WRITE_CONCURRENCY_LIMIT: usize = 128;
+/// Default maximum concurrent in-flight writes. Historically this fixed cap was
+/// the primary guard against write load starving Raft heartbeat processing on a
+/// shared runtime. Raft is now isolated at the source (dedicated OS thread via
+/// `spawn_raft_lane_actor` + a `ferrosa_sched` consensus reservation), so this
+/// cap is belt-and-suspenders — overridable via `FERROSA_WRITE_CONCURRENCY_LIMIT`
+/// to investigate the real write ceiling and eventually scale with node
+/// capacity (see the capacity-aware follow-up).
+const DEFAULT_WRITE_CONCURRENCY_LIMIT: usize = 128;
+
+/// Resolve the write-concurrency limit from an already-read env value, falling
+/// back to [`DEFAULT_WRITE_CONCURRENCY_LIMIT`]. Pure (takes the env value as an
+/// argument) so it is unit-testable without mutating the process environment.
+pub(crate) fn parse_write_concurrency_limit(env_val: Option<String>) -> usize {
+    env_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_WRITE_CONCURRENCY_LIMIT)
+}
+
+fn write_concurrency_limit() -> usize {
+    parse_write_concurrency_limit(std::env::var("FERROSA_WRITE_CONCURRENCY_LIMIT").ok())
+}
 const STREAM_REQUEST_ID_EPOCH_BIT: u32 = 1 << 31;
 const STREAM_REQUEST_ID_RANDOM_MASK: u32 = (1 << 30) - 1;
 
@@ -159,7 +178,7 @@ impl ClusterCoordinator {
                 crate::coordinator::read::AntiEntropyRepairQueue::default(),
             ),
             raft_state: None,
-            write_semaphore: Arc::new(tokio::sync::Semaphore::new(WRITE_CONCURRENCY_LIMIT)),
+            write_semaphore: Arc::new(tokio::sync::Semaphore::new(write_concurrency_limit())),
             stream_router: Arc::new(StreamRouter::new()),
             next_request_id: Arc::new(AtomicU32::new(fresh_stream_request_id_seed(local_node_id))),
             streaming_range_reads,
@@ -397,6 +416,28 @@ mod tests {
     use super::*;
     use crate::error::ClusterError;
     use crate::pair::coordinator::encode_mutation;
+
+    #[test]
+    fn write_concurrency_limit_parses_override_else_defaults() {
+        assert_eq!(parse_write_concurrency_limit(Some("512".to_string())), 512);
+        assert_eq!(
+            parse_write_concurrency_limit(Some("  4096 ".to_string())),
+            4096
+        );
+        // invalid / sub-1 / absent -> default
+        assert_eq!(
+            parse_write_concurrency_limit(None),
+            DEFAULT_WRITE_CONCURRENCY_LIMIT
+        );
+        assert_eq!(
+            parse_write_concurrency_limit(Some("0".to_string())),
+            DEFAULT_WRITE_CONCURRENCY_LIMIT
+        );
+        assert_eq!(
+            parse_write_concurrency_limit(Some("garbage".to_string())),
+            DEFAULT_WRITE_CONCURRENCY_LIMIT
+        );
+    }
     use crate::raft::{NodeInfo, NodeState};
     use crate::ring::TokenRing;
     use ferrosa_common::key::DecoratedKey;

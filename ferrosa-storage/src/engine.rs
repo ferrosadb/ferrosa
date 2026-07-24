@@ -1875,6 +1875,10 @@ impl StorageEngine {
             config.flush_threshold_bytes,
             config.memtable_backpressure_bytes,
         );
+        // Pin the process-wide flush-pool width (FERROSA_FLUSH_PARALLELISM,
+        // default = host parallelism). Bounds fsync/flush concurrency across all
+        // flushes; the first engine to start wins for the process lifetime.
+        crate::flush_executor::configure(crate::flush_executor::default_parallelism());
 
         // Ensure data directories exist.
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {

@@ -314,7 +314,7 @@ pub(crate) async fn handle_connection<S>(
             state: "startup".to_owned(),
             username: None,
             connected_at: Instant::now(),
-            requests_served: 0,
+            requests_served: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             protocol_version: 5,
         },
     );
@@ -3600,7 +3600,7 @@ mod tests {
                 state: "startup".to_owned(),
                 username: None,
                 connected_at: Instant::now(),
-                requests_served: 0,
+                requests_served: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 protocol_version: 5,
             },
         );
@@ -3626,7 +3626,7 @@ mod tests {
                 state: "startup".to_owned(),
                 username: None,
                 connected_at: Instant::now(),
-                requests_served: 0,
+                requests_served: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 protocol_version: 5,
             },
         );

@@ -72,6 +72,10 @@ pub async fn get_metrics(
     // Query-scheduler pool gauges/counters (ferrosa_sched_*). The
     // consensus-headroom gauge must stay > 0 under scan load (t_88223ad0).
     body.push_str(&ferrosa_sched::render_prometheus());
+    // SSTable direct-writer counters (ferrosa_sstable_direct_write_*, Phase 3).
+    // `_fallbacks_total` MUST stay 0 when FERROSA_SSTABLE_DIRECT_IO=1 — non-zero
+    // means the fs rejected O_DIRECT and Data.db is page-cached (mitigation inert).
+    ferrosa_sstable::direct::render_prometheus(&mut body);
     // Raft consensus liveness: ferrosa_raft_current_term / _is_leader /
     // _has_leader (fed by a current_leader() poller) + the election-storm counter
     // (_election_storm_term_jumps_total). The scan-storm regression (t_88223ad0

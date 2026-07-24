@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ferrosa_index::{IndexKey, RowPosition};
+use rayon::prelude::*;
 
 use ferrosa_common::schema::TableSchema;
 use ferrosa_common::{Result, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
@@ -188,6 +189,74 @@ pub fn build_serialization_header(
             .map(|c| (c.name.as_bytes().to_vec(), c.type_name.clone()))
             .collect(),
     }
+}
+
+/// Split token-sorted `partitions` into at most `num_shards` contiguous slices
+/// so each shard can be encoded into its own SSTable in parallel (parallel flush
+/// slice #3 — the encode phase is ~98% of flush time and single-threaded per
+/// SSTable, so sharding the encode across cores is the write-throughput lever).
+///
+/// Preconditions / invariants:
+/// - Input MUST already be sorted by `DecoratedKey` (token order). The caller
+///   (`TableStore::flush`) sorts before calling. Each returned shard then covers
+///   a disjoint, CONTIGUOUS token range, so no partition straddles two shards
+///   and the shards' concatenation, in order, equals the input. That is what
+///   makes the N resulting SSTables correct to merge on read/compaction exactly
+///   like any other set of non-overlapping-by-construction SSTables.
+/// - Balanced by partition count: the first `n % shards` shards get one extra
+///   partition. (Balancing by bytes is a possible future refinement; count is a
+///   good proxy and keeps the split O(n) and allocation-light.)
+/// - No empty shard is ever returned. `num_shards <= 1`, an empty input, or
+///   fewer partitions than shards all degrade gracefully to `<= n` non-empty
+///   shards (and to the single-SSTable behavior when `num_shards <= 1`).
+pub(crate) fn split_sorted_partitions_into_shards(
+    partitions: Vec<Partition>,
+    num_shards: usize,
+) -> Vec<Vec<Partition>> {
+    let n = partitions.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let shards = num_shards.clamp(1, n);
+    if shards == 1 {
+        return vec![partitions];
+    }
+    let base = n / shards;
+    let rem = n % shards;
+    let mut out = Vec::with_capacity(shards);
+    let mut it = partitions.into_iter();
+    for i in 0..shards {
+        let take = base + usize::from(i < rem);
+        let chunk: Vec<Partition> = it.by_ref().take(take).collect();
+        debug_assert!(
+            !chunk.is_empty(),
+            "balanced split must not yield empty shard"
+        );
+        out.push(chunk);
+    }
+    out
+}
+
+/// Minimum partitions per shard — don't shard a flush into slivers. Sharding a
+/// tiny flush just makes more, smaller SSTables (more compaction) for no encode
+/// win, since the encode cost that sharding parallelizes scales with data size.
+pub(crate) const MIN_PARTITIONS_PER_FLUSH_SHARD: usize = 512;
+
+/// Decide how many SSTable shards a flush of `partition_count` partitions should
+/// produce (parallel flush slice #3). Returns 1 (single SSTable — the unchanged
+/// path) unless the table is shardable (`can_shard`: no secondary indexes in
+/// this first increment) AND there is enough data to be worth parallelizing.
+/// Capped at `pool_width` — more shards than the flush pool has threads would
+/// just queue.
+pub(crate) fn desired_flush_shards(
+    partition_count: usize,
+    can_shard: bool,
+    pool_width: usize,
+) -> usize {
+    if !can_shard || pool_width <= 1 || partition_count < 2 * MIN_PARTITIONS_PER_FLUSH_SHARD {
+        return 1;
+    }
+    (partition_count / MIN_PARTITIONS_PER_FLUSH_SHARD).clamp(1, pool_width)
 }
 
 /// Trait abstracting where flushed SSTable component bytes are stored.
@@ -891,14 +960,39 @@ impl FileFlushTarget {
         if has_compression_info {
             components.push(&paths.compression_info);
         }
-        for component in components {
-            Self::fsync_path(component).map_err(|e| {
-                ferrosa_common::Error::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("fsync of component {} failed: {e}", component.display()),
-                ))
-            })?;
-        }
+
+        // Issue every component fsync CONCURRENTLY so their device flushes fill
+        // the storage queue depth instead of serializing at QD1. The single
+        // serial fsync stream is the measured write-throughput floor: the device
+        // has ~4x idle queue depth over one serial fsync stream (fio: 17000 raw
+        // IOPS at QD128 vs ~4090 single-stream fdatasync). Each `sync_all()` is
+        // an independent blocking syscall on a distinct component file.
+        //
+        // The fsyncs run on the shared, BOUNDED flush pool
+        // (`crate::flush_executor`), whose width is configurable
+        // (`FERROSA_FLUSH_PARALLELISM`, default = host parallelism). The pool
+        // caps concurrency across ALL concurrent flushes, so parallelism is a
+        // tunable, not a hard-coded per-flush thread count.
+        //
+        // BARRIER ORDERING (crash-safety — do NOT weaken): `install` blocks
+        // until every component fsync completes, so all component bytes are
+        // durable BEFORE the single directory fsync below. The directory fsync
+        // makes the rename entries durable / claims the SSTable complete, so it
+        // must happen strictly after. `try_for_each` short-circuits on the first
+        // failure and we return it WITHOUT reaching the directory fsync — no
+        // false-durability claim. Guarded by
+        // `fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing`.
+        crate::flush_executor::pool().install(|| {
+            components.par_iter().try_for_each(|component| {
+                Self::fsync_path(component).map_err(|e| {
+                    ferrosa_common::Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("fsync of component {} failed: {e}", component.display()),
+                    ))
+                })
+            })
+        })?;
+
         // One directory fsync after all component fsyncs makes the rename
         // entries durable. This is the most important step in the barrier.
         Self::fsync_dir(&self.base_dir).map_err(|e| {
@@ -1946,6 +2040,165 @@ mod tests {
         assert!(
             fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
             "containing directory was not fsynced"
+        );
+    }
+
+    // ---- split_sorted_partitions_into_shards (parallel-flush slice #3) ----
+
+    /// Flatten shards back to a key list to assert order/coverage preservation.
+    fn shard_keys(shards: &[Vec<Partition>]) -> Vec<DecoratedKey> {
+        shards
+            .iter()
+            .flat_map(|s| s.iter().map(|p| p.key.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn desired_shards_is_one_unless_shardable_and_big_enough() {
+        // Not shardable (has indexes) → always 1.
+        assert_eq!(desired_flush_shards(100_000, false, 8), 1);
+        // Pool width 1 → 1 (no concurrency available).
+        assert_eq!(desired_flush_shards(100_000, true, 1), 1);
+        // Too few partitions to be worth it → 1.
+        assert_eq!(
+            desired_flush_shards(2 * MIN_PARTITIONS_PER_FLUSH_SHARD - 1, true, 8),
+            1
+        );
+    }
+
+    #[test]
+    fn desired_shards_scales_with_data_capped_at_pool_width() {
+        // 4x the min → 4 shards, within an 8-wide pool.
+        assert_eq!(
+            desired_flush_shards(4 * MIN_PARTITIONS_PER_FLUSH_SHARD, true, 8),
+            4
+        );
+        // Plenty of data but only 2 pool threads → capped at 2.
+        assert_eq!(
+            desired_flush_shards(100 * MIN_PARTITIONS_PER_FLUSH_SHARD, true, 2),
+            2
+        );
+    }
+
+    #[test]
+    fn split_empty_partitions_yields_no_shards() {
+        assert!(split_sorted_partitions_into_shards(vec![], 4).is_empty());
+    }
+
+    #[test]
+    fn split_one_shard_returns_input_unchanged() {
+        let parts = vec![make_partition("a", b"1", 1), make_partition("b", b"2", 2)];
+        let keys: Vec<_> = parts.iter().map(|p| p.key.clone()).collect();
+        let shards = split_sorted_partitions_into_shards(parts, 1);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shard_keys(&shards), keys);
+    }
+
+    #[test]
+    fn split_zero_shards_clamps_to_one() {
+        let parts = vec![make_partition("a", b"1", 1)];
+        let shards = split_sorted_partitions_into_shards(parts, 0);
+        assert_eq!(shards.len(), 1, "num_shards=0 must clamp to a single shard");
+    }
+
+    #[test]
+    fn split_balances_and_preserves_order_and_coverage() {
+        // 10 partitions into 3 shards → sizes [4,3,3], concatenation == input.
+        let parts: Vec<Partition> = (0..10)
+            .map(|i| make_partition(&format!("k{i:02}"), b"v", i as i64 + 1))
+            .collect();
+        let input_keys: Vec<_> = parts.iter().map(|p| p.key.clone()).collect();
+        let shards = split_sorted_partitions_into_shards(parts, 3);
+        assert_eq!(shards.len(), 3);
+        assert_eq!(
+            shards.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            vec![4, 3, 3],
+            "first (n % shards) shards get one extra"
+        );
+        // No partition lost/duplicated; order preserved (so token ranges are
+        // contiguous and disjoint — the read/compaction-safety invariant).
+        assert_eq!(shard_keys(&shards), input_keys);
+    }
+
+    #[test]
+    fn split_more_shards_than_partitions_yields_singletons_no_empties() {
+        let parts: Vec<Partition> = (0..3)
+            .map(|i| make_partition(&format!("k{i}"), b"v", i as i64 + 1))
+            .collect();
+        let input_keys: Vec<_> = parts.iter().map(|p| p.key.clone()).collect();
+        let shards = split_sorted_partitions_into_shards(parts, 8);
+        assert_eq!(shards.len(), 3, "at most n shards, never empty ones");
+        assert!(shards.iter().all(|s| s.len() == 1));
+        assert_eq!(shard_keys(&shards), input_keys);
+    }
+
+    #[test]
+    fn split_coverage_holds_across_many_shapes() {
+        // Property-ish: for many (n, shards), flatten == input and no empties.
+        for n in [1usize, 2, 5, 7, 16, 33] {
+            let parts: Vec<Partition> = (0..n)
+                .map(|i| make_partition(&format!("p{i:03}"), b"v", i as i64 + 1))
+                .collect();
+            let input_keys: Vec<_> = parts.iter().map(|p| p.key.clone()).collect();
+            for shards_n in [1usize, 2, 3, 4, 8, 64] {
+                let shards = split_sorted_partitions_into_shards(parts.clone(), shards_n);
+                assert!(
+                    shards.iter().all(|s| !s.is_empty()),
+                    "n={n} shards_n={shards_n}: empty shard"
+                );
+                assert!(shards.len() <= n.min(shards_n.max(1)));
+                assert_eq!(
+                    shard_keys(&shards),
+                    input_keys,
+                    "n={n} shards_n={shards_n}: coverage/order broken"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fsync_components_fails_loud_and_skips_dir_when_a_component_is_missing() {
+        // Guards the fail-loud barrier that the parallel-fsync refactor must
+        // preserve: if ANY component fsync fails (here, a missing file), the
+        // call returns Err AND the containing directory is NOT fsynced. Fsyncing
+        // the directory is what makes the rename entries durable / claims the
+        // SSTable is complete — doing it after a component fsync failed would be
+        // a false-durability claim (the worst outcome). Present components may or
+        // may not have been fsynced by the time the failure is observed (with
+        // parallel fsyncs some will have completed); the invariant under test is
+        // narrowly: Err is returned and the dir barrier did not fire.
+        let _fsync_probe = fsync_probe::exclusive();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        // Create every component file EXCEPT `statistics`, which stays missing so
+        // its fsync_path() (File::open) fails.
+        let base = dir.path();
+        let touch = |name: &str| {
+            let p = base.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let paths = FileComponentPaths {
+            data: touch("9-Data.db"),
+            partitions: touch("9-Partitions.db"),
+            rows: touch("9-Rows.db"),
+            filter: touch("9-Filter.db"),
+            statistics: base.join("9-Statistics.db"), // intentionally NOT created
+            toc: touch("9-TOC.txt"),
+            compression_info: base.join("9-CompressionInfo.db"),
+        };
+
+        let result = target.fsync_components(&paths, /* has_compression_info */ false);
+        assert!(
+            result.is_err(),
+            "fsync_components must fail loud when a component is missing"
+        );
+        assert!(
+            !fsync_probe::synced_dirs().contains(&base.to_path_buf()),
+            "directory must NOT be fsynced after a component fsync failed \
+             (that would falsely claim the SSTable is durable)"
         );
     }
 

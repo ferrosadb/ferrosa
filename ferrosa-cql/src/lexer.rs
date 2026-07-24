@@ -323,6 +323,21 @@ fn kind_matches(actual: &TokenKind<'_>, expected: &TokenKind<'_>) -> bool {
     }
 }
 
+/// Identifier-byte classification table: `true` for `[A-Za-z0-9_]`, the byte
+/// class an unquoted identifier / keyword may contain. A single indexed load
+/// replaces the `is_ascii_alphanumeric() || b == b'_'` range-check chain in the
+/// identifier scan (the hottest lexer leaf); `const` so it lives in `.rodata`.
+const IDENT_BYTE: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        t[i] = b.is_ascii_alphanumeric() || b == b'_';
+        i += 1;
+    }
+    t
+};
+
 /// Zero-allocation lexer for CQL queries.
 ///
 /// Yields `Token<'input>` values that borrow from the source string.
@@ -357,6 +372,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Peek at the next token without consuming it.
+    #[inline]
     pub fn peek(&mut self) -> Result<&Token<'input>, CqlError> {
         if self.peeked.is_none() {
             self.peeked = Some(self.advance()?);
@@ -366,6 +382,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Consume and return the next token.
+    #[inline]
     pub fn next_token(&mut self) -> Result<Token<'input>, CqlError> {
         if let Some(tok) = self.peeked.take() {
             return Ok(tok);
@@ -374,6 +391,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Consume the next token and assert its kind matches `expected`.
+    #[inline]
     pub fn expect(&mut self, expected: &TokenKind<'_>) -> Result<Token<'input>, CqlError> {
         let tok = self.next_token()?;
         if kind_matches(&tok.kind, expected) {
@@ -388,6 +406,7 @@ impl<'input> Lexer<'input> {
 
     /// Peek and consume the next token if it matches `expected`.
     /// Returns `Ok(true)` if consumed, `Ok(false)` otherwise.
+    #[inline]
     pub fn eat(&mut self, expected: &TokenKind<'_>) -> Result<bool, CqlError> {
         let tok = self.peek()?;
         if kind_matches(&tok.kind, expected) {
@@ -399,6 +418,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Skip whitespace and comments (`--` line comments, `/* */` block comments).
+    #[inline]
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             // Skip whitespace
@@ -472,6 +492,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Advance the cursor and produce the next token.
+    #[inline]
     fn advance(&mut self) -> Result<Token<'input>, CqlError> {
         self.skip_whitespace_and_comments();
 
@@ -680,16 +701,21 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read an identifier or keyword. Also detects UUID literals.
+    #[inline]
     fn read_identifier(&mut self) -> Token<'input> {
         let start = self.pos;
-        while self.pos < self.bytes.len() {
-            let b = self.bytes[self.pos];
-            if b.is_ascii_alphanumeric() || b == b'_' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
+        // Scan the `[A-Za-z0-9_]` run via a branchless classification-table
+        // lookup + `position()` (one table load per byte, no range-check
+        // branch chain) instead of `is_ascii_alphanumeric() || b == b'_'`.
+        // `position` stops at the first non-ident byte; `unwrap_or` handles an
+        // identifier that runs to end-of-input. This is the dominant `advance`
+        // leaf in the write-path flamegraph (t_48d5eeaa).
+        let rest = &self.bytes[self.pos..];
+        let run = rest
+            .iter()
+            .position(|&b| !IDENT_BYTE[b as usize])
+            .unwrap_or(rest.len());
+        self.pos += run;
 
         let text = &self.input[start..self.pos];
 
@@ -713,18 +739,35 @@ impl<'input> Lexer<'input> {
             self.pos = saved_pos;
         }
 
-        // Case-insensitive keyword lookup
-        let upper = text.to_ascii_uppercase();
-        if let Some(&kw) = KEYWORDS.get(upper.as_str()) {
-            Token {
-                kind: TokenKind::Keyword(kw),
-                pos: start,
+        // Case-insensitive keyword lookup WITHOUT a heap allocation.
+        //
+        // The old `text.to_ascii_uppercase()` allocated a String on EVERY
+        // identifier and keyword — the dominant unprepared-write lexer cost in
+        // the perf flamegraph (t_48d5eeaa). Instead: only an identifier no
+        // longer than the longest keyword (DURABLE_WRITES = 14) can match, so
+        // uppercase into a fixed stack buffer and look that up; longer
+        // identifiers skip the lookup entirely. `text` is ASCII by construction
+        // (this fn only consumed `[A-Za-z0-9_]`), so `from_utf8` is the cheap
+        // ASCII fast path and never fails.
+        const KW_BUF: usize = 32; // >= longest keyword; an ident longer than this cannot be one
+        let n = text.len();
+        if n <= KW_BUF {
+            let mut buf = [0u8; KW_BUF];
+            for (dst, &b) in buf[..n].iter_mut().zip(text.as_bytes()) {
+                *dst = b.to_ascii_uppercase();
             }
-        } else {
-            Token {
-                kind: TokenKind::Ident(text),
-                pos: start,
+            if let Ok(upper) = std::str::from_utf8(&buf[..n]) {
+                if let Some(&kw) = KEYWORDS.get(upper) {
+                    return Token {
+                        kind: TokenKind::Keyword(kw),
+                        pos: start,
+                    };
+                }
             }
+        }
+        Token {
+            kind: TokenKind::Ident(text),
+            pos: start,
         }
     }
 
@@ -772,6 +815,7 @@ impl<'input> Lexer<'input> {
     /// might be a UUID literal like `550e8400-e29b-...`. In that case we
     /// extend the read to the full alphanumeric word and attempt UUID
     /// detection, falling back to an identifier if it's not a valid UUID.
+    #[inline]
     fn read_number(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
@@ -839,16 +883,11 @@ impl<'input> Lexer<'input> {
                 self.pos = saved_pos;
             }
 
-            // Not a UUID — return as identifier (keyword lookup won't match
-            // anything starting with a digit, so it'll be Ident).
+            // Not a UUID — return as identifier. This token starts with a digit
+            // (we're in read_number), and no CQL keyword starts with a digit, so
+            // the keyword lookup can never match: skip it entirely (the old code
+            // heap-allocated an uppercased String just to look up nothing).
             let text = &self.input[start..self.pos];
-            let upper = text.to_ascii_uppercase();
-            if let Some(&kw) = KEYWORDS.get(upper.as_str()) {
-                return Ok(Token {
-                    kind: TokenKind::Keyword(kw),
-                    pos: start,
-                });
-            }
             return Ok(Token {
                 kind: TokenKind::Ident(text),
                 pos: start,
@@ -959,22 +998,56 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a string literal: `'hello'` with `''` escape.
+    ///
+    /// Fast path: search ahead (byte offsets) for the closing quote. With no
+    /// `''` escape — the common case — the content is a contiguous source slice
+    /// copied ONCE (en masse) rather than byte-by-byte `String::push`. A `''`
+    /// escape drops to `read_escaped_string`.
+    #[inline]
     fn read_string_literal(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
+        let content_start = self.pos;
+        // memchr jumps (SIMD) straight to the next single-quote instead of
+        // testing every content byte. The byte after it disambiguates a `''`
+        // escape (slow path) from the closing quote (fast bulk copy).
+        if let Some(rel) = memchr::memchr(b'\'', &self.bytes[content_start..]) {
+            let quote = content_start + rel;
+            if quote + 1 < self.bytes.len() && self.bytes[quote + 1] == b'\'' {
+                self.pos = quote;
+                return self.read_escaped_string(start, content_start);
+            }
+            let content = self.input[content_start..quote].to_owned();
+            self.pos = quote + 1; // consume closing quote
+            return Ok(Token {
+                kind: TokenKind::StringLiteral(content),
+                pos: start,
+            });
+        }
+        self.pos = self.bytes.len();
+        Err(CqlError::SyntaxError(format!(
+            "unterminated string literal starting at position {start}"
+        )))
+    }
 
+    /// Slow path for string literals that contain a `''` escape: unescape into
+    /// an owned String. Reached only when the fast path detected an escape.
+    fn read_escaped_string(
+        &mut self,
+        start: usize,
+        content_start: usize,
+    ) -> Result<Token<'input>, CqlError> {
+        self.pos = content_start;
         let mut s = String::new();
         loop {
             if self.pos >= self.bytes.len() {
                 return Err(CqlError::SyntaxError(format!(
-                    "unterminated string literal starting at position {}",
-                    start
+                    "unterminated string literal starting at position {start}"
                 )));
             }
             let b = self.bytes[self.pos];
             if b == b'\'' {
                 self.pos += 1;
-                // Check for escaped quote ('')
                 if self.pos < self.bytes.len() && self.bytes[self.pos] == b'\'' {
                     s.push('\'');
                     self.pos += 1;
@@ -993,6 +1066,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a quoted identifier: `"MyTable"`.
+    #[inline]
     fn read_quoted_identifier(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 1; // skip opening double-quote
@@ -1027,6 +1101,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a hex blob literal: `0xDEADBEEF`.
+    #[inline]
     fn read_hex_blob(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 2; // skip 0x

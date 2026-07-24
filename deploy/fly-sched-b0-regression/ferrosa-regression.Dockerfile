@@ -20,14 +20,16 @@ ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1"
 RUN cargo build --release -p ferrosa -p ferrosa-loadgen
 
 FROM debian:trixie-slim
+# gdb: capture an all-thread backtrace when the diag sampler detects a >1s pause.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl procps \
+        ca-certificates curl procps gdb \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
 COPY --from=builder /build/target/release/ferrosa-loadgen /usr/local/bin/
 COPY deploy/fly-sched-b0-regression/regression-entrypoint.sh /usr/local/bin/
 COPY deploy/fly-sched-b0-regression/scrape.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/regression-entrypoint.sh /usr/local/bin/scrape.sh
+COPY deploy/fly-sched-b0-regression/diag.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/regression-entrypoint.sh /usr/local/bin/scrape.sh /usr/local/bin/diag.sh
 EXPOSE 9042 17000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa
 ENTRYPOINT ["regression-entrypoint.sh"]

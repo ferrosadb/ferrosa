@@ -23,6 +23,7 @@ pub mod bloom;
 pub mod byte_comparable;
 pub mod compression;
 pub mod data;
+pub mod direct;
 pub mod io;
 pub mod marshal;
 pub mod partition_index;
