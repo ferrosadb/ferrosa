@@ -34,6 +34,7 @@ BIN_DIR="${INSTALL_ROOT}/bin"
 CONFIG_DIR="${INSTALL_ROOT}/config"
 DATA_DIR="${INSTALL_ROOT}/data"
 LOG_DIR="${INSTALL_ROOT}/logs"
+INSTALL_OUTCOME_PATH="${INSTALL_ROOT}/install-outcome.json"
 NOMIC_MODEL="${NOMIC_MODEL:-nomic-embed-text-v2-moe}"
 DB_HOST="${FERROSA_SETUP_CQL_HOST:-127.0.0.1}"
 DB_PORT="${FERROSA_SETUP_CQL_PORT:-9042}"
@@ -46,6 +47,8 @@ WANT_HOOKS=""    # ask|yes|no — install harness hooks (default yes)
 WANT_START="${FERROSA_MEMORY_START:-}"   # yes|no — start the MCP server (default yes on macOS)
 HARNESS="${FERROSA_HARNESS:-auto}"   # auto|all|codex|claude|hermes|pi|generic
 MCP_URL="${FERROSA_MEMORY_MCP_URL:-http://127.0.0.1:18765/mcp}"
+DB_OUTCOME="not_attempted"
+MCP_OUTCOME="not_attempted"
 
 # Path to the LaunchAgent plist template shipped in the ferrosa-memory tarball.
 # Populated in Stage 1 (before the extract dir is cleaned) and consumed by the
@@ -88,6 +91,21 @@ done
 
 say() { printf ':: %s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+write_install_outcome() {
+  local tmp="${INSTALL_OUTCOME_PATH}.tmp.$$"
+  (
+    umask 077
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "installer": "setup-memory",\n'
+    printf '  "recorded_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "database": { "status": "%s" },\n' "$DB_OUTCOME"
+    printf '  "mcp": { "status": "%s" }\n' "$MCP_OUTCOME"
+    printf '}\n'
+  ) > "$tmp"
+  mv "$tmp" "$INSTALL_OUTCOME_PATH"
+}
 
 detect_target() {
   local os arch
@@ -319,6 +337,8 @@ wait_for_db() {
 }
 
 manual_db_action_required() {
+  DB_OUTCOME="manual_action_required"
+  write_install_outcome
   say "manual_action_required: local Ferrosa is configured but not running"
   say "Start the database, then re-run this installer:"
   say "  FERROSA_CONFIG=\"$CONFIG_DIR/ferrosa.toml\" \"$BIN_DIR/ferrosa\""
@@ -381,6 +401,7 @@ ensure_local_db_ready() {
 }
 
 ensure_local_db_ready
+DB_OUTCOME="ready"
 
 # ── Stage 4b: start the MCP server (macOS LaunchAgent) ──────────────────────
 # A fresh install lays down a binary + config but no running process, so nothing
@@ -465,17 +486,26 @@ start_server() {
 }
 
 if [ "$WANT_START" = "no" ]; then
+  MCP_OUTCOME="skipped"
   say "skipping MCP server start (--no-start). Start it later with:"
   say "  FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp"
 elif [ "$(uname -s)" = "Darwin" ]; then
-  if start_server; then STARTED="yes"; else STARTED="failed"; fi
+  if start_server; then
+    STARTED="yes"
+    MCP_OUTCOME="started"
+  else
+    STARTED="failed"
+    MCP_OUTCOME="failed"
+  fi
 else
   # Auto-start uses a macOS LaunchAgent; on other OSes, tell the user how to run
   # it manually rather than failing.
   STARTED="manual"
+  MCP_OUTCOME="manual"
   say "auto-start is macOS-only on this installer — start the server manually:"
   say "  FERROSA_MEMORY_CONFIG=$CONFIG_DIR/ferrosa-memory.toml $BIN_DIR/ferrosa-memory-mcp"
 fi
+write_install_outcome
 
 # ── Stage 5: hand off to LLM harness ────────────────────────────────────────
 case "$STARTED" in
@@ -493,6 +523,7 @@ ferrosa-memory $VERSION installed.
   binaries: $BIN_DIR
   config:   $CONFIG_DIR/ferrosa-memory.toml
   hooks:    ~/.config/ferrosa-memory/hooks (harness=$HARNESS; unless --no-hooks)
+  outcome:  $INSTALL_OUTCOME_PATH
   onboard:  $ONBOARDING_PATH
   $SERVER_LINE
 
