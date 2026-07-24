@@ -74,10 +74,10 @@ error-frame encoding is worth fixing (tracked separately).
 ## Scope and honest limits
 
 - This certifies the **single-DC, RF=3, Accord list-append** transaction path
-  under a **fault-free** run. Fault-injected certification
-  (`certify-nemesis.sh`: minority partition + 200 ms WAN) and **dual-DC**
-  (`certify-dc.sh`, still gated on cross-DC replication) are separate and not
-  covered by this artifact.
+  both fault-free and under the recorded fault schedule: minority partition,
+  coordinator isolation, and 200 ms latency. It does **not** cover other fault
+  schedules or **dual-DC** certification (`certify-dc.sh` remains gated on
+  cross-DC replication).
 - The Elle checker is **not** wired into CI; CI checks the bank conservation
   invariant nightly. This certification is a **manual, reproducible** run.
 
