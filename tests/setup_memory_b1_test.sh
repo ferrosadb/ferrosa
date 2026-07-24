@@ -30,6 +30,21 @@ ok() {
   printf 'ok: %s\n' "$*" >&2
 }
 
+assert_outcome() { # home database-status mcp-status
+  python3 - "$1/.ferrosa/install-outcome.json" "$2" "$3" <<'PY'
+import json
+import sys
+
+path, expected_db, expected_mcp = sys.argv[1:]
+with open(path, encoding="utf-8") as receipt:
+    outcome = json.load(receipt)
+
+assert outcome["schema_version"] == 1, outcome
+assert outcome["database"]["status"] == expected_db, outcome
+assert outcome["mcp"]["status"] == expected_mcp, outcome
+PY
+}
+
 free_port() {
   python3 - <<'PY'
 import socket
@@ -199,6 +214,8 @@ grep -F "enable --now ferrosa.service" "$WORK/systemctl-ready.log" >/dev/null \
   || fail "quick start did not use the canonical systemd DB start path"
 grep -F "database ready on 127.0.0.1:$ready_port" "$ready_log" >/dev/null \
   || fail "quick start did not wait for the DB readiness probe"
+assert_outcome "$ready_home" ready skipped \
+  || fail "quick start did not record its skipped MCP start outcome"
 [ ! -e "$WORK/mcp-ready.started" ] \
   || fail "--no-start must not launch MCP after the DB gate"
 ok "supported Linux service path starts and verifies the database before MCP handling"
@@ -215,6 +232,8 @@ grep -F "database ready on 127.0.0.1:$mac_port" "$mac_log" >/dev/null \
   || fail "quick start did not wait for database readiness before MCP launchd setup"
 [ -e "$WORK/mcp-macos.started" ] \
   || fail "MCP LaunchAgent was not started after the database gate"
+assert_outcome "$mac_home" ready started \
+  || fail "quick start did not record its successful MCP start outcome"
 db_bootstrap=$(grep -n '/com.ferrosadb.ferrosa.plist' "$WORK/launchctl-macos.log" | head -1 | cut -d: -f1)
 mcp_bootstrap=$(grep -n '/com.ferrosa-memory.mcp.plist' "$WORK/launchctl-macos.log" | head -1 | cut -d: -f1)
 [ -n "$db_bootstrap" ] && [ -n "$mcp_bootstrap" ] && [ "$db_bootstrap" -lt "$mcp_bootstrap" ] \
@@ -234,6 +253,8 @@ grep -F "manual_action_required: local Ferrosa is configured but not running" "$
   || fail "missing explicit manual-action state"
 grep -F "$manual_command" "$manual_log" >/dev/null \
   || fail "manual-action state did not include the exact DB start command"
+assert_outcome "$manual_home" manual_action_required not_attempted \
+  || fail "quick start did not record the failed DB service outcome"
 [ ! -e "$WORK/mcp-fail.started" ] \
   || fail "MCP must not launch when the database start requires manual action"
 ok "unsupported service path exits with the exact manual DB command before MCP handling"
