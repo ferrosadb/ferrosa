@@ -1444,6 +1444,13 @@ pub struct SharedState {
     /// Accord clock, peer manager), shared with other front-ends via `Deref`.
     pub core: Arc<SessionCore>,
     pub prepared_cache: Arc<PreparedCache>,
+    /// Transparent auto-parameterization cache for inline-literal unprepared
+    /// queries (INSERT slice 1, t_48d5eeaa). `None` disables the fast path —
+    /// the DEFAULT — so `handle_query` always full-parses; `Some` opts a shape
+    /// into skeleton caching after a verified first parse. Gated by
+    /// `FERROSA_TRANSPARENT_PARAM_CACHE` at server construction, never per
+    /// request (so no test-time env race), and never changes query semantics.
+    pub param_cache: Option<Arc<crate::param_cache::TransparentCache>>,
     pub connection_tracker: Arc<ConnectionTracker>,
     pub query_tracker: Arc<QueryTracker>,
     /// Records full-scan occurrences for `system_observability.full_scan_reasons`.
@@ -13498,6 +13505,7 @@ mod tests {
                 accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
             }),
             prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),
+            param_cache: None,
             connection_tracker: Arc::new(ConnectionTracker::new()),
             query_tracker: Arc::new(QueryTracker::new()),
             full_scan_tracker: Arc::new(crate::virtual_tables::FullScanTracker::new()),
