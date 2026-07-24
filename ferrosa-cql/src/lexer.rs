@@ -979,23 +979,53 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a string literal: `'hello'` with `''` escape.
+    ///
+    /// Fast path: search ahead (byte offsets) for the closing quote. With no
+    /// `''` escape — the common case — the content is a contiguous source slice
+    /// copied ONCE (en masse) rather than byte-by-byte `String::push`. A `''`
+    /// escape drops to `read_escaped_string`.
     #[inline]
     fn read_string_literal(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
+        let content_start = self.pos;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b'\'' {
+                if self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == b'\'' {
+                    return self.read_escaped_string(start, content_start);
+                }
+                let content = self.input[content_start..self.pos].to_owned();
+                self.pos += 1; // consume closing quote
+                return Ok(Token {
+                    kind: TokenKind::StringLiteral(content),
+                    pos: start,
+                });
+            }
+            self.pos += 1;
+        }
+        Err(CqlError::SyntaxError(format!(
+            "unterminated string literal starting at position {start}"
+        )))
+    }
 
+    /// Slow path for string literals that contain a `''` escape: unescape into
+    /// an owned String. Reached only when the fast path detected an escape.
+    fn read_escaped_string(
+        &mut self,
+        start: usize,
+        content_start: usize,
+    ) -> Result<Token<'input>, CqlError> {
+        self.pos = content_start;
         let mut s = String::new();
         loop {
             if self.pos >= self.bytes.len() {
                 return Err(CqlError::SyntaxError(format!(
-                    "unterminated string literal starting at position {}",
-                    start
+                    "unterminated string literal starting at position {start}"
                 )));
             }
             let b = self.bytes[self.pos];
             if b == b'\'' {
                 self.pos += 1;
-                // Check for escaped quote ('')
                 if self.pos < self.bytes.len() && self.bytes[self.pos] == b'\'' {
                     s.push('\'');
                     self.pos += 1;
