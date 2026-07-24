@@ -67,3 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [[bench]]
 name = "lexer_bench"
 harness = false
+
+[[bench]]
+name = "param_cache_bench"
+harness = false
