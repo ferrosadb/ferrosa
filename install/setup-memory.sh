@@ -192,6 +192,15 @@ chmod +x "$BIN_DIR/ferrosa-memory-mcp"
 if [ ! -f "$CONFIG_DIR/ferrosa-memory.toml" ]; then
   cp "$M_TMP/config/ferrosa-memory.example.toml" "$CONFIG_DIR/ferrosa-memory.toml"
 fi
+# Retain released HTTP/auth templates after the temporary archive is removed.
+# They are reference material, never active credentials or generated config.
+if [ -d "$M_TMP/examples" ]; then
+  MEMORY_EXAMPLES_DIR="$INSTALL_ROOT/share/ferrosa-memory/examples"
+  mkdir -p "$(dirname "$MEMORY_EXAMPLES_DIR")"
+  rm -rf "${MEMORY_EXAMPLES_DIR:?}"
+  cp -R "$M_TMP/examples" "$MEMORY_EXAMPLES_DIR"
+  say "installed memory templates to $MEMORY_EXAMPLES_DIR"
+fi
 # The release tarball ships a LaunchAgent plist template (with __BINARY_PATH__ /
 # __REPO_ROOT__ / __CONFIG_PATH__ / __HOME__ placeholders). Stash it to a stable
 # location now, before $M_TMP is removed, so the server-start stage can render it.

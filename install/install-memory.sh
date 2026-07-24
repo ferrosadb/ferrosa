@@ -32,6 +32,9 @@ CONFIG_DIR="${INSTALL_ROOT}/config"
 DATA_DIR="${INSTALL_ROOT}/data"
 LOG_DIR="${INSTALL_ROOT}/logs"
 RUN_DIR="${INSTALL_ROOT}/run"
+# Released HTTP/auth templates are documentation, not active configuration.
+# Keep them outside config/ so upgrades never overwrite generated credentials.
+EXAMPLES_DIR="${INSTALL_ROOT}/share/ferrosa-memory/examples"
 # Separate stamp from ferrosa's own .version so the two installers don't clobber
 # each other's idempotency state.
 VERSION_STAMP="${INSTALL_ROOT}/.memory-version"
@@ -183,6 +186,15 @@ else
   say "kept existing $CONFIG_DIR/ferrosa-memory.toml"
 fi
 
+if [ -d "$TMP/examples" ]; then
+  mkdir -p "$(dirname "$EXAMPLES_DIR")"
+  rm -rf "${EXAMPLES_DIR:?}"
+  cp -R "$TMP/examples" "$EXAMPLES_DIR"
+  say "installed release templates to $EXAMPLES_DIR"
+else
+  say "warning: this release bundles no examples; upgrade for HTTP/auth templates"
+fi
+
 # ---------- service registration ----------
 prompt_yes() {
   local q="$1" a
@@ -273,6 +285,7 @@ fi
 cat <<EOF >&2
   binary: $BIN_DIR/ferrosa-memory-mcp
   config: $CONFIG_DIR/ferrosa-memory.toml
+  templates: $EXAMPLES_DIR
 
 This MCP server connects to a running Ferrosa instance at localhost:9042
 (default from https://ferrosadb.com/install.sh). Ensure Ferrosa is up:
