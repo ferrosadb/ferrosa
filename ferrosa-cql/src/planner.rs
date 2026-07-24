@@ -130,6 +130,31 @@ impl fmt::Display for ScanPlan {
     }
 }
 
+impl ScanPlan {
+    /// The query-scheduler class this plan's storage work belongs to (B1 T1.4).
+    ///
+    /// Only an unindexed [`FullScan`](ScanPlan::FullScan) — the `ALLOW FILTERING`
+    /// whole-table read that starved consensus in `t_88223ad0` — is unbounded
+    /// [`Bulk`](ferrosa_sched::SchedClass::Bulk) work that must cede the scan pool
+    /// to interactive queries. Every other plan is *keyed or index-bounded*
+    /// (`O(matching rows)`, not `O(table)`), so it is latency-sensitive
+    /// [`Foreground`](ferrosa_sched::SchedClass::Foreground) work. The class
+    /// seeds the fair-share weight (`weight_for_class`) when the scan is admitted.
+    pub fn sched_class(&self) -> ferrosa_sched::SchedClass {
+        match self {
+            ScanPlan::FullScan => ferrosa_sched::SchedClass::Bulk,
+            ScanPlan::PartitionKeyLookup
+            | ScanPlan::SingleIndex { .. }
+            | ScanPlan::PartitionIndexLookup { .. }
+            | ScanPlan::IndexScanWithFilter { .. }
+            | ScanPlan::IndexIntersection { .. }
+            | ScanPlan::VectorAnn { .. }
+            | ScanPlan::GeoIndex { .. }
+            | ScanPlan::FullTextIndex { .. } => ferrosa_sched::SchedClass::Foreground,
+        }
+    }
+}
+
 /// Choose an execution plan for a SELECT query.
 ///
 /// # Parameters
@@ -308,6 +333,84 @@ mod tests {
             value: Term::StringLiteral("dummy".to_string()),
             token_fn: false,
         }
+    }
+
+    // ── B1 T1.4: ScanPlan → SchedClass classifier ────────────────────────────
+    #[test]
+    fn full_scan_is_bulk_every_bounded_plan_is_foreground() {
+        use ferrosa_sched::SchedClass::{Bulk, Foreground};
+        let idx = || ("i".to_string(), "c".to_string());
+        // The full ScanPlan matrix → expected scheduling class.
+        let cases = [
+            (ScanPlan::FullScan, Bulk),
+            (ScanPlan::PartitionKeyLookup, Foreground),
+            (
+                ScanPlan::SingleIndex {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::PartitionIndexLookup {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::IndexScanWithFilter {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                    filter_columns: vec!["f".into()],
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::IndexIntersection {
+                    indexes: vec![idx(), idx()],
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::VectorAnn {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::GeoIndex {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                    op: "GeoNearest".into(),
+                },
+                Foreground,
+            ),
+            (
+                ScanPlan::FullTextIndex {
+                    index_name: "i".into(),
+                    index_column: "c".into(),
+                },
+                Foreground,
+            ),
+        ];
+        for (plan, expected) in cases {
+            assert_eq!(plan.sched_class(), expected, "unexpected class for {plan}");
+        }
+    }
+
+    #[test]
+    fn full_scan_class_seeds_a_lighter_weight_than_a_point_read() {
+        use ferrosa_sched::runqueue::weight_for_class;
+        // A FullScan (Bulk) must weigh less than a point read (Foreground) so it
+        // yields the scan pool to interactive work.
+        let scan_w = weight_for_class(ScanPlan::FullScan.sched_class());
+        let point_w = weight_for_class(ScanPlan::PartitionKeyLookup.sched_class());
+        assert!(
+            scan_w < point_w,
+            "FullScan {scan_w} should weigh < point read {point_w}"
+        );
     }
 
     fn pk(names: &[&str]) -> Vec<String> {
