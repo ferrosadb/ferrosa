@@ -357,6 +357,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Peek at the next token without consuming it.
+    #[inline]
     pub fn peek(&mut self) -> Result<&Token<'input>, CqlError> {
         if self.peeked.is_none() {
             self.peeked = Some(self.advance()?);
@@ -366,6 +367,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Consume and return the next token.
+    #[inline]
     pub fn next_token(&mut self) -> Result<Token<'input>, CqlError> {
         if let Some(tok) = self.peeked.take() {
             return Ok(tok);
@@ -374,6 +376,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Consume the next token and assert its kind matches `expected`.
+    #[inline]
     pub fn expect(&mut self, expected: &TokenKind<'_>) -> Result<Token<'input>, CqlError> {
         let tok = self.next_token()?;
         if kind_matches(&tok.kind, expected) {
@@ -388,6 +391,7 @@ impl<'input> Lexer<'input> {
 
     /// Peek and consume the next token if it matches `expected`.
     /// Returns `Ok(true)` if consumed, `Ok(false)` otherwise.
+    #[inline]
     pub fn eat(&mut self, expected: &TokenKind<'_>) -> Result<bool, CqlError> {
         let tok = self.peek()?;
         if kind_matches(&tok.kind, expected) {
@@ -399,6 +403,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Skip whitespace and comments (`--` line comments, `/* */` block comments).
+    #[inline]
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             // Skip whitespace
@@ -472,6 +477,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Advance the cursor and produce the next token.
+    #[inline]
     fn advance(&mut self) -> Result<Token<'input>, CqlError> {
         self.skip_whitespace_and_comments();
 
@@ -680,6 +686,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read an identifier or keyword. Also detects UUID literals.
+    #[inline]
     fn read_identifier(&mut self) -> Token<'input> {
         let start = self.pos;
         while self.pos < self.bytes.len() {
@@ -772,6 +779,7 @@ impl<'input> Lexer<'input> {
     /// might be a UUID literal like `550e8400-e29b-...`. In that case we
     /// extend the read to the full alphanumeric word and attempt UUID
     /// detection, falling back to an identifier if it's not a valid UUID.
+    #[inline]
     fn read_number(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
@@ -959,6 +967,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a string literal: `'hello'` with `''` escape.
+    #[inline]
     fn read_string_literal(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
@@ -993,6 +1002,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a quoted identifier: `"MyTable"`.
+    #[inline]
     fn read_quoted_identifier(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 1; // skip opening double-quote
@@ -1027,6 +1037,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Read a hex blob literal: `0xDEADBEEF`.
+    #[inline]
     fn read_hex_blob(&mut self) -> Result<Token<'input>, CqlError> {
         let start = self.pos;
         self.pos += 2; // skip 0x

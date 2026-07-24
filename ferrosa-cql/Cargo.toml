@@ -55,9 +55,14 @@ live-infra-tests = []
 test-util = []
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
 rcgen = "0.14"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "lexer_bench"
+harness = false
