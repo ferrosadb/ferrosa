@@ -403,6 +403,7 @@ mod tests {
             max_groups: 1000,
             max_collect_size: 1000,
             max_var_path_visited: 100,
+            ..GraphEngineConfig::default()
         }
     }
 

@@ -1,18 +1,19 @@
 //! Module: Spill adapter — lets graph result rows use the storage engine's
 //! bounded-memory external merge sort.
 //! Correctness: Correct when [`GraphRowOrder`] orders rows EXACTLY as the
-//!   in-memory [`super::expand::sort_rows`] does, so switching ORDER BY to the
+//!   in-memory `sort_rows` does, so switching ORDER BY to the
 //!   spilling sorter changes memory behavior and nothing else.
 //! Last revised: 2026-07-25
-//! Last changed: New module — increment 5 of the streaming executor
-//!   (t_4ce82a3e). Adapter only; the executor is not wired to it yet.
+//! Last changed: Wired into the executor — `execute_expand`'s unbounded ORDER BY
+//!   now sorts through `spill_order_by`, and the `max_result_rows` truncation
+//!   it replaced is gone (increment 5 of the streaming executor, t_4ce82a3e).
 //!
 //! # Why
 //!
 //! `ORDER BY` without `LIMIT` is a pipeline-breaker: every row must be seen
-//! before the first output row is known. The graph executor currently buffers
-//! the whole result and silently truncates at `max_result_rows` — a client
-//! cannot distinguish a partial result from a complete one.
+//! before the first output row is known. The graph executor used to buffer the
+//! whole result and silently truncate at `max_result_rows` — no error, no flag,
+//! so a client could not distinguish a partial result from a complete one.
 //!
 //! ferrosa-cql already solved this with [`ferrosa_storage::ExternalSorter`]:
 //! accumulate to a byte threshold, spill sorted runs to a temp directory, k-way
@@ -25,7 +26,7 @@
 //!
 //! The sorter is generic over `SpillOrder<T>` precisely so callers keep their
 //! own ordering. Graph rows are `Vec<serde_json::Value>` and
-//! [`super::expand::compare_json_values`] has semantics `CqlValue`'s `Ord` does
+//! `compare_json_values` has semantics `CqlValue`'s `Ord` does
 //! not share — mixed types (String vs Number) and complex values (objects,
 //! arrays) compare **Equal**, and `Null` sorts before any present value.
 //! Converting graph rows to `CqlValue` to reuse the CQL comparator would
@@ -36,6 +37,22 @@ use std::cmp::Ordering;
 use ferrosa_storage::external_sort::{SpillOrder, SpillRow};
 
 use super::stream::RowVals;
+
+/// Reserves a cancellable temp directory for a spilling ORDER BY sort.
+///
+/// Hung off `GraphEngineConfig` — which the executor already
+/// threads everywhere — rather than plumbing a `StorageEngine` through every
+/// recursive `execute` call. `None` means no spill backend is available (unit
+/// tests, embedded use); ORDER BY then sorts in memory exactly as before.
+///
+/// The returned reservation's `Drop` removes the directory, so an aborted or
+/// cancelled query cleans up the same way a successful one does.
+pub trait SpillReserver: Send + Sync + std::fmt::Debug {
+    fn reserve(
+        &self,
+        label: &str,
+    ) -> ferrosa_common::Result<ferrosa_storage::TempSortTableReservation>;
+}
 
 /// A graph result row that the external sorter can spill.
 ///
@@ -113,6 +130,82 @@ impl SpillOrder<GraphRow> for GraphRowOrder {
     fn compare(&self, a: &GraphRow, b: &GraphRow) -> Ordering {
         self.compare_rows(&a.0, &b.0)
     }
+}
+
+/// Sort `rows` in place through the storage engine's bounded external merge
+/// sort, spilling to a cancellable temp directory instead of holding the whole
+/// sorted set in memory (t_4ce82a3e).
+///
+/// Returns `Ok(false)` — leaving `rows` untouched for the in-memory sort — when
+/// this cannot apply:
+/// - no spill backend configured (unit tests, embedded use);
+/// - no ORDER BY, or a LIMIT is present (the bounded case does not need spill);
+/// - an ORDER BY term is not a projected column, which the in-memory
+///   `sort_projected_rows_by_bindings` handles via the states' bindings and this
+///   path cannot (a spilled row carries no binding context).
+///
+/// Fails loud on any spill/merge I/O error — a dropped run would silently lose
+/// rows, which is strictly worse than the old cap.
+pub(super) async fn spill_order_by(
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    columns: &[String],
+    return_clause: &crate::parser::ReturnClause,
+    config: &super::expand::GraphEngineConfig,
+) -> crate::error::Result<bool> {
+    let Some(reserver) = config.spill.as_ref() else {
+        return Ok(false);
+    };
+    if return_clause.order_by.is_empty() || return_clause.limit.is_some() {
+        return Ok(false);
+    }
+    // Resolve every order term to a projected column index; bail to the
+    // in-memory path if any term is not projected.
+    let mut terms = Vec::with_capacity(return_clause.order_by.len());
+    for item in &return_clause.order_by {
+        let name = super::expand::expr_to_column_name(&item.expr);
+        let Some(column) = columns.iter().position(|c| c == &name) else {
+            return Ok(false);
+        };
+        terms.push(GraphOrderTerm {
+            column,
+            ascending: matches!(item.direction, crate::parser::SortDir::Asc),
+        });
+    }
+
+    let reservation = reserver.reserve("graph_order_by").map_err(|e| {
+        crate::error::GraphError::Internal(format!("ORDER BY temp-sort setup failed: {e}"))
+    })?;
+    let mut sorter: ferrosa_storage::external_sort::ExternalSorter<GraphRow, GraphRowOrder> =
+        ferrosa_storage::external_sort::ExternalSorter::new(
+            reservation.path(),
+            GraphRowOrder::new(terms),
+            config.spill_threshold_bytes,
+        );
+    for row in rows.drain(..) {
+        sorter
+            .push(GraphRow(row))
+            .map_err(|e| crate::error::GraphError::Internal(format!("ORDER BY spill: {e}")))?;
+    }
+    let spilled_to_disk = sorter.spilled();
+    let sorted = sorter
+        .finish()
+        .map_err(|e| crate::error::GraphError::Internal(format!("ORDER BY spill finish: {e}")))?;
+    for row in sorted {
+        rows.push(
+            row.map_err(|e| crate::error::GraphError::Internal(format!("ORDER BY merge: {e}")))?
+                .0,
+        );
+    }
+    if spilled_to_disk {
+        tracing::info!(
+            rows = rows.len(),
+            temp_sort_table = %reservation.path().display(),
+            "graph ORDER BY spilled to a cancellable temp-sort table"
+        );
+    }
+    // `reservation` drops here — its Drop removes the temp directory, so a
+    // cancelled or failed query cleans up exactly like a successful one.
+    Ok(true)
 }
 
 #[cfg(test)]

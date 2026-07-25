@@ -84,7 +84,19 @@ pub struct GraphEngineConfig {
     /// Maximum query execution time.
     pub query_timeout: Duration,
     /// Maximum number of result rows.
+    ///
+    /// DEPRECATED — being removed (t_4ce82a3e). This used to SILENTLY TRUNCATE
+    /// the result set (`break`, no error, no flag), so a client could not tell a
+    /// partial answer from a complete one. ORDER BY now spills instead of
+    /// capping (see `spill`); the remaining uses are on the not-yet-converted
+    /// varpath/leapfrog paths.
     pub max_result_rows: usize,
+    /// Backend for spilling an unbounded ORDER BY to disk. `None` = sort in
+    /// memory (unit tests, embedded use). See
+    /// [`crate::executor::spill::SpillReserver`].
+    pub spill: Option<std::sync::Arc<dyn crate::executor::spill::SpillReserver>>,
+    /// Bytes of rows to accumulate before spilling a sorted run.
+    pub spill_threshold_bytes: u64,
     /// Maximum fan-out per hop (T4: limits adjacency reads).
     pub max_fan_out_per_hop: usize,
     /// Maximum number of groups in an aggregation (FMEA F7).
@@ -101,6 +113,11 @@ impl Default for GraphEngineConfig {
         Self {
             query_timeout: Duration::from_secs(30),
             max_result_rows: 10_000,
+            spill: None,
+            // 64 MiB of accumulated rows before a run is spilled — large enough
+            // that ordinary queries never touch disk, small enough that a huge
+            // sort stays bounded.
+            spill_threshold_bytes: 64 * 1024 * 1024,
             max_fan_out_per_hop: 10_000,
             max_groups: 100_000,
             max_collect_size: 10_000,
@@ -1381,13 +1398,14 @@ async fn execute_expand(
         .any(|item| expr_has_pattern_comprehension(&item.expr));
     let anchor_var = anchor.var.as_deref().unwrap_or("");
 
+    // Project every surviving state. The old `max_result_rows` break here
+    // SILENTLY TRUNCATED the result — no error, no flag, so a client could not
+    // tell a partial answer from a complete one. Removed (t_4ce82a3e): an
+    // unbounded ORDER BY now SPILLS (below) instead of being capped, which is
+    // the honest answer rather than a quiet wrong one.
     let mut result_states = Vec::new();
     let mut rows = Vec::new();
     for state in &current_states {
-        if rows.len() >= config.max_result_rows {
-            break;
-        }
-
         let row = project_state(
             return_clause,
             needs_graph_projection,
@@ -1404,7 +1422,19 @@ async fn execute_expand(
 
     // Apply ORDER BY before projection-only values disappear. Cypher permits
     // ordering by expressions that are not part of RETURN.
-    sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+    //
+    // An UNBOUNDED ORDER BY (no LIMIT) must see every row before the first
+    // output row is known — a pipeline-breaker. Rather than cap it in memory,
+    // spill through the storage engine's bounded external merge sort when a
+    // backend is available (t_4ce82a3e). `spill_order_by` returns Ok(false) when
+    // it cannot apply (no backend, no LIMIT-free ORDER BY, or an order term that
+    // is not a projected column), leaving the in-memory sort below to run
+    // exactly as before.
+    let spilled =
+        crate::executor::spill::spill_order_by(&mut rows, &columns, return_clause, config).await?;
+    if !spilled {
+        sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+    }
 
     // Apply DISTINCT.
     if return_clause.distinct {
@@ -5361,7 +5391,7 @@ fn column_name_for_item(item: &ReturnItem) -> String {
 }
 
 /// Convert an expression to a display-friendly column name.
-fn expr_to_column_name(expr: &Expr) -> String {
+pub(super) fn expr_to_column_name(expr: &Expr) -> String {
     match expr {
         Expr::Property { var, name } => format!("{var}.{name}"),
         Expr::Var(v) => v.clone(),
