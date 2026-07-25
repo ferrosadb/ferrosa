@@ -1028,24 +1028,9 @@ async fn execute_expand(
         check_timeout(start, config.query_timeout)?;
         (states, &hops[1..])
     } else {
-        let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
         let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-        let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
-            if let Some((key, _clustering)) =
-                build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
-            {
-                let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
-                write_path
-                    .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
-                    .await?
-                    .into_iter()
-                    .collect()
-            } else {
-                write_path.range_read(&anchor_table_id).await?
-            }
-        } else {
-            write_path.range_read(&anchor_table_id).await?
-        };
+        let anchor_partitions =
+            read_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
         stats.vertices_read += anchor_partitions.len();
         check_timeout(start, config.query_timeout)?;
 
@@ -1347,6 +1332,37 @@ async fn execute_expand(
         rows,
         stats,
     })
+}
+
+/// Read the anchor table's candidate partitions: a direct primary-key lookup
+/// when the anchor's properties pin the full key, else a range scan of the
+/// table.
+///
+/// Extracted from `execute_expand` so the anchor read strategy is one named
+/// decision the pull-based streaming `AnchorScan` (t_4ce82a3e,
+/// specs/streaming-executor-design.md) can reuse. NOTE for that work: the
+/// `range_read` arm is the unbounded materialization — the streaming operator
+/// replaces it with a lazy scan, while the pk arm is already bounded.
+async fn read_anchor_partitions(
+    write_path: &WritePath,
+    anchor: &Anchor,
+    anchor_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    schema: Option<&Schema>,
+) -> Result<Vec<Partition>> {
+    let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
+    if let Some(meta) = anchor_meta {
+        if let Some((key, _clustering)) =
+            build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
+        {
+            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+            return Ok(write_path
+                .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
+                .await?
+                .into_iter()
+                .collect());
+        }
+    }
+    Ok(write_path.range_read(&anchor_table_id).await?)
 }
 
 /// Project one expand state's bindings into a result row per the RETURN items.
