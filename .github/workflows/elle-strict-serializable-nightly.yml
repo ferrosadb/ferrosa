@@ -22,6 +22,7 @@ on:
     paths:
       - '.github/workflows/elle-strict-serializable-nightly.yml'
       - 'ferrosa-jepsen/tests/docker/elle-cluster-rf3.yml'
+      - 'ferrosa-jepsen/elle-checker/**'
 
 permissions:
   contents: read
@@ -37,6 +38,10 @@ env:
   ELLE_GEN_CLEAN: "8 300 8 3"
   ELLE_GEN_NEMESIS: "8 700 8 3"
   COMPOSE: ferrosa-jepsen/tests/docker/elle-cluster-rf3.yml
+  # Propagate to every JVM (incl. the checker subprocess `lein run` spawns):
+  # Elle/jepsen touches AWT, which throws HeadlessException on a display-less
+  # CI host. Belt-and-suspenders with the checker's project.clj :jvm-opts.
+  JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
 
 jobs:
   elle-cert:

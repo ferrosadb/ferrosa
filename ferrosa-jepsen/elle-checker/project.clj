@@ -6,4 +6,7 @@
   :license {:name "Apache-2.0"}
   :dependencies [[org.clojure/clojure "1.12.0"]
                  [jepsen "0.3.6"]]
+  ;; Run headless: Elle/jepsen pulls in AWT, which throws HeadlessException on a
+  ;; display-less host (CI). The verdict is printed to stdout; no graphs needed.
+  :jvm-opts ["-Djava.awt.headless=true"]
   :main ferrosa.elle-check)
