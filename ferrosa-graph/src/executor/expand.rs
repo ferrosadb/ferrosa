@@ -29,6 +29,12 @@ use crate::parser::{
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
+/// Maximum neighbor hydrations in flight at once within a single hop
+/// (t_4ce82a3e). Bounds the concurrent storage reads a high-degree hub can
+/// launch: fan-out is unbounded, in-flight work is not. Small enough that the
+/// per-hop future set stays cheap, large enough to overlap read latency.
+const HOP_HYDRATION_CONCURRENCY: usize = 16;
+
 #[derive(Debug, Clone)]
 struct ExpandState {
     current_key: DecoratedKey,
@@ -168,7 +174,7 @@ pub async fn execute(
             var,
             with_pipeline,
             return_clause,
-        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start),
+        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start).await,
         PhysicalPlan::ReturnOnly { return_clause } => execute_return_only(&return_clause, start),
         PhysicalPlan::Expand {
             anchor,
@@ -916,7 +922,7 @@ fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<G
     })
 }
 
-fn execute_unwind(
+async fn execute_unwind(
     expr: &Expr,
     var: &str,
     with_pipeline: Option<&WithPipeline>,
@@ -947,22 +953,49 @@ fn execute_unwind(
     }
 
     let columns = build_columns(return_clause);
-    let mut rows = Vec::new();
-    for state in &states {
-        rows.push(
-            return_clause
+
+    // ORDER BY must see every row before any row is final, so it stays a
+    // pipeline-breaker over the (bounded) UNWIND list. Without it, projection
+    // and LIMIT stream: rows are produced lazily and `take(limit)` stops pulling
+    // — no full projection followed by a truncate (t_4ce82a3e increment 2).
+    let rows = if return_clause.order_by.is_empty() {
+        use futures::StreamExt as _;
+        let limit = return_clause
+            .limit
+            .map(|l| l.max(0) as usize)
+            .unwrap_or(usize::MAX);
+        let projected = futures::stream::iter(states.iter()).map(|state| {
+            Ok(return_clause
                 .items
                 .iter()
                 .map(|item| {
                     eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
                 })
-                .collect::<Vec<_>>(),
-        );
-    }
-    sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
-    if let Some(limit) = return_clause.limit {
-        rows.truncate(limit.max(0) as usize);
-    }
+                .collect::<Vec<_>>())
+        });
+        let stream: crate::executor::stream::RowStream<'_> = Box::pin(projected.take(limit));
+        crate::executor::stream::collect_rows(stream).await?
+    } else {
+        let mut rows = Vec::new();
+        for state in &states {
+            rows.push(
+                return_clause
+                    .items
+                    .iter()
+                    .map(|item| {
+                        eval::eval_expr(&item.expr, &state.bindings)
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
+        if let Some(limit) = return_clause.limit {
+            rows.truncate(limit.max(0) as usize);
+        }
+        rows
+    };
+
     Ok(GraphResult {
         columns,
         rows,
@@ -1028,24 +1061,9 @@ async fn execute_expand(
         check_timeout(start, config.query_timeout)?;
         (states, &hops[1..])
     } else {
-        let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
         let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-        let anchor_partitions = if let Some(meta) = anchor_meta.as_ref() {
-            if let Some((key, _clustering)) =
-                build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
-            {
-                let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
-                write_path
-                    .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
-                    .await?
-                    .into_iter()
-                    .collect()
-            } else {
-                write_path.range_read(&anchor_table_id).await?
-            }
-        } else {
-            write_path.range_read(&anchor_table_id).await?
-        };
+        let anchor_partitions =
+            read_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
         stats.vertices_read += anchor_partitions.len();
         check_timeout(start, config.query_timeout)?;
 
@@ -1153,13 +1171,26 @@ async fn execute_expand(
             && optional_hops.is_empty();
         (safe && limit > 0).then_some(limit as usize)
     });
-    let last_hop_idx = traversal_hops.len().saturating_sub(1);
-
-    for (hop_idx, hop) in traversal_hops.iter().enumerate() {
+    for hop in traversal_hops.iter() {
         check_timeout(start, config.query_timeout)?;
-        // Only the final hop may short-circuit; earlier hops must fully expand
-        // because their fan-out feeds the next hop.
-        let cap_this_hop = pushdown_cap.filter(|_| hop_idx == last_hop_idx);
+        // LIMIT short-circuit on EVERY hop, not just the last (t_4ce82a3e
+        // increment 4).
+        //
+        // Why an INTERMEDIATE hop may also stop at `limit`: `pushdown_cap` is
+        // only set when there is no ORDER BY / DISTINCT / WITH pipeline /
+        // post-MATCH WHERE / OPTIONAL MATCH (see its definition above). With all
+        // of those absent, nothing between the hop loop and the projection can
+        // drop or reorder a state, and the projection emits EXACTLY ONE row per
+        // surviving state. So `limit` states at any hop can already produce the
+        // whole answer: expanding an extra state could only ever yield rows past
+        // the limit, which are discarded. Each state's own fan-out still feeds
+        // the next hop — we simply stop collecting NEW states once we hold
+        // enough to satisfy the limit.
+        //
+        // (Without the guard conditions this would be wrong: a post-filter could
+        // drop a state, an ORDER BY could promote a later one, and truncating
+        // early would lose rows. That is exactly why the cap is `None` then.)
+        let cap_this_hop = pushdown_cap;
 
         let mut next_states = Vec::new();
         'states: for state in &current_states {
@@ -1193,11 +1224,35 @@ async fn execute_expand(
                     })
                     .collect();
 
-                if let Some(cap) = cap_this_hop {
-                    // LIMIT push-down: hydrate sequentially and stop as soon as
-                    // the cap is met, so a bounded query touches minimal storage
-                    // (t_0cc8d63e).
-                    for (row, nid) in pairs {
+                // Hydrate this vertex's neighbors with BOUNDED CONCURRENCY
+                // (t_4ce82a3e increment 3).
+                //
+                // Every input to `hydrate_hop_neighbor` is shared/immutable, so
+                // neighbors of one vertex hydrate independently. The futures are
+                // held in a `FuturesUnordered` that this loop drives INLINE —
+                // which, unlike `buffer_unordered`/`tokio::spawn`, does NOT
+                // require `Send + 'static`: the set polls the futures in place,
+                // so they may keep borrowing `write_path`/`schema`/`hop`/`state`
+                // /`row`. That is what dissolves the old "Send is not general
+                // enough" wall WITHOUT the clone-per-neighbor restructure the
+                // task forbids — the only owned input is `nid`, exactly as
+                // before.
+                //
+                // In-flight is capped at HOP_HYDRATION_CONCURRENCY so a
+                // high-degree hub cannot launch unbounded concurrent reads, and
+                // `cap_this_hop` (LIMIT push-down) still stops the moment the
+                // cap is met, keeping the bounded-query storage-touch guarantee
+                // (http_limit_short_circuits_expansion_hydration).
+                //
+                // Ordering: results are drained in completion order, so a
+                // `cap_this_hop` prefix could differ from the sequential order.
+                // Capped hops therefore stay STRICTLY SEQUENTIAL (concurrency
+                // would change which rows a LIMIT returns); only uncapped hops —
+                // where the full fan-out is consumed and order is re-established
+                // downstream — hydrate concurrently.
+                let mut pairs_iter = pairs.into_iter();
+                if cap_this_hop.is_some() {
+                    for (row, nid) in pairs_iter {
                         if let Some(st) = hydrate_hop_neighbor(
                             write_path,
                             schema,
@@ -1212,33 +1267,35 @@ async fn execute_expand(
                         .await?
                         {
                             next_states.push(st);
-                            if next_states.len() >= cap {
+                            if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
                                 break 'states;
                             }
                         }
                     }
                 } else {
-                    // Unbounded: hydrate every neighbor. Concurrent per-hop
-                    // hydration (bounded buffered pk_reads) is the intended win
-                    // here, but the borrowed per-neighbor futures can't satisfy
-                    // the multi-threaded runtime's Send bound without a
-                    // clone-heavy `'static` restructure of this loop — which the
-                    // streaming/pull executor (t_4ce82a3e) will supersede. Kept
-                    // sequential for now; correctness is unaffected.
-                    for (row, nid) in pairs {
-                        if let Some(st) = hydrate_hop_neighbor(
-                            write_path,
-                            schema,
-                            hop,
-                            state,
-                            vertex_key,
-                            edge_meta.as_ref(),
-                            vertex_meta.as_ref(),
-                            row,
-                            nid,
-                        )
-                        .await?
-                        {
+                    use futures::stream::{FuturesUnordered, StreamExt as _};
+                    let mut in_flight = FuturesUnordered::new();
+                    loop {
+                        while in_flight.len() < HOP_HYDRATION_CONCURRENCY {
+                            let Some((row, nid)) = pairs_iter.next() else {
+                                break;
+                            };
+                            in_flight.push(hydrate_hop_neighbor(
+                                write_path,
+                                schema,
+                                hop,
+                                state,
+                                vertex_key,
+                                edge_meta.as_ref(),
+                                vertex_meta.as_ref(),
+                                row,
+                                nid,
+                            ));
+                        }
+                        let Some(hydrated) = in_flight.next().await else {
+                            break;
+                        };
+                        if let Some(st) = hydrated? {
                             next_states.push(st);
                         }
                     }
@@ -1331,24 +1388,16 @@ async fn execute_expand(
             break;
         }
 
-        let mut row = Vec::with_capacity(return_clause.items.len());
-        for item in &return_clause.items {
-            let value = if needs_graph_projection {
-                graph_eval_expr(
-                    &item.expr,
-                    write_path,
-                    keyspace,
-                    schema,
-                    &state.bindings,
-                    anchor_var,
-                    &state.current_key,
-                )
-                .await?
-            } else {
-                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
-            };
-            row.push(value);
-        }
+        let row = project_state(
+            return_clause,
+            needs_graph_projection,
+            write_path,
+            keyspace,
+            schema,
+            anchor_var,
+            state,
+        )
+        .await?;
         result_states.push(state.clone());
         rows.push(row);
     }
@@ -1377,6 +1426,75 @@ async fn execute_expand(
         rows,
         stats,
     })
+}
+
+/// Read the anchor table's candidate partitions: a direct primary-key lookup
+/// when the anchor's properties pin the full key, else a range scan of the
+/// table.
+///
+/// Extracted from `execute_expand` so the anchor read strategy is one named
+/// decision the pull-based streaming `AnchorScan` (t_4ce82a3e,
+/// specs/streaming-executor-design.md) can reuse. NOTE for that work: the
+/// `range_read` arm is the unbounded materialization — the streaming operator
+/// replaces it with a lazy scan, while the pk arm is already bounded.
+async fn read_anchor_partitions(
+    write_path: &WritePath,
+    anchor: &Anchor,
+    anchor_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    schema: Option<&Schema>,
+) -> Result<Vec<Partition>> {
+    let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
+    if let Some(meta) = anchor_meta {
+        if let Some((key, _clustering)) =
+            build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
+        {
+            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+            return Ok(write_path
+                .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
+                .await?
+                .into_iter()
+                .collect());
+        }
+    }
+    Ok(write_path.range_read(&anchor_table_id).await?)
+}
+
+/// Project one expand state's bindings into a result row per the RETURN items.
+///
+/// Extracted from the `execute_expand` projection loop so the pull-based
+/// streaming `Project` operator (t_4ce82a3e, specs/streaming-executor-design.md)
+/// reuses this exact per-state logic instead of re-deriving it — and so the
+/// materialize loop no longer inlines it. `needs_graph_projection` selects the
+/// graph-aware path (pattern comprehensions need traversal keyed on the anchor
+/// var) vs. the cheap binding-only evaluator.
+async fn project_state(
+    return_clause: &ReturnClause,
+    needs_graph_projection: bool,
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    anchor_var: &str,
+    state: &ExpandState,
+) -> Result<Vec<serde_json::Value>> {
+    let mut row = Vec::with_capacity(return_clause.items.len());
+    for item in &return_clause.items {
+        let value = if needs_graph_projection {
+            graph_eval_expr(
+                &item.expr,
+                write_path,
+                keyspace,
+                schema,
+                &state.bindings,
+                anchor_var,
+                &state.current_key,
+            )
+            .await?
+        } else {
+            eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+        };
+        row.push(value);
+    }
+    Ok(row)
 }
 
 fn sort_projected_rows_by_bindings(
@@ -7053,6 +7171,51 @@ mod tests {
         let result =
             compare_json_values(Some(&serde_json::json!(10)), Some(&serde_json::json!(20)));
         assert_eq!(result, std::cmp::Ordering::Less);
+    }
+
+    /// UNWIND's unsorted path now projects through a `RowStream` and applies
+    /// LIMIT as `take(k)` (t_4ce82a3e increment 2). This drives the real
+    /// executor fn to prove the conversion preserves behavior: LIMIT yields
+    /// exactly k rows, in list order, and the un-limited query returns all.
+    #[tokio::test]
+    async fn unwind_streaming_limit_yields_exactly_k_rows_in_order() {
+        use crate::parser::{Expr, Literal, ReturnClause, ReturnItem};
+
+        let list = Expr::List(
+            (1..=5)
+                .map(|i| Expr::Literal(Literal::Integer(i * 10)))
+                .collect(),
+        );
+        let items = vec![ReturnItem {
+            expr: Expr::Var("x".to_string()),
+            alias: None,
+        }];
+
+        let limited = ReturnClause {
+            items: items.clone(),
+            distinct: false,
+            order_by: Vec::new(),
+            limit: Some(2),
+        };
+        let res = execute_unwind(&list, "x", None, &limited, Instant::now())
+            .await
+            .expect("unwind with limit");
+        assert_eq!(
+            res.rows,
+            vec![vec![serde_json::json!(10)], vec![serde_json::json!(20)]],
+            "LIMIT 2 must yield the first two list elements, in order"
+        );
+
+        let unlimited = ReturnClause {
+            items,
+            distinct: false,
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let res = execute_unwind(&list, "x", None, &unlimited, Instant::now())
+            .await
+            .expect("unwind without limit");
+        assert_eq!(res.rows.len(), 5, "no LIMIT must yield every element");
     }
 
     #[test]
