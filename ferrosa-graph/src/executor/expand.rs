@@ -1331,24 +1331,16 @@ async fn execute_expand(
             break;
         }
 
-        let mut row = Vec::with_capacity(return_clause.items.len());
-        for item in &return_clause.items {
-            let value = if needs_graph_projection {
-                graph_eval_expr(
-                    &item.expr,
-                    write_path,
-                    keyspace,
-                    schema,
-                    &state.bindings,
-                    anchor_var,
-                    &state.current_key,
-                )
-                .await?
-            } else {
-                eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
-            };
-            row.push(value);
-        }
+        let row = project_state(
+            return_clause,
+            needs_graph_projection,
+            write_path,
+            keyspace,
+            schema,
+            anchor_var,
+            state,
+        )
+        .await?;
         result_states.push(state.clone());
         rows.push(row);
     }
@@ -1377,6 +1369,44 @@ async fn execute_expand(
         rows,
         stats,
     })
+}
+
+/// Project one expand state's bindings into a result row per the RETURN items.
+///
+/// Extracted from the `execute_expand` projection loop so the pull-based
+/// streaming `Project` operator (t_4ce82a3e, specs/streaming-executor-design.md)
+/// reuses this exact per-state logic instead of re-deriving it — and so the
+/// materialize loop no longer inlines it. `needs_graph_projection` selects the
+/// graph-aware path (pattern comprehensions need traversal keyed on the anchor
+/// var) vs. the cheap binding-only evaluator.
+async fn project_state(
+    return_clause: &ReturnClause,
+    needs_graph_projection: bool,
+    write_path: &WritePath,
+    keyspace: &str,
+    schema: Option<&Schema>,
+    anchor_var: &str,
+    state: &ExpandState,
+) -> Result<Vec<serde_json::Value>> {
+    let mut row = Vec::with_capacity(return_clause.items.len());
+    for item in &return_clause.items {
+        let value = if needs_graph_projection {
+            graph_eval_expr(
+                &item.expr,
+                write_path,
+                keyspace,
+                schema,
+                &state.bindings,
+                anchor_var,
+                &state.current_key,
+            )
+            .await?
+        } else {
+            eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
+        };
+        row.push(value);
+    }
+    Ok(row)
 }
 
 fn sort_projected_rows_by_bindings(
