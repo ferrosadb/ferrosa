@@ -29,6 +29,12 @@ use crate::parser::{
 };
 use crate::planner::physical::{AggregateProjection, Anchor, CreateOp, Hop, MergeOp, PhysicalPlan};
 
+/// Maximum neighbor hydrations in flight at once within a single hop
+/// (t_4ce82a3e). Bounds the concurrent storage reads a high-degree hub can
+/// launch: fan-out is unbounded, in-flight work is not. Small enough that the
+/// per-hop future set stays cheap, large enough to overlap read latency.
+const HOP_HYDRATION_CONCURRENCY: usize = 16;
+
 #[derive(Debug, Clone)]
 struct ExpandState {
     current_key: DecoratedKey,
@@ -1205,31 +1211,79 @@ async fn execute_expand(
                     })
                     .collect();
 
-                // Hydrate this vertex's neighbors sequentially. `cap_this_hop`
-                // (LIMIT push-down, t_0cc8d63e) stops as soon as the cap is met
-                // so a bounded query touches minimal storage; uncapped, every
-                // neighbor is hydrated. Concurrent bounded hydration is the
-                // intended win but the borrowed per-neighbor futures can't
-                // satisfy the multi-threaded runtime's Send bound without a
-                // clone-heavy `'static` restructure — which the streaming/pull
-                // executor (t_4ce82a3e) supersedes. Sequential here; correct.
-                for (row, nid) in pairs {
-                    if let Some(st) = hydrate_hop_neighbor(
-                        write_path,
-                        schema,
-                        hop,
-                        state,
-                        vertex_key,
-                        edge_meta.as_ref(),
-                        vertex_meta.as_ref(),
-                        row,
-                        nid,
-                    )
-                    .await?
-                    {
-                        next_states.push(st);
-                        if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
-                            break 'states;
+                // Hydrate this vertex's neighbors with BOUNDED CONCURRENCY
+                // (t_4ce82a3e increment 3).
+                //
+                // Every input to `hydrate_hop_neighbor` is shared/immutable, so
+                // neighbors of one vertex hydrate independently. The futures are
+                // held in a `FuturesUnordered` that this loop drives INLINE —
+                // which, unlike `buffer_unordered`/`tokio::spawn`, does NOT
+                // require `Send + 'static`: the set polls the futures in place,
+                // so they may keep borrowing `write_path`/`schema`/`hop`/`state`
+                // /`row`. That is what dissolves the old "Send is not general
+                // enough" wall WITHOUT the clone-per-neighbor restructure the
+                // task forbids — the only owned input is `nid`, exactly as
+                // before.
+                //
+                // In-flight is capped at HOP_HYDRATION_CONCURRENCY so a
+                // high-degree hub cannot launch unbounded concurrent reads, and
+                // `cap_this_hop` (LIMIT push-down) still stops the moment the
+                // cap is met, keeping the bounded-query storage-touch guarantee
+                // (http_limit_short_circuits_expansion_hydration).
+                //
+                // Ordering: results are drained in completion order, so a
+                // `cap_this_hop` prefix could differ from the sequential order.
+                // Capped hops therefore stay STRICTLY SEQUENTIAL (concurrency
+                // would change which rows a LIMIT returns); only uncapped hops —
+                // where the full fan-out is consumed and order is re-established
+                // downstream — hydrate concurrently.
+                let mut pairs_iter = pairs.into_iter();
+                if cap_this_hop.is_some() {
+                    for (row, nid) in pairs_iter {
+                        if let Some(st) = hydrate_hop_neighbor(
+                            write_path,
+                            schema,
+                            hop,
+                            state,
+                            vertex_key,
+                            edge_meta.as_ref(),
+                            vertex_meta.as_ref(),
+                            row,
+                            nid,
+                        )
+                        .await?
+                        {
+                            next_states.push(st);
+                            if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
+                                break 'states;
+                            }
+                        }
+                    }
+                } else {
+                    use futures::stream::{FuturesUnordered, StreamExt as _};
+                    let mut in_flight = FuturesUnordered::new();
+                    loop {
+                        while in_flight.len() < HOP_HYDRATION_CONCURRENCY {
+                            let Some((row, nid)) = pairs_iter.next() else {
+                                break;
+                            };
+                            in_flight.push(hydrate_hop_neighbor(
+                                write_path,
+                                schema,
+                                hop,
+                                state,
+                                vertex_key,
+                                edge_meta.as_ref(),
+                                vertex_meta.as_ref(),
+                                row,
+                                nid,
+                            ));
+                        }
+                        let Some(hydrated) = in_flight.next().await else {
+                            break;
+                        };
+                        if let Some(st) = hydrated? {
+                            next_states.push(st);
                         }
                     }
                 }
