@@ -175,6 +175,32 @@ expand-with-limit shape; 5–7 complete coverage and end-to-end streaming.
   `MATCH (h)<-[r]-(n) RETURN n LIMIT k` where the hub degree ≫ k.
 - `cargo test -p ferrosa-graph` + clippy `-D warnings` green each increment.
 
+## 6b. Materialization inventory
+
+`frg materialization-scan ferrosa-graph/src` reports 45 findings; most are
+**false positives** — Vecs sized by the *query* or *schema* (parser items,
+planner hops, merge column shapes, `column_names_for_table`, param binding), not
+by the data. The ones that actually scale with graph data:
+
+| Site | Holds | Bound today | Retired by |
+|---|---|---|---|
+| `expand.rs:1079` anchor `states` | every anchor partition (**full table scan**) | none | inc 2 — use `WritePath::range_read_stream_all*` (already exists) |
+| `expand.rs:1225` `pairs` collect | one vertex's full adjacency (**hub degree**) | `max_fan_out_per_hop` | inc 3/4 (concurrency+early-stop done; still collects) |
+| `expand.rs:1384-85` `rows`/`result_states` | **entire result set** | `max_result_rows` (silent truncate — see §7) | inc 7 (transport) |
+| `expand.rs:1328` `kept` (post-filters) | full frontier | none | inc 5 |
+| `expand.rs:471` `next_frontier` (pattern predicate) | BFS frontier | none | inc 5 |
+| `expand.rs:1857` edge-anchored `states` | edge-anchor scan | none | inc 2 |
+| `varpath.rs` frontier / `result_keys` / `visited` | BFS frontier + visited set | `max_var_path_visited` | inc 6 |
+| `leapfrog.rs` `result_rows` / `AdjacencyIterator` | join output + sorted adjacency | `max_results` | inc 6 |
+| `engine.rs:910-915` CALL subquery `out_rows` | **outer result + every inner result** (nested-loop join) | none | inc 5 |
+| `http.rs:510` SUBSCRIBE diff | **two full result sets** (previous + current) | none | see §7 — needs a design decision |
+| `stream.rs:69/91` collect bridges | migration scaffolding | caller's | inc 7 (they disappear) |
+
+Note the storage layer already went through this discipline and has a source
+tripwire enforcing it (`ferrosa-cluster/src/write_path.rs` test: *"unbounded local
+range reads must be exposed as streams, not collected into `Vec<Partition>`"*).
+The graph executor should end up subject to an equivalent guard.
+
 ## 7. Non-goals / risks
 
 - Not changing query semantics, result ordering, or the traversal DoS caps
