@@ -1193,53 +1193,31 @@ async fn execute_expand(
                     })
                     .collect();
 
-                if let Some(cap) = cap_this_hop {
-                    // LIMIT push-down: hydrate sequentially and stop as soon as
-                    // the cap is met, so a bounded query touches minimal storage
-                    // (t_0cc8d63e).
-                    for (row, nid) in pairs {
-                        if let Some(st) = hydrate_hop_neighbor(
-                            write_path,
-                            schema,
-                            hop,
-                            state,
-                            vertex_key,
-                            edge_meta.as_ref(),
-                            vertex_meta.as_ref(),
-                            row,
-                            nid,
-                        )
-                        .await?
-                        {
-                            next_states.push(st);
-                            if next_states.len() >= cap {
-                                break 'states;
-                            }
-                        }
-                    }
-                } else {
-                    // Unbounded: hydrate every neighbor. Concurrent per-hop
-                    // hydration (bounded buffered pk_reads) is the intended win
-                    // here, but the borrowed per-neighbor futures can't satisfy
-                    // the multi-threaded runtime's Send bound without a
-                    // clone-heavy `'static` restructure of this loop — which the
-                    // streaming/pull executor (t_4ce82a3e) will supersede. Kept
-                    // sequential for now; correctness is unaffected.
-                    for (row, nid) in pairs {
-                        if let Some(st) = hydrate_hop_neighbor(
-                            write_path,
-                            schema,
-                            hop,
-                            state,
-                            vertex_key,
-                            edge_meta.as_ref(),
-                            vertex_meta.as_ref(),
-                            row,
-                            nid,
-                        )
-                        .await?
-                        {
-                            next_states.push(st);
+                // Hydrate this vertex's neighbors sequentially. `cap_this_hop`
+                // (LIMIT push-down, t_0cc8d63e) stops as soon as the cap is met
+                // so a bounded query touches minimal storage; uncapped, every
+                // neighbor is hydrated. Concurrent bounded hydration is the
+                // intended win but the borrowed per-neighbor futures can't
+                // satisfy the multi-threaded runtime's Send bound without a
+                // clone-heavy `'static` restructure — which the streaming/pull
+                // executor (t_4ce82a3e) supersedes. Sequential here; correct.
+                for (row, nid) in pairs {
+                    if let Some(st) = hydrate_hop_neighbor(
+                        write_path,
+                        schema,
+                        hop,
+                        state,
+                        vertex_key,
+                        edge_meta.as_ref(),
+                        vertex_meta.as_ref(),
+                        row,
+                        nid,
+                    )
+                    .await?
+                    {
+                        next_states.push(st);
+                        if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
+                            break 'states;
                         }
                     }
                 }
