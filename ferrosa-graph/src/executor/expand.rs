@@ -1171,13 +1171,26 @@ async fn execute_expand(
             && optional_hops.is_empty();
         (safe && limit > 0).then_some(limit as usize)
     });
-    let last_hop_idx = traversal_hops.len().saturating_sub(1);
-
-    for (hop_idx, hop) in traversal_hops.iter().enumerate() {
+    for hop in traversal_hops.iter() {
         check_timeout(start, config.query_timeout)?;
-        // Only the final hop may short-circuit; earlier hops must fully expand
-        // because their fan-out feeds the next hop.
-        let cap_this_hop = pushdown_cap.filter(|_| hop_idx == last_hop_idx);
+        // LIMIT short-circuit on EVERY hop, not just the last (t_4ce82a3e
+        // increment 4).
+        //
+        // Why an INTERMEDIATE hop may also stop at `limit`: `pushdown_cap` is
+        // only set when there is no ORDER BY / DISTINCT / WITH pipeline /
+        // post-MATCH WHERE / OPTIONAL MATCH (see its definition above). With all
+        // of those absent, nothing between the hop loop and the projection can
+        // drop or reorder a state, and the projection emits EXACTLY ONE row per
+        // surviving state. So `limit` states at any hop can already produce the
+        // whole answer: expanding an extra state could only ever yield rows past
+        // the limit, which are discarded. Each state's own fan-out still feeds
+        // the next hop — we simply stop collecting NEW states once we hold
+        // enough to satisfy the limit.
+        //
+        // (Without the guard conditions this would be wrong: a post-filter could
+        // drop a state, an ORDER BY could promote a later one, and truncating
+        // early would lose rows. That is exactly why the cap is `None` then.)
+        let cap_this_hop = pushdown_cap;
 
         let mut next_states = Vec::new();
         'states: for state in &current_states {
