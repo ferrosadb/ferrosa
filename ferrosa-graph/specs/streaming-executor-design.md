@@ -71,16 +71,33 @@ Operators compose as a tree; the transport pulls the root. Two operator classes:
   OptionalExpand, Filter, Project, Unwind, Limit, Union(all). These hold no
   result buffer; they transform/forward one row (or one frontier element) at a
   time.
-- **Pipeline-breakers (bounded buffering):** OrderBy, Distinct, Aggregate,
-  VarPath, WcoJoin. These must see multiple/all inputs, but each is bounded by an
-  existing cap (`max_result_rows`, `max_groups`, `max_var_path_visited`,
-  `max_results`) — those caps are preserved and are the memory bound. Two
-  refinements make the common cases streaming-friendly:
+- **Pipeline-breakers:** OrderBy, Distinct, Aggregate, VarPath, WcoJoin. These
+  must see multiple/all inputs. Rather than capping them in memory, they follow
+  the approach **ferrosa-cql already proved for the same problem**:
   - **ORDER BY + LIMIT k → bounded top-k** (a k-sized heap), not a full sort.
-    ORDER BY without LIMIT inherently must see every row; it stays bounded by
-    `max_result_rows` and fails loud past it (as today).
-  - **DISTINCT** stays a bounded `HashSet` of serialized rows, emitting each row
-    the first time it is seen (streaming dedup), bounded by `max_result_rows`.
+  - **ORDER BY without LIMIT → SPILL, don't cap.** Reuse
+    [`ferrosa_storage::ExternalSorter`] (`ferrosa-storage/src/external_sort.rs`):
+    accumulate to a byte threshold, spill sorted runs to a temp dir, k-way merge
+    on `finish()`, fail loud on any spill/merge I/O error. The temp dir is a
+    [`TempSortTableReservation`] whose `Drop` does `remove_dir_all`, so a
+    cancelled or aborted query cleans up automatically — the cancel-friendly
+    property this executor needs, for free. The CQL side already classifies this
+    shape as `OrderByExecutionPlan::SpillableTempTable { estimated_scan_bytes }`
+    (`ferrosa-cql/src/router.rs`); the graph planner should classify the same way.
+    *Gap to close:* `ExternalSorter` sorts `Row`/`CqlValue` while graph rows are
+    `Vec<serde_json::Value>`, so this needs either a value bridge or a small
+    generic-ification of the sorter — the spill/merge/cleanup machinery itself is
+    reused untouched.
+  - **DISTINCT** emits each row the first time it is seen (streaming dedup). Its
+    seen-set is subject to the same argument: a spilling/sort-based dedup rather
+    than an unbounded in-memory `HashSet`.
+  - **Aggregate** stays bounded by `max_groups`; a spilling group-by is a later
+    option if that cap proves too restrictive in practice.
+  - VarPath / WcoJoin keep their existing `max_var_path_visited` / `max_results`
+    caps (they bound *traversal*, not result buffering).
+
+  The principle: an in-memory cap that fails a legitimate query is a worse answer
+  than spilling, when the spill machinery already exists and is cancel-safe.
 
 `Limit(k)` is `upstream.take(k)`: when the transport (or an outer Limit) stops
 pulling, `take` drops the upstream stream, which drops the Expand operator's
@@ -135,8 +152,9 @@ the stream — behavior-identical.
    must keep `http_limit_short_circuits_expansion_hydration`'s `vertices_read`
    bound (`tests:6615`).
 4. **Multi-hop Expand** — pull chains hop→hop; LIMIT/`take` propagates upstream.
-5. **Pipeline-breakers as bounded operators:** OrderBy (top-k on LIMIT, else
-   bounded full sort), streaming Distinct, Aggregate (bounded groups). Unwind,
+5. **Pipeline-breakers:** OrderBy (top-k on LIMIT; SPILLING external sort via
+   `ferrosa_storage::ExternalSorter` + `TempSortTableReservation` otherwise),
+   streaming/spilling Distinct, Aggregate (bounded groups). Unwind,
    OPTIONAL MATCH, WITH-pipeline as streaming stages.
 6. **VarPath + Leapfrog** streaming (bounded by their visited/result caps).
 7. **Transport streaming:** HTTP chunked body + Bolt incremental PULL honoring
@@ -159,10 +177,12 @@ expand-with-limit shape; 5–7 complete coverage and end-to-end streaming.
 
 ## 7. Non-goals / risks
 
-- Not changing query semantics, result ordering, or the DoS caps.
-- ORDER BY without LIMIT and global Aggregate inherently buffer (bounded by
-  `max_result_rows`/`max_groups`) — streaming does not remove those bounds, it
-  preserves them and fails loud past them, as today.
+- Not changing query semantics, result ordering, or the traversal DoS caps
+  (`max_fan_out_per_hop`, `max_var_path_visited`, `max_results`).
+- ORDER BY without LIMIT and global Aggregate are pipeline-breakers — they must
+  see their whole input. Streaming does not remove that, but per §2 the answer is
+  to **spill** (reusing the CQL `ExternalSorter` + `TempSortTableReservation`
+  RAII cleanup), not to cap in memory and fail a legitimate query.
 - The recursive `Box::pin(execute(...))` children (Union/Subscribe/Set/Remove/
   Delete/Aggregate inner) each currently await a full child `GraphResult`;
   increment 5+ converts them to consume the child `RowStream`.
