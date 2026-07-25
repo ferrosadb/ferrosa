@@ -159,6 +159,7 @@ pub async fn run_endurance(config: &RunConfig, endurance: &EnduranceConfig) -> R
             linearizability: linear,
             invariant_passed: passed,
             invariant_error: None,
+            setup_error: None,
             duration_secs: endurance.pattern_duration.as_secs_f64(),
             op_count: history.len(),
         });

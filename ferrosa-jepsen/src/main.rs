@@ -159,10 +159,22 @@ async fn main() -> Result<()> {
                 if !report.all_passed() {
                     println!("\nFailures:");
                     for f in report.failures() {
-                        println!(
-                            "  - {} / {}: {:?}",
-                            f.workload, f.nemesis, f.invariant_error
-                        );
+                        // Distinguish a harness/infrastructure failure from a real
+                        // correctness result (issue #303). A setup failure produced
+                        // NO history, so no invariant was evaluated — saying it
+                        // "violated an invariant" announces a flaky nightly as a
+                        // correctness regression.
+                        if let Some(setup) = &f.setup_error {
+                            println!(
+                                "  - {} / {}: SETUP FAILED (no invariant evaluated): {}",
+                                f.workload, f.nemesis, setup
+                            );
+                        } else {
+                            println!(
+                                "  - {} / {}: INVARIANT VIOLATED: {:?}",
+                                f.workload, f.nemesis, f.invariant_error
+                            );
+                        }
                     }
                 }
             }
@@ -180,11 +192,33 @@ async fn main() -> Result<()> {
                 );
             }
             if !report.all_passed() {
-                anyhow::bail!(
-                    "jepsen run failed: {} of {} combination(s) violated an invariant",
-                    report.failed,
-                    report.total
-                );
+                // Report the two failure classes separately. Both still fail the
+                // run (a harness that cannot provision is not a green result),
+                // but calling a setup failure an invariant violation misdirects
+                // triage at a correctness bug that was never observed (#303).
+                let setup_failures = report
+                    .failures()
+                    .iter()
+                    .filter(|f| f.is_setup_failure())
+                    .count();
+                let invariant_failures = report.failed.saturating_sub(setup_failures);
+                match (setup_failures, invariant_failures) {
+                    (s, 0) => anyhow::bail!(
+                        "jepsen run failed: {s} of {} combination(s) FAILED TO RUN \
+                         (setup/infrastructure — no invariant was evaluated, so this is \
+                         not a correctness result)",
+                        report.total
+                    ),
+                    (0, i) => anyhow::bail!(
+                        "jepsen run failed: {i} of {} combination(s) violated an invariant",
+                        report.total
+                    ),
+                    (s, i) => anyhow::bail!(
+                        "jepsen run failed: {i} of {} combination(s) violated an invariant; \
+                         {s} more FAILED TO RUN (setup/infrastructure)",
+                        report.total
+                    ),
+                }
             }
 
             Ok(())
