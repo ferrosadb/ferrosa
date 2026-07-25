@@ -18,6 +18,7 @@ pub mod connection;
 pub mod extended;
 pub mod handshake;
 pub mod messages;
+pub(crate) mod offload;
 pub mod query;
 pub mod scram;
 pub mod server;

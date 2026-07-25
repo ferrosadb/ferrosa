@@ -86,8 +86,24 @@ inside an open transaction block.
 `load_catalog` materializes each referenced table (the async
 `StorageEngine::range_iter` stream is drained up front and decomposed via the
 shared `ferrosa_row_bridge::partition_to_rows_with_storage_mapping`) into an
-`InMemoryTable` → `ferrosa_sql::execute` runs the sync operators →
-`RowDescription` + `DataRow`s + `CommandComplete "SELECT n"`.
+`InMemoryTable` → `offload::execute_offloaded` runs the sync operators **on a
+blocking thread** → `RowDescription` + `DataRow`s +
+`CommandComplete "SELECT n"`.
+
+`ferrosa_sql::execute` is synchronous and CPU-bound (scan, filter, sort,
+hash-aggregate, hash-join). It must never be called inline from the async
+handlers: doing so pins an async worker for the whole query and starves
+connection keepalives — the failure mode PR #131 fixed on the CQL path. Both
+call sites (simple query in `query.rs`, extended query in `server.rs`) go
+through `offload::execute_offloaded`, and
+`offload::tests::executor_does_not_run_on_the_async_worker` fails if either
+regresses (forge t_d3b2dec1).
+
+Known limitation: `load_catalog` still materializes whole tables, so a
+full-table `SELECT` is bounded by table size rather than by the query. That is
+tracked as forge t_f348ba0b, and it is gated on making `ferrosa_sql`'s
+`QueryResult` stream (t_50d99192) — streaming the loader alone would only move
+the memory peak.
 
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +

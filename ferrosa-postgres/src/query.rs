@@ -35,7 +35,7 @@ use std::sync::Arc;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    execute, parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
+    parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
     QueryResult, Returning, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
@@ -702,7 +702,17 @@ pub async fn execute_query(
                 Ok(catalog) => catalog,
                 Err(err_msg) => return vec![err_msg],
             };
-            match execute(&select, &catalog, default_schema, &[]) {
+            // Offloaded: the relational executor is synchronous and CPU-bound
+            // (sort/hash-join), so running it inline would pin an async worker
+            // for the whole query — the PR #131 starvation shape. See `offload`.
+            match crate::offload::execute_offloaded(
+                *select,
+                catalog,
+                default_schema.to_string(),
+                Vec::new(),
+            )
+            .await
+            {
                 Ok(result) => render_result(result, &[]), // simple query: all text
                 Err(e) => vec![exec_error_response(&e)],
             }
