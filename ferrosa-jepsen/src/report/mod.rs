@@ -124,6 +124,7 @@ mod tests {
             linearizability: vec![],
             invariant_passed: passed,
             invariant_error: if passed { None } else { Some("bad".into()) },
+            setup_error: None,
             duration_secs: 1.0,
             op_count: 10,
         }
