@@ -219,8 +219,27 @@ pub struct CombinationResult {
     pub linearizability: Vec<CheckResult>,
     pub invariant_passed: bool,
     pub invariant_error: Option<String>,
+    /// Set when the combination never RAN to completion — cluster provisioning,
+    /// DDL, or driver setup failed — so no history was produced and no invariant
+    /// was ever evaluated.
+    ///
+    /// This is deliberately distinct from `invariant_error`. Both used to be
+    /// reported as "violated an invariant", which announced a flaky harness or
+    /// infrastructure failure as a CORRECTNESS regression (see issue #303: a
+    /// schema-agreement timeout at `CREATE KEYSPACE` was reported that way, and
+    /// the bank invariant it named had never been tested).
+    #[serde(default)]
+    pub setup_error: Option<String>,
     pub duration_secs: f64,
     pub op_count: usize,
+}
+
+impl CombinationResult {
+    /// True when this combination failed before producing any history — the
+    /// failure says nothing about the database's correctness.
+    pub fn is_setup_failure(&self) -> bool {
+        self.setup_error.is_some()
+    }
 }
 
 /// Run the full test suite per the config.
@@ -311,7 +330,8 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                                     nemesis = nemesis_name.as_str(),
                                     driver = driver_name.as_str(),
                                     error = %e,
-                                    "Combination failed"
+                                    "Combination failed to run (setup/execution error — no \
+                                     invariant was evaluated)"
                                 );
                                 results.push(CombinationResult {
                                     workload: workload_name.clone(),
@@ -321,8 +341,11 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                                     driver: driver_name.clone(),
                                     passed: false,
                                     linearizability: vec![],
+                                    // The combination never ran, so no invariant
+                                    // was checked — do NOT claim one was violated.
                                     invariant_passed: false,
-                                    invariant_error: Some(e.to_string()),
+                                    invariant_error: None,
+                                    setup_error: Some(e.to_string()),
                                     duration_secs: 0.0,
                                     op_count: 0,
                                 });
@@ -495,6 +518,7 @@ async fn run_single_combination(
         linearizability,
         invariant_passed,
         invariant_error,
+        setup_error: None,
         duration_secs: duration.as_secs_f64(),
         op_count: history.len(),
     })
@@ -516,6 +540,7 @@ mod tests {
             linearizability: vec![],
             invariant_passed: true,
             invariant_error: None,
+            setup_error: None,
             duration_secs: 1.5,
             op_count: 42,
         };
