@@ -1,0 +1,182 @@
+# Single-DC 3-node RF=3 ferrosa cluster for the Accord strict-serializability
+# (Elle list-append) certification in CI. Mirrors the T3 nightly compose but with
+# ONE datacenter and 3 voters (SimpleStrategy RF=3 is what the elle_list_append
+# generator creates), and a single flat network so the nemesis schedule can
+# partition/slow individual nodes with `docker exec` iptables/tc (NET_ADMIN).
+#
+# 12-factor: nodes run the pre-built ${FERROSA_NIGHTLY_IMAGE}; `up --no-build`
+# never compiles. The host driver reconnects through the mapped 127.0.0.1 ports,
+# so each node advertises its CQL broadcast as its host-mapped port.
+name: ferrosa-elle-rf3
+
+networks:
+  elle-net:
+    driver: bridge
+
+volumes:
+  elle-rustfs-data:
+  elle-node1-data:
+  elle-node2-data:
+  elle-node3-data:
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: ferrosa-elle-rustfs
+    networks: [elle-net]
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs0
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin  # pragma: allowlist secret
+      RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS: "true"
+    volumes:
+      - elle-rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  rustfs-init:
+    image: minio/mc
+    container_name: ferrosa-elle-rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    networks: [elle-net]
+    entrypoint: >
+      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
+             mc mb local/ferrosa-elle --ignore-existing &&
+             echo 'bucket ferrosa-elle ready'"
+    restart: "no"
+
+  node1:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
+    container_name: ferrosa-elle-node1
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [elle-net]
+    ports:
+      - "9042:9042"
+      - "9090:9090"
+    environment:
+      FERROSA_HOST_ID: "e11e0001-0001-0001-0001-000000000001"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node1:7000"
+      FERROSA_SEED: "node2:7000,node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-elle"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-elle"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_CACHE_MAX_BYTES: "536870912"
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"
+    cap_add: [NET_ADMIN]
+    volumes:
+      - elle-node1-data:/var/lib/ferrosa
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 18
+      start_period: 15s
+
+  node2:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
+    container_name: ferrosa-elle-node2
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [elle-net]
+    ports:
+      - "9043:9042"
+      - "9091:9090"
+    environment:
+      FERROSA_HOST_ID: "e11e0002-0002-0002-0002-000000000002"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node2:7000"
+      FERROSA_SEED: "node1:7000,node3:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:9043"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-elle"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-elle"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_CACHE_MAX_BYTES: "536870912"
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"
+    cap_add: [NET_ADMIN]
+    volumes:
+      - elle-node2-data:/var/lib/ferrosa
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 18
+      start_period: 15s
+
+  node3:
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-nightly:latest}
+    container_name: ferrosa-elle-node3
+    depends_on:
+      rustfs-init:
+        condition: service_completed_successfully
+    networks: [elle-net]
+    ports:
+      - "9044:9042"
+      - "9092:9090"
+    environment:
+      FERROSA_HOST_ID: "e11e0003-0003-0003-0003-000000000003"
+      FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
+      FERROSA_INTERNODE_BROADCAST: "node3:7000"
+      FERROSA_SEED: "node1:7000,node2:7000"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_CQL_BROADCAST: "127.0.0.1:9044"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
+      FERROSA_CLUSTER_NAME: "ferrosa-elle"
+      FERROSA_DATA_DIR: "/var/lib/ferrosa"
+      FERROSA_AUTH_DISABLED: "true"
+      FERROSA_S3_ENDPOINT: "http://rustfs:9000"
+      FERROSA_S3_BUCKET: "ferrosa-elle"
+      FERROSA_S3_ALLOW_HTTP: "true"
+      FERROSA_S3_ACCESS_KEY_ID: "rustfsadmin"
+      FERROSA_S3_SECRET_ACCESS_KEY: "rustfsadmin"  # pragma: allowlist secret
+      FERROSA_CACHE_MAX_BYTES: "536870912"
+      FERROSA_MEMTABLE_BACKPRESSURE_BYTES: "134217728"
+      FERROSA_FLUSH_THRESHOLD_BYTES: "33554432"
+    cap_add: [NET_ADMIN]
+    volumes:
+      - elle-node3-data:/var/lib/ferrosa
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/health || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 18
+      start_period: 15s
