@@ -126,6 +126,40 @@ fn cql_value_payload_bytes(v: &CqlValue) -> usize {
     }
 }
 
+/// A row this sorter can spill: serializable (runs are length-prefixed JSON) and
+/// able to estimate its own footprint for threshold accounting.
+///
+/// Implemented for the CQL result [`Row`]; other engines (e.g. the graph
+/// executor's `Vec<serde_json::Value>` rows, t_4ce82a3e) implement it to reuse
+/// this spill/merge machinery with their own row type.
+pub trait SpillRow: serde::Serialize + serde::de::DeserializeOwned {
+    /// Approximate in-memory bytes. Need not be exact — only monotonic in real
+    /// memory use, so the buffer spills before the process is starved.
+    fn estimated_bytes(&self) -> usize;
+}
+
+impl SpillRow for Row {
+    fn estimated_bytes(&self) -> usize {
+        estimate_row_bytes(self)
+    }
+}
+
+/// The ordering strategy for a [`SpillRow`].
+///
+/// Kept as a trait rather than a closure so it can be cloned into each heap
+/// entry, and so a caller supplies its OWN comparator — the graph executor must
+/// preserve its `compare_json_values` semantics (mixed types and complex values
+/// compare Equal), which differ from `CqlValue`'s `Ord`.
+pub trait SpillOrder<T>: Clone {
+    fn compare(&self, a: &T, b: &T) -> Ordering;
+}
+
+impl SpillOrder<Row> for RowOrder {
+    fn compare(&self, a: &Row, b: &Row) -> Ordering {
+        RowOrder::compare(self, a, b)
+    }
+}
+
 /// Wrap a contextual message as an `Error::Io` (the `Io` variant carries a
 /// `std::io::Error`, so string context is threaded through one).
 fn io_error(msg: String) -> Error {
@@ -133,7 +167,7 @@ fn io_error(msg: String) -> Error {
 }
 
 /// Serialize one row to `w` as a length-prefixed JSON record: `[u32 LE len][json]`.
-fn write_row<W: Write>(w: &mut W, row: &Row) -> Result<()> {
+fn write_row<W: Write, T: SpillRow>(w: &mut W, row: &T) -> Result<()> {
     let bytes = serde_json::to_vec(row)
         .map_err(|e| Error::InvalidFormat(format!("external sort: encode row: {e}")))?;
     let len = u32::try_from(bytes.len())
@@ -149,7 +183,7 @@ fn write_row<W: Write>(w: &mut W, row: &Row) -> Result<()> {
 ///
 /// A truncated record (EOF mid-row) is a corrupt run and fails loud — it is
 /// never treated as a clean end, because that would silently drop rows.
-fn read_row<R: Read>(r: &mut R) -> Result<Option<Row>> {
+fn read_row<R: Read, T: SpillRow>(r: &mut R) -> Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -163,7 +197,7 @@ fn read_row<R: Read>(r: &mut R) -> Result<Option<Row>> {
             "external sort: truncated run record (want {len} bytes): {e}"
         ))
     })?;
-    let row: Row = serde_json::from_slice(&buf)
+    let row: T = serde_json::from_slice(&buf)
         .map_err(|e| Error::InvalidFormat(format!("external sort: decode run row: {e}")))?;
     Ok(Some(row))
 }
@@ -173,21 +207,21 @@ fn read_row<R: Read>(r: &mut R) -> Result<Option<Row>> {
 /// Push every row, then call [`ExternalSorter::finish`] to obtain the sorted
 /// stream. Run files are written under the caller-provided directory (typically
 /// a [`crate::TempSortTableReservation`] whose `Drop` removes them).
-pub struct ExternalSorter {
+pub struct ExternalSorter<T = Row, C = RowOrder> {
     dir: PathBuf,
-    order: RowOrder,
+    order: C,
     threshold_bytes: usize,
-    buffer: Vec<Row>,
+    buffer: Vec<T>,
     buffer_bytes: usize,
     runs: Vec<PathBuf>,
     /// Whether at least one spill to disk occurred (observability + tests).
     spilled: bool,
 }
 
-impl ExternalSorter {
+impl<T: SpillRow, C: SpillOrder<T>> ExternalSorter<T, C> {
     /// Create a sorter that spills into `dir` once the in-memory buffer's
     /// estimated size reaches `threshold_bytes`.
-    pub fn new(dir: impl Into<PathBuf>, order: RowOrder, threshold_bytes: u64) -> Self {
+    pub fn new(dir: impl Into<PathBuf>, order: C, threshold_bytes: u64) -> Self {
         Self {
             dir: dir.into(),
             order,
@@ -213,8 +247,8 @@ impl ExternalSorter {
 
     /// Push one row (moved, never cloned). Spills the buffer to a run file if it
     /// crosses the threshold.
-    pub fn push(&mut self, row: Row) -> Result<()> {
-        self.buffer_bytes += estimate_row_bytes(&row);
+    pub fn push(&mut self, row: T) -> Result<()> {
+        self.buffer_bytes += row.estimated_bytes();
         self.buffer.push(row);
         if self.buffer_bytes >= self.threshold_bytes {
             self.spill_buffer()?;
@@ -253,7 +287,7 @@ impl ExternalSorter {
     ///   k-way merge. This caps peak open readers (and heap size) at `MERGE_FANIN`
     ///   regardless of how many runs (i.e. how large the result) — so the sort's
     ///   working set is bounded independent of the row count.
-    pub fn finish(mut self) -> Result<SortedRows> {
+    pub fn finish(mut self) -> Result<SortedRows<T, C>> {
         if self.runs.is_empty() {
             self.buffer.sort_by(|a, b| self.order.compare(a, b));
             let rows = std::mem::take(&mut self.buffer);
@@ -313,7 +347,11 @@ const MERGE_FANIN: usize = 64;
 /// Merge the sorted run files in `inputs` into one sorted run at `out` via a
 /// bounded k-way merge, then return. Rows move through one at a time — the
 /// output run is written streaming, so this holds `<= inputs.len()` rows.
-fn merge_runs_into(inputs: &[PathBuf], order: &RowOrder, out: &std::path::Path) -> Result<()> {
+fn merge_runs_into<T: SpillRow, C: SpillOrder<T>>(
+    inputs: &[PathBuf],
+    order: &C,
+    out: &std::path::Path,
+) -> Result<()> {
     let mut merger = KWayMerge::open(inputs, order.clone())?;
     let file = File::create(out).map_err(|e| {
         io_error(format!(
@@ -334,15 +372,15 @@ fn merge_runs_into(inputs: &[PathBuf], order: &RowOrder, out: &std::path::Path) 
 ///
 /// Each item is a `Result<Row>`: the merge does real I/O, so a read error on a
 /// spilled run surfaces here rather than being swallowed.
-pub enum SortedRows {
+pub enum SortedRows<T = Row, C = RowOrder> {
     /// Fast path: everything fit in memory; already-sorted rows.
-    InMemory(std::vec::IntoIter<Row>),
+    InMemory(std::vec::IntoIter<T>),
     /// Spilled path: a bounded k-way merge over run files.
-    Merged(KWayMerge),
+    Merged(KWayMerge<T, C>),
 }
 
-impl Iterator for SortedRows {
-    type Item = Result<Row>;
+impl<T: SpillRow, C: SpillOrder<T>> Iterator for SortedRows<T, C> {
+    type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -360,24 +398,24 @@ struct RunCursor {
 
 /// A heap entry ordering run heads by the sort key. The `run_idx` breaks ties
 /// deterministically so the merge is stable and total.
-struct HeapEntry {
-    row: Row,
+struct HeapEntry<T, C> {
+    row: T,
     run_idx: usize,
-    order: RowOrder,
+    order: C,
 }
 
-impl PartialEq for HeapEntry {
+impl<T: SpillRow, C: SpillOrder<T>> PartialEq for HeapEntry<T, C> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
-impl Eq for HeapEntry {}
-impl PartialOrd for HeapEntry {
+impl<T: SpillRow, C: SpillOrder<T>> Eq for HeapEntry<T, C> {}
+impl<T: SpillRow, C: SpillOrder<T>> PartialOrd for HeapEntry<T, C> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for HeapEntry {
+impl<T: SpillRow, C: SpillOrder<T>> Ord for HeapEntry<T, C> {
     fn cmp(&self, other: &Self) -> Ordering {
         // `BinaryHeap` is a max-heap; we want the SMALLEST key on top, so invert
         // the key comparison. Ties fall back to run_idx (also inverted) so the
@@ -393,14 +431,14 @@ impl Ord for HeapEntry {
 ///
 /// The heap holds at most one entry per run, so peak memory is
 /// O(number_of_runs), independent of the total number of rows.
-pub struct KWayMerge {
+pub struct KWayMerge<T = Row, C = RowOrder> {
     cursors: Vec<RunCursor>,
-    heap: BinaryHeap<HeapEntry>,
-    order: RowOrder,
+    heap: BinaryHeap<HeapEntry<T, C>>,
+    order: C,
 }
 
-impl KWayMerge {
-    fn open(runs: &[PathBuf], order: RowOrder) -> Result<Self> {
+impl<T: SpillRow, C: SpillOrder<T>> KWayMerge<T, C> {
+    fn open(runs: &[PathBuf], order: C) -> Result<Self> {
         let mut cursors = Vec::with_capacity(runs.len());
         let mut heap = BinaryHeap::with_capacity(runs.len());
         for (run_idx, path) in runs.iter().enumerate() {
@@ -427,7 +465,7 @@ impl KWayMerge {
     }
 
     /// Emit the next row in sorted order, or `Ok(None)` when all runs drain.
-    fn next_row(&mut self) -> Result<Option<Row>> {
+    fn next_row(&mut self) -> Result<Option<T>> {
         let Some(top) = self.heap.pop() else {
             return Ok(None);
         };
@@ -526,6 +564,59 @@ mod tests {
             let span = (hi - lo) as u64;
             lo + (self.next_u64() % span) as i64
         }
+    }
+
+    /// The point of the generic-ification (t_4ce82a3e): a FOREIGN row type with
+    /// its OWN comparator reuses the spill/merge machinery and gets that
+    /// comparator's ordering — not `CqlValue`'s. Models the graph executor's
+    /// `Vec<serde_json::Value>` rows and its `compare_json_values` semantics,
+    /// where mixed types compare Equal (which `CqlValue::Ord` would not do).
+    #[test]
+    fn foreign_row_type_spills_and_merges_with_its_own_comparator() {
+        type JsonRow = Vec<serde_json::Value>;
+
+        impl SpillRow for JsonRow {
+            fn estimated_bytes(&self) -> usize {
+                self.len() * 32
+            }
+        }
+
+        #[derive(Clone)]
+        struct JsonAsc;
+        impl SpillOrder<JsonRow> for JsonAsc {
+            fn compare(&self, a: &JsonRow, b: &JsonRow) -> Ordering {
+                match (a.first(), b.first()) {
+                    (Some(serde_json::Value::Number(x)), Some(serde_json::Value::Number(y))) => x
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .partial_cmp(&y.as_f64().unwrap_or(0.0))
+                        .unwrap_or(Ordering::Equal),
+                    // Graph semantics: anything else is Equal.
+                    _ => Ordering::Equal,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Threshold of 1 byte forces a spill on every push, so the merge path
+        // (not the in-memory fast path) is what is exercised.
+        let mut sorter: ExternalSorter<JsonRow, JsonAsc> =
+            ExternalSorter::new(dir.path(), JsonAsc, 1);
+        for n in [5i64, 1, 4, 2, 3] {
+            sorter.push(vec![serde_json::json!(n)]).unwrap();
+        }
+        assert!(sorter.spilled(), "threshold 1 must force spilling");
+
+        let sorted: Vec<JsonRow> = sorter.finish().unwrap().collect::<Result<_>>().unwrap();
+        let got: Vec<i64> = sorted
+            .iter()
+            .map(|r| r[0].as_i64().expect("number"))
+            .collect();
+        assert_eq!(
+            got,
+            vec![1, 2, 3, 4, 5],
+            "foreign comparator must order the merge"
+        );
     }
 
     #[test]
@@ -651,7 +742,9 @@ mod tests {
         f.write_all(&[1, 2, 3]).unwrap();
         drop(f);
         let mut r = BufReader::new(File::open(&path).unwrap());
-        let err = read_row(&mut r).unwrap_err();
+        // `read_row` is generic over the row type now; this test exercises the
+        // CQL row, so name it explicitly.
+        let err = read_row::<_, Row>(&mut r).unwrap_err();
         assert!(
             format!("{err}").contains("truncated"),
             "expected truncated-run error, got {err}"
