@@ -405,14 +405,38 @@ async fn process_message(
             }
         }
 
-        BoltMessage::Pull { .. } => {
-            if let Some(result) = state.pending_result.take() {
+        BoltMessage::Pull { extra } => {
+            if let Some(mut result) = state.pending_result.take() {
                 let mut replies = Vec::new();
 
-                // Send a RECORD for each row.
-                for row in &result.rows {
+                // Honor the protocol's `n`: PULL {n} must deliver AT MOST n
+                // records and signal `has_more` when the result is not
+                // exhausted, so a client can page a large result instead of
+                // receiving all of it in one batch. `n` absent or negative
+                // (canonically -1) means "fetch all" (t_4ce82a3e).
+                //
+                // Previously `extra` was discarded and every row was sent with
+                // has_more hardcoded false, so a client asking for 10 rows got
+                // the entire result — a protocol violation, and unbounded
+                // client-side memory for a large query.
+                let (batch, has_more) = take_batch(&mut result.rows, requested_batch_size(&extra));
+
+                // Send a RECORD for each row in this batch.
+                for row in &batch {
                     let values: Vec<PackValue> = row.iter().map(json_to_pack_value).collect();
                     replies.push(BoltMessage::Record { values });
+                }
+
+                // Keep the rest for the next PULL. Stats travel with the FINAL
+                // batch, matching Bolt's summary semantics.
+                if has_more {
+                    // `result.rows` already holds exactly the unconsumed
+                    // remainder, so this is a move, not a copy.
+                    state.pending_result = Some(result);
+                    replies.push(BoltMessage::Success {
+                        metadata: vec![("has_more".into(), PackValue::Bool(true))],
+                    });
+                    return Ok(replies);
                 }
 
                 // Send summary SUCCESS.
@@ -457,9 +481,26 @@ async fn process_message(
             }
         }
 
-        BoltMessage::Discard { .. } => {
-            state.pending_result = None;
-            Ok(vec![BoltMessage::Success { metadata: vec![] }])
+        BoltMessage::Discard { extra } => {
+            // DISCARD {n} discards AT MOST n records, exactly mirroring PULL {n}
+            // — it is not "throw the whole result away". Previously `extra` was
+            // discarded and the entire pending result was dropped, so a client
+            // discarding one record lost the rest with no way to reach it.
+            // `n` absent or negative means discard everything (t_4ce82a3e).
+            match state.pending_result.take() {
+                Some(mut result) => {
+                    let (_dropped, has_more) =
+                        take_batch(&mut result.rows, requested_batch_size(&extra));
+                    if has_more {
+                        state.pending_result = Some(result);
+                        return Ok(vec![BoltMessage::Success {
+                            metadata: vec![("has_more".into(), PackValue::Bool(true))],
+                        }]);
+                    }
+                    Ok(vec![BoltMessage::Success { metadata: vec![] }])
+                }
+                None => Ok(vec![BoltMessage::Success { metadata: vec![] }]),
+            }
         }
 
         BoltMessage::Reset => {
@@ -677,6 +718,51 @@ fn pack_to_json_value(v: &PackValue) -> serde_json::Value {
 }
 
 /// Convert a `serde_json::Value` to a `PackValue`.
+/// How many records this `PULL` may deliver: `Some(n)` for a bounded batch,
+/// `None` for "fetch all".
+///
+/// Pure (takes the decoded `extra` map, does no I/O) so the protocol rule is
+/// unit-testable without a socket or a session — the risky part of PULL paging
+/// is this parse, not the row copying.
+///
+/// Bolt semantics: `n` absent, negative (canonically `-1`), or non-integer means
+/// fetch everything. `n >= 0` bounds the batch; `n == 0` legitimately yields an
+/// empty batch with `has_more` still set.
+fn requested_batch_size(extra: &[(String, PackValue)]) -> Option<usize> {
+    match extra.iter().find(|(k, _)| k == "n").map(|(_, v)| v) {
+        Some(PackValue::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// Decide one PULL batch: `(rows_to_send, has_more)` for a `requested` batch
+/// size (`None` = fetch all) against `total` buffered rows.
+///
+/// Pure so the paging arithmetic — the part with the off-by-one and
+/// saturation edges — is unit-testable without a GraphEngine or a socket.
+/// Consume at most `requested` records from `rows`, returning the consumed
+/// batch and whether any records remain.
+///
+/// PULL and DISCARD share this contract exactly and differ only in what they do
+/// with the batch — PULL serializes it into RECORDs, DISCARD drops it — so the
+/// consumption lives here rather than being written twice and drifting.
+fn take_batch(
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    requested: Option<usize>,
+) -> (Vec<Vec<serde_json::Value>>, bool) {
+    let (take, has_more) = batch_split(requested, rows.len());
+    let remainder = rows.split_off(take);
+    // `rows` now holds the batch and `remainder` the rest; swap so the caller's
+    // pending buffer is left holding exactly the unconsumed records.
+    let batch = std::mem::replace(rows, remainder);
+    (batch, has_more)
+}
+
+fn batch_split(requested: Option<usize>, total: usize) -> (usize, bool) {
+    let take = requested.map_or(total, |n| n.min(total));
+    (take, take < total)
+}
+
 fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
     match v {
         serde_json::Value::Null => PackValue::Null,
@@ -719,6 +805,131 @@ fn error_code(err: &GraphError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// PULL and DISCARD share one contract: consume at most `n` records from
+    /// the pending result and report whether any remain. They differ only in
+    /// what they do with the consumed batch (serialize it vs drop it), so the
+    /// consumption itself lives in one tested function — a second copy in the
+    /// DISCARD arm is how the two drift apart.
+    #[test]
+    fn take_batch_consumes_at_most_n_and_leaves_the_remainder() {
+        let rows = || -> Vec<Vec<serde_json::Value>> {
+            (1..=5).map(|i| vec![serde_json::json!(i)]).collect()
+        };
+
+        // Partial: batch is the first n, remainder stays for the next message.
+        let mut r = rows();
+        let (batch, has_more) = take_batch(&mut r, Some(2));
+        assert_eq!(
+            batch,
+            vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]]
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![serde_json::json!(3)],
+                vec![serde_json::json!(4)],
+                vec![serde_json::json!(5)],
+            ]
+        );
+        assert!(has_more, "3 rows remain");
+
+        // n == len: exact drain must NOT report more, or the client loops forever.
+        let mut r = rows();
+        let (batch, has_more) = take_batch(&mut r, Some(5));
+        assert_eq!(batch.len(), 5);
+        assert!(r.is_empty());
+        assert!(!has_more);
+
+        // Fetch-all (n absent / negative) drains everything.
+        let mut r = rows();
+        let (batch, has_more) = take_batch(&mut r, None);
+        assert_eq!(batch.len(), 5);
+        assert!(r.is_empty());
+        assert!(!has_more);
+
+        // n == 0 consumes nothing but must still report more, else the
+        // remaining rows become unreachable.
+        let mut r = rows();
+        let (batch, has_more) = take_batch(&mut r, Some(0));
+        assert!(batch.is_empty());
+        assert_eq!(r.len(), 5, "nothing consumed");
+        assert!(has_more);
+
+        // Empty pending result: no panic, nothing more.
+        let mut r: Vec<Vec<serde_json::Value>> = Vec::new();
+        let (batch, has_more) = take_batch(&mut r, Some(3));
+        assert!(batch.is_empty());
+        assert!(!has_more);
+    }
+
+    /// The paging arithmetic, including the edges that decide whether a client
+    /// ever sees the rest of its result (t_4ce82a3e inc 7).
+    #[test]
+    fn batch_split_pages_and_signals_has_more() {
+        // Bounded batch smaller than the result: more remains.
+        assert_eq!(batch_split(Some(2), 5), (2, true));
+        // Exactly the result size: no more (must NOT claim has_more, which would
+        // make a client PULL forever).
+        assert_eq!(batch_split(Some(5), 5), (5, false));
+        // Asking for more than exists is clamped, and completes.
+        assert_eq!(batch_split(Some(99), 5), (5, false));
+        // n = 0 sends nothing but must still report more to come.
+        assert_eq!(batch_split(Some(0), 5), (0, true));
+        // ...unless there is nothing to send at all.
+        assert_eq!(batch_split(Some(0), 0), (0, false));
+        // Fetch-all takes everything and completes — the pre-existing behavior,
+        // which must be preserved for clients that send n = -1 or omit it.
+        assert_eq!(batch_split(None, 5), (5, false));
+        assert_eq!(batch_split(None, 0), (0, false));
+    }
+
+    /// Bolt PULL {n} must deliver AT MOST n records. `n` absent/negative means
+    /// "fetch all". Before this parse existed the whole `extra` map was
+    /// discarded, so EVERY row was sent regardless of `n` — a protocol
+    /// violation and unbounded client-side memory (t_4ce82a3e inc 7). These
+    /// cases are exactly what the old `Pull { .. }` could not express.
+    #[test]
+    fn requested_batch_size_honors_the_protocol_n() {
+        use crate::bolt::codec::PackValue;
+
+        // Bounded batch.
+        assert_eq!(
+            requested_batch_size(&[("n".to_string(), PackValue::Int(10))]),
+            Some(10)
+        );
+        // n = 0 is legal: an empty batch, has_more still decides continuation.
+        assert_eq!(
+            requested_batch_size(&[("n".to_string(), PackValue::Int(0))]),
+            Some(0)
+        );
+        // -1 is the canonical "fetch all".
+        assert_eq!(
+            requested_batch_size(&[("n".to_string(), PackValue::Int(-1))]),
+            None
+        );
+        // Any other negative also means fetch-all rather than panicking on the
+        // `as usize` cast.
+        assert_eq!(
+            requested_batch_size(&[("n".to_string(), PackValue::Int(-99))]),
+            None
+        );
+        // Absent -> fetch all (what every pre-existing client sends).
+        assert_eq!(requested_batch_size(&[]), None);
+        // Wrong type -> fetch all rather than failing the pull.
+        assert_eq!(
+            requested_batch_size(&[("n".to_string(), PackValue::String("10".into()))]),
+            None
+        );
+        // Unrelated keys (qid etc.) are ignored.
+        assert_eq!(
+            requested_batch_size(&[
+                ("qid".to_string(), PackValue::Int(1)),
+                ("n".to_string(), PackValue::Int(3)),
+            ]),
+            Some(3)
+        );
+    }
     use super::*;
 
     #[test]

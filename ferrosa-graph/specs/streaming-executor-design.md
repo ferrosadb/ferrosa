@@ -146,6 +146,14 @@ sibling returning `(columns, RowStream, StatsHandle)`; the buffered `GraphResult
 is kept for internal callers (CALL join, aggregate inner, tests) by `collect`ing
 the stream — behavior-identical.
 
+**Landed** (see §5 status): `execute_streaming()` in `expand.rs`, returning
+`(Vec<String>, RowStream<'a>, QueryStats)`. `QueryStats` is returned **by value
+up front**, not as a `StatsHandle` — stats are finalized after the last row
+(e.g. `execution_ms`), so a by-value return forces any variant whose stats are
+not known in advance to be executed eagerly. Converting that to a deferred
+`StatsHandle` is a prerequisite for lazy `UNION ALL` arms and for the transport
+increment.
+
 - **HTTP:** replace `Json(result)` (`http.rs:286`) with a chunked
   `application/x-ndjson` (or a JSON array streamed element-by-element) body over
   the SUBSCRIBE mpsc/`ReceiverStream` template (`:456-560`). Header row first,
@@ -176,6 +184,90 @@ the stream — behavior-identical.
 
 Increments 1–4 deliver the headline OOM/LIMIT win for the common
 expand-with-limit shape; 5–7 complete coverage and end-to-end streaming.
+
+### Status
+
+| Increment | State |
+|---|---|
+| 1 — `RowStream` + collect bridges | **done** (`executor/stream.rs`) |
+| 2 — streaming entry point | **partial** — see below |
+| 3 — Expand projection + DISTINCT + SET/REMOVE | **partial** — see below |
+| 4–7 | not started |
+
+Increment 2 landed as an **additive scaffold**: `execute_streaming()` exists and
+`execute()` is now a thin `collect` over it, so there is one executor rather than
+two. Only three plan variants actually stream:
+
+- `Subscribe` — passthrough to the inner plan.
+- `Union { all: true }` — concatenation via `stream::chain_streams`; a later arm
+  is never *polled* until the earlier arms are drained. The arms are still
+  *executed* eagerly, because the union's `QueryStats` is the sum over its arms
+  and stats are returned up front (§4). End-to-end laziness across arms needs the
+  `StatsHandle` change.
+- `ReturnOnly` — at most one row, produced on pull, so `LIMIT 0` never evaluates
+  the projection. `ORDER BY` is skipped as the identity on a one-row result.
+
+Every other variant computes today's buffered `GraphResult` and is wrapped with
+`stream_from_rows`. Deliberately **not** converted, with reasons:
+
+- `Union { all: false }` — the `HashSet` dedup spans the whole concatenation.
+- `DeleteNodes` — consumes the matched rows twice (validate every matched vertex,
+  then tombstone). A single pass would delete a prefix and then fail validation:
+  partial deletion.
+- `Aggregate`, DISTINCT, ORDER BY, `WcoJoin`, `ExpandVarLength` — pipeline
+  breakers, scheduled for increments 5–6.
+- The sequential-vs-concurrent hop split (`expand.rs`, capped hops run
+  sequentially) is untouched: completion-order draining changes which rows a
+  LIMIT returns.
+- `http.rs` / `bolt/server.rs` are untouched: `Body::from_stream` requires
+  `'static`, and Bolt holds the result in a struct field across protocol
+  messages. That is increment 7.
+
+Known behavior preserved rather than fixed: the buffered `UNION` never summed
+`edges_deleted` across arms, and the streaming one does not either.
+
+#### Increment 3 (partial)
+
+`execute_expand` was split into a shared phase A (`expand_to_states`: anchor
+scan → hops → post-filters → OPTIONAL MATCH → WITH) and two tails. The hop loop,
+its sequential-vs-concurrent split, and `max_fan_out_per_hop` are **unchanged**;
+phase A is still fully materializing. What was converted:
+
+- **Expand projection** — `project_states_stream` projects one state per pull,
+  so `LIMIT k` projects k states instead of projecting everything and
+  truncating. It also drops the buffered loop's `result_states.push(state.clone())`,
+  a per-row deep clone of every binding map that only the `ORDER BY` tail needed.
+  An Expand with an `ORDER BY` still uses `finish_expand_buffered` (pipeline
+  breaker, and it keeps the spill path).
+- **`DISTINCT`** — now `stream::dedup_stream` on top of the projection, for
+  Expands without an `ORDER BY`.
+- **SET / REMOVE** — consume their inner expand as a `RowStream` instead of a
+  `Vec` of projected rows. Their own output is a single summary row that is only
+  known after the last write, so it cannot stream; the memory win is entirely in
+  the inner expand. `projection_reads_storage` drains the stream first if the
+  inner projection would touch storage, so a projection can never observe the
+  writes the statement is making.
+
+**Behavior change — `DISTINCT` ordering (deliberate, owner-approved).**
+`RETURN DISTINCT` **without** an `ORDER BY` now returns rows in **first-seen
+(expansion) order**. It previously returned them in string-repr **sorted** order
+(`rows.sort_by(|a, b| format!("{a:?}").cmp(..))` then `dedup()`). The row SET is
+unchanged. This also makes the Expand path agree with the CALL-subquery trailing
+`RETURN DISTINCT` in `engine.rs`, which already deduped first-seen with the same
+`serde_json::to_string` key. `DISTINCT` + `ORDER BY` is unaffected (buffered
+tail). `ExpandVarLength`'s `DISTINCT` (`varpath.rs`) still sorts — that path is
+out of scope here, so the two disagree until increment 6.
+
+**`DISTINCT` is still unbounded in memory.** `dedup_stream`'s `HashSet` grows
+with the number of distinct rows, exactly as the buffered `Vec` did. This
+increment changed ordering and latency, **not** the memory bound; a
+high-cardinality `DISTINCT` can still exhaust memory. Bounding it is separate
+work.
+
+**`execution_ms` now under-reports for a streamed Expand.** Stats are returned
+up front (§4), so `execution_ms` is measured before any row is projected, where
+the buffered tail measured after. Fixing this needs the deferred stats handle.
+
 
 ## 6. Verification
 
