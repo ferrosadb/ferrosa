@@ -302,12 +302,14 @@ pub async fn execute_var_length(
     // Determine the variable name for result binding.
     let result_var = hop.var.as_deref().unwrap_or(anchor_var);
 
+    // No `max_result_rows` break here: it SILENTLY TRUNCATED the result — no
+    // error, no flag — so a client could not tell a partial answer from a
+    // complete one. Removed with the same reasoning as the expand path
+    // (t_4ce82a3e): an unbounded ORDER BY spills below instead of being capped.
+    // Traversal is still bounded by `max_var_path_visited`, which limits WORK
+    // (a DoS control), not the result buffer.
     let mut rows = Vec::new();
     for key in &result_keys {
-        if rows.len() >= config.max_result_rows {
-            break;
-        }
-
         let partition = write_path.read(&proj_table_id, key).await?;
         let hex_id = hex::encode(key.key.as_bytes());
 
@@ -351,9 +353,17 @@ pub async fn execute_var_length(
         rows.push(row);
     }
 
-    // Apply ORDER BY.
+    // Apply ORDER BY. An unbounded one spills through the storage engine's
+    // bounded external merge sort; `spill_order_by` returns false (leaving the
+    // in-memory sort) when it cannot apply — no backend, a LIMIT is present, or
+    // an order term is not a projected column.
     if !return_clause.order_by.is_empty() {
-        sort_rows(&mut rows, &columns, &return_clause.order_by);
+        let spilled =
+            crate::executor::spill::spill_order_by(&mut rows, &columns, return_clause, config)
+                .await?;
+        if !spilled {
+            sort_rows(&mut rows, &columns, &return_clause.order_by);
+        }
     }
 
     // Apply DISTINCT.

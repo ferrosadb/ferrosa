@@ -231,9 +231,27 @@ pub async fn execute_wco_join(
         .await?;
     }
 
-    // Apply ORDER BY.
+    // Apply ORDER BY. An unbounded one spills through the storage engine's
+    // bounded external merge sort (t_4ce82a3e); `spill_order_by` returns false —
+    // leaving the in-memory sort — when it cannot apply.
+    //
+    // NOTE: unlike the expand and varpath paths, this file's `max_result_rows`
+    // uses are NOT removed here. Several of them bound JOIN WORK rather than the
+    // result buffer (`leapfrog_join(&mut iterators, config.max_result_rows)`
+    // caps the intersection itself, and `enumerate_bindings` stops recursing on
+    // it), so removing them is a different change that needs its own analysis of
+    // what each cap is actually protecting.
     if !return_clause.order_by.is_empty() {
-        sort_rows(&mut result_rows, &columns, &return_clause.order_by);
+        let spilled = crate::executor::spill::spill_order_by(
+            &mut result_rows,
+            &columns,
+            return_clause,
+            config,
+        )
+        .await?;
+        if !spilled {
+            sort_rows(&mut result_rows, &columns, &return_clause.order_by);
+        }
     }
 
     // Apply DISTINCT.
