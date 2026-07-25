@@ -84,10 +84,24 @@ Operators compose as a tree; the transport pulls the root. Two operator classes:
     property this executor needs, for free. The CQL side already classifies this
     shape as `OrderByExecutionPlan::SpillableTempTable { estimated_scan_bytes }`
     (`ferrosa-cql/src/router.rs`); the graph planner should classify the same way.
-    *Gap to close:* `ExternalSorter` sorts `Row`/`CqlValue` while graph rows are
-    `Vec<serde_json::Value>`, so this needs either a value bridge or a small
-    generic-ification of the sorter — the spill/merge/cleanup machinery itself is
-    reused untouched.
+    *Gap to close — resolved:* `ExternalSorter`'s row type is
+    `Vec<Option<CqlValue>>` (a RESULT row, not an sstable row) while graph rows
+    are `Vec<serde_json::Value>`. Two ways to bridge that, and the choice is
+    forced by correctness:
+    - **A value bridge (json → CqlValue) is WRONG.** Graph's `compare_json_values`
+      (`expand.rs`) has semantics `CqlValue`'s `Ord` does not share: mixed-type
+      comparisons (String vs Number) and complex values (objects, arrays) compare
+      **Equal**, and `Null` sorts before any present value. Converting to
+      `CqlValue` and using its `Ord` would silently reorder those cases — a
+      behavior change in ORDER BY results.
+    - **Generic-ify the sorter** over its row type + comparator (and its
+      serialization for spilled runs), so graph passes its own
+      `compare_json_values` and gets identical ordering. The spill / k-way merge /
+      `TempSortTableReservation` cleanup machinery is reused untouched, and the
+      CQL caller keeps its current behavior by instantiating with the existing
+      `RowOrder`.
+    This makes increment 5 a change in `ferrosa-storage` (generic-ification, CQL
+    path must not regress) plus the graph-side wiring.
   - **DISTINCT** emits each row the first time it is seen (streaming dedup). Its
     seen-set is subject to the same argument: a spilling/sort-based dedup rather
     than an unbounded in-memory `HashSet`.
