@@ -405,14 +405,39 @@ async fn process_message(
             }
         }
 
-        BoltMessage::Pull { .. } => {
-            if let Some(result) = state.pending_result.take() {
+        BoltMessage::Pull { extra } => {
+            if let Some(mut result) = state.pending_result.take() {
                 let mut replies = Vec::new();
 
-                // Send a RECORD for each row.
+                // Honor the protocol's `n`: PULL {n} must deliver AT MOST n
+                // records and signal `has_more` when the result is not
+                // exhausted, so a client can page a large result instead of
+                // receiving all of it in one batch. `n` absent or negative
+                // (canonically -1) means "fetch all" (t_4ce82a3e).
+                //
+                // Previously `extra` was discarded and every row was sent with
+                // has_more hardcoded false, so a client asking for 10 rows got
+                // the entire result — a protocol violation, and unbounded
+                // client-side memory for a large query.
+                let (take, has_more) = pull_split(pull_batch_size(&extra), result.rows.len());
+                let remainder = result.rows.split_off(take);
+
+                // Send a RECORD for each row in this batch.
                 for row in &result.rows {
                     let values: Vec<PackValue> = row.iter().map(json_to_pack_value).collect();
                     replies.push(BoltMessage::Record { values });
+                }
+
+                // Keep the rest for the next PULL. Stats travel with the FINAL
+                // batch, matching Bolt's summary semantics.
+                if has_more {
+                    let mut pending = result.clone();
+                    pending.rows = remainder;
+                    state.pending_result = Some(pending);
+                    replies.push(BoltMessage::Success {
+                        metadata: vec![("has_more".into(), PackValue::Bool(true))],
+                    });
+                    return Ok(replies);
                 }
 
                 // Send summary SUCCESS.
@@ -677,6 +702,33 @@ fn pack_to_json_value(v: &PackValue) -> serde_json::Value {
 }
 
 /// Convert a `serde_json::Value` to a `PackValue`.
+/// How many records this `PULL` may deliver: `Some(n)` for a bounded batch,
+/// `None` for "fetch all".
+///
+/// Pure (takes the decoded `extra` map, does no I/O) so the protocol rule is
+/// unit-testable without a socket or a session — the risky part of PULL paging
+/// is this parse, not the row copying.
+///
+/// Bolt semantics: `n` absent, negative (canonically `-1`), or non-integer means
+/// fetch everything. `n >= 0` bounds the batch; `n == 0` legitimately yields an
+/// empty batch with `has_more` still set.
+fn pull_batch_size(extra: &[(String, PackValue)]) -> Option<usize> {
+    match extra.iter().find(|(k, _)| k == "n").map(|(_, v)| v) {
+        Some(PackValue::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// Decide one PULL batch: `(rows_to_send, has_more)` for a `requested` batch
+/// size (`None` = fetch all) against `total` buffered rows.
+///
+/// Pure so the paging arithmetic — the part with the off-by-one and
+/// saturation edges — is unit-testable without a GraphEngine or a socket.
+fn pull_split(requested: Option<usize>, total: usize) -> (usize, bool) {
+    let take = requested.map_or(total, |n| n.min(total));
+    (take, take < total)
+}
+
 fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
     match v {
         serde_json::Value::Null => PackValue::Null,
@@ -719,6 +771,74 @@ fn error_code(err: &GraphError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The paging arithmetic, including the edges that decide whether a client
+    /// ever sees the rest of its result (t_4ce82a3e inc 7).
+    #[test]
+    fn pull_split_pages_and_signals_has_more() {
+        // Bounded batch smaller than the result: more remains.
+        assert_eq!(pull_split(Some(2), 5), (2, true));
+        // Exactly the result size: no more (must NOT claim has_more, which would
+        // make a client PULL forever).
+        assert_eq!(pull_split(Some(5), 5), (5, false));
+        // Asking for more than exists is clamped, and completes.
+        assert_eq!(pull_split(Some(99), 5), (5, false));
+        // n = 0 sends nothing but must still report more to come.
+        assert_eq!(pull_split(Some(0), 5), (0, true));
+        // ...unless there is nothing to send at all.
+        assert_eq!(pull_split(Some(0), 0), (0, false));
+        // Fetch-all takes everything and completes — the pre-existing behavior,
+        // which must be preserved for clients that send n = -1 or omit it.
+        assert_eq!(pull_split(None, 5), (5, false));
+        assert_eq!(pull_split(None, 0), (0, false));
+    }
+
+    /// Bolt PULL {n} must deliver AT MOST n records. `n` absent/negative means
+    /// "fetch all". Before this parse existed the whole `extra` map was
+    /// discarded, so EVERY row was sent regardless of `n` — a protocol
+    /// violation and unbounded client-side memory (t_4ce82a3e inc 7). These
+    /// cases are exactly what the old `Pull { .. }` could not express.
+    #[test]
+    fn pull_batch_size_honors_the_protocol_n() {
+        use crate::bolt::codec::PackValue;
+
+        // Bounded batch.
+        assert_eq!(
+            pull_batch_size(&[("n".to_string(), PackValue::Int(10))]),
+            Some(10)
+        );
+        // n = 0 is legal: an empty batch, has_more still decides continuation.
+        assert_eq!(
+            pull_batch_size(&[("n".to_string(), PackValue::Int(0))]),
+            Some(0)
+        );
+        // -1 is the canonical "fetch all".
+        assert_eq!(
+            pull_batch_size(&[("n".to_string(), PackValue::Int(-1))]),
+            None
+        );
+        // Any other negative also means fetch-all rather than panicking on the
+        // `as usize` cast.
+        assert_eq!(
+            pull_batch_size(&[("n".to_string(), PackValue::Int(-99))]),
+            None
+        );
+        // Absent -> fetch all (what every pre-existing client sends).
+        assert_eq!(pull_batch_size(&[]), None);
+        // Wrong type -> fetch all rather than failing the pull.
+        assert_eq!(
+            pull_batch_size(&[("n".to_string(), PackValue::String("10".into()))]),
+            None
+        );
+        // Unrelated keys (qid etc.) are ignored.
+        assert_eq!(
+            pull_batch_size(&[
+                ("qid".to_string(), PackValue::Int(1)),
+                ("n".to_string(), PackValue::Int(3)),
+            ]),
+            Some(3)
+        );
+    }
     use super::*;
 
     #[test]
