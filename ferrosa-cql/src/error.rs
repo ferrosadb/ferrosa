@@ -125,6 +125,19 @@ impl CqlError {
                 buf.put_i32(saturating_i32(*required));
                 buf.put_u8(u8::from(*data_present));
             }
+            Self::TransactionTimeout { .. } => {
+                // Shares the Write_timeout code (0x1100), so it MUST carry the
+                // Write_timeout trailer — without it the driver reads past the
+                // buffer ("Malformed error field CONSISTENCY … failed to fill
+                // whole buffer"). A transaction timeout carries no CL/counts, so
+                // report the paxos/transaction shape: serial consistency, zero
+                // acknowledged writes (the transaction aborted; nothing
+                // persisted), and Cassandra's `CAS` write type.
+                put_consistency(&mut buf, ConsistencyLevel::Serial);
+                buf.put_i32(0); // received
+                buf.put_i32(0); // blockfor
+                put_string(&mut buf, "CAS");
+            }
             Self::AlreadyExists { keyspace, table } => {
                 buf.put_u16(keyspace.len() as u16);
                 buf.put_slice(keyspace.as_bytes());
@@ -482,6 +495,39 @@ mod tests {
         offset += 2;
         assert_eq!(&body[offset..offset + write_type_len], b"SIMPLE");
         assert_eq!(offset + write_type_len, body.len());
+    }
+
+    #[test]
+    fn encode_transaction_timeout_has_complete_write_timeout_trailer() {
+        // A transaction timeout is sent as Write_timeout (0x1100) so drivers
+        // classify it as transient. The trailer MUST be present and exact, or
+        // the driver fails to deserialize the frame ("Malformed error field
+        // CONSISTENCY … failed to fill whole buffer"), as seen against Accord
+        // commit timeouts in the nemesis certification (t_03c8b79b).
+        let err = CqlError::TransactionTimeout {
+            timeout_ms: 1000,
+            elapsed_ms: 1200,
+        };
+        let body = err.encode_body();
+
+        assert_eq!(&body[..4], &0x1100u32.to_be_bytes());
+        let msg_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+        let mut offset = 6 + msg_len;
+        // [short consistency] — serial (transactions use serial consistency)
+        assert_eq!(
+            u16::from_be_bytes([body[offset], body[offset + 1]]),
+            ConsistencyLevel::Serial.to_wire()
+        );
+        offset += 2;
+        // [int received] + [int blockfor]
+        offset += 8;
+        // [string writeType] = "CAS" (Cassandra's paxos/transaction write type)
+        let wt_len = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+        offset += 2;
+        assert_eq!(&body[offset..offset + wt_len], b"CAS");
+        // Exact length: the frame is precisely code+message+trailer, so the
+        // driver's buffer fills exactly — no under-run, no trailing garbage.
+        assert_eq!(offset + wt_len, body.len());
     }
 
     #[test]
