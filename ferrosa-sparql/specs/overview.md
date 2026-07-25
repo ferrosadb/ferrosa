@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sparql
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-07-25
 executive_summary: >
   The SPARQL 1.1 Query + Update endpoint for ferrosa. Parses SPARQL with
   spargebra/oxrdf, plans algebra into TripleOps over a single CQL-backed
@@ -41,9 +41,9 @@ rejected, never silently mapped onto the default graph.
 |--------|----------------|
 | `engine` (`src/engine.rs`, ~600 LoC) | `SparqlEngine`: parse→plan→execute orchestration, `SparqlResult`, ASK/CONSTRUCT/DESCRIBE graph assembly, JSON/XML/NT/Turtle dispatch |
 | `planner` (`src/planner.rs`, ~770 LoC) | `spargebra` algebra → `QueryPlan` of `TripleOp`s; per-pattern access-method selection; CONSTRUCT/DESCRIBE mode detection |
-| `executor` (`src/executor.rs`, ~970 LoC) | Nested-loop join over triple patterns, FILTER/ORDER BY/DISTINCT/LIMIT, composite-key decode, tombstone skipping, ObjectScan index |
+| `executor` (`src/executor.rs`, ~1150 LoC) | Streaming triple-pattern scans + `ExecutionLimits` row bound, LIMIT pushdown, nested-loop join, constant-term enforcement, FILTER/ORDER BY/DISTINCT/LIMIT, composite-key decode, tombstone skipping, ObjectScan index |
 | `update` (`src/update.rs`, ~730 LoC) | INSERT/DELETE DATA, DELETE WHERE, DELETE/INSERT WHERE, CLEAR, DROP, CREATE; up-front atomicity validation; one shared tombstone primitive |
-| `property_path` (`src/property_path.rs`, ~420 LoC) | `+ * ? ^` evaluation via in-memory BFS with cycle detection |
+| `property_path` (`src/property_path.rs`, ~440 LoC) | `+ * ? ^` evaluation via BFS with cycle detection over a streamed, bounded adjacency read |
 | `filter` (`src/filter.rs`, ~490 LoC) | `Expression` evaluation: comparisons, boolean ops, arithmetic, a function subset; `unsupported_expr` gate for ORDER BY fail-loud |
 | `results` (`src/results.rs`, ~415 LoC) | `Binding`, `SparqlJsonResults`, `ResultFormat`; JSON / W3C XML / N-Triples serializers |
 | `http` (`src/http.rs`, ~234 LoC) | axum router, content negotiation, 1 MiB body limit, error→status mapping |
@@ -59,7 +59,7 @@ flowchart TD
     ENG --> PARSE["spargebra parse<br/>query / update"]
     PARSE --> PLAN["planner::plan_query<br/>algebra to Vec&lt;TripleOp&gt;"]
     PLAN --> EXEC["executor::execute<br/>nested-loop join"]
-    EXEC --> WP["ferrosa-cluster WritePath<br/>read / range_read / index_read"]
+    EXEC --> WP["ferrosa-cluster WritePath<br/>read / range_read_stream_all / index_read"]
     WP --> POST["FILTER to ORDER BY to DISTINCT to LIMIT/OFFSET"]
     POST --> SHAPE{"query form?"}
     SHAPE -->|SELECT| SER["results.rs serialize"]
@@ -73,11 +73,15 @@ flowchart TD
 ```
 
 **Read path.** A bound subject plans to `SubjectLookup` (point read on the
-partition key); a bound predicate to `PredicateScan` (range read + filter); a
-bound object to `ObjectScan` (secondary index `rdf_triples_object_idx`, falling
-back to a capped range scan); nothing bound to `FullScan`. The executor folds
-each `TripleOp`'s rows into the running binding set with a compatibility check on
-both value and `binding_type`.
+partition key); a bound predicate to `PredicateScan` (streaming range scan +
+filter); a bound object to `ObjectScan` (secondary index
+`rdf_triples_object_idx`, falling back to a streaming range scan); nothing bound
+to `FullScan`. Range scans pull one partition at a time from
+`WritePath::range_read_stream_all` and bind each row as it arrives — no
+intermediate `Vec` of fetched triples exists. The executor folds each
+`TripleOp`'s rows into the running binding set with a compatibility check on both
+value and `binding_type`, and enforces every constant term in the pattern (the
+access path is a pushdown, not the whole match).
 
 **Write path.** UPDATE first validates **every** operation (atomicity), then
 applies them sequentially. Inserts write a live row; every delete form funnels
@@ -86,9 +90,18 @@ through one `tombstone_triple` primitive that writes a deletion-marker row with
 
 ## Key invariants
 
-1. **One graph per keyspace.** The `graph` partition-key component equals the
-   keyspace. Operations addressing a different named graph fail loud, never
-   retarget (`check_quad_graph_pattern`, `check_pattern_graph_reads`).
+1. **One graph per keyspace.** Operations addressing a different named graph
+   fail loud, never retarget (`check_quad_graph_pattern`,
+   `check_pattern_graph_reads`).
+
+   > **This invariant is VIOLATED today (FMEA SP-11 / t_af4eb9f0).** The read
+   > side sets the `graph` partition-key component from the KEYSPACE, but
+   > `update.rs` writes it as the literal string `"default"`. The two agree only
+   > when the keyspace *is* `default` — and the HTTP endpoint defaults the
+   > keyspace to `rdf`. On any other keyspace a point read computes a key
+   > nothing was written under, so `SubjectLookup` misses data a `FullScan`
+   > finds and `DELETE` reports success while tombstoning empty keys. Resolving
+   > it requires deciding which side is authoritative; see the roadmap.
 2. **UPDATE atomicity by up-front rejection.** Because execution has no rollback,
    `validate_update` rejects the whole request before any mutation if any op is
    unaddressable — preventing a desugared `Drop` from wiping data before a later
@@ -102,6 +115,23 @@ through one `tombstone_triple` primitive that writes a deletion-marker row with
    `SparqlError::Plan`, not approximate results.
 5. **Deleted rows never surface.** The executor skips any row whose deletion
    marker is non-live (URS-QEC-D05).
+6. **Complete result, or an error — never a silent truncation.**
+   `ExecutionLimits::max_rows` (from `SparqlConfig::max_rows`) is the one row
+   bound. It is enforced at the SOURCE, as storage rows arrive from the
+   partition stream, and on every operator's solution buffer. Crossing it
+   returns `SparqlError::Execution`. Blocking operators (`ORDER BY`, `DISTINCT`,
+   property-path BFS) may buffer but not exceed it.
+7. **A constant is a match constraint in every position.** The access method is
+   chosen from ONE bound term, but `try_bind_triple` re-checks subject,
+   predicate, and object — including term kind, so an IRI constant never matches
+   a literal spelling the same characters. A blank node in a pattern is a
+   non-selectable variable and constrains nothing.
+8. **LIMIT pushdown only where it is provably safe.** The scan stops after
+   `offset + limit` solutions only for a single triple pattern with no
+   `ORDER BY`, `DISTINCT`, `FILTER`, or graph query form above it; those
+   operators either block or drop rows after binding, so an early stop would
+   return the wrong rows or too few. LIMIT/OFFSET arithmetic saturates — both
+   values are attacker-controlled `usize`.
 
 ## Position in the dependency graph
 
