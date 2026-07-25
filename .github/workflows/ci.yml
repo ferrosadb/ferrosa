@@ -227,7 +227,16 @@ jobs:
           ENV FERROSA_DATA_DIR=/var/lib/ferrosa
           CMD ["ferrosa"]
           DEOF
-          docker build -t ferrosa-test-node:latest node-bin
+          # Retry: pulling the debian:trixie-slim base from Docker Hub
+          # intermittently times out (registry-1.docker.io i/o timeout), which
+          # fails the job and DROPS the PR from the merge queue. A bounded retry
+          # rides out the transient registry blip (see forge t_75ec87fd).
+          for attempt in 1 2 3 4; do
+            docker build -t ferrosa-test-node:latest node-bin && break
+            [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
+            echo "docker build attempt $attempt failed (likely Docker Hub base-image pull); retrying in $((attempt * 10))s…"
+            sleep $((attempt * 10))
+          done
           docker save ferrosa-test-node:latest | gzip > ferrosa-node-image.tar.gz
       - name: Push image to GHCR (cross-workflow reuse)
         # Lets the separate, path-filtered driver-smoke workflow and paired
@@ -329,7 +338,15 @@ jobs:
           ENV FERROSA_DATA_DIR=/var/lib/ferrosa
           CMD ["ferrosa"]
           DEOF
-          docker build -t ferrosa-ci:latest -f /tmp/Dockerfile.ci /tmp/ferrosa-bin
+          # Retry: the debian:trixie-slim base pull from Docker Hub
+          # intermittently times out and fails the job (dropping the PR from the
+          # merge queue). A bounded retry rides it out (see forge t_75ec87fd).
+          for attempt in 1 2 3 4; do
+            docker build -t ferrosa-ci:latest -f /tmp/Dockerfile.ci /tmp/ferrosa-bin && break
+            [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
+            echo "docker build attempt $attempt failed (likely Docker Hub base-image pull); retrying in $((attempt * 10))s…"
+            sleep $((attempt * 10))
+          done
 
       - name: Start single-node Ferrosa with RustFS
         run: |
