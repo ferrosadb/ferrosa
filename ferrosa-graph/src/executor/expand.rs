@@ -210,6 +210,156 @@ pub async fn execute_streaming<'a>(
     execute_streaming_inner(plan, write_path, keyspace, config, virtual_tables, schema).await
 }
 
+/// Owned handles for one query execution — the same inputs
+/// [`execute_streaming`] borrows, held by value.
+///
+/// # Why this exists
+///
+/// [`execute_streaming`] returns a `RowStream<'a>` that borrows its inputs. That
+/// is exactly what we want inside the executor (no per-row clones), and exactly
+/// what a *transport* cannot use: an HTTP response body outlives the handler
+/// frame, so `axum::body::Body::from_stream` demands `Stream + Send + 'static`.
+///
+/// Two concrete borrows blocked it. `arc_swap::ArcSwap::load()` yields a `Guard`
+/// that is a local of the calling frame, and `Schema::snapshot()` /
+/// `Schema::virtual_tables()` borrow the `Arc<Schema>` the caller is holding.
+/// Both have owned counterparts (`load_full()`, `virtual_tables_arc()`, an
+/// `Arc<Schema>` clone), which is what this struct collects.
+///
+/// This is a wrapper, not a second executor: [`execute_streaming_owned`] calls
+/// straight through to [`execute_streaming`]. There is one dispatch.
+pub struct OwnedExecCtx {
+    /// From `ArcSwap::load_full()`, not `load()` — an owned `Arc`, not a `Guard`.
+    pub write_path: std::sync::Arc<WritePath>,
+    /// Owned copy of the caller's `&str`.
+    pub keyspace: String,
+    /// Owned config; `GraphEngineConfig` is small and `Clone`.
+    pub config: std::sync::Arc<GraphEngineConfig>,
+    /// From `Schema::virtual_tables_arc()`, not `virtual_tables()`.
+    pub virtual_tables: Option<std::sync::Arc<VirtualTableRegistry>>,
+    /// An `Arc<Schema>` clone, not a `&Schema`.
+    pub schema: Option<std::sync::Arc<Schema>>,
+}
+
+/// One item of the internal owned execution generator.
+///
+/// The generator has to deliver the columns and stats *through* the stream
+/// (they are produced inside it, where the borrows of the owned context live),
+/// so the first item is the head and every later item is a row.
+/// [`execute_streaming_owned`] peels the head back off, which is why this type
+/// never escapes the module.
+enum OwnedStreamItem {
+    Head(Vec<String>, QueryStats),
+    Row(crate::executor::stream::RowVals),
+}
+
+/// [`execute_streaming`] with owned handles: the row stream is `'static`, so it
+/// can be handed to a response body that outlives this frame.
+///
+/// # Error timing (this is a transport-visible contract)
+///
+/// A failure raised while *setting up* the execution — validation, a fallback
+/// plan's whole buffered execution, the first storage read — comes back as
+/// `Err` from this function, before the caller has written a byte. That is what
+/// lets the HTTP layer still choose a status code.
+///
+/// A failure raised *after* the first row has been yielded can only appear as an
+/// `Err` item on the stream. A transport must abort the body there; the status
+/// line is already on the wire.
+///
+/// # Laziness
+///
+/// Unchanged from [`execute_streaming`]: whatever streams there streams here,
+/// and whatever falls back to a buffered `GraphResult` there falls back here.
+/// Wrapping does not convert an operator.
+pub async fn execute_streaming_owned(
+    plan: PhysicalPlan,
+    ctx: OwnedExecCtx,
+) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+    use futures::StreamExt as _;
+
+    let mut items = Box::pin(owned_stream_items(plan, ctx));
+
+    // Drive the generator up to (and including) the head. This is what runs
+    // setup, so a setup error is returned as `Err` rather than becoming the
+    // stream's first item.
+    let (columns, stats) = match items.next().await {
+        Some(Ok(OwnedStreamItem::Head(columns, stats))) => (columns, stats),
+        Some(Ok(OwnedStreamItem::Row(_))) => {
+            return Err(GraphError::Internal(
+                "owned execution stream yielded a row before its head".to_string(),
+            ))
+        }
+        Some(Err(e)) => return Err(e),
+        None => {
+            return Err(GraphError::Internal(
+                "owned execution stream ended before its head".to_string(),
+            ))
+        }
+    };
+
+    let rows: RowStream<'static> = Box::pin(items.map(|item| match item {
+        Ok(OwnedStreamItem::Row(row)) => Ok(row),
+        // Fail loud rather than drop: a second head would mean the generator
+        // below was restructured and this peel is now wrong.
+        Ok(OwnedStreamItem::Head(..)) => Err(GraphError::Internal(
+            "owned execution stream yielded a second head".to_string(),
+        )),
+        Err(e) => Err(e),
+    }));
+
+    Ok((columns, rows, stats))
+}
+
+/// The owned execution generator.
+///
+/// `ctx` is *moved into* the async generator, so the `&ctx.write_path` /
+/// `&ctx.keyspace` / `&ctx.config` borrows [`execute_streaming`] needs are
+/// borrows of the generator's own locals — legal to hold across yield points,
+/// and invisible from outside. That is what turns a `RowStream<'a>` into a
+/// `'static` one without cloning per row, spawning a task, or duplicating the
+/// executor.
+fn owned_stream_items(
+    plan: PhysicalPlan,
+    ctx: OwnedExecCtx,
+) -> impl futures::Stream<Item = Result<OwnedStreamItem>> + Send + 'static {
+    use futures::StreamExt as _;
+
+    async_stream::stream! {
+        let started = execute_streaming(
+            plan,
+            &ctx.write_path,
+            &ctx.keyspace,
+            &ctx.config,
+            ctx.virtual_tables.as_deref(),
+            ctx.schema.as_deref(),
+        )
+        .await;
+
+        let (columns, mut rows, stats) = match started {
+            Ok(started) => started,
+            Err(e) => {
+                yield Err(e);
+                return;
+            }
+        };
+
+        yield Ok(OwnedStreamItem::Head(columns, stats));
+
+        while let Some(row) = rows.next().await {
+            match row {
+                Ok(row) => yield Ok(OwnedStreamItem::Row(row)),
+                Err(e) => {
+                    // Surface and stop: continuing past an error would emit a
+                    // short result that looks complete.
+                    yield Err(e);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Boxed body of [`execute_streaming`].
 ///
 /// `Subscribe` and `Union` recurse into it, so the future has to be type-erased.
@@ -8257,6 +8407,190 @@ mod tests {
             rows,
             stats,
         }
+    }
+
+    // --- owned-handle entry point (`execute_streaming_owned`) -------------
+    //
+    // The HTTP body outlives the handler frame, so it can only be fed by a
+    // `RowStream<'static>`. These pin the three properties that makes possible:
+    // same rows as the borrowed entry point, a stream that genuinely outlives
+    // the scope that built its handles, and setup errors that still surface as
+    // `Err` (so the transport can still pick an HTTP status before writing).
+
+    fn owned_test_ctx(wp: Arc<WritePath>, keyspace: &str) -> OwnedExecCtx {
+        OwnedExecCtx {
+            write_path: wp,
+            keyspace: keyspace.to_string(),
+            config: Arc::new(GraphEngineConfig::default()),
+            virtual_tables: None,
+            schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_streaming_matches_the_borrowed_entry_point() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let wp = Arc::new(wp);
+        let config = GraphEngineConfig::default();
+        let build = || PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("a", 2)], None),
+            ],
+            all: true,
+        };
+
+        let (borrowed_cols, borrowed_stream, _) =
+            execute_streaming(build(), &wp, "social", &config, None, None)
+                .await
+                .unwrap();
+        let borrowed_rows = crate::executor::stream::collect_rows(borrowed_stream)
+            .await
+            .unwrap();
+
+        let (owned_cols, owned_stream, _) =
+            execute_streaming_owned(build(), owned_test_ctx(Arc::clone(&wp), "social"))
+                .await
+                .unwrap();
+        let owned_rows = crate::executor::stream::collect_rows(owned_stream)
+            .await
+            .unwrap();
+
+        assert_eq!(owned_cols, borrowed_cols);
+        assert_eq!(owned_rows, borrowed_rows);
+    }
+
+    /// The whole point of the owned entry point: the returned stream is
+    /// `'static`, so it can be handed to a response body that outlives the
+    /// function that built the handles.
+    ///
+    /// The `RowStream<'static>` annotation is the real assertion — it does not
+    /// compile if the stream borrows the write path, the keyspace, the config,
+    /// or the schema. Draining it after the builder frame has returned proves
+    /// the handles are genuinely kept alive by the stream.
+    #[tokio::test]
+    async fn owned_row_stream_is_static_and_outlives_its_builder() {
+        async fn build_stream(wp: Arc<WritePath>) -> (Vec<String>, RowStream<'static>, QueryStats) {
+            // Everything borrowed by the executor is created and dropped inside
+            // this frame; only the stream escapes.
+            execute_streaming_owned(
+                return_one_plan(&[("a", 42)], None),
+                OwnedExecCtx {
+                    write_path: wp,
+                    keyspace: "social".to_string(),
+                    config: Arc::new(GraphEngineConfig::default()),
+                    virtual_tables: None,
+                    schema: None,
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        let (_tmp, wp) = streaming_test_write_path();
+        let (columns, stream, _stats) = build_stream(Arc::new(wp)).await;
+        let stream: RowStream<'static> = stream;
+        assert_eq!(columns, vec!["a".to_string()]);
+        assert_eq!(
+            crate::executor::stream::collect_rows(stream).await.unwrap(),
+            vec![vec![serde_json::json!(42)]]
+        );
+    }
+
+    /// A setup failure must still come back as `Err` from the owned entry
+    /// point, NOT as an error item on the stream. The transport picks its HTTP
+    /// status here, before the first byte of the body is written — once the
+    /// body starts there is no status left to choose.
+    #[tokio::test]
+    async fn owned_streaming_setup_error_surfaces_before_the_stream() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let plan = PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("b", 2)], None),
+            ],
+            all: true,
+        };
+        // `RowStream` is not `Debug`, so the Ok arm cannot be unwrapped.
+        let err = match execute_streaming_owned(plan, owned_test_ctx(Arc::new(wp), "social")).await
+        {
+            Ok(_) => panic!("owned streaming must reject arms with mismatched columns"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, GraphError::Validation(ref m) if m.contains("identical columns")),
+            "got {err:?}"
+        );
+    }
+
+    /// Laziness survives the owned wrapper: a downstream `take(k)` still stops
+    /// the chain. If the wrapper collected internally this would be the only
+    /// visible symptom — the rows would be right, but every arm would run.
+    #[tokio::test]
+    async fn owned_streaming_take_still_short_circuits() {
+        use futures::StreamExt as _;
+
+        let (_tmp, wp) = streaming_test_write_path();
+        let plan = PhysicalPlan::Union {
+            arms: (0..64)
+                .map(|i| return_one_plan(&[("a", i)], None))
+                .collect(),
+            all: true,
+        };
+        let (_columns, rows_stream, _stats) =
+            execute_streaming_owned(plan, owned_test_ctx(Arc::new(wp), "social"))
+                .await
+                .unwrap();
+        let limited: RowStream<'static> = Box::pin(rows_stream.take(2));
+        assert_eq!(
+            crate::executor::stream::collect_rows(limited)
+                .await
+                .unwrap(),
+            vec![vec![serde_json::json!(0)], vec![serde_json::json!(1)]]
+        );
+    }
+
+    /// An error raised MID-stream (after rows have already been yielded) must
+    /// still reach the consumer as an `Err` item — never be swallowed into a
+    /// short-but-successful result.
+    #[tokio::test]
+    async fn owned_streaming_propagates_a_mid_stream_error() {
+        use futures::StreamExt as _;
+
+        let (_tmp, wp) = streaming_test_write_path();
+        let (_columns, rows_stream, _stats) = execute_streaming_owned(
+            return_one_plan(&[("a", 1)], None),
+            owned_test_ctx(Arc::new(wp), "social"),
+        )
+        .await
+        .unwrap();
+
+        // Splice a failure in after the real row, the way a lazily-hydrated hop
+        // surfaces a storage error partway through the projection.
+        let spliced: RowStream<'static> = Box::pin(rows_stream.chain(stream_error_once()));
+        let mut rows = Vec::new();
+        let mut seen_err = None;
+        let mut spliced = spliced;
+        while let Some(item) = futures::StreamExt::next(&mut spliced).await {
+            match item {
+                Ok(row) => rows.push(row),
+                Err(e) => {
+                    seen_err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(rows, vec![vec![serde_json::json!(1)]]);
+        assert!(
+            matches!(seen_err, Some(GraphError::Internal(ref m)) if m == "mid-stream boom"),
+            "the mid-stream error must reach the consumer"
+        );
+    }
+
+    fn stream_error_once() -> RowStream<'static> {
+        Box::pin(futures::stream::once(async {
+            Err(GraphError::Internal("mid-stream boom".to_string()))
+        }))
     }
 
     // --- converted: ReturnOnly -------------------------------------------

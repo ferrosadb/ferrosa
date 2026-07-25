@@ -25,6 +25,11 @@
 //! [`RowStream`]; callers that still need a buffered result use
 //! [`collect_to_graph_result`], which is behavior-identical to the old path.
 //! That keeps every increment green against the existing integration suite.
+//!
+//! The `'a` lifetime is also why a transport cannot consume a [`RowStream`]
+//! directly: a response body outlives the handler frame, so it needs `'static`.
+//! [`crate::executor::expand::execute_streaming_owned`] supplies that without
+//! forking the executor — see its docs for how.
 
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;

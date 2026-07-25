@@ -58,6 +58,26 @@ resolved port.
   then tombstone), `Aggregate`, `WcoJoin`, `ExpandVarLength` and the
   virtual-table anchor are deliberately excluded. The hop loop is still fully
   materializing. See `specs/streaming-executor-design.md` §5.
+- **Owned-handle entry point** (`executor/expand.rs`) — `execute_streaming_owned(plan,
+  OwnedExecCtx)` returns `(columns, RowStream<'static>, QueryStats)`. Same
+  dispatch as `execute_streaming()`, but the handles are owned
+  (`ArcSwap::load_full()` instead of `load()`, `Schema::virtual_tables_arc()`
+  instead of `virtual_tables()`, `Arc<Schema>` instead of `&Schema`), so the row
+  stream can outlive the frame that started it — which is what a transport
+  needs. `GraphEngine::execute_stream_with_params()` is the engine-level form;
+  `execute_with_params()` is a `collect` over it.
+- **Streamed HTTP response** (`http.rs`) — `POST /graph/query` writes the JSON
+  body straight from the row stream. Nothing buffers the result server-side for
+  a plan the executor streams. **Scope**: this bounds the *response*, not the
+  query — phase A of `Expand` still materializes the frontier, and the
+  buffering plan variants above still materialize, so a high-fan-out query can
+  still exhaust memory. The trailing `"stats"` object is built **after** the
+  last row, so `execution_ms` now covers the projection too (a larger, more
+  accurate number than the buffered path reported). A failure that surfaces
+  after the first chunk **aborts the body**; the client sees a `200` with a
+  truncated chunked transfer, never a `4xx`/`5xx`, because the status line is
+  already on the wire. Bolt (`bolt/server.rs`) still buffers — it holds results
+  in the connection struct across protocol messages and emits stats before rows.
 - **`RETURN DISTINCT` ordering** — `DISTINCT` **without** an `ORDER BY` returns
   rows in **first-seen (expansion) order**, not sorted order. This changed
   deliberately when DISTINCT became a streaming dedup; earlier releases returned

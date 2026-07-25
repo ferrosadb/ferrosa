@@ -3,6 +3,11 @@
 //! Provides a REST API for executing Cypher queries, explaining query plans,
 //! inspecting graph schema, and health checks. Includes Basic auth middleware (T2),
 //! error sanitization (T8), and TLS support (T11).
+//!
+//! `POST /graph/query` consumes a `RowStream` end to end: the handler never
+//! holds the result set. See `stream_graph_rows` (private) for the exact scope
+//! of that claim — it bounds the response, not the query — and for what a
+//! client observes when a query fails after N rows.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -266,7 +271,7 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     match state
         .engine
-        .execute_with_params(
+        .execute_stream_with_params(
             &query_req.query,
             &query_req.keyspace,
             &auth,
@@ -274,16 +279,38 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
         )
         .await
     {
-        Ok(result) => {
-            tracing::info!(
-                user = %auth.role,
-                keyspace = %query_req.keyspace,
-                rows = result.rows.len(),
-                execution_ms = result.stats.execution_ms,
-                status = "Ok",
-                "graph query completed"
-            );
-            stream_graph_result(result)
+        Ok((columns, rows, stats)) => {
+            // The completion log moves to the end of the body: with a streamed
+            // response the row count and the total duration are not known until
+            // the last row is out. A client that disconnects mid-stream
+            // therefore produces no completion line — the drain never finishes.
+            let user = auth.role.clone();
+            let keyspace = query_req.keyspace.clone();
+            let drain_start = std::time::Instant::now();
+            stream_graph_rows(
+                columns,
+                rows,
+                Box::new(move |emitted| {
+                    let mut stats = stats;
+                    // The executor's measurement stops at setup; the streamed
+                    // projection happens after it. Adding the drain makes
+                    // `execution_ms` cover the whole query rather than its
+                    // prefix — a MORE accurate number than the buffered path
+                    // reported, not a differently-defined one.
+                    stats.execution_ms = stats
+                        .execution_ms
+                        .saturating_add(drain_start.elapsed().as_millis() as u64);
+                    tracing::info!(
+                        user = %user,
+                        keyspace = %keyspace,
+                        rows = emitted,
+                        execution_ms = stats.execution_ms,
+                        status = "Ok",
+                        "graph query completed"
+                    );
+                    stats
+                }),
+            )
         }
         Err(ref e) => {
             let status_str = match e {
@@ -455,32 +482,48 @@ async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> 
 
 /// Build an SSE stream that yields the initial snapshot followed by
 /// periodic re-executions of the query.
-/// Serialize a [`GraphResult`] into a STREAMING chunked response body instead of
-/// `Json(result)`.
+/// Produces the response's trailing `"stats"` object once the row stream has
+/// drained, given the number of rows actually emitted.
 ///
-/// `Json` serializes the whole result into one contiguous buffer before writing
-/// a byte — for a large result that is a second full copy of the data on top of
-/// the rows themselves, at peak. This emits the identical JSON
-/// (`{"columns":…,"rows":[…],"stats":…}`, same field order as the derive) one
-/// row at a time, so the serialized form is never fully resident and the client
-/// starts receiving data immediately (t_4ce82a3e inc 7).
+/// A closure rather than a value because `execution_ms` is not knowable until
+/// the last row is out — the executor's own measurement stops at setup, and for
+/// a genuinely streamed plan the projection happens afterwards. Capturing the
+/// stats up front would report a duration that excludes most of the query.
+type StatsFinalizer = Box<dyn FnOnce(usize) -> crate::executor::QueryStats + Send>;
+
+/// Write a query result to the wire as a STREAMING chunked response body,
+/// pulling rows from `rows` as the client consumes them.
 ///
-/// SCOPE: this removes the serialization copy, not the row buffer — `result`
-/// still owns every row. Ending server-side buffering needs `execute()` to
-/// return a `RowStream`, which is tracked separately.
+/// Emits exactly the JSON `Json(GraphResult)` would
+/// (`{"columns":…,"rows":[…],"stats":…}`, same field order as the derive), one
+/// row at a time. Neither the rows nor their serialized form is ever fully
+/// resident on the server, and the client starts receiving data immediately.
 ///
-/// A row that fails to serialize aborts the body with an error rather than
-/// silently emitting truncated JSON — a partial body that parses would be worse
-/// than a broken connection.
-fn stream_graph_result(result: crate::executor::GraphResult) -> Response {
+/// # Scope — this bounds the RESPONSE, not the query
+///
+/// Server-side buffering of the *result* is gone for every plan the executor
+/// streams. It is NOT gone for the query as a whole: phase A of `Expand` still
+/// materializes the frontier before the first row is projected, and the plans
+/// that legitimately buffer (ORDER BY, aggregation, DELETE, `WcoJoin`,
+/// `ExpandVarLength`) still hand back a fully-materialized stream. A
+/// high-fan-out query can still exhaust memory in phase A.
+///
+/// # Failure after the first chunk
+///
+/// The status line is chosen before any byte is written, so a failure that
+/// surfaces mid-stream — an executor error, or a row that fails to serialize —
+/// can only ABORT the body. It does that rather than emit the closing
+/// `],"stats":{…}}`, because truncated-but-parsable JSON would be read by the
+/// client as a complete, shorter result. The client observes a 200 with an
+/// incomplete body (a broken chunked transfer), not an error status.
+fn stream_graph_rows(
+    columns: Vec<String>,
+    rows: crate::executor::stream::RowStream<'static>,
+    finish: StatsFinalizer,
+) -> Response {
     use futures::stream::StreamExt as _;
 
-    let crate::executor::GraphResult {
-        columns,
-        rows,
-        stats,
-    } = result;
-
+    // Built eagerly: a failure here still happens before the status is chosen.
     let head = match serde_json::to_string(&columns) {
         Ok(cols) => format!("{{\"columns\":{cols},\"rows\":["),
         Err(e) => {
@@ -491,37 +534,44 @@ fn stream_graph_result(result: crate::executor::GraphResult) -> Response {
                 .into_response()
         }
     };
-    let tail = match serde_json::to_string(&stats) {
-        Ok(st) => format!("],\"stats\":{st}}}"),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("encode stats: {e}") })),
-            )
-                .into_response()
+
+    let mut rows = rows;
+    let body_stream = async_stream::stream! {
+        yield Ok::<_, std::io::Error>(head);
+
+        let mut emitted = 0usize;
+        while let Some(row) = rows.next().await {
+            let row = match row {
+                Ok(row) => row,
+                // Fail loud: abort mid-body rather than close the JSON around a
+                // short result the client cannot distinguish from a complete one.
+                Err(e) => {
+                    yield Err(std::io::Error::other(format!("row {emitted}: {e}")));
+                    return;
+                }
+            };
+            let mut chunk = String::new();
+            if emitted > 0 {
+                chunk.push(',');
+            }
+            match serde_json::to_string(&row) {
+                Ok(encoded) => chunk.push_str(&encoded),
+                Err(e) => {
+                    yield Err(std::io::Error::other(format!("encode row {emitted}: {e}")));
+                    return;
+                }
+            }
+            emitted += 1;
+            yield Ok(chunk);
+        }
+
+        // Only now are the stats final.
+        let stats = finish(emitted);
+        match serde_json::to_string(&stats) {
+            Ok(st) => yield Ok(format!("],\"stats\":{st}}}")),
+            Err(e) => yield Err(std::io::Error::other(format!("encode stats: {e}"))),
         }
     };
-
-    let body_stream = futures::stream::once(async move { Ok::<_, std::io::Error>(head) })
-        .chain(
-            futures::stream::iter(rows.into_iter().enumerate()).map(|(i, row)| {
-                let mut chunk = String::new();
-                if i > 0 {
-                    chunk.push(',');
-                }
-                match serde_json::to_string(&row) {
-                    Ok(encoded) => {
-                        chunk.push_str(&encoded);
-                        Ok(chunk)
-                    }
-                    // Fail loud: abort the body rather than emit truncated-but-parsable JSON.
-                    Err(e) => Err(std::io::Error::other(format!("encode row {i}: {e}"))),
-                }
-            }),
-        )
-        .chain(futures::stream::once(async move {
-            Ok::<_, std::io::Error>(tail)
-        }));
 
     Response::builder()
         .status(StatusCode::OK)
@@ -814,6 +864,15 @@ pub async fn start_graph_disabled_http(config: &GraphHttpConfig) -> crate::error
 mod tests {
     use super::*;
 
+    use crate::executor::stream::{stream_from_rows, RowStream};
+
+    /// A finalizer that ignores the row count and returns fixed stats, so the
+    /// byte-identity assertion stays deterministic (the production finalizer
+    /// stamps a wall-clock `execution_ms`).
+    fn fixed_stats(stats: crate::executor::QueryStats) -> StatsFinalizer {
+        Box::new(move |_rows| stats)
+    }
+
     /// The streamed body MUST be byte-identical to what `Json(result)` produced,
     /// or every existing client breaks on a change that was supposed to be pure
     /// plumbing. Field order, separators, and escaping all have to match serde's
@@ -838,14 +897,20 @@ mod tests {
         ];
 
         for rows in cases {
+            // The rows now arrive as a stream, so the expected value is built
+            // from the same rows the stream will yield.
             let result = crate::executor::GraphResult {
                 columns: vec!["x".to_string(), "y".to_string()],
-                rows,
+                rows: rows.clone(),
                 stats: crate::executor::QueryStats::default(),
             };
             let expected = serde_json::to_string(&result).expect("serde encodes the result");
 
-            let resp = stream_graph_result(result);
+            let resp = stream_graph_rows(
+                result.columns.clone(),
+                stream_from_rows(rows),
+                fixed_stats(crate::executor::QueryStats::default()),
+            );
             assert_eq!(resp.status(), StatusCode::OK);
             let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -857,6 +922,135 @@ mod tests {
                 "streamed body diverged from Json(result)"
             );
         }
+    }
+
+    /// The trailing `"stats"` object is built AFTER the last row, not captured
+    /// up front — `execution_ms` is not knowable until the stream drains.
+    ///
+    /// Asserted by having the finalizer observe a counter that the row stream
+    /// itself increments: if `stats` were serialized eagerly the finalizer would
+    /// see 0 rows, and the body would report 0.
+    #[tokio::test]
+    async fn stats_are_built_after_the_last_row_not_captured_up_front() {
+        use futures::stream::StreamExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let rows: RowStream<'static> = Box::pin(
+            stream_from_rows(vec![
+                vec![serde_json::json!(1)],
+                vec![serde_json::json!(2)],
+                vec![serde_json::json!(3)],
+            ])
+            .inspect(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let observed = Arc::clone(&pulled);
+        let resp = stream_graph_rows(
+            vec!["n".to_string()],
+            rows,
+            Box::new(move |row_count| crate::executor::QueryStats {
+                // Two independent witnesses that the finalizer ran last: the
+                // row count handed to it, and what the stream had produced.
+                vertices_read: row_count,
+                edges_read: observed.load(Ordering::SeqCst),
+                ..Default::default()
+            }),
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("streamed body collects");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("body is well-formed JSON");
+        assert_eq!(parsed["stats"]["vertices_read"], serde_json::json!(3));
+        assert_eq!(parsed["stats"]["edges_read"], serde_json::json!(3));
+    }
+
+    /// The response is NOT buffered server-side: its first chunk is deliverable
+    /// while the rows are still unproduced.
+    ///
+    /// This is the property the whole change exists for. The row stream here
+    /// cannot yield until it is released, so a handler that collected rows
+    /// before writing the body would deadlock at the first `next()` instead of
+    /// handing back the head.
+    #[tokio::test]
+    async fn the_response_head_is_deliverable_before_any_row_exists() {
+        use futures::stream::StreamExt as _;
+
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let rows: RowStream<'static> = Box::pin(futures::stream::once(async move {
+            released.await.expect("release signal");
+            Ok(vec![serde_json::json!(1)])
+        }));
+
+        let resp = stream_graph_rows(
+            vec!["n".to_string()],
+            rows,
+            fixed_stats(crate::executor::QueryStats::default()),
+        );
+        let mut chunks = resp.into_body().into_data_stream();
+
+        let head = chunks
+            .next()
+            .await
+            .expect("a head chunk before the rows")
+            .expect("head chunk is not an error");
+        assert_eq!(
+            head.as_ref(),
+            br#"{"columns":["n"],"rows":["#,
+            "the head must be on the wire before the first row is produced"
+        );
+
+        // Only now let the row through.
+        release.send(()).expect("body stream is still alive");
+        let mut rest = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            rest.extend_from_slice(&chunk.expect("no mid-stream failure"));
+        }
+        assert_eq!(
+            String::from_utf8(rest).expect("utf8"),
+            format!(
+                "[1]],\"stats\":{}}}",
+                serde_json::to_string(&crate::executor::QueryStats::default()).unwrap()
+            )
+        );
+    }
+
+    /// An executor error that surfaces AFTER the first chunk is on the wire must
+    /// ABORT the body. Emitting the closing `],"stats":{…}}` anyway would produce
+    /// truncated-but-parsable JSON — a silently short result, which is strictly
+    /// worse than a broken connection.
+    ///
+    /// The client-visible consequence is spelled out here because it is a real
+    /// limitation, not an implementation detail: the status line (200) is
+    /// already sent, so the failure can only appear as an aborted/incomplete
+    /// response body, never as a 4xx/5xx.
+    #[tokio::test]
+    async fn mid_stream_error_aborts_the_body_instead_of_closing_the_json() {
+        let rows: RowStream<'static> = Box::pin(futures::stream::iter(vec![
+            Ok(vec![serde_json::json!(1)]),
+            Err(crate::error::GraphError::Internal("boom".to_string())),
+        ]));
+
+        let resp = stream_graph_rows(
+            vec!["n".to_string()],
+            rows,
+            fixed_stats(crate::executor::QueryStats::default()),
+        );
+        // The status was already chosen before any byte was written.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let err = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect_err("a mid-stream failure must abort the body, not complete it");
+        assert!(
+            err.to_string().contains("boom"),
+            "the abort must carry the underlying cause, got: {err}"
+        );
     }
 
     #[tokio::test]
