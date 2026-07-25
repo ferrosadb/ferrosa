@@ -23,6 +23,9 @@ use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, Accumulator};
 use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
+use crate::executor::stream::{
+    chain_streams, collect_to_graph_result, dedup_stream, stream_from_rows, RowStream,
+};
 use crate::parser::{
     CompareOp, Direction, Expr, Literal, PatternComprehensionHop, RemoveItem, ReturnClause,
     ReturnItem, SortDir, WithPipeline,
@@ -84,7 +87,19 @@ pub struct GraphEngineConfig {
     /// Maximum query execution time.
     pub query_timeout: Duration,
     /// Maximum number of result rows.
+    ///
+    /// DEPRECATED — being removed (t_4ce82a3e). This used to SILENTLY TRUNCATE
+    /// the result set (`break`, no error, no flag), so a client could not tell a
+    /// partial answer from a complete one. ORDER BY now spills instead of
+    /// capping (see `spill`); the remaining uses are on the not-yet-converted
+    /// varpath/leapfrog paths.
     pub max_result_rows: usize,
+    /// Backend for spilling an unbounded ORDER BY to disk. `None` = sort in
+    /// memory (unit tests, embedded use). See
+    /// [`crate::executor::spill::SpillReserver`].
+    pub spill: Option<std::sync::Arc<dyn crate::executor::spill::SpillReserver>>,
+    /// Bytes of rows to accumulate before spilling a sorted run.
+    pub spill_threshold_bytes: u64,
     /// Maximum fan-out per hop (T4: limits adjacency reads).
     pub max_fan_out_per_hop: usize,
     /// Maximum number of groups in an aggregation (FMEA F7).
@@ -101,6 +116,11 @@ impl Default for GraphEngineConfig {
         Self {
             query_timeout: Duration::from_secs(30),
             max_result_rows: 10_000,
+            spill: None,
+            // 64 MiB of accumulated rows before a run is spilled — large enough
+            // that ordinary queries never touch disk, small enough that a huge
+            // sort stays bounded.
+            spill_threshold_bytes: 64 * 1024 * 1024,
             max_fan_out_per_hop: 10_000,
             max_groups: 100_000,
             max_collect_size: 10_000,
@@ -108,6 +128,9 @@ impl Default for GraphEngineConfig {
         }
     }
 }
+
+/// The columns, row stream, and stats produced by [`execute_streaming`].
+type StreamingPlanResult<'a> = Result<(Vec<String>, RowStream<'a>, QueryStats)>;
 
 /// Execute a physical plan against the storage engine.
 ///
@@ -118,6 +141,10 @@ impl Default for GraphEngineConfig {
 /// If `schema` is provided, column names from table metadata are used to
 /// map cell indices to property names (e.g., `name`, `age`) so that Cypher
 /// property lookups like `a.name` resolve correctly.
+///
+/// This is the buffered façade over [`execute_streaming`]: it drains the row
+/// stream through [`collect_to_graph_result`]. There is one executor, not two —
+/// this entry point adds only the materialization.
 pub async fn execute(
     plan: PhysicalPlan,
     write_path: &WritePath,
@@ -126,48 +153,279 @@ pub async fn execute(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
-    let start = Instant::now();
+    let (columns, rows_stream, stats) =
+        execute_streaming(plan, write_path, keyspace, config, virtual_tables, schema).await?;
+    // `usize::MAX`, deliberately NOT `config.max_result_rows`: `execute` has
+    // never applied a global row cap. The caps live inside individual operators
+    // (leapfrog, the virtual-table anchor, projection), and a UNION of capped
+    // arms may legitimately return more than `max_result_rows` rows today.
+    // Capping here would silently truncate results that currently come back in
+    // full — a behavior change, and a silent one.
+    collect_to_graph_result(columns, rows_stream, stats, usize::MAX).await
+}
 
-    match plan {
-        PhysicalPlan::Union { arms, all } => {
-            let mut columns: Option<Vec<String>> = None;
-            let mut rows = Vec::new();
-            let mut stats = QueryStats::default();
-            for arm in arms {
-                let result = Box::pin(execute(
-                    arm,
+/// Streaming entry point: the projected column names, a pull-based row stream,
+/// and the query's [`QueryStats`].
+///
+/// Additive scaffold (increment 2 of the streaming executor, t_4ce82a3e). Only
+/// the provably-safe plan variants stream; everything else computes today's
+/// buffered [`GraphResult`] and hands it back through [`stream_from_rows`].
+/// Behavior is identical for every query either way — [`execute`] is this
+/// function plus a `collect`.
+///
+/// # What actually streams
+///
+/// - [`PhysicalPlan::Subscribe`] — pure passthrough to the inner plan, so it
+///   streams exactly as well as whatever it wraps.
+/// - [`PhysicalPlan::Union`] with `all: true` — concatenation, via
+///   [`chain_streams`]. A later arm is never polled until the earlier arms are
+///   drained. The arms themselves are
+///   still *executed* eagerly, because `stats` is returned up front and a
+///   UNION's stats are the sum over its arms — so the end-to-end laziness is
+///   real only when the arms are themselves converted variants.
+/// - [`PhysicalPlan::ReturnOnly`] — at most one row, produced on pull, so
+///   `LIMIT 0` never evaluates the projection.
+///
+/// # What deliberately does not
+///
+/// Everything else, including `UNION` *without* `ALL` (its `HashSet` dedup
+/// spans the whole concatenation), `DeleteNodes` (it walks the matched rows
+/// twice — validate every vertex, then tombstone — and streaming it would
+/// partially delete), `Aggregate`, DISTINCT, ORDER BY, `WcoJoin`, and
+/// `ExpandVarLength`.
+///
+/// # Stats
+///
+/// `QueryStats` is returned alongside the stream rather than after it, so it is
+/// computed exactly where the buffered path computes it today. That is why a
+/// fallback variant is fully executed before this function returns.
+pub async fn execute_streaming<'a>(
+    plan: PhysicalPlan,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    config: &'a GraphEngineConfig,
+    virtual_tables: Option<&'a VirtualTableRegistry>,
+    schema: Option<&'a Schema>,
+) -> StreamingPlanResult<'a> {
+    execute_streaming_inner(plan, write_path, keyspace, config, virtual_tables, schema).await
+}
+
+/// Boxed body of [`execute_streaming`].
+///
+/// `Subscribe` and `Union` recurse into it, so the future has to be type-erased.
+fn execute_streaming_inner<'a>(
+    plan: PhysicalPlan,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    config: &'a GraphEngineConfig,
+    virtual_tables: Option<&'a VirtualTableRegistry>,
+    schema: Option<&'a Schema>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = StreamingPlanResult<'a>> + Send + 'a>> {
+    Box::pin(async move {
+        let start = Instant::now();
+
+        match plan {
+            // --- converted: streams for real ---------------------------------
+            PhysicalPlan::Subscribe { inner, .. } => {
+                // The initial snapshot IS the inner plan's result. Passthrough,
+                // including the inner plan's own `start` for `execution_ms`,
+                // exactly as the buffered path's recursive `execute` call did.
+                execute_streaming_inner(
+                    *inner,
                     write_path,
                     keyspace,
                     config,
                     virtual_tables,
                     schema,
-                ))
-                .await?;
-                if let Some(existing) = &columns {
-                    if existing != &result.columns {
-                        return Err(GraphError::Validation(
-                            "UNION arms must return identical columns".to_string(),
-                        ));
-                    }
-                } else {
-                    columns = Some(result.columns.clone());
-                }
-                stats.vertices_read += result.stats.vertices_read;
-                stats.edges_read += result.stats.edges_read;
-                stats.vertices_written += result.stats.vertices_written;
-                stats.vertices_deleted += result.stats.vertices_deleted;
-                rows.extend(result.rows);
+                )
+                .await
             }
+            PhysicalPlan::Union { arms, all: true } => {
+                let mut columns: Option<Vec<String>> = None;
+                let mut stats = QueryStats::default();
+                let mut arm_streams: Vec<RowStream<'a>> = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    let (arm_columns, arm_stream, arm_stats) = execute_streaming_inner(
+                        arm,
+                        write_path,
+                        keyspace,
+                        config,
+                        virtual_tables,
+                        schema,
+                    )
+                    .await?;
+                    if let Some(existing) = &columns {
+                        if existing != &arm_columns {
+                            return Err(GraphError::Validation(
+                                "UNION arms must return identical columns".to_string(),
+                            ));
+                        }
+                    } else {
+                        columns = Some(arm_columns);
+                    }
+                    stats.vertices_read += arm_stats.vertices_read;
+                    stats.edges_read += arm_stats.edges_read;
+                    stats.vertices_written += arm_stats.vertices_written;
+                    stats.vertices_deleted += arm_stats.vertices_deleted;
+                    // `edges_deleted` is NOT summed here. That omission is
+                    // carried over verbatim from the buffered UNION: fixing it
+                    // would change what a `UNION` over DELETE arms reports, so
+                    // it is out of scope for a behavior-preserving scaffold.
+                    arm_streams.push(arm_stream);
+                }
+                stats.execution_ms = start.elapsed().as_millis() as u64;
+                Ok((
+                    columns.unwrap_or_default(),
+                    chain_streams(arm_streams),
+                    stats,
+                ))
+            }
+            PhysicalPlan::ReturnOnly { return_clause } => {
+                Ok(return_only_stream(return_clause, start))
+            }
+            PhysicalPlan::Expand {
+                anchor,
+                hops,
+                optional_hops,
+                post_filters,
+                with_pipeline,
+                return_clause,
+            } => {
+                execute_expand_streaming(
+                    ExpandParts {
+                        anchor,
+                        hops,
+                        optional_hops,
+                        post_filters,
+                        with_pipeline,
+                        return_clause,
+                    },
+                    ExpandCtx {
+                        write_path,
+                        keyspace,
+                        config,
+                        virtual_tables,
+                        schema,
+                        start,
+                    },
+                )
+                .await
+            }
+
+            // --- everything else: today's buffered result, wrapped -----------
+            other => {
+                let result = execute_buffered(
+                    other,
+                    write_path,
+                    keyspace,
+                    config,
+                    virtual_tables,
+                    schema,
+                    start,
+                )
+                .await?;
+                Ok((result.columns, stream_from_rows(result.rows), result.stats))
+            }
+        }
+    })
+}
+
+/// `RETURN <exprs>` with no MATCH: at most one row, built on pull.
+///
+/// The buffered form projected the row, ran `sort_rows`, then
+/// `rows.truncate(limit)`. Streaming, the truncate is a `take`, so `LIMIT 0`
+/// short-circuits before the projection is evaluated at all. `ORDER BY` is
+/// dropped on purpose: sorting a one-row result is the identity.
+fn return_only_stream<'a>(
+    return_clause: ReturnClause,
+    start: Instant,
+) -> (Vec<String>, RowStream<'a>, QueryStats) {
+    use futures::StreamExt as _;
+
+    let columns = build_columns(&return_clause);
+    let limit = return_clause
+        .limit
+        .map(|limit| limit.max(0) as usize)
+        .unwrap_or(usize::MAX);
+    let row = futures::stream::once(async move {
+        let bindings = HashMap::new();
+        Ok(return_clause
+            .items
+            .iter()
+            .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>())
+    });
+    let stats = QueryStats {
+        vertices_read: 0,
+        edges_read: 0,
+        vertices_written: 0,
+        vertices_deleted: 0,
+        edges_deleted: 0,
+        execution_ms: start.elapsed().as_millis() as u64,
+    };
+    (columns, Box::pin(row.take(limit)), stats)
+}
+
+/// The materializing executor: every plan variant that has not been converted
+/// to streaming, unchanged.
+///
+/// `start` is threaded in from [`execute_streaming_inner`] so `execution_ms`
+/// still measures from the same instant the buffered `execute` used to.
+async fn execute_buffered<'a>(
+    plan: PhysicalPlan,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    config: &'a GraphEngineConfig,
+    virtual_tables: Option<&'a VirtualTableRegistry>,
+    schema: Option<&'a Schema>,
+    start: Instant,
+) -> Result<GraphResult> {
+    match plan {
+        PhysicalPlan::Union { arms, all } => {
+            // Concatenation is the streaming half; `all: false` adds a HashSet
+            // dedup over the WHOLE concatenation, which has to see every row
+            // before any row is final. Route the concatenation through the
+            // streaming UNION ALL so there is one implementation of it, then
+            // materialize and dedup.
+            let (columns, rows_stream, mut stats) = execute_streaming(
+                PhysicalPlan::Union { arms, all: true },
+                write_path,
+                keyspace,
+                config,
+                virtual_tables,
+                schema,
+            )
+            .await?;
+            let mut rows = crate::executor::stream::collect_rows(rows_stream).await?;
             if !all {
                 let mut seen = std::collections::HashSet::new();
                 rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
             }
             stats.execution_ms = start.elapsed().as_millis() as u64;
             Ok(GraphResult {
-                columns: columns.unwrap_or_default(),
+                columns,
                 rows,
                 stats,
             })
+        }
+        // Converted variants: `execute_streaming` intercepts these before it
+        // ever delegates here. Present so this function stays total over
+        // `PhysicalPlan`, and routed through the same code so there is no
+        // second implementation to drift.
+        PhysicalPlan::ReturnOnly { return_clause } => {
+            let (columns, rows_stream, stats) = return_only_stream(return_clause, start);
+            collect_to_graph_result(columns, rows_stream, stats, usize::MAX).await
+        }
+        PhysicalPlan::Subscribe { inner, .. } => {
+            Box::pin(execute(
+                *inner,
+                write_path,
+                keyspace,
+                config,
+                virtual_tables,
+                schema,
+            ))
+            .await
         }
         PhysicalPlan::Unwind {
             expr,
@@ -175,7 +433,6 @@ pub async fn execute(
             with_pipeline,
             return_clause,
         } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start).await,
-        PhysicalPlan::ReturnOnly { return_clause } => execute_return_only(&return_clause, start),
         PhysicalPlan::Expand {
             anchor,
             hops,
@@ -185,18 +442,22 @@ pub async fn execute(
             return_clause,
         } => {
             execute_expand(
-                write_path,
-                keyspace,
-                &anchor,
-                &hops,
-                &optional_hops,
-                &post_filters,
-                with_pipeline.as_ref(),
-                &return_clause,
-                config,
-                start,
-                virtual_tables,
-                schema,
+                ExpandPlan {
+                    anchor: &anchor,
+                    hops: &hops,
+                    optional_hops: &optional_hops,
+                    post_filters: &post_filters,
+                    with_pipeline: with_pipeline.as_ref(),
+                    return_clause: &return_clause,
+                },
+                ExpandCtx {
+                    write_path,
+                    keyspace,
+                    config,
+                    virtual_tables,
+                    schema,
+                    start,
+                },
             )
             .await
         }
@@ -256,6 +517,10 @@ pub async fn execute(
             detach,
             variable_tables,
         } => {
+            // NOT streamable: this consumes the matched rows TWICE — validate
+            // across every matched vertex first, then tombstone. A single-pass
+            // stream would delete a prefix and then fail validation, i.e.
+            // partial deletion.
             execute_delete(
                 write_path,
                 *expand,
@@ -288,18 +553,6 @@ pub async fn execute(
                 virtual_tables,
                 schema,
             )
-            .await
-        }
-        PhysicalPlan::Subscribe { inner, .. } => {
-            // Execute the initial snapshot from the inner plan.
-            Box::pin(execute(
-                *inner,
-                write_path,
-                keyspace,
-                config,
-                virtual_tables,
-                schema,
-            ))
             .await
         }
         PhysicalPlan::ExpandVarLength {
@@ -896,32 +1149,6 @@ async fn resolve_target_node_json(
     Ok(matched.map(|m| m.json))
 }
 
-fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<GraphResult> {
-    let bindings = HashMap::new();
-    let mut rows = vec![return_clause
-        .items
-        .iter()
-        .map(|item| eval::eval_expr(&item.expr, &bindings).unwrap_or(serde_json::Value::Null))
-        .collect::<Vec<_>>()];
-    let columns = build_columns(return_clause);
-    sort_rows(&mut rows, &columns, &return_clause.order_by);
-    if let Some(limit) = return_clause.limit {
-        rows.truncate(limit.max(0) as usize);
-    }
-    Ok(GraphResult {
-        columns,
-        rows,
-        stats: QueryStats {
-            vertices_read: 0,
-            edges_read: 0,
-            vertices_written: 0,
-            vertices_deleted: 0,
-            edges_deleted: 0,
-            execution_ms: start.elapsed().as_millis() as u64,
-        },
-    })
-}
-
 async fn execute_unwind(
     expr: &Expr,
     var: &str,
@@ -1010,21 +1237,175 @@ async fn execute_unwind(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_expand(
-    write_path: &WritePath,
-    keyspace: &str,
-    anchor: &Anchor,
-    hops: &[Hop],
-    optional_hops: &[Hop],
-    post_filters: &[Expr],
-    with_pipeline: Option<&crate::parser::WithPipeline>,
-    return_clause: &ReturnClause,
-    config: &GraphEngineConfig,
+/// The borrowed pieces of a `PhysicalPlan::Expand`.
+#[derive(Clone, Copy)]
+struct ExpandPlan<'p> {
+    anchor: &'p Anchor,
+    hops: &'p [Hop],
+    optional_hops: &'p [Hop],
+    post_filters: &'p [Expr],
+    with_pipeline: Option<&'p crate::parser::WithPipeline>,
+    return_clause: &'p ReturnClause,
+}
+
+/// The shared execution context an Expand runs against.
+#[derive(Clone, Copy)]
+struct ExpandCtx<'a> {
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    config: &'a GraphEngineConfig,
+    virtual_tables: Option<&'a VirtualTableRegistry>,
+    schema: Option<&'a Schema>,
     start: Instant,
-    virtual_tables: Option<&VirtualTableRegistry>,
-    schema: Option<&Schema>,
-) -> Result<GraphResult> {
+}
+
+/// Outcome of an Expand's state-materialization phase.
+enum ExpandStates {
+    /// Virtual-table anchor: `execute_virtual_anchor` produced the whole result
+    /// itself. Deliberately NOT converted to streaming — its handling of
+    /// `ORDER BY`/`DISTINCT` is under separate investigation, and streaming it
+    /// would lock in the current behavior.
+    Virtual(GraphResult),
+    /// The surviving states after hops, post-filters, OPTIONAL MATCH and the
+    /// WITH pipeline, plus the stats accumulated getting there.
+    Materialized(Vec<ExpandState>, QueryStats),
+}
+
+/// Execute a `PhysicalPlan::Expand` and buffer the whole result.
+async fn execute_expand(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<GraphResult> {
+    match expand_to_states(plan, ctx).await? {
+        ExpandStates::Virtual(result) => Ok(result),
+        ExpandStates::Materialized(states, stats) => {
+            finish_expand_buffered(states, stats, plan, ctx).await
+        }
+    }
+}
+
+/// Owned pieces of a `PhysicalPlan::Expand`, for the streaming entry point.
+///
+/// Owned rather than borrowed because the projection stream outlives the
+/// destructured plan: `execute_streaming` consumes the `PhysicalPlan` by value,
+/// so nothing in the returned stream may borrow from it.
+struct ExpandParts {
+    anchor: Anchor,
+    hops: Vec<Hop>,
+    optional_hops: Vec<Hop>,
+    post_filters: Vec<Expr>,
+    with_pipeline: Option<crate::parser::WithPipeline>,
+    return_clause: ReturnClause,
+}
+
+/// Execute a `PhysicalPlan::Expand`, streaming the projection when it is safe.
+///
+/// Phase A (which states survive) is shared verbatim with the buffered path and
+/// is NOT lazy — the hop loop still materializes the frontier, and the
+/// sequential-vs-concurrent hop split is untouched. What streams is phase B:
+/// one `project_state` per pull, so a `LIMIT k` projects k states instead of
+/// projecting everything and truncating.
+///
+/// Falls back to [`finish_expand_buffered`] when the query has an `ORDER BY`
+/// (it must see every row before the first is final), and to
+/// `execute_virtual_anchor`'s buffered result for a virtual-table anchor.
+///
+/// `DISTINCT` composes as [`dedup_stream`] on top of the projection — see that
+/// function for the deliberate first-seen-vs-sorted order change.
+async fn execute_expand_streaming<'a>(
+    parts: ExpandParts,
+    ctx: ExpandCtx<'a>,
+) -> StreamingPlanResult<'a> {
+    use futures::StreamExt as _;
+
+    let plan = ExpandPlan {
+        anchor: &parts.anchor,
+        hops: &parts.hops,
+        optional_hops: &parts.optional_hops,
+        post_filters: &parts.post_filters,
+        with_pipeline: parts.with_pipeline.as_ref(),
+        return_clause: &parts.return_clause,
+    };
+
+    let (states, mut stats) = match expand_to_states(plan, ctx).await? {
+        ExpandStates::Virtual(result) => {
+            return Ok((result.columns, stream_from_rows(result.rows), result.stats));
+        }
+        ExpandStates::Materialized(states, stats) => (states, stats),
+    };
+
+    // ORDER BY (with or without DISTINCT) is a pipeline breaker: no row is
+    // final until every row is projected. Keep the buffered tail, which also
+    // keeps the spill path and the ordering-by-non-projected-expressions
+    // behavior intact.
+    if !parts.return_clause.order_by.is_empty() {
+        let result = finish_expand_buffered(states, stats, plan, ctx).await?;
+        return Ok((result.columns, stream_from_rows(result.rows), result.stats));
+    }
+
+    let columns = build_columns(&parts.return_clause);
+    let needs_graph_projection = parts
+        .return_clause
+        .items
+        .iter()
+        .any(|item| expr_has_pattern_comprehension(&item.expr));
+    let distinct = parts.return_clause.distinct;
+    let limit = parts.return_clause.limit.map(|limit| limit.max(0) as usize);
+    // Stats are returned up front (see `execute_streaming`), so `execution_ms`
+    // is measured here rather than after the last row. For a streamed Expand it
+    // therefore EXCLUDES projection time, where the buffered path included it.
+    // Fixing that needs the deferred stats handle, not a change here.
+    stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
+
+    let ExpandParts {
+        anchor,
+        return_clause,
+        ..
+    } = parts;
+    let mut rows = project_states_stream(
+        states,
+        ExpandProjection {
+            return_clause,
+            // Matches the buffered tail's `anchor.var.as_deref().unwrap_or("")`.
+            anchor_var: anchor.var.unwrap_or_default(),
+            needs_graph_projection,
+            write_path: ctx.write_path,
+            keyspace: ctx.keyspace,
+            schema: ctx.schema,
+        },
+    );
+    if distinct {
+        rows = dedup_stream(rows);
+    }
+    if let Some(limit) = limit {
+        // `rows.truncate(limit)` becomes `take(limit)`: the states past the
+        // limit are never projected at all.
+        rows = Box::pin(rows.take(limit));
+    }
+    Ok((columns, rows, stats))
+}
+
+/// Phase A of an Expand: anchor scan, hop traversal, post-filters, OPTIONAL
+/// MATCH and the WITH pipeline — everything that decides WHICH states survive.
+///
+/// Shared verbatim by the buffered and streaming tails, so the two can never
+/// disagree about what matched. Nothing here is lazy yet: the hop loop still
+/// materializes the frontier (later increments), and `max_fan_out_per_hop`
+/// still guards it exactly as before.
+async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<ExpandStates> {
+    let ExpandPlan {
+        anchor,
+        hops,
+        optional_hops,
+        post_filters,
+        with_pipeline,
+        return_clause,
+    } = plan;
+    let ExpandCtx {
+        write_path,
+        keyspace,
+        config,
+        virtual_tables,
+        schema,
+        start,
+    } = ctx;
     let mut stats = QueryStats::default();
 
     // Step 1: Anchor lookup.
@@ -1044,7 +1425,8 @@ async fn execute_expand(
             return_clause,
             config,
             start,
-        );
+        )
+        .map(ExpandStates::Virtual);
     }
 
     let (mut current_states, traversal_hops): (Vec<ExpandState>, &[Hop]) = if let Some(states) =
@@ -1369,6 +1751,34 @@ async fn execute_expand(
         current_states = apply_with_pipeline(current_states, with_pipeline)?;
     }
 
+    Ok(ExpandStates::Materialized(current_states, stats))
+}
+
+/// Phase B, buffered: project every surviving state, then `ORDER BY`,
+/// `DISTINCT` and `LIMIT` over the materialized rows.
+///
+/// This is the pipeline-breaking tail. `execute_expand_streaming` keeps it
+/// unchanged for any query with an `ORDER BY`, and replaces it with
+/// `project_states_stream` (+ `dedup_stream` + `take`) otherwise.
+async fn finish_expand_buffered(
+    current_states: Vec<ExpandState>,
+    mut stats: QueryStats,
+    plan: ExpandPlan<'_>,
+    ctx: ExpandCtx<'_>,
+) -> Result<GraphResult> {
+    let ExpandPlan {
+        anchor,
+        return_clause,
+        ..
+    } = plan;
+    let ExpandCtx {
+        write_path,
+        keyspace,
+        config,
+        schema,
+        start,
+        ..
+    } = ctx;
     // Step 3: Build result from return clause, projecting property values.
     let columns = build_columns(return_clause);
 
@@ -1381,13 +1791,14 @@ async fn execute_expand(
         .any(|item| expr_has_pattern_comprehension(&item.expr));
     let anchor_var = anchor.var.as_deref().unwrap_or("");
 
+    // Project every surviving state. The old `max_result_rows` break here
+    // SILENTLY TRUNCATED the result — no error, no flag, so a client could not
+    // tell a partial answer from a complete one. Removed (t_4ce82a3e): an
+    // unbounded ORDER BY now SPILLS (below) instead of being capped, which is
+    // the honest answer rather than a quiet wrong one.
     let mut result_states = Vec::new();
     let mut rows = Vec::new();
     for state in &current_states {
-        if rows.len() >= config.max_result_rows {
-            break;
-        }
-
         let row = project_state(
             return_clause,
             needs_graph_projection,
@@ -1404,7 +1815,19 @@ async fn execute_expand(
 
     // Apply ORDER BY before projection-only values disappear. Cypher permits
     // ordering by expressions that are not part of RETURN.
-    sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+    //
+    // An UNBOUNDED ORDER BY (no LIMIT) must see every row before the first
+    // output row is known — a pipeline-breaker. Rather than cap it in memory,
+    // spill through the storage engine's bounded external merge sort when a
+    // backend is available (t_4ce82a3e). `spill_order_by` returns Ok(false) when
+    // it cannot apply (no backend, no LIMIT-free ORDER BY, or an order term that
+    // is not a projected column), leaving the in-memory sort below to run
+    // exactly as before.
+    let spilled =
+        crate::executor::spill::spill_order_by(&mut rows, &columns, return_clause, config).await?;
+    if !spilled {
+        sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+    }
 
     // Apply DISTINCT.
     if return_clause.distinct {
@@ -1495,6 +1918,65 @@ async fn project_state(
         row.push(value);
     }
     Ok(row)
+}
+
+/// Everything the Expand projection needs once the surviving states are final.
+///
+/// Owned (`return_clause`, `anchor_var`) rather than borrowed, because the
+/// projection stream outlives the destructured `PhysicalPlan` it came from.
+struct ExpandProjection<'a> {
+    return_clause: ReturnClause,
+    anchor_var: String,
+    needs_graph_projection: bool,
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    schema: Option<&'a Schema>,
+}
+
+/// Project the surviving expand states lazily: one [`project_state`] call per
+/// pull, in expansion order.
+///
+/// This is the streaming replacement for the materializing projection loop. Two
+/// things it does NOT do, and one thing it drops:
+///
+/// - It does not sort. `ORDER BY` must see every row before the first is final,
+///   so an ordered Expand keeps the buffered tail.
+/// - It does not dedup. `DISTINCT` composes on top via
+///   [`dedup_stream`](crate::executor::stream::dedup_stream).
+/// - It drops the buffered loop's `result_states.push(state.clone())` — that
+///   per-row deep clone of every binding map existed only to let
+///   `sort_projected_rows_by_bindings` order by non-projected expressions,
+///   which is the `ORDER BY` path this stream never takes.
+///
+/// The states themselves are still materialized by the hop loop; making the
+/// hops lazy is a later increment.
+fn project_states_stream<'a>(
+    states: Vec<ExpandState>,
+    projection: ExpandProjection<'a>,
+) -> RowStream<'a> {
+    Box::pin(futures::stream::unfold(
+        (states.into_iter(), projection, false),
+        |(mut states, projection, failed)| async move {
+            // Stop after a failure rather than projecting the rest: a caller
+            // that kept pulling would see a partial result follow an error.
+            if failed {
+                return None;
+            }
+            let state = states.next()?;
+            let row = project_state(
+                &projection.return_clause,
+                projection.needs_graph_projection,
+                projection.write_path,
+                projection.keyspace,
+                projection.schema,
+                &projection.anchor_var,
+                &state,
+            )
+            .await;
+            let failed = row.is_err();
+            Some((row, (states, projection, failed)))
+        },
+    ))
 }
 
 fn sort_projected_rows_by_bindings(
@@ -4239,6 +4721,32 @@ fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>
     }
 }
 
+/// Does this plan's projection READ STORAGE, rather than only the values
+/// already bound by the match?
+///
+/// SET and REMOVE consume their inner expand as a stream, so its projection is
+/// interleaved with their writes. That is only sound when the projection cannot
+/// observe those writes. `project_state` touches storage exactly when a RETURN
+/// item contains a pattern comprehension (`graph_eval_expr`); otherwise it
+/// evaluates against `state.bindings`, which were captured before any write.
+///
+/// The planner synthesizes plain `Expr::Var` projections for SET/REMOVE
+/// (`plan_set` / `plan_remove`), so this is false in practice. It exists so
+/// that if that ever changes, the caller drains the projection BEFORE writing
+/// instead of silently letting a comprehension read half-written state.
+fn projection_reads_storage(plan: &PhysicalPlan) -> bool {
+    let return_clause = match plan {
+        PhysicalPlan::Expand { return_clause, .. } => return_clause,
+        // Any other shape is not the plain expand SET/REMOVE plan for; be
+        // conservative and make the caller materialize first.
+        _ => return true,
+    };
+    return_clause
+        .items
+        .iter()
+        .any(|item| expr_has_pattern_comprehension(&item.expr))
+}
+
 /// Execute a SET plan: run the expand to find matching vertices, then write
 /// updated cells for each one.
 #[allow(clippy::too_many_arguments)]
@@ -4254,7 +4762,19 @@ async fn execute_set(
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
     // Execute the inner expand to find matching vertices.
-    let expand_result = Box::pin(execute(
+    // Consume the inner expand as a STREAM: its projected rows are never
+    // collected into a `Vec`, so a SET/REMOVE across a large MATCH no longer
+    // buffers one row per matched vertex. Columns arrive before rows, which is
+    // all the write loop below needs.
+    //
+    // Soundness of interleaving projection with our writes: the projection only
+    // touches storage when it contains a pattern comprehension, and
+    // `projection_reads_storage` makes us drain the stream first in that case,
+    // so a projection can never observe a write this statement is making.
+    use futures::StreamExt as _;
+
+    let drain_first = projection_reads_storage(&expand);
+    let (columns, rows_stream, expand_stats) = Box::pin(execute_streaming(
         expand,
         write_path,
         keyspace,
@@ -4263,9 +4783,16 @@ async fn execute_set(
         schema,
     ))
     .await?;
-    let mut stats = QueryStats::default();
-    stats.vertices_read = expand_result.stats.vertices_read;
-    stats.edges_read = expand_result.stats.edges_read;
+    let mut rows_stream = if drain_first {
+        stream_from_rows(crate::executor::stream::collect_rows(rows_stream).await?)
+    } else {
+        rows_stream
+    };
+    let mut stats = QueryStats {
+        vertices_read: expand_stats.vertices_read,
+        edges_read: expand_stats.edges_read,
+        ..Default::default()
+    };
 
     let timestamp = now_micros();
     let strategy = graph_replication_strategy(schema, keyspace)?;
@@ -4273,8 +4800,9 @@ async fn execute_set(
     // For each matched vertex, apply the assignments.
     // The expand result rows contain vertex IDs (hex-encoded).
     // We need to reconstruct the partition key from the hex ID.
-    for row_values in &expand_result.rows {
-        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+    while let Some(row_values) = rows_stream.next().await {
+        let row_values = row_values?;
+        for (col_idx, col_name) in columns.iter().enumerate() {
             // Find assignments that target this variable.
             let matching_assignments: Vec<&(String, String, Expr)> = assignments
                 .iter()
@@ -4428,7 +4956,19 @@ async fn execute_remove(
         }
     }
 
-    let expand_result = Box::pin(execute(
+    // Consume the inner expand as a STREAM: its projected rows are never
+    // collected into a `Vec`, so a SET/REMOVE across a large MATCH no longer
+    // buffers one row per matched vertex. Columns arrive before rows, which is
+    // all the write loop below needs.
+    //
+    // Soundness of interleaving projection with our writes: the projection only
+    // touches storage when it contains a pattern comprehension, and
+    // `projection_reads_storage` makes us drain the stream first in that case,
+    // so a projection can never observe a write this statement is making.
+    use futures::StreamExt as _;
+
+    let drain_first = projection_reads_storage(&expand);
+    let (columns, rows_stream, expand_stats) = Box::pin(execute_streaming(
         expand,
         write_path,
         keyspace,
@@ -4437,16 +4977,24 @@ async fn execute_remove(
         schema,
     ))
     .await?;
-    let mut stats = QueryStats::default();
-    stats.vertices_read = expand_result.stats.vertices_read;
-    stats.edges_read = expand_result.stats.edges_read;
+    let mut rows_stream = if drain_first {
+        stream_from_rows(crate::executor::stream::collect_rows(rows_stream).await?)
+    } else {
+        rows_stream
+    };
+    let mut stats = QueryStats {
+        vertices_read: expand_stats.vertices_read,
+        edges_read: expand_stats.edges_read,
+        ..Default::default()
+    };
 
     let timestamp = now_micros();
     let local_deletion_time = timestamp.div_euclid(1_000_000).clamp(0, i32::MAX as i64) as i32;
     let strategy = graph_replication_strategy(schema, keyspace)?;
 
-    for row_values in &expand_result.rows {
-        for (col_idx, col_name) in expand_result.columns.iter().enumerate() {
+    while let Some(row_values) = rows_stream.next().await {
+        let row_values = row_values?;
+        for (col_idx, col_name) in columns.iter().enumerate() {
             let matching_props: Vec<&str> = items
                 .iter()
                 .filter_map(|item| match item {
@@ -5240,7 +5788,7 @@ pub fn sort_rows(
 }
 
 /// Compare two JSON values for sorting purposes.
-fn compare_json_values(
+pub(super) fn compare_json_values(
     a: Option<&serde_json::Value>,
     b: Option<&serde_json::Value>,
 ) -> std::cmp::Ordering {
@@ -5361,7 +5909,7 @@ fn column_name_for_item(item: &ReturnItem) -> String {
 }
 
 /// Convert an expression to a display-friendly column name.
-fn expr_to_column_name(expr: &Expr) -> String {
+pub(super) fn expr_to_column_name(expr: &Expr) -> String {
     match expr {
         Expr::Property { var, name } => format!("{var}.{name}"),
         Expr::Var(v) => v.clone(),
@@ -7633,6 +8181,575 @@ mod tests {
         strength_idx.expect(
             "SET r.strength must produce a cell whose col_idx maps to the strength column \
              on the receiver's TableSchema",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming entry point (`execute_streaming`)
+    //
+    // Two obligations, one per test group:
+    //   (1) a converted variant genuinely streams — see
+    //       `union_all_streams_without_pulling_later_arms`;
+    //   (2) EVERY variant — converted or fallback — reproduces the buffered
+    //       `GraphResult` exactly, which is what `assert_streaming_matches`
+    //       asserts field by field (`execution_ms` excluded: it is a wall-clock
+    //       measurement, not a result value).
+    // ---------------------------------------------------------------------
+
+    fn streaming_test_write_path() -> (tempfile::TempDir, WritePath) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        (tmp, WritePath::direct(storage))
+    }
+
+    fn return_one_plan(items: &[(&str, i64)], limit: Option<i64>) -> PhysicalPlan {
+        use crate::parser::{Expr, Literal, ReturnClause, ReturnItem};
+        PhysicalPlan::ReturnOnly {
+            return_clause: ReturnClause {
+                distinct: false,
+                items: items
+                    .iter()
+                    .map(|(alias, value)| ReturnItem {
+                        expr: Expr::Literal(Literal::Integer(*value)),
+                        alias: Some((*alias).to_string()),
+                    })
+                    .collect(),
+                order_by: vec![],
+                limit,
+            },
+        }
+    }
+
+    /// Run `plan` through both entry points and assert the streaming one is
+    /// indistinguishable from today's buffered one.
+    async fn assert_streaming_matches(
+        // `PhysicalPlan` is not `Clone`, and the plan is consumed by value, so
+        // the caller supplies a factory that builds it once per entry point.
+        build_plan: impl Fn() -> PhysicalPlan,
+        keyspace: &str,
+        registry: Option<&VirtualTableRegistry>,
+    ) -> GraphResult {
+        let (_tmp, wp) = streaming_test_write_path();
+        let config = GraphEngineConfig::default();
+
+        let buffered = execute(build_plan(), &wp, keyspace, &config, registry, None)
+            .await
+            .unwrap();
+
+        let (columns, rows_stream, stats) =
+            execute_streaming(build_plan(), &wp, keyspace, &config, registry, None)
+                .await
+                .unwrap();
+        let rows = crate::executor::stream::collect_rows(rows_stream)
+            .await
+            .unwrap();
+
+        assert_eq!(columns, buffered.columns, "columns must be identical");
+        assert_eq!(rows, buffered.rows, "rows must be identical, in order");
+        assert_eq!(stats.vertices_read, buffered.stats.vertices_read);
+        assert_eq!(stats.edges_read, buffered.stats.edges_read);
+        assert_eq!(stats.vertices_written, buffered.stats.vertices_written);
+        assert_eq!(stats.vertices_deleted, buffered.stats.vertices_deleted);
+        assert_eq!(stats.edges_deleted, buffered.stats.edges_deleted);
+
+        GraphResult {
+            columns,
+            rows,
+            stats,
+        }
+    }
+
+    // --- converted: ReturnOnly -------------------------------------------
+
+    #[tokio::test]
+    async fn return_only_streaming_matches_buffered() {
+        let result = assert_streaming_matches(
+            || return_one_plan(&[("a", 1), ("b", 2)], None),
+            "social",
+            None,
+        )
+        .await;
+        assert_eq!(result.columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            result.rows,
+            vec![vec![serde_json::json!(1), serde_json::json!(2)]]
+        );
+    }
+
+    /// `RETURN 1 LIMIT 0` truncated a materialized one-row Vec. Streaming, the
+    /// `take(0)` means the projection is never even reached — and the result is
+    /// still the same empty row set.
+    #[tokio::test]
+    async fn return_only_streaming_honors_limit_zero() {
+        let result =
+            assert_streaming_matches(|| return_one_plan(&[("a", 1)], Some(0)), "social", None)
+                .await;
+        assert!(result.rows.is_empty(), "LIMIT 0 yields no rows");
+    }
+
+    #[tokio::test]
+    async fn return_only_streaming_honors_negative_limit() {
+        // `limit.max(0)` in the buffered path: a negative LIMIT is a zero LIMIT.
+        let result =
+            assert_streaming_matches(|| return_one_plan(&[("a", 1)], Some(-5)), "social", None)
+                .await;
+        assert!(result.rows.is_empty());
+    }
+
+    // --- converted: Subscribe --------------------------------------------
+
+    #[tokio::test]
+    async fn subscribe_streaming_passes_through_to_inner() {
+        let build = || PhysicalPlan::Subscribe {
+            inner: Box::new(return_one_plan(&[("a", 7)], None)),
+            interval: Duration::from_secs(1),
+            delta: false,
+            return_clause: crate::parser::ReturnClause {
+                distinct: false,
+                items: vec![],
+                order_by: vec![],
+                limit: None,
+            },
+        };
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert_eq!(result.columns, vec!["a".to_string()]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(7)]]);
+    }
+
+    // --- converted: Union { all: true } ----------------------------------
+
+    #[tokio::test]
+    async fn union_all_streaming_matches_buffered() {
+        let build = || PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("a", 2)], None),
+                // A duplicate row: UNION ALL keeps it.
+                return_one_plan(&[("a", 1)], None),
+            ],
+            all: true,
+        };
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![serde_json::json!(1)],
+                vec![serde_json::json!(2)],
+                vec![serde_json::json!(1)]
+            ],
+            "UNION ALL is concatenation in arm order, duplicates kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn union_all_streaming_with_no_arms_matches_buffered() {
+        let build = || PhysicalPlan::Union {
+            arms: vec![],
+            all: true,
+        };
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+    }
+
+    /// Incrementality at the PLAN level: a downstream `take(k)` over a
+    /// converted `UNION ALL` returns after the arm that supplies row `k` and
+    /// drops the rest of the chain unpolled.
+    ///
+    /// The per-arm production counting lives in
+    /// `stream::tests::chain_streams_does_not_pull_later_arms_early`, where the
+    /// arms can be instrumented. Here the arms are `ReturnOnly` plans, whose
+    /// projection has no observable side effect — so this test pins the
+    /// row-level contract (which rows come back, and that the stream can be
+    /// abandoned early without error), not the arm-execution schedule.
+    #[tokio::test]
+    async fn union_all_streams_without_pulling_later_arms() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let config = GraphEngineConfig::default();
+        let plan = PhysicalPlan::Union {
+            arms: (0..64)
+                .map(|i| return_one_plan(&[("a", i)], None))
+                .collect(),
+            all: true,
+        };
+        let (columns, rows_stream, _stats) =
+            execute_streaming(plan, &wp, "social", &config, None, None)
+                .await
+                .unwrap();
+        assert_eq!(columns, vec!["a".to_string()]);
+
+        let limited: crate::executor::stream::RowStream<'_> = {
+            use futures::StreamExt as _;
+            Box::pin(rows_stream.take(2))
+        };
+        let rows = crate::executor::stream::collect_rows(limited)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![serde_json::json!(0)], vec![serde_json::json!(1)]],
+            "take(2) over UNION ALL yields the first two arms' rows and stops"
+        );
+    }
+
+    #[tokio::test]
+    async fn union_streaming_column_mismatch_still_errors() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let config = GraphEngineConfig::default();
+        let build = || PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("b", 2)], None),
+            ],
+            all: true,
+        };
+        // `RowStream` is not `Debug`, so the Ok arm cannot be unwrapped/printed.
+        let err = match execute_streaming(build(), &wp, "social", &config, None, None).await {
+            Ok(_) => panic!("streaming UNION must reject arms with mismatched columns"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, GraphError::Validation(ref m) if m.contains("identical columns")),
+            "streaming UNION must reject mismatched arms exactly as the buffered path does, got {err:?}"
+        );
+        // ...and the buffered entry point still rejects it too.
+        assert!(execute(build(), &wp, "social", &config, None, None)
+            .await
+            .is_err());
+    }
+
+    // --- fallback: Union { all: false } ----------------------------------
+
+    /// `UNION` (no ALL) dedups over the WHOLE concatenation, so it must NOT be
+    /// converted. Proving the fallback still dedups is the regression guard.
+    #[tokio::test]
+    async fn union_distinct_falls_back_and_still_dedups() {
+        let build = || PhysicalPlan::Union {
+            arms: vec![
+                return_one_plan(&[("a", 1)], None),
+                return_one_plan(&[("a", 2)], None),
+                return_one_plan(&[("a", 1)], None),
+            ],
+            all: false,
+        };
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert_eq!(
+            result.rows,
+            vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
+            "UNION without ALL must still dedup across all arms"
+        );
+    }
+
+    // --- fallback: Expand (virtual table + storage) -----------------------
+
+    #[tokio::test]
+    async fn expand_falls_back_with_identical_result() {
+        let registry = VirtualTableRegistry::new();
+        registry.register(Arc::new(TestVirtualTable {
+            table_name: "connections".to_string(),
+            ks: "system_observability".to_string(),
+            cols: vec![VirtualColumnDef {
+                name: "peer_address".to_string(),
+                data_type: DataType::Text,
+            }],
+            rows: vec![
+                VirtualRow {
+                    cells: vec![CellValue::live(b"10.0.0.1".to_vec(), 1000)],
+                },
+                VirtualRow {
+                    cells: vec![CellValue::live(b"10.0.0.2".to_vec(), 1000)],
+                },
+            ],
+        }));
+
+        let build = || {
+            virtual_anchor_plan(
+                "system_observability",
+                "connections",
+                &[("n", "peer_address")],
+            )
+        };
+        let result = assert_streaming_matches(build, "system_observability", Some(&registry)).await;
+        assert_eq!(result.rows.len(), 2, "the fallback must still return rows");
+    }
+
+    #[tokio::test]
+    async fn empty_storage_expand_falls_back_with_identical_result() {
+        let build = || virtual_anchor_plan("social", "person_v", &[("n", "name")]);
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert!(result.rows.is_empty());
+    }
+
+    // --- fallback: Unwind -------------------------------------------------
+
+    #[tokio::test]
+    async fn unwind_falls_back_with_identical_result() {
+        use crate::parser::{Expr, Literal, ReturnClause, ReturnItem};
+        let build = || PhysicalPlan::Unwind {
+            expr: Expr::List(vec![
+                Expr::Literal(Literal::Integer(3)),
+                Expr::Literal(Literal::Integer(1)),
+                Expr::Literal(Literal::Integer(2)),
+            ]),
+            var: "x".to_string(),
+            with_pipeline: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Var("x".to_string()),
+                    alias: Some("x".to_string()),
+                }],
+                order_by: vec![],
+                limit: None,
+            },
+        };
+        let result = assert_streaming_matches(build, "social", None).await;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![serde_json::json!(3)],
+                vec![serde_json::json!(1)],
+                vec![serde_json::json!(2)]
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // SET / REMOVE stream their INNER EXPAND (their own output is one summary
+    // row, only knowable after the last write). `projection_reads_storage` is
+    // the guard that makes interleaving the inner projection with those writes
+    // sound.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn projection_reads_storage_is_false_for_the_planner_shape_set_and_remove_use() {
+        // `plan_set` / `plan_remove` synthesize plain `Expr::Var` projections.
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        let plan = PhysicalPlan::Expand {
+            anchor: Anchor {
+                var: Some("n".to_string()),
+                table: crate::planner::logical::ResolvedTable {
+                    keyspace: "social".to_string(),
+                    table: "person".to_string(),
+                    graph_type: "vertex".to_string(),
+                    label: "Person".to_string(),
+                },
+                props: vec![],
+                filters: vec![],
+            },
+            hops: vec![],
+            optional_hops: vec![],
+            post_filters: vec![],
+            with_pipeline: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expr: Expr::Var("n".to_string()),
+                    alias: None,
+                }],
+                order_by: vec![],
+                limit: None,
+            },
+        };
+        assert!(
+            !projection_reads_storage(&plan),
+            "a plain Expr::Var projection reads only the bindings, so SET/REMOVE may \
+             stream the inner expand and interleave their writes with it"
+        );
+    }
+
+    #[test]
+    fn projection_reads_storage_is_true_for_a_non_expand_inner_plan() {
+        // Anything that is not the plain expand SET/REMOVE plan for must be
+        // materialized before writing — conservative by construction.
+        assert!(projection_reads_storage(&return_one_plan(
+            &[("a", 1)],
+            None
+        )));
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming Expand projection (`project_states_stream`)
+    //
+    // The states are still materialized by the hop loop (increments 3-4); what
+    // streams here is the PROJECTION — one `project_state` call per pull, so a
+    // downstream `take(k)` projects exactly k states.
+    // ---------------------------------------------------------------------
+
+    fn projection_state(name: &str) -> ExpandState {
+        let mut bindings = HashMap::new();
+        bindings.insert("n".to_string(), serde_json::json!({ "name": name }));
+        ExpandState {
+            current_key: DecoratedKey::new(PartitionKey::new(name.as_bytes().to_vec())),
+            bindings,
+        }
+    }
+
+    fn name_return_clause(distinct: bool, limit: Option<i64>) -> crate::parser::ReturnClause {
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        ReturnClause {
+            distinct,
+            items: vec![ReturnItem {
+                expr: Expr::Property {
+                    var: "n".to_string(),
+                    name: "name".to_string(),
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit,
+        }
+    }
+
+    fn projection_ctx<'a>(
+        write_path: &'a WritePath,
+        return_clause: crate::parser::ReturnClause,
+        needs_graph_projection: bool,
+    ) -> ExpandProjection<'a> {
+        ExpandProjection {
+            return_clause,
+            anchor_var: "n".to_string(),
+            needs_graph_projection,
+            write_path,
+            keyspace: "social",
+            schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn project_states_stream_yields_one_row_per_state_in_order() {
+        let (_tmp, wp) = streaming_test_write_path();
+        let states = vec![
+            projection_state("Cara"),
+            projection_state("Alice"),
+            projection_state("Bob"),
+        ];
+        let stream = project_states_stream(
+            states,
+            projection_ctx(&wp, name_return_clause(false, None), false),
+        );
+        assert_eq!(
+            crate::executor::stream::collect_rows(stream).await.unwrap(),
+            vec![
+                vec![serde_json::json!("Cara")],
+                vec![serde_json::json!("Alice")],
+                vec![serde_json::json!("Bob")],
+            ],
+            "projection is 1:1 with the surviving states, in expansion order"
+        );
+    }
+
+    /// The incrementality obligation for the Expand conversion: projection work
+    /// happens ON PULL, not up front.
+    ///
+    /// Observed through an error. `project_state`'s graph-aware path propagates
+    /// evaluation failures (`graph_eval_expr` uses `?`, unlike the binding-only
+    /// path's `unwrap_or(Null)`), and `Expr::Parameter` is always an unbound-
+    /// parameter error. So: draining the stream MUST fail (the projection ran),
+    /// while `take(0)` MUST succeed (no state was ever projected). A
+    /// materialize-then-return implementation cannot pass both halves.
+    #[tokio::test]
+    async fn project_states_stream_defers_projection_until_pulled() {
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        let (_tmp, wp) = streaming_test_write_path();
+        let erroring = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Parameter("never_bound".to_string()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+        let states = || {
+            vec![
+                projection_state("Cara"),
+                projection_state("Alice"),
+                projection_state("Bob"),
+            ]
+        };
+
+        let drained = crate::executor::stream::collect_rows(project_states_stream(
+            states(),
+            projection_ctx(&wp, erroring.clone(), true),
+        ))
+        .await;
+        assert!(
+            drained.is_err(),
+            "draining must surface the projection error — otherwise the projection never ran \
+             and this test proves nothing"
+        );
+
+        let untouched: crate::executor::stream::RowStream<'_> = {
+            use futures::StreamExt as _;
+            Box::pin(project_states_stream(states(), projection_ctx(&wp, erroring, true)).take(0))
+        };
+        assert_eq!(
+            crate::executor::stream::collect_rows(untouched)
+                .await
+                .unwrap(),
+            Vec::<Vec<serde_json::Value>>::new(),
+            "take(0) must project NOTHING — no state may be projected before it is pulled"
+        );
+    }
+
+    /// LIMIT over a streaming projection is `take(k)`: only k states are
+    /// projected, proven by the same error observable.
+    #[tokio::test]
+    async fn project_states_stream_take_projects_only_the_pulled_prefix() {
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        let (_tmp, wp) = streaming_test_write_path();
+        // Item 1 always evaluates; a SECOND item is an unbound parameter, so
+        // projecting ANY state fails. With `take(0)` nothing is projected.
+        let clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Parameter("never_bound".to_string()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+        let stream: crate::executor::stream::RowStream<'_> = {
+            use futures::StreamExt as _;
+            Box::pin(
+                project_states_stream(
+                    vec![projection_state("Cara"), projection_state("Alice")],
+                    projection_ctx(&wp, clause, true),
+                )
+                .take(0),
+            )
+        };
+        assert!(
+            crate::executor::stream::collect_rows(stream).await.is_ok(),
+            "a zero-row LIMIT must not project the first state"
+        );
+    }
+
+    /// After an error the stream STOPS. Continuing would re-poll an operator
+    /// that already failed and could report a partial result as complete.
+    #[tokio::test]
+    async fn project_states_stream_stops_after_a_projection_error() {
+        use crate::parser::{Expr, ReturnClause, ReturnItem};
+        use futures::StreamExt as _;
+        let (_tmp, wp) = streaming_test_write_path();
+        let clause = ReturnClause {
+            distinct: false,
+            items: vec![ReturnItem {
+                expr: Expr::Parameter("never_bound".to_string()),
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+        let mut stream = project_states_stream(
+            vec![projection_state("Cara"), projection_state("Alice")],
+            projection_ctx(&wp, clause, true),
+        );
+        assert!(stream.next().await.expect("first item").is_err());
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must terminate after a projection error, not keep yielding"
         );
     }
 }

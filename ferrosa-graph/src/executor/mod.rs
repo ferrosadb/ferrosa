@@ -5,6 +5,7 @@ pub mod eval;
 pub mod expand;
 pub mod leapfrog;
 pub mod result;
+pub mod spill;
 pub mod stream;
 pub mod subscribe;
 pub mod varpath;

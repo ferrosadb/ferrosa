@@ -44,6 +44,27 @@ resolved port.
 - **Expand executor** (`executor/expand.rs`) — anchor lookup, per-hop adjacency
   reads, property evaluation, aggregation, write clauses; honors DoS limits
   (`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`).
+- **Streaming entry point** (`executor/stream.rs`, `executor/expand.rs`) —
+  `execute_streaming()` returns `(columns, RowStream<'a>, QueryStats)`;
+  `execute()` is a thin `collect` over it, so there is one executor, not two.
+  Streaming today: `Subscribe`, `Union { all: true }` (via `chain_streams`),
+  `ReturnOnly`, and the **Expand projection** — one `project_state` per pull, so
+  `LIMIT k` projects k states instead of projecting everything and truncating.
+  `DISTINCT` composes as `dedup_stream`. SET/REMOVE consume their inner expand
+  as a stream (their own output is one summary row, so it cannot stream). Every
+  other variant computes the buffered `GraphResult` and is wrapped with
+  `stream_from_rows`. `UNION` without `ALL` (whole-result dedup), `ORDER BY`
+  (pipeline breaker), `DELETE` (two passes over the matched rows — validate,
+  then tombstone), `Aggregate`, `WcoJoin`, `ExpandVarLength` and the
+  virtual-table anchor are deliberately excluded. The hop loop is still fully
+  materializing. See `specs/streaming-executor-design.md` §5.
+- **`RETURN DISTINCT` ordering** — `DISTINCT` **without** an `ORDER BY` returns
+  rows in **first-seen (expansion) order**, not sorted order. This changed
+  deliberately when DISTINCT became a streaming dedup; earlier releases returned
+  string-repr sorted rows. The set of rows is the same. Add an explicit
+  `ORDER BY` if you need a particular order. `DISTINCT` on a variable-length
+  path (`varpath.rs`) still returns sorted order. The dedup set is **unbounded**
+  in memory — a high-cardinality `DISTINCT` can still exhaust it.
 - **Label-agnostic expansion** (`executor/expand.rs`) — traversals may omit the
   relationship type and/or the target-node label (`(a)-[r]->(n)`, `(a)<-[r]-(n)`,
   `-[r:T]->(n)`, `-[r]->(n:L)`). When a hop lacks a plan-time edge or vertex
