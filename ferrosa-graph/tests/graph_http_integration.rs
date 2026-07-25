@@ -1676,6 +1676,285 @@ async fn return_distinct_deduplicates_projected_rows() {
     );
 }
 
+/// SET across MANY matched vertices.
+///
+/// This is the shape whose inner expand is now consumed as a STREAM rather than
+/// a `Vec` of projected rows (t_4ce82a3e). What streams is the INNER EXPAND —
+/// SET's own output is a single summary row that is only known after the last
+/// write, so it cannot stream. The property under test is that every matched
+/// vertex is still written and the summary still counts them all: a streaming
+/// consumer that stopped early would under-write and under-report.
+#[tokio::test]
+async fn set_streams_the_inner_expand_and_updates_every_matched_vertex() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let names = ["Sa", "Sb", "Sc", "Sd", "Se"];
+    for (i, name) in names.iter().enumerate() {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (n:Person {{id: '00000000-0000-0000-0000-00000000e10{i}', name: '{name}', age: 1}}) RETURN n.name"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let set_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) SET n.age = 77",
+            "keyspace": "social"
+        })),
+    );
+    let set_resp = app.clone().oneshot(set_req).await.unwrap();
+    assert_eq!(set_resp.status(), StatusCode::OK);
+    let set_body = response_json(set_resp).await;
+    assert_eq!(
+        set_body["rows"],
+        serde_json::json!([[format!("updated {} vertices", names.len())]]),
+        "SET must report every matched vertex, not just the first streamed row"
+    );
+
+    let check_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name",
+            "keyspace": "social"
+        })),
+    );
+    let check_resp = app.oneshot(check_req).await.unwrap();
+    assert_eq!(check_resp.status(), StatusCode::OK);
+    let rows = response_json(check_resp).await["rows"]
+        .as_array()
+        .expect("rows array")
+        .clone();
+    assert_eq!(rows.len(), names.len());
+    for row in &rows {
+        assert_eq!(row[1], 77, "every vertex must be updated, got {row:?}");
+    }
+}
+
+/// REMOVE across MANY matched vertices — the same streaming-inner-expand shape
+/// as `set_streams_the_inner_expand_and_updates_every_matched_vertex`.
+#[tokio::test]
+async fn remove_streams_the_inner_expand_and_unsets_on_every_matched_vertex() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    let names = ["Ra", "Rb", "Rc", "Rd"];
+    for (i, name) in names.iter().enumerate() {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (n:Person {{id: '00000000-0000-0000-0000-00000000e20{i}', name: '{name}', age: 33}}) RETURN n.name"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let remove_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) REMOVE n.age",
+            "keyspace": "social"
+        })),
+    );
+    let remove_resp = app.clone().oneshot(remove_req).await.unwrap();
+    assert_eq!(remove_resp.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(remove_resp).await["rows"],
+        serde_json::json!([[format!("removed properties on {} vertices", names.len())]]),
+        "REMOVE must report every matched vertex"
+    );
+
+    let check_req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name",
+            "keyspace": "social"
+        })),
+    );
+    let check_resp = app.oneshot(check_req).await.unwrap();
+    assert_eq!(check_resp.status(), StatusCode::OK);
+    let rows = response_json(check_resp).await["rows"]
+        .as_array()
+        .expect("rows array")
+        .clone();
+    assert_eq!(rows.len(), names.len());
+    for row in &rows {
+        assert_eq!(
+            row[1],
+            serde_json::Value::Null,
+            "every vertex must have age unset, got {row:?}"
+        );
+    }
+}
+
+/// `RETURN DISTINCT` with no `ORDER BY` returns rows in FIRST-SEEN (expansion)
+/// order — a deliberate, owner-approved behavior change (t_4ce82a3e).
+///
+/// The buffered executor did `rows.sort_by(|a, b| format!("{a:?}").cmp(..))`
+/// then `dedup()`, so an unordered `DISTINCT` came back in string-repr SORTED
+/// order. Streaming dedup emits each row the first time it is seen.
+///
+/// The test pins first-seen semantics without hard-coding the storage scan
+/// order: it reads the raw (non-DISTINCT) expansion order, dedups it in Rust,
+/// and requires `DISTINCT` to match. The `assert_ne!` guard makes the test
+/// non-vacuous — if the raw order happened to already be sorted, the test could
+/// not tell first-seen from sorted, and it fails loudly instead of passing for
+/// the wrong reason.
+#[tokio::test]
+async fn return_distinct_without_order_by_is_first_seen_order_not_sorted() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for (id, name) in [
+        ("00000000-0000-0000-0000-0000000f0001", "Cara"),
+        ("00000000-0000-0000-0000-0000000f0002", "Alice"),
+        ("00000000-0000-0000-0000-0000000f0003", "Cara"),
+        ("00000000-0000-0000-0000-0000000f0004", "Bob"),
+        ("00000000-0000-0000-0000-0000000f0005", "Alice"),
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{id: '{id}', name: '{name}'}}) RETURN n.name"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let names_for = |query: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = json_request(
+                "POST",
+                "/graph/query",
+                Some(serde_json::json!({ "query": query, "keyspace": "social" })),
+            );
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{query} must return 200");
+            response_json(resp).await["rows"]
+                .as_array()
+                .expect("rows array")
+                .iter()
+                .map(|row| row[0].as_str().expect("name").to_string())
+                .collect::<Vec<String>>()
+        }
+    };
+
+    let raw = names_for("MATCH (n:Person) RETURN n.name").await;
+    let distinct = names_for("MATCH (n:Person) RETURN DISTINCT n.name").await;
+
+    let mut seen = std::collections::HashSet::new();
+    let first_seen: Vec<String> = raw
+        .iter()
+        .filter(|name| seen.insert((*name).clone()))
+        .cloned()
+        .collect();
+
+    let mut sorted = first_seen.clone();
+    sorted.sort();
+    assert_ne!(
+        first_seen, sorted,
+        "test data must expand in a NON-sorted order, otherwise this test cannot \
+         distinguish first-seen order from the old sorted order (raw order was {raw:?})"
+    );
+
+    assert_eq!(
+        distinct, first_seen,
+        "RETURN DISTINCT without ORDER BY must emit rows in first-seen expansion order \
+         (raw order was {raw:?})"
+    );
+}
+
+/// `DISTINCT` **with** an explicit `ORDER BY` still goes through the buffered
+/// tail (`finish_expand_buffered`), so the first-seen change does not reach it.
+///
+/// SCOPE WARNING — this test does NOT prove that `ORDER BY` is honored when
+/// `DISTINCT` is present. It is not: the buffered tail sorts by `order_by` and
+/// then RE-SORTS by string repr to dedup, which discards the requested
+/// ordering. Verified: `... RETURN n.name ORDER BY n.name DESC` gives
+/// `[Cara, Bob, Alice]`, but `... RETURN DISTINCT n.name ORDER BY n.name DESC`
+/// gives `[Alice, Bob, Cara]`. That is a PRE-EXISTING bug, deliberately left
+/// untouched here so this increment stays behavior-preserving on the ordered
+/// path; it is tracked separately. What this test pins is only that the ordered
+/// DISTINCT path still returns the deduplicated set in the buffered path's
+/// order, i.e. that nothing regressed.
+#[tokio::test]
+async fn return_distinct_with_order_by_takes_the_unchanged_buffered_path() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+
+    for (id, name) in [
+        ("00000000-0000-0000-0000-0000000f1001", "Cara"),
+        ("00000000-0000-0000-0000-0000000f1002", "Alice"),
+        ("00000000-0000-0000-0000-0000000f1003", "Cara"),
+        ("00000000-0000-0000-0000-0000000f1004", "Bob"),
+    ] {
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{id: '{id}', name: '{name}'}}) RETURN n.name"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN DISTINCT n.name ORDER BY n.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(resp).await["rows"],
+        serde_json::json!([["Alice"], ["Bob"], ["Cara"]]),
+        "DISTINCT + ORDER BY must still come back ordered"
+    );
+}
+
 #[tokio::test]
 async fn negative_pattern_predicate_filters_existing_relationships() {
     let (schema, storage, _dir) = setup();
