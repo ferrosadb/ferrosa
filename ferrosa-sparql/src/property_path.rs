@@ -8,10 +8,12 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use ferrosa_cluster::write_path::WritePath;
+use futures::StreamExt;
 use spargebra::algebra::PropertyPathExpression;
 use spargebra::term::TermPattern;
 
 use crate::error::SparqlError;
+use crate::executor::ExecutionLimits;
 use crate::results::Binding;
 use crate::triple_store;
 
@@ -27,24 +29,33 @@ pub async fn evaluate_property_path(
     object: &TermPattern,
     graph: &str,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
     match path {
         PropertyPathExpression::NamedNode(predicate) => {
-            evaluate_single_hop(subject, predicate.as_str(), object, graph, write_path).await
+            evaluate_single_hop(
+                subject,
+                predicate.as_str(),
+                object,
+                graph,
+                write_path,
+                limits,
+            )
+            .await
         }
         PropertyPathExpression::OneOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, write_path, false).await
+            evaluate_closure(subject, inner, object, graph, write_path, limits, false).await
         }
         PropertyPathExpression::ZeroOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, write_path, true).await
+            evaluate_closure(subject, inner, object, graph, write_path, limits, true).await
         }
         PropertyPathExpression::ZeroOrOne(inner) => {
-            evaluate_zero_or_one(subject, inner, object, graph, write_path).await
+            evaluate_zero_or_one(subject, inner, object, graph, write_path, limits).await
         }
         PropertyPathExpression::Reverse(inner) => {
             // Swap subject and object, evaluate, then swap results back.
             let results = Box::pin(evaluate_property_path(
-                object, inner, subject, graph, write_path,
+                object, inner, subject, graph, write_path, limits,
             ))
             .await?;
             Ok(results.into_iter().map(|(s, o)| (o, s)).collect())
@@ -62,8 +73,9 @@ async fn evaluate_single_hop(
     object: &TermPattern,
     graph: &str,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
-    let triples = fetch_triples_for_predicate(graph, predicate, write_path).await?;
+    let triples = fetch_triples_for_predicate(graph, predicate, write_path, limits).await?;
     filter_by_endpoints(subject, object, &triples)
 }
 
@@ -77,10 +89,11 @@ async fn evaluate_closure(
     object: &TermPattern,
     graph: &str,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
     include_start: bool,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path).await?;
+    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path, limits).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -99,9 +112,10 @@ async fn evaluate_zero_or_one(
     object: &TermPattern,
     graph: &str,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path).await?;
+    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path, limits).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -167,18 +181,41 @@ fn extract_single_predicate(path: &PropertyPathExpression) -> Result<String, Spa
 }
 
 /// Fetch all (subject, object) pairs for a given predicate from storage.
+///
+/// The scan STREAMS: partitions arrive one at a time from
+/// [`WritePath::range_read_stream_all`] and only the matching `(subject,
+/// object)` pairs are retained, so the whole table is never materialized.
+///
+/// BFS closure is a blocking operator — it cannot emit a reachable node before
+/// it has seen the edges that reach it — so the adjacency list it walks IS
+/// buffered. That buffer is bounded by [`ExecutionLimits::max_rows`] and
+/// crossing the bound is a loud error, never a silent partial traversal (a
+/// partial adjacency would produce a wrong answer that looks complete).
 async fn fetch_triples_for_predicate(
     graph: &str,
     predicate: &str,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<Vec<(String, String)>, SparqlError> {
     let table_id = triple_store::triples_table_id(graph);
-    let partitions = write_path.range_read(&table_id).await?;
+    let mut partitions = write_path.range_read_stream_all(&table_id, 0).await?;
 
     let mut pairs = Vec::new();
-    for partition in &partitions {
-        let subject = crate::executor::extract_subject_from_key(partition);
+    let mut rows_read: usize = 0;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition?;
+        let subject = crate::executor::extract_subject_from_key(&partition);
         for row in &partition.rows {
+            rows_read += 1;
+            if rows_read > limits.max_rows {
+                return Err(SparqlError::Execution(format!(
+                    "property path over <{predicate}> read more than {} storage rows. \
+                     A partial adjacency would yield a wrong reachability answer that \
+                     looks complete, so this fails instead of truncating — constrain the \
+                     path or raise the engine's max_rows bound.",
+                    limits.max_rows
+                )));
+            }
             let pred = crate::executor::clustering_component(&row.clustering, 0);
             if pred == predicate {
                 let obj = crate::executor::clustering_component(&row.clustering, 1);

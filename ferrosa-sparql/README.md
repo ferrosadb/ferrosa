@@ -55,9 +55,53 @@ LIMIT/OFFSET) → **shape** (ASK boolean / CONSTRUCT+DESCRIBE graph assembly in
 
 Each triple pattern is planned into the cheapest storage access it can prove:
 `SubjectLookup` (point read on the partition key) when the subject is bound,
-`PredicateScan`/`FullScan` (range read) otherwise, `ObjectScan` (secondary index
-on `object`, falling back to range scan) when only the object is bound, or
-`PropertyPath` (BFS) for closure operators.
+`PredicateScan`/`FullScan` (streaming range read) otherwise, `ObjectScan`
+(secondary index on `object`, falling back to a streaming range scan) when only
+the object is bound, or `PropertyPath` (BFS) for closure operators. The access
+path is only a *pushdown*: every constant in the triple pattern is enforced
+again when a row is bound, so choosing a path on one constant never discards
+another.
+
+### Scans stream, and the bound is real
+
+Range scans pull **one partition at a time** from
+`WritePath::range_read_stream_all` — the same streaming primitive the CQL path
+uses — decode each row, filter it, and bind it immediately. No intermediate
+`Vec` of fetched triples exists, so the memory a scan costs is one partition
+rather than the table. `SELECT * WHERE { ?s ?p ?o }` no longer materializes the
+whole triple store.
+
+`SparqlConfig::max_rows` (default `100_000`) is the engine's single row bound.
+It is enforced in two places, both real:
+
+- **at the source** — storage rows read by a scan, counted as they arrive;
+- **at each operator** — solutions buffered by a pattern, counted as appended.
+
+Crossing either returns `SparqlError::Execution`. **Nothing is silently
+truncated**: a clipped result reported as complete is indistinguishable from a
+correct short one, which is worse than a failure. This replaces the former
+`SCAN_ROW_CAP` constant, which only logged "scan results truncated at row cap"
+*after* the whole table had already been materialized and truncated nothing, and
+the former `SparqlConfig::max_results` field, which nothing read.
+
+`LIMIT` is pushed **into** the scan — the scan stops after `offset + limit`
+solutions — whenever that is provably safe: exactly one triple pattern, and no
+`ORDER BY`, `DISTINCT`, `FILTER`, or `CONSTRUCT`/`DESCRIBE` above it. Those
+operators either block (they must see every solution before emitting one) or
+drop rows after binding (so stopping early would return too few), and in each
+case the scan runs to completion under the bound instead. `ASK` is planned with
+`LIMIT 1`, so it terminates on the first match.
+
+### What is and is not bounded
+
+| Path | Status |
+|------|--------|
+| Single-pattern scan (`FullScan`, `PredicateScan`, `ObjectScan` fallback) | **Streamed and bounded.** One partition resident; `max_rows` enforced at the source. |
+| `SubjectLookup` point read | **Bounded** by one partition, by construction. |
+| `LIMIT`/`OFFSET`/`ASK` over a single pattern | **Bounded by the query**; the scan stops at `offset + limit`. |
+| `ORDER BY` / `DISTINCT` buffers | **Bounded, fail-loud.** They may buffer (both are blocking) but cannot exceed `max_rows`. |
+| Property-path adjacency (BFS) | **Streamed read, bounded buffer.** BFS is blocking, so the adjacency list is buffered; past `max_rows` it errors rather than traversing a partial graph. |
+| Multi-pattern join intermediates | **Bounded, NOT pipelined.** The nested-loop join still rebuilds a materialized solution set per pattern, so peak memory for a multi-pattern BGP is set by the intermediates, not by the scan. They are capped at `max_rows` and fail loud past it; pipelining the join is a separate redesign (FMEA SP-6). |
 
 ## Public API (key entry points)
 
@@ -66,7 +110,7 @@ on `object`, falling back to range scan) when only the object is bound, or
 | Engine | `SparqlEngine::{new, execute, execute_update}`, `SparqlConfig`, `SparqlResult`, `ConstructedTriple` |
 | HTTP | `start_sparql_http`, `build_router` (internal), `SparqlHttpConfig`, `AppState` |
 | Planner | `plan_query`, `plan_where`, `QueryPlan`, `TripleOp`, `GraphQueryMode`, `OrderCondition` |
-| Executor | `execute`, `execute_bindings`, `extract_subject_from_key`, `clustering_component` |
+| Executor | `execute`, `execute_bindings`, `ExecutionLimits`, `DEFAULT_MAX_ROWS`, `extract_subject_from_key`, `clustering_component` |
 | Update | `execute_update`, `UpdateResult` |
 | Triple store | `rdf_triples_schema`, `triples_table_id`, `partition_key`, `RdfTriple`, `ObjectType` |
 | Results | `SparqlJsonResults`, `Binding`, `SparqlAskResult`, `ResultFormat` |
@@ -76,8 +120,11 @@ on `object`, falling back to range scan) when only the object is bound, or
 
 **Calls** (ferrosa crates this depends on):
 
-- **`ferrosa-cluster`** — `write_path::WritePath` for all reads
-  (`read`, `range_read`, `index_read`) on the query/path side.
+- **`ferrosa-cluster`** — `write_path::WritePath` for all reads on the
+  query/path side: `read` (point), `index_read` (keyed), and
+  `range_read_stream_all` (streaming scan). The `Vec`-returning `range_read` is
+  **not** used and a unit tripwire (`sparql_scans_never_call_a_materializing_range_read`)
+  fails the build if it is reintroduced.
 - **`ferrosa-storage`** — `engine::StorageEngine` (`write`, `register_table`) for
   the UPDATE write/tombstone path; `TableId`.
 - **`ferrosa-common`** — `CellValue`, `DecoratedKey`/`PartitionKey`, schema
@@ -88,8 +135,9 @@ on `object`, falling back to range scan) when only the object is bound, or
 - **`ferrosa-schema`** — `Schema` carried in `AppState`.
 
 External: `spargebra`, `sparesults`, `oxrdf` (all with `sparql-12`/`rdf-12`),
-`axum`, `tokio`, `tower-http`, `serde`/`serde_json`, `serde_urlencoded`,
-`base64` (declared, currently unused), `uuid`, `tracing`.
+`axum`, `tokio`, `futures` (`StreamExt` over the partition stream), `tower-http`,
+`serde`/`serde_json`, `serde_urlencoded`, `base64` (declared, currently unused),
+`uuid`, `tracing`.
 
 **Called by** (crates that depend on this):
 
@@ -97,11 +145,27 @@ External: `spargebra`, `sparesults`, `oxrdf` (all with `sparql-12`/`rdf-12`),
 
 ## Tests
 
-110 tests: 79 in-crate unit tests (executor 21, planner 14, property_path 11,
-results 11, engine 8, filter 7, plus rdf_star/update/triple_store/namespace) and
-31 integration tests (`sparql_m3_completeness` 14, `sparql_update_s02_mgmt` 11,
-`sparql_update_pattern_delete` 6). Coverage gaps — OPTIONAL, real UNION
-semantics, auth, property-path cost — are tracked in
+83 in-crate unit tests plus 5 integration suites.
+
+**Invariant suites** — these drive `executor::execute` END TO END (a real
+`QueryPlan` from the real planner, a real `WritePath` over a temp
+`StorageEngine`, real rows written by `INSERT DATA`) and assert what MUST be
+true of a SPARQL engine, rather than describing what the code currently does:
+
+- `tests/sparql_executor_invariants.rs` — constant-term enforcement in every
+  position, read-path agreement between a point lookup and a full scan, delete
+  honesty, LIMIT/OFFSET totality over any `usize`, DISTINCT exactness.
+  **4 of these currently FAIL** against t_af4eb9f0; see
+  [specs/fmea.md](specs/fmea.md) SP-11.
+- `tests/sparql_scan_bound_invariants.rs` (10) — completeness (complete result
+  or an error, never a silent truncation) and boundedness (`LIMIT n` does not
+  read the whole table), asserted without timing by setting `max_rows` below the
+  table size so "did this read everything?" is directly observable.
+
+**Behavioural suites**: `sparql_m3_completeness` (14),
+`sparql_update_s02_mgmt` (11), `sparql_update_pattern_delete` (6).
+
+Coverage gaps — OPTIONAL, real UNION semantics, auth, join cost — are tracked in
 [specs/fmea.md](specs/fmea.md).
 
 ## Specs

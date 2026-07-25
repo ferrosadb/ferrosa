@@ -2654,6 +2654,7 @@ dependencies = [
  "ferrosa-schema",
  "ferrosa-sstable",
  "ferrosa-storage",
+ "futures",
  "oxrdf",
  "serde",
  "serde_json",

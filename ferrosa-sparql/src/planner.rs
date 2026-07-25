@@ -536,7 +536,13 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<Triple
     } else if object_bound {
         let object = match &tp.object {
             TermPattern::NamedNode(n) => n.as_str().to_string(),
-            TermPattern::Literal(l) => l.to_string(),
+            // The object column stores the BARE lexical form of a literal
+            // (`update::write_triple` writes `Literal::value()`), so the scan
+            // key must be the lexical form too. `Literal::to_string()` is the
+            // N-Triples *serialization* (`"beta"`, quoted, possibly with a
+            // `^^<datatype>` suffix) and never equals a stored object, which
+            // made every literal-object pattern match nothing (t_c3a2d3e4).
+            TermPattern::Literal(l) => l.value().to_string(),
             _ => unreachable!(),
         };
         TripleOp::ObjectScan { graph, object }
