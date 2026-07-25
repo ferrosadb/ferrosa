@@ -432,6 +432,30 @@ fn max_subscriptions() -> usize {
         .unwrap_or(DEFAULT_MAX_SUBSCRIPTIONS)
 }
 
+/// Spill backend backing the graph executor's unbounded ORDER BY: reserves a
+/// cancellable temp-sort directory from the storage engine, exactly as the CQL
+/// ORDER BY path does. The returned reservation's `Drop` removes the directory,
+/// so an aborted or cancelled query cleans up like a successful one.
+struct StorageEngineSpill {
+    storage: Arc<StorageEngine>,
+}
+
+impl std::fmt::Debug for StorageEngineSpill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StorageEngineSpill")
+    }
+}
+
+impl crate::executor::spill::SpillReserver for StorageEngineSpill {
+    fn reserve(
+        &self,
+        label: &str,
+    ) -> ferrosa_common::Result<ferrosa_storage::TempSortTableReservation> {
+        self.storage
+            .reserve_order_by_temp_sort_table("graph", label)
+    }
+}
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
@@ -511,10 +535,19 @@ impl GraphEngine {
         schema: Arc<Schema>,
         storage: Arc<StorageEngine>,
         write_path: Arc<ArcSwap<WritePath>>,
-        config: GraphEngineConfig,
+        mut config: GraphEngineConfig,
         reconciliation_interval: std::time::Duration,
         schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
     ) -> Self {
+        // Give the executor a spill backend so an unbounded ORDER BY sorts
+        // through the storage engine's bounded external merge sort instead of
+        // being capped in memory (t_4ce82a3e). Only set when the caller left it
+        // unset, so an explicit override (tests) still wins.
+        if config.spill.is_none() {
+            config.spill = Some(Arc::new(StorageEngineSpill {
+                storage: Arc::clone(&storage),
+            }));
+        }
         // Adjacency-keyspace registration is done lazily on the first
         // graph query that touches the keyspace (see
         // `ensure_adjacency_storage_for_keyspace`), so the constructor
