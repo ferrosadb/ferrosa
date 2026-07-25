@@ -283,7 +283,7 @@ async fn handle_query(State(state): State<AppState>, req: Request<Body>) -> Resp
                 status = "Ok",
                 "graph query completed"
             );
-            Json(result).into_response()
+            stream_graph_result(result)
         }
         Err(ref e) => {
             let status_str = match e {
@@ -455,6 +455,87 @@ async fn handle_subscribe(State(state): State<AppState>, req: Request<Body>) -> 
 
 /// Build an SSE stream that yields the initial snapshot followed by
 /// periodic re-executions of the query.
+/// Serialize a [`GraphResult`] into a STREAMING chunked response body instead of
+/// `Json(result)`.
+///
+/// `Json` serializes the whole result into one contiguous buffer before writing
+/// a byte — for a large result that is a second full copy of the data on top of
+/// the rows themselves, at peak. This emits the identical JSON
+/// (`{"columns":…,"rows":[…],"stats":…}`, same field order as the derive) one
+/// row at a time, so the serialized form is never fully resident and the client
+/// starts receiving data immediately (t_4ce82a3e inc 7).
+///
+/// SCOPE: this removes the serialization copy, not the row buffer — `result`
+/// still owns every row. Ending server-side buffering needs `execute()` to
+/// return a `RowStream`, which is tracked separately.
+///
+/// A row that fails to serialize aborts the body with an error rather than
+/// silently emitting truncated JSON — a partial body that parses would be worse
+/// than a broken connection.
+fn stream_graph_result(result: crate::executor::GraphResult) -> Response {
+    use futures::stream::StreamExt as _;
+
+    let crate::executor::GraphResult {
+        columns,
+        rows,
+        stats,
+    } = result;
+
+    let head = match serde_json::to_string(&columns) {
+        Ok(cols) => format!("{{\"columns\":{cols},\"rows\":["),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("encode columns: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let tail = match serde_json::to_string(&stats) {
+        Ok(st) => format!("],\"stats\":{st}}}"),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("encode stats: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let body_stream = futures::stream::once(async move { Ok::<_, std::io::Error>(head) })
+        .chain(
+            futures::stream::iter(rows.into_iter().enumerate()).map(|(i, row)| {
+                let mut chunk = String::new();
+                if i > 0 {
+                    chunk.push(',');
+                }
+                match serde_json::to_string(&row) {
+                    Ok(encoded) => {
+                        chunk.push_str(&encoded);
+                        Ok(chunk)
+                    }
+                    // Fail loud: abort the body rather than emit truncated-but-parsable JSON.
+                    Err(e) => Err(std::io::Error::other(format!("encode row {i}: {e}"))),
+                }
+            }),
+        )
+        .chain(futures::stream::once(async move {
+            Ok::<_, std::io::Error>(tail)
+        }));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("build response: {e}") })),
+            )
+                .into_response()
+        })
+}
+
 fn make_subscribe_stream(
     engine: Arc<GraphEngine>,
     query: String,
@@ -732,6 +813,51 @@ pub async fn start_graph_disabled_http(config: &GraphHttpConfig) -> crate::error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streamed body MUST be byte-identical to what `Json(result)` produced,
+    /// or every existing client breaks on a change that was supposed to be pure
+    /// plumbing. Field order, separators, and escaping all have to match serde's
+    /// own output, so this asserts against serde directly rather than against a
+    /// hand-written expected string that could encode the same mistake twice.
+    #[tokio::test]
+    async fn streamed_body_is_byte_identical_to_json_serialization() {
+        let cases = vec![
+            // Empty: the `rows:[]` separator logic has no element to lean on.
+            vec![],
+            vec![vec![serde_json::json!(1)]],
+            vec![
+                vec![serde_json::json!("a"), serde_json::json!(null)],
+                // Quotes, backslashes, newlines, and non-BMP unicode must escape
+                // exactly as serde escapes them — hand-rolled framing around
+                // serde-encoded rows is where a mismatch would hide.
+                vec![
+                    serde_json::json!("he said \"hi\"\n\\ \u{1f600}"),
+                    serde_json::json!(2.5),
+                ],
+            ],
+        ];
+
+        for rows in cases {
+            let result = crate::executor::GraphResult {
+                columns: vec!["x".to_string(), "y".to_string()],
+                rows,
+                stats: crate::executor::QueryStats::default(),
+            };
+            let expected = serde_json::to_string(&result).expect("serde encodes the result");
+
+            let resp = stream_graph_result(result);
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("streamed body collects");
+
+            assert_eq!(
+                String::from_utf8(got.to_vec()).expect("body is utf8"),
+                expected,
+                "streamed body diverged from Json(result)"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn disabled_router_returns_clear_error_for_all_routes() {
