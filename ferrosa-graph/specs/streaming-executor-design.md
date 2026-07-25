@@ -201,10 +201,43 @@ tripwire enforcing it (`ferrosa-cluster/src/write_path.rs` test: *"unbounded loc
 range reads must be exposed as streams, not collected into `Vec<Partition>`"*).
 The graph executor should end up subject to an equivalent guard.
 
+## 6c. Owner decisions (Ben, 2026-07-25)
+
+Three questions the inventory surfaced, and the answers this work implements:
+
+1. **`max_result_rows` → SPILL, remove the cap.** Today it silently truncates
+   (`break`, no error, no flag) — a client cannot distinguish a partial result
+   from a complete one, which is a fail-loud violation. It does **not** become a
+   `ResourceLimit` error and does **not** get a `truncated` flag: with the
+   spilling sorter (§2) plus streamed transport (§5 inc 7), a large result no
+   longer needs an in-memory bound at all. Remove `max_result_rows` rather than
+   convert it. Applies to `expand.rs:1387`, `varpath.rs:307`, and the
+   `leapfrog.rs` uses.
+
+2. **SUBSCRIBE → CDC-driven push.** Stop the poll-and-diff model
+   (`http.rs:488-524`) that holds previous + current result sets. Drive
+   subscriptions from the change feed so updates are pushed as they happen, with
+   **no previous-result buffer at all**. This is a substantial separable change —
+   tracked as its own task, not folded into this refactor.
+
+3. **`max_fan_out_per_hop` → relax once the frontier streams.** The cap's
+   rationale is the per-hop `Vec`; once the frontier is a stream there is no
+   memory argument for refusing a legitimate high-degree traversal. DoS
+   protection falls to the **query timeout** instead. Keep the cap only until the
+   frontier actually streams (it still guards the current `next_states` Vec), then
+   remove it with the Vec.
+
+The through-line: prefer removing a bound over converting it into an error, when
+streaming or spilling makes the bound unnecessary.
+
 ## 7. Non-goals / risks
 
-- Not changing query semantics, result ordering, or the traversal DoS caps
-  (`max_fan_out_per_hop`, `max_var_path_visited`, `max_results`).
+- Not changing query semantics or result ordering.
+- Caps are **not** preserved for their own sake — per §6c, `max_result_rows` is
+  removed (spill instead) and `max_fan_out_per_hop` is removed once the frontier
+  streams (timeout becomes the DoS control). `max_var_path_visited` /
+  `max_results` remain for now: they bound *traversal work*, not result
+  buffering, and are revisited with increment 6.
 - ORDER BY without LIMIT and global Aggregate are pipeline-breakers — they must
   see their whole input. Streaming does not remove that, but per §2 the answer is
   to **spill** (reusing the CQL `ExternalSorter` + `TempSortTableReservation`
