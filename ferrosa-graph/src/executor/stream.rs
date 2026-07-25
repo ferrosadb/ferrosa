@@ -5,9 +5,10 @@
 //!   byte — so an operator can be converted to streaming without any observable
 //!   behavior change.
 //! Last revised: 2026-07-25
-//! Last changed: New module — increment 1 of the streaming executor
-//!   (t_4ce82a3e, specs/streaming-executor-design.md). Scaffold only: the row
-//!   stream type + the collect bridge. No operator is streaming yet.
+//! Last changed: Added `chain_streams` — the `UNION ALL` concatenation operator
+//!   used by `expand::execute_streaming` (t_4ce82a3e,
+//!   specs/streaming-executor-design.md increment 2). The row stream type and
+//!   the collect bridges landed in increment 1.
 //!
 //! # Why
 //!
@@ -104,12 +105,89 @@ pub fn stream_from_rows<'a>(rows: Vec<RowVals>) -> RowStream<'a> {
     Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
 }
 
+/// Concatenate row streams end to end, in order.
+///
+/// This is `UNION ALL`: arm order is result order, duplicates are kept. Unlike
+/// the materializing form (`rows.extend(arm_rows)` per arm) it never builds the
+/// concatenated `Vec`, and it never polls a later arm until every earlier arm is
+/// drained — so a downstream `take(k)` stops at whichever arm supplies row `k`.
+///
+/// `UNION` *without* `ALL` is deliberately NOT this function: its `HashSet`
+/// dedup spans the whole concatenation, which is a pipeline breaker.
+pub fn chain_streams<'a>(streams: Vec<RowStream<'a>>) -> RowStream<'a> {
+    streams.into_iter().fold(
+        Box::pin(futures::stream::empty()) as RowStream<'a>,
+        |acc, next| Box::pin(acc.chain(next)) as RowStream<'a>,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn row(n: i64) -> RowVals {
         vec![serde_json::json!(n)]
+    }
+
+    #[tokio::test]
+    async fn chain_streams_concatenates_in_arm_order() {
+        // `UNION ALL` is concatenation: arm order is result order.
+        let chained = chain_streams(vec![
+            stream_from_rows(vec![row(1), row(2)]),
+            stream_from_rows(vec![]),
+            stream_from_rows(vec![row(3)]),
+        ]);
+        assert_eq!(
+            collect_rows(chained).await.unwrap(),
+            vec![row(1), row(2), row(3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_streams_of_nothing_is_empty() {
+        assert!(collect_rows(chain_streams(vec![]))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The incrementality property for the converted `UNION ALL`: pulling `k`
+    /// rows pulls them from the earliest arms only — a later arm is never
+    /// polled. Same shape as `limit_short_circuits_upstream_production`: assert
+    /// on how many items each source actually produced.
+    #[tokio::test]
+    async fn chain_streams_does_not_pull_later_arms_early() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+
+        let c1 = first.clone();
+        // An "infinite" first arm: a materializing UNION could never terminate.
+        let arm1: RowStream<'_> = Box::pin(futures::stream::repeat_with(move || {
+            c1.fetch_add(1, Ordering::SeqCst);
+            Ok(row(1))
+        }));
+        let c2 = second.clone();
+        let arm2: RowStream<'_> = Box::pin(futures::stream::repeat_with(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Ok(row(2))
+        }));
+
+        let limited: RowStream<'_> = Box::pin(chain_streams(vec![arm1, arm2]).take(3));
+        assert_eq!(collect_rows(limited).await.unwrap(), vec![row(1); 3]);
+
+        assert_eq!(
+            first.load(Ordering::SeqCst),
+            3,
+            "the first arm must produce only the rows actually pulled"
+        );
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            0,
+            "a later UNION ALL arm must not be polled before the earlier arms are drained"
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,16 @@ resolved port.
 - **Expand executor** (`executor/expand.rs`) — anchor lookup, per-hop adjacency
   reads, property evaluation, aggregation, write clauses; honors DoS limits
   (`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`).
+- **Streaming entry point** (`executor/stream.rs`, `executor/expand.rs`) —
+  `execute_streaming()` returns `(columns, RowStream<'a>, QueryStats)`;
+  `execute()` is a thin `collect` over it, so there is one executor, not two.
+  Additive scaffold: only `Subscribe`, `Union { all: true }` (concatenated with
+  `chain_streams`) and `ReturnOnly` genuinely stream today. Every other variant
+  computes the buffered `GraphResult` and is wrapped with `stream_from_rows`, so
+  behavior is unchanged for every query. `UNION` without `ALL` (whole-result
+  dedup) and `DELETE` (two passes over the matched rows — validate, then
+  tombstone) are deliberately excluded. See
+  `specs/streaming-executor-design.md` §5 for the increment status.
 - **Label-agnostic expansion** (`executor/expand.rs`) — traversals may omit the
   relationship type and/or the target-node label (`(a)-[r]->(n)`, `(a)<-[r]-(n)`,
   `-[r:T]->(n)`, `-[r]->(n:L)`). When a hop lacks a plan-time edge or vertex
