@@ -991,112 +991,112 @@ expires = "2026-10-01"
 [[allow]]
 path = "ferrosa-graph/src/adjacency/observer.rs"
 rule = "with-capacity-limit"
-reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: capacity is the partition-key/clustering component count (schema arity, ~1-5), not result size."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/adjacency/reconcile.rs"
 rule = "clone-on-row-data"
-reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row cloned per single-mutation write(); never accumulated."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/adjacency/reconcile.rs"
 rule = "materializing-range-read-call-site"
-reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
 owner = "storage"
-expires = "2026-10-01"
+expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/bolt/codec.rs"
 rule = "with-capacity-limit"
-reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED for query data: one Bolt frame's element count, not query-sized. NOTE the wire-declared count is a pre-auth allocation-amplification issue tracked separately as t_3e665492."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/bolt/server.rs"
 rule = "copies-row-data-arg"
-reason = "t_a49d88c3: pre-existing copies-row-data-arg in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: extend is guarded by the explicit fail-loud max_message_size check at server.rs:627."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/engine.rs"
 rule = "cloned-stream-elements"
-reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: copies an already-materialized GraphResult, bounded by config.max_result_rows."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "clone-on-row-data"
-reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: a single row per write(), reused after the clone."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "cloned-stream-elements"
-reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: row.get(idx).cloned()/.copied() over an Option is one cell, not a stream chain."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "materializing-range-read-call-site"
-reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
 owner = "storage"
-expires = "2026-10-01"
+expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "returns-vec-partition-or-row"
-reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_250fa355; delete this entry when the call site streams."
 owner = "storage"
-expires = "2026-10-01"
+expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "stream-push-accumulation"
-reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: streaming SET/REMOVE loops consume rows one at a time; push targets a per-column assignment vec sized by SET-clause arity, not the stream."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
 rule = "with-capacity-limit"
-reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: composite/clustering key component count (schema arity), not result size."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/leapfrog.rs"
 rule = "materializing-range-read-call-site"
-reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
 owner = "storage"
-expires = "2026-10-01"
+expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/stream.rs"
 rule = "stream-push-accumulation"
-reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: collect_to_graph_result breaks at max_rows. collect_rows is uncapped BY DESIGN (the caller bounds the stream so the limit stops upstream production); its 3 production callers are under verification in t_daf898e1."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/varpath.rs"
 rule = "materializing-range-read-call-site"
-reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
 owner = "storage"
-expires = "2026-10-01"
+expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/http.rs"
 rule = "clone-on-row-data"
-reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: SUBSCRIBE delta snapshot is one result copy bounded by config.max_result_rows, replaced each tick rather than accumulated."
 owner = "storage"
 expires = "2026-10-01"
 
@@ -1124,21 +1124,21 @@ expires = "2026-10-01"
 [[allow]]
 path = "ferrosa-sparql/src/executor.rs"
 rule = "clone-in-scan-closure"
-reason = "t_a49d88c3: pre-existing clone-in-scan-closure in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: per-row projection copy, bounded by projection arity x the LIMIT window."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-sparql/src/executor.rs"
 rule = "server-side-result-cap"
-reason = "t_a49d88c3: pre-existing server-side-result-cap in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: NOT A SILENT CAP: crossing max_rows raises SparqlError::Execution — a loud error, never a truncation. It is a fail-loud resource bound that PREVENTS OOM. The genuine streaming work (pipelining the nested-loop join) is separate."
 owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-sparql/src/property_path.rs"
 rule = "stream-push-accumulation"
-reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+reason = "t_a49d88c3 TRIAGED: BOUNDED: the scan streams; the pairs buffer is bounded by max_rows with a loud error. A BFS transitive closure must buffer."
 owner = "storage"
 expires = "2026-10-01"
 
