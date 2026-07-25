@@ -168,7 +168,7 @@ pub async fn execute(
             var,
             with_pipeline,
             return_clause,
-        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start),
+        } => execute_unwind(&expr, &var, with_pipeline.as_ref(), &return_clause, start).await,
         PhysicalPlan::ReturnOnly { return_clause } => execute_return_only(&return_clause, start),
         PhysicalPlan::Expand {
             anchor,
@@ -916,7 +916,7 @@ fn execute_return_only(return_clause: &ReturnClause, start: Instant) -> Result<G
     })
 }
 
-fn execute_unwind(
+async fn execute_unwind(
     expr: &Expr,
     var: &str,
     with_pipeline: Option<&WithPipeline>,
@@ -947,22 +947,49 @@ fn execute_unwind(
     }
 
     let columns = build_columns(return_clause);
-    let mut rows = Vec::new();
-    for state in &states {
-        rows.push(
-            return_clause
+
+    // ORDER BY must see every row before any row is final, so it stays a
+    // pipeline-breaker over the (bounded) UNWIND list. Without it, projection
+    // and LIMIT stream: rows are produced lazily and `take(limit)` stops pulling
+    // — no full projection followed by a truncate (t_4ce82a3e increment 2).
+    let rows = if return_clause.order_by.is_empty() {
+        use futures::StreamExt as _;
+        let limit = return_clause
+            .limit
+            .map(|l| l.max(0) as usize)
+            .unwrap_or(usize::MAX);
+        let projected = futures::stream::iter(states.iter()).map(|state| {
+            Ok(return_clause
                 .items
                 .iter()
                 .map(|item| {
                     eval::eval_expr(&item.expr, &state.bindings).unwrap_or(serde_json::Value::Null)
                 })
-                .collect::<Vec<_>>(),
-        );
-    }
-    sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
-    if let Some(limit) = return_clause.limit {
-        rows.truncate(limit.max(0) as usize);
-    }
+                .collect::<Vec<_>>())
+        });
+        let stream: crate::executor::stream::RowStream<'_> = Box::pin(projected.take(limit));
+        crate::executor::stream::collect_rows(stream).await?
+    } else {
+        let mut rows = Vec::new();
+        for state in &states {
+            rows.push(
+                return_clause
+                    .items
+                    .iter()
+                    .map(|item| {
+                        eval::eval_expr(&item.expr, &state.bindings)
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        sort_projected_rows_by_bindings(&mut rows, &states, return_clause);
+        if let Some(limit) = return_clause.limit {
+            rows.truncate(limit.max(0) as usize);
+        }
+        rows
+    };
+
     Ok(GraphResult {
         columns,
         rows,
@@ -7077,6 +7104,51 @@ mod tests {
         let result =
             compare_json_values(Some(&serde_json::json!(10)), Some(&serde_json::json!(20)));
         assert_eq!(result, std::cmp::Ordering::Less);
+    }
+
+    /// UNWIND's unsorted path now projects through a `RowStream` and applies
+    /// LIMIT as `take(k)` (t_4ce82a3e increment 2). This drives the real
+    /// executor fn to prove the conversion preserves behavior: LIMIT yields
+    /// exactly k rows, in list order, and the un-limited query returns all.
+    #[tokio::test]
+    async fn unwind_streaming_limit_yields_exactly_k_rows_in_order() {
+        use crate::parser::{Expr, Literal, ReturnClause, ReturnItem};
+
+        let list = Expr::List(
+            (1..=5)
+                .map(|i| Expr::Literal(Literal::Integer(i * 10)))
+                .collect(),
+        );
+        let items = vec![ReturnItem {
+            expr: Expr::Var("x".to_string()),
+            alias: None,
+        }];
+
+        let limited = ReturnClause {
+            items: items.clone(),
+            distinct: false,
+            order_by: Vec::new(),
+            limit: Some(2),
+        };
+        let res = execute_unwind(&list, "x", None, &limited, Instant::now())
+            .await
+            .expect("unwind with limit");
+        assert_eq!(
+            res.rows,
+            vec![vec![serde_json::json!(10)], vec![serde_json::json!(20)]],
+            "LIMIT 2 must yield the first two list elements, in order"
+        );
+
+        let unlimited = ReturnClause {
+            items,
+            distinct: false,
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let res = execute_unwind(&list, "x", None, &unlimited, Instant::now())
+            .await
+            .expect("unwind without limit");
+        assert_eq!(res.rows.len(), 5, "no LIMIT must yield every element");
     }
 
     #[test]

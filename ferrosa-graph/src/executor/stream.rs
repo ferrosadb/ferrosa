@@ -80,6 +80,21 @@ pub async fn collect_to_graph_result(
     })
 }
 
+/// Drain a [`RowStream`] into its rows.
+///
+/// The un-wrapped half of [`collect_to_graph_result`], for callers that build
+/// the `GraphResult` themselves. The stream's own `take`/`Limit` is what bounds
+/// this — there is no separate cap here, so a caller relying on a row cap must
+/// express it in the stream (e.g. `.take(limit)`), which is the point: the limit
+/// stops upstream production instead of truncating a materialized Vec.
+pub async fn collect_rows(mut rows_stream: RowStream<'_>) -> Result<Vec<RowVals>> {
+    let mut rows = Vec::new();
+    while let Some(row) = rows_stream.next().await {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
 /// Build a [`RowStream`] from an already-materialized set of rows.
 ///
 /// The adapter used while converting callers: a not-yet-streaming operator can
