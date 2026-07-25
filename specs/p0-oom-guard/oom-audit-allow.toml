@@ -860,3 +860,382 @@ symbol = "split_sorted_partitions_into_shards"
 reason = "re-chunks an already-materialized, flush-threshold-bounded Vec<Partition> into disjoint per-shard owned Vecs for parallel rayon SSTable encode; no new scan materialization, owned chunks inherent to cross-thread hand-off."
 owner = "bkearns"
 expires = "2027-07-01"
+
+# ---------------------------------------------------------------------------
+# Group 3 — baseline for crates that entered audit scope in t_2487eeb7
+#
+# `AUDIT_CRATES` went from 6 crates to 15, and the `returns-vec-partition-or-row`
+# rule gained the `Vec<VirtualRow>` shape. Together those surfaced 82 findings.
+# They are PRE-EXISTING materialization that the gate simply could not see — not
+# new regressions introduced by this change.
+#
+# These entries are deliberately marked NOT INDIVIDUALLY TRIAGED. They do not
+# assert the sites are safe; they record that the gate now sees them and that
+# classification is owed. The expiry is short (2026-10-01) so they fail the gate
+# rather than becoming a permanent rubber stamp. Triage is forge t_a49d88c3;
+# the one confirmed class-A site is forge t_250fa355.
+# ---------------------------------------------------------------------------
+
+[[allow]]
+path = "ferrosa-cql/src/observability.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing collect-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/observability.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/active_queries.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/alerts.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/billing.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/connections.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/consolidation_status.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/full_scan_reasons.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/index_usage.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/materialization.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/peers_v2.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/query_fingerprints.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/rrd_runtime_settings.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/stubs.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/table_access.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-cql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-flight/src/convert.rs"
+rule = "cqlvalue-row-accumulation"
+reason = "t_a49d88c3: pre-existing cqlvalue-row-accumulation in ferrosa-flight, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/observer.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/reconcile.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/reconcile.rs"
+rule = "materializing-range-read-call-site"
+reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/bolt/codec.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/bolt/server.rs"
+rule = "copies-row-data-arg"
+reason = "t_a49d88c3: pre-existing copies-row-data-arg in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/engine.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "materializing-range-read-call-site"
+reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/leapfrog.rs"
+rule = "materializing-range-read-call-site"
+reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/stream.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/varpath.rs"
+rule = "materializing-range-read-call-site"
+reason = "t_a49d88c3: pre-existing materializing-range-read-call-site in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/http.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-graph, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-postgres/src/catalog.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing collect-vec-partition-or-row in ferrosa-postgres, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-postgres/src/storage_provider.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-postgres, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-schema/src/system/aggregate_tables.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-schema, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/executor.rs"
+rule = "clone-in-scan-closure"
+reason = "t_a49d88c3: pre-existing clone-in-scan-closure in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/executor.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3: pre-existing server-side-result-cap in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/property_path.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3: pre-existing stream-push-accumulation in ferrosa-sparql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sql/src/exec.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-sql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sql/src/plan.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing collect-vec-partition-or-row in ferrosa-sql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sql/src/plan.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-sql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sql/src/provider.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-sql, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "copies-row-data-arg"
+reason = "t_a49d88c3: pre-existing copies-row-data-arg in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3: pre-existing server-side-result-cap in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3: pre-existing with-capacity-limit in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/trie/walker.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3: pre-existing server-side-result-cap in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/writer.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3: pre-existing clone-on-row-data in ferrosa-sstable, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-storage/src/index/virtual_table.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-storage, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-storage/src/virtual_tables.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3: pre-existing returns-vec-partition-or-row in ferrosa-storage, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-view/src/delta.rs"
+rule = "clone-in-scan-closure"
+reason = "t_a49d88c3: pre-existing clone-in-scan-closure in ferrosa-view, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-view/src/delta.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3: pre-existing cloned-stream-elements in ferrosa-view, surfaced when the crate entered audit scope (t_2487eeb7). NOT individually triaged — bounded-vs-unbounded still unknown."
+owner = "storage"
+expires = "2026-10-01"
