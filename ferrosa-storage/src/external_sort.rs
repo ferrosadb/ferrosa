@@ -566,7 +566,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The point of the generic-ification (t_4ce82a3e): a FOREIGN row type with
     /// its OWN comparator reuses the spill/merge machinery and gets that
     /// comparator's ordering — not `CqlValue`'s. Models the graph executor's
