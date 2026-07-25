@@ -69,16 +69,37 @@ flowchart TD
 ```
 
 ### Layer 1 — Static AST audit (`cargo xtask p0-oom-audit`)
-New `xtask` crate (none exists today). Uses `syn` over `ferrosa-cql`,
-`ferrosa-cluster`, `ferrosa-storage`, `ferrosa-row-bridge`, `ferrosa-net`,
-`ferrosa-index` (the last two carry the streaming pipeline: lane frames and
-scan/FTS hit paths). Fails on:
+New `xtask` crate (none exists today). Uses `syn` over the crates listed in
+`oom_audit::AUDIT_CRATES`. Fails on:
 - a fn whose name contains `stream` returning `Vec<T>`/`Result<Vec<T>>`/Vec-alias;
 - production returns of `Vec<Partition>`/`Vec<Row>` not whitelisted;
 - `Vec::with_capacity(limit)` where `limit` derives from paging/query/user input;
 - `while let Some(x) = stream.next().await { vec.push(x?) }` accumulation;
 - CQL broad-scan call sites invoking `range_read_limited_rows` / `coordinate_*_limited_rows` unwhitelisted.
 Whitelist: `specs/p0-oom-guard/oom-audit-allow.toml` (reason/bound/owner/expiry).
+
+**Coverage is exhaustive by default (2026-07 extension, forge t_2487eeb7).** The
+audited-crate set was originally a hand-maintained list, which made coverage
+opt-in — and opt-in coverage rots. `ferrosa-graph` and `ferrosa-sparql` both grew
+query-sized serving paths, and shipped real materialization OOMs, while sitting
+entirely outside the gate.
+
+Every workspace member must now be either in `AUDIT_CRATES` or in
+`NON_SERVING_CRATES` with the reason it owns no query-sized path. A crate in
+neither set produces an `unclassified-crate` finding, so a newly added crate
+fails the audit instead of silently widening the blind spot. The check runs in
+the binary (not only in unit tests) and treats an unreadable workspace manifest
+as a finding — unknown coverage must never read as a clean run.
+
+The same change taught `returns-vec-partition-or-row` about `Vec<VirtualRow>`.
+`VirtualTable::read` returns a whole table while `visit_rows` streams, and the
+trait docs already tell large/live tables to override the visitor; the rule is
+what holds them to it. That shape alone surfaced 21 findings inside crates the
+gate was *already* auditing.
+
+Known gap: allow entries that omit `symbol` suppress a whole (file, rule) pair,
+so a *new* violation inside an already-allowlisted file is not caught. Tracked
+as forge t_e1d5f83c; baseline triage is forge t_a49d88c3.
 
 **Move-based-streaming Clone/Copy rules (2026-07 extension).** The original
 `clone-on-row-data` matched only literal `partition/rows/cells` receivers; six
