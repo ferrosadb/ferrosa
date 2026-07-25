@@ -5240,7 +5240,7 @@ pub fn sort_rows(
 }
 
 /// Compare two JSON values for sorting purposes.
-fn compare_json_values(
+pub(super) fn compare_json_values(
     a: Option<&serde_json::Value>,
     b: Option<&serde_json::Value>,
 ) -> std::cmp::Ordering {
