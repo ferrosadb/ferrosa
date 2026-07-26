@@ -2398,6 +2398,7 @@ name = "ferrosa-graph"
 version = "0.17.0"
 dependencies = [
  "arc-swap",
+ "async-stream",
  "async-trait",
  "axum 0.8.9",
  "axum-server",
