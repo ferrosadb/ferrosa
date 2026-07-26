@@ -78,8 +78,15 @@ error-frame encoding is worth fixing (tracked separately).
   coordinator isolation, and 200 ms latency. It does **not** cover other fault
   schedules or **dual-DC** certification (`certify-dc.sh` remains gated on
   cross-DC replication).
-- The Elle checker is **not** wired into CI; CI checks the bank conservation
-  invariant nightly. This certification is a **manual, reproducible** run.
+- The Elle checker **is** wired into CI:
+  `.github/workflows/elle-strict-serializable-nightly.yml` runs both the
+  fault-free and nemesis certifications nightly (and on PRs touching the cert
+  files) against a 3-node RF=3 compose cluster
+  (`ferrosa-jepsen/tests/docker/elle-cluster-rf3.yml`), opening an issue on
+  failure. The Fly run recorded here remains the **manual, reproducible**
+  reference certification on real multi-host infrastructure — CI covers
+  regression, Fly covers certification.
+  (This line previously read "not wired into CI"; that predated the CI job.)
 
 ## History
 
