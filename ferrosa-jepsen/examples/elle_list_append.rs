@@ -426,3 +426,49 @@ fn decode_int_list(col: Option<&Option<CqlValue>>) -> Vec<i64> {
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_session_dead;
+
+    /// The failure texts that actually dominated a fault-injected run. Each left
+    /// the session unusable, and each was previously NOT reconnected because the
+    /// reconnect was gated on a transaction id existing — which it never does
+    /// when BEGIN is the statement that failed.
+    #[test]
+    fn pool_and_connection_failures_mean_the_session_is_dead() {
+        for why in [
+            "BEGIN: No connections in the pool: The pool is broken; Last connection failed with: Connection broken, reason: ...",
+            "BEGIN: No connections in the pool: The pool is broken; Last connection failed with: Connection refused (os error 61)",
+            "BEGIN: Connection broken, reason: Failed to deserialize frame: Failed to read the frame header: Connection reset by peer",
+            "UPDATE: broken pipe",
+            "READ: connection reset",
+        ] {
+            assert!(is_session_dead(why), "must replace the session for: {why}");
+        }
+    }
+
+    /// Server-side rejections leave the session perfectly usable. Reconnecting on
+    /// these would be actively harmful: rebuilding a session mid-run discards the
+    /// transaction state the pinned-connection model depends on, turning a
+    /// recoverable statement error into a lost transaction.
+    #[test]
+    fn server_side_rejections_do_not_kill_the_session() {
+        for why in [
+            "UPDATE: Database returned an error: Not enough nodes responded to the write request in time to satisfy required consistency",
+            "BEGIN: Database returned an error: The query is syntactically correct but invalid, Error message: nested transactions are not supported",
+            "BEGIN: no txn id in result",
+            "COMMIT: Request execution exceeded a client timeout of 30000ms",
+            "COMMIT: Database returned an error: Internal server error",
+        ] {
+            assert!(!is_session_dead(why), "must NOT replace the session for: {why}");
+        }
+    }
+
+    /// Driver error casing is not a stable contract to depend on.
+    #[test]
+    fn classification_ignores_case() {
+        assert!(is_session_dead("BEGIN: THE POOL IS BROKEN"));
+        assert!(is_session_dead("begin: connection refused"));
+    }
+}
