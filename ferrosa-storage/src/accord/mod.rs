@@ -28,7 +28,8 @@ pub mod write_gate;
 
 pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
 pub use crash_recovery::{
-    CrashRecoveryReplay, ReplayedConflictEntry, ReplayedPhase, ReplayedTxnState,
+    resolve_orphan_intent, CrashRecoveryReplay, OrphanResolution, ReplayedConflictEntry,
+    ReplayedPhase, ReplayedTxnState,
 };
 pub use entries::{AccordAppliedEntry, AccordProtocolEntry};
 pub use protocol_log::ProtocolLog;
