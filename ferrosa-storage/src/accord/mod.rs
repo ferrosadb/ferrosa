@@ -18,6 +18,7 @@
 pub mod conflict_index;
 pub mod crash_recovery;
 pub mod entries;
+pub mod framed_log;
 pub mod oversized_entry;
 pub mod protocol_log;
 pub mod read_2i;
