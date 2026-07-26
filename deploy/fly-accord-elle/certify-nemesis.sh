@@ -265,7 +265,7 @@ inject_restart() {
   # the run to 2 nodes, which is a WEAKER test, not a pass.
   local i
   for i in $(seq 1 30); do
-    if nem "$mid" "timeout 2 sh -c '</dev/tcp/127.0.0.1/9042' && echo UP" 2>/dev/null | grep -q UP; then
+    if nem "$mid" "curl -sf --max-time 3 http://localhost:9090/readyz >/dev/null && echo UP || echo DOWN" 2>/dev/null | grep -q UP; then
       log "node${n} rejoined and is serving CQL after $((i*10))s"
       return 0
     fi
@@ -289,8 +289,19 @@ nemesis_schedule() {
 }
 # Preflight the generator's network path to its target. A bad address here would
 # otherwise waste the whole build+run and yield an empty history.
+#
+# Uses curl against node1's WEB port, not a raw CQL connect, for two reasons the
+# first attempt got wrong:
+#   - `/dev/tcp/host/port` is a BASH builtin, but `nem` runs `sh -lc` and /bin/sh
+#     on debian:trixie-slim is dash — so it fails regardless of connectivity;
+#   - `nem` wraps its argument in single quotes, so any nested single quote ends
+#     the string early and mangles the command.
+# curl is installed in the image and is already the readiness probe `wait_ready`
+# trusts. CQL binds `[::]:9042` with the same wildcard as web's `[::]:9090`, so a
+# reachable web port on the target proves the DNS + cross-node IPv6 path the
+# generator needs.
 log "generator preflight: node2 -> $GEN_TARGET"
-GP="$(nem "$GEN_MID" "timeout 5 sh -c '</dev/tcp/$(dns "$SEED_ID")/9042' && echo GEN_OK || echo GEN_FAIL")"
+GP="$(nem "$GEN_MID" "curl -sf --max-time 5 http://$(dns "$SEED_ID"):9090/readyz >/dev/null && echo GEN_OK || echo GEN_FAIL")"
 log "preflight: $GP"
 [ "$GP" = "GEN_OK" ] || die "generator host cannot reach $GEN_TARGET — aborting before the run rather than producing an empty history"
 
