@@ -54,7 +54,7 @@ OUT_EDN="${OUT_EDN:-${ROOT_DIR}/deploy/fly-accord-elle/elle-fly-history-nemesis.
 # GEN_ARGS was 8/700/8/3 (which produced 5600 ops). Scaled up accordingly; the
 # post-run check below reports whether the generator actually outlasted the
 # schedule, so a too-short run is visible rather than assumed.
-GEN_ARGS="${GEN_ARGS:-8 1800 8 3}"
+GEN_ARGS="${GEN_ARGS:-8 8000 8 3}"
 
 log() { printf '\n[nem-cert] %s\n' "$*" >&2; }
 die() { printf '\n[nem-cert][FATAL] %s\n' "$*" >&2; exit 1; }
@@ -260,18 +260,29 @@ inject_restart() {
   local st
   st="$(flyctl machine status "$mid" --app "$APP" 2>/dev/null | grep -iE '^ *State' | head -1)"
   log "node${n} state after SIGKILL: ${st:-<unknown>}"
+  local t_start t_now
+  t_start=$(date +%s)
   flyctl machine start "$mid" --app "$APP" >/dev/null 2>&1 || log "WARN: start node${n} failed"
-  # Wait for it to accept CQL again. A node that never rejoins silently degrades
-  # the run to 2 nodes, which is a WEAKER test, not a pass.
+  # Wait for it to serve again. A node that never rejoins silently degrades the
+  # run to 2 nodes, which is a WEAKER test, not a pass.
+  #
+  # Timing is measured as REAL elapsed wall-clock, not loop-iteration count. The
+  # first version reported `i*10`, which silently omitted the several seconds
+  # each `flyctl ssh` round-trip costs — so it under-reported, and made two
+  # restarts look like they landed on an identical figure when the instrument
+  # simply lacked the resolution to distinguish them. Rejoin latency is a real
+  # operational property; measure it properly or do not claim it.
   local i
-  for i in $(seq 1 30); do
+  for i in $(seq 1 40); do
     if nem "$mid" "curl -sf --max-time 3 http://localhost:9090/readyz >/dev/null && echo UP || echo DOWN" 2>/dev/null | grep -q UP; then
-      log "node${n} rejoined and is serving CQL after $((i*10))s"
+      t_now=$(date +%s)
+      log "node${n} REJOIN_SECONDS=$((t_now-t_start)) (serving /readyz again; formation_timeout=${FERROSA_FORMATION_TIMEOUT_SECS:-120}s)"
       return 0
     fi
-    sleep 10
+    sleep 5
   done
-  log "WARN: node${n} did NOT rejoin within 300s — the rest of this run is a 2-node cluster; treat any verdict with suspicion"
+  t_now=$(date +%s)
+  log "WARN: node${n} did NOT rejoin within $((t_now-t_start))s — the rest of this run is a 2-node cluster; treat any verdict with suspicion"
 }
 
 nemesis_schedule() {
