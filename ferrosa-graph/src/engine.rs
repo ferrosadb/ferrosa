@@ -27,8 +27,11 @@ use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
 use crate::executor::aggregate::{create_accumulator, is_aggregate_function};
 use crate::executor::eval::eval_expr;
-use crate::executor::expand::{build_columns, execute, sort_rows, GraphEngineConfig};
+use crate::executor::expand::{
+    build_columns, execute, execute_streaming_owned, sort_rows, GraphEngineConfig, OwnedExecCtx,
+};
 use crate::executor::result::{GraphResult, QueryStats};
+use crate::executor::stream::{collect_to_graph_result, stream_from_rows, RowStream};
 use crate::executor::subscribe::SubscriptionRegistry;
 use crate::parser::{
     parse, Assignment, Expr, Literal, Pattern, ReturnClause, ReturnItem, Statement, WithPipeline,
@@ -60,6 +63,16 @@ fn adjacency_keyspace_metadata(
             },
         }
     }
+}
+
+/// Present an already-materialized [`GraphResult`] in the streaming shape.
+///
+/// Every use marks a path that genuinely buffers — FOREACH and `CALL {}` (both
+/// orchestrate many sub-executions), and the missing-label short circuit. Naming
+/// it keeps those honest instead of hiding them behind an inline
+/// `stream_from_rows`.
+fn buffered_as_stream(result: GraphResult) -> (Vec<String>, RowStream<'static>, QueryStats) {
+    (result.columns, stream_from_rows(result.rows), result.stats)
 }
 
 fn replication_needs_repair(replication: &ferrosa_schema::ReplicationParams) -> bool {
@@ -707,6 +720,9 @@ impl GraphEngine {
             .await
     }
 
+    /// Buffered façade over [`GraphEngine::execute_stream_with_params`]: drains
+    /// the row stream into a `GraphResult`. There is one query pipeline, not
+    /// two — this entry point adds only the materialization.
     pub async fn execute_with_params(
         &self,
         query: &str,
@@ -714,11 +730,51 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<GraphResult> {
+        let (columns, rows, stats) = self
+            .execute_stream_with_params(query, keyspace, auth, params)
+            .await?;
+        // `usize::MAX`, deliberately NOT `config.max_result_rows` — matching
+        // `executor::expand::execute`, which has never applied a global cap.
+        collect_to_graph_result(columns, rows, stats, usize::MAX).await
+    }
+
+    /// Execute a query and return its columns, a `'static` row stream, and the
+    /// stats known at that point.
+    ///
+    /// The streaming entry point for transports: the row stream borrows nothing
+    /// from this call, so it can be handed to an HTTP response body that
+    /// outlives the handler frame (see
+    /// [`crate::executor::expand::OwnedExecCtx`]).
+    ///
+    /// # What actually streams
+    ///
+    /// Whatever [`crate::executor::expand::execute_streaming`] streams — today
+    /// `Subscribe`, `UNION ALL`, `RETURN`-only, the `Expand` projection without
+    /// `ORDER BY`, `SET`/`REMOVE`, and `DISTINCT`. Everything else computes a
+    /// buffered result and hands it back as an already-materialized stream. This
+    /// is a transport change, not an operator conversion.
+    ///
+    /// `FOREACH` and `CALL {}` are orchestrated across many sub-executions and
+    /// are materialized here, exactly as before.
+    ///
+    /// # Stats
+    ///
+    /// `execution_ms` is measured where the executor measures it today — at
+    /// setup, i.e. *before* the rows are pulled. A caller that drains the stream
+    /// and wants a total should add its own drain time; the HTTP transport does.
+    pub async fn execute_stream_with_params(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         let statement = bind_statement_params(parse(query)?, params)?;
         if let Statement::Foreach { var, list, body } = statement {
-            return self
+            let result = self
                 .execute_foreach(&var, &list, &body, keyspace, auth)
-                .await;
+                .await?;
+            return Ok(buffered_as_stream(result));
         }
         if let Statement::CallSubquery {
             outer,
@@ -727,22 +783,39 @@ impl GraphEngine {
             return_clause,
         } = statement
         {
-            return self
+            let result = self
                 .execute_call_subquery(*outer, &imports, *inner, return_clause, keyspace, auth)
-                .await;
+                .await?;
+            return Ok(buffered_as_stream(result));
         }
-        self.execute_statement(statement, keyspace, auth).await
+        self.execute_statement_streaming(statement, keyspace, auth)
+            .await
     }
 
     /// Validate, plan, and execute a single non-orchestrated statement (i.e. not
     /// FOREACH / CALL {}, which the engine expands first). Shared by the top-level
     /// query path and the CALL {} subquery orchestrator.
+    ///
+    /// Buffered façade over [`GraphEngine::execute_statement_streaming`].
     async fn execute_statement(
         &self,
         statement: Statement,
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<GraphResult> {
+        let (columns, rows, stats) = self
+            .execute_statement_streaming(statement, keyspace, auth)
+            .await?;
+        collect_to_graph_result(columns, rows, stats, usize::MAX).await
+    }
+
+    /// The streaming half of [`GraphEngine::execute_statement`].
+    async fn execute_statement_streaming(
+        &self,
+        statement: Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         if statement_requires_adjacency(&statement) {
             let adjacency_registered = self.ensure_adjacency_storage_for_keyspace(keyspace).await?;
             if adjacency_registered {
@@ -763,21 +836,28 @@ impl GraphEngine {
                 if msg.contains("no table with graph.label")
                     && empty_match_for_missing_label(&statement) =>
             {
-                return Ok(empty_match_result(&statement));
+                return Ok(buffered_as_stream(empty_match_result(&statement)));
             }
             Err(e) => return Err(e),
         };
         let physical = plan(logical)?;
-        let wp = self.write_path.load();
-        execute(
-            physical,
-            &wp,
-            keyspace,
-            &self.config,
-            Some(self.schema.virtual_tables()),
-            Some(&self.schema),
-        )
-        .await
+        execute_streaming_owned(physical, self.owned_exec_ctx(keyspace)).await
+    }
+
+    /// Collect the engine's execution handles as owned values.
+    ///
+    /// `load_full()` rather than `load()`, and `virtual_tables_arc()` rather
+    /// than `virtual_tables()`: both of the borrowed forms produce a guard or a
+    /// reference tied to *this* frame, which is precisely what stops a row
+    /// stream from outliving the handler that started it.
+    fn owned_exec_ctx(&self, keyspace: &str) -> OwnedExecCtx {
+        OwnedExecCtx {
+            write_path: self.write_path.load_full(),
+            keyspace: keyspace.to_string(),
+            config: Arc::new(self.config.clone()),
+            virtual_tables: Some(self.schema.virtual_tables_arc()),
+            schema: Some(Arc::clone(&self.schema)),
+        }
     }
 
     /// Execute `FOREACH (var IN list | body...)`: run each body update clause

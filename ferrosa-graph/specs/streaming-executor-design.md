@@ -192,7 +192,8 @@ expand-with-limit shape; 5–7 complete coverage and end-to-end streaming.
 | 1 — `RowStream` + collect bridges | **done** (`executor/stream.rs`) |
 | 2 — streaming entry point | **partial** — see below |
 | 3 — Expand projection + DISTINCT + SET/REMOVE | **partial** — see below |
-| 4–7 | not started |
+| 4–6 | not started |
+| 7 — transport streaming | **HTTP done** (t_81087be0) — Bolt not started; see below |
 
 Increment 2 landed as an **additive scaffold**: `execute_streaming()` exists and
 `execute()` is now a thin `collect` over it, so there is one executor rather than
@@ -219,12 +220,57 @@ Every other variant computes today's buffered `GraphResult` and is wrapped with
 - The sequential-vs-concurrent hop split (`expand.rs`, capped hops run
   sequentially) is untouched: completion-order draining changes which rows a
   LIMIT returns.
-- `http.rs` / `bolt/server.rs` are untouched: `Body::from_stream` requires
-  `'static`, and Bolt holds the result in a struct field across protocol
-  messages. That is increment 7.
+- `bolt/server.rs` is untouched: Bolt holds the result in a struct field across
+  protocol messages and emits stats before rows, so it needs its own pass.
+  `http.rs` is done — see *Increment 7 (HTTP)* below.
 
 Known behavior preserved rather than fixed: the buffered `UNION` never summed
 `edges_deleted` across arms, and the streaming one does not either.
+
+#### Increment 7 (HTTP done, Bolt not started)
+
+`Body::from_stream` requires `Stream + Send + 'static`, and the response body
+outlives the handler frame, so a borrowing `RowStream<'a>` could not feed it.
+Two concrete borrows caused that, both in `engine.rs`: `self.write_path.load()`
+returns an `arc_swap` `Guard` that is a *local* of the calling frame, and
+`self.schema.snapshot()` / `virtual_tables()` borrow the caller's `Arc<Schema>`.
+
+Resolved with an **owned-handle wrapper**, not a second executor:
+
+- `OwnedExecCtx` (`expand.rs`) holds `Arc<WritePath>` (from `load_full()`),
+  `String` keyspace, `Arc<GraphEngineConfig>`, `Arc<VirtualTableRegistry>` (from
+  `Schema::virtual_tables_arc()`), and `Arc<Schema>`.
+- `execute_streaming_owned(plan, ctx)` moves the ctx into an `async_stream`
+  generator and calls `execute_streaming` **inside** it, so the executor's
+  borrows are borrows of the generator's own locals — legal across yield points
+  and invisible from outside. The result is a `RowStream<'static>` with no
+  per-row clone, no spawned task, and one dispatch.
+- The generator's first item is the head (columns + stats);
+  `execute_streaming_owned` peels it back off so a **setup** failure is still an
+  `Err` return, which is what lets the HTTP layer choose a status code before
+  any byte is written.
+- `GraphEngine::execute_stream_with_params()` is the engine-level entry;
+  `execute_with_params()` and `execute_statement()` are now `collect` bridges
+  over their streaming halves. `FOREACH` and `CALL {}` still materialize (they
+  orchestrate many sub-executions).
+- `http.rs::stream_graph_rows()` writes the body from the stream. The trailing
+  `"stats"` object is produced by a `StatsFinalizer` closure run **after** the
+  last row, so `execution_ms` covers the projection too — larger and more
+  accurate than the buffered path's number.
+
+**Scope — this bounds the RESPONSE, not the query.** Phase A of `Expand` still
+materializes the frontier before the first row is projected, and every
+non-converted variant still materializes. A high-fan-out query can still exhaust
+memory. The OOM class is not closed.
+
+**Failure after the first chunk.** The status line is chosen before any byte is
+written. A mid-stream executor error, or a row that fails to serialize, aborts
+the body rather than emitting the closing `],"stats":{…}}`, because
+truncated-but-parsable JSON would read as a complete, shorter result. The client
+observes a `200` with an incomplete chunked transfer — never a `4xx`/`5xx`. It
+must treat an incomplete body as a failure, not as an empty tail. The completion
+log line also moves to the end of the body, so a client that disconnects
+mid-stream produces no `graph query completed` line.
 
 #### Increment 3 (partial)
 
@@ -264,9 +310,14 @@ increment changed ordering and latency, **not** the memory bound; a
 high-cardinality `DISTINCT` can still exhaust memory. Bounding it is separate
 work.
 
-**`execution_ms` now under-reports for a streamed Expand.** Stats are returned
-up front (§4), so `execution_ms` is measured before any row is projected, where
-the buffered tail measured after. Fixing this needs the deferred stats handle.
+**`execution_ms` now under-reports for a streamed Expand** *at the executor
+boundary*. Stats are returned up front (§4), so `execution_ms` is measured
+before any row is projected, where the buffered tail measured after. Fixing that
+inside the executor still needs the deferred stats handle. The **HTTP**
+transport compensates: `stream_graph_rows`'s `StatsFinalizer` adds the drain
+duration after the last row, so a `POST /graph/query` response reports the whole
+query. Internal `collect` callers (`execute`, Bolt) still see the setup-only
+number.
 
 
 ## 6. Verification
@@ -292,7 +343,7 @@ by the data. The ones that actually scale with graph data:
 |---|---|---|---|
 | `expand.rs:1079` anchor `states` | every anchor partition (**full table scan**) | none | inc 2 — use `WritePath::range_read_stream_all*` (already exists) |
 | `expand.rs:1225` `pairs` collect | one vertex's full adjacency (**hub degree**) | `max_fan_out_per_hop` | inc 3/4 (concurrency+early-stop done; still collects) |
-| `expand.rs:1384-85` `rows`/`result_states` | **entire result set** | `max_result_rows` (silent truncate — see §7) | inc 7 (transport) |
+| `expand.rs:1384-85` `rows`/`result_states` | **entire result set** | `max_result_rows` (silent truncate — see §7) | inc 3 (streamed projection) + inc 7 (HTTP transport) — **done for the HTTP path**; still buffered for Bolt and for ORDER BY / aggregate / DELETE / varpath / leapfrog |
 | `expand.rs:1328` `kept` (post-filters) | full frontier | none | inc 5 |
 | `expand.rs:471` `next_frontier` (pattern predicate) | BFS frontier | none | inc 5 |
 | `expand.rs:1857` edge-anchored `states` | edge-anchor scan | none | inc 2 |
@@ -300,7 +351,7 @@ by the data. The ones that actually scale with graph data:
 | `leapfrog.rs` `result_rows` / `AdjacencyIterator` | join output + sorted adjacency | `max_results` | inc 6 |
 | `engine.rs:910-915` CALL subquery `out_rows` | **outer result + every inner result** (nested-loop join) | none | inc 5 |
 | `http.rs:510` SUBSCRIBE diff | **two full result sets** (previous + current) | none | see §7 — needs a design decision |
-| `stream.rs:69/91` collect bridges | migration scaffolding | caller's | inc 7 (they disappear) |
+| `stream.rs:69/91` collect bridges | migration scaffolding | caller's | inc 7 — **HTTP no longer collects**; the bridges remain for Bolt, `execute()`, FOREACH/`CALL {}`, and every non-converted variant |
 
 Note the storage layer already went through this discipline and has a source
 tripwire enforcing it (`ferrosa-cluster/src/write_path.rs` test: *"unbounded local

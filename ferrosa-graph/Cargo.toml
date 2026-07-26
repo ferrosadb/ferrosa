@@ -11,6 +11,7 @@ ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-storage = { path = "../ferrosa-storage" }
 arc-swap = "1.7"
+async-stream = "0.3"
 hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 phf = { version = "0.13", features = ["macros"] }
