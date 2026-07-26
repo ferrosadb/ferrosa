@@ -10,6 +10,12 @@
 #      writes across a partition — the safety property Elle checks.
 #   2. slow          : add 200ms netem latency on node2+node3 so the coordinator's
 #      commits must wait on a slow replica — validates ordering under WAN latency.
+#   3. restart-replica : SIGKILL node3 and bring it back. Unlike 1 and 2 this is a
+#      PROCESS fault, not a network one: the node returns having lost all
+#      in-flight Accord state (nothing replays the protocol log at startup), so
+#      it resumes voting on PreAccept with an empty ConflictIndex. Tests whether
+#      quorum covers that amnesia or whether a restarted node must be fenced
+#      until recovery completes (forge t_66e24bcc).
 # Replicates chaos::network primitives (ip6tables/tc) over `flyctl ssh`. RF=3 so a
 # 2/1 partition keeps a quorum available (unlike a 3/3 dual-DC split). Teardown
 # ALWAYS runs (trap). Elle CHECK runs locally afterwards.
@@ -193,6 +199,53 @@ inject_isolate_coordinator() {
 inject_slow() { log "NEMESIS inject slow (200ms on node2+node3)"; for n in 2 3; do nem "${MIDS[$n]}" "tc qdisc add dev eth0 root netem delay 200ms 50ms"; done; }
 heal_slow() { log "NEMESIS heal slow"; for n in 2 3; do nem "${MIDS[$n]}" "tc qdisc del dev eth0 root 2>/dev/null || true"; done; }
 
+# --- Restart fault (forge t_66e24bcc) -------------------------------------
+#
+# WHY: nothing replays the Accord protocol log at startup, so a restarted node
+# comes back with an EMPTY ConflictIndex — no memory of in-flight transactions —
+# and begins serving PreAccept immediately. A replica answers PreAccept with the
+# dependencies it knows about, so an amnesiac replica reports an INCOMPLETE dep
+# set. Whether quorum covers that, or whether a restarted node must be fenced
+# until recovery completes, is the open question this fault exists to answer.
+#
+# Every other fault in this schedule is a NETWORK fault. Process death is a
+# different failure class: the network faults never discard local state, so
+# `valid? true` from the previous certification says nothing about this path.
+#
+# NODE CHOICE: node3, deliberately NOT the seed. The generator runs ON node1 and
+# writes its history to node1's /tmp — restarting node1 would kill the generator
+# mid-run and take the history with it. Restarting a non-coordinator still
+# exercises the amnesia question: node3 returns with no conflict state and
+# resumes voting on PreAccepts from the still-live coordinator. Covering a
+# COORDINATOR restart needs the generator to run off-cluster (or stream its
+# history out) and is tracked separately.
+#
+# SIGKILL, not a graceful restart: a clean shutdown could flush state that a real
+# crash would not, which would test the easy case and hide the one we care about.
+inject_restart_replica() {
+  local mid="${MIDS[3]}"
+  log "NEMESIS inject restart-replica (SIGKILL node3; returns with an empty conflict index)"
+  flyctl machine stop "$mid" --app "$APP" --signal SIGKILL >/dev/null 2>&1 \
+    || log "WARN: stop node3 failed"
+  sleep 8
+  # Prove the fault actually bit. A no-op fault yields a meaningless green.
+  local st
+  st="$(flyctl machine status "$mid" --app "$APP" 2>/dev/null | grep -iE '^ *State' | head -1)"
+  log "node3 state after SIGKILL: ${st:-<unknown>}"
+  flyctl machine start "$mid" --app "$APP" >/dev/null 2>&1 || log "WARN: start node3 failed"
+  # Wait for it to accept CQL again before healing on; a node that never rejoins
+  # silently degrades the run to 2 nodes, which is a WEAKER test, not a pass.
+  local i
+  for i in $(seq 1 30); do
+    if nem "$mid" "timeout 2 sh -c '</dev/tcp/127.0.0.1/9042' && echo UP" 2>/dev/null | grep -q UP; then
+      log "node3 rejoined and is serving CQL after ${i}0s"
+      return 0
+    fi
+    sleep 10
+  done
+  log "WARN: node3 did NOT rejoin within 300s — the remainder of this run is a 2-node cluster; treat any verdict with suspicion"
+}
+
 nemesis_schedule() {
   sleep 25
   inject_partition_one;        sleep 20; heal_netfilter   # minority isolated; majority available (safety)
@@ -200,6 +253,9 @@ nemesis_schedule() {
   inject_isolate_coordinator;  sleep 40; heal_netfilter   # coordinator in minority >30s => :info (correct refusal)
   sleep 12
   inject_slow;                 sleep 22; heal_slow        # ordering under latency
+  sleep 12
+  inject_restart_replica                                  # process death: amnesiac replica rejoins and votes
+  sleep 20                                                # let it participate in real traffic before the run ends
 }
 log "starting nemesis schedule (parallel) + generator (foreground)"
 nemesis_schedule &
