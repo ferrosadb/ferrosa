@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sparql
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-07-25
 ---
 
 # ferrosa-sparql — Roadmap
@@ -11,6 +11,14 @@ stubs), the FMEA ([fmea.md](fmea.md)), and the dependency/usage review.
 
 ## Now (highest value)
 
+- **Decide the graph/keyspace partition-key contract (FMEA SP-11, t_af4eb9f0).**
+  `update.rs` writes the graph component as the literal `"default"`; the planner
+  reads it from the keyspace. On the deployed keyspace (`rdf`) point reads miss
+  data full scans find, and `DELETE` reports success while deleting nothing.
+  This is a **decision**, not a patch: changing the read side is
+  backward-compatible with data already on disk, changing the write side orphans
+  it. Four invariant tests in `tests/sparql_executor_invariants.rs` are red
+  against this and must not be weakened.
 - **Authentication + authorization (FMEA SP-1).** The endpoint is fully
   unauthenticated read+write. Wire a real auth layer (token / mTLS), make
   `auth_disabled` actually gate request handling, and return
@@ -25,14 +33,22 @@ stubs), the FMEA ([fmea.md](fmea.md)), and the dependency/usage review.
 
 ## Next
 
-- **Bound property-path cost (FMEA SP-4).** Replace the full-adjacency
-  `range_read` + in-memory BFS with index-driven neighbor expansion and a
-  hop/row cap; surface truncation instead of OOM risk.
-- **Surface scan truncation (FMEA SP-5).** When a scan hits `SCAN_ROW_CAP`,
-  return a machine-readable "results truncated" signal (or paginate) rather than
-  a 200 OK with a silently partial body.
-- **Join planning (FMEA SP-6).** Add pattern reordering (most-selective first)
-  and a hash join to escape the nested-loop O(rows^patterns) blowup.
+- **Pipeline the multi-pattern join (FMEA SP-6).** The scan streams, but the
+  nested-loop join still rebuilds a materialized solution set per pattern, so
+  peak memory for a multi-pattern BGP is set by the intermediates rather than by
+  the scan. They are now capped at `max_rows` and fail loud past it, so this is
+  a scalability limit rather than an OOM — but a pattern that could stream
+  end-to-end still cannot. Needs pattern reordering (most-selective first) plus
+  either a pipelined or hash join.
+- **Index-driven property-path expansion (FMEA SP-4).** The adjacency read
+  streams and its buffer is bounded, but BFS still materializes every edge for
+  the predicate before traversing. Expand neighbours through the index instead,
+  with a hop cap.
+- **Paginate instead of failing at the bound.** Crossing `max_rows` is now a
+  loud error, which is correct but blunt: the right answer for a large honest
+  result set is a continuation token over the streaming scan (`ScanResume` in
+  `WritePath` already supports it) rather than asking the operator to raise a
+  limit.
 
 ## Later
 

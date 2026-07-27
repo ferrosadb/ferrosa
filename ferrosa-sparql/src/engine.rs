@@ -6,6 +6,7 @@ use ferrosa_cluster::write_path::WritePath;
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
+use crate::executor::{ExecutionLimits, DEFAULT_MAX_ROWS};
 use crate::planner::{self, GraphQueryMode};
 use crate::results::{SparqlAskResult, SparqlJsonResults};
 
@@ -176,15 +177,24 @@ impl SparqlResult {
 pub struct SparqlConfig {
     /// Default graph name for queries without explicit FROM.
     pub default_graph: String,
-    /// Maximum result rows returned per query.
-    pub max_results: usize,
+    /// The executor's row bound: the most storage rows a single scan may read,
+    /// and the most solutions any operator may buffer.
+    ///
+    /// This replaces the former `max_results` field, which was never read
+    /// anywhere in the workspace, and the former `SCAN_ROW_CAP` constant, which
+    /// only logged a warning claiming results had been "truncated at row cap"
+    /// AFTER the whole table had already been materialized and truncated
+    /// nothing. Unlike both of those, this bound is real: it is enforced at the
+    /// storage scan and on every operator's buffer, and crossing it returns a
+    /// [`SparqlError::Execution`] rather than a silently short result.
+    pub max_rows: usize,
 }
 
 impl Default for SparqlConfig {
     fn default() -> Self {
         Self {
             default_graph: "default".into(),
-            max_results: 10_000,
+            max_rows: DEFAULT_MAX_ROWS,
         }
     }
 }
@@ -194,6 +204,7 @@ pub struct SparqlEngine {
     storage: Arc<StorageEngine>,
     write_path: Arc<WritePath>,
     config: SparqlConfig,
+    limits: ExecutionLimits,
 }
 
 impl SparqlEngine {
@@ -212,10 +223,14 @@ impl SparqlEngine {
         if let Err(e) = storage.register_table(schema) {
             tracing::warn!(%e, "failed to register rdf_triples table for default graph");
         }
+        let limits = ExecutionLimits {
+            max_rows: config.max_rows,
+        };
         Self {
             storage,
             write_path,
             config,
+            limits,
         }
     }
 
@@ -251,7 +266,14 @@ impl SparqlEngine {
             )));
         }
         self.ensure_table_registered(ks);
-        crate::update::execute_update(update_str, ks, &self.storage, &self.write_path).await
+        crate::update::execute_update(
+            update_str,
+            ks,
+            &self.storage,
+            &self.write_path,
+            &self.limits,
+        )
+        .await
     }
 
     /// Execute a SPARQL query and return results.
@@ -289,7 +311,7 @@ impl SparqlEngine {
         let plan = planner::plan_query(&query, graph)?;
 
         // 3. Execute plan against storage.
-        let results = crate::executor::execute(&plan, &self.write_path).await?;
+        let results = crate::executor::execute(&plan, &self.write_path, &self.limits).await?;
 
         // BUG-S6 fix: ASK queries return boolean result format.
         if plan.is_ask {
@@ -303,7 +325,8 @@ impl SparqlEngine {
         // URS-QEC-S01: CONSTRUCT / DESCRIBE return a graph result.
         if let Some(graph_mode) = &plan.graph_mode {
             return Ok(SparqlResult::Graph(
-                build_graph_result(graph_mode, &results, &plan, &self.write_path).await?,
+                build_graph_result(graph_mode, &results, &plan, &self.write_path, &self.limits)
+                    .await?,
             ));
         }
 
@@ -324,6 +347,7 @@ async fn build_graph_result(
     where_results: &SparqlJsonResults,
     plan: &planner::QueryPlan,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<Vec<ConstructedTriple>, SparqlError> {
     use spargebra::term::{NamedNodePattern, TermPattern};
 
@@ -430,7 +454,7 @@ async fn build_graph_result(
                     filters: vec![],
                     graph_mode: None,
                 };
-                let sub = crate::executor::execute(&lookup_plan, write_path).await?;
+                let sub = crate::executor::execute(&lookup_plan, write_path, limits).await?;
                 for row in sub.results.bindings {
                     let pred = match row.get("__p") {
                         Some(b) => b.value.clone(),
@@ -501,7 +525,7 @@ async fn build_graph_result(
                     filters: vec![],
                     graph_mode: None,
                 };
-                let sub_result = crate::executor::execute(&dummy_plan, write_path).await?;
+                let sub_result = crate::executor::execute(&dummy_plan, write_path, limits).await?;
                 for row in sub_result.results.bindings {
                     let pred = match row.get("__p") {
                         Some(b) => b.value.clone(),
