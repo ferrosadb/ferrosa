@@ -22,6 +22,7 @@ use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::error::SparqlError;
+use crate::executor::ExecutionLimits;
 use crate::results::Binding;
 use crate::triple_store;
 
@@ -42,6 +43,7 @@ pub async fn execute_update(
     keyspace: &str,
     storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<UpdateResult, SparqlError> {
     let update = spargebra::SparqlParser::new()
         .parse_update(update_str)
@@ -79,15 +81,16 @@ pub async fn execute_update(
                 using: _,
                 pattern,
             } => {
-                let (d, i) =
-                    exec_delete_insert(delete, insert, pattern, keyspace, storage, write_path)
-                        .await?;
+                let (d, i) = exec_delete_insert(
+                    delete, insert, pattern, keyspace, storage, write_path, limits,
+                )
+                .await?;
                 total_deleted += d;
                 total_inserted += i;
             }
             spargebra::GraphUpdateOperation::Clear { graph, .. }
             | spargebra::GraphUpdateOperation::Drop { graph, .. } => {
-                total_deleted += exec_clear(graph, keyspace, storage, write_path).await?;
+                total_deleted += exec_clear(graph, keyspace, storage, write_path, limits).await?;
             }
             spargebra::GraphUpdateOperation::Load { .. } => {
                 // URS-QEC-X01: LOAD fetches and parses an external RDF document.
@@ -280,6 +283,7 @@ async fn exec_delete_insert(
     keyspace: &str,
     storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<(usize, usize), SparqlError> {
     // URS-QEC-X01: a delete or insert template whose target graph is a named
     // graph distinct from this keyspace's default graph is NOT addressable in
@@ -300,7 +304,7 @@ async fn exec_delete_insert(
     }
 
     let plan = crate::planner::plan_where(pattern, keyspace)?;
-    let solutions = crate::executor::execute_bindings(&plan, write_path).await?;
+    let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
     let mut deleted = 0usize;
     let mut inserted = 0usize;
@@ -343,6 +347,7 @@ async fn exec_clear(
     keyspace: &str,
     storage: &Arc<StorageEngine>,
     write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
 ) -> Result<usize, SparqlError> {
     // The triple store is single-graph-per-keyspace; the partition-key graph
     // component is the keyspace. DEFAULT / NAMED / ALL therefore all resolve to
@@ -359,7 +364,7 @@ async fn exec_clear(
         .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
         .map_err(|e| SparqlError::Parse(format!("{e}")))?;
     let plan = crate::planner::plan_query(&scan, keyspace)?;
-    let solutions = crate::executor::execute_bindings(&plan, write_path).await?;
+    let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
     let mut deleted = 0usize;
     for sol in &solutions {
