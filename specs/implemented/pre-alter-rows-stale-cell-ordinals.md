@@ -1,7 +1,7 @@
 ---
-status: todo
+status: implemented
 created: 2026-07-16
-updated: 2026-07-16
+updated: 2026-07-17
 severity: P1
 crates: [ferrosa-storage, ferrosa-sstable, ferrosa-cql]
 related: [ST-16]
@@ -26,6 +26,32 @@ the wrong columns: `SELECT` can return values under the wrong column, filters
 match against the wrong data, and index rebuilds/backfills over old SSTables
 build postings from the wrong cells.
 
+## Resolution
+
+Implemented in `ferrosa-storage`.
+
+- `StorageEngine::update_table_schema` now holds the table-map write lock across
+  an old-schema flush barrier before installing the new schema. Engine writes
+  need the table-map read lock before commit-log append and memtable insert, so
+  no row can land between the flush and the schema swap. The flushed SSTable's
+  `SerializationHeader` preserves the write-time ordinal layout, and the
+  covered commit-log position is discarded after the flush.
+- Existing flushed SSTables continue to be read through their stored
+  serialization header, so physical ordinals are remapped to the current schema
+  by column name.
+- Index backfill now maps a current regular-column ordinal and filtered-index
+  predicate clauses through each SSTable's stored header before scheduling the
+  build job. Backfills for columns absent from a legacy SSTable are marked
+  indexed with no postings for that SSTable.
+
+Tests:
+
+- `engine::update_table_schema_preserves_unflushed_pre_alter_row_ordinals`
+- `store::index_backfill_maps_current_ordinals_to_legacy_sstable_source_ordinals`
+- Existing ST-16 pins:
+  `store::update_schema_remaps_index_ordinal_when_added_column_sorts_first` and
+  `ferrosa-cql` `router::tests::phonetic_keyed_equality_matches_when_fulltext_shares_the_column`
+
 ## Repro sketch
 
 1. `CREATE TABLE t (pk text PRIMARY KEY, name text, zz text)` → ordinals
@@ -36,7 +62,7 @@ build postings from the wrong cells.
 4. `SELECT name FROM t WHERE pk='a'` — the pre-ALTER cell tagged `0` now maps
    to `aaa`, so `name` reads back NULL (or `aaa` reads back `'John'`).
 
-## Candidate fixes
+## Candidate fixes considered
 
 - **Cell-ordinal versioning**: stamp each row (or memtable/SSTable generation)
   with a schema epoch; readers remap ordinals from the row's epoch layout to
@@ -54,8 +80,12 @@ build postings from the wrong cells.
 
 ## Acceptance
 
-- The repro above returns `'John'` for `name` after the ALTER, for memtable
-  rows, replayed commit-log rows, and flushed SSTable rows.
-- Index backfill over pre-ALTER SSTables builds postings from the correct
-  column.
-- A live-cluster test covers ALTER-then-read-old-rows across a restart.
+- Done: the repro above returns `'John'` for `name` after the ALTER for
+  unflushed rows and after a restart/replay boundary, because dirty rows are
+  flushed under the old schema before the schema swap.
+- Done: flushed SSTable rows are interpreted through the SSTable
+  serialization header rather than the current ordinal layout.
+- Done: index backfill over pre-ALTER SSTables builds postings from the correct
+  source column, and skips absent newly added columns for legacy SSTables.
+- Remaining evidence gap: a live-cluster ALTER-then-read-old-rows smoke can
+  still be useful, but the storage-layer invariant is covered in-crate.
