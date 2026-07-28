@@ -39,6 +39,75 @@ use ferrosa_storage::{CommitLogConfig, CompactionConfig};
 // Test helpers
 // ---------------------------------------------------------------------------
 
+/// Install a tracing subscriber so `RUST_LOG` reaches raft/cluster spans.
+///
+/// Without this the whole crate's `tracing::` output is discarded, which is
+/// why a formation failure in CI prints only the final metrics line and
+/// nothing about the vote round that produced it.
+fn init_test_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::EnvFilter;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+/// A recorded Raft state transition, used to reconstruct what an election
+/// actually did on failure.
+type Timeline = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Watch a node's Raft metrics and record every distinct state transition.
+///
+/// This exists instead of `RUST_LOG=openraft=debug` on purpose: verbose
+/// logging does synchronous formatted writes on the Raft path, which shifts
+/// the timing enough to hide the formation race entirely (20/20 passes with
+/// debug logging vs ~17% failures without). Sampling the metrics watch channel
+/// records the same election story without perturbing it.
+fn spawn_timeline_recorder(controller: Arc<ModeController>, host_id: Uuid, timeline: Timeline) {
+    tokio::spawn(async move {
+        // ONE epoch shared by all nodes. Per-node epochs are useless here:
+        // the nodes are started sequentially, so per-node-relative stamps
+        // cannot be interleaved into a single causal story (an earlier
+        // version of this recorder did exactly that and produced an
+        // apparent impossibility — peers voting for a node before it
+        // existed — that was purely an artifact of mismatched origins).
+        static EPOCH: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+        let start = *EPOCH.get_or_init(tokio::time::Instant::now);
+        let mut last = String::new();
+        loop {
+            if let Some(raft) = controller.raft() {
+                let m = raft.metrics().borrow().clone();
+                // `inst` is the Arc identity of the Raft instance. If this
+                // changes, the node REBUILT its raft (e.g. across a mode
+                // transition) — a second instance replaying a term the peers
+                // have already voted in cannot win, because openraft grants
+                // only on a strictly greater vote.
+                let cur = format!(
+                    "inst={:p} term={:?} state={:?} leader={:?} vote={:?} last_log={:?}",
+                    Arc::as_ptr(&raft),
+                    m.current_term,
+                    m.state,
+                    m.current_leader,
+                    m.vote,
+                    m.last_log_index,
+                );
+                if cur != last {
+                    let ms = start.elapsed().as_millis();
+                    timeline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("  +{ms:>6}ms [{host_id}] {cur}"));
+                    last = cur;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+}
+
 /// Create a StorageEngine with a temp directory.
 fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
     let config = StorageEngineConfig {
@@ -106,6 +175,7 @@ struct TestClusterNode {
     peer_manager: Arc<PeerManager>,
     host_id: Uuid,
     bound_addr: SocketAddr,
+    timeline: Timeline,
     _dir: tempfile::TempDir,
 }
 
@@ -154,6 +224,9 @@ impl TestClusterNode {
         let server = Arc::new(RpcServer::new((*net_config).clone(), host_id, registry));
         let addr = server.start_and_get_addr().await.unwrap();
 
+        let timeline: Timeline = Arc::new(std::sync::Mutex::new(Vec::new()));
+        spawn_timeline_recorder(controller.clone(), host_id, timeline.clone());
+
         Self {
             controller,
             _handles: handles,
@@ -161,6 +234,7 @@ impl TestClusterNode {
             peer_manager: pm,
             host_id,
             bound_addr: addr,
+            timeline,
             _dir: dir,
         }
     }
@@ -201,9 +275,28 @@ impl TestClusterNode {
                 // Diagnostic on timeout: print Raft state for each node.
                 if let Some(raft) = self.controller.raft() {
                     let m = raft.metrics().borrow().clone();
+                    // Membership + vote are what separate the failure modes:
+                    // a stuck candidate at a FROZEN term means elections
+                    // stopped, whereas a climbing term means votes are being
+                    // rejected. `voter_ids` shows whether the peers were ever
+                    // promoted out of Learner.
                     eprintln!(
-                        "[{}] election timeout: term={:?} state={:?} leader={:?}",
-                        self.host_id, m.current_term, m.state, m.current_leader,
+                        "[{}] election timeout: term={:?} state={:?} leader={:?} \
+                         vote={:?} last_log={:?} voters={:?} learners={:?}",
+                        self.host_id,
+                        m.current_term,
+                        m.state,
+                        m.current_leader,
+                        m.vote,
+                        m.last_log_index,
+                        m.membership_config
+                            .membership()
+                            .voter_ids()
+                            .collect::<Vec<_>>(),
+                        m.membership_config
+                            .membership()
+                            .learner_ids()
+                            .collect::<Vec<_>>(),
                     );
                 } else {
                     eprintln!("[{}] election timeout: Raft instance is NONE", self.host_id);
@@ -281,6 +374,7 @@ mod harness_slot;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_elects_raft_leader() {
+    init_test_tracing();
     let _slot = harness_slot::acquire_harness_slot().await;
     // Use deterministic UUIDs so the test is reproducible.
     // Node1 has the highest UUID so it becomes Primary in pair mode,
@@ -396,6 +490,31 @@ async fn three_node_cluster_elects_raft_leader() {
         "Leader election results: node1={:?} node2={:?} node3={:?}",
         leader_on_node1, leader_on_node2, leader_on_node3
     );
+
+    if leader_on_node1.is_none() {
+        eprintln!("=== Raft state timeline (all nodes, transitions only) ===");
+        let mut all: Vec<String> = Vec::new();
+        for n in [&node1, &node2, &node3] {
+            all.extend(
+                n.timeline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            );
+        }
+        // Interleave by the +NNNNms prefix so the three nodes read as one story.
+        all.sort_by_key(|l| {
+            l.split_once('+')
+                .and_then(|(_, r)| r.split_once("ms"))
+                .and_then(|(ms, _)| ms.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        for line in all {
+            eprintln!("{line}");
+        }
+        eprintln!("=== end timeline ===");
+    }
 
     // Assert a leader was elected on at least one node
     assert!(
