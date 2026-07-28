@@ -5738,6 +5738,12 @@ impl<F: FlushTarget> TableStore<F> {
         FilterPredicate::conjunction(clauses)
     }
 
+    /// Returns `None` either because the SSTable is no longer in the view
+    /// (benign — it vanished under compaction) or because the reader failed to
+    /// open. The reader-open failure is WARN-logged: callers fall back to
+    /// current-schema ordinals on `None`, which on a legacy reordered SSTable
+    /// reintroduces the wrong-ordinal probe this mapping exists to prevent, so
+    /// that degradation must be visible (fail-loud rule).
     fn column_mapping_for_sstable(&self, sstable_id: &str) -> Option<ColumnOrdinalMapping> {
         let schema = self.schema.load();
         let view = self.view.load();
@@ -5747,7 +5753,20 @@ impl<F: FlushTarget> TableStore<F> {
             .position(|(id, _)| id == sstable_id)
             .or_else(|| view.sstables.iter().position(|desc| desc.gen == sstable_id))?;
         let desc = view.sstables.get(idx)?;
-        let reader = self.open_reader(desc).ok()?;
+        let reader = match self.open_reader(desc) {
+            Ok(reader) => reader,
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    sstable_id,
+                    table = %self.pool_table_key,
+                    "ordinal remap: failed to open SSTable reader; falling back to \
+                     current-schema ordinals for this SSTable — a legacy reordered \
+                     SSTable may be probed at the wrong column ordinal"
+                );
+                return None;
+            }
+        };
         Some(ColumnOrdinalMapping::for_header(&schema, reader.header()))
     }
 
