@@ -133,7 +133,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   declaration through the old schema's column name, because adding a column
   that sorts before an indexed column shifts the indexed column's cell
   ordinal (ST-16); a declaration that cannot be mapped fails loud instead of
-  silently indexing the wrong cell.
+  silently indexing the wrong cell. It also flushes dirty pre-ALTER rows under
+  the old schema before swapping layouts, so their SSTable serialization header
+  preserves the write-time cell ordinals; reads and index backfills remap those
+  physical ordinals through the per-SSTable header instead of interpreting old
+  rows against the new layout.
   Boot-time
   `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
   (`restored`/`skipped`); unresolvable rows emit one summary warn plus the

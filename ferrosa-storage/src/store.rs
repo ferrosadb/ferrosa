@@ -5682,6 +5682,75 @@ impl<F: FlushTarget> TableStore<F> {
         (start..=last_gen).map(|g| format!("{g}")).collect()
     }
 
+    /// Translate a current-schema regular-column ordinal to the physical
+    /// ordinal used by one SSTable's SerializationHeader.
+    ///
+    /// Backfill jobs read raw SSTable rows, so their `column_position` must be
+    /// in the source SSTable's ordinal space. Returns `None` when the current
+    /// column did not exist in that SSTable; callers should treat that
+    /// generation as an empty backfill rather than probing a different old
+    /// column with the same ordinal.
+    pub fn source_regular_ordinal_for_sstable(
+        &self,
+        sstable_id: &str,
+        current_ordinal: usize,
+    ) -> Option<usize> {
+        let current = u16::try_from(current_ordinal).ok()?;
+        let Some(mapping) = self.column_mapping_for_sstable(sstable_id) else {
+            return Some(current_ordinal);
+        };
+        let source = mapping.source_regular_ordinals_for_projection(&[current]);
+        match source.as_slice() {
+            [only] => Some(*only as usize),
+            _ => None,
+        }
+    }
+
+    /// Remap a filtered-index predicate from current-schema ordinals to one
+    /// SSTable's physical ordinals.
+    ///
+    /// If any predicate column is absent from that SSTable, the correct
+    /// backfill result is empty because the conjunction cannot be satisfied.
+    /// An empty conjunction evaluates false in `ferrosa-index`, giving the
+    /// local backend a normal no-entry build path.
+    pub fn source_filter_predicate_for_sstable(
+        &self,
+        sstable_id: &str,
+        predicate: &FilterPredicate,
+    ) -> FilterPredicate {
+        let Some(mapping) = self.column_mapping_for_sstable(sstable_id) else {
+            return predicate.clone();
+        };
+
+        let mut clauses = Vec::with_capacity(predicate.clauses.len());
+        for clause in &predicate.clauses {
+            let Some(current) = u16::try_from(clause.column_position).ok() else {
+                return FilterPredicate::conjunction(Vec::new());
+            };
+            let source = mapping.source_regular_ordinals_for_projection(&[current]);
+            let [source_ordinal] = source.as_slice() else {
+                return FilterPredicate::conjunction(Vec::new());
+            };
+            let mut remapped = clause.clone();
+            remapped.column_position = *source_ordinal as usize;
+            clauses.push(remapped);
+        }
+        FilterPredicate::conjunction(clauses)
+    }
+
+    fn column_mapping_for_sstable(&self, sstable_id: &str) -> Option<ColumnOrdinalMapping> {
+        let schema = self.schema.load();
+        let view = self.view.load();
+        let idx = view
+            .sstable_ids
+            .iter()
+            .position(|(id, _)| id == sstable_id)
+            .or_else(|| view.sstables.iter().position(|desc| desc.gen == sstable_id))?;
+        let desc = view.sstables.get(idx)?;
+        let reader = self.open_reader(desc).ok()?;
+        Some(ColumnOrdinalMapping::for_header(&schema, reader.header()))
+    }
+
     /// Number of SSTables currently in the store.
     pub fn sstable_count(&self) -> usize {
         self.view.load().sstables.len()
@@ -6553,6 +6622,120 @@ mod tests {
         assert_eq!(row.cells[0].1.value.as_deref(), Some(b"aye".as_slice()));
         assert_eq!(row.cells[1].0, 1);
         assert_eq!(row.cells[1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[test]
+    fn index_backfill_maps_current_ordinals_to_legacy_sstable_source_ordinals() {
+        let key = make_key("pk-backfill-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("name", "zz"),
+            TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "column_order".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![
+                    ColumnDefinition {
+                        name: "aaa".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "name".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "zz".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                ],
+                extensions: Default::default(),
+            },
+            &key,
+            make_two_column_row(b"John", b"x", 1000),
+        );
+
+        assert_eq!(
+            store.source_regular_ordinal_for_sstable("1", 1),
+            Some(0),
+            "current name ordinal 1 must backfill from old physical ordinal 0"
+        );
+        assert_eq!(
+            store.source_regular_ordinal_for_sstable("1", 2),
+            Some(1),
+            "current zz ordinal 2 must backfill from old physical ordinal 1"
+        );
+        assert_eq!(
+            store.source_regular_ordinal_for_sstable("1", 0),
+            None,
+            "newly-added aaa did not exist in the old SSTable"
+        );
+    }
+
+    #[test]
+    fn index_backfill_remaps_filtered_predicate_to_legacy_sstable_source_ordinals() {
+        let key = make_key("pk-filter-backfill-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("name", "zz"),
+            TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "column_order".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![
+                    ColumnDefinition {
+                        name: "aaa".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "name".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "zz".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                ],
+                extensions: Default::default(),
+            },
+            &key,
+            make_two_column_row(b"John", b"x", 1000),
+        );
+
+        let predicate = FilterPredicate::conjunction(vec![
+            ferrosa_index::FilterClause::new(1, ferrosa_index::FilterOp::Eq, b"John".to_vec()),
+            ferrosa_index::FilterClause::new(2, ferrosa_index::FilterOp::NotEq, b"z".to_vec()),
+        ]);
+        let remapped = store.source_filter_predicate_for_sstable("1", &predicate);
+        let positions: Vec<usize> = remapped
+            .clauses()
+            .iter()
+            .map(|clause| clause.column_position)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![0, 1],
+            "current predicate ordinals name=1, zz=2 must remap to old physical ordinals 0, 1"
+        );
+
+        let absent_new_column =
+            FilterPredicate::single(0, ferrosa_index::FilterOp::Eq, b"aaa".to_vec());
+        let remapped_absent = store.source_filter_predicate_for_sstable("1", &absent_new_column);
+        assert!(
+            remapped_absent.clauses().is_empty(),
+            "a predicate on a newly-added column cannot match a legacy SSTable"
+        );
+        assert!(
+            !ferrosa_index::evaluate_predicate_row(&remapped_absent, |_| Some(b"anything")),
+            "empty remapped predicate must evaluate false"
+        );
     }
 
     #[tokio::test]
