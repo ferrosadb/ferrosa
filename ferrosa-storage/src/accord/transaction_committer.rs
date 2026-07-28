@@ -84,17 +84,27 @@ pub trait TransactionCommitter: Send + Sync {
     /// Commit `writes` and evaluate `reads` at the transaction's agreed commit
     /// timestamp, returning the row bytes observed for each read (positional).
     ///
-    /// The default implementation commits the writes and returns no rows — used
-    /// by front-ends that never buffer transactional reads (e.g. the Postgres
-    /// front-end) and by committers that do not yet support read-in-transaction.
-    /// The CQL front-end calls this so a `BEGIN; SELECT; …; COMMIT` can return
-    /// the SELECT's rows atomically.
+    /// The default implementation supports only an EMPTY read-set — the shape
+    /// used by front-ends that never buffer transactional reads (e.g. the
+    /// Postgres front-end) and by write-only CQL transactions. A NON-empty
+    /// read-set against a committer that has not overridden this method is a
+    /// hard error: silently returning `CommitReads::default()` would fabricate
+    /// row-ABSENCE (`None` means "absent at commit-t" to the caller), turning a
+    /// missing capability into wrong query results. Fail loud instead; the
+    /// front-end surfaces the error and the transaction does not lie.
     async fn commit_with_reads(
         &self,
         writes: Vec<TransactionWrite>,
         reads: Vec<TransactionRead>,
     ) -> Result<(CommitOutcome, CommitReads), CommitError> {
-        let _ = &reads;
+        if !reads.is_empty() {
+            return Err(CommitError {
+                reason: format!(
+                    "committer does not implement read-in-transaction but {} read(s) were staged;                      refusing to fabricate row-absence",
+                    reads.len()
+                ),
+            });
+        }
         let outcome = self.commit(writes).await?;
         Ok((outcome, CommitReads::default()))
     }
@@ -221,16 +231,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_commit_with_reads_commits_writes_and_returns_no_rows() {
+    async fn default_commit_with_reads_accepts_empty_read_set() {
         let committer = WriteOnlyCommitter;
         let (outcome, reads) = committer
+            .commit_with_reads(vec![write("ks", b"a")], Vec::new())
+            .await
+            .expect("empty read-set must commit through the default impl");
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert!(reads.rows.is_empty());
+    }
+
+    /// A committer without read-in-transaction support must REFUSE a non-empty
+    /// read-set. Silently returning `CommitReads::default()` would fabricate
+    /// row-absence (`None` means "absent at commit-t" to the caller) — a
+    /// missing capability must never become wrong query results.
+    #[tokio::test]
+    async fn default_commit_with_reads_rejects_staged_reads_loudly() {
+        let committer = WriteOnlyCommitter;
+        let err = committer
             .commit_with_reads(vec![write("ks", b"a")], vec![read("ks", "t", b"a")])
             .await
-            .expect("commit_with_reads");
-        assert_eq!(outcome, CommitOutcome::Committed);
+            .expect_err("non-empty read-set against the default impl must fail loud");
         assert!(
-            reads.rows.is_empty(),
-            "a write-only committer returns no transactional read rows"
+            err.reason.contains("read-in-transaction"),
+            "error must name the missing capability: {}",
+            err.reason
         );
     }
 
