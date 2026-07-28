@@ -37,6 +37,7 @@ proptest = "1"
 rand = "0.10"
 serial_test = "3"
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
