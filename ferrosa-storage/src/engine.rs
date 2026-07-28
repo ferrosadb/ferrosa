@@ -20070,8 +20070,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
         let sstable_dir = dir.path().join("sstables").join(tid.to_string());
-        let input_data_files: Vec<_> = StorageEngine::scan_generations(&sstable_dir)
-            .into_iter()
+        let input_gens: std::collections::HashSet<u64> =
+            StorageEngine::scan_generations(&sstable_dir)
+                .into_iter()
+                .collect();
+        let input_data_files: Vec<_> = input_gens
+            .iter()
             .filter_map(|gen| {
                 StorageEngine::generation_component_path(&sstable_dir, &gen.to_string(), "Data.db")
             })
@@ -20090,10 +20094,28 @@ mod tests {
         }
         std::fs::create_dir(&pending_log_path).unwrap();
 
+        // Completion witness: `poll_compactions` promotes the compacted output
+        // into the table SSTable directory under a NEW generation before the
+        // pending-log step. Without observing that promotion the preservation
+        // assert below would pass vacuously (inputs trivially still exist if
+        // compaction never ran).
+        let mut output_promoted = false;
         for _ in 0..40 {
             engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir)
+                .into_iter()
+                .any(|gen| !input_gens.contains(&gen))
+            {
+                output_promoted = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert!(
+            output_promoted,
+            "compaction never ran within the window: no output generation was promoted into {:?}; the input-preservation assert would be vacuous",
+            sstable_dir
+        );
 
         assert!(
             input_data_files.iter().all(|path| path.exists()),
