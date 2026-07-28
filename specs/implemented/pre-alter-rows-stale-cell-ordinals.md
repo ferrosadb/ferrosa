@@ -31,11 +31,20 @@ build postings from the wrong cells.
 Implemented in `ferrosa-storage`.
 
 - `StorageEngine::update_table_schema` now holds the table-map write lock across
-  an old-schema flush barrier before installing the new schema. Engine writes
-  need the table-map read lock before commit-log append and memtable insert, so
-  no row can land between the flush and the schema swap. The flushed SSTable's
-  `SerializationHeader` preserves the write-time ordinal layout, and the
-  covered commit-log position is discarded after the flush.
+  an old-schema flush barrier before installing the new schema. The write path
+  takes the table-map read lock for memtable admission, so the hold excludes any
+  new row from entering the memtable between the flush and the schema swap. The
+  flushed SSTable's `SerializationHeader` preserves the write-time ordinal
+  layout, and the covered commit-log position is discarded after the flush.
+- **Known residual (t_237efb08)**: the write path appends to the commit log
+  *before* taking the table-map read lock, so a writer that has already
+  appended an old-ordinal row and then blocks on the ALTER's write lock inserts
+  that row into the new-schema memtable after the swap — and its commit-log
+  position postdates the discarded barrier position, so it also replays
+  mis-tagged after a crash. This closes the dominant window (all buffered rows)
+  but not the racing-writer window; candidate closures are schema-epoch
+  validation at memtable admission, moving the append under the guard, or
+  name-keyed cells.
 - Existing flushed SSTables continue to be read through their stored
   serialization header, so physical ordinals are remapped to the current schema
   by column name.

@@ -3081,9 +3081,21 @@ impl StorageEngine {
             })?;
 
             // Hold the table-map write lock across the old-schema flush and
-            // schema swap. Engine writes need the table-map read lock before
-            // they can append to the commit log or enter TableStore::write, so
-            // no row can land between the flush barrier and the new schema.
+            // schema swap. The write path takes the table-map read lock for
+            // memtable admission and the `last_commit_log_position` store, so
+            // this hold excludes any new row from entering the memtable (or
+            // advancing the tracked position) between the flush barrier and
+            // the schema swap.
+            //
+            // Residual window (t_237efb08): the write path appends to the
+            // commit log BEFORE taking the read lock (see `write`, step 1 vs
+            // step 2), so a writer that has already appended an old-ordinal
+            // row and then blocks on this write lock will insert that row
+            // into the new-schema memtable after the swap — and its commit-log
+            // position postdates the `cl_position` captured here, so it also
+            // replays mis-tagged after a crash. Closing it needs schema-epoch
+            // validation at memtable admission, moving the append under this
+            // guard, or name-keyed cells.
             let cl_position = **state.last_commit_log_position.load();
             if state.store.memtable_size() > 0 {
                 state.store.flush()?;
