@@ -151,7 +151,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   read does, on every page but the last), the per-replica forwarder task fires
   `RangeReadStreamCancel` (info-logged) so the remote producer stops between
   batches instead of streaming the remaining table onto `Lane::Bulk` for
-  nobody; the producer-side handler is registered for the Cancel MsgType.
+  nobody; the producer-side handler is registered for the Cancel MsgType. The
+  N-way merge also races its core loop against `out_tx.closed()` so abandonment
+  aborts even while the merge is parked awaiting a stalled source; pinned by
+  `range_read_stream::tests::nway_merge_consumer_drop_aborts_when_parked_on_stalled_source`.
   Harness: `tests/range_scan_multi_replica_paging.rs` (real 3-node loopback,
   RF=3/CL=ALL, counter-asserted).
   **Flow control (t_a0f922a3):** internode range streams are WINDOWED — each

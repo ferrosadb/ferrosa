@@ -2373,6 +2373,83 @@ mod tests {
         out
     }
 
+    struct OneFragmentThenPending {
+        first: Option<Partition>,
+        parked: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl futures::Stream for OneFragmentThenPending {
+        type Item = Result<Partition, ClusterError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if let Some(first) = self.first.take() {
+                return std::task::Poll::Ready(Some(Ok(first)));
+            }
+            if let Some(parked) = self.parked.take() {
+                let _ = parked.send(());
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Deterministic pin for t_577dd385 / t_3fc6be3c: after the merge has
+    /// delivered a prefix and then parks in `FragmentCursor::ensure_peeked` on
+    /// a stalled source, dropping the consumer must still abort the merge. If
+    /// `run_fragment_merge_nway` stops racing the core merge against
+    /// `out_tx.closed()`, this test hangs until the timeout fires.
+    #[tokio::test]
+    async fn nway_merge_consumer_drop_aborts_when_parked_on_stalled_source() {
+        let mut keys = [dk(b"alpha"), dk(b"bravo")];
+        keys.sort();
+
+        let prefix = Partition {
+            key: keys[0].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(0, b"prefix", 1000)],
+        };
+        let stalled = Partition {
+            key: keys[1].clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(0, b"stalled", 1000)],
+        };
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let stalled_stream = OneFragmentThenPending {
+            first: Some(stalled),
+            parked: Some(parked_tx),
+        };
+        let cursors: Vec<FragmentCursor<BoxedFragmentStream>> = vec![
+            FragmentCursor::new(stream_of(vec![prefix])).boxed(),
+            FragmentCursor::new(stalled_stream).boxed(),
+        ];
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let driver = tokio::spawn(async move { run_fragment_merge_nway(cursors, 1, tx).await });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("merge must deliver the finite prefix before parking")
+            .expect("merge output channel must stay open until the prefix is delivered")
+            .expect("prefix fragment must be successful");
+        assert_eq!(first.key, keys[0]);
+        assert_eq!(first.rows.len(), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), parked_rx)
+            .await
+            .expect("merge must park on the stalled source after delivering the prefix")
+            .expect("stalled source must signal the parked poll");
+
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver)
+            .await
+            .expect("consumer drop must abort the merge while it is parked on a stalled source")
+            .expect("merge task must not panic");
+    }
+
     /// Bug B regression over REAL captured typed_edges SSTables (t_paging_cursor).
     ///
     /// Loads each of the 3 nodes' real SSTable set, builds one per-node
