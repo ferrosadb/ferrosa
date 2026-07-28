@@ -4,7 +4,8 @@ status: implemented
 last_updated: 2026-07-03
 executive_summary: >
   The distribution layer that turns single-node ferrosa-storage engines into a
-  cluster: Raft metadata consensus (openraft 0.9 fork with PreVote + CheckQuorum),
+  cluster: Raft metadata consensus (openraft 0.9 fork with CheckQuorum; a PreVote
+  gate exists in the fork but defaults OFF until its network transport is built),
   tunable-CL read/write coordination with write backpressure and read repair, the
   Standalone→Pair→Forming→Cluster formation state machine, Merkle anti-entropy
   repair + hinted handoff, and Accord strict-serializable transactions. Consensus
