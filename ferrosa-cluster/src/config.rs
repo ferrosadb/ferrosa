@@ -57,9 +57,21 @@ pub struct ClusterConfig {
     /// Raft maximum election timeout in milliseconds. Default: 2000.
     pub raft_election_timeout_max_ms: u64,
     /// Whether to enable PreVote (Ongaro §9.6) — ferrosa fork extension per
-    /// ADR-012. Default: `true` (ferrosa default; upstream openraft 0.9 is
-    /// `false`). Override with `FERROSA_RAFT_ENABLE_PRE_VOTE=false` to fall
-    /// back to upstream behavior.
+    /// ADR-012. Default: `false`.
+    ///
+    /// ADR-012 intended this ON, but the pre-vote gate is only half-built: the
+    /// pinned openraft fork hard-gates the tick election path behind a pre-vote
+    /// round (`run_pre_vote_round()` calls `RaftNetwork::pre_vote()`), yet
+    /// `FerrosRaftNetwork` (raft/network.rs) does NOT override `pre_vote`, so the
+    /// default trait impl returns an "unimplemented" NetworkError that counts as
+    /// a NO vote. In any multi-voter cluster a pre-vote quorum is therefore
+    /// structurally impossible: after the seed's single initialize()-driven
+    /// election at term 1, NO further election can ever fire, and a transient
+    /// vote loss becomes a PERMANENT formation stall (candidate frozen at
+    /// term=1). Enabling pre-vote here only SUBTRACTS liveness until the network
+    /// transport exists. See forge t_b0aac0d3 (root cause) and t_32cb5ad3 (the
+    /// stalled fork epic that must land the `pre_vote` transport before this
+    /// flips back on). Override with `FERROSA_RAFT_ENABLE_PRE_VOTE=true`.
     pub raft_enable_pre_vote: bool,
     /// CheckQuorum step-down ratio (Ongaro §6.4) — ferrosa fork extension per
     /// ADR-012. Default: `0.75` (ferrosa default; upstream openraft 0.9
@@ -116,7 +128,7 @@ impl Default for ClusterConfig {
             raft_heartbeat_ms: 300,
             raft_election_timeout_min_ms: 3000,
             raft_election_timeout_max_ms: 6000,
-            raft_enable_pre_vote: true,
+            raft_enable_pre_vote: false,
             raft_check_quorum_ratio: 0.75,
             per_dc_overrides: BTreeMap::new(),
         }
@@ -309,13 +321,20 @@ mod tests {
         assert!(config.auto_join);
     }
 
-    /// W3.12 / ADR-012: ferrosa defaults flip the openraft knobs ON.
+    /// W3.12 / ADR-012: CheckQuorum is on by default; PreVote is intentionally
+    /// OFF until its network transport exists.
     #[test]
     fn default_raft_correctness_knobs_match_adr_012() {
         let config = ClusterConfig::default();
+        // ADR-012 intended PreVote ON, but until FerrosRaftNetwork overrides
+        // `pre_vote` the fork's tick election gate only SUBTRACTS liveness (any
+        // multi-voter election becomes structurally unwinnable — forge
+        // t_b0aac0d3). It stays OFF; election-storm mitigation remains the
+        // election_guard watchdog, not pre-vote.
         assert!(
-            config.raft_enable_pre_vote,
-            "ADR-012: PreVote must be on by default in ferrosa builds"
+            !config.raft_enable_pre_vote,
+            "PreVote must default OFF until FerrosRaftNetwork implements the \
+             pre_vote transport (forge t_b0aac0d3 / t_32cb5ad3)"
         );
         assert_eq!(
             config.raft_check_quorum_ratio, 0.75,
