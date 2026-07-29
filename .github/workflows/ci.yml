@@ -103,9 +103,18 @@ jobs:
           # repair fuzz harness (ferrosa-storage `fuzz-fileio` feature, on under
           # --all-features) from the per-PR gate; it runs deeply in
           # nightly-fuzz.yml. Add new tests/repair_fuzz.rs properties to both.
+          # `accord::perf_regression` asserts ABSOLUTE wall-clock bounds (e.g.
+          # a 1000-message ReorderBuffer drain under 10 ms). On a contended
+          # shared runner — especially a merge-group build running several jobs
+          # at once — that measures the runner, not the code: it was observed at
+          # 52.8 ms and ejected a DOCS-ONLY PR from the merge queue
+          # (forge t_430e21f7). The thresholds are UNCHANGED and still enforced,
+          # nightly, in nightly-fuzz.yml's `perf-regression` job where the
+          # machine is not competing with the rest of the PR gate. Keep the two
+          # in sync: a new perf assertion added here must run there.
           cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -- --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+            -- --skip accord::perf_regression --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
                --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
