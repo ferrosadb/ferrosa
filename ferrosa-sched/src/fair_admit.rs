@@ -450,13 +450,29 @@ mod tests {
         let served: Arc<Mutex<Map<GroupId, u64>>> = Arc::new(Mutex::new(Map::new()));
         let total = Arc::new(AtomicUsize::new(0));
         const BUDGET: usize = 6000;
+        const SCANS: usize = 4;
+
+        // All four scans must be RUNNING before any of them consumes the shared
+        // budget. Without this, the measurement is a thread-start race, not a
+        // fairness measurement: `spawn_blocking` threads start at the OS's
+        // discretion, so on a loaded/low-core machine one group could drain
+        // most of the budget before the other group's thread had started at
+        // all — producing a ratio that says nothing about admission fairness.
+        // Observed as a real CI failure (ratio 2.26, forge t_ffb53cf9).
+        //
+        // The barrier equalizes the START, not the outcome: the 0.5..=2.0 bound
+        // is unchanged and every rescheduling decision is still made by the
+        // live admission path.
+        let start_line = Arc::new(std::sync::Barrier::new(SCANS));
 
         let run = |group: GroupId| {
             let admit = admit.clone();
             let handle = handle.clone();
             let served = served.clone();
             let total = total.clone();
+            let start_line = start_line.clone();
             tokio::task::spawn_blocking(move || {
+                start_line.wait();
                 let id = slot(handle.block_on(admit.admit(
                     group,
                     GW,
@@ -472,6 +488,7 @@ mod tests {
         };
         // Group 1: three scans (the "gaming" tenant); group 2: one scan.
         let tasks = vec![run(1), run(1), run(1), run(2)];
+        assert_eq!(tasks.len(), SCANS, "barrier party count must match scans");
         for t in tasks {
             t.await.unwrap();
         }
