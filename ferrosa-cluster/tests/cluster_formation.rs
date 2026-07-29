@@ -1,22 +1,33 @@
-//! Integration test for 3-node cluster formation via progressive join.
-//!
-//! This test exposes a bug where a fresh 3-node Raft cluster cannot elect a
-//! leader. See specs/bug-cluster-formation-raft-election-failure.md for the
-//! full bug report.
+//! Integration tests for 3-node cluster formation via progressive join.
 //!
 //! Expected behavior:
 //!   - Node1 starts standalone, transitions to pair when node2 connects,
 //!     then to cluster when node3 connects.
-//!   - A Raft leader is elected within a reasonable time (~10s).
-//!   - All 3 nodes agree on the leader.
+//!   - The seed (highest UUID) calls `raft.initialize()`; a Raft leader is
+//!     elected within a reasonable time and all 3 nodes agree on it.
 //!   - DDL operations (e.g., CREATE KEYSPACE) succeed through Raft.
 //!
-//! Actual behavior (the bug):
-//!   - All 3 nodes start elections simultaneously.
-//!   - Candidates each get their own vote but never win quorum (need 2 of 3).
-//!   - Terms increment slowly (T1 -> T19 in ~90s) but no leader is elected.
-//!   - Vote RPCs timeout at 3s despite TCP connectivity being fine.
-//!   - Node3 may be rejected with "peer not approved to join cluster".
+//! Formation-stall bug these tests now guard against (fixed):
+//! `specs/implemented/bug-cluster-formation-pre-vote-election-stall.md`.
+//!
+//!   - `raft_enable_pre_vote` defaulted to `true`, but `FerrosRaftNetwork`
+//!     never implemented the `pre_vote` RPC. The pinned openraft fork
+//!     hard-gates the tick election path behind a pre-vote round, so every
+//!     `pre_vote()` returned an "unimplemented" NetworkError counted as a NO
+//!     vote — a pre-vote quorum was structurally impossible.
+//!   - Consequence: after the seed's single `initialize()`-driven election at
+//!     term 1, NO further election could ever fire. A transient first-round
+//!     vote loss (e.g. a peer whose raft was not yet built) froze the
+//!     candidate at term=1 for the whole formation window instead of
+//!     self-healing on the next election timeout.
+//!   - It hid under debug logging: verbose synchronous log writes on the raft
+//!     path shift the timing enough to paper over the initial vote loss, so
+//!     the stall only reproduced in quiet, CPU-starved runs (~3% on a shared
+//!     vCPU). The metrics-watch timeline recorder below exists precisely to
+//!     capture the election story WITHOUT that perturbation.
+//!   - Fix: default `raft_enable_pre_vote` to `false` until the transport is
+//!     implemented (tracked separately). `candidate_re_campaigns_while_peers_are_down`
+//!     is the regression guard on election-timer liveness.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,6 +49,75 @@ use ferrosa_storage::{CommitLogConfig, CompactionConfig};
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/// Install a tracing subscriber so `RUST_LOG` reaches raft/cluster spans.
+///
+/// Without this the whole crate's `tracing::` output is discarded, which is
+/// why a formation failure in CI prints only the final metrics line and
+/// nothing about the vote round that produced it.
+fn init_test_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::EnvFilter;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+/// A recorded Raft state transition, used to reconstruct what an election
+/// actually did on failure.
+type Timeline = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Watch a node's Raft metrics and record every distinct state transition.
+///
+/// This exists instead of `RUST_LOG=openraft=debug` on purpose: verbose
+/// logging does synchronous formatted writes on the Raft path, which shifts
+/// the timing enough to hide the formation race entirely (20/20 passes with
+/// debug logging vs ~17% failures without). Sampling the metrics watch channel
+/// records the same election story without perturbing it.
+fn spawn_timeline_recorder(controller: Arc<ModeController>, host_id: Uuid, timeline: Timeline) {
+    tokio::spawn(async move {
+        // ONE epoch shared by all nodes. Per-node epochs are useless here:
+        // the nodes are started sequentially, so per-node-relative stamps
+        // cannot be interleaved into a single causal story (an earlier
+        // version of this recorder did exactly that and produced an
+        // apparent impossibility — peers voting for a node before it
+        // existed — that was purely an artifact of mismatched origins).
+        static EPOCH: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+        let start = *EPOCH.get_or_init(tokio::time::Instant::now);
+        let mut last = String::new();
+        loop {
+            if let Some(raft) = controller.raft() {
+                let m = raft.metrics().borrow().clone();
+                // `inst` is the Arc identity of the Raft instance. If this
+                // changes, the node REBUILT its raft (e.g. across a mode
+                // transition) — a second instance replaying a term the peers
+                // have already voted in cannot win, because openraft grants
+                // only on a strictly greater vote.
+                let cur = format!(
+                    "inst={:p} term={:?} state={:?} leader={:?} vote={:?} last_log={:?}",
+                    Arc::as_ptr(&raft),
+                    m.current_term,
+                    m.state,
+                    m.current_leader,
+                    m.vote,
+                    m.last_log_index,
+                );
+                if cur != last {
+                    let ms = start.elapsed().as_millis();
+                    timeline
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("  +{ms:>6}ms [{host_id}] {cur}"));
+                    last = cur;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+}
 
 /// Create a StorageEngine with a temp directory.
 fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
@@ -106,6 +186,7 @@ struct TestClusterNode {
     peer_manager: Arc<PeerManager>,
     host_id: Uuid,
     bound_addr: SocketAddr,
+    timeline: Timeline,
     _dir: tempfile::TempDir,
 }
 
@@ -154,6 +235,9 @@ impl TestClusterNode {
         let server = Arc::new(RpcServer::new((*net_config).clone(), host_id, registry));
         let addr = server.start_and_get_addr().await.unwrap();
 
+        let timeline: Timeline = Arc::new(std::sync::Mutex::new(Vec::new()));
+        spawn_timeline_recorder(controller.clone(), host_id, timeline.clone());
+
         Self {
             controller,
             _handles: handles,
@@ -161,6 +245,7 @@ impl TestClusterNode {
             peer_manager: pm,
             host_id,
             bound_addr: addr,
+            timeline,
             _dir: dir,
         }
     }
@@ -201,9 +286,28 @@ impl TestClusterNode {
                 // Diagnostic on timeout: print Raft state for each node.
                 if let Some(raft) = self.controller.raft() {
                     let m = raft.metrics().borrow().clone();
+                    // Membership + vote are what separate the failure modes:
+                    // a stuck candidate at a FROZEN term means elections
+                    // stopped, whereas a climbing term means votes are being
+                    // rejected. `voter_ids` shows whether the peers were ever
+                    // promoted out of Learner.
                     eprintln!(
-                        "[{}] election timeout: term={:?} state={:?} leader={:?}",
-                        self.host_id, m.current_term, m.state, m.current_leader,
+                        "[{}] election timeout: term={:?} state={:?} leader={:?} \
+                         vote={:?} last_log={:?} voters={:?} learners={:?}",
+                        self.host_id,
+                        m.current_term,
+                        m.state,
+                        m.current_leader,
+                        m.vote,
+                        m.last_log_index,
+                        m.membership_config
+                            .membership()
+                            .voter_ids()
+                            .collect::<Vec<_>>(),
+                        m.membership_config
+                            .membership()
+                            .learner_ids()
+                            .collect::<Vec<_>>(),
                     );
                 } else {
                     eprintln!("[{}] election timeout: Raft instance is NONE", self.host_id);
@@ -281,6 +385,7 @@ mod harness_slot;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_elects_raft_leader() {
+    init_test_tracing();
     let _slot = harness_slot::acquire_harness_slot().await;
     // Use deterministic UUIDs so the test is reproducible.
     // Node1 has the highest UUID so it becomes Primary in pair mode,
@@ -397,13 +502,39 @@ async fn three_node_cluster_elects_raft_leader() {
         leader_on_node1, leader_on_node2, leader_on_node3
     );
 
+    if leader_on_node1.is_none() {
+        eprintln!("=== Raft state timeline (all nodes, transitions only) ===");
+        let mut all: Vec<String> = Vec::new();
+        for n in [&node1, &node2, &node3] {
+            all.extend(
+                n.timeline
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            );
+        }
+        // Interleave by the +NNNNms prefix so the three nodes read as one story.
+        all.sort_by_key(|l| {
+            l.split_once('+')
+                .and_then(|(_, r)| r.split_once("ms"))
+                .and_then(|(ms, _)| ms.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+        for line in all {
+            eprintln!("{line}");
+        }
+        eprintln!("=== end timeline ===");
+    }
+
     // Assert a leader was elected on at least one node
     assert!(
         leader_on_node1.is_some(),
-        "BUG: No Raft leader elected on node1 within {election_timeout:?}. \
-         This indicates the cluster formation race condition where all nodes \
-         start elections simultaneously and split votes indefinitely. \
-         See specs/bug-cluster-formation-raft-election-failure.md"
+        "No Raft leader elected on node1 within {election_timeout:?}. If the \
+         seed froze at term=1 while its peers were reachable, suspect a \
+         regression of the pre-vote election-stall (an election gate with no \
+         network transport). See \
+         specs/implemented/bug-cluster-formation-pre-vote-election-stall.md"
     );
 
     let leader = leader_on_node1.unwrap();
@@ -462,6 +593,106 @@ async fn three_node_cluster_elects_raft_leader() {
     node1.shutdown().await;
     node2.shutdown().await;
     node3.shutdown().await;
+}
+
+/// A seed whose two peers never come up must keep re-campaigning.
+///
+/// This is the election-timer liveness guard for the pre-vote formation stall
+/// (forge t_b0aac0d3). The seed (highest UUID) transitions standalone → pair →
+/// cluster off two `on_peer_connected` notifications for peers that were never
+/// started (no RPC server, no pool), then calls `raft.initialize()` with a
+/// 3-voter membership. It cannot win — quorum is 2 and the peers are down — so
+/// the ONLY correct behavior is to keep firing elections, bumping `current_term`
+/// past 1 on every election-timeout tick. That is what lets a transient vote
+/// loss self-heal once a peer's raft finally exists.
+///
+/// The oracle asserts election-timer liveness (`current_term > 1`), NOT
+/// leadership — a lone seed can never lead a 3-voter cluster.
+///
+/// FAILS on `raft_enable_pre_vote == true`: the fork's tick election path
+/// hard-gates `engine.elect()` behind `run_pre_vote_round()`, which calls
+/// `FerrosRaftNetwork::pre_vote()`. That method is not overridden, so the
+/// default trait impl returns an "unimplemented" NetworkError counted as a NO
+/// vote. A pre-vote quorum is then structurally impossible, every tick election
+/// is suppressed, and the seed freezes at `term == 1` for the whole window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn candidate_re_campaigns_while_peers_are_down() {
+    init_test_tracing();
+    let _slot = harness_slot::acquire_harness_slot().await;
+
+    // The single live node has the HIGHEST UUID, so it is the Raft seed and is
+    // the node that calls raft.initialize() with the full 3-voter membership.
+    let seed_id = Uuid::from_bytes([0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let down_peer_a = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    let down_peer_b = Uuid::from_bytes([0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+
+    let seed = TestClusterNode::start(seed_id).await;
+
+    // Two peers that were never started: valid, unreachable localhost addrs with
+    // no RPC server behind them and no pool registered in the PeerManager. Vote
+    // RPCs to them fail fast, exactly like peers whose raft is not yet built.
+    let down_addr_a: SocketAddr = "127.0.0.1:59102".parse().unwrap();
+    let down_addr_b: SocketAddr = "127.0.0.1:59103".parse().unwrap();
+
+    // Drive the seed's state machine directly: standalone → pair (peer A) →
+    // forming → cluster (peer B). At the cluster transition the seed sees a
+    // 3-member set {seed, A, B}, wins the highest-UUID seed election, and calls
+    // raft.initialize().
+    seed.controller
+        .on_peer_connected((down_peer_a, down_addr_a));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    seed.controller
+        .on_peer_connected((down_peer_b, down_addr_b));
+
+    // Poll the seed's raft metrics until its term advances past 1 (the healthy
+    // outcome: elections keep firing) or the deadline elapses (the stall: term
+    // frozen at 1). The seed retries ClusterInvite delivery + pool
+    // establishment to the two down peers BEFORE building the raft and calling
+    // initialize(), so the raft is not even constructed for ~20s (observed).
+    // The deadline is set well past that build window plus several 500-1000ms
+    // election cycles so machine-load variance in the pre-init phase can't
+    // masquerade as a dead election timer. The healthy path breaks out the
+    // instant term crosses 1, so this generous bound only costs wall time on a
+    // genuine (failing) stall.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_term: u64 = 0;
+    let advanced = loop {
+        if let Some(raft) = seed.controller.raft() {
+            last_term = raft.metrics().borrow().current_term;
+            if last_term > 1 {
+                break true;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    if !advanced {
+        eprintln!("=== seed raft timeline (transitions only) ===");
+        for line in seed
+            .timeline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            eprintln!("{line}");
+        }
+        eprintln!("=== end timeline ===");
+    }
+
+    assert!(
+        advanced,
+        "seed's raft term never advanced past 1 (last observed term={last_term}): \
+         the election timer is dead. With pre-vote enabled but no pre_vote network \
+         transport, the fork's tick election path gates elect() behind a pre-vote \
+         round that can never reach quorum, so a transient vote loss becomes a \
+         permanent formation stall. See forge t_b0aac0d3 / \
+         specs/implemented/bug-cluster-formation-pre-vote-election-stall.md"
+    );
+
+    seed.shutdown().await;
 }
 
 /// Minimal test: verify that ModeController transitions through

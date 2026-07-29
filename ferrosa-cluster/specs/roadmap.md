@@ -178,8 +178,15 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 - **Retire the election-storm safety nets once Jepsen is clean (CL-2).**
   `election_guard.rs` (W4.11) and `snapshot_pusher.rs` (W4.12) are explicitly
-  marked for deletion after a clean Jepsen window against the PreVote+CheckQuorum
-  build. Do not remove before CL-1 closes; track the two-week clean-window gate.
+  marked for deletion after a clean Jepsen window. Do NOT remove before CL-1
+  closes — and note the guard is currently load-bearing, not redundant, because
+  PreVote is disabled (CL-15): its network transport is unimplemented, so the
+  build runs CheckQuorum-only. Track the two-week clean-window gate.
+- **Implement the PreVote network transport, then re-enable it (CL-15).**
+  Override `FerrosRaftNetwork::pre_vote` (`raft/network.rs`) and the fork's
+  `PreCandidate` engine path so `raft_enable_pre_vote` can default back on
+  (forge t_32cb5ad3). Until then pre-vote only subtracts liveness — see
+  `specs/implemented/bug-cluster-formation-pre-vote-election-stall.md`.
 - **Make write backpressure observable and tunable (CL-3).** `WRITE_CONCURRENCY_LIMIT`
   (128) is a hard constant. Add an admission/queue-depth metric and consider a
   configurable / per-tenant limit so operators can trade Raft-protection headroom

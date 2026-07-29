@@ -860,3 +860,382 @@ symbol = "split_sorted_partitions_into_shards"
 reason = "re-chunks an already-materialized, flush-threshold-bounded Vec<Partition> into disjoint per-shard owned Vecs for parallel rayon SSTable encode; no new scan materialization, owned chunks inherent to cross-thread hand-off."
 owner = "bkearns"
 expires = "2027-07-01"
+
+# ---------------------------------------------------------------------------
+# Group 3 — baseline for crates that entered audit scope in t_2487eeb7
+#
+# `AUDIT_CRATES` went from 6 crates to 15, and the `returns-vec-partition-or-row`
+# rule gained the `Vec<VirtualRow>` shape. Together those surfaced 82 findings.
+# They are PRE-EXISTING materialization that the gate simply could not see — not
+# new regressions introduced by this change.
+#
+# These entries are deliberately marked NOT INDIVIDUALLY TRIAGED. They do not
+# assert the sites are safe; they record that the gate now sees them and that
+# classification is owed. The expiry is short (2026-10-01) so they fail the gate
+# rather than becoming a permanent rubber stamp. Triage is forge t_a49d88c3;
+# the one confirmed class-A site is forge t_250fa355.
+# ---------------------------------------------------------------------------
+
+[[allow]]
+path = "ferrosa-cql/src/observability.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: same fixed counter-label snapshot as the sibling finding."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/observability.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: metrics.snapshot() is a fixed set of named counter labels."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/active_queries.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per in-flight query, bounded by concurrency/connection count."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/alerts.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per active alert, bounded by configured alert rules."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/billing.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED - VERIFIED: buckets are capped by MAX_BUCKETS with evict_oldest() at billing.rs:79-80. Initially suspected unbounded (tenant x keyspace x minute); the eviction refutes it."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/connections.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per open connection, bounded by max connections."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/consolidation_status.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per active consolidation job (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/full_scan_reasons.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: deduped per (keyspace, table, predicate_column) with count+last_seen, so schema-bounded."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/index_usage.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per index = schema (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/materialization.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: read() wraps visit_rows over queue/status snapshots; bounded by queue depth and number of MVs."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/peers_v2.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per peer = cluster size."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/query_fingerprints.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED - VERIFIED: entries capped by MAX_ENTRIES=10_000 with evict_lowest() at query_fingerprints.rs:74-75. Initially suspected attacker-amplifiable via distinct query shapes; the cap refutes it."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/rrd_runtime_settings.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: fixed runtime-settings set (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/stubs.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: stub/fixed rows (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-cql/src/virtual_tables/table_access.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: counters keyed by (keyspace, table) = schema."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-flight/src/convert.rs"
+rule = "cqlvalue-row-accumulation"
+reason = "t_a49d88c3 TRIAGED: BOUNDED - VERIFIED: decode/build of ONE inbound Arrow RecordBatch; outer dim is tuple/UDT arity. query_to_batch uses page_size=1 (schema only), so no single giant batch."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/observer.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: capacity is the partition-key/clustering component count (schema arity, ~1-5), not result size."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/reconcile.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row cloned per single-mutation write(); never accumulated."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/adjacency/reconcile.rs"
+rule = "materializing-range-read-call-site"
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-graph/src/bolt/codec.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3 TRIAGED: BOUNDED for query data: one Bolt frame's element count, not query-sized. NOTE the wire-declared count is a pre-auth allocation-amplification issue tracked separately as t_3e665492."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/bolt/server.rs"
+rule = "copies-row-data-arg"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: extend is guarded by the explicit fail-loud max_message_size check at server.rs:627."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/engine.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: copies an already-materialized GraphResult, bounded by config.max_result_rows."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: a single row per write(), reused after the clone."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: row.get(idx).cloned()/.copied() over an Option is one cell, not a stream chain."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "materializing-range-read-call-site"
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "returns-vec-partition-or-row"
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_250fa355; delete this entry when the call site streams."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: streaming SET/REMOVE loops consume rows one at a time; push targets a per-column assignment vec sized by SET-clause arity, not the stream."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/expand.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: composite/clustering key component count (schema arity), not result size."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/leapfrog.rs"
+rule = "materializing-range-read-call-site"
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/stream.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3 TRIAGED: collect_to_graph_result breaks at max_rows. collect_rows is uncapped BY DESIGN (the caller bounds the stream so the limit stops upstream production); its 3 production callers are under verification in t_daf898e1."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-graph/src/executor/varpath.rs"
+rule = "materializing-range-read-call-site"
+reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-graph/src/http.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: SUBSCRIBE delta snapshot is one result copy bounded by config.max_result_rows, replaced each tick rather than accumulated."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-postgres/src/catalog.rs"
+rule = "collect-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: pg_namespace/pg_class/pg_type are schema-sized (per keyspace, per table, fixed type universe)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-postgres/src/storage_provider.rs"
+rule = "stream-push-accumulation"
+reason = "CONFIRMED REAL materialization. Tracked for fix as t_f348ba0b; delete this entry when the path is bounded or streamed."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-schema/src/system/aggregate_tables.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: per-aggregate/per-table system rows = schema (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/executor.rs"
+rule = "clone-in-scan-closure"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: per-row projection copy, bounded by projection arity x the LIMIT window."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/executor.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3 TRIAGED: NOT A SILENT CAP: crossing max_rows raises SparqlError::Execution — a loud error, never a truncation. It is a fail-loud resource bound that PREVENTS OOM. The genuine streaming work (pipelining the nested-loop join) is separate."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sparql/src/property_path.rs"
+rule = "stream-push-accumulation"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: the scan streams; the pairs buffer is bounded by max_rows with a loud error. A BFS transitive closure must buffer."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sql/src/exec.rs"
+rule = "returns-vec-partition-or-row"
+reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-sql/src/plan.rs"
+rule = "collect-vec-partition-or-row"
+reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-sql/src/plan.rs"
+rule = "returns-vec-partition-or-row"
+reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
+owner = "storage"
+expires = "2026-09-15"
+
+[[allow]]
+path = "ferrosa-sql/src/provider.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: InMemoryTable::scan is a lazy iter().cloned(), one row at a time; no simultaneous materialization."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "copies-row-data-arg"
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: Arc::clone(chunk) is a refcount bump, not a data copy."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: read_partitions_limited/_rows are bounded by their limit args; the streaming partitions_iter exists and the docs steer full-table callers to it."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE - INVERTED: PARTITION_TOKEN_SUMMARY_MAX_ENTRIES DOWNSAMPLES the token summary so reader memory does NOT scale with table size. It is a memory-bounding ceiling, the opposite of a result cap."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/reader.rs"
+rule = "with-capacity-limit"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: with_capacity(limit) matching the same caller-supplied limit."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/trie/walker.rs"
+rule = "server-side-result-cap"
+reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: MAX_NODE_READ=2560 is a fixed single-trie-node read buffer size, unrelated to result counts."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-sstable/src/writer.rs"
+rule = "clone-on-row-data"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: clones serialized SSTable index-component bytes for the verify-reopen, bounded by one flush-sized SSTable (memtable threshold). Efficiency nit only: could borrow/Arc."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-storage/src/index/virtual_table.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: one row per index = schema (registry pattern; not individually opened)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-storage/src/virtual_tables.rs"
+rule = "returns-vec-partition-or-row"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: collect_stats() is one row per table = schema."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-view/src/delta.rs"
+rule = "clone-in-scan-closure"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: projected_columns is per-row, bounded by selected column count (schema arity)."
+owner = "storage"
+expires = "2026-10-01"
+
+[[allow]]
+path = "ferrosa-view/src/delta.rs"
+rule = "cloned-stream-elements"
+reason = "t_a49d88c3 TRIAGED: BOUNDED: view_pk_values is per-row, bounded by view PK column count (schema arity)."
+owner = "storage"
+expires = "2026-10-01"

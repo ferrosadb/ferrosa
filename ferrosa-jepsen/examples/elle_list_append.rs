@@ -23,7 +23,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -66,15 +66,26 @@ async fn main() -> Result<()> {
         .known_nodes([&contact])
         .build()
         .await?;
-    let target = probe
-        .get_cluster_state()
-        .get_nodes_info()
-        .iter()
-        .min_by_key(|n| n.host_id)
-        .cloned()
-        .context("no known nodes")?;
+    // ALL nodes, in a stable order, so workers spread across the cluster.
+    //
+    // This used to be `min_by_key(host_id)` — one node coordinated 100% of the
+    // workload. Two consequences, both bad:
+    //   - a fault that takes out that node removes ALL traffic, so a rejoining
+    //     node has nothing to be tested against (which made the coordinator
+    //     restart fault in certify-nemesis.sh unable to produce evidence);
+    //   - concurrent transactions were only ever coordinated by ONE node, so
+    //     cross-coordinator Accord ordering — precisely where disagreements
+    //     would show up — went unexercised by the certification.
+    let mut nodes: Vec<_> = probe.get_cluster_state().get_nodes_info().to_vec();
+    nodes.sort_by_key(|n| n.host_id);
+    if nodes.is_empty() {
+        anyhow::bail!("no known nodes");
+    }
+    eprintln!("pinning {workers} workers across {} node(s)", nodes.len());
+    let target = nodes[0].clone();
     drop(probe);
 
+    // Schema setup runs on ONE session; only the workers spread.
     let session = Arc::new(connect_pinned(&contact, &target).await?);
 
     // Fresh schema. RF=3 so cluster mode is active and reads route through Accord.
@@ -104,7 +115,10 @@ async fn main() -> Result<()> {
 
     let mut handles = Vec::new();
     for w in 0..workers {
-        // Each worker gets its OWN pinned connection ⇒ its own transaction state.
+        // Each worker gets its OWN pinned connection ⇒ its own transaction state,
+        // and workers round-robin across nodes so no single node carries the
+        // whole workload.
+        let target = nodes[(w as usize) % nodes.len()].clone();
         let mut session = Arc::new(connect_pinned(&contact, &target).await?);
         let history = history.clone();
         let next_val = next_val.clone();
@@ -199,17 +213,41 @@ async fn main() -> Result<()> {
                                 .or_insert(0) += 1;
                             // Best-effort abort of the (possibly still-open) txn by id
                             // so a lingering entry cannot block this connection's next
-                            // BEGIN via the shim binding. Reconnect only if even that
-                            // fails. If BEGIN itself failed there is no id to roll back.
-                            if let Some(id) = txn_id_opt {
-                                if session
+                            // BEGIN via the shim binding. If BEGIN itself failed there
+                            // is no id to roll back.
+                            let rollback_failed = match &txn_id_opt {
+                                Some(id) => session
                                     .query_unpaged(format!("ROLLBACK TRANSACTION {id}"), &[])
                                     .await
-                                    .is_err()
-                                {
-                                    if let Ok(fresh) = connect_pinned(&contact, &target).await {
-                                        session = Arc::new(fresh);
-                                    }
+                                    .is_err(),
+                                None => false,
+                            };
+
+                            // Replace a DEAD SESSION regardless of which statement
+                            // failed.
+                            //
+                            // This used to live inside `if let Some(id)`, so a session
+                            // was only ever replaced when BEGIN had already SUCCEEDED.
+                            // That is exactly backwards: when the connection dies,
+                            // BEGIN is the statement that fails, so there is no txn id
+                            // and the broken session was never replaced. The worker
+                            // then spun its entire remaining op budget against a corpse.
+                            //
+                            // Measured cost of that gap on a fault-injected run: 38,543
+                            // of 61,564 failures were `BEGIN: No connections in the
+                            // pool: The pool is broken`, i.e. one network disruption
+                            // early in the run permanently killed every worker and left
+                            // Elle checking a history that was 96% connection errors —
+                            // a vacuous `valid? true`.
+                            //
+                            // Earlier certifications never hit this because the
+                            // generator ran ON the coordinator against localhost, which
+                            // survives peer-level ip6tables rules. Any off-node
+                            // generator (needed to fault-inject the coordinator itself)
+                            // depends on this reconnect.
+                            if rollback_failed || is_session_dead(&why) {
+                                if let Ok(fresh) = connect_pinned(&contact, &target).await {
+                                    session = Arc::new(fresh);
                                 }
                             }
                             failures.fetch_add(1, Ordering::Relaxed);
@@ -248,7 +286,21 @@ async fn main() -> Result<()> {
                                 edn_txn(w, ":ok", ":txn", &format!("[[:r {k} [{elems}]]]")),
                             );
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            // Reads need the same dead-session handling as appends,
+                            // and for the same reason: a broken pool otherwise fails
+                            // every remaining read for the rest of the run.
+                            let why = format!("READ: {e}");
+                            *errors
+                                .lock()
+                                .unwrap()
+                                .entry(normalize_err(":fail", &why))
+                                .or_insert(0) += 1;
+                            if is_session_dead(&why) {
+                                if let Ok(fresh) = connect_pinned(&contact, &target).await {
+                                    session = Arc::new(fresh);
+                                }
+                            }
                             failures.fetch_add(1, Ordering::Relaxed);
                             log(
                                 &history,
@@ -327,6 +379,26 @@ fn log(history: &Arc<Mutex<Vec<Event>>>, e: Event) {
 
 /// Collapse a failure to a stable category so similar errors tally together:
 /// the op kind plus the message with digit runs replaced by `#` (partition keys,
+/// Does this failure mean the SESSION itself is unusable, rather than the single
+/// statement having failed?
+///
+/// A dead session must be replaced or the worker issues every remaining op
+/// against a broken pool. The scylla driver surfaces these as connection/pool
+/// errors; a server-side rejection (invalid query, insufficient replicas) leaves
+/// the session perfectly usable and must NOT trigger a reconnect, since
+/// needlessly rebuilding a session mid-run would discard transaction state that
+/// the pinned-connection model depends on.
+fn is_session_dead(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    w.contains("pool is broken")
+        || w.contains("no connections in the pool")
+        || w.contains("connection broken")
+        || w.contains("connection refused")
+        || w.contains("connection reset")
+        || w.contains("broken pipe")
+        || w.contains("failed to read the frame header")
+}
+
 /// timestamps, node ids vary per op but the failure class does not) and
 /// truncated. Only digits are replaced, so error words stay readable.
 fn normalize_err(kind: &str, why: &str) -> String {
@@ -352,5 +424,51 @@ fn decode_int_list(col: Option<&Option<CqlValue>>) -> Vec<i64> {
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_session_dead;
+
+    /// The failure texts that actually dominated a fault-injected run. Each left
+    /// the session unusable, and each was previously NOT reconnected because the
+    /// reconnect was gated on a transaction id existing — which it never does
+    /// when BEGIN is the statement that failed.
+    #[test]
+    fn pool_and_connection_failures_mean_the_session_is_dead() {
+        for why in [
+            "BEGIN: No connections in the pool: The pool is broken; Last connection failed with: Connection broken, reason: ...",
+            "BEGIN: No connections in the pool: The pool is broken; Last connection failed with: Connection refused (os error 61)",
+            "BEGIN: Connection broken, reason: Failed to deserialize frame: Failed to read the frame header: Connection reset by peer",
+            "UPDATE: broken pipe",
+            "READ: connection reset",
+        ] {
+            assert!(is_session_dead(why), "must replace the session for: {why}");
+        }
+    }
+
+    /// Server-side rejections leave the session perfectly usable. Reconnecting on
+    /// these would be actively harmful: rebuilding a session mid-run discards the
+    /// transaction state the pinned-connection model depends on, turning a
+    /// recoverable statement error into a lost transaction.
+    #[test]
+    fn server_side_rejections_do_not_kill_the_session() {
+        for why in [
+            "UPDATE: Database returned an error: Not enough nodes responded to the write request in time to satisfy required consistency",
+            "BEGIN: Database returned an error: The query is syntactically correct but invalid, Error message: nested transactions are not supported",
+            "BEGIN: no txn id in result",
+            "COMMIT: Request execution exceeded a client timeout of 30000ms",
+            "COMMIT: Database returned an error: Internal server error",
+        ] {
+            assert!(!is_session_dead(why), "must NOT replace the session for: {why}");
+        }
+    }
+
+    /// Driver error casing is not a stable contract to depend on.
+    #[test]
+    fn classification_ignores_case() {
+        assert!(is_session_dead("BEGIN: THE POOL IS BROKEN"));
+        assert!(is_session_dead("begin: connection refused"));
     }
 }

@@ -35,7 +35,7 @@ use std::sync::Arc;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    execute, parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
+    parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
     QueryResult, Returning, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
@@ -702,7 +702,17 @@ pub async fn execute_query(
                 Ok(catalog) => catalog,
                 Err(err_msg) => return vec![err_msg],
             };
-            match execute(&select, &catalog, default_schema, &[]) {
+            // Offloaded: the relational executor is synchronous and CPU-bound
+            // (sort/hash-join), so running it inline would pin an async worker
+            // for the whole query — the PR #131 starvation shape. See `offload`.
+            match crate::offload::execute_offloaded(
+                *select,
+                catalog,
+                default_schema.to_string(),
+                Vec::new(),
+            )
+            .await
+            {
                 Ok(result) => render_result(result, &[]), // simple query: all text
                 Err(e) => vec![exec_error_response(&e)],
             }
@@ -712,11 +722,16 @@ pub async fn execute_query(
             Ok(result) => render_result(result, &[]),
             Err(err_msg) => vec![err_msg],
         },
-        // Transaction control routes through Accord; execution is wired
-        // separately (t_0f96cb47). Fail loud rather than fake atomicity.
+        // Unreachable on the server path: `server::execute_simple` intercepts
+        // BEGIN/COMMIT/ROLLBACK and drives them against the session's buffered
+        // write-set (`server::commit_txn`, Accord-backed — FMEA PG-1), and the
+        // extended protocol does the same. This arm only catches a caller that
+        // reaches `dispatch` directly without session state, where there is no
+        // transaction to begin or commit. Failing loud beats silently reporting
+        // a COMMIT that buffered nothing.
         Statement::Begin | Statement::Commit | Statement::Rollback => vec![error_response(
             "0A000",
-            "transactions are not yet implemented (Accord-backed transactions are in progress)",
+            "transaction control requires a session; this path has no transaction state",
         )],
         // Session GUCs are not modeled yet.
         Statement::Set { .. } | Statement::Reset { .. } => vec![error_response(

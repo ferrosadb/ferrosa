@@ -651,7 +651,16 @@ async fn execute_portal(
                     Ok(catalog) => catalog,
                     Err(err) => return vec![session.fail(err)],
                 };
-            let result = ferrosa_sql::execute(&select, &catalog, &ctx.default_schema, &params);
+            // Offloaded for the same reason as the simple-query path: the
+            // relational executor is synchronous and CPU-bound, so running it
+            // inline pins an async worker for the whole sort/join.
+            let result = crate::offload::execute_offloaded(
+                *select,
+                catalog,
+                ctx.default_schema.clone(),
+                params.clone(),
+            )
+            .await;
             let errored = result.is_err();
             let msgs = query::render_execute_result(result, &result_formats);
             // On an execution error, set the skip flag so the rest of the

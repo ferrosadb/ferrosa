@@ -2,14 +2,23 @@
 # Single-DC 3-node Elle strict-serializability cert WITH FAULT INJECTION.
 #
 # The classic Jepsen strict-serializability-under-partition test on the proven
-# 3-node RF=3 fly harness: run the Elle list-append generator on the seed (node1)
-# and, WHILE it runs, fire a nemesis schedule:
+# 3-node RF=3 fly harness: run the Elle list-append generator on node2 (driving
+# node1 over the internal network) and, WHILE it runs, fire a nemesis schedule:
 #   1. partition-one : isolate node3 (drop its traffic to/from node1+node2). The
 #      MAJORITY (node1+node2) retains quorum and keeps committing; node3 falls
 #      behind and catches up on heal. Validates NO split-brain / lost / reordered
 #      writes across a partition — the safety property Elle checks.
 #   2. slow          : add 200ms netem latency on node2+node3 so the coordinator's
 #      commits must wait on a slow replica — validates ordering under WAN latency.
+#   3. restart-replica    : SIGKILL node3 and bring it back.
+#   4. restart-coordinator : SIGKILL node1 — the node the generator drives.
+#      Unlike 1 and 2 these are PROCESS faults, not network ones: nothing
+#      discards local state under a partition, but a killed node returns having
+#      lost all in-flight Accord state (nothing replays the protocol log at
+#      startup) and resumes voting on PreAccept with an EMPTY ConflictIndex.
+#      Tests whether quorum covers that amnesia or whether a restarted node must
+#      be fenced until recovery completes (forge t_66e24bcc). The generator runs
+#      on node2 precisely so fault 4 cannot kill it or its history.
 # Replicates chaos::network primitives (ip6tables/tc) over `flyctl ssh`. RF=3 so a
 # 2/1 partition keeps a quorum available (unlike a 3/3 dual-DC split). Teardown
 # ALWAYS runs (trap). Elle CHECK runs locally afterwards.
@@ -35,10 +44,17 @@ CPU_KIND="${CPU_KIND:-performance}"
 CPUS="${CPUS:-2}"
 MEM="${MEM:-4096}"
 OUT_EDN="${OUT_EDN:-${ROOT_DIR}/deploy/fly-accord-elle/elle-fly-history-nemesis.edn}"
-# Generous ops so the run outlasts the ~155s nemesis schedule (the coordinator-
-# isolation window blocks each in-flight op up to the 30s client timeout, slowing
-# throughput sharply during that phase — so over-provision).
-GEN_ARGS="${GEN_ARGS:-8 700 8 3}"
+# Generous ops so the run outlasts the nemesis schedule. This matters more than
+# it looks: a fault that fires after the generator has finished hits an IDLE
+# cluster and proves nothing, so under-provisioning here silently turns the new
+# restart faults into no-ops while still printing `valid? true`.
+#
+# The two restart faults each BLOCK until the node serves CQL again (up to 300s
+# worst case), so the schedule is now roughly 2-3x the ~155s it was when
+# GEN_ARGS was 8/700/8/3 (which produced 5600 ops). Scaled up accordingly; the
+# post-run check below reports whether the generator actually outlasted the
+# schedule, so a too-short run is visible rather than assumed.
+GEN_ARGS="${GEN_ARGS:-8 8000 8 3}"
 
 log() { printf '\n[nem-cert] %s\n' "$*" >&2; }
 die() { printf '\n[nem-cert][FATAL] %s\n' "$*" >&2; exit 1; }
@@ -160,6 +176,23 @@ for n in 1 2 3; do
   [ -n "${MIDS[$n]}" ] && [ -n "${IPS[$n]}" ] || die "missing id/ip for ferrosa-${n}"
 done
 SEED_ID="${MIDS[1]}"
+# WHERE THE GENERATOR RUNS, and why it is not the node it drives.
+#
+# The fault-free cert runs the generator on the seed against `localhost:9042`.
+# That cannot survive a COORDINATOR restart: the generator is a process on that
+# machine writing its history to that machine's /tmp, so SIGKILLing it would
+# destroy both the run and its evidence.
+#
+# So here the generator runs on node2 — which is never restarted — and drives
+# node1 over the internal network. node1 is then the coordinator under test and
+# can be killed while the generator keeps running and keeps its history.
+#
+# The generator tolerates this by construction: each worker is pinned to one
+# target with NO retry failover (FallthroughRetryPolicy), and a failed BEGIN or
+# UPDATE classifies `:fail` while a failed COMMIT classifies `:info` — never
+# `:fail`, so a write that did land cannot masquerade as one that did not.
+GEN_MID="${MIDS[2]}"
+GEN_TARGET="$(dns "$SEED_ID"):9042"
 log "cluster up (n1=${IPS[1]} n2=${IPS[2]} n3=${IPS[3]}). settling 20s."
 sleep 20
 
@@ -193,6 +226,65 @@ inject_isolate_coordinator() {
 inject_slow() { log "NEMESIS inject slow (200ms on node2+node3)"; for n in 2 3; do nem "${MIDS[$n]}" "tc qdisc add dev eth0 root netem delay 200ms 50ms"; done; }
 heal_slow() { log "NEMESIS heal slow"; for n in 2 3; do nem "${MIDS[$n]}" "tc qdisc del dev eth0 root 2>/dev/null || true"; done; }
 
+# --- Restart fault (forge t_66e24bcc) -------------------------------------
+#
+# WHY: nothing replays the Accord protocol log at startup, so a restarted node
+# comes back with an EMPTY ConflictIndex — no memory of in-flight transactions —
+# and begins serving PreAccept immediately. A replica answers PreAccept with the
+# dependencies it knows about, so an amnesiac replica reports an INCOMPLETE dep
+# set. Whether quorum covers that, or whether a restarted node must be fenced
+# until recovery completes, is the open question this fault exists to answer.
+#
+# Every other fault in this schedule is a NETWORK fault. Process death is a
+# different failure class: the network faults never discard local state, so
+# `valid? true` from the previous certification says nothing about this path.
+#
+# NODE CHOICE: node3, deliberately NOT the seed. The generator runs ON node1 and
+# writes its history to node1's /tmp — restarting node1 would kill the generator
+# mid-run and take the history with it. Restarting a non-coordinator still
+# exercises the amnesia question: node3 returns with no conflict state and
+# resumes voting on PreAccepts from the still-live coordinator. Covering a
+# COORDINATOR restart needs the generator to run off-cluster (or stream its
+# history out) and is tracked separately.
+#
+# SIGKILL, not a graceful restart: a clean shutdown could flush state that a real
+# crash would not, which would test the easy case and hide the one we care about.
+inject_restart() {
+  local n="$1" label="$2"
+  local mid="${MIDS[$n]}"
+  log "NEMESIS inject restart-${label} (SIGKILL node${n}; returns with an empty conflict index)"
+  flyctl machine stop "$mid" --app "$APP" --signal SIGKILL >/dev/null 2>&1 \
+    || log "WARN: stop node${n} failed"
+  sleep 8
+  # Prove the fault actually bit. A no-op fault yields a meaningless green.
+  local st
+  st="$(flyctl machine status "$mid" --app "$APP" 2>/dev/null | grep -iE '^ *State' | head -1)"
+  log "node${n} state after SIGKILL: ${st:-<unknown>}"
+  local t_start t_now
+  t_start=$(date +%s)
+  flyctl machine start "$mid" --app "$APP" >/dev/null 2>&1 || log "WARN: start node${n} failed"
+  # Wait for it to serve again. A node that never rejoins silently degrades the
+  # run to 2 nodes, which is a WEAKER test, not a pass.
+  #
+  # Timing is measured as REAL elapsed wall-clock, not loop-iteration count. The
+  # first version reported `i*10`, which silently omitted the several seconds
+  # each `flyctl ssh` round-trip costs — so it under-reported, and made two
+  # restarts look like they landed on an identical figure when the instrument
+  # simply lacked the resolution to distinguish them. Rejoin latency is a real
+  # operational property; measure it properly or do not claim it.
+  local i
+  for i in $(seq 1 40); do
+    if nem "$mid" "curl -sf --max-time 3 http://localhost:9090/readyz >/dev/null && echo UP || echo DOWN" 2>/dev/null | grep -q UP; then
+      t_now=$(date +%s)
+      log "node${n} REJOIN_SECONDS=$((t_now-t_start)) (serving /readyz again; formation_timeout=${FERROSA_FORMATION_TIMEOUT_SECS:-120}s)"
+      return 0
+    fi
+    sleep 5
+  done
+  t_now=$(date +%s)
+  log "WARN: node${n} did NOT rejoin within $((t_now-t_start))s — the rest of this run is a 2-node cluster; treat any verdict with suspicion"
+}
+
 nemesis_schedule() {
   sleep 25
   inject_partition_one;        sleep 20; heal_netfilter   # minority isolated; majority available (safety)
@@ -200,23 +292,53 @@ nemesis_schedule() {
   inject_isolate_coordinator;  sleep 40; heal_netfilter   # coordinator in minority >30s => :info (correct refusal)
   sleep 12
   inject_slow;                 sleep 22; heal_slow        # ordering under latency
+  sleep 12
+  inject_restart 3 replica                                # process death: amnesiac REPLICA rejoins and votes
+  sleep 25                                                # let it serve real traffic before the next fault
+  inject_restart 1 coordinator                            # process death of the node the generator drives
+  sleep 25                                                # let it coordinate again before the run ends
 }
+# Preflight the generator's network path to its target. A bad address here would
+# otherwise waste the whole build+run and yield an empty history.
+#
+# Uses curl against node1's WEB port, not a raw CQL connect, for two reasons the
+# first attempt got wrong:
+#   - `/dev/tcp/host/port` is a BASH builtin, but `nem` runs `sh -lc` and /bin/sh
+#     on debian:trixie-slim is dash — so it fails regardless of connectivity;
+#   - `nem` wraps its argument in single quotes, so any nested single quote ends
+#     the string early and mangles the command.
+# curl is installed in the image and is already the readiness probe `wait_ready`
+# trusts. CQL binds `[::]:9042` with the same wildcard as web's `[::]:9090`, so a
+# reachable web port on the target proves the DNS + cross-node IPv6 path the
+# generator needs.
+log "generator preflight: node2 -> $GEN_TARGET"
+GP="$(nem "$GEN_MID" "curl -sf --max-time 5 http://$(dns "$SEED_ID"):9090/readyz >/dev/null && echo GEN_OK || echo GEN_FAIL")"
+log "preflight: $GP"
+[ "$GP" = "GEN_OK" ] || die "generator host cannot reach $GEN_TARGET — aborting before the run rather than producing an empty history"
+
 log "starting nemesis schedule (parallel) + generator (foreground)"
+RUN_START=$(date +%s)
 nemesis_schedule &
 NEM_PID=$!
 
 # 4. Generator on the seed (node1, majority side), foreground.
-log "run generator on seed: elle_list_append localhost:9042 /tmp/hist.edn $GEN_ARGS"
-flyctl ssh console --app "$APP" --machine "$SEED_ID" --command \
-  "sh -lc 'elle_list_append localhost:9042 /tmp/hist.edn ${GEN_ARGS}'" 2>&1 | tail -40 \
+log "run generator on node2 -> $GEN_TARGET (node1 is the coordinator under test and WILL be killed)"
+flyctl ssh console --app "$APP" --machine "$GEN_MID" --command \
+  "sh -lc 'elle_list_append ${GEN_TARGET} /tmp/hist.edn ${GEN_ARGS}'" 2>&1 | tail -40 \
   || log "WARN: generator returned non-zero (faults may abort some ops — history still analyzed)"
 
+GEN_END=$(date +%s)
+if kill -0 "$NEM_PID" 2>/dev/null; then
+  log "generator finished at $((GEN_END-RUN_START))s while the nemesis schedule was STILL RUNNING — later faults will hit an idle cluster and prove nothing. Raise GEN_ARGS and re-run before trusting a green verdict."
+else
+  log "generator outlasted the full nemesis schedule ($((GEN_END-RUN_START))s) — every fault fired against live traffic"
+fi
 wait "$NEM_PID" 2>/dev/null || true
 heal_netfilter; heal_slow
 
 # 5. Retrieve history.
 log "fetch history -> $OUT_EDN"
-flyctl ssh console --app "$APP" --machine "$SEED_ID" --command \
+flyctl ssh console --app "$APP" --machine "$GEN_MID" --command \
   "sh -lc 'cat /tmp/hist.edn'" > "$OUT_EDN" 2>/dev/null
 lines="$(wc -l < "$OUT_EDN" | tr -d ' ')"
 [ "$lines" -gt 2 ] || die "history looks empty ($lines lines)"

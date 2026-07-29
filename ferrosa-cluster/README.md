@@ -12,8 +12,9 @@ token ring and a Raft-replicated metadata state machine:
 
 1. **Raft metadata consensus** (`raft/`) — schema/DDL, membership, token
    assignments, and cluster config are replicated through openraft 0.9 (a pinned
-   ferrosa fork with PreVote + CheckQuorum). The state machine is in-memory
-   `RaftState`; the log is sled-backed.
+   ferrosa fork with a CheckQuorum extension; a PreVote gate also exists in the
+   fork but is **disabled by default** — its network transport is unimplemented,
+   see below). The state machine is in-memory `RaftState`; the log is sled-backed.
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
    backpressure, read repair, batchlog, and range/streaming reads.
@@ -40,8 +41,18 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 
 ### Raft metadata consensus (`raft/`)
 - openraft 0.9 with features `serde`, `storage-v2`, `loosen-follower-log-revert`,
-  plus a pinned fork adding **PreVote** (`raft_enable_pre_vote`, default on) and
+  plus a pinned fork adding **PreVote** (`raft_enable_pre_vote`) and
   **CheckQuorum** (`raft_check_quorum_ratio`, default 0.75) per ADR-012.
+  - **PreVote defaults OFF** (`raft_enable_pre_vote = false`). ADR-012 intended
+    it on, but the fork's tick election path hard-gates `elect()` behind a
+    pre-vote round while `FerrosRaftNetwork` (`raft/network.rs`) never overrides
+    `pre_vote` — the default trait impl returns an "unimplemented" error counted
+    as a NO vote, making a pre-vote quorum structurally impossible and freezing
+    any multi-voter formation at term 1. Leaving it on only subtracts liveness.
+    Re-enable only after the pre-vote transport lands (forge t_b0aac0d3 /
+    t_32cb5ad3). Regression guard: `candidate_re_campaigns_while_peers_are_down`
+    in `tests/cluster_formation.rs`. Spec:
+    [`specs/implemented/bug-cluster-formation-pre-vote-election-stall.md`](../specs/implemented/bug-cluster-formation-pre-vote-election-stall.md).
 - `FerrosStateMachine` / `RaftState` — keyspaces, tables, roles/grants, indexes,
   types, UDFs/UDAs, members, token map, per-node index status, cluster config.
   `DropTable` apply removes the table's index entries from `RaftState` and, via

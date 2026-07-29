@@ -14,19 +14,10 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 
-use oom_audit::{audit_paths, expired_allow_findings, Allowlist, Finding, DEFAULT_TODAY};
-
-/// Crates whose `src/` dirs are scanned (blueprint §3 Layer 1). `ferrosa-net`
-/// and `ferrosa-index` carry the streaming pipeline (lane frames, scan/FTS
-/// hits) — clones there defeat move streaming the same as in the core four.
-const AUDIT_CRATES: &[&str] = &[
-    "ferrosa-cql",
-    "ferrosa-cluster",
-    "ferrosa-storage",
-    "ferrosa-row-bridge",
-    "ferrosa-net",
-    "ferrosa-index",
-];
+use oom_audit::{
+    audit_paths, coverage_findings, expired_allow_findings, Allowlist, Finding, AUDIT_CRATES,
+    DEFAULT_TODAY,
+};
 
 const ALLOW_FILE: &str = "specs/p0-oom-guard/oom-audit-allow.toml";
 
@@ -111,6 +102,9 @@ fn p0_oom_audit(args: &[String]) -> anyhow::Result<ExitCode> {
 
     let mut findings = audit_paths(&roots, &allow);
     findings.extend(expired_allow_findings(&allow, &today));
+    // Coverage is part of the verdict: an unclassified crate is a blind spot,
+    // and a blind spot must not be reported as a clean run.
+    findings.extend(coverage_findings(&root));
     findings.sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
 
     print_findings(&findings, &root);

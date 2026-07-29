@@ -16,6 +16,167 @@ use syn::visit::Visit;
 pub const DEFAULT_TODAY: &str = "2026-06-29";
 
 // ---------------------------------------------------------------------------
+// Audit coverage policy
+// ---------------------------------------------------------------------------
+//
+// The audited-crate set used to be a hand-maintained list in `main.rs`. That
+// made coverage opt-in, and opt-in coverage silently rots: `ferrosa-graph` and
+// `ferrosa-sparql` both grew query-sized serving paths (and shipped real
+// materialization OOMs) while sitting entirely outside the gate.
+//
+// Coverage is therefore exhaustive by default. Every workspace member must be
+// either audited or listed in `NON_SERVING_CRATES` with the reason it owns no
+// query-sized path. A new crate belongs to neither set, so
+// `every_workspace_crate_is_classified` fails until someone classifies it —
+// the decision is forced at review time instead of being silently skipped.
+
+/// Crates whose `src/` dirs are scanned (blueprint §3 Layer 1).
+pub const AUDIT_CRATES: &[&str] = &[
+    "ferrosa-cql",
+    "ferrosa-cluster",
+    "ferrosa-storage",
+    "ferrosa-row-bridge",
+    "ferrosa-net",
+    "ferrosa-index",
+    "ferrosa-graph",
+    "ferrosa-sparql",
+    "ferrosa-sstable",
+    "ferrosa-sql",
+    "ferrosa-postgres",
+    "ferrosa-flight",
+    "ferrosa-schema",
+    "ferrosa-view",
+    "ferrosa-cdc",
+];
+
+/// Workspace members deliberately outside the audit, each paired with the
+/// reason it carries no query-sized serving/scan path. Reasons are load-bearing:
+/// they are what a reviewer checks when a crate later grows a read path.
+pub const NON_SERVING_CRATES: &[(&str, &str)] = &[
+    (
+        "ferrosa",
+        "binary entrypoint: wires listeners and background tasks; the query paths it \
+         serves live in the audited crates it calls into",
+    ),
+    (
+        "ferrosa-common",
+        "shared scalar value types (Token, PartitionKey, CellValue); holds no result set",
+    ),
+    (
+        "ferrosa-session",
+        "per-connection session state; sized by connection count, not by result rows",
+    ),
+    (
+        "ferrosa-sched",
+        "task scheduling and admission control; moves no row data",
+    ),
+    (
+        "ferrosa-worker",
+        "background task lifecycle management; moves no row data",
+    ),
+    (
+        "ferrosa-udf",
+        "UDF parsing and Wasmtime compilation; operates per-value, not per-result-set",
+    ),
+    (
+        "ferrosa-index-builder",
+        "standalone build-side binary; reads via its own streaming S3/HTTP path, not a \
+         serving read path",
+    ),
+    (
+        "ferrosa-ctl",
+        "operator CLI/TUI client: materializes only what an operator paged into a \
+         terminal, and cannot OOM a serving node",
+    ),
+    (
+        "ferrosa-loadgen",
+        "load-generation harness; a test client rather than a serving path",
+    ),
+    (
+        "ferrosa-jepsen",
+        "distributed-correctness test harness; not shipped in the serving binary",
+    ),
+    (
+        "ferrosa-sim",
+        "deterministic simulation harness; not shipped in the serving binary",
+    ),
+    (
+        "xtask",
+        "build tooling: hosts this audit, whose own rule fixtures and messages contain \
+         the very patterns it matches",
+    ),
+];
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceManifest {
+    workspace: WorkspaceTable,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceTable {
+    members: Vec<String>,
+}
+
+/// Parse `[workspace] members` from the workspace manifest at `root`.
+pub fn workspace_members(root: &Path) -> anyhow::Result<Vec<String>> {
+    let manifest_path = root.join("Cargo.toml");
+    let src = std::fs::read_to_string(&manifest_path)?;
+    let manifest: WorkspaceManifest = toml::from_str(&src)?;
+    Ok(manifest.workspace.members)
+}
+
+/// Workspace members that are neither audited nor explicitly excluded.
+/// A non-empty result means audit coverage has an unreviewed hole.
+pub fn unclassified_crates(members: &[String]) -> Vec<String> {
+    members
+        .iter()
+        .filter(|m| {
+            !AUDIT_CRATES.contains(&m.as_str())
+                && !NON_SERVING_CRATES.iter().any(|(name, _)| name == m)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Coverage findings for the workspace at `root`: one per unclassified member.
+///
+/// The gate reports these itself rather than leaving them to a unit test, so a
+/// crate added in CI fails the audit instead of quietly widening the blind spot.
+/// A manifest that cannot be read is itself a finding — an unreadable workspace
+/// means coverage is unknown, which must never read as "clean".
+pub fn coverage_findings(root: &Path) -> Vec<Finding> {
+    let manifest = root.join("Cargo.toml");
+    let members = match workspace_members(root) {
+        Ok(m) => m,
+        Err(e) => {
+            return vec![Finding {
+                path: manifest.to_string_lossy().into_owned(),
+                line: 1,
+                rule: rule::UNCLASSIFIED_CRATE,
+                message: format!(
+                    "cannot determine audit coverage: workspace manifest unreadable ({e})"
+                ),
+                symbol: String::new(),
+            }]
+        }
+    };
+    unclassified_crates(&members)
+        .into_iter()
+        .map(|name| Finding {
+            path: manifest.to_string_lossy().into_owned(),
+            line: 1,
+            rule: rule::UNCLASSIFIED_CRATE,
+            message: format!(
+                "workspace crate `{name}` is neither audited nor listed as non-serving, so the \
+                 materialization gate ignores it; add it to AUDIT_CRATES or to \
+                 NON_SERVING_CRATES with the reason it owns no query-sized path"
+            ),
+            symbol: name,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Findings + allowlist
 // ---------------------------------------------------------------------------
 
@@ -34,6 +195,7 @@ pub struct Finding {
 
 /// Rule ids. Kept as constants so tests and allowlist entries can't typo them.
 pub mod rule {
+    pub const UNCLASSIFIED_CRATE: &str = "unclassified-crate";
     pub const STREAM_RETURNS_VEC: &str = "stream-returns-vec";
     pub const RETURNS_VEC_PARTITION_OR_ROW: &str = "returns-vec-partition-or-row";
     pub const WITH_CAPACITY_LIMIT: &str = "with-capacity-limit";
@@ -228,8 +390,13 @@ fn is_limited_rows_call(method: &str) -> bool {
 }
 
 /// `Partition`/`Row` element idents that signal broad-scan row materialization.
+///
+/// `VirtualRow` is included because `VirtualTable::read` returns
+/// `Vec<VirtualRow>` for a whole table while `visit_rows` streams; the trait
+/// docs already tell large/live tables to override the visitor, and this is
+/// what holds them to it.
 fn is_partition_or_row_ident(id: &str) -> bool {
-    id == "Partition" || id == "Row"
+    id == "Partition" || id == "Row" || id == "VirtualRow"
 }
 
 /// If `ty` (through an outer `Vec`/`Result`) is a `Vec<Partition>` / `Vec<Row>`,
@@ -1377,6 +1544,86 @@ mod tests {
         Allowlist::default()
     }
 
+    /// Repo root: `xtask/`'s parent is the workspace root.
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(PathBuf::from)
+            .expect("xtask crate dir has a parent workspace root")
+    }
+
+    // -- Audit coverage policy ---------------------------------------------
+
+    /// Audit coverage must be exhaustive over the workspace: every member is
+    /// either scanned or carries a written reason it owns no query-sized path.
+    ///
+    /// This is the invariant that `ferrosa-graph` / `ferrosa-sparql` violated —
+    /// both grew serving paths (and real materialization OOMs) while silently
+    /// outside the hand-maintained audit list.
+    #[test]
+    fn every_workspace_crate_is_classified() {
+        let members = workspace_members(&repo_root()).expect("workspace manifest parses");
+        assert!(
+            members.len() > 10,
+            "sanity: expected a multi-crate workspace, got {members:?}"
+        );
+
+        let unclassified = unclassified_crates(&members);
+        assert!(
+            unclassified.is_empty(),
+            "these workspace crates are neither audited nor explicitly excluded, so the \
+             materialization gate silently ignores them: {unclassified:?}\n\
+             Add each to AUDIT_CRATES, or to NON_SERVING_CRATES with the reason it owns \
+             no query-sized serving path."
+        );
+    }
+
+    /// The real workspace is fully classified, so the gate reports no coverage
+    /// holes. This is the runtime counterpart of the policy test above.
+    #[test]
+    fn coverage_findings_are_empty_for_the_classified_workspace() {
+        let f = coverage_findings(&repo_root());
+        assert!(f.is_empty(), "unexpected coverage holes: {f:?}");
+    }
+
+    /// An unreadable workspace manifest means coverage is UNKNOWN. Unknown must
+    /// surface as a finding — never as an empty (clean-looking) result.
+    #[test]
+    fn unreadable_manifest_is_a_finding_not_a_clean_run() {
+        let missing = PathBuf::from("/nonexistent-ferrosa-root-for-test");
+        let f = coverage_findings(&missing);
+        assert_eq!(f.len(), 1, "expected exactly one coverage finding: {f:?}");
+        assert_eq!(f[0].rule, rule::UNCLASSIFIED_CRATE);
+        assert!(
+            f[0].message.contains("unreadable"),
+            "finding must say coverage could not be determined: {:?}",
+            f[0].message
+        );
+    }
+
+    /// An exclusion without a real reason is a rubber stamp, not a decision.
+    #[test]
+    fn every_non_serving_exclusion_carries_a_reason() {
+        for (name, reason) in NON_SERVING_CRATES {
+            assert!(
+                reason.len() >= 20,
+                "crate `{name}` is excluded from the materialization audit with a \
+                 non-explanatory reason: {reason:?}"
+            );
+        }
+    }
+
+    /// A crate cannot be both audited and excluded — that hides which one wins.
+    #[test]
+    fn audited_and_excluded_sets_are_disjoint() {
+        for (name, _) in NON_SERVING_CRATES {
+            assert!(
+                !AUDIT_CRATES.contains(name),
+                "crate `{name}` is both audited and listed as non-serving"
+            );
+        }
+    }
+
     // -- Rule (a): stream-named fn returning Vec ---------------------------
     #[test]
     fn rule_a_fires_on_stream_fn_returning_vec() {
@@ -1407,6 +1654,29 @@ mod tests {
             "streaming return types must not trip rule (a): {f:?}"
         );
         assert_eq!(f.len(), 0, "no findings at all expected: {f:?}");
+    }
+
+    /// `VirtualTable::read` returns `Vec<VirtualRow>` while `visit_rows` is the
+    /// streaming path the trait docs steer large/live tables toward. The gate
+    /// must see that materializing shape, or "should override visit_rows" stays
+    /// advice no reviewer is held to.
+    #[test]
+    fn rule_b_fires_on_vec_virtual_row() {
+        let src = r#"
+            fn read(&self, p: Option<&RowPredicate>) -> Vec<VirtualRow> { Vec::new() }
+            fn visit_rows(&self, p: Option<&RowPredicate>, visit: &mut dyn FnMut(VirtualRow)) {}
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        let hits: Vec<_> = f
+            .iter()
+            .filter(|x| x.rule == rule::RETURNS_VEC_PARTITION_OR_ROW)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the Vec<VirtualRow> return fires; the streaming visitor does not: {f:?}"
+        );
+        assert_eq!(hits[0].symbol, "read");
     }
 
     // -- Rule (b): returns Vec<Partition>/Vec<Row> -------------------------
