@@ -44,6 +44,18 @@ use crate::memtable::Memtable;
 use crate::merge;
 use crate::range_merger::ColumnOrdinalMapping;
 
+/// Outcome of resolving an SSTable's column-ordinal mapping.
+///
+/// `SstableGone` is benign — compaction replaced the generation and its rows
+/// live in a successor SSTable. `Unavailable` means the header could not be
+/// read, so the physical layout is UNKNOWN: callers must propagate the error
+/// (fail closed) rather than guess a layout.
+enum SstableMappingOutcome {
+    Mapped(ColumnOrdinalMapping),
+    SstableGone,
+    Unavailable(ferrosa_common::Error),
+}
+
 /// Engine-wide bounded reader pool keyed by `(table_id, gen)`, shared by every
 /// `TableStore` so resident reader memory is `O(reader_cap)` across all tables.
 pub(crate) type SharedReaderPool<R> =
@@ -5694,15 +5706,21 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         sstable_id: &str,
         current_ordinal: usize,
-    ) -> Option<usize> {
-        let current = u16::try_from(current_ordinal).ok()?;
-        let Some(mapping) = self.column_mapping_for_sstable(sstable_id) else {
-            return Some(current_ordinal);
+    ) -> ferrosa_common::Result<Option<usize>> {
+        let Ok(current) = u16::try_from(current_ordinal) else {
+            return Ok(None);
+        };
+        let mapping = match self.column_mapping_for_sstable(sstable_id) {
+            SstableMappingOutcome::Mapped(mapping) => mapping,
+            // Vanished under compaction: nothing left to build from this
+            // generation; the successor SSTable carries the rows.
+            SstableMappingOutcome::SstableGone => return Ok(None),
+            SstableMappingOutcome::Unavailable(e) => return Err(e),
         };
         let source = mapping.source_regular_ordinals_for_projection(&[current]);
         match source.as_slice() {
-            [only] => Some(*only as usize),
-            _ => None,
+            [only] => Ok(Some(*only as usize)),
+            _ => Ok(None),
         }
     }
 
@@ -5717,57 +5735,72 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         sstable_id: &str,
         predicate: &FilterPredicate,
-    ) -> FilterPredicate {
-        let Some(mapping) = self.column_mapping_for_sstable(sstable_id) else {
-            return predicate.clone();
+    ) -> ferrosa_common::Result<FilterPredicate> {
+        let mapping = match self.column_mapping_for_sstable(sstable_id) {
+            SstableMappingOutcome::Mapped(mapping) => mapping,
+            // Vanished: an unsatisfiable conjunction gives the normal
+            // no-entry build path for a generation that no longer exists.
+            SstableMappingOutcome::SstableGone => {
+                return Ok(FilterPredicate::conjunction(Vec::new()));
+            }
+            SstableMappingOutcome::Unavailable(e) => return Err(e),
         };
 
         let mut clauses = Vec::with_capacity(predicate.clauses.len());
         for clause in &predicate.clauses {
             let Some(current) = u16::try_from(clause.column_position).ok() else {
-                return FilterPredicate::conjunction(Vec::new());
+                return Ok(FilterPredicate::conjunction(Vec::new()));
             };
             let source = mapping.source_regular_ordinals_for_projection(&[current]);
             let [source_ordinal] = source.as_slice() else {
-                return FilterPredicate::conjunction(Vec::new());
+                return Ok(FilterPredicate::conjunction(Vec::new()));
             };
             let mut remapped = clause.clone();
             remapped.column_position = *source_ordinal as usize;
             clauses.push(remapped);
         }
-        FilterPredicate::conjunction(clauses)
+        Ok(FilterPredicate::conjunction(clauses))
     }
 
-    /// Returns `None` either because the SSTable is no longer in the view
-    /// (benign — it vanished under compaction) or because the reader failed to
-    /// open. The reader-open failure is WARN-logged: callers fall back to
-    /// current-schema ordinals on `None`, which on a legacy reordered SSTable
-    /// reintroduces the wrong-ordinal probe this mapping exists to prevent, so
-    /// that degradation must be visible (fail-loud rule).
-    fn column_mapping_for_sstable(&self, sstable_id: &str) -> Option<ColumnOrdinalMapping> {
+    // Outcome of resolving an SSTable's column-ordinal mapping. `SstableGone`
+    // is benign (compaction replaced the generation); `Unavailable` must FAIL
+    // the caller — guessing a layout fabricates ordinal correctness.
+
+    /// Resolve one SSTable's column-ordinal mapping, with a three-state
+    /// outcome so callers can distinguish the benign vanished-under-compaction
+    /// case from an unreadable header (which MUST fail the caller — see
+    /// `SstableMappingOutcome`).
+    fn column_mapping_for_sstable(&self, sstable_id: &str) -> SstableMappingOutcome {
         let schema = self.schema.load();
         let view = self.view.load();
-        let idx = view
+        let Some(idx) = view
             .sstable_ids
             .iter()
             .position(|(id, _)| id == sstable_id)
-            .or_else(|| view.sstables.iter().position(|desc| desc.gen == sstable_id))?;
-        let desc = view.sstables.get(idx)?;
-        let reader = match self.open_reader(desc) {
-            Ok(reader) => reader,
-            Err(e) => {
-                tracing::warn!(
-                    %e,
-                    sstable_id,
-                    table = %self.pool_table_key,
-                    "ordinal remap: failed to open SSTable reader; falling back to \
-                     current-schema ordinals for this SSTable — a legacy reordered \
-                     SSTable may be probed at the wrong column ordinal"
-                );
-                return None;
-            }
+            .or_else(|| view.sstables.iter().position(|desc| desc.gen == sstable_id))
+        else {
+            return SstableMappingOutcome::SstableGone;
         };
-        Some(ColumnOrdinalMapping::for_header(&schema, reader.header()))
+        let Some(desc) = view.sstables.get(idx) else {
+            return SstableMappingOutcome::SstableGone;
+        };
+        match self.open_reader(desc) {
+            Ok(reader) => SstableMappingOutcome::Mapped(ColumnOrdinalMapping::for_header(
+                &schema,
+                reader.header(),
+            )),
+            // FAIL CLOSED: an unreadable header means the physical ordinal
+            // layout is UNKNOWN. Guessing (identity fallback) would reintroduce
+            // the wrong-ordinal probe this mapping exists to prevent, silently.
+            // The caller must surface the error (e.g. fail the CREATE INDEX
+            // DDL) so the operation retries against a readable file.
+            Err(e) => {
+                SstableMappingOutcome::Unavailable(ferrosa_common::Error::InvalidFormat(format!(
+                    "ordinal remap: cannot open SSTable reader for {sstable_id}: {e}; \
+                     refusing to guess the physical column layout"
+                )))
+            }
+        }
     }
 
     /// Number of SSTables currently in the store.
@@ -6678,17 +6711,23 @@ mod tests {
         );
 
         assert_eq!(
-            store.source_regular_ordinal_for_sstable("1", 1),
+            store
+                .source_regular_ordinal_for_sstable("1", 1)
+                .expect("mapping must resolve for a readable SSTable"),
             Some(0),
             "current name ordinal 1 must backfill from old physical ordinal 0"
         );
         assert_eq!(
-            store.source_regular_ordinal_for_sstable("1", 2),
+            store
+                .source_regular_ordinal_for_sstable("1", 2)
+                .expect("mapping must resolve for a readable SSTable"),
             Some(1),
             "current zz ordinal 2 must backfill from old physical ordinal 1"
         );
         assert_eq!(
-            store.source_regular_ordinal_for_sstable("1", 0),
+            store
+                .source_regular_ordinal_for_sstable("1", 0)
+                .expect("mapping must resolve for a readable SSTable"),
             None,
             "newly-added aaa did not exist in the old SSTable"
         );
@@ -6732,7 +6771,9 @@ mod tests {
             ferrosa_index::FilterClause::new(1, ferrosa_index::FilterOp::Eq, b"John".to_vec()),
             ferrosa_index::FilterClause::new(2, ferrosa_index::FilterOp::NotEq, b"z".to_vec()),
         ]);
-        let remapped = store.source_filter_predicate_for_sstable("1", &predicate);
+        let remapped = store
+            .source_filter_predicate_for_sstable("1", &predicate)
+            .expect("predicate remap must resolve for a readable SSTable");
         let positions: Vec<usize> = remapped
             .clauses()
             .iter()
@@ -6746,7 +6787,9 @@ mod tests {
 
         let absent_new_column =
             FilterPredicate::single(0, ferrosa_index::FilterOp::Eq, b"aaa".to_vec());
-        let remapped_absent = store.source_filter_predicate_for_sstable("1", &absent_new_column);
+        let remapped_absent = store
+            .source_filter_predicate_for_sstable("1", &absent_new_column)
+            .expect("predicate remap must resolve for a readable SSTable");
         assert!(
             remapped_absent.clauses().is_empty(),
             "a predicate on a newly-added column cannot match a legacy SSTable"
