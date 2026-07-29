@@ -38,6 +38,7 @@ pub use read_2i::{
 pub use sidecar::{AccordSidecar, SidecarUploadManifest, SIDECAR_EXTENSION};
 pub use sync_writer::{FileSyncWriter, MockSyncWriter, SyncWriteResult, SyncWriter};
 pub use transaction_committer::{
-    CommitError, CommitOutcome, MockTransactionCommitter, TransactionCommitter, TransactionWrite,
+    CommitError, CommitOutcome, CommitReads, MockTransactionCommitter, TransactionCommitter,
+    TransactionRead, TransactionWrite,
 };
 pub use write_gate::{check_write_gate, check_write_gate_range, WriteGateDecision};

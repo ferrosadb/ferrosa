@@ -24,6 +24,27 @@ pub struct TransactionWrite {
     pub mutation: Vec<u8>,
 }
 
+/// One buffered read in a transaction: the partition key and the keyspace/table
+/// it targets. Evaluated at the transaction's agreed commit timestamp so the
+/// returned rows are part of the same atomic transaction as the writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionRead {
+    /// Keyspace the read targets.
+    pub keyspace: String,
+    /// Table the read targets.
+    pub table: String,
+    /// Raw partition-key bytes to read (Accord conflict-ordering + routing key).
+    pub key: Vec<u8>,
+}
+
+/// Rows observed by a transaction's read-set, evaluated at the commit timestamp.
+/// Positional: `rows[i]` is the agreed row bytes for the `i`-th
+/// [`TransactionRead`], or `None` when the row was absent at commit-`t`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitReads {
+    pub rows: Vec<Option<Vec<u8>>>,
+}
+
 /// Outcome of committing a buffered transaction write-set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitOutcome {
@@ -59,6 +80,34 @@ impl std::error::Error for CommitError {}
 pub trait TransactionCommitter: Send + Sync {
     /// Commit `writes` as one atomic multi-key transaction.
     async fn commit(&self, writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError>;
+
+    /// Commit `writes` and evaluate `reads` at the transaction's agreed commit
+    /// timestamp, returning the row bytes observed for each read (positional).
+    ///
+    /// The default implementation supports only an EMPTY read-set — the shape
+    /// used by front-ends that never buffer transactional reads (e.g. the
+    /// Postgres front-end) and by write-only CQL transactions. A NON-empty
+    /// read-set against a committer that has not overridden this method is a
+    /// hard error: silently returning `CommitReads::default()` would fabricate
+    /// row-ABSENCE (`None` means "absent at commit-t" to the caller), turning a
+    /// missing capability into wrong query results. Fail loud instead; the
+    /// front-end surfaces the error and the transaction does not lie.
+    async fn commit_with_reads(
+        &self,
+        writes: Vec<TransactionWrite>,
+        reads: Vec<TransactionRead>,
+    ) -> Result<(CommitOutcome, CommitReads), CommitError> {
+        if !reads.is_empty() {
+            return Err(CommitError {
+                reason: format!(
+                    "committer does not implement read-in-transaction but {} read(s) were staged;                      refusing to fabricate row-absence",
+                    reads.len()
+                ),
+            });
+        }
+        let outcome = self.commit(writes).await?;
+        Ok((outcome, CommitReads::default()))
+    }
 }
 
 /// In-memory [`TransactionCommitter`] for tests: records every committed
@@ -66,7 +115,11 @@ pub trait TransactionCommitter: Send + Sync {
 /// `BEGIN`/`COMMIT`/`ROLLBACK` buffering without a live cluster.
 pub struct MockTransactionCommitter {
     committed: std::sync::Mutex<Vec<Vec<TransactionWrite>>>,
+    read: std::sync::Mutex<Vec<Vec<TransactionRead>>>,
     result: Result<CommitOutcome, CommitError>,
+    /// Canned rows returned from [`commit_with_reads`](TransactionCommitter::commit_with_reads),
+    /// one per read (positional). Empty ⇒ `None` for every read.
+    read_rows: Vec<Option<Vec<u8>>>,
 }
 
 impl MockTransactionCommitter {
@@ -74,7 +127,9 @@ impl MockTransactionCommitter {
     pub fn new() -> Self {
         Self {
             committed: std::sync::Mutex::new(Vec::new()),
+            read: std::sync::Mutex::new(Vec::new()),
             result: Ok(CommitOutcome::Committed),
+            read_rows: Vec::new(),
         }
     }
 
@@ -82,7 +137,20 @@ impl MockTransactionCommitter {
     pub fn with_result(result: Result<CommitOutcome, CommitError>) -> Self {
         Self {
             committed: std::sync::Mutex::new(Vec::new()),
+            read: std::sync::Mutex::new(Vec::new()),
             result,
+            read_rows: Vec::new(),
+        }
+    }
+
+    /// A committer that commits cleanly and echoes `read_rows` (positional) back
+    /// from [`commit_with_reads`](TransactionCommitter::commit_with_reads).
+    pub fn with_read_rows(read_rows: Vec<Option<Vec<u8>>>) -> Self {
+        Self {
+            committed: std::sync::Mutex::new(Vec::new()),
+            read: std::sync::Mutex::new(Vec::new()),
+            result: Ok(CommitOutcome::Committed),
+            read_rows,
         }
     }
 
@@ -90,6 +158,13 @@ impl MockTransactionCommitter {
     /// call order.
     pub fn committed(&self) -> Vec<Vec<TransactionWrite>> {
         self.committed.lock().expect("committer mutex").clone()
+    }
+
+    /// Every read-set passed to
+    /// [`commit_with_reads`](TransactionCommitter::commit_with_reads), in call
+    /// order.
+    pub fn reads(&self) -> Vec<Vec<TransactionRead>> {
+        self.read.lock().expect("committer mutex").clone()
     }
 }
 
@@ -105,6 +180,21 @@ impl TransactionCommitter for MockTransactionCommitter {
         self.committed.lock().expect("committer mutex").push(writes);
         self.result.clone()
     }
+
+    async fn commit_with_reads(
+        &self,
+        writes: Vec<TransactionWrite>,
+        reads: Vec<TransactionRead>,
+    ) -> Result<(CommitOutcome, CommitReads), CommitError> {
+        self.read.lock().expect("committer mutex").push(reads);
+        let outcome = self.commit(writes).await?;
+        Ok((
+            outcome,
+            CommitReads {
+                rows: self.read_rows.clone(),
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +207,73 @@ mod tests {
             key: key.to_vec(),
             mutation: b"row".to_vec(),
         }
+    }
+
+    fn read(ks: &str, table: &str, key: &[u8]) -> TransactionRead {
+        TransactionRead {
+            keyspace: ks.to_string(),
+            table: table.to_string(),
+            key: key.to_vec(),
+        }
+    }
+
+    /// A committer with no read-in-transaction support keeps the write-only
+    /// behaviour via the default `commit_with_reads`: writes commit, no rows.
+    struct WriteOnlyCommitter;
+    #[async_trait]
+    impl TransactionCommitter for WriteOnlyCommitter {
+        async fn commit(
+            &self,
+            _writes: Vec<TransactionWrite>,
+        ) -> Result<CommitOutcome, CommitError> {
+            Ok(CommitOutcome::Committed)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_commit_with_reads_accepts_empty_read_set() {
+        let committer = WriteOnlyCommitter;
+        let (outcome, reads) = committer
+            .commit_with_reads(vec![write("ks", b"a")], Vec::new())
+            .await
+            .expect("empty read-set must commit through the default impl");
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert!(reads.rows.is_empty());
+    }
+
+    /// A committer without read-in-transaction support must REFUSE a non-empty
+    /// read-set. Silently returning `CommitReads::default()` would fabricate
+    /// row-absence (`None` means "absent at commit-t" to the caller) — a
+    /// missing capability must never become wrong query results.
+    #[tokio::test]
+    async fn default_commit_with_reads_rejects_staged_reads_loudly() {
+        let committer = WriteOnlyCommitter;
+        let err = committer
+            .commit_with_reads(vec![write("ks", b"a")], vec![read("ks", "t", b"a")])
+            .await
+            .expect_err("non-empty read-set against the default impl must fail loud");
+        assert!(
+            err.reason.contains("read-in-transaction"),
+            "error must name the missing capability: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_records_reads_and_echoes_canned_rows() {
+        let committer =
+            MockTransactionCommitter::with_read_rows(vec![Some(b"row-a".to_vec()), None]);
+        let reads = vec![read("ks", "t", b"a"), read("ks", "t", b"b")];
+
+        let (outcome, got) = committer
+            .commit_with_reads(vec![write("ks", b"a")], reads.clone())
+            .await
+            .expect("commit_with_reads");
+
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert_eq!(got.rows, vec![Some(b"row-a".to_vec()), None]);
+        assert_eq!(committer.reads(), vec![reads]);
+        assert_eq!(committer.committed(), vec![vec![write("ks", b"a")]]);
     }
 
     #[tokio::test]
