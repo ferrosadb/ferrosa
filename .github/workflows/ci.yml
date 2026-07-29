@@ -156,6 +156,10 @@ jobs:
       - name: Run differential oracle (corpus + restricted-query + DML)
         env:
           FERROSA_TEST_CONTAINERS: "1"
+          # Pin the runtime: the harness prefers podman when it is on PATH, but
+          # this job verifies and pre-pulls with docker. ubuntu-latest runners
+          # ship both, and their podman/crun setup is not guaranteed to work.
+          FERROSA_CONTAINER_RUNTIME: docker
         run: |
           cargo test -p ferrosa-postgres --features live-infra-tests \
             --test differential_oracle -- --test-threads=1 --nocapture
