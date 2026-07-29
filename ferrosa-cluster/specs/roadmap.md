@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-07-01
+last_updated: 2026-07-17
 ---
 
 # ferrosa-cluster — Roadmap
@@ -55,8 +55,11 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   loudly, counted by `StreamFrameRouter::route_closures()`), and the coordinator
   now actually FIRES `RangeReadStreamCancel` from the per-replica forwarder task
   whenever a stream ends without Done (consumer abandoned a page / errored), with
-  the Cancel MsgType registered on the producer side. Counter-asserted 3-node
-  loopback harness: `tests/range_scan_multi_replica_paging.rs`.
+  the Cancel MsgType registered on the producer side. `run_fragment_merge_nway`
+  also races the merge core against `out_tx.closed()` so an abandoned consumer
+  aborts the merge while it is parked on a stalled source; deterministic pin:
+  `range_read_stream::tests::nway_merge_consumer_drop_aborts_when_parked_on_stalled_source`.
+  Counter-asserted 3-node loopback harness: `tests/range_scan_multi_replica_paging.rs`.
   **Follow-up before closing:** live RF=3 validation on fmem-dev (viz WS run +
   15k-row 3-page `SELECT id`) — the reverted predecessor (3ec30240, Drop-guard
   cancel) passed in-process tests but sent zero cancels live.
