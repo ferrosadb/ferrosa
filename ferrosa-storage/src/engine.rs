@@ -760,13 +760,26 @@ fn eager_index_build_job(
     index_name: &str,
     column_position: usize,
     clustering_source: Option<crate::index::ClusteringComponentRef>,
-) -> crate::index::IndexBuildJob {
-    let source_column_position = clustering_source
-        .is_none()
-        .then(|| store.source_regular_ordinal_for_sstable(&sstable_id, column_position))
-        .flatten()
-        .unwrap_or(column_position);
-    crate::index::IndexBuildJob {
+) -> ferrosa_common::Result<crate::index::IndexBuildJob> {
+    // A just-written SSTable's header matches the current schema, so the remap
+    // is normally identity — but it must be RESOLVED, not assumed: an
+    // unreadable header (or an absent column) means the physical layout is
+    // unknown and enqueueing a guessed ordinal would build a silently wrong
+    // index. Fail closed; the caller logs and leaves the SSTable
+    // tracker-pending (queries then treat it as unindexed rather than
+    // trusting a wrong index).
+    let source_column_position = match clustering_source {
+        Some(_) => column_position,
+        None => store
+            .source_regular_ordinal_for_sstable(&sstable_id, column_position)?
+            .ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "eager index build: column ordinal {column_position} absent from \
+                     just-written SSTable {sstable_id} header"
+                ))
+            })?,
+    };
+    Ok(crate::index::IndexBuildJob {
         sstable_id,
         index_name: index_name.to_string(),
         index_type: store.index_type_for(index_name),
@@ -779,7 +792,7 @@ fn eager_index_build_job(
         column_position: source_column_position,
         clustering_source,
         filter_predicate: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3796,9 +3809,13 @@ impl StorageEngine {
         // index from an asynchronously backfilled one.
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
+            // Fail closed: an unreadable header FAILS the CREATE INDEX DDL
+            // (`?`) so the operator retries against readable files — never a
+            // guessed layout. A column genuinely absent from (or an SSTable
+            // vanished under) this generation is completion, not failure.
             let Some(source_column_position) = state
                 .store
-                .source_regular_ordinal_for_sstable(&sst_id, column_position)
+                .source_regular_ordinal_for_sstable(&sst_id, column_position)?
             else {
                 self.index_tracker.mark_indexed(
                     table_id.keyspace(),
@@ -3808,11 +3825,14 @@ impl StorageEngine {
                 );
                 continue;
             };
-            let source_filter_predicate = filter_predicate.as_ref().map(|predicate| {
-                state
-                    .store
-                    .source_filter_predicate_for_sstable(&sst_id, predicate)
-            });
+            let source_filter_predicate = match filter_predicate.as_ref() {
+                Some(predicate) => Some(
+                    state
+                        .store
+                        .source_filter_predicate_for_sstable(&sst_id, predicate)?,
+                ),
+                None => None,
+            };
             self.index_tracker.mark_pending(
                 table_id.keyspace(),
                 table_id.table(),
@@ -7195,15 +7215,24 @@ impl StorageEngine {
                                 &sstable_id,
                                 0,
                             );
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 sstable_id,
                                 &index_name,
                                 col_pos,
                                 clustering_source,
-                            );
-                            let _ = scheduler.submit(job);
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
+                                ),
+                            }
                         }
                     }
                 }
@@ -7448,16 +7477,23 @@ impl StorageEngine {
                     // Same as flush — keeps MemtableIndex bounded in steady state.
                     if let Some(ref scheduler) = self.index_scheduler {
                         for (index_name, col_pos) in state.store.indexed_columns() {
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 output.id.clone(),
                                 index_name,
                                 *col_pos,
                                 None,
-                            );
-                            if let Err(e) = scheduler.submit(job) {
-                                tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "compaction: cannot resolve ordinal layout; output left tracker-pending (unindexed)"
+                                ),
                             }
                         }
                         // Clustering-column indexes (t_430c4188): the compacted
@@ -7466,7 +7502,7 @@ impl StorageEngine {
                         // entries for compacted data.
                         let ck_total = state.store.clustering_column_count();
                         for (index_name, component) in state.store.indexed_clustering_columns() {
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 output.id.clone(),
@@ -7476,9 +7512,16 @@ impl StorageEngine {
                                     component: *component,
                                     total: ck_total,
                                 }),
-                            );
-                            if let Err(e) = scheduler.submit(job) {
-                                tracing::error!(%e, %index_name, "compaction: failed to submit clustering index rebuild");
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "compaction: failed to submit clustering index rebuild");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "compaction: cannot resolve clustering ordinal layout; output left tracker-pending"
+                                ),
                             }
                         }
                     }
@@ -19364,21 +19407,36 @@ mod tests {
         // path does, so the store can report its real type.
         store.add_index("val_phonetic_idx".to_string(), 0, IndexType::Phonetic);
 
+        // The eager helper now RESOLVES the target SSTable's header (fail-closed
+        // ordinal contract), so the job must reference a real, readable SSTable
+        // — exactly like the production call sites, which run after the flush /
+        // compaction swap has installed the output in the view. Flush one row
+        // to create it.
+        store
+            .write(&make_key("eager-type-pk"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let sstable_id = store
+            .sstable_generation_ids()
+            .pop()
+            .expect("flush must install one SSTable generation");
+
         // Mirror the compaction eager-rebuild call: output SSTable id + col pos.
         let job = eager_index_build_job(
             &store,
             &table_id,
-            "compacted-1".to_string(),
+            sstable_id.clone(),
             "val_phonetic_idx",
             0,
             None,
-        );
+        )
+        .expect("eager job must resolve for a readable in-view SSTable");
         assert_eq!(
             job.index_type,
             IndexType::Phonetic,
             "compaction rebuild job must carry the real Phonetic type, not a hardcoded BTree"
         );
-        assert_eq!(job.sstable_id, "compacted-1");
+        assert_eq!(job.sstable_id, sstable_id);
         assert_eq!(job.index_name, "val_phonetic_idx");
         assert_eq!(job.table, ("test_ks".to_string(), "test_table".to_string()));
 
@@ -19387,11 +19445,12 @@ mod tests {
         let btree_job = eager_index_build_job(
             &store,
             &table_id,
-            "compacted-1".to_string(),
+            sstable_id.clone(),
             "unknown_idx",
             0,
             None,
-        );
+        )
+        .expect("eager job must resolve for a readable in-view SSTable");
         assert_eq!(
             btree_job.index_type,
             IndexType::BTree,
