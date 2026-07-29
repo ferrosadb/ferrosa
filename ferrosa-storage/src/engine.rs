@@ -760,8 +760,26 @@ fn eager_index_build_job(
     index_name: &str,
     column_position: usize,
     clustering_source: Option<crate::index::ClusteringComponentRef>,
-) -> crate::index::IndexBuildJob {
-    crate::index::IndexBuildJob {
+) -> ferrosa_common::Result<crate::index::IndexBuildJob> {
+    // A just-written SSTable's header matches the current schema, so the remap
+    // is normally identity — but it must be RESOLVED, not assumed: an
+    // unreadable header (or an absent column) means the physical layout is
+    // unknown and enqueueing a guessed ordinal would build a silently wrong
+    // index. Fail closed; the caller logs and leaves the SSTable
+    // tracker-pending (queries then treat it as unindexed rather than
+    // trusting a wrong index).
+    let source_column_position = match clustering_source {
+        Some(_) => column_position,
+        None => store
+            .source_regular_ordinal_for_sstable(&sstable_id, column_position)?
+            .ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "eager index build: column ordinal {column_position} absent from \
+                     just-written SSTable {sstable_id} header"
+                ))
+            })?,
+    };
+    Ok(crate::index::IndexBuildJob {
         sstable_id,
         index_name: index_name.to_string(),
         index_type: store.index_type_for(index_name),
@@ -771,10 +789,10 @@ fn eager_index_build_job(
         ),
         priority: crate::index::BuildPriority::High,
         enqueued_at: std::time::Instant::now(),
-        column_position,
+        column_position: source_column_position,
         clustering_source,
         filter_predicate: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3053,10 +3071,14 @@ impl StorageEngine {
     ///
     /// Propagates the new schema both to `TableState.schema` (used by
     /// compaction/snapshot paths) and `TableStore.schema` (used by the flush
-    /// path's `SerializationHeader`). Without this, `ALTER TABLE ADD COLUMN`
-    /// left the storage engine with a stale column list and the flush path
-    /// produced silently corrupt SSTables. See
-    /// `specs/in-process/bug-sstable-writer-produces-zero-byte-rows-db.md`.
+    /// path's `SerializationHeader`). Dirty pre-ALTER rows are flushed under
+    /// the old schema before the swap so their SSTable `SerializationHeader`
+    /// preserves the write-time ordinal layout; post-ALTER reads remap those
+    /// physical ordinals by column name. Without this barrier,
+    /// `ALTER TABLE ADD` of a column that sorts first left old memtable/replay
+    /// rows tagged with stale ordinals and reads misattributed them to the new
+    /// layout. See
+    /// `specs/implemented/pre-alter-rows-stale-cell-ordinals.md`.
     ///
     /// Returns `Err` if the table is not registered.
     pub fn update_table_schema(
@@ -3065,13 +3087,50 @@ impl StorageEngine {
         new_schema: TableSchema,
     ) -> ferrosa_common::Result<()> {
         let time_series_handle = self.build_time_series_consolidator(table_id, &new_schema)?;
-        let mut tables = self.tables.write();
-        let state = tables.get_mut(table_id).ok_or_else(|| {
-            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
-        })?;
-        state.schema = new_schema.clone();
-        state.store.update_schema(new_schema);
-        drop(tables);
+        let cl_position = {
+            let mut tables = self.tables.write();
+            let state = tables.get_mut(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+
+            // Hold the table-map write lock across the old-schema flush and
+            // schema swap. The write path takes the table-map read lock for
+            // memtable admission and the `last_commit_log_position` store, so
+            // this hold excludes any new row from entering the memtable (or
+            // advancing the tracked position) between the flush barrier and
+            // the schema swap.
+            //
+            // Residual window (t_237efb08): the write path appends to the
+            // commit log BEFORE taking the read lock (see `write`, step 1 vs
+            // step 2), so a writer that has already appended an old-ordinal
+            // row and then blocks on this write lock will insert that row
+            // into the new-schema memtable after the swap — and its commit-log
+            // position postdates the `cl_position` captured here, so it also
+            // replays mis-tagged after a crash. Closing it needs schema-epoch
+            // validation at memtable admission, moving the append under this
+            // guard, or name-keyed cells.
+            let cl_position = **state.last_commit_log_position.load();
+            if state.store.memtable_size() > 0 {
+                state.store.flush()?;
+                state
+                    .first_unflushed_write_at_nanos
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.maybe_compact(table_id, state);
+            }
+
+            state.schema = new_schema.clone();
+            state.store.update_schema(new_schema);
+            cl_position
+        };
+
+        if let Some(pos) = cl_position {
+            if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
+                tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
+            }
+        }
+        if let Err(e) = self.persist_schema_locally() {
+            tracing::warn!("failed to persist schema.json after schema update: {e}");
+        }
         self.remove_time_series_consolidator(table_id);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
         Ok(())
@@ -3750,6 +3809,30 @@ impl StorageEngine {
         // index from an asynchronously backfilled one.
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
+            // Fail closed: an unreadable header FAILS the CREATE INDEX DDL
+            // (`?`) so the operator retries against readable files — never a
+            // guessed layout. A column genuinely absent from (or an SSTable
+            // vanished under) this generation is completion, not failure.
+            let Some(source_column_position) = state
+                .store
+                .source_regular_ordinal_for_sstable(&sst_id, column_position)?
+            else {
+                self.index_tracker.mark_indexed(
+                    table_id.keyspace(),
+                    table_id.table(),
+                    index_name,
+                    &sst_id,
+                );
+                continue;
+            };
+            let source_filter_predicate = match filter_predicate.as_ref() {
+                Some(predicate) => Some(
+                    state
+                        .store
+                        .source_filter_predicate_for_sstable(&sst_id, predicate)?,
+                ),
+                None => None,
+            };
             self.index_tracker.mark_pending(
                 table_id.keyspace(),
                 table_id.table(),
@@ -3768,9 +3851,9 @@ impl StorageEngine {
                     ),
                     priority: crate::index::BuildPriority::Initial,
                     enqueued_at: std::time::Instant::now(),
-                    column_position,
+                    column_position: source_column_position,
                     clustering_source: None,
-                    filter_predicate: filter_predicate.clone(),
+                    filter_predicate: source_filter_predicate,
                 };
                 if let Err(e) = scheduler.submit(job) {
                     tracing::error!(%e, "engine: failed to submit index backfill");
@@ -7132,15 +7215,24 @@ impl StorageEngine {
                                 &sstable_id,
                                 0,
                             );
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 sstable_id,
                                 &index_name,
                                 col_pos,
                                 clustering_source,
-                            );
-                            let _ = scheduler.submit(job);
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
+                                ),
+                            }
                         }
                     }
                 }
@@ -7385,16 +7477,23 @@ impl StorageEngine {
                     // Same as flush — keeps MemtableIndex bounded in steady state.
                     if let Some(ref scheduler) = self.index_scheduler {
                         for (index_name, col_pos) in state.store.indexed_columns() {
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 output.id.clone(),
                                 index_name,
                                 *col_pos,
                                 None,
-                            );
-                            if let Err(e) = scheduler.submit(job) {
-                                tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "compaction: failed to submit index rebuild");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "compaction: cannot resolve ordinal layout; output left tracker-pending (unindexed)"
+                                ),
                             }
                         }
                         // Clustering-column indexes (t_430c4188): the compacted
@@ -7403,7 +7502,7 @@ impl StorageEngine {
                         // entries for compacted data.
                         let ck_total = state.store.clustering_column_count();
                         for (index_name, component) in state.store.indexed_clustering_columns() {
-                            let job = eager_index_build_job(
+                            match eager_index_build_job(
                                 &state.store,
                                 table_id,
                                 output.id.clone(),
@@ -7413,9 +7512,16 @@ impl StorageEngine {
                                     component: *component,
                                     total: ck_total,
                                 }),
-                            );
-                            if let Err(e) = scheduler.submit(job) {
-                                tracing::error!(%e, %index_name, "compaction: failed to submit clustering index rebuild");
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "compaction: failed to submit clustering index rebuild");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "compaction: cannot resolve clustering ordinal layout; output left tracker-pending"
+                                ),
                             }
                         }
                     }
@@ -16724,6 +16830,117 @@ mod tests {
         assert!(r2.unwrap().is_some(), "new row should exist");
     }
 
+    #[test]
+    fn update_table_schema_preserves_unflushed_pre_alter_row_ordinals() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(dir.path()),
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "pre_alter_ordinals".into(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ferrosa_common::ColumnDefinition {
+                    name: "name".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                },
+                ferrosa_common::ColumnDefinition {
+                    name: "zz".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        engine.register_table(schema).unwrap();
+        let tid = TableId::new("test_ks", "pre_alter_ordinals");
+
+        let key = make_key("pk-old");
+        let row = Row {
+            clustering: vec![],
+            cells: vec![
+                (0, CellValue::live(b"John".to_vec(), 1000)),
+                (1, CellValue::live(b"x".to_vec(), 1000)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine.write(&tid, &key, row, 1000).unwrap();
+
+        let post_alter = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "pre_alter_ordinals".into(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![
+                ferrosa_common::ColumnDefinition {
+                    name: "aaa".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                },
+                ferrosa_common::ColumnDefinition {
+                    name: "name".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                },
+                ferrosa_common::ColumnDefinition {
+                    name: "zz".into(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                },
+            ],
+            extensions: Default::default(),
+        };
+        engine.update_table_schema(&tid, post_alter).unwrap();
+
+        let assert_old_row_remapped = |engine: &StorageEngine| {
+            let partition = engine
+                .read(&tid, &key)
+                .unwrap()
+                .expect("pre-ALTER row must remain readable after schema update");
+            let cells = &partition.rows[0].cells;
+
+            assert!(
+                cells.iter().any(|(idx, cell)| {
+                    *idx == 1 && cell.value.as_deref() == Some(b"John".as_slice())
+                }),
+                "pre-ALTER name cell must remap from old ordinal 0 to current ordinal 1; got {cells:?}"
+            );
+            assert!(
+                cells
+                    .iter()
+                    .any(|(idx, cell)| *idx == 2 && cell.value.as_deref() == Some(b"x".as_slice())),
+                "pre-ALTER zz cell must remap from old ordinal 1 to current ordinal 2; got {cells:?}"
+            );
+            assert!(
+                !cells.iter().any(|(idx, cell)| {
+                    *idx == 0 && cell.value.as_deref() == Some(b"John".as_slice())
+                }),
+                "old name value must not be misattributed to newly-added aaa column; got {cells:?}"
+            );
+        };
+
+        assert_old_row_remapped(&engine);
+
+        drop(engine);
+        let (reopened, pending) = StorageEngine::open(
+            StorageEngineConfig {
+                commit_log: CommitLogConfig::test_config(dir.path()),
+                ..StorageEngineConfig::test_config(dir.path())
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            pending.is_empty(),
+            "schema.json should let startup replay apply or skip mutations without buffering"
+        );
+        assert_old_row_remapped(&reopened);
+    }
+
     /// FMEA #8: A read RESOLVABLE from the memtable must still succeed
     /// (`Ok(Some)`) even when an SSTable is corrupt — the corruption only
     /// affects keys that lived in that SSTable. A read of the corrupt-only key,
@@ -19214,21 +19431,36 @@ mod tests {
         // path does, so the store can report its real type.
         store.add_index("val_phonetic_idx".to_string(), 0, IndexType::Phonetic);
 
+        // The eager helper now RESOLVES the target SSTable's header (fail-closed
+        // ordinal contract), so the job must reference a real, readable SSTable
+        // — exactly like the production call sites, which run after the flush /
+        // compaction swap has installed the output in the view. Flush one row
+        // to create it.
+        store
+            .write(&make_key("eager-type-pk"), make_row(b"v", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let sstable_id = store
+            .sstable_generation_ids()
+            .pop()
+            .expect("flush must install one SSTable generation");
+
         // Mirror the compaction eager-rebuild call: output SSTable id + col pos.
         let job = eager_index_build_job(
             &store,
             &table_id,
-            "compacted-1".to_string(),
+            sstable_id.clone(),
             "val_phonetic_idx",
             0,
             None,
-        );
+        )
+        .expect("eager job must resolve for a readable in-view SSTable");
         assert_eq!(
             job.index_type,
             IndexType::Phonetic,
             "compaction rebuild job must carry the real Phonetic type, not a hardcoded BTree"
         );
-        assert_eq!(job.sstable_id, "compacted-1");
+        assert_eq!(job.sstable_id, sstable_id);
         assert_eq!(job.index_name, "val_phonetic_idx");
         assert_eq!(job.table, ("test_ks".to_string(), "test_table".to_string()));
 
@@ -19237,11 +19469,12 @@ mod tests {
         let btree_job = eager_index_build_job(
             &store,
             &table_id,
-            "compacted-1".to_string(),
+            sstable_id.clone(),
             "unknown_idx",
             0,
             None,
-        );
+        )
+        .expect("eager job must resolve for a readable in-view SSTable");
         assert_eq!(
             btree_job.index_type,
             IndexType::BTree,

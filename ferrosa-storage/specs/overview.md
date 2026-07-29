@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-07-13
+last_updated: 2026-07-17
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -99,11 +99,13 @@ for the mermaid diagrams.
 6. **Table registration is compare-and-install.** A schema replay that loses
    the table-map install race merges declarations into the already-live store;
    it cannot replace active memtable rows or index postings.
-7. **Schema updates remap index ordinals.** Regular columns are ordered by
-   name, so `ALTER TABLE ADD` can shift an indexed column's cell ordinal;
-   `update_schema` remaps every positional index declaration (scalar,
-   full-text, vector, filtered-predicate clauses) through the old schema's
-   column name before swapping in the new schema (ST-16).
+7. **Schema updates preserve ordinal identity.** Regular columns are ordered by
+   name, so `ALTER TABLE ADD` can shift a column's cell ordinal. `update_schema`
+   remaps every positional index declaration (scalar, full-text, vector,
+   filtered-predicate clauses) through the old schema's column name, flushes
+   dirty pre-ALTER rows under their old serialization header before swapping in
+   the new schema, and index backfills remap current column ordinals through
+   each SSTable's stored header (ST-16).
 8. **Malformed data is quarantined, not dropped or crashed on.** A row that
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`

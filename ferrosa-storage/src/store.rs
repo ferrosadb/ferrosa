@@ -44,6 +44,18 @@ use crate::memtable::Memtable;
 use crate::merge;
 use crate::range_merger::ColumnOrdinalMapping;
 
+/// Outcome of resolving an SSTable's column-ordinal mapping.
+///
+/// `SstableGone` is benign — compaction replaced the generation and its rows
+/// live in a successor SSTable. `Unavailable` means the header could not be
+/// read, so the physical layout is UNKNOWN: callers must propagate the error
+/// (fail closed) rather than guess a layout.
+enum SstableMappingOutcome {
+    Mapped(ColumnOrdinalMapping),
+    SstableGone,
+    Unavailable(ferrosa_common::Error),
+}
+
 /// Engine-wide bounded reader pool keyed by `(table_id, gen)`, shared by every
 /// `TableStore` so resident reader memory is `O(reader_cap)` across all tables.
 pub(crate) type SharedReaderPool<R> =
@@ -5682,6 +5694,115 @@ impl<F: FlushTarget> TableStore<F> {
         (start..=last_gen).map(|g| format!("{g}")).collect()
     }
 
+    /// Translate a current-schema regular-column ordinal to the physical
+    /// ordinal used by one SSTable's SerializationHeader.
+    ///
+    /// Backfill jobs read raw SSTable rows, so their `column_position` must be
+    /// in the source SSTable's ordinal space. Returns `None` when the current
+    /// column did not exist in that SSTable; callers should treat that
+    /// generation as an empty backfill rather than probing a different old
+    /// column with the same ordinal.
+    pub fn source_regular_ordinal_for_sstable(
+        &self,
+        sstable_id: &str,
+        current_ordinal: usize,
+    ) -> ferrosa_common::Result<Option<usize>> {
+        let Ok(current) = u16::try_from(current_ordinal) else {
+            return Ok(None);
+        };
+        let mapping = match self.column_mapping_for_sstable(sstable_id) {
+            SstableMappingOutcome::Mapped(mapping) => mapping,
+            // Vanished under compaction: nothing left to build from this
+            // generation; the successor SSTable carries the rows.
+            SstableMappingOutcome::SstableGone => return Ok(None),
+            SstableMappingOutcome::Unavailable(e) => return Err(e),
+        };
+        let source = mapping.source_regular_ordinals_for_projection(&[current]);
+        match source.as_slice() {
+            [only] => Ok(Some(*only as usize)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Remap a filtered-index predicate from current-schema ordinals to one
+    /// SSTable's physical ordinals.
+    ///
+    /// If any predicate column is absent from that SSTable, the correct
+    /// backfill result is empty because the conjunction cannot be satisfied.
+    /// An empty conjunction evaluates false in `ferrosa-index`, giving the
+    /// local backend a normal no-entry build path.
+    pub fn source_filter_predicate_for_sstable(
+        &self,
+        sstable_id: &str,
+        predicate: &FilterPredicate,
+    ) -> ferrosa_common::Result<FilterPredicate> {
+        let mapping = match self.column_mapping_for_sstable(sstable_id) {
+            SstableMappingOutcome::Mapped(mapping) => mapping,
+            // Vanished: an unsatisfiable conjunction gives the normal
+            // no-entry build path for a generation that no longer exists.
+            SstableMappingOutcome::SstableGone => {
+                return Ok(FilterPredicate::conjunction(Vec::new()));
+            }
+            SstableMappingOutcome::Unavailable(e) => return Err(e),
+        };
+
+        let mut clauses = Vec::with_capacity(predicate.clauses.len());
+        for clause in &predicate.clauses {
+            let Some(current) = u16::try_from(clause.column_position).ok() else {
+                return Ok(FilterPredicate::conjunction(Vec::new()));
+            };
+            let source = mapping.source_regular_ordinals_for_projection(&[current]);
+            let [source_ordinal] = source.as_slice() else {
+                return Ok(FilterPredicate::conjunction(Vec::new()));
+            };
+            let mut remapped = clause.clone();
+            remapped.column_position = *source_ordinal as usize;
+            clauses.push(remapped);
+        }
+        Ok(FilterPredicate::conjunction(clauses))
+    }
+
+    // Outcome of resolving an SSTable's column-ordinal mapping. `SstableGone`
+    // is benign (compaction replaced the generation); `Unavailable` must FAIL
+    // the caller — guessing a layout fabricates ordinal correctness.
+
+    /// Resolve one SSTable's column-ordinal mapping, with a three-state
+    /// outcome so callers can distinguish the benign vanished-under-compaction
+    /// case from an unreadable header (which MUST fail the caller — see
+    /// `SstableMappingOutcome`).
+    fn column_mapping_for_sstable(&self, sstable_id: &str) -> SstableMappingOutcome {
+        let schema = self.schema.load();
+        let view = self.view.load();
+        let Some(idx) = view
+            .sstable_ids
+            .iter()
+            .position(|(id, _)| id == sstable_id)
+            .or_else(|| view.sstables.iter().position(|desc| desc.gen == sstable_id))
+        else {
+            return SstableMappingOutcome::SstableGone;
+        };
+        let Some(desc) = view.sstables.get(idx) else {
+            return SstableMappingOutcome::SstableGone;
+        };
+        match self.open_reader(desc) {
+            Ok(reader) => SstableMappingOutcome::Mapped(ColumnOrdinalMapping::for_header(
+                &schema,
+                reader.header(),
+            )),
+            // FAIL CLOSED: an unreadable header means the physical ordinal
+            // layout is UNKNOWN. Guessing (identity fallback) would reintroduce
+            // the wrong-ordinal probe this mapping exists to prevent, silently.
+            // The caller must surface the error (e.g. fail the CREATE INDEX
+            // DDL) so the operation retries against a readable file.
+            Err(e) => {
+                SstableMappingOutcome::Unavailable(ferrosa_common::Error::InvalidFormat(format!(
+                    "ordinal remap: cannot open SSTable reader for {sstable_id}: {e}; \
+                     refusing to guess the physical column layout"
+                )))
+            }
+        }
+    }
+
     /// Number of SSTables currently in the store.
     pub fn sstable_count(&self) -> usize {
         self.view.load().sstables.len()
@@ -6553,6 +6674,130 @@ mod tests {
         assert_eq!(row.cells[0].1.value.as_deref(), Some(b"aye".as_slice()));
         assert_eq!(row.cells[1].0, 1);
         assert_eq!(row.cells[1].1.value.as_deref(), Some(b"bee".as_slice()));
+    }
+
+    #[test]
+    fn index_backfill_maps_current_ordinals_to_legacy_sstable_source_ordinals() {
+        let key = make_key("pk-backfill-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("name", "zz"),
+            TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "column_order".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![
+                    ColumnDefinition {
+                        name: "aaa".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "name".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "zz".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                ],
+                extensions: Default::default(),
+            },
+            &key,
+            make_two_column_row(b"John", b"x", 1000),
+        );
+
+        assert_eq!(
+            store
+                .source_regular_ordinal_for_sstable("1", 1)
+                .expect("mapping must resolve for a readable SSTable"),
+            Some(0),
+            "current name ordinal 1 must backfill from old physical ordinal 0"
+        );
+        assert_eq!(
+            store
+                .source_regular_ordinal_for_sstable("1", 2)
+                .expect("mapping must resolve for a readable SSTable"),
+            Some(1),
+            "current zz ordinal 2 must backfill from old physical ordinal 1"
+        );
+        assert_eq!(
+            store
+                .source_regular_ordinal_for_sstable("1", 0)
+                .expect("mapping must resolve for a readable SSTable"),
+            None,
+            "newly-added aaa did not exist in the old SSTable"
+        );
+    }
+
+    #[test]
+    fn index_backfill_remaps_filtered_predicate_to_legacy_sstable_source_ordinals() {
+        let key = make_key("pk-filter-backfill-column-order");
+        let store = store_with_legacy_order_sstable(
+            two_column_schema("name", "zz"),
+            TableSchema {
+                keyspace: "test_ks".to_string(),
+                table: "column_order".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![ColumnDefinition {
+                    name: "ck".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                static_columns: vec![],
+                regular_columns: vec![
+                    ColumnDefinition {
+                        name: "aaa".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "name".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                    ColumnDefinition {
+                        name: "zz".to_string(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                    },
+                ],
+                extensions: Default::default(),
+            },
+            &key,
+            make_two_column_row(b"John", b"x", 1000),
+        );
+
+        let predicate = FilterPredicate::conjunction(vec![
+            ferrosa_index::FilterClause::new(1, ferrosa_index::FilterOp::Eq, b"John".to_vec()),
+            ferrosa_index::FilterClause::new(2, ferrosa_index::FilterOp::NotEq, b"z".to_vec()),
+        ]);
+        let remapped = store
+            .source_filter_predicate_for_sstable("1", &predicate)
+            .expect("predicate remap must resolve for a readable SSTable");
+        let positions: Vec<usize> = remapped
+            .clauses()
+            .iter()
+            .map(|clause| clause.column_position)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![0, 1],
+            "current predicate ordinals name=1, zz=2 must remap to old physical ordinals 0, 1"
+        );
+
+        let absent_new_column =
+            FilterPredicate::single(0, ferrosa_index::FilterOp::Eq, b"aaa".to_vec());
+        let remapped_absent = store
+            .source_filter_predicate_for_sstable("1", &absent_new_column)
+            .expect("predicate remap must resolve for a readable SSTable");
+        assert!(
+            remapped_absent.clauses().is_empty(),
+            "a predicate on a newly-added column cannot match a legacy SSTable"
+        );
+        assert!(
+            !ferrosa_index::evaluate_predicate_row(&remapped_absent, |_| Some(b"anything")),
+            "empty remapped predicate must evaluate false"
+        );
     }
 
     #[tokio::test]
