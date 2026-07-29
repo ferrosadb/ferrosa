@@ -310,6 +310,41 @@ jobs:
         if: always()
         run: docker compose down -v --remove-orphans 2>/dev/null || true
 
+  perf-regression:
+    name: Accord perf regression (wall-clock thresholds)
+    runs-on: ubuntu-latest
+    # These assertions are ABSOLUTE wall-clock bounds, so they only mean
+    # something when the machine is not competing with the rest of the PR gate.
+    # They were moved out of the per-PR lane (ci.yml `--skip
+    # accord::perf_regression`) after a contended merge-group build measured a
+    # 1000-message ReorderBuffer drain at 52.8 ms against a 10 ms bound and
+    # ejected a docs-only PR from the merge queue (forge t_430e21f7).
+    #
+    # HONEST LIMIT: a GitHub-hosted nightly runner is still shared hardware, so
+    # this job catches GROSS regressions, not small ones. Precise measurement
+    # belongs on the Fly perf-tier instances (see ~/ferrosa-perf-evidence and
+    # the write-path A/B methodology). Do NOT widen a threshold to make this
+    # green — investigate, or move the measurement to dedicated hardware.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+
+      - name: Install Cap'n Proto compiler
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Run Accord perf regression suite
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo test -p ferrosa-cluster --lib accord::perf_regression -- --nocapture
+
   race-stress-fly:
     name: Read-vs-compaction stress (shared-cpu Fly)
     runs-on: ubuntu-latest

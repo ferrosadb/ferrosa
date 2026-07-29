@@ -1,9 +1,22 @@
 //! Performance regression test suite for Accord.
 //!
-//! Deterministic performance tests that verify operation latency stays within
-//! acceptable thresholds. These use wall-clock timing to catch regressions in
-//! the critical path, but with generous bounds that pass on CI (no
-//! micro-benchmarking).
+//! Performance tests that verify operation latency stays within acceptable
+//! thresholds, using ABSOLUTE wall-clock bounds to catch regressions in the
+//! critical path.
+//!
+//! # Where these run
+//!
+//! NOT in the per-PR / merge-queue lane. `ci.yml` skips `accord::perf_regression`
+//! and the suite runs nightly (`nightly-fuzz.yml`, job `perf-regression`).
+//! Absolute time bounds measure the RUNNER when the machine is contended: a
+//! merge-group build clocked the 1000-message `ReorderBuffer` drain at 52.8 ms
+//! against the 10 ms bound and ejected a docs-only PR from the merge queue
+//! (forge t_430e21f7). The thresholds below are unchanged — only where they are
+//! evaluated changed.
+//!
+//! A nightly GitHub runner is still shared hardware, so this catches GROSS
+//! regressions only; precise measurement belongs on the Fly perf-tier rigs. If a
+//! threshold trips, investigate or move the measurement — do not widen it.
 //!
 //! # A7.9 Tests
 //!

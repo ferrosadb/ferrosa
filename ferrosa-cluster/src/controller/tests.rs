@@ -2779,7 +2779,15 @@ async fn forming_falls_back_to_pair_on_timeout() {
 /// dropped late arrivals because it observed an empty queue once and
 /// exited; the new helper waits N consecutive empties so in-flight
 /// `Forming` senders can still land.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// `start_paused` puts BOTH the late sender's delay and the drain's
+// cool-downs on the same VIRTUAL clock, which auto-advances only when the
+// runtime is idle. That makes the interleaving deterministic instead of a
+// wall-clock race: the previous version slept 80 ms of real time hoping to
+// land inside the drain's ~150 ms quiet window, but that 80 ms starts when
+// the spawned task is FIRST POLLED, so on a loaded runner the send landed
+// after the drain had already exited (2 of 3 replayed — observed ejecting a
+// PR from the merge queue, forge t_58da3900).
+#[tokio::test(start_paused = true)]
 async fn ddl_during_forming_queues_and_replays() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2790,12 +2798,11 @@ async fn ddl_during_forming_queues_and_replays() {
     tx.send(1).unwrap();
     tx.send(2).unwrap();
 
-    // Inject a third op AFTER the drain starts but before its
-    // first try_recv-empty cool-down completes.
+    // Inject a third op AFTER the drain has seen the queue go empty, so the
+    // test still exercises the cool-down path this helper exists for: a
+    // try_recv-once-then-quit drain would miss it.
     let tx_for_late = tx.clone();
     tokio::spawn(async move {
-        // Sleep long enough for drain_ddl_queue to consume the first
-        // two ops and start its first cool-down (50 ms).
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         tx_for_late.send(3).unwrap();
     });
