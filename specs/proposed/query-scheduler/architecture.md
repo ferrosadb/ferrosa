@@ -1,7 +1,7 @@
 ---
 title: "Query QoS / Fair Scheduler — Architecture"
-status: proposed
-component: ferrosa-sched (new) + ferrosa-cql, ferrosa-cluster, ferrosa-storage, ferrosa-index
+status: partially-implemented
+component: ferrosa-sched + ferrosa-cql, ferrosa-cluster, ferrosa-storage, ferrosa-index
 last_revised: 2026-07-20
 executive_summary: >
   A CFS-inspired, two-dimensional (CPU + I/O), hierarchical (per-tenant) fair
@@ -15,6 +15,11 @@ executive_summary: >
 ---
 
 # Query QoS / Fair Scheduler — Architecture
+
+> **Status note (2026-07-28).** `ferrosa-sched` EXISTS and is wired into
+> `ferrosa-cql` and `ferrosa-cluster`; this document describes the design, not
+> pending work. See the implementation-status table in `project-plan.md` for
+> what has landed per phase.
 
 > Read `decisions.md` first — this spec assumes DR-1..10 are locked.
 

@@ -1,8 +1,8 @@
 ---
 title: "Query QoS / Fair Scheduler — Project Plan"
-status: proposed
+status: partially-implemented
 component: ferrosa-sched + integration crates
-last_revised: 2026-07-20
+last_revised: 2026-07-28
 executive_summary: >
   Four phases. Phase 0 (reservation + bounded background pool) is a shippable
   slice that fixes the raft-heartbeat starvation regression (t_88223ad0) with no
@@ -13,6 +13,24 @@ executive_summary: >
 ---
 
 # Query QoS / Fair Scheduler — Project Plan
+
+> **Implementation status (2026-07-28).** This plan was authored before the work
+> began and is preserved for its design rationale, FMEA-driven sequencing, and
+> decision record — NOT as a description of unbuilt work. Much of it has since
+> landed in `ferrosa-sched`; read the code as the source of truth and this plan
+> as the "why".
+>
+> | Phase | Plan intent | On `main` today |
+> |---|---|---|
+> | 0 — reservation + bounded pool | fix raft starvation (t_88223ad0) | **Landed.** `SchedPool` bounds the `spawn_blocking` fan-out; `lib.rs` documents the reserved-headroom invariant. |
+> | 1 — fair scheduling (vruntime) | vruntime run queue, chunk-budget yielding | **Largely landed.** `runqueue.rs` + `scheduler.rs` vruntime core; `SchedPool::submit_scan`/`ScanSlot` do cooperative re-acquire so one scan cannot monopolize the pool. |
+> | 2 — two resource dimensions (CPU + I/O) | separate I/O accounting | **Partly landed.** `io_permits.rs` exists; check it against the plan's dimension model before assuming full coverage. |
+> | 3 — tenant groups + background unification | per-tenant fair share | **Partly landed.** `group_runqueue.rs` + `fair_admit.rs` provide group-level admission; the background-job unification refactor is the piece to verify. |
+>
+> Consumers already wired: `ferrosa-cql` (planner) and `ferrosa-cluster`
+> (coordinator). Before using this document to plan new work, diff each phase's
+> task list against the modules above — some tasks are done, some were superseded,
+> and the per-phase tables below have NOT been individually re-audited.
 
 Priorities: **P1** = FMEA RPN ≥ 200 or blocks the bug fix; **P2** = high-risk /
 dependency-unblocking; **P3** = completeness; **P4** = polish/tuning.

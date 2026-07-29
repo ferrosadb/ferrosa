@@ -1,6 +1,6 @@
 ---
 title: "Query QoS / Fair Scheduler — FMEA"
-status: proposed
+status: partially-implemented
 component: ferrosa-sched + integration crates
 last_revised: 2026-07-20
 executive_summary: >
