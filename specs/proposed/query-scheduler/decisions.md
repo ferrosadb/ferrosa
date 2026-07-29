@@ -1,7 +1,7 @@
 ---
 title: "Query QoS / Fair Scheduler — Decision Records"
-status: proposed
-component: ferrosa-sched (new) + ferrosa-cql, ferrosa-cluster, ferrosa-storage, ferrosa-index
+status: partially-implemented
+component: ferrosa-sched + ferrosa-cql, ferrosa-cluster, ferrosa-storage, ferrosa-index
 last_revised: 2026-07-20
 executive_summary: >
   Locked design decisions for a CFS-inspired, multi-resource (CPU + I/O),
