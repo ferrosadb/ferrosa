@@ -7425,12 +7425,14 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
-            let cleanup_start = Instant::now();
-            Self::evict_local_input_sstable_files(&result.task.inputs);
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::InputCleanup,
-                cleanup_start.elapsed(),
-            );
+            let cleanup_inputs = || {
+                let cleanup_start = Instant::now();
+                Self::evict_local_input_sstable_files(&result.task.inputs);
+                crate::metrics::observe_compaction_phase(
+                    crate::metrics::CompactionPhase::InputCleanup,
+                    cleanup_start.elapsed(),
+                );
+            };
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
             //
@@ -7457,6 +7459,7 @@ impl StorageEngine {
                 }
                 self.pin_metrics.add_pinned_bytes(size as i64);
                 self.enforce_pin_max_bytes(table_id);
+                cleanup_inputs();
                 continue;
             }
 
@@ -7475,9 +7478,11 @@ impl StorageEngine {
                 .as_ref()
                 .or(self.upload_manager.as_ref());
             let Some(upload_mgr) = upload_mgr else {
+                cleanup_inputs();
                 continue;
             };
             let Some((store, prefix)) = self.resolve_store_and_prefix() else {
+                cleanup_inputs();
                 continue;
             };
 
@@ -7517,20 +7522,41 @@ impl StorageEngine {
                 total_size,
             );
 
-            // Step 1: record the pending upload (best-effort).
+            // Step 1: record the pending upload before deleting any input.
+            // Without this fsynced marker, a crash can strand the local-only
+            // output after its inputs are reclaimed (#235).
             let pending_log_path = self.config.data_dir.join("pending-uploads.log");
-            let pending_log_result = crate::upload::PendingUploadsLog::open(&pending_log_path);
-            if let Ok(ref pending_log) = pending_log_result {
-                let compaction = crate::upload::pending_log::PendingCompactionUpload {
-                    remove_input_ids: manifest_plan.remove_input_ids.clone(),
-                    output: manifest_plan.add_output.clone(),
-                };
-                if let Err(e) =
-                    pending_log.add_compaction_entry(&table_id_str, &sstable_id, compaction)
-                {
-                    tracing::warn!(%e, %sstable_id, "compaction: failed to write pending-log entry");
+            let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
+                Ok(pending_log) => {
+                    let compaction = crate::upload::pending_log::PendingCompactionUpload {
+                        remove_input_ids: manifest_plan.remove_input_ids.clone(),
+                        output: manifest_plan.add_output.clone(),
+                    };
+                    if let Err(e) =
+                        pending_log.add_compaction_entry(&table_id_str, &sstable_id, compaction)
+                    {
+                        tracing::error!(
+                            %e,
+                            %sstable_id,
+                            "compaction: pending-upload record failed; preserving inputs"
+                        );
+                        continue;
+                    }
+                    pending_log
                 }
-            }
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        %sstable_id,
+                        "compaction: pending-upload log unavailable; preserving inputs"
+                    );
+                    continue;
+                }
+            };
+
+            // The output is now recoverable after a crash, so reclaiming the
+            // superseded inputs cannot leave the manifest without a readable copy.
+            cleanup_inputs();
 
             // Step 2: create completion channel and submit the upload.
             //
@@ -7721,11 +7747,9 @@ impl StorageEngine {
                 manifest_saved,
             ) {
                 crate::compaction::finalize::PendingLogDecision::RemoveConfirmed => {
-                    if let Ok(ref pending_log) = pending_log_result {
-                        if let Err(e) = pending_log.remove_entry(&table_id_str, &sstable_id) {
-                            tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
-                            // Non-fatal: replay will re-upload (idempotent).
-                        }
+                    if let Err(e) = pending_log.remove_entry(&table_id_str, &sstable_id) {
+                        tracing::warn!(%e, %sstable_id, "compaction: failed to remove pending-log entry");
+                        // Non-fatal: replay will re-upload (idempotent).
                     }
                 }
                 crate::compaction::finalize::PendingLogDecision::KeepForReplay => {
@@ -20037,10 +20061,76 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn compaction_keeps_inputs_when_pending_upload_log_cannot_be_written() {
+        // #235: the output is not recoverable after a crash until its pending
+        // upload record is fsynced. A failed marker write must therefore leave
+        // every input component intact; deleting them first strands the local
+        // output if disk pressure or a later restart removes it.
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        let input_gens: std::collections::HashSet<u64> =
+            StorageEngine::scan_generations(&sstable_dir)
+                .into_iter()
+                .collect();
+        let input_data_files: Vec<_> = input_gens
+            .iter()
+            .filter_map(|gen| {
+                StorageEngine::generation_component_path(&sstable_dir, &gen.to_string(), "Data.db")
+            })
+            .collect();
+        assert!(
+            input_data_files.len() >= 2,
+            "test setup must contain the two compaction inputs"
+        );
+
+        // `PendingUploadsLog::open` accepts an existing path, but appending to
+        // this directory fails. That precisely exercises the durability-marker
+        // error branch without altering the object-store upload path.
+        let pending_log_path = dir.path().join("pending-uploads.log");
+        if pending_log_path.exists() {
+            std::fs::remove_file(&pending_log_path).unwrap();
+        }
+        std::fs::create_dir(&pending_log_path).unwrap();
+
+        // Completion witness: `poll_compactions` promotes the compacted output
+        // into the table SSTable directory under a NEW generation before the
+        // pending-log step. Without observing that promotion the preservation
+        // assert below would pass vacuously (inputs trivially still exist if
+        // compaction never ran).
+        let mut output_promoted = false;
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir)
+                .into_iter()
+                .any(|gen| !input_gens.contains(&gen))
+            {
+                output_promoted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            output_promoted,
+            "compaction never ran within the window: no output generation was promoted into {:?}; the input-preservation assert would be vacuous",
+            sstable_dir
+        );
+
+        assert!(
+            input_data_files.iter().all(|path| path.exists()),
+            "compaction must preserve every input until the output has a durable pending-upload record; missing: {:?}",
+            input_data_files
+                .iter()
+                .filter(|path| !path.exists())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// C2.2 — S3 upload confirmation before manifest update.
     ///
     /// Verifies the invariant: when an S3 upload fails, `poll_compactions` must
-    /// NOT update the manifest.  The compacted output entry must not appear in
+    /// NOT update the manifest. The compacted output entry must not appear in
     /// S3, and the upload counter must remain zero.
     ///
     /// The fix lives in `poll_compactions()` at the `rx.await` match arm: an
