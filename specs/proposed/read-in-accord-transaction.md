@@ -44,8 +44,12 @@ async fn commit_with_reads(
     writes: Vec<TransactionWrite>,
     reads: Vec<TransactionRead>,   // { keyspace, table, key }
 ) -> Result<(CommitOutcome, CommitReads), CommitError> {
-    // default: commit writes, return no rows (front-ends/committers without
-    // transactional-read support are unaffected — e.g. Postgres front-end)
+    // Default: supports an EMPTY read-set only. Front-ends that never buffer
+    // transactional reads (Postgres) and write-only CQL transactions are
+    // unaffected. A NON-empty read-set here is a hard error — see below.
+    if !reads.is_empty() {
+        return Err(CommitError { reason: /* names the missing capability */ });
+    }
     Ok((self.commit(writes).await?, CommitReads::default()))
 }
 ```
@@ -53,6 +57,13 @@ async fn commit_with_reads(
 `CommitReads { rows: Vec<Option<Vec<u8>>> }` carries the agreed row bytes per
 read (positional). The CQL front-end calls `commit_with_reads`; the Postgres
 front-end is untouched.
+
+**Why the default REFUSES a non-empty read-set** rather than returning an empty
+`CommitReads`: `None` in `rows` means "row absent at commit-`t`" to the caller.
+Silently returning defaults would therefore fabricate row-ABSENCE the moment a
+front-end staged a read against a committer that has not implemented the read
+path — turning a missing capability into wrong query results. Fail loud; the
+front-end surfaces the error and the transaction does not lie.
 
 ## Phased TDD plan
 
