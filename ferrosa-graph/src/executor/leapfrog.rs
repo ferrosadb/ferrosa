@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use futures::StreamExt as _;
+
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
@@ -22,9 +24,35 @@ use crate::executor::expand::{
     build_columns, check_timeout, extract_neighbor_id, GraphEngineConfig,
 };
 use crate::executor::result::{GraphResult, QueryStats};
+use crate::executor::spill::SpillSortSink;
+use crate::executor::stream::RowVals;
 use crate::executor::{eval, sort_rows};
 use crate::parser::ReturnClause;
 use crate::planner::physical::WcoJoinPlan;
+
+/// Where enumerated result rows go.
+///
+/// `Spilling` pushes each row into the external merge sort AS IT IS PRODUCED,
+/// so an unbounded ORDER BY result never sits fully in memory (t_3f2f961a).
+/// `Buffered` is the fallback when the sink cannot apply (no backend, LIMIT
+/// present, no ORDER BY, or an order term that is not a projected column) —
+/// identical to the old accumulation.
+enum RowAcc {
+    Buffered(Vec<RowVals>),
+    Spilling(SpillSortSink),
+}
+
+impl RowAcc {
+    fn push(&mut self, row: RowVals) -> Result<()> {
+        match self {
+            Self::Buffered(rows) => {
+                rows.push(row);
+                Ok(())
+            }
+            Self::Spilling(sink) => sink.push(row),
+        }
+    }
+}
 
 /// A sorted iterator over neighbor IDs from the adjacency index.
 /// Supports seek (advance to a position >= target) and next.
@@ -185,25 +213,35 @@ pub async fn execute_wco_join(
     let adj_ks = adjacency_keyspace_name(keyspace);
     let adj_table_id = TableId::new(&adj_ks, "adjacency");
 
-    // Get all candidate vertices for the first variable.
+    // Get all candidate vertices for the first variable — STREAMED, not
+    // materialized: `range_read` returned every partition of the table in one
+    // `Vec` before the first candidate was examined (t_3f2f961a). Each pull
+    // now yields one partition; only the candidate's key survives the
+    // iteration.
     let first_var = &plan.variables[0];
     let first_table = plan.var_tables.get(first_var).ok_or_else(|| {
         GraphError::Validation(format!("no resolved table for variable '{first_var}'"))
     })?;
     let first_table_id = TableId::new(&first_table.keyspace, &first_table.table);
-    let candidates = write_path.range_read(&first_table_id).await?;
-    stats.vertices_read += candidates.len();
-    check_timeout(start, config.query_timeout)?;
 
     let columns = build_columns(return_clause);
 
-    // For each candidate binding of the first variable, do variable elimination.
-    let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    // Result accumulation is spill-backed when the sorter applies, so an
+    // unbounded ORDER BY never holds the full result in memory. The silent
+    // `max_result_rows` truncation that used to stop enumeration is REMOVED
+    // (result caps are bugs: a client could not tell a partial answer from a
+    // complete one). Work stays bounded by `check_timeout`, which every
+    // enumeration step already consults.
+    let mut acc =
+        match SpillSortSink::try_new(&columns, return_clause, config, "graph_wco_order_by")? {
+            Some(sink) => RowAcc::Spilling(sink),
+            None => RowAcc::Buffered(Vec::new()),
+        };
 
-    for candidate in &candidates {
-        if result_rows.len() >= config.max_result_rows {
-            break;
-        }
+    let mut candidates = write_path.range_read_stream_all(&first_table_id, 0).await?;
+    while let Some(candidate) = candidates.next().await {
+        let candidate = candidate?;
+        stats.vertices_read += 1;
         check_timeout(start, config.query_timeout)?;
 
         let first_key_bytes = candidate.key.key.as_bytes().to_vec();
@@ -220,7 +258,7 @@ pub async fn execute_wco_join(
             &plan.variables,
             1, // Start from second variable.
             &mut var_bindings,
-            &mut result_rows,
+            &mut acc,
             return_clause,
             &columns,
             config,
@@ -231,28 +269,17 @@ pub async fn execute_wco_join(
         .await?;
     }
 
-    // Apply ORDER BY. An unbounded one spills through the storage engine's
-    // bounded external merge sort (t_4ce82a3e); `spill_order_by` returns false —
-    // leaving the in-memory sort — when it cannot apply.
-    //
-    // NOTE: unlike the expand and varpath paths, this file's `max_result_rows`
-    // uses are NOT removed here. Several of them bound JOIN WORK rather than the
-    // result buffer (`leapfrog_join(&mut iterators, config.max_result_rows)`
-    // caps the intersection itself, and `enumerate_bindings` stops recursing on
-    // it), so removing them is a different change that needs its own analysis of
-    // what each cap is actually protecting.
-    if !return_clause.order_by.is_empty() {
-        let spilled = crate::executor::spill::spill_order_by(
-            &mut result_rows,
-            &columns,
-            return_clause,
-            config,
-        )
-        .await?;
-        if !spilled {
-            sort_rows(&mut result_rows, &columns, &return_clause.order_by);
+    // Terminal ORDER BY: the spilling accumulator already sorted while
+    // accumulating; the buffered fallback sorts in memory exactly as before.
+    let mut result_rows = match acc {
+        RowAcc::Spilling(sink) => sink.finish_rows()?,
+        RowAcc::Buffered(mut rows) => {
+            if !return_clause.order_by.is_empty() {
+                sort_rows(&mut rows, &columns, &return_clause.order_by);
+            }
+            rows
         }
-    }
+    };
 
     // Apply DISTINCT.
     if return_clause.distinct {
@@ -288,7 +315,7 @@ async fn enumerate_bindings(
     variables: &[String],
     var_idx: usize,
     var_bindings: &mut HashMap<String, Vec<u8>>,
-    result_rows: &mut Vec<Vec<serde_json::Value>>,
+    acc: &mut RowAcc,
     return_clause: &ReturnClause,
     columns: &[String],
     config: &GraphEngineConfig,
@@ -296,9 +323,6 @@ async fn enumerate_bindings(
     stats: &mut QueryStats,
     schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<()> {
-    if result_rows.len() >= config.max_result_rows {
-        return Ok(());
-    }
     check_timeout(start, config.query_timeout)?;
 
     // Base case: all variables are bound. Verify that all relations are satisfied
@@ -310,7 +334,7 @@ async fn enumerate_bindings(
             let row =
                 project_bindings(write_path, plan, var_bindings, return_clause, stats, schema)
                     .await?;
-            result_rows.push(row);
+            acc.push(row)?;
         }
         return Ok(());
     }
@@ -372,16 +396,16 @@ async fn enumerate_bindings(
 
     if iterators.is_empty() {
         // No constraints on this variable from bound variables yet.
-        // Fall back to scanning all candidates for this variable.
+        // Fall back to scanning all candidates for this variable — streamed,
+        // one partition per pull, instead of materializing the whole table
+        // (t_3f2f961a).
         if let Some(table) = plan.var_tables.get(current_var) {
             let table_id = TableId::new(&table.keyspace, &table.table);
-            let candidates = write_path.range_read(&table_id).await?;
-            stats.vertices_read += candidates.len();
+            let mut candidates = write_path.range_read_stream_all(&table_id, 0).await?;
 
-            for candidate in &candidates {
-                if result_rows.len() >= config.max_result_rows {
-                    break;
-                }
+            while let Some(candidate) = candidates.next().await {
+                let candidate = candidate?;
+                stats.vertices_read += 1;
                 let key_bytes = candidate.key.key.as_bytes().to_vec();
                 var_bindings.insert(current_var.clone(), key_bytes);
                 Box::pin(enumerate_bindings(
@@ -391,7 +415,7 @@ async fn enumerate_bindings(
                     variables,
                     var_idx + 1,
                     var_bindings,
-                    result_rows,
+                    acc,
                     return_clause,
                     columns,
                     config,
@@ -406,13 +430,13 @@ async fn enumerate_bindings(
         return Ok(());
     }
 
-    // Leapfrog join: intersect all iterators for the current variable.
-    let valid_bindings = leapfrog_join(&mut iterators, config.max_result_rows);
+    // Leapfrog join: intersect all iterators for the current variable. The
+    // intersection is bounded by the smallest adjacency list, which is already
+    // resident — truncating it (`max_result_rows`, removed) only dropped valid
+    // join results without saving memory.
+    let valid_bindings = leapfrog_join(&mut iterators, usize::MAX);
 
     for binding in &valid_bindings {
-        if result_rows.len() >= config.max_result_rows {
-            break;
-        }
         var_bindings.insert(current_var.clone(), binding.clone());
         Box::pin(enumerate_bindings(
             write_path,
@@ -421,7 +445,7 @@ async fn enumerate_bindings(
             variables,
             var_idx + 1,
             var_bindings,
-            result_rows,
+            acc,
             return_clause,
             columns,
             config,

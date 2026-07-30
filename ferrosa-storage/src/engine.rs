@@ -316,6 +316,17 @@ impl TempSortTableReservation {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Take ownership of an existing directory as a temp-sort reservation:
+    /// dropping the reservation deletes the directory.
+    ///
+    /// For spill-backend test doubles and embedded callers that manage their
+    /// own temp roots. The storage engine's own reservations come from
+    /// [`StorageEngine::reserve_order_by_temp_sort_table`], which also creates
+    /// the directory under the engine's data dir.
+    pub fn claim_dir(path: PathBuf) -> Self {
+        Self { path }
+    }
 }
 
 impl Drop for TempSortTableReservation {
