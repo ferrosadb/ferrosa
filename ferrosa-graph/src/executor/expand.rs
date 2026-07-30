@@ -1482,10 +1482,48 @@ async fn execute_expand_streaming<'a>(
     };
 
     // ORDER BY (with or without DISTINCT) is a pipeline breaker: no row is
-    // final until every row is projected. Keep the buffered tail, which also
-    // keeps the spill path and the ordering-by-non-projected-expressions
-    // behavior intact.
+    // final until every row is projected. But "must see every row" does not
+    // mean "must hold every row": when the spilling sorter applies, project
+    // each state straight INTO it and stream the merged output — the full
+    // result set is never resident (t_3f2f961a). DISTINCT still takes the
+    // buffered tail: its buffered semantics re-sort by debug string after the
+    // ORDER BY sort (t_363c1316 tracks that bug), and this path must not
+    // change observable behavior.
     if !parts.return_clause.order_by.is_empty() {
+        let columns = build_columns(&parts.return_clause);
+        if !parts.return_clause.distinct {
+            if let Some(mut sink) = crate::executor::spill::SpillSortSink::try_new(
+                &columns,
+                &parts.return_clause,
+                ctx.config,
+                "graph_order_by_stream",
+            )? {
+                let proj = ExpandProjection {
+                    needs_graph_projection: parts
+                        .return_clause
+                        .items
+                        .iter()
+                        .any(|item| expr_has_pattern_comprehension(&item.expr)),
+                    anchor_var: parts.anchor.var.clone().unwrap_or_default(),
+                    return_clause: parts.return_clause.clone(),
+                    write_path: ctx.write_path,
+                    keyspace: ctx.keyspace,
+                    schema: ctx.schema,
+                };
+                project_states_into_sink(
+                    &states,
+                    &proj,
+                    &mut sink,
+                    ctx.start,
+                    ctx.config.query_timeout,
+                )
+                .await?;
+                stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
+                return Ok((columns, sink.finish_stream()?, stats));
+            }
+        }
+        // Fallback: no spill backend, LIMIT present, an order term that is not
+        // a projected column (needs the states' bindings), or DISTINCT.
         let result = finish_expand_buffered(states, stats, plan, ctx).await?;
         return Ok((result.columns, stream_from_rows(result.rows), result.stats));
     }
@@ -1944,39 +1982,65 @@ async fn finish_expand_buffered(
     // Project every surviving state. The old `max_result_rows` break here
     // SILENTLY TRUNCATED the result — no error, no flag, so a client could not
     // tell a partial answer from a complete one. Removed (t_4ce82a3e): an
-    // unbounded ORDER BY now SPILLS (below) instead of being capped, which is
-    // the honest answer rather than a quiet wrong one.
-    let mut result_states = Vec::new();
-    let mut rows = Vec::new();
-    for state in &current_states {
-        let row = project_state(
-            return_clause,
-            needs_graph_projection,
-            write_path,
-            keyspace,
-            schema,
-            anchor_var,
-            state,
-        )
-        .await?;
-        result_states.push(state.clone());
-        rows.push(row);
-    }
-
-    // Apply ORDER BY before projection-only values disappear. Cypher permits
-    // ordering by expressions that are not part of RETURN.
+    // unbounded ORDER BY now SPILLS instead of being capped, which is the
+    // honest answer rather than a quiet wrong one.
     //
-    // An UNBOUNDED ORDER BY (no LIMIT) must see every row before the first
-    // output row is known — a pipeline-breaker. Rather than cap it in memory,
-    // spill through the storage engine's bounded external merge sort when a
-    // backend is available (t_4ce82a3e). `spill_order_by` returns Ok(false) when
-    // it cannot apply (no backend, no LIMIT-free ORDER BY, or an order term that
-    // is not a projected column), leaving the in-memory sort below to run
-    // exactly as before.
-    let spilled =
-        crate::executor::spill::spill_order_by(&mut rows, &columns, return_clause, config).await?;
-    if !spilled {
-        sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+    // When the spilling sorter applies, each projected row goes straight INTO
+    // it — the interim rows `Vec` and the per-state clones (only ever needed by
+    // the bindings-based fallback sort) are skipped entirely, so projection
+    // memory is bounded by the spill threshold rather than the result size
+    // (t_3f2f961a). The final `Vec` below is this function's buffered
+    // contract; the streaming entry point avoids even that.
+    //
+    // ORDER BY runs before projection-only values disappear: Cypher permits
+    // ordering by expressions that are not part of RETURN, and exactly that
+    // case is why the fallback sorts via the states' bindings — a spilled row
+    // carries no binding context, so `SpillSortSink::try_new` refuses it.
+    let sink = crate::executor::spill::SpillSortSink::try_new(
+        &columns,
+        return_clause,
+        config,
+        "graph_order_by",
+    )?;
+    let mut rows = Vec::new();
+    match sink {
+        Some(mut sink) => {
+            let proj = ExpandProjection {
+                return_clause: return_clause.clone(),
+                anchor_var: anchor_var.to_string(),
+                needs_graph_projection,
+                write_path,
+                keyspace,
+                schema,
+            };
+            project_states_into_sink(
+                &current_states,
+                &proj,
+                &mut sink,
+                start,
+                config.query_timeout,
+            )
+            .await?;
+            rows = sink.finish_rows()?;
+        }
+        None => {
+            let mut result_states = Vec::new();
+            for state in &current_states {
+                let row = project_state(
+                    return_clause,
+                    needs_graph_projection,
+                    write_path,
+                    keyspace,
+                    schema,
+                    anchor_var,
+                    state,
+                )
+                .await?;
+                result_states.push(state.clone());
+                rows.push(row);
+            }
+            sort_projected_rows_by_bindings(&mut rows, &result_states, return_clause);
+        }
     }
 
     // Apply DISTINCT.
@@ -2081,6 +2145,40 @@ struct ExpandProjection<'a> {
     write_path: &'a WritePath,
     keyspace: &'a str,
     schema: Option<&'a Schema>,
+}
+
+/// Project every surviving state sequentially, pushing each row straight into
+/// the spilling ORDER BY sorter — the interim rows `Vec` never exists, so
+/// projection memory is bounded by the spill threshold rather than the result
+/// size (t_3f2f961a). Shared by the streaming and buffered ORDER BY tails so
+/// they cannot drift.
+///
+/// Checks the query timeout once per state: projection can read storage (a
+/// pattern comprehension traverses per row), so it is WORK and gets the same
+/// bound as the hop loop. The buffered tail historically skipped that check —
+/// a gap, not a behavior worth preserving.
+async fn project_states_into_sink(
+    states: &[ExpandState],
+    proj: &ExpandProjection<'_>,
+    sink: &mut crate::executor::spill::SpillSortSink,
+    start: Instant,
+    query_timeout: std::time::Duration,
+) -> Result<()> {
+    for state in states {
+        check_timeout(start, query_timeout)?;
+        let row = project_state(
+            &proj.return_clause,
+            proj.needs_graph_projection,
+            proj.write_path,
+            proj.keyspace,
+            proj.schema,
+            &proj.anchor_var,
+            state,
+        )
+        .await?;
+        sink.push(row)?;
+    }
+    Ok(())
 }
 
 /// Project the surviving expand states lazily: one [`project_state`] call per

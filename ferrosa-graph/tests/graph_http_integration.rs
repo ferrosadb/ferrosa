@@ -501,6 +501,29 @@ fn build_app_with_write_path(
     build_router(state)
 }
 
+fn build_app_with_config(
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    config: GraphEngineConfig,
+) -> axum::Router {
+    let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+    ));
+    let engine = Arc::new(GraphEngine::new(
+        Arc::clone(&schema),
+        Arc::clone(&storage),
+        write_path,
+        config,
+        std::time::Duration::from_secs(300),
+    ));
+    let state = AppState {
+        engine,
+        schema: Arc::clone(&schema),
+        auth_disabled: false,
+    };
+    build_router(state)
+}
+
 fn build_app_and_engine(
     schema: Arc<Schema>,
     storage: Arc<StorageEngine>,
@@ -954,6 +977,72 @@ async fn graph_full_workflow() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A WCO (leapfrog) triangle join must return EVERY match. Before t_3f2f961a
+/// the enumeration stopped silently at `max_result_rows` — a partial answer
+/// indistinguishable from a complete one. With the cap gone (work is bounded
+/// by the query timeout; ORDER BY results spill), a config whose cap is
+/// SMALLER than the match count must still yield all matches.
+#[tokio::test]
+async fn wco_triangle_join_returns_all_matches_not_a_truncated_prefix() {
+    let (schema, storage, _dir) = setup();
+    create_social_graph_schema(&schema);
+    register_social_tables_with_storage(&storage);
+
+    for name in ["TriA", "TriB", "TriC"] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!("MERGE (n:Person {{name: '{name}'}}) RETURN n"),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+    for (src, dst) in [("TriA", "TriB"), ("TriB", "TriC"), ("TriC", "TriA")] {
+        let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+        let req = json_request(
+            "POST",
+            "/graph/query",
+            Some(serde_json::json!({
+                "query": format!(
+                    "MERGE (a:Person {{name: '{src}'}})-[r:KNOWS]->(b:Person {{name: '{dst}'}}) RETURN r"
+                ),
+                "keyspace": "social"
+            })),
+        );
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // The triangle has 3 matches (one per rotation of the anchor). A cap of 2
+    // silently returned a 2-row prefix before the fix.
+    let capped_config = GraphEngineConfig {
+        max_result_rows: 2,
+        ..GraphEngineConfig::default()
+    };
+    let app = build_app_with_config(Arc::clone(&schema), Arc::clone(&storage), capped_config);
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+                      RETURN a.name, b.name, c.name",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "triangle WCO join must return all 3 rotations, not a silent \
+         max_result_rows prefix; got {rows:?}"
+    );
 }
 
 #[tokio::test]
