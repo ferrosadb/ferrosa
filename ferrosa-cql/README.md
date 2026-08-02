@@ -29,7 +29,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   custom `STREAMING_FLAG` (bit 0x10) for SUBSCRIBE response frames.
 - **Connection state machine** (`connection.rs`, ~4k LoC) — STARTUP → (AUTH) →
   READY handshake, per-opcode dispatch (QUERY / PREPARE / EXECUTE / BATCH /
-  REGISTER / OPTIONS), bind-marker counting, subscription push pump.
+  REGISTER / OPTIONS), bind-marker counting, subscription push pump. PREPARE
+  metadata preserves bind order and includes synthetic typed specs for
+  non-column parameters such as `LIMIT ?` (`[limit] : int`), so strict drivers
+  receive one variable specification per placeholder.
 - **Lexer + parser** (`lexer.rs`, `parser.rs` ~5.9k LoC, `ast.rs`) — hand-written
   tokenizer and recursive-descent parser producing a `Statement` AST: full DML,
   DDL (keyspace/table/index/type/role/function/aggregate), BATCH, LWT `IF`

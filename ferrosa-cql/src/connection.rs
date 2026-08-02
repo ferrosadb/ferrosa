@@ -1,3 +1,9 @@
+//! Module: Per-connection CQL native-protocol handler.
+//! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
+//! substitution preserve the CQL wire contract for every accepted opcode.
+//! Last revised: 2026-07-30
+//! Last changed: Added the synthetic `int` variable specification for `SELECT ... LIMIT ?`.
+//!
 //! Per-connection CQL protocol handler.
 //!
 //! Implements the CQL v5 connection lifecycle:
@@ -2212,11 +2218,19 @@ fn analyze_prepared_columns(
     match stmt {
         Statement::Select(s) => {
             // Bind markers in SELECT clauses, preserving statement bind order:
-            // WHERE predicates first, then ANN vector term if `ANN OF ?` is used.
+            // WHERE predicates first, then ANN vector term, then LIMIT.
             for col_name in select_bind_marker_columns(s) {
                 if let Some(cql_type) = resolve(col_name) {
                     bound_columns.push((col_name.to_string(), cql_type));
                 }
+            }
+            // `LIMIT ?` is an integer bind variable, not a table column. Its
+            // metadata therefore uses Cassandra's synthetic `[limit]` name.
+            if matches!(
+                s.limit,
+                Some(crate::ast::Limit::BindMarker | crate::ast::Limit::NamedBindMarker(_))
+            ) {
+                bound_columns.push(("[limit]".into(), CqlType::Int));
             }
 
             // Build result columns from the SELECT column list

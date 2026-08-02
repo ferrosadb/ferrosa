@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-07-12
+last_updated: 2026-07-30
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -36,7 +36,7 @@ same encode/decode without depending on this large crate.
 |--------|-----|----------------|
 | `router` | ~22.4k | Central `route()` dispatch: permission checks, DML/DDL handlers, prepared fast paths, ORDER BY planning, `SharedState` |
 | `parser` | ~5.9k | Recursive-descent CQL parser → `Statement` AST |
-| `connection` | ~4.0k | Per-connection state machine, handshake, per-opcode dispatch, subscription pump |
+| `connection` | ~4.0k | Per-connection state machine, handshake, per-opcode dispatch, PREPARE variable metadata, subscription pump |
 | `bridge` | ~2.7k | `Term`↔`CqlValue`↔storage conversions, server-side fn eval, **row-codec re-export** |
 | `frame` | ~1.4k | CQL header/body codec, opcodes, LZ4/Snappy compression, streaming flag |
 | `lexer` | ~1.4k | Hand-written CQL tokenizer |
@@ -94,6 +94,13 @@ geo indexes use their dedicated operators; allowing them into a scalar `=` plan
 would consult an incompatible storage map and could turn a valid keyed read
 into a false empty result when, for example, a full-text and phonetic index
 share the same column.
+
+**Prepared metadata.** `connection::handle_prepare` counts placeholders from the
+AST and emits the same number of ordered variable specifications. Table-backed
+markers resolve through the schema; statement-only markers use typed synthetic
+names. In particular, `SELECT ... WHERE pk = ? LIMIT ?` advertises the key
+column followed by `[limit] : int`, allowing strict drivers to bind both values
+without treating `limit` as a missing schema column.
 
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
 it resolves the matching row-granular doc keys through the cluster write path

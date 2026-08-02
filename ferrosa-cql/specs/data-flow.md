@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: data-flow
-last_updated: 2026-06-19
+last_updated: 2026-07-30
 ---
 
 # ferrosa-cql — Data Flow
@@ -98,6 +98,14 @@ page 1 forever and ignored `fetch_size`. Router-level tests that hand-built
 `ctx.paging` passed while the live wire path was broken, which is why the
 regression must be pinned through the real codec
 (`live_wire_paged_scan_advances_and_terminates_exactly`).
+
+**Prepared SELECT metadata.** A PREPARE frame follows the same parse path but
+stops before routing: `connection::handle_prepare` counts AST bind markers,
+resolves table-backed columns, and emits a Prepared RESULT with the matching
+ordered variable specifications. Statement-only values do not go through table
+schema lookup: `LIMIT ?` emits the synthetic `[limit]` variable with CQL type
+`int` after any WHERE or ANN variables. This lets the driver encode every bound
+value before the later EXECUTE reaches `router::route_select`.
 
 ## Bridge re-export relationship (D10)
 
