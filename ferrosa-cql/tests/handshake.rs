@@ -2257,6 +2257,47 @@ fn extract_bind_col_count_from_prepared_response(body: &[u8]) -> i32 {
     i32::from_be_bytes(body[26..30].try_into().unwrap())
 }
 
+/// Decode the simple global-table bind metadata emitted by the v4 test server.
+///
+/// The regression uses only scalar types, so every variable spec ends after its
+/// two-byte type id; collection and UDT type parameters are deliberately out of
+/// scope for this narrow wire assertion.
+fn extract_global_bind_specs_from_prepared_response(body: &[u8]) -> Vec<(String, u16)> {
+    let id_len = u16::from_be_bytes(body[4..6].try_into().unwrap()) as usize;
+    let mut offset = 6 + id_len;
+    let bind_flags = i32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    assert_eq!(
+        bind_flags & 0x0001,
+        0x0001,
+        "expected global-table metadata"
+    );
+    let bind_col_count = i32::from_be_bytes(body[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+
+    let pk_count = i32::from_be_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4 + pk_count * 2;
+    for _ in 0..2 {
+        let string_len = u16::from_be_bytes(body[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2 + string_len;
+    }
+
+    (0..bind_col_count)
+        .map(|_| {
+            let name_len =
+                u16::from_be_bytes(body[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let name = std::str::from_utf8(&body[offset..offset + name_len])
+                .unwrap()
+                .to_string();
+            offset += name_len;
+            let type_id = u16::from_be_bytes(body[offset..offset + 2].try_into().unwrap());
+            offset += 2;
+            (name, type_id)
+        })
+        .collect()
+}
+
 /// P0-22 regression: INSERT with 3 `?` bind markers must report col_count = 3.
 ///
 /// This is the canonical external-driver compatibility test.  A strict driver
@@ -2377,6 +2418,66 @@ async fn prepare_select_with_one_where_bind_marker_reports_col_count_one() {
         col_count, 1,
         "PREPARE SELECT with 1 WHERE bind marker must report bind col_count = 1; \
          got {col_count}"
+    );
+}
+
+/// A parameterized LIMIT must contribute its synthetic `int` variable spec
+/// after the table-column marker in the prepared response.
+#[tokio::test]
+async fn prepare_select_with_where_and_limit_bind_markers_reports_col_count_two() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE control WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body =
+        encode_query_body("CREATE TABLE control.vm_health (vm_id uuid PRIMARY KEY, status text)");
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let vm_id = uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+    let body = encode_query_body(
+        "INSERT INTO control.vm_health (vm_id, status) \
+         VALUES (aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee, 'healthy')",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let prep_body = encode_prepare_body("SELECT * FROM control.vm_health WHERE vm_id = ? LIMIT ?");
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+
+    let col_count = extract_bind_col_count_from_prepared_response(&resp.body);
+    assert_eq!(
+        col_count, 2,
+        "PREPARE SELECT with WHERE ? and LIMIT ? must report two bind column specs; \
+         got {col_count}"
+    );
+    assert_eq!(
+        extract_global_bind_specs_from_prepared_response(&resp.body),
+        vec![("vm_id".into(), 0x000C), ("[limit]".into(), 0x0009)],
+        "PREPARE must advertise LIMIT ? as the synthetic [limit] int variable"
+    );
+
+    let mut prepared_id = [0u8; 16];
+    prepared_id.copy_from_slice(&resp.body[6..22]);
+    let limit = 1i32.to_be_bytes();
+    let exec_body = encode_execute_body_with_values(&prepared_id, &[vm_id.as_bytes(), &limit]);
+    send_raw_frame(&mut stream, Opcode::Execute, &exec_body).await;
+    let resp = read_frame(&mut stream).await;
+    assert_result(&resp);
+    assert_eq!(
+        extract_row_count_from_result(&resp.body),
+        1,
+        "the prepared LIMIT value must be accepted during EXECUTE"
     );
 }
 
