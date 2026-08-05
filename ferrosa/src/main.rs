@@ -1013,7 +1013,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .unwrap_or(false);
 
-    let (storage, pending_mutations) = if has_commitlog_segments {
+    // Restore-on-boot: when FERROSA_RESTORE_SNAPSHOT is set and this exact
+    // intent has not already been applied, open by restoring the snapshot
+    // instead of taking the ordinary path. The applied-marker is what stops an
+    // env var that survives reboots from re-restoring on every start and
+    // discarding everything written since.
+    let restore_intent = ferrosa_storage::restore::RestoreIntent::from_env()?;
+    let restore_data_dir = storage_config.data_dir.clone();
+    let pending_restore = match restore_intent {
+        Some(intent) if intent.already_applied(&restore_data_dir) => {
+            tracing::info!(
+                snapshot = %intent.snapshot,
+                point_in_time = ?intent.point_in_time,
+                "restore intent already applied on a previous boot — starting normally"
+            );
+            None
+        }
+        other => other,
+    };
+
+    let (storage, pending_mutations) = if let Some(intent) = &pending_restore {
+        tracing::warn!(
+            snapshot = %intent.snapshot,
+            point_in_time = ?intent.point_in_time,
+            force = intent.force,
+            "restore-on-boot: opening engine from snapshot instead of local state"
+        );
+        let engine = ferrosa_storage::StorageEngine::open_from_snapshot(
+            storage_config,
+            intent,
+            &host_id.to_string(),
+        )
+        .await?;
+        // Only now that the engine has actually opened. Marking earlier would
+        // skip a restore that never happened.
+        intent.mark_applied(&restore_data_dir)?;
+        tracing::info!(
+            snapshot = %intent.snapshot,
+            "restore-on-boot: restore complete and recorded"
+        );
+        (engine, Vec::new())
+    } else if has_commitlog_segments {
         tracing::info!("existing commit log segments found — replaying for crash recovery");
         let (engine, mutations) =
             ferrosa_storage::StorageEngine::open(storage_config, Some(&storage_upload_handle))?;

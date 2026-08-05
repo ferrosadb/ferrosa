@@ -6913,6 +6913,47 @@ impl StorageEngine {
         self.commit_log.current_position()
     }
 
+    /// Open the engine by restoring the snapshot named in `intent`.
+    ///
+    /// Convenience over [`Self::open_from_snapshot_with_store`] that builds the
+    /// object store from `config.object_store`, so startup does not have to.
+    ///
+    /// This is the production entry point for restore-on-boot. It does **not**
+    /// consult the applied-marker — the caller checks
+    /// [`RestoreIntent::already_applied`] first and records
+    /// [`RestoreIntent::mark_applied`] afterwards, so the marker is only
+    /// written once the engine has actually opened.
+    ///
+    /// [`RestoreIntent::already_applied`]: crate::restore::RestoreIntent::already_applied
+    /// [`RestoreIntent::mark_applied`]: crate::restore::RestoreIntent::mark_applied
+    pub async fn open_from_snapshot(
+        config: StorageEngineConfig,
+        intent: &crate::restore::RestoreIntent,
+        node_id: &str,
+    ) -> ferrosa_common::Result<Self> {
+        let os_config = config.object_store.clone().ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "cannot restore snapshot {:?}: no object store is configured, \
+                 and snapshots live in object storage",
+                intent.snapshot
+            ))
+        })?;
+        let point_in_time = intent.point_in_time_micros()?;
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::from(os_config.build_object_store()?);
+
+        Self::open_from_snapshot_with_store(
+            config,
+            &intent.snapshot,
+            point_in_time,
+            node_id,
+            intent.force,
+            store,
+            &os_config.prefix,
+        )
+        .await
+    }
+
     /// Opens a StorageEngine by restoring from a named snapshot.
     ///
     /// Steps:
