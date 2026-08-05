@@ -275,12 +275,37 @@ jobs:
       - name: Collect Docker state and logs
         if: always()
         run: |
-          docker compose ps > docker-compose-ps.log 2>&1 || true
-          docker compose ps -a >> docker-compose-ps.log 2>&1 || true
-          docker system df >> docker-compose-ps.log 2>&1 || true
+          # This step runs AFTER docker-smoke.sh's EXIT trap has already run
+          # `docker compose down -v --remove-orphans`, so the containers are
+          # gone and `compose logs` HERE returns nothing. The script captures
+          # the real logs at failure time (collect_default_compose_logs, called
+          # from fail() before the trap fires) — and this step used to TRUNCATE
+          # those good captures to zero bytes with `>`. That is why every
+          # "node1 CQL did not become ready" nightly shipped an empty
+          # node1.log/node2.log and could never be diagnosed.
+          #
+          # Only write a file the script did not already fill.
+          if [ ! -s docker-compose-ps.log ]; then
+            docker compose ps > docker-compose-ps.log 2>&1 || true
+          fi
+          {
+            echo "--- post-teardown snapshot (containers may already be removed) ---"
+            docker compose ps -a 2>&1 || true
+            docker system df 2>&1 || true
+          } >> docker-compose-ps.log
           for service in node1 node2 node3 rustfs rustfs-init; do
-            docker compose logs --tail 500 "$service" > "${service}.log" 2>&1 || true
+            if [ -s "${service}.log" ]; then
+              echo "preserving script-captured ${service}.log ($(wc -c < "${service}.log") bytes)"
+            else
+              docker compose logs --tail 500 "$service" > "${service}.log" 2>&1 || true
+            fi
           done
+          # An empty node1.log after a FAILED smoke run means the capture path
+          # is broken again. Say so loudly — a silent empty artifact is exactly
+          # what hid this for weeks.
+          if [ ! -s node1.log ]; then
+            echo "::warning::node1.log is EMPTY — if the smoke run failed, the capture path is broken (see collect_default_compose_logs in tests/docker-smoke.sh)"
+          fi
 
       - name: Upload Docker logs
         if: always()
