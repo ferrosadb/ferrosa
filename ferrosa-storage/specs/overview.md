@@ -42,7 +42,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | `upload/` | `UploadManager` (tokio task), `ObjectStoreConfig`, pending-upload log + replay across flat and generation-dir SSTable layouts |
 | `cache`, `pin_config` | `LocalCache` LRU + pinning; NVMe `PinMode` |
 | `index/` | Index state tracker (registered/pending/current completeness), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
-| `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR) |
+| `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |
 | `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector |
 | `accord/` | Per-shard conflict index + protocol log for Accord transactions |
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |

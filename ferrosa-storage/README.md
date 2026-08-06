@@ -171,6 +171,30 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   internally. Guarded by `tests/fulltext_streaming_each_memory_bound.rs`.
 - **Snapshot / PITR** (`snapshot/`, `restore/`, `commitlog/archiver.rs`) —
   S3 snapshot manager, commit-log archiving, restore manager with validation.
+- **Restore on boot** (`restore/intent.rs`) — a node started with
+  `FERROSA_RESTORE_SNAPSHOT` set opens by restoring that snapshot instead of
+  taking the ordinary open path. `FERROSA_RESTORE_POINT_IN_TIME` (RFC 3339 UTC)
+  sets the commit-log replay cutoff; `FERROSA_RESTORE_FORCE=1` accepts a
+  snapshot taken by a different node.
+
+  The intent is applied **at most once**. An env var survives a reboot, so
+  after a successful restore the node records a fingerprint of the intent in
+  `{data_dir}/.restore-applied` and later boots carrying the same intent skip
+  it — otherwise every restart would silently roll the database back and
+  discard everything written since. A different snapshot or cutoff is a new
+  request and is applied normally. The marker is written only after the engine
+  opens, so a failed restore is never recorded as done.
+
+  Timestamp parsing is deliberately strict (`parse_rfc3339_micros`): non-UTC,
+  unpadded, and space-separated forms are rejected rather than coerced, and a
+  cutoff with no snapshot is an error. A silently mis-parsed cutoff would
+  restore to the wrong moment, which is worse than refusing. Validation happens
+  at startup, before any SSTable is downloaded.
+
+  > **The HTTP endpoint is not wired to this.** `POST /api/restore` validates a
+  > request and replies `202 "restart the node to complete restore"`, but it
+  > persists no intent, so restarting after calling it does **not** restore.
+  > The env-var path above is the only one that works today.
 - **Quarantine + self-heal** (`quarantine.rs`, `self_heal/`) — malformed rows
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
@@ -227,7 +251,8 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 | Write | `write`, `batch_write`, `write_atomic_batch`, `apply_batch`, `begin_batch`/`BatchTxn`/`BatchOp`, `replay_mutations` |
 | Read | `read`, `read_range`, `read_token_range[_bounded]`, `range_iter[_projected|_fragmented]`, `count_range`, `read_by_index`, `read_by_index_in_partition` (keyed consult restricted to one partition, t_430c4188), `ann_search`, `fulltext_search`, `walk_token_range[_for_digest]` |
 | Maintenance | `flush`, `flush_if_needed`, `flush_all`, `poll_compactions`, `truncate`, `sync_sstables_to_s3` |
-| Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `list/delete_snapshot_with_store` |
+| Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `open_from_snapshot` (builds the object store from `config.object_store`; the restore-on-boot entry point), `list/delete_snapshot_with_store` |
+| Restore intent | `restore::RestoreIntent` (`from_env`, `from_vars`, `point_in_time_micros`, `already_applied`, `mark_applied`), `restore::parse_rfc3339_micros`, `ENV_RESTORE_SNAPSHOT` / `ENV_RESTORE_POINT_IN_TIME` / `ENV_RESTORE_FORCE` |
 | Abstraction | `DataStore` / `LocalDataStore` (the `Arc<dyn DataStore>` boundary) |
 | Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation` |
 | Config types | `CommitLogConfig`, `SyncStrategyConfig`, `CompactionConfig`, `ObjectStoreConfig`, `Mutation`, `TableId` |
