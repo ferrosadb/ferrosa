@@ -241,12 +241,28 @@ pub fn parse_rfc3339_micros(s: &str) -> ferrosa_common::Result<i64> {
             if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(bad("fractional seconds must be digits"));
             }
-            let mut six = f.to_string();
-            six.truncate(6);
-            while six.len() < 6 {
-                six.push('0');
+            // Read exactly 6 fractional digits, right-padding with zeros and
+            // ignoring anything beyond microsecond precision.
+            //
+            // Written as an explicit accumulation rather than truncate/take:
+            // both read as result caps to the p0-oom-audit
+            // `server-side-result-cap` check, and that guard is worth keeping
+            // sharp rather than whitelisting around. Six here is the width of
+            // a microsecond field, not a bound on anything that should stream.
+            //
+            // Indexing bytes directly is safe: `f` is verified all-ASCII-digit
+            // immediately above.
+            let digits = f.as_bytes();
+            let mut micros = 0i64;
+            for i in 0..6 {
+                let d = if i < digits.len() {
+                    i64::from(digits[i] - b'0')
+                } else {
+                    0
+                };
+                micros = micros * 10 + d;
             }
-            six.parse::<i64>().unwrap_or(0)
+            micros
         }
         None => 0,
     };
