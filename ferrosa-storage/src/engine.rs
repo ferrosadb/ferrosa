@@ -15873,6 +15873,201 @@ mod tests {
         rt.block_on(run_pitr_replay_e2e(100));
     }
 
+    /// End-to-end restore driven by a [`RestoreIntent`], the way a node start
+    /// drives it — not by calling the restore constructor directly.
+    ///
+    /// `run_pitr_replay_e2e` proves the engine can restore. This proves the
+    /// *boot path* does: that an RFC 3339 cutoff carried in
+    /// `FERROSA_RESTORE_POINT_IN_TIME` resolves to the same instant the engine
+    /// expects, that data after the cutoff is actually gone, and that the
+    /// applied-marker stops the same intent restoring twice.
+    ///
+    /// That last part is the one that matters most in production: the intent
+    /// lives in an env var that survives reboots, so without the marker every
+    /// subsequent restart would silently roll the database back again and
+    /// discard everything written since.
+    async fn restore_via_intent_e2e() {
+        use crate::restore::RestoreIntent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = "restore-intent-e2e";
+
+        crate::manifest::Manifest::new()
+            .save_with_retry(store.as_ref(), prefix)
+            .await
+            .unwrap();
+        crate::manifest::save_schema_snapshot(store.as_ref(), prefix, b"{}")
+            .await
+            .unwrap();
+
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256,
+                archive: Some(crate::commitlog::config::ArchiveConfig {
+                    enabled: true,
+                    poll_interval: std::time::Duration::from_millis(20),
+                    ..crate::commitlog::config::ArchiveConfig::default()
+                }),
+                ..CommitLogConfig::test_config(dir.path())
+            },
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+
+        let engine = StorageEngine::new_with_archive_store(
+            config,
+            Some(&tokio::runtime::Handle::current()),
+            Some(Arc::clone(&store)),
+            prefix.to_string(),
+        )
+        .unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        // Pre-snapshot rows — must survive.
+        for i in 0..5usize {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("keep-{i}")),
+                    make_row(b"keep", (1_000 + i as i64) * 1_000),
+                    (1_000 + i as i64) * 1_000,
+                )
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        engine
+            .upload_manifest_for_test(Arc::clone(&store), prefix)
+            .await;
+
+        engine
+            .create_snapshot_with_store(
+                "intent-snap",
+                "node-1",
+                None,
+                false,
+                Arc::clone(&store),
+                prefix,
+            )
+            .await
+            .unwrap();
+
+        // Post-cutoff rows — must be gone after restore.
+        for i in 0..5usize {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("drop-{i}")),
+                    make_row(b"drop", 2_000_000_000 + i as i64),
+                    2_000_000_000 + i as i64,
+                )
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        engine.shutdown().unwrap();
+
+        // The intent as a node would receive it: an RFC 3339 string, not a
+        // pre-computed integer. 1_999_999_999 microseconds after the epoch is
+        // 1970-01-01T00:33:19.999999Z — after every "keep" row, before every
+        // "drop" row. If the parser and the engine disagree on the instant,
+        // this test fails rather than the disagreement reaching production.
+        let intent = RestoreIntent::from_vars(
+            Some("intent-snap".to_string()),
+            Some("1970-01-01T00:33:19.999999Z".to_string()),
+            None,
+        )
+        .unwrap()
+        .expect("snapshot set, so an intent is expected");
+
+        let cutoff = intent
+            .point_in_time_micros()
+            .unwrap()
+            .expect("point_in_time was supplied");
+        assert_eq!(
+            cutoff, 1_999_999_999,
+            "RFC 3339 cutoff must resolve to the microsecond the engine expects"
+        );
+
+        let restore_dir = tempfile::tempdir().unwrap();
+        let restore_config = StorageEngineConfig {
+            commit_log: CommitLogConfig::test_config(restore_dir.path()),
+            ..StorageEngineConfig::test_config(restore_dir.path())
+        };
+        let restore_data_dir = restore_config.data_dir.clone();
+
+        // A fresh node has not applied this intent, so it must restore.
+        assert!(
+            !intent.already_applied(&restore_data_dir),
+            "a fresh data dir must not report the intent as already applied"
+        );
+
+        let restored = StorageEngine::open_from_snapshot_with_store(
+            restore_config,
+            &intent.snapshot,
+            Some(cutoff),
+            "node-1",
+            intent.force,
+            Arc::clone(&store),
+            prefix,
+        )
+        .await
+        .unwrap();
+        restored.register_table(test_schema()).unwrap();
+
+        // Record the intent exactly as startup does, after the engine opened.
+        intent.mark_applied(&restore_data_dir).unwrap();
+
+        for i in 0..5usize {
+            let key = format!("keep-{i}");
+            let got = restored.read(&tid, &make_key(&key)).unwrap();
+            assert!(got.is_some(), "pre-snapshot row '{key}' must survive");
+            assert_eq!(
+                got.unwrap().rows[0].cells[0].1.value.as_deref(),
+                Some(b"keep".as_slice()),
+                "pre-snapshot row '{key}' must keep its value"
+            );
+        }
+        for i in 0..5usize {
+            let key = format!("drop-{i}");
+            assert!(
+                restored.read(&tid, &make_key(&key)).unwrap().is_none(),
+                "row '{key}' written after the cutoff must be absent"
+            );
+        }
+
+        // The reboot case: same env var still set, so the node must NOT
+        // restore again and discard whatever has been written since.
+        assert!(
+            intent.already_applied(&restore_data_dir),
+            "after a successful restore the intent must be recorded as applied"
+        );
+
+        // A genuinely new request — same snapshot, later cutoff — must still run.
+        let newer = RestoreIntent::from_vars(
+            Some("intent-snap".to_string()),
+            Some("1970-01-01T00:33:20.500000Z".to_string()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !newer.already_applied(&restore_data_dir),
+            "a different point-in-time is a new restore request and must apply"
+        );
+    }
+
+    /// Runs [`restore_via_intent_e2e`] on a current-thread runtime, matching
+    /// the other PITR tests in this module.
+    #[test]
+    fn e4_restore_applied_via_intent_and_only_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(restore_via_intent_e2e());
+    }
+
     /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
     /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
     ///
