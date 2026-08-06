@@ -296,13 +296,19 @@ async fn restore_preflight(
 
 /// `POST /api/restore` — trigger a PITR restore.
 ///
-/// Validates the snapshot, then returns `202 Accepted` with a restore plan
-/// summary.  Full restore (downloading SSTables and replaying mutations) is
-/// performed during the next node startup using
+/// Validates the snapshot, **records the restore intent in the data dir**, then
+/// returns `202 Accepted` with a restore plan summary. Full restore
+/// (downloading SSTables and replaying mutations) is performed during the next
+/// node startup, which reads that intent and takes
 /// `StorageEngine::open_from_snapshot_with_store`.
 ///
+/// The recording step is not optional: without it the 202 would promise a
+/// restore that never happens, and the node would come back serving
+/// pre-restore data while the caller believed otherwise.
+///
 /// Returns `503` if S3 is not configured, `404` if the snapshot does not
-/// exist, `422` if validation fails, `202` on acceptance.
+/// exist, `422` if validation fails, `500` if the intent cannot be recorded,
+/// `202` on acceptance.
 async fn trigger_restore(
     State(state): State<WebAppState>,
     Json(body): Json<RestoreRequest>,
@@ -350,6 +356,39 @@ async fn trigger_restore(
         );
     }
 
+    // Record the intent. Without this the 202 below would be a lie: the node
+    // would restart and come back serving pre-restore data.
+    let intent = match ferrosa_storage::restore::RestoreIntent::from_vars(
+        Some(body.snapshot.clone()),
+        body.point_in_time.clone(),
+        body.force.then(|| "true".to_string()),
+    ) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "snapshot name is empty" })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": e.to_string() })),
+            );
+        }
+    };
+    let data_dir = engine.data_dir().to_path_buf();
+    if let Err(e) = intent.persist(&data_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("restore could not be recorded: {e}"),
+                "hint": "the restore was NOT scheduled; restarting the node now would \
+                         come back with pre-restore data",
+            })),
+        );
+    }
+
     // Return 202 Accepted — full restore happens on next node restart.
     (
         StatusCode::ACCEPTED,
@@ -363,7 +402,7 @@ async fn trigger_restore(
                 "segment_id": meta.commit_log_position.segment_id,
                 "offset": meta.commit_log_position.offset,
             },
-            "message": "restore accepted; restart the node to complete restore",
+            "message": "restore recorded; restart the node to apply it",
         })),
     )
 }
@@ -529,6 +568,196 @@ mod tests {
             auth_disabled: true,
             debug: None,
         }
+    }
+
+    /// Build a `WebAppState` backed by a durable local `file://` object store,
+    /// so the restore endpoints run their real success path instead of the
+    /// 503 branch. The `TempDir` is returned because the state's data dir and
+    /// object store both live inside it.
+    fn make_state_with_local_store() -> (WebAppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let object_store = ferrosa_storage::upload::ObjectStoreConfig {
+            local_path: Some(dir.path().join("objectstore")),
+            endpoint: String::new(),
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key_id: None,
+            secret_access_key: None,
+            allow_http: true,
+            prefix: "pitr-http".into(),
+            upload_queue_depth: 16,
+            upload_workers: 1,
+            compaction_upload_workers: 1,
+            compaction_upload_queue_depth: 16,
+            delete_workers: 1,
+        };
+        let storage_config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: Some(object_store),
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().join("data"),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+        };
+        let storage = Arc::new(StorageEngine::new(storage_config, None).expect("storage"));
+        let rpc_registry = Arc::new(HandlerRegistry::new());
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(ferrosa_schema::SchemaConfig {
+                hasher: ferrosa_schema::PasswordHasher::Bcrypt { cost: 4 },
+                password_policy: ferrosa_schema::PasswordPolicy::permissive(),
+                auth_method: ferrosa_schema::AuthMethod::Password,
+                rate_limit: ferrosa_schema::RateLimitConfig::default(),
+                audit_sink: Box::new(ferrosa_schema::TestAuditSink::new()),
+                secrets: Box::new(ferrosa_schema::EnvSecretsProvider),
+                mode: ferrosa_schema::DeploymentMode::Development,
+            })
+            .expect("schema"),
+        );
+        let (mc, _) = ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            uuid::Uuid::new_v4(),
+            storage.clone(),
+            schema.clone(),
+            rpc_registry,
+        );
+        let state = WebAppState {
+            registry: Arc::new(ferrosa_schema::VirtualTableRegistry::new()),
+            mode_controller: mc,
+            schema,
+            storage,
+            host_id: uuid::Uuid::new_v4(),
+            auth_disabled: true,
+            debug: None,
+        };
+        (state, dir)
+    }
+
+    /// Create a real snapshot owned by this node, so `POST /api/restore`
+    /// reaches the accept path rather than 404/409.
+    async fn seed_snapshot(state: &WebAppState, name: &str) {
+        let (os_config, store) = state
+            .storage
+            .object_store_and_config()
+            .expect("local object store");
+        let prefix = os_config.prefix.clone();
+        ferrosa_storage::manifest::Manifest::new()
+            .save_with_retry(store.as_ref(), &prefix)
+            .await
+            .expect("save manifest");
+        ferrosa_storage::manifest::save_schema_snapshot(store.as_ref(), &prefix, b"{}")
+            .await
+            .expect("save schema snapshot");
+        state
+            .storage
+            .create_snapshot_with_store(
+                name,
+                &state.host_id.to_string(),
+                None,
+                false,
+                Arc::clone(&store),
+                &prefix,
+            )
+            .await
+            .expect("create snapshot");
+    }
+
+    // ---- POST /api/restore persists the intent -----------------------------
+
+    #[tokio::test]
+    async fn trigger_restore_records_an_intent_the_next_boot_can_read() {
+        let (state, _dir) = make_state_with_local_store();
+        seed_snapshot(&state, "http-snap").await;
+        let data_dir = state.storage.data_dir().to_path_buf();
+
+        // Precondition: nothing pending, or the assertion below proves nothing.
+        assert_eq!(
+            ferrosa_storage::restore::RestoreIntent::from_data_dir(&data_dir).unwrap(),
+            None,
+            "no restore should be pending before the request"
+        );
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"snapshot":"http-snap","point_in_time":"2026-08-05T12:00:00Z"}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // The whole point of the 202: a restart must now restore. Read it back
+        // through the same API startup uses.
+        let pending = ferrosa_storage::restore::RestoreIntent::resolve(&data_dir)
+            .expect("resolve")
+            .expect("the accepted restore must be pending after a 202");
+        assert_eq!(pending.snapshot, "http-snap");
+        assert_eq!(
+            pending.point_in_time.as_deref(),
+            Some("2026-08-05T12:00:00Z")
+        );
+        assert!(!pending.force);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_restore_records_nothing() {
+        let (state, _dir) = make_state_with_local_store();
+        seed_snapshot(&state, "http-snap").await;
+        let data_dir = state.storage.data_dir().to_path_buf();
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"snapshot":"no-such-snapshot"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            ferrosa_storage::restore::RestoreIntent::from_data_dir(&data_dir).unwrap(),
+            None,
+            "a refused restore must not schedule anything for the next boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_preflight_records_nothing() {
+        let (state, _dir) = make_state_with_local_store();
+        seed_snapshot(&state, "http-snap").await;
+        let data_dir = state.storage.data_dir().to_path_buf();
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/restore/preflight")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"snapshot":"http-snap"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            ferrosa_storage::restore::RestoreIntent::from_data_dir(&data_dir).unwrap(),
+            None,
+            "preflight validates only — it must not schedule a restore"
+        );
     }
 
     // ---- GET /api/snapshots ------------------------------------------------

@@ -42,6 +42,13 @@ pub const ENV_RESTORE_FORCE: &str = "FERROSA_RESTORE_FORCE";
 /// Name of the marker recording the last successfully applied intent.
 const MARKER_FILE: &str = ".restore-applied";
 
+/// Name of the file recording a restore requested over HTTP.
+///
+/// `POST /api/restore` writes this; the next startup reads it. It shares the
+/// intent-fingerprint wire format with the applied-marker file, so
+/// "requested" and "already applied" are directly comparable.
+pub const INTENT_FILE: &str = ".restore-intent";
+
 /// A restore requested for the next node start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreIntent {
@@ -142,6 +149,158 @@ impl RestoreIntent {
         std::fs::read_to_string(Self::marker_path(data_dir))
             .map(|recorded| recorded == self.fingerprint())
             .unwrap_or(false)
+    }
+
+    fn intent_path(data_dir: &Path) -> PathBuf {
+        data_dir.join(INTENT_FILE)
+    }
+
+    /// Record this intent so the next startup applies it.
+    ///
+    /// This is what makes `POST /api/restore` more than a validation call: the
+    /// handler replies "restart the node to complete restore", and this is the
+    /// only thing that makes the restart honour it.
+    pub fn persist(&self, data_dir: &Path) -> ferrosa_common::Result<()> {
+        // The on-disk form is line-oriented, so an embedded newline would
+        // silently change what a later boot reads back. Refuse it here rather
+        // than restore from a snapshot nobody asked for.
+        for (field, value) in [
+            ("snapshot", self.snapshot.as_str()),
+            ("point_in_time", self.point_in_time.as_deref().unwrap_or("")),
+        ] {
+            if value.contains('\n') {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "restore {field} contains a newline, which the {INTENT_FILE} \
+                     format cannot represent: {value:?}"
+                )));
+            }
+        }
+
+        std::fs::create_dir_all(data_dir).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to create data dir {}: {e}",
+                data_dir.display()
+            ))
+        })?;
+        std::fs::write(Self::intent_path(data_dir), self.fingerprint()).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to record the restore intent at {}: {e}",
+                Self::intent_path(data_dir).display()
+            ))
+        })
+    }
+
+    /// Read a previously [`persist`](Self::persist)ed intent.
+    ///
+    /// Returns `Ok(None)` when no restore was requested. A file that exists but
+    /// cannot be parsed is an error: someone asked for a restore and we cannot
+    /// tell which, so booting normally would quietly ignore the request.
+    pub fn from_data_dir(data_dir: &Path) -> ferrosa_common::Result<Option<Self>> {
+        let path = Self::intent_path(data_dir);
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to read {INTENT_FILE} at {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        Self::parse_persisted(&raw, &path).map(Some)
+    }
+
+    fn parse_persisted(raw: &str, path: &Path) -> ferrosa_common::Result<Self> {
+        let malformed = |detail: &str| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "malformed {INTENT_FILE} at {}: {detail}. Remove the file to \
+                 cancel the restore, or rewrite it as \
+                 snapshot/point-in-time/force on three lines.",
+                path.display()
+            ))
+        };
+
+        let lines: Vec<&str> = raw.split('\n').collect();
+        let [snapshot, point_in_time, force] = lines.as_slice() else {
+            return Err(malformed(&format!(
+                "expected 3 lines, found {}",
+                lines.len()
+            )));
+        };
+        if snapshot.trim().is_empty() {
+            return Err(malformed("snapshot name is empty"));
+        }
+        let force = match *force {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(malformed(&format!(
+                    "force must be true or false, got {other:?}"
+                )))
+            }
+        };
+        let point_in_time = (!point_in_time.is_empty()).then(|| (*point_in_time).to_string());
+        if let Some(pit) = &point_in_time {
+            parse_rfc3339_micros(pit)?;
+        }
+
+        Ok(Self {
+            snapshot: (*snapshot).to_string(),
+            point_in_time,
+            force,
+        })
+    }
+
+    /// Remove any persisted intent. Absent is success — the env-var path never
+    /// writes one, and startup clears unconditionally after applying.
+    pub fn clear_persisted(data_dir: &Path) -> ferrosa_common::Result<()> {
+        match std::fs::remove_file(Self::intent_path(data_dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "restore applied but {INTENT_FILE} could not be removed from {}: {e}. \
+                 Leaving it would restore again on the next boot and discard \
+                 everything written since.",
+                data_dir.display()
+            ))),
+        }
+    }
+
+    /// The restore this node should apply at startup, from either source.
+    ///
+    /// The environment carries an orchestrator's request (DBaaS MMDS); the
+    /// persisted file carries an operator's `POST /api/restore`. Both are
+    /// honoured so the two paths converge on one apply-once mechanism.
+    pub fn resolve(data_dir: &Path) -> ferrosa_common::Result<Option<Self>> {
+        Self::decide(Self::from_env()?, Self::from_data_dir(data_dir)?, data_dir)
+    }
+
+    /// Pick between the two intent sources. Split out from
+    /// [`resolve`](Self::resolve) so the rules are testable without mutating
+    /// the process environment.
+    pub fn decide(
+        from_env: Option<Self>,
+        from_file: Option<Self>,
+        data_dir: &Path,
+    ) -> ferrosa_common::Result<Option<Self>> {
+        // A spent intent is not a competing request. A DBaaS node keeps
+        // FERROSA_RESTORE_SNAPSHOT set forever, so without this an operator
+        // could never request a second restore over HTTP.
+        let pending = |i: Option<Self>| i.filter(|i| !i.already_applied(data_dir));
+        match (pending(from_env), pending(from_file)) {
+            (Some(env), Some(file)) if env != file => {
+                Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "two different restores are pending: {ENV_RESTORE_SNAPSHOT} asks for \
+                     {:?} and {INTENT_FILE} asks for {:?}. Refusing to guess — clear one \
+                     (delete {}/{INTENT_FILE} or unset the env var) and restart.",
+                    env.snapshot,
+                    file.snapshot,
+                    data_dir.display(),
+                )))
+            }
+            (Some(intent), _) | (None, Some(intent)) => Ok(Some(intent)),
+            (None, None) => Ok(None),
+        }
     }
 
     /// Record this intent as applied so later boots skip it.
@@ -425,5 +584,172 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- persisted intent (the `POST /api/restore` path) -------------------
+
+    fn intent(snapshot: &str, pit: Option<&str>, force: bool) -> RestoreIntent {
+        RestoreIntent::from_vars(
+            Some(snapshot.into()),
+            pit.map(String::from),
+            force.then(|| "true".to_string()),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn persisted_intent_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        assert_eq!(
+            RestoreIntent::from_data_dir(d).unwrap(),
+            None,
+            "no file means no persisted intent"
+        );
+
+        for original in [
+            intent("snap-1", None, false),
+            intent("snap-2", Some("2026-08-05T12:00:00Z"), false),
+            intent("snap-3", Some("1970-01-01T00:33:19.999999Z"), true),
+        ] {
+            original.persist(d).unwrap();
+            assert_eq!(
+                RestoreIntent::from_data_dir(d).unwrap(),
+                Some(original.clone()),
+                "persisted intent must read back identically"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_persisted_removes_the_file_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        intent("snap-1", None, false).persist(d).unwrap();
+        RestoreIntent::clear_persisted(d).unwrap();
+        assert_eq!(RestoreIntent::from_data_dir(d).unwrap(), None);
+
+        // Clearing an absent intent is not an error — the env path never
+        // writes one, and startup clears unconditionally.
+        RestoreIntent::clear_persisted(d).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_intent_file_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        for junk in [
+            "",
+            "only-one-line",
+            "a\nb",
+            "snap\n\nnotabool",
+            "a\nb\nc\nd",
+        ] {
+            std::fs::write(d.join(INTENT_FILE), junk).unwrap();
+            let err = RestoreIntent::from_data_dir(d).unwrap_err();
+            assert!(
+                err.to_string().contains(INTENT_FILE),
+                "a corrupt intent must name the file it could not parse, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_rejects_values_that_would_corrupt_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let smuggled = RestoreIntent {
+            snapshot: "snap\nnot-a-real-line".into(),
+            point_in_time: None,
+            force: false,
+        };
+        let err = smuggled.persist(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "a newline in a field must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decide_uses_whichever_source_supplied_the_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let env_only = intent("from-env", None, false);
+        let file_only = intent("from-file", None, false);
+
+        assert_eq!(RestoreIntent::decide(None, None, d).unwrap(), None);
+        assert_eq!(
+            RestoreIntent::decide(Some(env_only.clone()), None, d).unwrap(),
+            Some(env_only.clone())
+        );
+        assert_eq!(
+            RestoreIntent::decide(None, Some(file_only.clone()), d).unwrap(),
+            Some(file_only)
+        );
+        // Both sources agreeing is not a conflict.
+        assert_eq!(
+            RestoreIntent::decide(Some(env_only.clone()), Some(env_only.clone()), d).unwrap(),
+            Some(env_only)
+        );
+    }
+
+    #[test]
+    fn decide_refuses_two_conflicting_pending_intents() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = RestoreIntent::decide(
+            Some(intent("from-env", None, false)),
+            Some(intent("from-file", None, false)),
+            dir.path(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("from-env") && msg.contains("from-file"),
+            "the conflict must name both snapshots so an operator can resolve it, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_ignores_an_already_applied_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let applied = intent("from-env", None, false);
+        let fresh = intent("from-file", None, false);
+        applied.mark_applied(d).unwrap();
+
+        // The realistic DBaaS sequence: a permanent env var whose restore
+        // already ran, plus a newly requested restore over HTTP. That is not
+        // ambiguous — the env intent is spent.
+        assert_eq!(
+            RestoreIntent::decide(Some(applied.clone()), Some(fresh.clone()), d).unwrap(),
+            Some(fresh),
+            "an applied env intent must not block a new HTTP restore"
+        );
+        assert_eq!(
+            RestoreIntent::decide(Some(applied), None, d).unwrap(),
+            None,
+            "an applied intent on its own means nothing to do"
+        );
+    }
+
+    #[test]
+    fn resolve_reads_the_persisted_intent() {
+        // Deliberately exercises only the file source: this process's env is
+        // shared across tests, so mutating it here would race.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let want = intent("resolved-snap", Some("2026-08-05T12:00:00Z"), false);
+        want.persist(d).unwrap();
+
+        if std::env::var(ENV_RESTORE_SNAPSHOT).is_ok() {
+            panic!(
+                "{ENV_RESTORE_SNAPSHOT} is set in the test process; \
+                 this test asserts the file-only path"
+            );
+        }
+        assert_eq!(RestoreIntent::resolve(d).unwrap(), Some(want));
     }
 }
