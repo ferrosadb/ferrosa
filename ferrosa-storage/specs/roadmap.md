@@ -36,8 +36,16 @@ open work lives in specs and the items below.
   follow-ups in `self_heal/mod.rs`. Each remediation must stay bounded before the
   controller runs without an operator.
 - **End-to-end PITR hardening (FMEA ST-10).** Snapshot/restore + commit-log
-  archiving exist; broaden restore validation coverage and the fork/branch
-  orchestration consumed by `ferrosa-dbaas`.
+  archiving exist, and restore-on-boot (`restore/intent.rs`) now connects a
+  requested restore to an actual node start — previously nothing did, so a
+  node restarted cleanly and came back with pre-restore data. Remaining:
+  - Wire `POST /api/restore` to persist an intent. It still validates and
+    replies `202 "restart the node to complete restore"` while persisting
+    nothing, so the HTTP path is a no-op; only the env-var path works.
+  - Broaden restore validation coverage.
+  - Fork/branch orchestration consumed by `ferrosa-dbaas`, including whether a
+    manifest may reference SSTables under another object-store prefix (the
+    prerequisite for a zero-copy fork).
 
 ## Later
 
