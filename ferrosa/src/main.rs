@@ -1013,24 +1013,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .unwrap_or(false);
 
-    // Restore-on-boot: when FERROSA_RESTORE_SNAPSHOT is set and this exact
-    // intent has not already been applied, open by restoring the snapshot
-    // instead of taking the ordinary path. The applied-marker is what stops an
-    // env var that survives reboots from re-restoring on every start and
+    // Restore-on-boot: a restore requested either by FERROSA_RESTORE_SNAPSHOT
+    // (orchestrator) or by POST /api/restore (operator, persisted to the data
+    // dir) opens by restoring the snapshot instead of taking the ordinary path.
+    // `resolve` drops an intent this node already applied, which is what stops
+    // an env var that survives reboots from re-restoring on every start and
     // discarding everything written since.
-    let restore_intent = ferrosa_storage::restore::RestoreIntent::from_env()?;
     let restore_data_dir = storage_config.data_dir.clone();
-    let pending_restore = match restore_intent {
-        Some(intent) if intent.already_applied(&restore_data_dir) => {
-            tracing::info!(
-                snapshot = %intent.snapshot,
-                point_in_time = ?intent.point_in_time,
-                "restore intent already applied on a previous boot — starting normally"
-            );
-            None
-        }
-        other => other,
-    };
+    let pending_restore = ferrosa_storage::restore::RestoreIntent::resolve(&restore_data_dir)?;
 
     let (storage, pending_mutations) = if let Some(intent) = &pending_restore {
         tracing::warn!(
@@ -1048,6 +1038,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Only now that the engine has actually opened. Marking earlier would
         // skip a restore that never happened.
         intent.mark_applied(&restore_data_dir)?;
+        // The marker alone would suppress a re-run, but leaving the request
+        // file behind makes a completed restore look permanently pending.
+        ferrosa_storage::restore::RestoreIntent::clear_persisted(&restore_data_dir)?;
         tracing::info!(
             snapshot = %intent.snapshot,
             "restore-on-boot: restore complete and recorded"
