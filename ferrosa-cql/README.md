@@ -27,6 +27,16 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Frame codec** (`frame.rs`) — `tokio_util::codec` `Framed` decoder/encoder for
   the 9-byte CQL header + body, opcode table, LZ4/Snappy body compression, and a
   custom `STREAMING_FLAG` (bit 0x10) for SUBSCRIBE response frames.
+  On a v5 connection the envelope is additionally wrapped in the modern frame
+  format (3-byte length/flag header + CRC24, payload, CRC32). A payload is
+  capped at `V5_MAX_PAYLOAD` (2^17−1 = 128 KiB) by the 17-bit length field, so
+  **an envelope larger than that is split across consecutive frames, every one
+  of them marked `isSelfContained=0`**; the receiver reassembles by reading the
+  envelope header's own length and accumulating until it is satisfied, since a
+  multi-frame envelope has no terminating marker. Both directions are
+  implemented and round-tripped in tests. (This path previously asserted on
+  oversize payloads, which panicked the CQL runtime thread and dropped the
+  connection for any response page over 128 KiB.)
 - **Connection state machine** (`connection.rs`, ~4k LoC) — STARTUP → (AUTH) →
   READY handshake, per-opcode dispatch (QUERY / PREPARE / EXECUTE / BATCH /
   REGISTER / OPTIONS), bind-marker counting, subscription push pump. PREPARE

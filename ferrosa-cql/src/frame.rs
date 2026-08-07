@@ -340,12 +340,37 @@ impl CqlCodec {
         src.advance(V5_CRC32_SIZE); // skip CRC32
 
         if !is_self_contained {
-            // Segmented message — accumulate and wait for final segment.
+            // Slice of a large envelope. Per the v5 spec EVERY slice carries
+            // isSelfContained=0 — there is no self-contained terminator — so
+            // completion is determined by the envelope's own length field.
+            // Waiting for a self-contained frame here would buffer forever
+            // against any spec-compliant sender (the DataStax Java driver
+            // included).
             self.v5_segment_buf.extend_from_slice(&payload);
-            return Ok(None);
+
+            let Some(target) = v5_reassembly_target(&self.v5_segment_buf) else {
+                return Ok(None); // envelope header not yet complete
+            };
+            if self.v5_segment_buf.len() < target {
+                return Ok(None); // more slices to come
+            }
+            if self.v5_segment_buf.len() > target {
+                // Slices must reassemble to exactly one envelope. Anything
+                // else means the peer framed the stream in a way we cannot
+                // interpret; guessing would silently corrupt the response.
+                return Err(CqlError::Protocol(format!(
+                    "v5 segmented envelope overran its declared length: \
+                     accumulated {} bytes, envelope declares {target}",
+                    self.v5_segment_buf.len()
+                )));
+            }
+            let envelope_data = self.v5_segment_buf.split().freeze();
+            return self.emit_envelopes(envelope_data);
         }
 
-        // Complete message — combine with any buffered segments.
+        // Self-contained frame. It may still be the tail of an accumulation
+        // from a peer that terminates with a self-contained slice; combining
+        // preserves that behavior.
         let envelope_data = if self.v5_segment_buf.is_empty() {
             payload.freeze()
         } else {
@@ -353,11 +378,19 @@ impl CqlCodec {
             self.v5_segment_buf.split().freeze()
         };
 
-        // The payload contains one or more 9-byte envelope headers + bodies.
-        // The v5 spec allows pipelining multiple envelopes in a single
-        // self-contained frame. The DataStax Java driver does this (e.g.,
-        // sending SELECT system.local and SELECT system.peers_v2 in one frame).
-        // Parse all envelopes and queue them; return the first one immediately.
+        self.emit_envelopes(envelope_data)
+    }
+
+    /// Parse every envelope out of a fully reassembled payload, return the
+    /// first, and queue the rest.
+    ///
+    /// The v5 spec allows pipelining multiple envelopes in a single
+    /// self-contained frame. The DataStax Java driver does this (e.g. sending
+    /// SELECT system.local and SELECT system.peers_v2 together).
+    fn emit_envelopes(
+        &mut self,
+        envelope_data: Bytes,
+    ) -> std::result::Result<Option<CqlFrame>, CqlError> {
         let mut offset = 0;
         let mut frames = Vec::new();
         while offset + HEADER_SIZE <= envelope_data.len() {
@@ -745,39 +778,76 @@ fn crc32_ieee_v5(data: &[u8]) -> u32 {
     crc ^ CRC32_INIT
 }
 
+/// Total bytes the accumulated segment buffer must reach to hold one complete
+/// envelope, or `None` while the 9-byte envelope header is still incomplete.
+///
+/// A multi-frame v5 envelope has no terminating marker — the receiver learns
+/// the total from the envelope header's own length field, exactly as the
+/// DataStax Java driver does (`header_size + decodeBodySize(slice)`).
+fn v5_reassembly_target(buf: &[u8]) -> Option<usize> {
+    if buf.len() < HEADER_SIZE {
+        return None;
+    }
+    // Envelope header layout: version(1) flags(1) stream(2) opcode(1) length(4, BE).
+    let body_len = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+    Some(HEADER_SIZE + body_len)
+}
+
 /// Encode a v5 frame around an envelope (header + body).
 ///
 /// Produces: [3-byte LE header][3-byte CRC24][payload][4-byte CRC32]
 /// where payload = 9-byte envelope header + envelope body.
 pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut BytesMut) {
-    // Build the envelope (9-byte header + body) as the frame payload.
+    // Build the envelope (9-byte header + body), then emit it as one or more
+    // frames depending on whether it fits the 17-bit payload length field.
     let payload_len = HEADER_SIZE + body.len();
-    assert!(payload_len <= V5_MAX_PAYLOAD, "v5 frame payload too large");
+
+    if payload_len <= V5_MAX_PAYLOAD {
+        let mut envelope = BytesMut::with_capacity(payload_len);
+        envelope_header.encode(&mut envelope);
+        envelope.put_slice(body);
+        put_v5_frame(&envelope, true, dst);
+        return;
+    }
+
+    // Oversize: split across consecutive NON-self-contained frames. Every
+    // slice carries isSelfContained=0 — there is no self-contained terminator.
+    // The receiver reassembles by reading the envelope header's length field
+    // and accumulating until it is satisfied (see `decode_v5_frame`). This
+    // matches the DataStax Java driver's SegmentToFrameDecoder.
+    //
+    // Previously this asserted, which panicked the CQL runtime thread and
+    // dropped the connection for any response page over 128 KiB.
+    let mut envelope = BytesMut::with_capacity(payload_len);
+    envelope_header.encode(&mut envelope);
+    envelope.put_slice(body);
+
+    for slice in envelope.chunks(V5_MAX_PAYLOAD) {
+        put_v5_frame(slice, false, dst);
+    }
+}
+
+/// Append exactly one v5 frame wrapping `payload`.
+///
+/// `payload` must already be at most [`V5_MAX_PAYLOAD`] bytes; callers are
+/// responsible for slicing. Writes the 3-byte length/flag header, its CRC24,
+/// the payload, and the payload's CRC32.
+fn put_v5_frame(payload: &[u8], self_contained: bool, dst: &mut BytesMut) {
+    debug_assert!(payload.len() <= V5_MAX_PAYLOAD);
 
     // 3-byte header: payload_length(17 bits) | isSelfContained(1 bit) | padding(6 bits)
-    let header_bits: u32 = (payload_len as u32) | (1 << 17); // isSelfContained=1
+    let mut header_bits: u32 = payload.len() as u32;
+    if self_contained {
+        header_bits |= 1 << 17;
+    }
     let h_bytes = header_bits.to_le_bytes(); // [b0, b1, b2, _]
+    let crc24_bytes = crc24(&h_bytes[..3]).to_le_bytes();
 
-    // CRC24 of the 3 header bytes.
-    let crc24_val = crc24(&h_bytes[..3]);
-    let crc24_bytes = crc24_val.to_le_bytes();
-
-    // Reserve space for header(6) + payload + CRC32(4)
-    dst.reserve(V5_FRAME_HEADER_SIZE + payload_len + V5_CRC32_SIZE);
-
-    // Write frame header (3 bytes) + CRC24 (3 bytes)
+    dst.reserve(V5_FRAME_HEADER_SIZE + payload.len() + V5_CRC32_SIZE);
     dst.put_slice(&h_bytes[..3]);
     dst.put_slice(&crc24_bytes[..3]);
-
-    // Write envelope (9-byte header + body) = payload
-    let payload_start = dst.len();
-    envelope_header.encode(dst);
-    dst.put_slice(body);
-    let payload_end = dst.len();
-
-    // CRC32 of the payload
-    let crc32_val = crc32_ieee_v5(&dst[payload_start..payload_end]);
-    dst.put_u32_le(crc32_val);
+    dst.put_slice(payload);
+    dst.put_u32_le(crc32_ieee_v5(payload));
 }
 
 #[cfg(test)]
@@ -1378,6 +1448,164 @@ mod tests {
         assert_eq!(decoded.header.opcode, Opcode::Query);
         assert_eq!(decoded.header.stream_id, 0);
         assert_eq!(decoded.header.flags, 0);
+    }
+
+    // --- v5 multi-frame (non-self-contained) encoding ---
+    //
+    // An envelope larger than V5_MAX_PAYLOAD must be split across several
+    // frames. Per the CQL v5 spec every slice carries isSelfContained=0, and
+    // the receiver knows the envelope is complete when the accumulated bytes
+    // satisfy the 9-byte envelope header's length field — there is no
+    // terminating self-contained frame. (Confirmed against the DataStax Java
+    // driver's SegmentToFrameDecoder, which computes
+    // `targetLength = header_size + decodeBodySize(slice)` and completes on
+    // `accumulatedLength == targetLength`.)
+    //
+    // Before this change `encode_v5_frame` asserted on oversize payloads,
+    // panicking the CQL runtime thread and dropping the client connection —
+    // reachable from any ordinary `SELECT *` with a large enough page.
+
+    /// Split `buf` into (payload, is_self_contained) pairs, validating CRCs.
+    fn split_v5_frames(buf: &[u8]) -> Vec<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+            assert!(
+                i + V5_FRAME_HEADER_SIZE <= buf.len(),
+                "truncated v5 frame header at {i}"
+            );
+            let bits = buf[i] as u32 | ((buf[i + 1] as u32) << 8) | ((buf[i + 2] as u32) << 16);
+            let len = (bits & 0x1FFFF) as usize;
+            let self_contained = (bits >> 17) & 1 == 1;
+            let expect_crc24 =
+                buf[i + 3] as u32 | ((buf[i + 4] as u32) << 8) | ((buf[i + 5] as u32) << 16);
+            assert_eq!(crc24(&buf[i..i + 3]), expect_crc24, "header CRC24 at {i}");
+            let ps = i + V5_FRAME_HEADER_SIZE;
+            let pe = ps + len;
+            assert!(
+                pe + V5_CRC32_SIZE <= buf.len(),
+                "truncated v5 payload at {i}"
+            );
+            let expect_crc32 = u32::from_le_bytes([buf[pe], buf[pe + 1], buf[pe + 2], buf[pe + 3]]);
+            assert_eq!(
+                crc32_ieee_v5(&buf[ps..pe]),
+                expect_crc32,
+                "payload CRC32 at {i}"
+            );
+            out.push((buf[ps..pe].to_vec(), self_contained));
+            i = pe + V5_CRC32_SIZE;
+        }
+        out
+    }
+
+    /// Feed a whole encoded stream through the codec and return the single
+    /// envelope it reassembles. Intermediate slices decode to `None`, so this
+    /// drains until the buffer is empty rather than stopping at the first one.
+    /// Asserts that exactly one envelope comes out.
+    fn drain_one_envelope(codec: &mut CqlCodec, buf: &mut BytesMut) -> Option<CqlFrame> {
+        let mut out = None;
+        let mut guard = 0;
+        while !buf.is_empty() {
+            guard += 1;
+            assert!(guard < 10_000, "decode made no progress");
+            match codec.decode(buf).expect("decode must not error") {
+                Some(f) => {
+                    assert!(out.is_none(), "only one envelope should be produced");
+                    out = Some(f);
+                }
+                None if buf.is_empty() => break,
+                None => {}
+            }
+        }
+        out
+    }
+
+    fn big_header(body_len: usize) -> FrameHeader {
+        FrameHeader {
+            version: VERSION_RESPONSE,
+            flags: 0,
+            stream_id: 7,
+            opcode: Opcode::Result,
+            length: body_len as u32,
+        }
+    }
+
+    #[test]
+    fn v5_envelope_that_fits_stays_one_self_contained_frame() {
+        // Largest body that still fits with its 9-byte envelope header.
+        let body = vec![0xABu8; V5_MAX_PAYLOAD - HEADER_SIZE];
+        let mut dst = BytesMut::new();
+        encode_v5_frame(&big_header(body.len()), &body, &mut dst);
+
+        let frames = split_v5_frames(&dst);
+        assert_eq!(frames.len(), 1, "should not split when it fits");
+        assert!(frames[0].1, "a fitting envelope must be self-contained");
+        assert_eq!(frames[0].0.len(), V5_MAX_PAYLOAD);
+    }
+
+    #[test]
+    fn v5_oversize_envelope_splits_into_non_self_contained_frames() {
+        // One byte past what a single frame can hold.
+        let body = vec![0x5Au8; V5_MAX_PAYLOAD - HEADER_SIZE + 1];
+        let mut dst = BytesMut::new();
+        encode_v5_frame(&big_header(body.len()), &body, &mut dst);
+
+        let frames = split_v5_frames(&dst);
+        assert!(frames.len() > 1, "oversize envelope must be split");
+        assert!(
+            frames.iter().all(|(_, sc)| !*sc),
+            "every slice of a multi-frame envelope must have isSelfContained=0"
+        );
+        assert!(
+            frames.iter().all(|(p, _)| p.len() <= V5_MAX_PAYLOAD),
+            "no slice may exceed V5_MAX_PAYLOAD"
+        );
+        let total: usize = frames.iter().map(|(p, _)| p.len()).sum();
+        assert_eq!(
+            total,
+            HEADER_SIZE + body.len(),
+            "slices must reassemble to the whole envelope"
+        );
+    }
+
+    #[test]
+    fn v5_oversize_envelope_round_trips_through_the_codec() {
+        // ~3.5 frames' worth, so the last slice is a partial one.
+        let body: Vec<u8> = (0..(V5_MAX_PAYLOAD * 7 / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut dst = BytesMut::new();
+        encode_v5_frame(&big_header(body.len()), &body, &mut dst);
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+
+        // Intermediate slices legitimately decode to None, so drain the whole
+        // buffer rather than stopping at the first None.
+        let f = drain_one_envelope(&mut codec, &mut dst)
+            .expect("a complete envelope must be reassembled");
+        assert_eq!(f.header.stream_id, 7);
+        assert_eq!(f.header.opcode, Opcode::Result);
+        assert_eq!(f.body.len(), body.len());
+        assert_eq!(&f.body[..], &body[..], "body must survive the round trip");
+    }
+
+    #[test]
+    fn v5_split_is_exact_at_a_slice_boundary() {
+        // Envelope length is an exact multiple of the frame payload limit —
+        // an off-by-one here produces a trailing empty frame or drops bytes.
+        let body = vec![0x11u8; V5_MAX_PAYLOAD * 2 - HEADER_SIZE];
+        let mut dst = BytesMut::new();
+        encode_v5_frame(&big_header(body.len()), &body, &mut dst);
+
+        let frames = split_v5_frames(&dst);
+        assert_eq!(frames.len(), 2, "exactly two full slices, no empty tail");
+        assert!(frames.iter().all(|(p, _)| p.len() == V5_MAX_PAYLOAD));
+
+        let mut codec = CqlCodec::new(DEFAULT_MAX_FRAME_SIZE);
+        codec.enable_v5_framing();
+        let f = drain_one_envelope(&mut codec, &mut dst).expect("must reassemble");
+        assert_eq!(f.body.len(), body.len());
     }
 
     /// Regression test: DataStax Java driver pipelines multiple queries in a
