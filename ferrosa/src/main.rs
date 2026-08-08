@@ -285,7 +285,10 @@ fn apply_internode_toml_overrides(
     }
     if let Some(v) = internode.get("broadcast").and_then(|v| v.as_str()) {
         match v.parse() {
-            Ok(addr) => cfg.broadcast_addr = addr,
+            Ok(addr) => {
+                cfg.broadcast_addr = addr;
+                cfg.internode_broadcast = Some(v.to_string());
+            }
             Err(e) => tracing::warn!(value = %v, %e, "ignoring invalid [internode].broadcast"),
         }
     }
@@ -2862,6 +2865,7 @@ mod tests {
         apply_internode_toml_overrides(&mut cfg, &toml);
         assert_eq!(cfg.bind_addr, "127.0.0.1:18003".parse().unwrap());
         assert_eq!(cfg.broadcast_addr, "10.0.0.1:18003".parse().unwrap());
+        assert_eq!(cfg.internode_broadcast.as_deref(), Some("10.0.0.1:18003"));
         assert_eq!(cfg.cluster_name, "team-cluster");
         assert_eq!(cfg.psk.as_deref(), Some("abc"));
     }

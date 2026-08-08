@@ -40,7 +40,7 @@ apply when neither source sets the listener.
 
 | Listener | Default bind | Owning crate | Enable / config |
 |----------|--------------|--------------|-----------------|
-| Internode RPC | `0.0.0.0:17000` | `ferrosa-net` | `FERROSA_INTERNODE_BIND` / `[internode].bind` — note **17000**, not Cassandra's 7000 (BUG-001: 7000 collides with macOS ControlCenter) |
+| Internode RPC | `0.0.0.0:17000` | `ferrosa-net` | bind: `FERROSA_INTERNODE_BIND` / `[internode].bind`; advertised endpoint: `FERROSA_INTERNODE_BROADCAST` / `[internode].broadcast`. The exact advertised host/port is preserved for peer handshakes, including same-host clusters whose nodes use different ports. Note **17000**, not Cassandra's 7000 (BUG-001: 7000 collides with macOS ControlCenter). |
 | CQL native v5 | `127.0.0.1:9042` | `ferrosa-cql` | `FERROSA_CQL_BIND` / `[cql].bind` |
 | Postgres wire | `127.0.0.1:5432` | `ferrosa-postgres` | `FERROSA_POSTGRES_BIND` / `[postgres].bind` — always started; query execution is a fail-loud stub until the relational engine lands |
 | Arrow Flight (gRPC) | `127.0.0.1:8815` | `ferrosa-flight` | **`--features flight`** + `FERROSA_FLIGHT_BIND` / `[flight].bind`; per-RPC signed bearer tokens |
@@ -61,7 +61,7 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 3. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
 4. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; probe S3 CAS; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables; replay pending S3 uploads.
 5. **Schema** — `Schema::new` (composes audit sinks); seed default roles if auth enabled; restore schema from local `schema.json` → S3 bootstrap → fresh; re-register secondary indexes, UDTs, UDFs, role permissions from `system_schema.*`; replay pending commit-log mutations.
-6. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode.
+6. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode.
 7. **PeerManager** — wire as `ModeController`'s `PeerEventListener`; start the heartbeat loop; spawn the self-heal controller with a **live** peer-health probe.
 8. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
 9. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
@@ -108,6 +108,7 @@ flat under tight cgroups; override with `MALLOC_CONF`).
 | `FERROSA_CONFIG` | TOML config path (default `/etc/ferrosa/ferrosa.toml`) |
 | `FERROSA_DATA_DIR` | data directory (default `/var/lib/ferrosa`) — holds `host_id`, `schema.json`, commit log, hints |
 | `FERROSA_HOST_ID` | authoritative host-id override (wins over disk) |
+| `FERROSA_INTERNODE_BROADCAST` | host/port advertised during internode handshakes; file equivalent `[internode].broadcast` is authoritative and preserves the exact endpoint |
 | `FERROSA_AUTH_ENABLED` | single source of truth for CQL role auth; `[cql].auth_enabled` is authoritative when configured |
 | `FERROSA_AUTH_DISABLED` | **deprecated** direct override — honored with a warning |
 | `FERROSA_SEED` | comma-separated seed peers (`host:port`, DNS-resolved) |

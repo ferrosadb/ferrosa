@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: fmea
-last_updated: 2026-07-17
+last_updated: 2026-08-07
 ---
 
 # ferrosa-cluster — FMEA / Known Issues
@@ -28,6 +28,7 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 | CL-13 | **Degraded pair read rejection (fixed).** `transition_to_degraded()` previously replaced `WritePath` with `Unavailable`, blocking both writes AND reads. The `WritePath` is also the read path. `is_cql_ready()` returned `true` for `DegradedPair` (intending stale reads), but the read methods on `Unavailable` returned errors. | After primary failure, follower could not serve reads of replicated data until operator promotion — violating the pair-mode design rule that reads work without promotion. | 8 | 4 | 5 | 160 | **Fixed:** `DegradedPair(Arc<PairCoordinator>)` variant preserves `local_storage()` for reads while rejecting writes. Regression test `degraded_pair_serves_stale_reads` verifies the `WritePath` variant after peer loss. |
 | CL-14 | **Paged multi-replica stream lifecycle (fixed, live validation pending).** Abandoning a page's merged stream (every paged read, every page but the last) left (a) the remote producers streaming the whole remaining table onto `Lane::Bulk` for nobody (`RangeReadStreamCancel` was never SENT and had no registered receiver MsgType), (b) the N-way merge parked forever on a stalled source before observing consumer abandonment, and (c) in-order straggler chunks whose route-error handling CLEARED live seq-state so the next straggler fabricated fresh `expected=0` state → phantom `expected_seq=0 observed_seq=5` gap-close per page (426–1065 closes per viz run on fmem-dev). | Paged scans stall (heartbeat-defunct connections), retry storms duplicate results, replica OOM under `pages × replicas` uncancelled full-table producers; phantom closes mask real chunk loss in logs. | 8 | 8 | 3 | 192 | **Fixed (t_dc729b1d/t_3fc6be3c/t_577dd385):** seq-state creation gated on route liveness (no-state+no-route = terminal straggler → silent drop; ids monotonic, route registered before fire); genuine gaps on LIVE routes still close loudly exactly once (`StreamFrameRouter::route_closures()` — alert if non-zero steady-state); forwarder task fires `RangeReadStreamCancel` on any non-`Completed` outcome (info-logged so a live deploy can verify cancels flow — the reverted Drop-guard sent zero); Cancel MsgType registered to the request handler; `run_fragment_merge_nway` races the merge core against `out_tx.closed()` so a dropped consumer aborts even while parked on a stalled source. Counter-asserted 3-node loopback harness `tests/range_scan_multi_replica_paging.rs`; deterministic parked-merge pin: `range_read_stream::tests::nway_merge_consumer_drop_aborts_when_parked_on_stalled_source`. **Residual:** the reverted predecessor passed in-process tests and failed live (t_3fc6be3c) — must be re-validated on a live RF=3 cluster (viz WS run + `SELECT id` 15k-row 3-page scan) before the claim closes. |
 | CL-15 | **Pre-vote election stall (fixed).** With `raft_enable_pre_vote = true` the fork's tick election path hard-gates `elect()` behind a pre-vote round, but `FerrosRaftNetwork` (`raft/network.rs`) never overrides `pre_vote` — the default trait impl returns "unimplemented", counted as a NO vote. A pre-vote quorum is then structurally impossible: after the seed's single `initialize()`-driven election at term 1 no further election ever fires, so a transient first-round vote loss freezes formation at term=1 permanently (reproduced ~3% under CPU starvation; CI 89743146291). Debug logging hides it by shifting timing. | Multi-voter cluster never elects a leader; `/cluster/topology` shows `committed_cluster_size:0`; looks like a hang, not a storm (term does NOT climb) | 9 | 3 | 6 | 162 | **Fixed (t_b0aac0d3):** `raft_enable_pre_vote` now defaults **false** (`config.rs`); the tick path calls `elect()` directly so a lost round self-heals on the next timeout. `FERROSA_RAFT_ENABLE_PRE_VOTE` override intact. Regression guard `candidate_re_campaigns_while_peers_are_down` (`tests/cluster_formation.rs`) asserts the seed's term advances past 1. **Residual:** pre-vote stays off until `FerrosRaftNetwork::pre_vote` is implemented (t_32cb5ad3); spec `specs/implemented/bug-cluster-formation-pre-vote-election-stall.md`. |
+| CL-16 | **Inbound reverse dialing collapses nonuniform peer ports onto the seed (fixed in code, live verification pending).** `on_inbound_peer` discarded the handshake's internode advertisement and built the reverse endpoint from the observed IP plus the receiver's own bind port. This assumes every node uses the same internode port. | In a same-host three-node cluster, the seed registers node1/node2 pools against itself, persists its own endpoint for all host IDs, and delivers `ClusterInvite` back to itself; joiners stay in pair mode while the seed reports a healthy one-node Raft leader. | 9 | 4 | 7 | 252 | **Fixed (2026-08-07):** `resolve_inbound_reverse_addr` prefers the advertised endpoint and retains the old fallback only when it is absent/unusable. Focused tests pin distinct-port selection and fallback behavior. The composition root now propagates TOML broadcast into the handshake (FE-10). Rebuild/restart of the launchd cluster is the remaining live gate. |
 
 ## Top risks to act on
 
@@ -36,11 +37,13 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
    serializability holds" claim rests on deterministic in-crate tests. Build the
    harness; it also gates removal of the CL-2 election-guard/snapshot-pusher
    safety nets.
-2. **CL-2 (RPN 160)** — election storms are mitigated by the `election_guard`
+2. **CL-16 (RPN 252 before mitigation)** — the same-host self-loop is covered by
+   focused tests but must be re-run on the launchd cluster before closure.
+3. **CL-2 (RPN 160)** — election storms are mitigated by the `election_guard`
    watchdog + `snapshot_pusher` + CheckQuorum. PreVote (the intended primary
    defense) is OFF until its transport lands (CL-15), so the guard is currently
    load-bearing, not a band-aid — keep it until both CL-15 and CL-1 close.
-3. **CL-4 / CL-5 (RPN 140 / 126)** — Accord recovery and the storage-apply seam are
+4. **CL-4 / CL-5 (RPN 140 / 126)** — Accord recovery and the storage-apply seam are
    the correctness-critical paths least covered by real-fault testing; prioritise
    them in the Jepsen workload set and add cross-DC failure cases.
 
@@ -56,3 +59,4 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
   `leader_snapshot_push` (31), `accord_lwt_concurrent` (21), `accord_nemesis` (15),
   `recovery_scenarios` (13), `proptests`, `repair_fuzz` (7).
 - **Missing:** external Jepsen/Knossos/Elle history checking (CL-1).
+- `inbound_peer_reverse_address_{prefers_advertised_nonuniform_port,falls_back_when_advertisement_is_unusable}` (CL-16).

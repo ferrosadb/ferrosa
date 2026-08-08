@@ -1,5 +1,6 @@
 //! PeerEventListener and InboundPeerCallback trait implementations.
 
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 use ferrosa_net::peer::PeerEventListener;
@@ -31,6 +32,16 @@ pub(super) fn track_connected_peer(
         peers.remove(0);
     }
     peers.push((host_id, addr));
+}
+
+pub(super) fn resolve_inbound_reverse_addr(
+    observed_addr: std::net::SocketAddr,
+    local_internode_port: u16,
+    internode_broadcast: Option<&str>,
+) -> std::net::SocketAddr {
+    internode_broadcast
+        .and_then(|addr| addr.trim().to_socket_addrs().ok()?.next())
+        .unwrap_or_else(|| std::net::SocketAddr::new(observed_addr.ip(), local_internode_port))
 }
 
 #[cfg(test)]
@@ -361,7 +372,11 @@ impl InboundPeerCallback for ModeController {
         internode_broadcast: Option<String>,
     ) {
         let (host_id, addr) = peer_id;
-        let reverse_addr = std::net::SocketAddr::new(addr.ip(), self.net_config.bind_addr.port());
+        let reverse_addr = resolve_inbound_reverse_addr(
+            addr,
+            self.net_config.bind_addr.port(),
+            internode_broadcast.as_deref(),
+        );
         tracing::info!(peer = %host_id, %addr, ?cql_broadcast, ?internode_broadcast, "inbound peer connected");
 
         // Store the peer's CQL broadcast address (from handshake) in PeerManager

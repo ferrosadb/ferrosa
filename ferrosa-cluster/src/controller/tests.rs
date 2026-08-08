@@ -706,6 +706,42 @@ fn inbound_peer_address_change_refreshes_live_outbound_pool() {
 }
 
 #[test]
+fn inbound_peer_reverse_address_prefers_advertised_nonuniform_port() {
+    let observed_ephemeral = "127.0.0.1:54198".parse().unwrap();
+
+    let reverse_addr = super::peer_events::resolve_inbound_reverse_addr(
+        observed_ephemeral,
+        17002,
+        Some("127.0.0.1:17000"),
+    );
+
+    assert_eq!(
+        reverse_addr,
+        "127.0.0.1:17000".parse().unwrap(),
+        "same-host clusters may assign a distinct internode port to every node; the peer's advertised endpoint must win over the receiver's port"
+    );
+}
+
+#[test]
+fn inbound_peer_reverse_address_falls_back_when_advertisement_is_unusable() {
+    let observed_ephemeral = "10.89.1.174:54198".parse().unwrap();
+    let expected = "10.89.1.174:7000".parse().unwrap();
+
+    assert_eq!(
+        super::peer_events::resolve_inbound_reverse_addr(observed_ephemeral, 7000, None),
+        expected,
+    );
+    assert_eq!(
+        super::peer_events::resolve_inbound_reverse_addr(
+            observed_ephemeral,
+            7000,
+            Some("not a valid endpoint"),
+        ),
+        expected,
+    );
+}
+
+#[test]
 fn stale_inbound_refresh_cannot_overwrite_newer_peer_address() {
     assert!(
         super::peer_events::should_install_refreshed_outbound_peer(

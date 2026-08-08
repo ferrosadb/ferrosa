@@ -1,19 +1,39 @@
 ---
 crate: ferrosa-cluster
 doc: data-flow
-last_updated: 2026-06-19
+last_updated: 2026-08-07
 ---
 
 # ferrosa-cluster — Data Flow
 
-Two end-to-end flows: a **tunable-consistency write** (the eventually-consistent
-data path) and an **Accord transaction** (the strict-serializable path). Both
-share the `TokenRing` for replica selection and run over `ferrosa-net` peers.
+Three end-to-end flows: **formation endpoint discovery**, a
+**tunable-consistency write** (the eventually-consistent data path), and an
+**Accord transaction** (the strict-serializable path). They share the
+`TokenRing` for replica selection and run over `ferrosa-net` peers.
 
 > Note: identifiers below are written without raw angle brackets so the diagrams
 > render — e.g. `Option Partition` rather than the generic-parameter form.
 
-## 1. Tunable-CL write coordination
+## 1. Formation endpoint discovery
+
+An inbound TCP source port is ephemeral and is never a valid reverse-dial
+target. The handshake's advertised internode host/port is authoritative when
+present; observed IP plus the receiver's local internode port is a compatibility
+fallback for older peers. The selected endpoint feeds both the outbound pool
+and `connected_peers`, whose addresses are carried in `ClusterInvite`.
+
+```mermaid
+flowchart LR
+    IN["Inbound socket + handshake"] --> ADV{"advertised internode endpoint usable?"}
+    ADV -->|yes| CANON["resolve advertised host/port"]
+    ADV -->|no| FALLBACK["observed IP + local internode port"]
+    CANON --> TRACK["reverse pool + connected_peers"]
+    FALLBACK --> TRACK
+    TRACK --> INVITE["ClusterInvite peer targets"]
+    INVITE --> RAFT["all members enter one Raft group"]
+```
+
+## 2. Tunable-CL write coordination
 
 A front-end (e.g. `ferrosa-cql`) hands a mutation to
 `ClusterCoordinator::coordinate_write*`. The coordinator gates on the write
@@ -54,7 +74,7 @@ symmetric read path issues one full read plus `block_for - 1` digest reads, then
 on digest mismatch fail-loud re-fetches the newest copy and repairs stale
 replicas inline before returning.
 
-## 2. Accord transaction (strict-serializable)
+## 3. Accord transaction (strict-serializable)
 
 `AccordCoordinator` runs the EPaxos-family protocol across the shards a
 transaction touches. The common case commits in one round trip (fast path); a

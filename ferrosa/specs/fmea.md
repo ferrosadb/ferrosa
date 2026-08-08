@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-08-07
 ---
 
 # ferrosa — FMEA / Known Issues
@@ -22,14 +22,18 @@ own their own internal FMEAs.
 | FE-7 | **Shutdown timeout drops un-flushed data.** The 30 s graceful drain (`mode_controller.shutdown` → internode drain → memtable flush → schema persist) can exceed the window under heavy flush/S3 load. | Memtables not flushed ⇒ data loss on restart for anything not yet in an SSTable or commit log. | 8 | 2 | 5 | 80 | SIGTERM is handled (not just SIGINT) so container stops drain; timeout logs "shutdown timed out after 30s". **Gap:** the timeout is fixed and the partial-flush case is not surfaced as a metric. |
 | FE-8 | **S3 bootstrap / index-UDT-UDF replay failures are non-fatal.** On cold start, schema bootstrap and the `system_schema.*` re-registration steps log a WARN and continue on error. | A node can come up "fresh" or missing secondary indexes / UDTs / UDFs that exist in S3, serving incomplete schema without crashing. | 7 | 3 | 6 | 126 | Each step logs the failure with table/keyspace context; designed as best-effort with local→S3→fresh priority. **Gap:** no readiness gate distinguishes "fresh by design" from "bootstrap failed". |
 | FE-9 | **Maintenance-loop sub-task panics swallowed.** Flush/S3-sync run on detached `std::thread`s; the schema-sync path `continue`s on flush failure to avoid persisting schema ahead of data. | A persistently failing flush silently stops schema persistence; a panicked sync thread is logged but the loop continues. | 6 | 3 | 6 | 108 | Failures are logged per tick; the "skip schema persist if flush failed" guard is correct fail-loud-ish behavior. **Gap:** no escalation/metric if a tick keeps failing. |
+| FE-10 | **TOML internode broadcast omitted from peer handshake.** `[internode].broadcast` updated `broadcast_addr` but left `internode_broadcast=None`; same-host nodes using distinct internode ports therefore could not advertise their canonical reverse-dial endpoint. | The cluster seed substitutes its own port for inbound peers, routes multiple host IDs back to itself, and reports successful invites while joiners remain in pair mode. | 9 | 4 | 7 | 252 | **Fixed in code, live re-verification pending (2026-08-07):** `apply_internode_toml_overrides` preserves the exact TOML value after validation. Regression `apply_internode_toml_overrides_sets_other_fields` asserts both resolved and advertised forms. The cluster-side reverse-address selection is tracked as CL-16. |
 
 ## Top risks to act on
 
-1. **FE-1 (RPN 196) — partial boot.** A failed bind of an *enabled* front-end
+1. **FE-10 (RPN 252) — TOML internode advertisement.** The focused regression is
+   green, but the launchd cluster must be rebuilt once with this binary to prove
+   all three nodes leave pair mode and recover one Raft group.
+2. **FE-1 (RPN 196) — partial boot.** A failed bind of an *enabled* front-end
    should fail loud (crash or fail `/readyz`), not log-and-continue. Today a node
    can serve CQL while its Postgres/Flight/graph listener never came up, with no
    health distinction from "disabled."
-2. **FE-3 (RPN 135) — auth resolves open by default.** The permissive default is
+3. **FE-3 (RPN 135) — auth resolves open by default.** The permissive default is
    silent; in production mode the composition root should default closed or
    refuse to start without an explicit auth decision, since the same flag also
    opens the admin REST surface.
@@ -41,3 +45,5 @@ own their own internal FMEAs.
 - `/readyz` (un-authenticated) and `/metrics` on the web console.
 - Per-step structured WARN/ERROR logs across bootstrap, replay, and shutdown.
 - `ferrosa-net` `default_bind_port_is_not_7000` guard (FE-6).
+- `apply_internode_toml_overrides_sets_other_fields` pins TOML broadcast
+  propagation into the handshake advertisement (FE-10).
