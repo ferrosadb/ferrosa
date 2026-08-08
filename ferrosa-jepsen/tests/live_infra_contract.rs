@@ -13,7 +13,7 @@ fn crate_file(relative: &str) -> String {
 }
 
 fn assert_feature_gated(source: &str, test_name: &str) {
-    let marker = format!("async fn {test_name}(");
+    let marker = format!("fn {test_name}(");
     let byte_index = source
         .find(&marker)
         .unwrap_or_else(|| panic!("missing live infra test {test_name}"));
@@ -42,14 +42,51 @@ fn live_infra_tests_are_feature_gated_not_false_passes() {
         ("src/firecracker.rs", "provision_single_vm"),
         ("src/ssh.rs", "ssh_execute_command"),
         ("src/ssh.rs", "ssh_upload_file"),
+        (
+            "tests/nemesis_correctness.rs",
+            "disk_fail_no_phantom_commits",
+        ),
+        (
+            "tests/nemesis_correctness.rs",
+            "packet_reorder_linearizability",
+        ),
+        (
+            "tests/nemesis_correctness.rs",
+            "lwt_batch_atomicity_all_nemeses",
+        ),
+        (
+            "tests/nemesis_correctness.rs",
+            "nemesis_partition_halves_docker",
+        ),
+        (
+            "tests/nemesis_correctness.rs",
+            "nemesis_kill_minority_docker",
+        ),
+        ("tests/nemesis_correctness.rs", "nemesis_clock_skew_docker"),
+        ("tests/smoke_tier.rs", "smoke_tier_end_to_end"),
+        ("tests/t3_topology.rs", "t3_topology_brings_up_two_dcs"),
+        (
+            "tests/tier_multi_dc.rs",
+            "tier_multi_dc_one_hour_bank_workload",
+        ),
     ];
 
     for (file, test_name) in cases {
         let source = crate_file(file);
         assert_feature_gated(&source, test_name);
+    }
+}
+
+#[test]
+fn all_live_only_test_targets_are_feature_gated() {
+    for file in [
+        "tests/cluster_topology_invariants.rs",
+        "tests/docker_mini_jepsen.rs",
+    ] {
+        let source = crate_file(file);
         assert!(
-            !source.contains("skipping "),
-            "{file} must not print skip-style messages from Rust test bodies; use feature gating plus panic-on-missing-infra instead"
+            source.contains(r#"#![cfg(feature = "live-infra-tests")]"#),
+            "{file} performs only live CQL queries and must be absent from default cargo test"
         );
     }
 }

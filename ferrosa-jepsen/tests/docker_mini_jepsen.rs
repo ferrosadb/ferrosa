@@ -6,7 +6,9 @@
 //!   cd ~/src/ferrosa-memory && podman compose up -d   # Podman Desktop (macOS)
 //!
 //! Run with:
-//!   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test docker_mini_jepsen -- --nocapture
+//!   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test docker_mini_jepsen -- --nocapture
+
+#![cfg(feature = "live-infra-tests")]
 
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -71,7 +73,7 @@ fn require_container_cluster() {
              Start the cluster:\n  \
              cd ~/src/ferrosa-memory && {rt} compose up -d\n\
              Then re-run with:\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test docker_mini_jepsen"
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test docker_mini_jepsen"
         );
     }
 }

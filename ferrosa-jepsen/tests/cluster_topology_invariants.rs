@@ -30,9 +30,12 @@
 //!
 //! # run the test
 //! FERROSA_TEST_CONTAINERS=1 \
-//!   cargo test -p ferrosa-jepsen --test cluster_topology_invariants \
+//!   cargo test -p ferrosa-jepsen --features live-infra-tests \
+//!   --test cluster_topology_invariants \
 //!   -- --nocapture
 //! ```
+
+#![cfg(feature = "live-infra-tests")]
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -124,6 +127,7 @@ fn require_containers(test_name: &str) {
              \n\
              scripts/test-cluster-up-ci.sh\n\
              FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen \\\n\
+                 --features live-infra-tests \\\n\
                  --test cluster_topology_invariants {test_name} -- --nocapture\n"
         );
     }

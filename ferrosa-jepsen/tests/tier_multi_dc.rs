@@ -57,6 +57,7 @@ fn dc_partition_plus_dc_slow_nemesis_registered() {
 /// gated on `FERROSA_TEST_CONTAINERS=1` per the test policy in
 /// `CLAUDE.md`. Without the env var the test must panic with setup
 /// instructions — never silently skip.
+#[cfg(feature = "live-infra-tests")]
 #[test]
 fn tier_multi_dc_one_hour_bank_workload() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -68,7 +69,7 @@ fn tier_multi_dc_one_hour_bank_workload() {
              To run locally:\n  \
              docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
              up -d --build\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test \
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test \
              tier_multi_dc -- tier_multi_dc_one_hour_bank_workload\n  \
              # ~1 hour wall-clock\n\
              Or rely on the nightly CI workflow at \

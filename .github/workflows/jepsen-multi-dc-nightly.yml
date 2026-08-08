@@ -74,6 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Install cqlsh
+        run: pip install cqlsh
+
       - name: Free disk space
         # Bringing up the 3+3 dual-DC topology (6 Ferrosa containers + the nightly
         # runtime image + jepsen state) exhausted the runner disk ("No space left
@@ -111,6 +114,7 @@ jobs:
       - name: Bring up T3 (3+3 dual-DC) topology
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
+          FERROSA_TEST_CLUSTER_NODES: 'localhost:29042,localhost:29043,localhost:29044,localhost:29142,localhost:29143,localhost:29144'
         run: |
           set -euo pipefail
           # --no-build (fail loud, never compile): the node services carry a
@@ -123,7 +127,7 @@ jobs:
           # (leader-aware: 503 until a Raft leader is elected, so a green probe
           # means the DC actually formed). Fail loud after ~120s.
           ready=0
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if curl -sf http://localhost:29090/health >/dev/null \
                && curl -sf http://localhost:29190/health >/dev/null; then
               ready=1
@@ -137,6 +141,58 @@ jobs:
             docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml logs --tail 200
             exit 1
           fi
+
+          # HTTP readiness on one node per DC is not enough: the Jepsen driver
+          # needs six distinct CQL hosts with converged schema metadata.
+          host_ids=$(mktemp)
+          schema_versions=$(mktemp)
+          trap 'rm -f "$host_ids" "$schema_versions"' EXIT
+          uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          preflight_deadline=$((SECONDS + 120))
+          preflight_ready=0
+          last_problem='CQL endpoints have not responded yet'
+          while (( SECONDS < preflight_deadline )); do
+            : > "$host_ids"
+            : > "$schema_versions"
+            endpoints_ready=1
+            for endpoint in ${FERROSA_TEST_CLUSTER_NODES//,/ }; do
+              host=${endpoint%:*}
+              port=${endpoint##*:}
+              output=$(cqlsh --connect-timeout=2 --request-timeout=5 "$host" "$port" \
+                -e 'SELECT host_id, schema_version FROM system.local;' 2>/dev/null) || true
+              row=$(printf '%s\n' "$output" | awk -F '|' \
+                'NF == 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($1 ~ /^[0-9a-f][0-9a-f-]+[0-9a-f]$/ && $2 ~ /^[0-9a-f][0-9a-f-]+[0-9a-f]$/) { print $1 "|" $2; exit } }')
+              host_id=${row%%|*}
+              schema_version=${row#*|}
+              if ! [[ "$host_id" =~ $uuid_re && "$schema_version" =~ $uuid_re ]]; then
+                endpoints_ready=0
+                last_problem="CQL endpoint $endpoint did not return valid host/schema IDs"
+                break
+              fi
+              echo "$host_id" >> "$host_ids"
+              echo "$schema_version" >> "$schema_versions"
+            done
+
+            if [ "$endpoints_ready" -eq 1 ]; then
+              distinct_hosts=$(sort -u "$host_ids" | wc -l | tr -d ' ')
+              distinct_schemas=$(sort -u "$schema_versions" | wc -l | tr -d ' ')
+              if [ "$distinct_hosts" -eq 6 ] && [ "$distinct_schemas" -eq 1 ]; then
+                preflight_ready=1
+                break
+              fi
+              last_problem="found $distinct_hosts distinct hosts and $distinct_schemas schema versions"
+            fi
+            sleep 2
+          done
+          if [ "$preflight_ready" -ne 1 ]; then
+            echo "::error::T3 CQL topology did not converge within 120s: $last_problem"
+            echo "Observed host IDs:"
+            sort -u "$host_ids"
+            echo "Observed schema versions:"
+            sort -u "$schema_versions"
+            exit 1
+          fi
+          echo "T3 CQL preflight passed: 6 distinct hosts, one schema version"
 
       - name: Run tier-multi-dc 1h bank workload
         env:
