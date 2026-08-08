@@ -120,18 +120,19 @@ jobs:
           docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
             up -d --no-build
 
-          # Probe each process through its host-mapped HTTP port. Unlike cqlsh,
-          # these endpoints cannot discover peers and load-balance the request
-          # onto a different node. Each row is web-port|local-host-id|DC-ring.
+          # Probe each CQL socket directly, then validate process identity and
+          # topology through its host-mapped HTTP port. Unlike cqlsh, neither
+          # check can discover peers and load-balance the request onto another
+          # node. Each row is cql-port|web-port|local-host-id|DC-ring.
           dc1_ring='11111111-1111-1111-1111-111111111111,11111111-1111-1111-1111-222222222222,11111111-1111-1111-1111-333333333333'
           dc2_ring='22222222-2222-2222-2222-111111111111,22222222-2222-2222-2222-222222222222,22222222-2222-2222-2222-333333333333'
           node_specs=(
-            "29090|11111111-1111-1111-1111-111111111111|$dc1_ring"
-            "29091|11111111-1111-1111-1111-222222222222|$dc1_ring"
-            "29092|11111111-1111-1111-1111-333333333333|$dc1_ring"
-            "29190|22222222-2222-2222-2222-111111111111|$dc2_ring"
-            "29191|22222222-2222-2222-2222-222222222222|$dc2_ring"
-            "29192|22222222-2222-2222-2222-333333333333|$dc2_ring"
+            "29042|29090|11111111-1111-1111-1111-111111111111|$dc1_ring"
+            "29043|29091|11111111-1111-1111-1111-222222222222|$dc1_ring"
+            "29044|29092|11111111-1111-1111-1111-333333333333|$dc1_ring"
+            "29142|29190|22222222-2222-2222-2222-111111111111|$dc2_ring"
+            "29143|29191|22222222-2222-2222-2222-222222222222|$dc2_ring"
+            "29144|29192|22222222-2222-2222-2222-333333333333|$dc2_ring"
           )
           preflight_deadline=$((SECONDS + 120))
           preflight_ready=0
@@ -139,8 +140,53 @@ jobs:
           while (( SECONDS < preflight_deadline )); do
             topology_ready=1
             for node_spec in "${node_specs[@]}"; do
-              IFS='|' read -r web_port expected_host_id expected_ring_ids <<< "$node_spec"
+              IFS='|' read -r cql_port web_port expected_host_id expected_ring_ids <<< "$node_spec"
               base_url="http://localhost:${web_port}"
+
+              if ! cql_error=$(python3 -c '
+          import socket, struct, sys
+          OPTIONS_OPCODE = 0x05
+          SUPPORTED_OPCODE = 0x06
+          cql_port = int(sys.argv[1])
+
+          def recv_exact(sock, length):
+              chunks = []
+              remaining = length
+              while remaining:
+                  chunk = sock.recv(remaining)
+                  if not chunk:
+                      raise RuntimeError(f"socket closed with {remaining} response bytes remaining")
+                  chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks)
+
+          try:
+              with socket.create_connection(("127.0.0.1", cql_port), timeout=5) as sock:
+                  sock.settimeout(5)
+                  sock.sendall(struct.pack(">BBhBI", 0x04, 0, 0, OPTIONS_OPCODE, 0))
+                  response_header = recv_exact(sock, 9)
+                  response_version, _, response_stream, response_opcode, response_length = struct.unpack(">BBhBI", response_header)
+                  if response_version != 0x84 or response_stream != 0 or response_opcode != SUPPORTED_OPCODE:
+                      raise RuntimeError(
+                          f"expected v4 SUPPORTED on stream 0, got version=0x{response_version:02x} "
+                          f"stream={response_stream} opcode=0x{response_opcode:02x}"
+                      )
+                  if response_length > 1048576:
+                      raise RuntimeError(f"SUPPORTED body is unreasonably large: {response_length} bytes")
+                  response_body = recv_exact(sock, response_length)
+                  if response_length < 2:
+                      raise RuntimeError("SUPPORTED body is missing its string-multimap header")
+                  supported_key_count = struct.unpack(">H", response_body[:2])[0]
+                  if supported_key_count < 1:
+                      raise RuntimeError("SUPPORTED body advertises no capabilities")
+          except Exception as error:
+              print(error)
+              raise SystemExit(1)
+          ' "$cql_port" 2>&1); then
+                topology_ready=0
+                last_problem="CQL endpoint $cql_port failed OPTIONS/SUPPORTED: $cql_error"
+                break
+              fi
 
               if ! curl --connect-timeout 2 --max-time 5 -sf "${base_url}/health" >/dev/null; then
                 topology_ready=0

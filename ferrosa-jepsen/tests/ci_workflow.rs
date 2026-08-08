@@ -136,7 +136,7 @@ fn multi_dc_nightly_workload_pipeline_fails_loudly_with_tee() {
 }
 
 #[test]
-fn multi_dc_nightly_preflights_each_node_directly_over_http() {
+fn multi_dc_nightly_preflights_each_node_directly_over_cql_and_http() {
     let path = multi_dc_nightly_yaml_path();
     let yaml =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -146,16 +146,24 @@ fn multi_dc_nightly_preflights_each_node_directly_over_http() {
         !yaml.contains("- name: Install cqlsh")
             && !step.contains("cqlsh --")
             && !step.contains("pip install cqlsh"),
-        "the topology preflight must use node-local HTTP endpoints; cqlsh discovers and load-balances across peers"
+        "the topology preflight must use socket-pinned checks; cqlsh discovers and load-balances across peers"
     );
     assert!(
-        step.contains("29090|")
-            && step.contains("29091|")
-            && step.contains("29092|")
-            && step.contains("29190|")
-            && step.contains("29191|")
-            && step.contains("29192|"),
-        "the topology step must probe every node's host-mapped HTTP endpoint; step was:\n{step}"
+        step.contains("29042|29090|")
+            && step.contains("29043|29091|")
+            && step.contains("29044|29092|")
+            && step.contains("29142|29190|")
+            && step.contains("29143|29191|")
+            && step.contains("29144|29192|"),
+        "the topology step must pair every node's host-mapped CQL and HTTP endpoints; step was:\n{step}"
+    );
+    assert!(
+        step.contains("socket.create_connection")
+            && step.contains("OPTIONS_OPCODE = 0x05")
+            && step.contains("SUPPORTED_OPCODE = 0x06")
+            && step.contains("response_version != 0x84")
+            && step.contains("supported_key_count"),
+        "each direct CQL socket must complete a native-protocol v4 OPTIONS/SUPPORTED handshake; step was:\n{step}"
     );
     assert!(
         step.contains("/api/cluster/status")
