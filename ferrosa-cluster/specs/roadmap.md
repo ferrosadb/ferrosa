@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-07-17
+last_updated: 2026-08-07
 ---
 
 # ferrosa-cluster — Roadmap
@@ -10,6 +10,14 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code deprecation markers,
 reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
+
+- **Same-host cluster reverse-address collapse (CL-16).** Live launchd evidence
+  showed node3 recovering a three-member ring whose three addresses all pointed
+  at node3's `:17002`; node1/node2 consequently stayed in pair mode. Inbound
+  peer handling now prefers the handshake-advertised endpoint, including its
+  distinct port, and falls back compatibly for older peers. Focused selection +
+  fallback tests are green; rebuilding the live launchd cluster remains the
+  closure gate.
 
 - **Paged-scan fail-loud completion contract (t_a0f922a3 bug #2).** The N-way
   merge concludes a scan complete once every source stream ends; that inference

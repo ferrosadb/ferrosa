@@ -1,6 +1,6 @@
 # BUG: Internode broadcast address frozen to startup IP — stale Raft membership after container IP churn
 
-**Status**: Broadcast-hostname fix **merged** (PR #86, advertise + re-resolve the broadcast hostname — option 1). Follow-up for the lane-reconnect path — lanes reconnecting to a stale resolved IP instead of the advertised hostname — fixed in **PR #94** (`ferrosa-net` `pick_reconnect_host`, unit-tested). **Live-cluster verification still pending** on a real podman cluster; should move to `specs/verified-test-plan/` once verified, then to `archive/`. (2026-06-09)
+**Status**: **Reopened / in progress (2026-08-07).** PR #86 fixed environment-variable hostname advertisement and PR #94 fixed lane reconnects, but a launchd-managed same-host cluster exposed two uncovered paths: `[internode].broadcast` updated only the resolved socket and was not advertised in the handshake, while inbound reverse dialing assumed every peer used the receiver's internode port. Focused RED/GREEN tests now cover both boundaries; live-cluster verification remains pending.
 **Component**: `ferrosa-net` (config), `ferrosa-cluster` (Raft membership / internode routing)
 **Severity**: High — silent read-path degradation in any environment where node IPs change across restarts (podman/docker default networking, k8s pods, DHCP).
 **Found**: 2026-06-05, debugging a live `ferrosa-memory` 3-node dev cluster.
@@ -105,7 +105,25 @@ a stale-membership read should surface as an error, not a 0 count.
 2. `podman compose down && up` (or otherwise recreate containers) several times so each node gets a new IP.
 3. Run a distributed index/range read (e.g. an ANN search or full entity range scan).
 4. Observe `Bulk lane timeout` / `ChannelClosedBeforeDone` against a stale `N.N.N.N:7000` address, and
-   under-reported counts, while `nodetool`-style health stays green.
+  under-reported counts, while `nodetool`-style health stays green.
+
+### 2026-08-07 launchd recurrence: all identities routed to the seed
+
+A three-node same-host cluster used distinct internode ports (`17000`, `17001`,
+`17002`) and valid per-node `[internode].broadcast` values. After restart, node1
+and node2 remained `pair/primary` while node3 recovered the three-member Raft
+snapshot and became the sole leader. Node3's ring stored `127.0.0.1:17002` for
+all three host IDs, so its successful-looking `ClusterInvite delivered` RPCs
+looped back to node3 instead of reaching node1/node2.
+
+The startup logs tied that topology collapse to two implementation gaps:
+
+1. inbound handshakes logged `internode_broadcast=None` even though TOML set it;
+2. the fallback reverse address combined the inbound IP with node3's own
+   internode port, which is valid only when every peer uses the same port.
+
+The launchd plist correctly selected a distinct TOML file per node. This was not
+a launchd configuration or startup-order error.
 
 ## Operational mitigation (not a code workaround)
 

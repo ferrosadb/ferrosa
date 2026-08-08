@@ -206,6 +206,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 - `controller/bootstrap/` — 8-phase formation pipeline (DeliverInvites →
   EstablishPools → CreateRaft → WaitLeader → ReplaySchema → BootstrapStream →
   Promote → DrainQueue).
+- `controller/peer_events.rs` — inbound handshakes prefer the peer's advertised
+  internode endpoint when creating reverse pools and tracking invite targets;
+  the observed IP plus local port is only a compatibility fallback. This keeps
+  same-host clusters with per-node ports from routing every host ID to the seed.
 - `ring/` — `TokenRing` (BTreeMap), SimpleStrategy + NetworkTopologyStrategy
   replica selection with rack diversity, learner `owns_tokens` handling.
 - `controller/membership.rs` — `MembershipChanger` mutates the four membership
@@ -213,8 +217,8 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   add/remove voter, learner-only join, promote/demote, DC swap drain.
 - `controller/cluster_rejoin.rs` — P0-21 rejoin after formation timeout;
   `CLUSTER_REJOIN_ATTEMPTS_TOTAL` / `_FAILURES_TOTAL`.
-- `pair/` — two-node primary/secondary coordination (role from TCP direction,
-  not UUID election), switchover, catch-up.
+- `pair/` — two-node primary/secondary coordination (deterministic host-ID
+  ordering, independent of which TCP direction wins), switchover, catch-up.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
 
 ### Repair & hints (`repair/`, `hints/`)

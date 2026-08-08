@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 doc: data-flow
-last_updated: 2026-06-19
+last_updated: 2026-08-07
 ---
 
 # ferrosa — Startup & Composition Data Flow
@@ -26,7 +26,8 @@ sequenceDiagram
     participant Front as front-end listeners
 
     Main->>Main: init tracing (non-blocking; OTel if enabled)
-    Main->>Cfg: load FERROSA_CONFIG TOML (env wins)
+    Main->>Cfg: load FERROSA_CONFIG TOML (file wins)
+    Cfg->>Cfg: preserve internode broadcast host/port for handshake
     Main->>Main: load/generate host_id (classify state)
     Main->>Store: open() replay commitlog OR new()
     Main->>Store: probe S3 CAS; register system tables
@@ -124,8 +125,10 @@ runtimes keeps bulk CQL writes from starving Raft heartbeats.
 
 ## Notes
 
-- **Config precedence** at every resolver: env var, then TOML
-  (`/etc/ferrosa/ferrosa.toml`), then hard default.
+- **Config precedence** at every resolver: TOML
+  (`/etc/ferrosa/ferrosa.toml`), then environment variable, then hard default.
+  `[internode].broadcast` retains both its resolved socket and exact configured
+  host/port; the latter is sent in peer handshakes.
 - **Auth flag** (`auth_disabled`) is derived once from
   `FERROSA_AUTH_ENABLED` / `[cql].auth_enabled` and threaded into CQL, web,
   graph HTTP, and Bolt so the kill-switch is uniform.

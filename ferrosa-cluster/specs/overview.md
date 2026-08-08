@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 status: implemented
-last_updated: 2026-07-03
+last_updated: 2026-08-07
 executive_summary: >
   The distribution layer that turns single-node ferrosa-storage engines into a
   cluster: Raft metadata consensus (openraft 0.9 fork with CheckQuorum; a PreVote
@@ -121,6 +121,11 @@ transactions before applying to storage at the agreed HLC timestamp. See
 6. **Membership mutates four stores atomically.** `MembershipChanger` keeps the
    Raft state machine, openraft voter set, network node-map, and peer table in
    sync; a partial change is an error, not a silent skew.
+7. **Reverse dialing uses the peer's canonical endpoint.** An inbound socket's
+   source port is ephemeral. When the handshake advertises an internode
+   host/port, `peer_events` resolves and uses it for the reverse pool and
+   `connected_peers`; only legacy peers without a usable advertisement fall back
+   to the observed IP plus the local internode port.
 
 ## Correctness evidence (be honest)
 

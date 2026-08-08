@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-08-07
 executive_summary: >
   The top-level binary and composition root. It constructs one StorageEngine,
   one Schema, one ModeController, one PeerManager, and one CdcBus, then wires
@@ -75,7 +75,9 @@ replication uniform.
 3. **Config precedence is TOML → env → default, everywhere.** All resolvers
    (`config_val`, `apply_internode_toml_overrides`, `resolve_graph_enabled`,
    `resolve_auth_enabled_toml`) honor this order; BUG-006 was TOML being ignored
-   for internode/graph/auth.
+   for internode/graph/auth. `[internode].broadcast` updates the resolved socket
+   and preserves the exact configured host/port in `NetConfig::internode_broadcast`
+   so the internode handshake does not lose a peer's distinct listening port.
 4. **Auth is driven from one switch.** `FERROSA_AUTH_ENABLED` (or
    `[cql].auth_enabled`) is the source of truth; `resolve_auth_disabled` derives
    the CQL/web/graph/Bolt `auth_disabled` flag. `FERROSA_AUTH_DISABLED` is a

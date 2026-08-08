@@ -1,13 +1,22 @@
 ---
 crate: ferrosa
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-08-07
 ---
 
 # ferrosa — Roadmap
 
 Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code `TODO`
 (`web/api.rs:475`), and the composition review of `main.rs`.
+
+## Recently addressed
+
+- **Preserve TOML internode broadcast advertisements (FMEA FE-10).** A launchd
+  three-node cluster used correct, distinct `[internode].broadcast` ports, but
+  the binary populated only the resolved `broadcast_addr`; handshakes therefore
+  advertised `None`. The loader now preserves the exact configured endpoint.
+  Focused unit coverage is green; rebuilding the live cluster is the remaining
+  verification gate.
 
 ## Now (highest value)
 
