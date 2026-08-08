@@ -6,10 +6,12 @@
 //!
 //! Run with:
 //!   FERROSA_TEST_CLUSTER_NODES=127.0.0.1:9042 \
-//!     cargo test -p ferrosa-jepsen --test nemesis_correctness
+//!     cargo test -p ferrosa-jepsen --features live-infra-tests --test nemesis_correctness
 //!   or:
 //!   FERROSA_TEST_FIRECRACKER=1 \
-//!     cargo test -p ferrosa-jepsen --test nemesis_correctness
+//!     cargo test -p ferrosa-jepsen --features live-infra-tests --test nemesis_correctness
+
+#![cfg(feature = "live-infra-tests")]
 
 use std::path::PathBuf;
 
@@ -30,6 +32,7 @@ fn require_cluster_env() -> TestClusterEnv {
     })
 }
 
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn disk_fail_no_phantom_commits() {
     let env = require_cluster_env();
@@ -79,6 +82,7 @@ async fn disk_fail_no_phantom_commits() {
     cluster.teardown().await.expect("teardown");
 }
 
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn packet_reorder_linearizability() {
     let env = require_cluster_env();
@@ -125,6 +129,7 @@ async fn packet_reorder_linearizability() {
     cluster.teardown().await.expect("teardown");
 }
 
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn lwt_batch_atomicity_all_nemeses() {
     let env = require_cluster_env();
@@ -198,6 +203,7 @@ fn mock_ctx_3_nodes() -> NemesisContext {
 /// Container-gated: verify that the `partition-halves` nemesis is registered in
 /// the Phase 1 registry, inject/heal complete (or fail gracefully on a mock
 /// context), and the nemesis name matches the expected value.
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn nemesis_partition_halves_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -205,7 +211,7 @@ async fn nemesis_partition_halves_docker() {
             "FERROSA_TEST_CONTAINERS not set — start Docker/Podman, \
              provision the ferrosa-jepsen cluster, then re-run:\n  \
              cd ~/src/ferrosa-memory && podman compose up -d\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test nemesis_correctness"
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test nemesis_correctness"
         );
     }
 
@@ -269,6 +275,7 @@ async fn nemesis_partition_halves_docker() {
 
 /// Container-gated: verify that the `kill-minority` nemesis is registered in
 /// the Phase 1 registry, and that inject/heal complete without panicking.
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn nemesis_kill_minority_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -276,7 +283,7 @@ async fn nemesis_kill_minority_docker() {
             "FERROSA_TEST_CONTAINERS not set — start Docker/Podman, \
              provision the ferrosa-jepsen cluster, then re-run:\n  \
              cd ~/src/ferrosa-memory && podman compose up -d\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test nemesis_correctness"
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test nemesis_correctness"
         );
     }
 
@@ -315,6 +322,7 @@ async fn nemesis_kill_minority_docker() {
 
 /// Container-gated: verify that the `clock-skew-small` nemesis is registered in
 /// the Phase 1 registry, and that inject/heal complete without panicking.
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn nemesis_clock_skew_docker() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -322,7 +330,7 @@ async fn nemesis_clock_skew_docker() {
             "FERROSA_TEST_CONTAINERS not set — start Docker/Podman, \
              provision the ferrosa-jepsen cluster, then re-run:\n  \
              cd ~/src/ferrosa-memory && podman compose up -d\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test nemesis_correctness"
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test nemesis_correctness"
         );
     }
 

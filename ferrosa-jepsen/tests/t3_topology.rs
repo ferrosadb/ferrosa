@@ -16,7 +16,9 @@
 //! reachable, per the test policy in `CLAUDE.md`.
 
 use std::path::PathBuf;
+#[cfg(feature = "live-infra-tests")]
 use std::process::Command;
+#[cfg(feature = "live-infra-tests")]
 use std::time::Duration;
 
 const COMPOSE_RELATIVE: &str = "tests/docker/jepsen-cluster-t3.yml";
@@ -250,6 +252,7 @@ fn t3_compose_attaches_each_dc_to_its_network_and_wan() {
 /// Per the test policy in `CLAUDE.md`, tests requiring container
 /// infrastructure must `panic!` with setup instructions when invoked
 /// without the runtime — never silently skip. We honor that here.
+#[cfg(feature = "live-infra-tests")]
 #[test]
 fn t3_topology_brings_up_two_dcs() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
@@ -258,7 +261,7 @@ fn t3_topology_brings_up_two_dcs() {
              Bring up the T3 (3+3 dual-DC) topology:\n  \
              docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml up -d --build\n\
              Then re-run with:\n  \
-             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test t3_topology -- t3_topology_brings_up_two_dcs"
+             FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test t3_topology -- t3_topology_brings_up_two_dcs"
         );
     }
 
@@ -313,6 +316,7 @@ fn t3_topology_brings_up_two_dcs() {
 /// Locate a working container runtime daemon. Mirrors the helper in
 /// `docker_mini_jepsen.rs`. Panics with setup instructions if none
 /// is reachable — matches the test policy.
+#[cfg(feature = "live-infra-tests")]
 fn container_runtime() -> &'static str {
     for candidate in &["docker", "podman"] {
         let ok = Command::new(candidate)

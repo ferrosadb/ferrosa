@@ -87,14 +87,15 @@ fn smoke_tier_config_produces_combinations() {
 ///   A Docker/Podman runtime with compose support.
 ///
 /// Run with:
-///   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --test smoke_tier smoke_tier_end_to_end -- --nocapture
+///   FERROSA_TEST_CONTAINERS=1 cargo test -p ferrosa-jepsen --features live-infra-tests --test smoke_tier smoke_tier_end_to_end -- --nocapture
+#[cfg(feature = "live-infra-tests")]
 #[tokio::test]
 async fn smoke_tier_end_to_end() {
     if std::env::var("FERROSA_TEST_CONTAINERS").is_err() {
         panic!(
             "FERROSA_TEST_CONTAINERS not set — start Docker/Podman Desktop, \
              then re-run with FERROSA_TEST_CONTAINERS=1 \
-             cargo test -p ferrosa-jepsen --test smoke_tier smoke_tier_end_to_end"
+             cargo test -p ferrosa-jepsen --features live-infra-tests --test smoke_tier smoke_tier_end_to_end"
         );
     }
 

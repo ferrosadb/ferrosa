@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-07-16
+last_updated: 2026-08-07
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
@@ -37,7 +37,7 @@ SSH (`russh`) for fault injection, and to the simulator via `ferrosa-sim`.
 | `workload` (`src/workload/`) | `Workload` trait + registry: `register`, `bank`, 16 `lwt-*`, `forward-probe`, `membership-churn`, `late-join-flood`. |
 | `chaos` (`src/chaos/`) | `NemesisAction` trait + registry: network, process, clock, disk, WAN/cross-DC, composed nemeses. WAN actions execute via SSH, Fly SSH, or `container_runtime() exec` (`iptables`/`tc`/signals). |
 | `checker` (`src/checker/`) | Linearizability (native WGL backtracking), membership invariants, Knossos (subprocess), Elle (stub). |
-| `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection); `ContainerDriver` (per-language Docker images, not in default tiers). |
+| `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection, pinned by host ID resolved in the workload session's own topology/pools); `ContainerDriver` (per-language Docker images, not in default tiers). |
 | `docker_provision` (`src/docker_provision.rs`) | **Wired** backend: managed Docker Compose for up to three nodes and non-owning external contact points for T3/Fly. `container_runtime()` selects a usable Docker/Podman daemon, not merely an installed CLI. |
 | `firecracker` / `cluster` | microVM provisioning primitives — present but **not wired** into the run path. |
 | `flyio` (`src/flyio.rs`) | Fly.io machine management primitives. A caller-provisioned Fly T3/T4 becomes a real run via `FERROSA_TEST_CLUSTER_NODES`; `FERROSA_JEPSEN_FLY_APP` plus ordered machine IDs selects Fly-SSH WAN faults. |
@@ -119,6 +119,9 @@ written history; Elle is type-only (`elle_result = None`).
    `iptables`; Fly private IPv6 addresses use `ip6tables`. The partition action
    selects the filter binary from the target address rather than applying a
    no-op/invalid IPv4 rule to a Fly node.
+7. **A healthy T3 is complete at the CQL layer.** The scheduled workflow checks
+   all six configured endpoints and requires six distinct host IDs plus one
+   shared schema version before Jepsen setup can create its keyspace.
 
 ## Position in the dependency graph
 

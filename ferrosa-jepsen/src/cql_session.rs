@@ -8,6 +8,7 @@ use scylla::client::session_builder::SessionBuilder;
 use scylla::client::PoolSize;
 use scylla::policies::load_balancing::{NodeIdentifier, SingleTargetLoadBalancingPolicy};
 use scylla::value::{CqlValue, Row};
+use uuid::Uuid;
 
 use crate::workload::CqlSession;
 
@@ -19,6 +20,10 @@ pub struct ScyllaCqlSession {
     session: Session,
 }
 
+fn coordinator_identifier(host_id: Uuid) -> NodeIdentifier {
+    NodeIdentifier::HostId(host_id)
+}
+
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
     ///
@@ -28,12 +33,11 @@ impl ScyllaCqlSession {
     /// would scatter the statements across coordinators and the buffered DML would
     /// never reach the `BEGIN`'s connection (silently non-atomic).
     ///
-    /// Pinning uses the **live node object** discovered by a short-lived probe
-    /// session — not an address and not a host-ID lookup in the freshly-created
-    /// session. A node's advertised address differs from the port-mapped contact
-    /// point in Docker/Fly, and a new session can execute before its topology
-    /// refresh has populated a host-ID map. Either alternative can leave the
-    /// load-balancing policy with no coordinator. The full topology stays
+    /// Pinning uses the stable host ID discovered by a short-lived probe session.
+    /// The pinned session resolves that ID through its own cluster metadata and
+    /// connection pools. Reusing the probe session's live `Node` object would
+    /// bypass that lookup and can make schema agreement search for a coordinator
+    /// that is absent from the pinned session's pools. The full topology stays
     /// connected (`known_nodes` + `PoolSize(1)`); the pinned node forwards writes
     /// as the Accord coordinator, so cross-shard fan-out still happens.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
@@ -48,18 +52,19 @@ impl ScyllaCqlSession {
             .build()
             .await
             .context("failed to connect to CQL cluster (probe)")?;
-        let target = probe
+        let target_host_id = probe
             .get_cluster_state()
             .get_nodes_info()
             .iter()
             .min_by_key(|n| n.host_id) // deterministic across topology refreshes
-            .cloned()
+            .map(|n| n.host_id)
             .context("cluster reports no known nodes to pin to")?;
         drop(probe);
 
         // Phase 2 — pin all queries to that node (one connection ⇒ transaction
         // affinity), keeping the full topology connected for reachability.
-        let policy = SingleTargetLoadBalancingPolicy::new(NodeIdentifier::Node(target), None);
+        let policy =
+            SingleTargetLoadBalancingPolicy::new(coordinator_identifier(target_host_id), None);
         let profile = ExecutionProfile::builder()
             .load_balancing_policy(policy)
             .build();
@@ -156,6 +161,16 @@ impl CqlSession for ScyllaCqlSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinning_uses_a_host_id_resolved_by_the_destination_session() {
+        let host_id = Uuid::new_v4();
+
+        match coordinator_identifier(host_id) {
+            NodeIdentifier::HostId(actual) => assert_eq!(actual, host_id),
+            other => panic!("expected host-ID coordinator pin, got {other:?}"),
+        }
+    }
 
     /// Verify that ScyllaCqlSession connects to a real cluster and can execute a
     /// system query. Requires FERROSA_TEST_CONTAINERS=1 and a cluster on port 49042.

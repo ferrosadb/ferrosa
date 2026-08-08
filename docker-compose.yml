@@ -79,6 +79,8 @@ services:
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node1:7000"
       FERROSA_SEED: "node2:7000,node3:7000"
@@ -117,6 +119,8 @@ services:
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node2:7000"
       FERROSA_SEED: "node1:7000,node3:7000"
@@ -149,6 +153,8 @@ services:
     environment:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
+      FERROSA_CQL_BIND: "0.0.0.0:9042"
+      FERROSA_WEB_BIND: "0.0.0.0:9090"
       FERROSA_INTERNODE_BIND: "0.0.0.0:7000"
       FERROSA_INTERNODE_BROADCAST: "node3:7000"
       FERROSA_SEED: "node1:7000,node2:7000"

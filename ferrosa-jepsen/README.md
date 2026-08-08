@@ -58,9 +58,11 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
   - **Elle** (`checker/elle.rs`) — types exist; `UnifiedChecker` always sets the
     Elle result to `None` (not wired to a running checker).
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
-  `scylla` driver (`phase1`, the only wired driver). `ContainerDriver` shells out
-  to per-language Docker images (Python/Go/Node/Java/C#) — `phase2`, not used by
-  the default tier resolution.
+  `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
+  policy carries a stable host ID from the discovery session so the workload
+  session resolves the coordinator through its own topology and connection
+  pools. `ContainerDriver` shells out to per-language Docker images
+  (Python/Go/Node/Java/C#) — `phase2`, not used by the default tier resolution.
 - **Cluster backends**:
   - **Docker Compose / external contacts** (`docker_provision.rs`) — the
     orchestrator provisions a 3-node cluster when `FERROSA_TEST_CONTAINERS` is
@@ -99,14 +101,19 @@ ferrosa-jepsen report list                       # (report subcommands are stubs
 
 ## Tests
 
-- **233** in-crate unit tests (checker correctness, registries, config
+- **234** in-crate unit tests (checker correctness, registries, config
   resolution, the endurance-sim smoke + tri-DC headline runs, etc.) — these run
   under default `cargo test -p ferrosa-jepsen`.
-- **30** integration test functions across `tests/`. The live-infra ones
+- **32** integration test functions across `tests/`. The live-infra ones
   (Docker mini-Jepsen, smoke tier, topology invariants, nemesis correctness)
   are gated behind the `live-infra-tests` feature and `panic!` with setup
   instructions when their `FERROSA_TEST_*` prerequisite is absent —
   `live_infra_contract.rs` pins that contract. Zero `#[ignore]`.
+
+The scheduled T3 workflow additionally queries all six CQL endpoints before
+starting a workload. It requires six distinct host IDs and one shared schema
+version, preventing an HTTP-healthy but incomplete topology from entering a
+correctness run.
 
 Local live-infra form:
 

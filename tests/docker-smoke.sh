@@ -160,12 +160,21 @@ cql_c3() { cqlsh localhost 9044 -e "$1" 2>/dev/null; }
 cql_c4() { cqlsh localhost 9045 -e "$1" 2>/dev/null; }
 cql_c5() { cqlsh localhost 9046 -e "$1" 2>/dev/null; }
 
+# Bound each failed probe so a nominal readiness timeout remains a real
+# wall-clock timeout instead of multiplying by cqlsh's connection timeout.
+cql_ready() {
+    local port=$1
+    cqlsh --connect-timeout=2 --request-timeout=2 localhost "$port" \
+        -e "SELECT cluster_name FROM system.local" >/dev/null 2>&1
+}
+
 # Helper: wait for CQL on cluster-compose nodes
 wait_cql_c() {
     local port=$1 name=$2 timeout=${3:-60}
+    local deadline=$((SECONDS + timeout))
     info "Waiting for $name CQL (port $port)..."
-    for i in $(seq 1 "$timeout"); do
-        if cqlsh localhost "$port" -e "SELECT cluster_name FROM system.local" >/dev/null 2>&1; then
+    while (( SECONDS < deadline )); do
+        if cql_ready "$port"; then
             pass "$name CQL is ready"
             return 0
         fi
@@ -242,15 +251,60 @@ cql3() { cqlsh localhost 9044 -e "$1" 2>/dev/null; }
 # Helper: wait for CQL port
 wait_cql() {
     local port=$1 name=$2 timeout=${3:-60}
+    local deadline=$((SECONDS + timeout))
     info "Waiting for $name CQL (port $port)..."
-    for i in $(seq 1 "$timeout"); do
-        if cqlsh localhost "$port" -e "SELECT cluster_name FROM system.local" >/dev/null 2>&1; then
+    while (( SECONDS < deadline )); do
+        if cql_ready "$port"; then
             pass "$name CQL is ready"
             return 0
         fi
         sleep 1
     done
     fail "$name CQL did not become ready in ${timeout}s"
+}
+
+# Helper: wait for an acknowledged mutation to become query-visible. Pair
+# startup can briefly overlap topology/schema convergence, so a one-shot read
+# is not a stable correctness assertion. Keep the retry bounded and report the
+# final response when the value never appears.
+wait_for_cql_value() {
+    local port=$1 query=$2 expected=$3 description=$4 timeout=${5:-30}
+    local deadline=$((SECONDS + timeout))
+    local last_result=""
+
+    while (( SECONDS < deadline )); do
+        last_result=$(cqlsh --connect-timeout=2 --request-timeout=2 \
+            localhost "$port" -e "$query" 2>&1) || true
+        if grep -Fq -- "$expected" <<<"$last_result"; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    info "$description last query result: $last_result"
+    fail "$description did not become visible in ${timeout}s (expected: $expected)"
+}
+
+# Helper: wait for a pair member to converge to its expected role. A secondary
+# is intentionally healthy while rejecting client CQL, so CQL readiness is the
+# wrong signal for pair-role transitions.
+wait_for_cluster_role() {
+    local port=$1 name=$2 expected_role=$3 timeout=${4:-60}
+    local deadline=$((SECONDS + timeout))
+    local last_status=""
+
+    while (( SECONDS < deadline )); do
+        last_status=$(curl --connect-timeout 2 --max-time 2 -sf \
+            "http://localhost:${port}/api/cluster/status" 2>&1) || true
+        if grep -Fq -- "\"role\":\"${expected_role}\"" <<<"$last_status"; then
+            pass "$name converged to pair role $expected_role"
+            return 0
+        fi
+        sleep 1
+    done
+
+    info "$name last cluster status: $last_status"
+    fail "$name did not converge to pair role $expected_role in ${timeout}s"
 }
 
 # Helper: check cluster status via REST API
@@ -272,17 +326,10 @@ docker compose up -d --build node1 node2
 wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
 
 # In pair mode, node2 becomes the secondary. The CQL server rejects all
-# connections on secondaries (only the primary serves CQL), so waiting for
-# CQL on node2 will never succeed. Wait for /health instead — it confirms
-# the node process is up and the web server is running.
-info "Waiting for node2 health (pair-mode secondary, CQL not served)..."
-for i in $(seq 1 "$PAIR_CQL_TIMEOUT"); do
-    if curl -sf http://localhost:9091/health >/dev/null 2>&1; then
-        pass "node2 is healthy (pair-mode secondary)"
-        break
-    fi
-    sleep 1
-done
+# connections on secondaries (only the primary serves CQL), so wait for the
+# explicit role rather than treating a rejected CQL connection as unready.
+info "Waiting for node2 to become the pair secondary..."
+wait_for_cluster_role 9091 "node2" "secondary" "$PAIR_CQL_TIMEOUT"
 
 info "Waiting for pair mode activation..."
 sleep 5
@@ -321,8 +368,8 @@ cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('key1', 'from_node1')"
 pass "Write to node1 succeeded"
 sleep 1
 
-RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node1" || fail "Read from node1 failed"
+wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
+    "from_node1" "node1 key1"
 pass "Read from node1: key1=from_node1"
 
 # Read from node2 — in pair mode, node2 is the secondary and rejects CQL
@@ -337,8 +384,8 @@ cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('key2', 'from_node2')"
 pass "Write to node1 succeeded (on behalf of node2)"
 sleep 1
 
-RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node2" || fail "Write not on node1"
+wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" \
+    "from_node2" "node1 key2"
 pass "Read from node1: key2=from_node2"
 
 # Read from node2 will be verified after Phase 3 operator promotion.
@@ -389,12 +436,12 @@ wait_cql 9043 "node2" "$PAIR_CQL_TIMEOUT"
 
 # Promotion makes the replicated data safe to serve from node2.
 info "Verifying replicated reads on promoted node2..."
-RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node1" || fail "Promoted node2 cannot read key1"
+wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
+    "from_node1" "promoted node2 key1"
 pass "Promoted node2 reads replicated key1=from_node1"
 
-RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" 2>&1) || true
-echo "$RESULT" | grep -q "from_node2" || fail "Promoted node2 cannot read key2"
+wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = 'key2';" \
+    "from_node2" "promoted node2 key2"
 pass "Promoted node2 reads replicated key2=from_node2"
 
 # Writes should now work on node2
@@ -404,8 +451,8 @@ cql2 "INSERT INTO smoke_test.kv (k, v) VALUES ('failover2', 'also_failover')"
 pass "Failover writes succeeded on promoted node2"
 
 # Verify reads work
-RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" 2>&1) || true
-echo "$RESULT" | grep -q "during_failover" || fail "Failover read failed"
+wait_for_cql_value 9043 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" \
+    "during_failover" "promoted node2 failover1"
 pass "Failover data readable on node2: failover1=during_failover"
 
 # ============================================================
@@ -416,46 +463,20 @@ info "=== Phase 4: Rejoin and catch-up ==="
 
 info "Restarting node1..."
 docker compose start node1
-wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
+wait_for_cluster_role 9090 "node1" "secondary" "$PAIR_CQL_TIMEOUT"
 
 # Wait for pair mode re-establishment and schema catch-up.
 # Schema should arrive via PairSchemaSync before mutation replay.
 info "Waiting for pair mode re-establishment and schema catch-up..."
 sleep 15
 
-# Verify schema was replicated via catch-up (node1 should know about smoke_test keyspace)
+# Verify schema was replicated via catch-up. Node1 is a healthy secondary and
+# intentionally rejects CQL, so use its always-available schema endpoint.
 info "Verifying schema catch-up on node1..."
-if cql1 "SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'smoke_test';" 2>&1 | grep -q "smoke_test"; then
+if curl -sf http://localhost:9090/api/schema/keyspaces 2>/dev/null | grep -q "smoke_test"; then
     pass "Schema catch-up: smoke_test keyspace exists on node1"
 else
     info "Schema catch-up did not arrive on node1 — keyspace not found"
-fi
-
-# Verify original data is still on node1 (from persistent storage)
-info "Verifying original data on node1..."
-RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" 2>&1) || true
-if echo "$RESULT" | grep -q "from_node1"; then
-    pass "Original data preserved on node1: key1=from_node1"
-else
-    info "Original data not found on node1 (expected if data dir was clean)"
-fi
-
-# Verify failover data replicated to node1
-info "Checking if failover data replicated to node1..."
-RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" 2>&1) || true
-if echo "$RESULT" | grep -q "during_failover"; then
-    pass "Failover data replicated to node1: failover1=during_failover"
-else
-    info "Failover data not yet on node1 (catch-up may still be running)"
-    info "Query result: $RESULT"
-    # Give more time and retry
-    sleep 5
-    RESULT=$(cql1 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" 2>&1) || true
-    if echo "$RESULT" | grep -q "during_failover"; then
-        pass "Failover data replicated to node1 (after retry): failover1=during_failover"
-    else
-        info "SKIP: Failover catch-up not yet implemented for this scenario"
-    fi
 fi
 
 # ============================================================
@@ -476,22 +497,25 @@ info "Switchover result: $SWITCHOVER_RESULT"
 if echo "$SWITCHOVER_RESULT" | grep -q "switchover complete"; then
     pass "Switchover completed successfully"
 
-    sleep 2
+    wait_for_cluster_role 9090 "node1" "primary" "$PAIR_CQL_TIMEOUT"
+    wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
     info "Node1 status: $(cluster_status 9090)"
     info "Node2 status: $(cluster_status 9091)"
+
+    # Node1 can now serve the data checks that were intentionally unavailable
+    # while it was the rejoining secondary.
+    wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'key1';" \
+        "from_node1" "switched node1 key1"
+    wait_for_cql_value 9042 "SELECT v FROM smoke_test.kv WHERE k = 'failover1';" \
+        "during_failover" "switched node1 failover1"
+    pass "Rejoined node1 serves original and failover data"
 
     # Verify writes work through both nodes after switchover
     info "Writing through node1 after switchover..."
     cql1 "INSERT INTO smoke_test.kv (k, v) VALUES ('post_switch1', 'via_node1')"
     pass "Write to node1 succeeded after switchover"
 
-    sleep 1
-    RESULT=$(cql2 "SELECT v FROM smoke_test.kv WHERE k = 'post_switch1';" 2>&1) || true
-    if echo "$RESULT" | grep -q "via_node1"; then
-        pass "Post-switchover data replicated to node2"
-    else
-        info "Post-switchover replication pending"
-    fi
+    info "Skipping node2 CQL read while it is the post-switchover secondary"
 else
     info "SKIP: Switchover not available (may require both nodes in pair mode)"
     info "Result: $SWITCHOVER_RESULT"

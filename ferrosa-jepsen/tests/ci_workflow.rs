@@ -134,3 +134,35 @@ fn multi_dc_nightly_workload_pipeline_fails_loudly_with_tee() {
         "workload step must preserve tier-multi-dc.log artifact capture"
     );
 }
+
+#[test]
+fn multi_dc_nightly_preflights_every_cql_endpoint() {
+    let path = multi_dc_nightly_yaml_path();
+    let yaml =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let step = step_body(&yaml, "Bring up T3 (3+3 dual-DC) topology");
+
+    assert!(
+        yaml.contains("- name: Install cqlsh") && yaml.contains("pip install cqlsh"),
+        "the Multi-DC runner must install the CQL client used by its topology preflight"
+    );
+    assert!(
+        step.contains("FERROSA_TEST_CLUSTER_NODES"),
+        "the topology step must receive the same six CQL endpoints as the workload"
+    );
+    assert!(
+        step.contains("for endpoint in ${FERROSA_TEST_CLUSTER_NODES//,/ }")
+            && step.contains("SELECT host_id, schema_version FROM system.local"),
+        "the topology step must query identity and schema state through every configured endpoint; step was:\n{step}"
+    );
+    assert!(
+        step.contains("sort -u") && step.contains("[ \"$distinct_hosts\" -eq 6 ]"),
+        "the topology step must reject duplicate or missing node identities; step was:\n{step}"
+    );
+    assert!(
+        step.contains("preflight_deadline=$((SECONDS + 120))")
+            && step.contains("while (( SECONDS < preflight_deadline )); do")
+            && step.contains("T3 CQL topology did not converge within 120s"),
+        "CQL reachability and schema agreement must share a bounded convergence retry; step was:\n{step}"
+    );
+}
