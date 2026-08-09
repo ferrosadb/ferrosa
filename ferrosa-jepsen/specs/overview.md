@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-08-07
+last_updated: 2026-08-08
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
@@ -77,7 +77,14 @@ real CQL run without giving the harness ownership of its lifecycle. T3 refuses
 to silently fall back to `MockCqlSession`. The nightly T3 compose stack maps
 every CQL port to the host and advertises that mapped address back to the
 driver; its nodes have `NET_ADMIN` because the selected WAN nemesis applies
-`iptables` and `tc` inside them. Firecracker provisioning remains unwired.
+`iptables` and `tc` inside them. Before the workload starts, the scheduled
+workflow performs a raw native-protocol v4 `OPTIONS` → `SUPPORTED` handshake
+on each host-mapped CQL socket, then directly probes each node's host-mapped
+`/health`, `/api/cluster/status`, and `/api/cluster/ring` endpoints. It requires
+six working CQL listeners, the configured local identities, cluster mode, and
+an exact three-member `Normal` ring per DC. Socket-pinned CQL and direct HTTP
+prevent topology-aware clients from satisfying a node-local check through a
+different peer. Firecracker provisioning remains unwired.
 
 ## Checker stack
 
@@ -119,9 +126,13 @@ written history; Elle is type-only (`elle_result = None`).
    `iptables`; Fly private IPv6 addresses use `ip6tables`. The partition action
    selects the filter binary from the target address rather than applying a
    no-op/invalid IPv4 rule to a Fly node.
-7. **A healthy T3 is complete at the CQL layer.** The scheduled workflow checks
-   all six configured endpoints and requires six distinct host IDs plus one
-   shared schema version before Jepsen setup can create its keyspace.
+7. **A healthy T3 has six working CQL listeners, six directly verified
+   processes, and two complete rings.** The scheduled workflow requires a v4
+   `OPTIONS` → `SUPPORTED` exchange on every mapped CQL socket, checks all six
+   host-mapped HTTP endpoints, requires each configured host ID in cluster
+   mode, and requires every node to see its DC's exact three `Normal` ring
+   members. Schema agreement is exercised after Jepsen setup creates schema;
+   random empty-schema UUIDs are not a readiness condition.
 
 ## Position in the dependency graph
 

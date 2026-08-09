@@ -74,9 +74,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install cqlsh
-        run: pip install cqlsh
-
       - name: Free disk space
         # Bringing up the 3+3 dual-DC topology (6 Ferrosa containers + the nightly
         # runtime image + jepsen state) exhausted the runner disk ("No space left
@@ -114,7 +111,6 @@ jobs:
       - name: Bring up T3 (3+3 dual-DC) topology
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
-          FERROSA_TEST_CLUSTER_NODES: 'localhost:29042,localhost:29043,localhost:29044,localhost:29142,localhost:29143,localhost:29144'
         run: |
           set -euo pipefail
           # --no-build (fail loud, never compile): the node services carry a
@@ -123,76 +119,135 @@ jobs:
           # Plain `up -d --no-build` runs the pre-built FERROSA_NIGHTLY_IMAGE.
           docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml \
             up -d --no-build
-          # Wait for the first node in each DC to report ready on /health
-          # (leader-aware: 503 until a Raft leader is elected, so a green probe
-          # means the DC actually formed). Fail loud after ~120s.
-          ready=0
-          for _ in $(seq 1 60); do
-            if curl -sf http://localhost:29090/health >/dev/null \
-               && curl -sf http://localhost:29190/health >/dev/null; then
-              ready=1
+
+          # Probe each CQL socket directly, then validate process identity and
+          # topology through its host-mapped HTTP port. Unlike cqlsh, neither
+          # check can discover peers and load-balance the request onto another
+          # node. Each row is cql-port|web-port|local-host-id|DC-ring.
+          dc1_ring='11111111-1111-1111-1111-111111111111,11111111-1111-1111-1111-222222222222,11111111-1111-1111-1111-333333333333'
+          dc2_ring='22222222-2222-2222-2222-111111111111,22222222-2222-2222-2222-222222222222,22222222-2222-2222-2222-333333333333'
+          node_specs=(
+            "29042|29090|11111111-1111-1111-1111-111111111111|$dc1_ring"
+            "29043|29091|11111111-1111-1111-1111-222222222222|$dc1_ring"
+            "29044|29092|11111111-1111-1111-1111-333333333333|$dc1_ring"
+            "29142|29190|22222222-2222-2222-2222-111111111111|$dc2_ring"
+            "29143|29191|22222222-2222-2222-2222-222222222222|$dc2_ring"
+            "29144|29192|22222222-2222-2222-2222-333333333333|$dc2_ring"
+          )
+          preflight_deadline=$((SECONDS + 120))
+          preflight_ready=0
+          last_problem='HTTP endpoints have not responded yet'
+          while (( SECONDS < preflight_deadline )); do
+            topology_ready=1
+            for node_spec in "${node_specs[@]}"; do
+              IFS='|' read -r cql_port web_port expected_host_id expected_ring_ids <<< "$node_spec"
+              base_url="http://localhost:${web_port}"
+
+              if ! cql_error=$(python3 -c '
+          import socket, struct, sys
+          OPTIONS_OPCODE = 0x05
+          SUPPORTED_OPCODE = 0x06
+          cql_port = int(sys.argv[1])
+
+          def recv_exact(sock, length):
+              chunks = []
+              remaining = length
+              while remaining:
+                  chunk = sock.recv(remaining)
+                  if not chunk:
+                      raise RuntimeError(f"socket closed with {remaining} response bytes remaining")
+                  chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks)
+
+          try:
+              with socket.create_connection(("127.0.0.1", cql_port), timeout=5) as sock:
+                  sock.settimeout(5)
+                  sock.sendall(struct.pack(">BBhBI", 0x04, 0, 0, OPTIONS_OPCODE, 0))
+                  response_header = recv_exact(sock, 9)
+                  response_version, _, response_stream, response_opcode, response_length = struct.unpack(">BBhBI", response_header)
+                  if response_version != 0x84 or response_stream != 0 or response_opcode != SUPPORTED_OPCODE:
+                      raise RuntimeError(
+                          f"expected v4 SUPPORTED on stream 0, got version=0x{response_version:02x} "
+                          f"stream={response_stream} opcode=0x{response_opcode:02x}"
+                      )
+                  if response_length > 1048576:
+                      raise RuntimeError(f"SUPPORTED body is unreasonably large: {response_length} bytes")
+                  response_body = recv_exact(sock, response_length)
+                  if response_length < 2:
+                      raise RuntimeError("SUPPORTED body is missing its string-multimap header")
+                  supported_key_count = struct.unpack(">H", response_body[:2])[0]
+                  if supported_key_count < 1:
+                      raise RuntimeError("SUPPORTED body advertises no capabilities")
+          except Exception as error:
+              print(error)
+              raise SystemExit(1)
+          ' "$cql_port" 2>&1); then
+                topology_ready=0
+                last_problem="CQL endpoint $cql_port failed OPTIONS/SUPPORTED: $cql_error"
+                break
+              fi
+
+              if ! curl --connect-timeout 2 --max-time 5 -sf "${base_url}/health" >/dev/null; then
+                topology_ready=0
+                last_problem="HTTP endpoint $web_port is not healthy"
+                break
+              fi
+
+              status=$(curl --connect-timeout 2 --max-time 5 -sf \
+                "${base_url}/api/cluster/status") || status=''
+              if ! status_error=$(printf '%s' "$status" | python3 -c '
+          import json, sys
+          expected_host_id = sys.argv[1]
+          try:
+              status = json.load(sys.stdin)
+          except Exception as error:
+              print(f"invalid JSON: {error}")
+              raise SystemExit(1)
+          if status.get("host_id") != expected_host_id or status.get("mode") != "cluster":
+              print(f"expected host_id={expected_host_id} mode=cluster, got {status}")
+              raise SystemExit(1)
+          ' "$expected_host_id"); then
+                topology_ready=0
+                last_problem="HTTP endpoint $web_port status mismatch: $status_error"
+                break
+              fi
+
+              ring=$(curl --connect-timeout 2 --max-time 5 -sf \
+                "${base_url}/api/cluster/ring") || ring=''
+              if ! ring_error=$(printf '%s' "$ring" | python3 -c '
+          import json, sys
+          expected_ring_ids = set(sys.argv[1].split(","))
+          try:
+              ring = json.load(sys.stdin)
+          except Exception as error:
+              print(f"invalid JSON: {error}")
+              raise SystemExit(1)
+          nodes = ring.get("nodes", [])
+          actual_ring_ids = {node.get("host_id") for node in nodes}
+          states = {node.get("host_id"): node.get("state") for node in nodes}
+          if len(nodes) != 3 or actual_ring_ids != expected_ring_ids or any(state != "Normal" for state in states.values()):
+              print(f"expected three Normal members {sorted(expected_ring_ids)}, got {states}")
+              raise SystemExit(1)
+          ' "$expected_ring_ids"); then
+                topology_ready=0
+                last_problem="HTTP endpoint $web_port ring mismatch: $ring_error"
+                break
+              fi
+            done
+
+            if [ "$topology_ready" -eq 1 ]; then
+              preflight_ready=1
               break
             fi
             sleep 2
           done
-          if [ "$ready" -ne 1 ]; then
-            echo "::error::T3 dual-DC topology did not reach ready on /health within ~120s"
-            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml ps
-            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml logs --tail 200
-            exit 1
-          fi
-
-          # HTTP readiness on one node per DC is not enough: the Jepsen driver
-          # needs six distinct CQL hosts with converged schema metadata.
-          host_ids=$(mktemp)
-          schema_versions=$(mktemp)
-          trap 'rm -f "$host_ids" "$schema_versions"' EXIT
-          uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          preflight_deadline=$((SECONDS + 120))
-          preflight_ready=0
-          last_problem='CQL endpoints have not responded yet'
-          while (( SECONDS < preflight_deadline )); do
-            : > "$host_ids"
-            : > "$schema_versions"
-            endpoints_ready=1
-            for endpoint in ${FERROSA_TEST_CLUSTER_NODES//,/ }; do
-              host=${endpoint%:*}
-              port=${endpoint##*:}
-              output=$(cqlsh --connect-timeout=2 --request-timeout=5 "$host" "$port" \
-                -e 'SELECT host_id, schema_version FROM system.local;' 2>/dev/null) || true
-              row=$(printf '%s\n' "$output" | awk -F '|' \
-                'NF == 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); if ($1 ~ /^[0-9a-f][0-9a-f-]+[0-9a-f]$/ && $2 ~ /^[0-9a-f][0-9a-f-]+[0-9a-f]$/) { print $1 "|" $2; exit } }')
-              host_id=${row%%|*}
-              schema_version=${row#*|}
-              if ! [[ "$host_id" =~ $uuid_re && "$schema_version" =~ $uuid_re ]]; then
-                endpoints_ready=0
-                last_problem="CQL endpoint $endpoint did not return valid host/schema IDs"
-                break
-              fi
-              echo "$host_id" >> "$host_ids"
-              echo "$schema_version" >> "$schema_versions"
-            done
-
-            if [ "$endpoints_ready" -eq 1 ]; then
-              distinct_hosts=$(sort -u "$host_ids" | wc -l | tr -d ' ')
-              distinct_schemas=$(sort -u "$schema_versions" | wc -l | tr -d ' ')
-              if [ "$distinct_hosts" -eq 6 ] && [ "$distinct_schemas" -eq 1 ]; then
-                preflight_ready=1
-                break
-              fi
-              last_problem="found $distinct_hosts distinct hosts and $distinct_schemas schema versions"
-            fi
-            sleep 2
-          done
           if [ "$preflight_ready" -ne 1 ]; then
-            echo "::error::T3 CQL topology did not converge within 120s: $last_problem"
-            echo "Observed host IDs:"
-            sort -u "$host_ids"
-            echo "Observed schema versions:"
-            sort -u "$schema_versions"
+            echo "::error::T3 topology did not converge within 120s: $last_problem"
+            docker compose -f ferrosa-jepsen/tests/docker/jepsen-cluster-t3.yml ps
             exit 1
           fi
-          echo "T3 CQL preflight passed: 6 distinct hosts, one schema version"
+          echo "T3 preflight passed: six direct endpoints and two three-node Normal rings"
 
       - name: Run tier-multi-dc 1h bank workload
         env:

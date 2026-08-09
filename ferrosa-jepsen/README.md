@@ -101,7 +101,7 @@ ferrosa-jepsen report list                       # (report subcommands are stubs
 
 ## Tests
 
-- **234** in-crate unit tests (checker correctness, registries, config
+- **235** in-crate unit tests (checker correctness, registries, config
   resolution, the endurance-sim smoke + tri-DC headline runs, etc.) — these run
   under default `cargo test -p ferrosa-jepsen`.
 - **32** integration test functions across `tests/`. The live-infra ones
@@ -110,10 +110,15 @@ ferrosa-jepsen report list                       # (report subcommands are stubs
   instructions when their `FERROSA_TEST_*` prerequisite is absent —
   `live_infra_contract.rs` pins that contract. Zero `#[ignore]`.
 
-The scheduled T3 workflow additionally queries all six CQL endpoints before
-starting a workload. It requires six distinct host IDs and one shared schema
-version, preventing an HTTP-healthy but incomplete topology from entering a
-correctness run.
+The scheduled T3 workflow additionally opens every host-mapped CQL socket and
+requires a native-protocol v4 `OPTIONS` → `SUPPORTED` exchange before starting
+a workload. It then probes every node through its distinct HTTP port: each
+process must report its configured host ID and `mode=cluster`, and every
+`/api/cluster/ring` view must contain exactly the three `Normal` members
+expected for its DC. The identity check deliberately does not use `cqlsh`,
+whose topology-aware driver can execute a query on a peer instead of the
+contact endpoint, or require schema UUID agreement before the workload has
+created any schema.
 
 Local live-infra form:
 

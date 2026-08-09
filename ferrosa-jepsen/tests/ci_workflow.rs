@@ -136,33 +136,56 @@ fn multi_dc_nightly_workload_pipeline_fails_loudly_with_tee() {
 }
 
 #[test]
-fn multi_dc_nightly_preflights_every_cql_endpoint() {
+fn multi_dc_nightly_preflights_each_node_directly_over_cql_and_http() {
     let path = multi_dc_nightly_yaml_path();
     let yaml =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let step = step_body(&yaml, "Bring up T3 (3+3 dual-DC) topology");
 
     assert!(
-        yaml.contains("- name: Install cqlsh") && yaml.contains("pip install cqlsh"),
-        "the Multi-DC runner must install the CQL client used by its topology preflight"
+        !yaml.contains("- name: Install cqlsh")
+            && !step.contains("cqlsh --")
+            && !step.contains("pip install cqlsh"),
+        "the topology preflight must use socket-pinned checks; cqlsh discovers and load-balances across peers"
     );
     assert!(
-        step.contains("FERROSA_TEST_CLUSTER_NODES"),
-        "the topology step must receive the same six CQL endpoints as the workload"
+        step.contains("29042|29090|")
+            && step.contains("29043|29091|")
+            && step.contains("29044|29092|")
+            && step.contains("29142|29190|")
+            && step.contains("29143|29191|")
+            && step.contains("29144|29192|"),
+        "the topology step must pair every node's host-mapped CQL and HTTP endpoints; step was:\n{step}"
     );
     assert!(
-        step.contains("for endpoint in ${FERROSA_TEST_CLUSTER_NODES//,/ }")
-            && step.contains("SELECT host_id, schema_version FROM system.local"),
-        "the topology step must query identity and schema state through every configured endpoint; step was:\n{step}"
+        step.contains("socket.create_connection")
+            && step.contains("OPTIONS_OPCODE = 0x05")
+            && step.contains("SUPPORTED_OPCODE = 0x06")
+            && step.contains("response_version != 0x84")
+            && step.contains("supported_key_count"),
+        "each direct CQL socket must complete a native-protocol v4 OPTIONS/SUPPORTED handshake; step was:\n{step}"
     );
     assert!(
-        step.contains("sort -u") && step.contains("[ \"$distinct_hosts\" -eq 6 ]"),
-        "the topology step must reject duplicate or missing node identities; step was:\n{step}"
+        step.contains("/api/cluster/status")
+            && step.contains("expected_host_id")
+            && step.contains("mode")
+            && step.contains("cluster"),
+        "each direct endpoint must report its configured host ID and cluster mode; step was:\n{step}"
+    );
+    assert!(
+        step.contains("/api/cluster/ring")
+            && step.contains("expected_ring_ids")
+            && step.contains("Normal"),
+        "each node must see exactly its three expected DC ring members in Normal state; step was:\n{step}"
     );
     assert!(
         step.contains("preflight_deadline=$((SECONDS + 120))")
             && step.contains("while (( SECONDS < preflight_deadline )); do")
-            && step.contains("T3 CQL topology did not converge within 120s"),
-        "CQL reachability and schema agreement must share a bounded convergence retry; step was:\n{step}"
+            && step.contains("T3 topology did not converge within 120s"),
+        "direct status and ring validation must share a bounded convergence retry; step was:\n{step}"
+    );
+    assert!(
+        !step.contains("schema_version"),
+        "pre-DDL schema UUIDs are process-local and must not gate topology readiness; step was:\n{step}"
     );
 }
