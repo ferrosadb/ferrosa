@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-07-30
+last_updated: 2026-08-09
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -159,8 +159,8 @@ See [data-flow.md](data-flow.md) for the sequence diagrams.
   as the greatest supported version.
 - The `SUPPORTED` response advertises **v3, v4, and v5** in
   `PROTOCOL_VERSIONS`. The DataStax Java driver 4.x auto-negotiates v5 and
-  passes 37/38 smoke tests (all except `DROP KEYSPACE`, which hits a
-  control-connection reconnect race during schema-agreement).
+  passes all 38 smoke tests, including CREATE INDEX followed by DROP KEYSPACE
+  through the control-connection schema-agreement path.
 - **v5 handshake and modern framing are fully implemented**: self-contained
   frames with CRC24/CRC32, multi-envelope decode (the DataStax driver pipelines
   multiple queries in a single v5 frame), and the v5 `result_metadata_id` in

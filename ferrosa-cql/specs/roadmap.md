@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-06-30
+last_updated: 2026-08-09
 ---
 
 # ferrosa-cql — Roadmap
@@ -67,11 +67,8 @@ real backlog is structural and security-shaped.
 - **CQL native protocol v5 — remaining gaps** (follow-up to v3/v4/v5 conformance
   work). The server now accepts v5, enables modern framing with multi-envelope
   decode, emits the v5 `result_metadata_id` in PREPARE/EXECUTE responses, and
-  passes 37/38 DataStax Java driver smoke tests. Remaining gaps:
-  - **DROP KEYSPACE schema-agreement race** (FMEA CQL-11): the DataStax driver
-    closes its control connection after CREATE INDEX and the new control
-    connection subscribes ~2 ms too late to receive the `DROP KEYSPACE` event.
-    The `watch` channel fallback partially mitigates this.
+  passes all 38 DataStax Java driver smoke tests, including the fixed DROP
+  KEYSPACE schema-agreement regression (FMEA CQL-11). Remaining gaps:
   - Full query-parameter flag parsing for v5 QUERY/EXECUTE (page size,
     default timestamp, serial consistency, keyspace override, `now_in_seconds`).
   - `EXECUTE` `Skip_metadata` flag and `Metadata_changed` result-set metadata
