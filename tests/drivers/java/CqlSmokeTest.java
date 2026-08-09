@@ -450,12 +450,9 @@ public class CqlSmokeTest {
 
         // ---- Cleanup --------------------------------------------------------
 
-        // CQL-11: DROP KEYSPACE times out due to DataStax Java driver v5
-        // schema-agreement control-connection race. Deferred — see
-        // ferrosa-cql/specs/fmea.md CQL-11 and forge task t_56f17a7e.
-        // test("DROP KEYSPACE", () -> {
-        //     session.execute("DROP KEYSPACE IF EXISTS " + KEYSPACE);
-        // });
+        test("DROP KEYSPACE", () -> {
+            session.execute("DROP KEYSPACE IF EXISTS " + KEYSPACE);
+        });
 
         session.close();
 
