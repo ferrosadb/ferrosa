@@ -59,9 +59,11 @@ graph. It calls `ferrosa-sim` for the simulator-backed endurance path.
     Elle result to `None` (not wired to a running checker).
 - **Drivers** (`driver/`) — `rust_driver` connects to a real cluster via the
   `scylla` driver (`phase1`, the only wired driver). Its single-coordinator
-  policy carries a stable host ID from the discovery session so the workload
-  session resolves the coordinator through its own topology and connection
-  pools. `ContainerDriver` shells out to per-language Docker images
+  policy first lets the workload session discover topology, selects a stable
+  host ID from that same session's metadata, then remaps that session's
+  execution profile to the selected coordinator. This preserves transaction
+  affinity without handing a possibly absent node identity across sessions.
+  `ContainerDriver` shells out to per-language Docker images
   (Python/Go/Node/Java/C#) — `phase2`, not used by the default tier resolution.
 - **Cluster backends**:
   - **Docker Compose / external contacts** (`docker_provision.rs`) — the
