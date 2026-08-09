@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-08-08
+last_updated: 2026-08-09
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
@@ -37,7 +37,7 @@ SSH (`russh`) for fault injection, and to the simulator via `ferrosa-sim`.
 | `workload` (`src/workload/`) | `Workload` trait + registry: `register`, `bank`, 16 `lwt-*`, `forward-probe`, `membership-churn`, `late-join-flood`. |
 | `chaos` (`src/chaos/`) | `NemesisAction` trait + registry: network, process, clock, disk, WAN/cross-DC, composed nemeses. WAN actions execute via SSH, Fly SSH, or `container_runtime() exec` (`iptables`/`tc`/signals). |
 | `checker` (`src/checker/`) | Linearizability (native WGL backtracking), membership invariants, Knossos (subprocess), Elle (stub). |
-| `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection, pinned by host ID resolved in the workload session's own topology/pools); `ContainerDriver` (per-language Docker images, not in default tiers). |
+| `driver` (`src/driver/`) | `rust_driver` (real `scylla` connection; after its workload session discovers topology, the same session is pinned by one of its own host IDs); `ContainerDriver` (per-language Docker images, not in default tiers). |
 | `docker_provision` (`src/docker_provision.rs`) | **Wired** backend: managed Docker Compose for up to three nodes and non-owning external contact points for T3/Fly. `container_runtime()` selects a usable Docker/Podman daemon, not merely an installed CLI. |
 | `firecracker` / `cluster` | microVM provisioning primitives — present but **not wired** into the run path. |
 | `flyio` (`src/flyio.rs`) | Fly.io machine management primitives. A caller-provisioned Fly T3/T4 becomes a real run via `FERROSA_TEST_CLUSTER_NODES`; `FERROSA_JEPSEN_FLY_APP` plus ordered machine IDs selects Fly-SSH WAN faults. |
@@ -133,6 +133,10 @@ written history; Elle is type-only (`elle_result = None`).
    mode, and requires every node to see its DC's exact three `Normal` ring
    members. Schema agreement is exercised after Jepsen setup creates schema;
    random empty-schema UUIDs are not a readiness condition.
+8. **Coordinator affinity is session-local.** The workload session first
+   discovers topology using the normal policy, selects a deterministic host ID
+   from its own metadata, and then remaps its execution profile to that node.
+   A disposable probe session must not choose the destination session's pin.
 
 ## Position in the dependency graph
 

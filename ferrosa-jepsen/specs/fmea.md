@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: fmea
-last_updated: 2026-08-08
+last_updated: 2026-08-09
 ---
 
 # ferrosa-jepsen — Failure Modes and Effects Analysis
@@ -10,7 +10,7 @@ last_updated: 2026-08-08
 |---|---|---|---|
 | T3 has no live CQL contact points | A multi-DC test could appear to run against `MockCqlSession`. | `Tier::MultiDc` returns an error before the combination starts. | Require exactly the topology's count of `FERROSA_TEST_CLUSTER_NODES`; do not provision a mock fallback for T3/T4. |
 | Port-mapped nodes advertise their container port | The Scylla driver discovers addresses it cannot dial and loses its pool. | Real T3 bank setup fails while creating the keyspace. | Each T3 node sets `FERROSA_CQL_BROADCAST` to its distinct host-mapped port; `t3_topology` guards all six mappings. |
-| Driver reuses a coordinator node object from a discarded probe session | Schema agreement cannot find the required coordinator in the workload session's connection pools, so setup fails before operations begin. | Setup reports `required for schema agreement is not present in connection pool`; a unit regression pins the identifier variant. | Carry only the stable host ID across sessions; the workload session resolves it through its own metadata and pools. |
+| Driver selects a coordinator from a discarded probe session | The workload session's metadata may not contain that host ID, so its single-target policy returns an empty plan and setup fails before operations begin. | Setup reports `Load balancing policy returned an empty plan`; unit regressions require selection from destination metadata and loud failure for an empty node set. | Build one workload session with the normal policy, select a deterministic host ID from that session's metadata, then remap the same session's execution profile to the single-target policy. |
 | Topology-aware CQL preflight answers through the wrong T3 process | A client pointed at six contact endpoints can load-balance `system.local` queries onto fewer peers, falsely reporting duplicate/missing nodes; independently random empty-schema UUIDs can falsely report disagreement before DDL. | Workflow contract rejects `cqlsh` topology validation, pins all six CQL/HTTP port pairs, and requires the native-protocol handshake. | Require `OPTIONS` → `SUPPORTED` directly on every CQL socket. Poll `/health` and `/api/cluster/status` directly on every process, require its configured host ID and cluster mode, then require `/api/cluster/ring` on every process to show exactly its DC's three `Normal` members. Let workload DDL exercise schema agreement. |
 | Live-infrastructure tests enter the default test target | Plain `cargo test` fails because an intentionally loud missing-infrastructure assertion runs without opt-in. | `live_infra_contract` enumerates live-only targets and individual tests. | Gate them with the `live-infra-tests` feature while preserving panic-on-missing-infrastructure after opt-in. |
 | WAN nemesis is selected but never executed | A report labels a faulted run that only tested normal workload behavior. | Orchestrator unit test records inject/heal calls; real runs fail on missing executor. | Run the selected non-`noop` action concurrently with workload and propagate injection/heal failures. |

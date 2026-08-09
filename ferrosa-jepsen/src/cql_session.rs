@@ -1,3 +1,9 @@
+//! CQL transport for Jepsen workloads with stable coordinator affinity.
+//! Correctness: every transaction statement uses one coordinator selected from
+//! the executing session's own metadata, and CQL results preserve row values.
+//! Last revised: 2026-08-08
+//! Last changed: Select the pinned coordinator from the destination session.
+
 use std::num::NonZeroUsize;
 
 use anyhow::{Context, Result};
@@ -24,6 +30,14 @@ fn coordinator_identifier(host_id: Uuid) -> NodeIdentifier {
     NodeIdentifier::HostId(host_id)
 }
 
+fn coordinator_host_id<'a>(host_ids: impl IntoIterator<Item = &'a Uuid>) -> Result<Uuid> {
+    host_ids
+        .into_iter()
+        .copied()
+        .min()
+        .context("cluster reports no known nodes to pin to")
+}
+
 impl ScyllaCqlSession {
     /// Connect to the cluster at the given contact points (e.g. `["127.0.0.1:9042"]`).
     ///
@@ -33,50 +47,47 @@ impl ScyllaCqlSession {
     /// would scatter the statements across coordinators and the buffered DML would
     /// never reach the `BEGIN`'s connection (silently non-atomic).
     ///
-    /// Pinning uses the stable host ID discovered by a short-lived probe session.
-    /// The pinned session resolves that ID through its own cluster metadata and
-    /// connection pools. Reusing the probe session's live `Node` object would
-    /// bypass that lookup and can make schema agreement search for a coordinator
-    /// that is absent from the pinned session's pools. The full topology stays
-    /// connected (`known_nodes` + `PoolSize(1)`); the pinned node forwards writes
-    /// as the Accord coordinator, so cross-shard fan-out still happens.
+    /// Pinning uses a stable host ID discovered from the destination session's
+    /// own cluster metadata. Selecting it from a separate probe session is not
+    /// safe: topology discovery can yield different node sets, leaving the
+    /// destination policy with an ID it cannot resolve and an empty query plan.
+    /// The full topology stays connected (`known_nodes` + `PoolSize(1)`); the
+    /// pinned node forwards writes as the Accord coordinator, so cross-shard
+    /// fan-out still happens.
     pub async fn connect(contact_points: &[String]) -> Result<Self> {
         assert!(
             !contact_points.is_empty(),
             "contact_points must not be empty"
         );
 
-        // Phase 1 — probe with a normal session to learn a live node's host_id.
-        let probe = SessionBuilder::new()
-            .known_nodes(contact_points)
-            .build()
-            .await
-            .context("failed to connect to CQL cluster (probe)")?;
-        let target_host_id = probe
-            .get_cluster_state()
-            .get_nodes_info()
-            .iter()
-            .min_by_key(|n| n.host_id) // deterministic across topology refreshes
-            .map(|n| n.host_id)
-            .context("cluster reports no known nodes to pin to")?;
-        drop(probe);
-
-        // Phase 2 — pin all queries to that node (one connection ⇒ transaction
-        // affinity), keeping the full topology connected for reachability.
-        let policy =
-            SingleTargetLoadBalancingPolicy::new(coordinator_identifier(target_host_id), None);
-        let profile = ExecutionProfile::builder()
-            .load_balancing_policy(policy)
-            .build();
+        // Build with the normal policy so topology discovery can complete, then
+        // remap the same session's profile to a coordinator that its metadata
+        // can resolve. ExecutionProfileHandle remapping is observed by the
+        // session because the builder receives a clone of this handle.
+        let mut profile_handle = ExecutionProfile::builder().build().into_handle();
         let session = SessionBuilder::new()
             .known_nodes(contact_points)
-            .default_execution_profile_handle(profile.into_handle())
+            .default_execution_profile_handle(profile_handle.clone())
             .pool_size(PoolSize::PerHost(
                 NonZeroUsize::new(1).expect("1 is nonzero"),
             ))
             .build()
             .await
-            .context("failed to connect to CQL cluster (pinned)")?;
+            .context("failed to connect to CQL cluster")?;
+        let target_host_id = coordinator_host_id(
+            session
+                .get_cluster_state()
+                .get_nodes_info()
+                .iter()
+                .map(|node| &node.host_id),
+        )?;
+
+        let policy =
+            SingleTargetLoadBalancingPolicy::new(coordinator_identifier(target_host_id), None);
+        let profile = ExecutionProfile::builder()
+            .load_balancing_policy(policy)
+            .build();
+        profile_handle.map_to_another_profile(profile);
         Ok(Self { session })
     }
 }
@@ -163,13 +174,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinning_uses_a_host_id_resolved_by_the_destination_session() {
+    fn pinning_uses_a_host_id_identifier() {
         let host_id = Uuid::new_v4();
 
         match coordinator_identifier(host_id) {
             NodeIdentifier::HostId(actual) => assert_eq!(actual, host_id),
             other => panic!("expected host-ID coordinator pin, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pinning_selects_a_coordinator_from_destination_metadata() {
+        let destination_host_ids = [
+            Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap(),
+            Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap(),
+        ];
+
+        let selected = coordinator_host_id(destination_host_ids.iter()).unwrap();
+
+        assert_eq!(selected, destination_host_ids[1]);
+    }
+
+    #[test]
+    fn pinning_fails_loudly_when_destination_metadata_is_empty() {
+        let destination_host_ids: [Uuid; 0] = [];
+
+        let error = coordinator_host_id(destination_host_ids.iter()).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cluster reports no known nodes to pin to"
+        );
     }
 
     /// Verify that ScyllaCqlSession connects to a real cluster and can execute a
