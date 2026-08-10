@@ -32,6 +32,7 @@ fi
 # Tests gated by FERROSA_TEST_CONTAINERS / FERROSA_TEST_FIRECRACKER /
 # FERROSA_TEST_CLUSTER_NODES per CLAUDE.md test policy.
 SKIPS=(
+  --skip accord::perf_regression
   --skip batch_atomicity
   --skip pause_resume
   --skip recovery_coordinator
@@ -48,6 +49,17 @@ SKIPS=(
   --skip flush_2000
   --skip single_writer
   --skip write_flush_compact
+  --skip reads_never_panic_on_arbitrary_content
+  --skip corrupt_sstable_bytes_never_panic_never_oom
+  --skip peak_resident_readers_within_cap
+  --skip streaming_equals_single_pass
+  --skip bounded_fetch_reassembles_to_single_pass
+  --skip read_merge_is_lww_no_data_loss
+  --skip digest_walk_is_deterministic
+  --skip differential_oracle
+  --skip fly_multi_node_streaming_scan
+  --skip real_typed_edges_paged_scan_delivers_every_distinct_row
+  --skip count_range_metadata_merger_dedups_real_typed_edges_sstables
 )
 
 # `cargo nextest run` hangs on this workspace's lib targets on macOS

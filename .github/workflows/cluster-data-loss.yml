@@ -2,9 +2,9 @@ name: Cluster Data Loss Test
 
 on:
   # Only run on main merges and manual dispatch — NOT on every PR push.
-  # This workflow builds Docker images + runs a 3-node cluster test,
-  # consuming ~15 min of CI per run. Running on every push to a PR
-  # burned 1300+ minutes in one day.
+  # This workflow packages the nightly .deb into a runtime image and runs a
+  # 3-node cluster test. Running it on every PR push burned 1300+ minutes in
+  # one day.
   push:
     branches: [main]
     paths:
@@ -42,25 +42,37 @@ jobs:
           docker build -f tests/Dockerfile.nightly-deb -t ferrosa-nightly:latest tests/
           rm -f tests/ferrosa.deb
 
-      - name: Build Ferrosa image (fallback)
-        if: steps.nightly_deb.outputs.deb_path == ''
-        run: docker build -t ferrosa-nightly .
-
       - name: Start 3-node cluster
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-nightly:latest
         run: |
           set -euo pipefail
-          docker compose -f tests/docker-compose.cluster.yml --profile trio up -d
+          docker compose -f tests/docker-compose.cluster.yml --profile trio up -d --no-build
           echo "Waiting for cluster formation..."
-          for i in $(seq 1 60); do
-            if docker compose -f tests/docker-compose.cluster.yml exec -T node1 \
-              bash -c 'echo > /dev/tcp/127.0.0.1/9042' 2>/dev/null; then
-              echo "CQL port ready after ${i}s"
+          deadline=$((SECONDS + 120))
+          ready=0
+          while (( SECONDS < deadline )); do
+            healthy=1
+            for node in node1 node2 node3; do
+              container_id="$(docker compose -f tests/docker-compose.cluster.yml ps -q "$node")"
+              status="$(docker inspect --format='{{.State.Health.Status}}' "$container_id" 2>/dev/null || true)"
+              if [[ "$status" != "healthy" ]]; then
+                healthy=0
+                break
+              fi
+            done
+            if (( healthy )); then
+              ready=1
+              echo "All cluster nodes are healthy after $((120 - (deadline - SECONDS)))s"
               break
             fi
-            sleep 1
+            sleep 2
           done
+          if (( ! ready )); then
+            echo "::error::Cluster did not become healthy within 120 seconds"
+            docker compose -f tests/docker-compose.cluster.yml ps
+            exit 1
+          fi
           # Extra wait for cluster formation + Raft election
           sleep 15
 
