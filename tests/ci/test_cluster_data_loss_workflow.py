@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CLUSTER_COMPOSE = ROOT / "tests" / "docker-compose.cluster.yml"
 WORKFLOW = ROOT / ".github" / "workflows" / "cluster-data-loss.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+PRE_PUSH_MIRROR = ROOT / "scripts" / "pre-push-mirror-ci.sh"
 
 
 def start_cluster_step() -> str:
@@ -21,6 +23,7 @@ class ClusterDataLossWorkflowTest(unittest.TestCase):
     # - [x] Readiness has a wall-clock deadline and fails with diagnostics.
     # - [x] Missing nightly artifacts cannot fall back to a source build.
     # - [x] The PR gate runs this regression suite.
+    # - [x] The local pre-push mirror uses the same exclusions as GitHub CI.
 
     def test_every_node_supports_the_nightly_image_override(self):
         compose = CLUSTER_COMPOSE.read_text(encoding="utf-8")
@@ -67,6 +70,17 @@ class ClusterDataLossWorkflowTest(unittest.TestCase):
             "python3 -m unittest tests.ci.test_cluster_data_loss_workflow",
             workflow,
         )
+
+    def test_pre_push_mirror_uses_the_same_test_exclusions_as_ci(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        run_tests = workflow.split("- name: Run tests", 1)[1]
+        run_tests = run_tests.split("# ── Stage 2a", 1)[0]
+        pre_push = PRE_PUSH_MIRROR.read_text(encoding="utf-8")
+
+        ci_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", run_tests))
+        pre_push_skips = set(re.findall(r"--skip ([A-Za-z0-9_:]+)", pre_push))
+
+        self.assertSetEqual(ci_skips, pre_push_skips)
 
 
 if __name__ == "__main__":
