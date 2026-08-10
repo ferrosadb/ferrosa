@@ -38,6 +38,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      - name: Check Cluster Data Loss workflow contract
+        run: python3 -m unittest tests.ci.test_cluster_data_loss_workflow
 
   clippy:
     name: Clippy

@@ -12,6 +12,10 @@
 #   # 5-node cluster
 #   docker compose -f tests/docker-compose.cluster.yml --profile quint up -d --build
 #
+#   # Run a pre-built image without compiling the source checkout
+#   FERROSA_NIGHTLY_IMAGE=ferrosa-nightly:latest \
+#     docker compose -f tests/docker-compose.cluster.yml --profile trio up -d --no-build
+#
 #   # Tear down
 #   docker compose -f tests/docker-compose.cluster.yml down -v --remove-orphans
 
@@ -76,7 +80,7 @@ services:
   # Node 1 — first seed; no FERROSA_SEED (it IS the seed)
   # ---------------------------------------------------------------------------
   node1:
-    image: ferrosa-test-node:latest
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-test-node:latest}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -114,7 +118,7 @@ services:
   # Node 2
   # ---------------------------------------------------------------------------
   node2:
-    image: ferrosa-test-node:latest
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-test-node:latest}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -153,7 +157,7 @@ services:
   # Node 3
   # ---------------------------------------------------------------------------
   node3:
-    image: ferrosa-test-node:latest
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-test-node:latest}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -192,7 +196,7 @@ services:
   # Node 4 — quint profile only
   # ---------------------------------------------------------------------------
   node4:
-    image: ferrosa-test-node:latest
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-test-node:latest}
     build:
       context: ..
       dockerfile: Dockerfile
@@ -231,7 +235,7 @@ services:
   # Node 5 — quint profile only
   # ---------------------------------------------------------------------------
   node5:
-    image: ferrosa-test-node:latest
+    image: ${FERROSA_NIGHTLY_IMAGE:-ferrosa-test-node:latest}
     build:
       context: ..
       dockerfile: Dockerfile
