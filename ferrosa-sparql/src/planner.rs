@@ -9,24 +9,61 @@ use spargebra::Query;
 
 use crate::error::SparqlError;
 
+/// Where a planned operation reads from.
+///
+/// The keyspace and the graph are DIFFERENT THINGS and were previously one
+/// `graph: String` used for both. That conflation was a silent-wrong-results
+/// bug: `rdf_triples` lives in a table named by the KEYSPACE, while a row's
+/// partition key is `(GRAPH, subject)` — and the writer has always taken the
+/// graph from the SPARQL graph name (`DefaultGraph` -> `"default"`) while the
+/// reader took it from the caller's keyspace (HTTP default `"rdf"`).
+///
+/// Both sides therefore agreed on the table, so scans worked, while a
+/// bound-subject point read asked for `("rdf", subject)` and missed a row
+/// stored under `("default", subject)` — returning a well-formed empty result
+/// for data that was present.
+///
+/// Carrying both in one struct is what stops that returning: an op cannot be
+/// constructed with only one of them, and the two are named at every use site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripleScope {
+    /// Selects the `rdf_triples` TABLE. Comes from the caller's keyspace.
+    pub keyspace: String,
+    /// The graph component of the partition key. Comes from the SPARQL graph
+    /// name — `"default"` for the default graph, the IRI for a named graph.
+    pub graph: String,
+}
+
+impl TripleScope {
+    pub fn new(keyspace: impl Into<String>, graph: impl Into<String>) -> Self {
+        Self {
+            keyspace: keyspace.into(),
+            graph: graph.into(),
+        }
+    }
+}
+
 /// A planned storage operation for evaluating a triple pattern.
 #[derive(Debug, Clone)]
 pub enum TripleOp {
     /// Lookup by subject (partition key scan): given subject, scan all (pred, obj).
     SubjectLookup {
-        graph: String,
+        scope: TripleScope,
         subject: String,
         predicate_filter: Option<String>,
     },
     /// Full scan with predicate filter (uses secondary index on predicate).
-    PredicateScan { graph: String, predicate: String },
+    PredicateScan {
+        scope: TripleScope,
+        predicate: String,
+    },
     /// Full scan with object filter (uses secondary index on object).
-    ObjectScan { graph: String, object: String },
+    ObjectScan { scope: TripleScope, object: String },
     /// Full table scan (no bound terms) — expensive, requires LIMIT.
-    FullScan { graph: String },
+    FullScan { scope: TripleScope },
     /// Property path traversal (BFS/DFS) — evaluates transitive closure.
     PropertyPath {
-        graph: String,
+        scope: TripleScope,
         subject: spargebra::term::TermPattern,
         path: spargebra::algebra::PropertyPathExpression,
         object: spargebra::term::TermPattern,
@@ -80,22 +117,22 @@ pub enum GraphQueryMode {
     /// assemble the result from the SELECT output.
     DescribeIris(Vec<String>),
     /// `DESCRIBE ?var WHERE { … }` — subjects are derived from WHERE solutions.
-    Describe(String),
+    ///
+    /// Carries the full scope, not just a graph: the follow-up SubjectLookup it
+    /// drives needs the keyspace to find the table AND the graph to build the
+    /// partition key, and passing one value for both is the bug this type
+    /// exists to prevent.
+    Describe(TripleScope),
 }
 
 /// Plan a SPARQL SELECT, ASK, CONSTRUCT, or DESCRIBE query.
-pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, SparqlError> {
+pub fn plan_query(query: &Query, scope: &TripleScope) -> Result<QueryPlan, SparqlError> {
     match query {
         Query::Select {
             pattern, base_iri, ..
-        } => plan_select(
-            pattern,
-            default_graph,
-            base_iri.as_ref().map(|i| i.as_str()),
-            false,
-        ),
+        } => plan_select(pattern, scope, base_iri.as_ref().map(|i| i.as_str()), false),
         Query::Ask { pattern, .. } => {
-            let mut plan = plan_select(pattern, default_graph, None, true)?;
+            let mut plan = plan_select(pattern, scope, None, true)?;
             plan.limit = Some(1);
             Ok(plan)
         }
@@ -107,7 +144,7 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
         } => {
             // Plan the WHERE clause exactly like SELECT so the executor can
             // bind solutions; then attach the CONSTRUCT template.
-            let mut plan = plan_select(pattern, default_graph, None, false)?;
+            let mut plan = plan_select(pattern, scope, None, false)?;
             // CONSTRUCT projects all variables — projection is derived from the template.
             plan.graph_mode = Some(GraphQueryMode::Construct(template.clone()));
             Ok(plan)
@@ -127,8 +164,8 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
             let iris = extract_describe_iris(pattern);
             if iris.is_empty() {
                 // DESCRIBE ?var WHERE { … } — plan the WHERE clause normally.
-                let mut plan = plan_select(pattern, default_graph, None, false)?;
-                plan.graph_mode = Some(GraphQueryMode::Describe(default_graph.to_string()));
+                let mut plan = plan_select(pattern, scope, None, false)?;
+                plan.graph_mode = Some(GraphQueryMode::Describe(scope.clone()));
                 return Ok(plan);
             }
 
@@ -147,7 +184,7 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
                 ops.push((
                     tp,
                     TripleOp::SubjectLookup {
-                        graph: default_graph.to_string(),
+                        scope: scope.clone(),
                         subject: iri.clone(),
                         predicate_filter: None,
                     },
@@ -172,13 +209,13 @@ pub fn plan_query(query: &Query, default_graph: &str) -> Result<QueryPlan, Sparq
 /// Plan a bare `GraphPattern` (e.g. the WHERE clause of a SPARQL UPDATE) into a
 /// [`QueryPlan`] so it can be evaluated by the SELECT executor to bind
 /// solutions. Used by `update.rs` for `DELETE WHERE` / `DELETE/INSERT … WHERE`.
-pub fn plan_where(pattern: &GraphPattern, default_graph: &str) -> Result<QueryPlan, SparqlError> {
-    plan_select(pattern, default_graph, None, false)
+pub fn plan_where(pattern: &GraphPattern, scope: &TripleScope) -> Result<QueryPlan, SparqlError> {
+    plan_select(pattern, scope, None, false)
 }
 
 fn plan_select(
     pattern: &GraphPattern,
-    default_graph: &str,
+    scope: &TripleScope,
     _base_iri: Option<&str>,
     is_ask: bool,
 ) -> Result<QueryPlan, SparqlError> {
@@ -192,7 +229,7 @@ fn plan_select(
 
     collect_ops(
         pattern,
-        default_graph,
+        scope,
         &mut ops,
         &mut projection,
         &mut limit,
@@ -218,7 +255,7 @@ fn plan_select(
 #[allow(clippy::too_many_arguments)]
 fn collect_ops(
     pattern: &GraphPattern,
-    default_graph: &str,
+    scope: &TripleScope,
     ops: &mut Vec<(TriplePattern, TripleOp)>,
     projection: &mut Vec<String>,
     limit: &mut Option<usize>,
@@ -230,7 +267,7 @@ fn collect_ops(
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for tp in patterns {
-                let op = plan_triple_pattern(tp, default_graph)?;
+                let op = plan_triple_pattern(tp, scope)?;
                 ops.push((tp.clone(), op));
             }
         }
@@ -239,15 +276,7 @@ fn collect_ops(
                 projection.push(var.as_str().to_string());
             }
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::Slice {
@@ -262,29 +291,13 @@ fn collect_ops(
                 *limit = Some(*len);
             }
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::Filter { inner, expr } => {
             filters.push(expr.clone());
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::OrderBy {
@@ -304,42 +317,18 @@ fn collect_ops(
                 });
             }
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::Distinct { inner } => {
             *distinct = true;
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::Reduced { inner } => {
             collect_ops(
-                inner,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::Path {
@@ -358,13 +347,13 @@ fn collect_ops(
                     ),
                     object: object.clone(),
                 };
-                let op = plan_triple_pattern(&tp, default_graph)?;
+                let op = plan_triple_pattern(&tp, scope)?;
                 ops.push((tp, op));
             } else {
                 // Transitive/closure path — emit PropertyPath op for BFS.
                 let tp = build_path_triple_pattern(subject, path, object);
                 let op = TripleOp::PropertyPath {
-                    graph: default_graph.to_string(),
+                    scope: scope.clone(),
                     subject: subject.clone(),
                     path: path.clone(),
                     object: object.clone(),
@@ -375,42 +364,18 @@ fn collect_ops(
         GraphPattern::Union { left, right } => {
             // BUG-S14: UNION support — concat both sides.
             collect_ops(
-                left,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                left, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
             // UNION appends the right side's patterns too.
             collect_ops(
-                right,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                right, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
         GraphPattern::LeftJoin { left, right: _, .. } => {
             // OPTIONAL → evaluate left side; right side patterns are optional.
             // For now, just evaluate the left side (inner patterns).
             collect_ops(
-                left,
-                default_graph,
-                ops,
-                projection,
-                limit,
-                offset,
-                distinct,
-                order_by,
-                filters,
+                left, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
             tracing::warn!("OPTIONAL (LeftJoin) right side not yet evaluated");
         }
@@ -484,7 +449,7 @@ fn extract_predicate_from_path(
 /// (RDF* / SPARQL-star syntax), which is parsed successfully by spargebra but
 /// whose annotation evaluation is not yet implemented (URS-QEC-S03 /
 /// URS-QEC-X01).  Failing loud here prevents silent wrong results.
-fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<TripleOp, SparqlError> {
+fn plan_triple_pattern(tp: &TriplePattern, scope: &TripleScope) -> Result<TripleOp, SparqlError> {
     // URS-QEC-S03 / URS-QEC-X01: detect RDF* embedded triple terms and fail loud.
     if matches!(&tp.subject, TermPattern::Triple(_)) {
         return Err(SparqlError::Plan(
@@ -500,7 +465,7 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<Triple
         ));
     }
 
-    let graph = default_graph.to_string();
+    let scope = scope.clone();
 
     let subject_bound = matches!(&tp.subject, TermPattern::NamedNode(_));
     let predicate_bound = matches!(&tp.predicate, NamedNodePattern::NamedNode(_));
@@ -523,7 +488,7 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<Triple
             None
         };
         TripleOp::SubjectLookup {
-            graph,
+            scope,
             subject,
             predicate_filter,
         }
@@ -532,7 +497,7 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<Triple
             NamedNodePattern::NamedNode(n) => n.as_str().to_string(),
             _ => unreachable!(),
         };
-        TripleOp::PredicateScan { graph, predicate }
+        TripleOp::PredicateScan { scope, predicate }
     } else if object_bound {
         let object = match &tp.object {
             TermPattern::NamedNode(n) => n.as_str().to_string(),
@@ -545,9 +510,9 @@ fn plan_triple_pattern(tp: &TriplePattern, default_graph: &str) -> Result<Triple
             TermPattern::Literal(l) => l.value().to_string(),
             _ => unreachable!(),
         };
-        TripleOp::ObjectScan { graph, object }
+        TripleOp::ObjectScan { scope, object }
     } else {
-        TripleOp::FullScan { graph }
+        TripleOp::FullScan { scope }
     };
     Ok(op)
 }
@@ -604,7 +569,7 @@ mod tests {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.projection, vec!["s", "p", "o"]);
         assert_eq!(plan.ops.len(), 1);
         assert!(matches!(plan.ops[0].1, TripleOp::FullScan { .. }));
@@ -615,7 +580,7 @@ mod tests {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }")
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.ops.len(), 1);
         assert!(matches!(plan.ops[0].1, TripleOp::SubjectLookup { .. }));
     }
@@ -625,7 +590,7 @@ mod tests {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10")
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.limit, Some(10));
     }
 
@@ -636,7 +601,7 @@ mod tests {
                 "ASK { <http://example.org/alice> <http://xmlns.com/foaf/0.1/name> ?name }",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert!(plan.is_ask, "ASK query must set is_ask=true");
         assert_eq!(plan.limit, Some(1), "ASK query must limit to 1 row");
     }
@@ -646,7 +611,7 @@ mod tests {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT ?s WHERE { ?s ?p ?o }")
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert!(!plan.is_ask, "SELECT query must set is_ask=false");
     }
 
@@ -655,7 +620,7 @@ mod tests {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT DISTINCT ?s WHERE { ?s ?p ?o }")
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert!(plan.distinct, "DISTINCT must set distinct=true");
     }
 
@@ -666,7 +631,7 @@ mod tests {
                 "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name } ORDER BY ?name",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.order_by.len(), 1);
         assert!(matches!(
             &plan.order_by[0].expression,
@@ -683,7 +648,7 @@ mod tests {
                 "SELECT ?a ?b WHERE { ?s <http://ex/a> ?a ; <http://ex/b> ?b } ORDER BY DESC(?a + ?b)",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.order_by.len(), 1);
         assert!(!plan.order_by[0].ascending);
         assert!(
@@ -701,7 +666,7 @@ mod tests {
             "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name } ORDER BY DESC(?name)",
         )
         .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.order_by.len(), 1);
         assert!(!plan.order_by[0].ascending);
     }
@@ -712,19 +677,36 @@ mod tests {
             "SELECT ?name WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?name . FILTER(?name = \"Alice\") }",
         )
         .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.filters.len(), 1, "FILTER must capture one expression");
     }
 
+    /// The keyspace selects the TABLE; the graph selects the PARTITION. They are
+    /// different values and a plan must keep them apart.
+    ///
+    /// This case previously read `plan_uses_keyspace_as_graph` and asserted
+    /// `graph == "my_tenant"` -- the keyspace. That was the bound-subject bug
+    /// written down as an expectation, and it is why the bug survived: the
+    /// writer takes the graph from the SPARQL graph name ("default"), so a plan
+    /// binding the keyspace instead produced a point read for a partition key
+    /// that was never written.
     #[test]
-    fn plan_uses_keyspace_as_graph() {
+    fn plan_separates_keyspace_from_graph() {
         let query = spargebra::SparqlParser::new()
             .parse_query("SELECT ?p ?o WHERE { <http://example.org/alice> ?p ?o }")
             .unwrap();
-        let plan = plan_query(&query, "my_tenant").unwrap();
+        let scope = TripleScope::new("my_tenant", "default");
+        let plan = plan_query(&query, &scope).unwrap();
         match &plan.ops[0].1 {
-            TripleOp::SubjectLookup { graph, .. } => {
-                assert_eq!(graph, "my_tenant", "graph must match supplied keyspace");
+            TripleOp::SubjectLookup { scope, .. } => {
+                assert_eq!(
+                    scope.keyspace, "my_tenant",
+                    "the keyspace must be carried through -- it names the table"
+                );
+                assert_eq!(
+                    scope.graph, "default",
+                    "the graph must come from the SPARQL graph name, not the keyspace"
+                );
             }
             other => panic!("expected SubjectLookup, got {other:?}"),
         }
@@ -737,7 +719,7 @@ mod tests {
                 "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows>+ ?o }",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert_eq!(plan.ops.len(), 1);
         assert!(
             matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
@@ -753,7 +735,7 @@ mod tests {
                 "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows>* ?o }",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert!(
             matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
             "ZeroOrMore path must produce PropertyPath op"
@@ -768,7 +750,7 @@ mod tests {
                 "SELECT ?o WHERE { <http://example.org/alice> <http://xmlns.com/foaf/0.1/knows> ?o }",
             )
             .unwrap();
-        let plan = plan_query(&query, "default").unwrap();
+        let plan = plan_query(&query, &TripleScope::new("default", "default")).unwrap();
         assert!(
             !matches!(plan.ops[0].1, TripleOp::PropertyPath { .. }),
             "simple BGP should not produce PropertyPath op"

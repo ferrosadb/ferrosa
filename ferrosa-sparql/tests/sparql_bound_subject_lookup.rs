@@ -27,13 +27,15 @@ use ferrosa_storage::{
 };
 use tempfile::TempDir;
 
-// "default" so the partition-key graph component written by INSERT DATA
-// (DefaultGraph -> "default") matches what the SELECT executor binds against.
-// The neighbouring pattern-delete suite makes the same choice, and its comment
-// records why: the keyspace/graph coupling otherwise gets in the way. Keeping
-// that out of scope here is deliberate -- this suite is about the ACCESS PATH,
-// and a keyspace mismatch would make all three fail together and prove nothing.
-const KS: &str = "default";
+// "rdf" -- the keyspace the HTTP surface actually defaults to, and the value
+// that made every one of these fail before the keyspace/graph split.
+//
+// Using "default" here would hide the bug entirely: with keyspace == graph the
+// reader and writer happen to agree, which is exactly why the neighbouring
+// pattern-delete suite (which pins "default" and says the coupling otherwise
+// "gets in the way") never caught it. Testing the value real callers use is the
+// whole point.
+const KS: &str = "rdf";
 
 fn setup() -> (Arc<StorageEngine>, Arc<WritePath>, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -68,11 +70,14 @@ fn setup() -> (Arc<StorageEngine>, Arc<WritePath>, TempDir) {
 }
 
 fn engine(storage: Arc<StorageEngine>, write_path: Arc<WritePath>) -> SparqlEngine {
-    let config = SparqlConfig {
-        default_graph: KS.to_string(),
-        ..Default::default()
-    };
-    SparqlEngine::new(storage, write_path, config)
+    // The DEFAULT config, deliberately: default_graph stays "default" while the
+    // keyspace is "rdf". That is the production shape -- SparqlConfig::default()
+    // sets "default", and http.rs defaults the keyspace to "rdf".
+    //
+    // Tying default_graph to the keyspace (as the neighbouring suites do) makes
+    // reader and writer agree by accident and hides the very bug this file
+    // exists for.
+    SparqlEngine::new(storage, write_path, SparqlConfig::default())
 }
 
 async fn select_count(eng: &SparqlEngine, query: &str) -> usize {
