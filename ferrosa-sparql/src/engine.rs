@@ -308,7 +308,12 @@ impl SparqlEngine {
         // Ensure rdf_triples table exists for this keyspace.
         self.ensure_table_registered(graph);
 
-        let plan = planner::plan_query(&query, graph)?;
+        // The keyspace names the TABLE; the default graph names the PARTITION.
+        // These were one value until this fix, and that conflation meant a
+        // bound-subject point read looked under ("<keyspace>", subject) for a
+        // row the writer had stored under ("default", subject).
+        let scope = planner::TripleScope::new(graph, &self.config.default_graph);
+        let plan = planner::plan_query(&query, &scope)?;
 
         // 3. Execute plan against storage.
         let results = crate::executor::execute(&plan, &self.write_path, &self.limits).await?;
@@ -433,11 +438,11 @@ async fn build_graph_result(
                     object: TermPattern::Variable(spargebra::term::Variable::new_unchecked("__o")),
                 };
                 let op = TripleOp::SubjectLookup {
-                    graph: plan.ops.first().map_or_else(
-                        || "__default".to_string(),
+                    scope: plan.ops.first().map_or_else(
+                        || planner::TripleScope::new("__default", "__default"),
                         |(_, o)| match o {
-                            TripleOp::SubjectLookup { graph, .. } => graph.clone(),
-                            _ => "__default".to_string(),
+                            TripleOp::SubjectLookup { scope, .. } => scope.clone(),
+                            _ => planner::TripleScope::new("__default", "__default"),
                         },
                     ),
                     subject: iri.clone(),
@@ -477,7 +482,7 @@ async fn build_graph_result(
             Ok(triples)
         }
 
-        GraphQueryMode::Describe(graph) => {
+        GraphQueryMode::Describe(scope) => {
             // DESCRIBE: collect all triples about every subject bound by the
             // WHERE clause (or the directly described IRI if no WHERE clause
             // was supplied by spargebra).
@@ -510,7 +515,7 @@ async fn build_graph_result(
                     object: TermPattern::Variable(spargebra::term::Variable::new_unchecked("__o")),
                 };
                 let op = TripleOp::SubjectLookup {
-                    graph: graph.clone(),
+                    scope: scope.clone(),
                     subject: subject_iri.clone(),
                     predicate_filter: None,
                 };

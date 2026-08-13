@@ -32,7 +32,7 @@ use ferrosa_sstable::types::{Partition, Row};
 use futures::StreamExt;
 
 use crate::error::SparqlError;
-use crate::planner::{QueryPlan, TripleOp};
+use crate::planner::{QueryPlan, TripleOp, TripleScope};
 use crate::results::{Binding, SparqlJsonResults};
 use crate::triple_store;
 
@@ -167,13 +167,13 @@ async fn evaluate_triple_patterns(
     for (tp, op) in &plan.ops {
         let new_bindings = match op {
             TripleOp::PropertyPath {
-                graph,
+                scope,
                 subject,
                 path,
                 object,
             } => {
                 evaluate_path_op(
-                    graph,
+                    scope,
                     subject,
                     path,
                     object,
@@ -226,7 +226,7 @@ fn scan_budget(plan: &QueryPlan) -> Option<usize> {
 
 /// Evaluate a property path op via BFS traversal.
 async fn evaluate_path_op(
-    graph: &str,
+    scope: &TripleScope,
     subject: &spargebra::term::TermPattern,
     path: &spargebra::algebra::PropertyPathExpression,
     object: &spargebra::term::TermPattern,
@@ -235,7 +235,7 @@ async fn evaluate_path_op(
     limits: &ExecutionLimits,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
     let results = crate::property_path::evaluate_property_path(
-        subject, path, object, graph, write_path, limits,
+        subject, path, object, scope, write_path, limits,
     )
     .await?;
     let path_bindings = crate::property_path::path_results_to_bindings(subject, object, &results);
@@ -509,13 +509,16 @@ const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
 
 /// The graph a storage-backed op reads from. `None` for `PropertyPath`, which
 /// is evaluated by [`evaluate_path_op`] and never reaches the scan.
-fn op_graph(op: &TripleOp) -> Option<&str> {
+fn op_scope(op: &TripleOp) -> Option<&TripleScope> {
     match op {
         // BUG-S2 fix: use the graph from the execution plan, not hardcoded "rdf".
-        TripleOp::SubjectLookup { graph, .. }
-        | TripleOp::PredicateScan { graph, .. }
-        | TripleOp::ObjectScan { graph, .. }
-        | TripleOp::FullScan { graph, .. } => Some(graph.as_str()),
+        // The scope carries the keyspace (which table) and the graph (which
+        // partition) separately; collapsing them into one value was the
+        // bound-subject-returns-nothing bug.
+        TripleOp::SubjectLookup { scope, .. }
+        | TripleOp::PredicateScan { scope, .. }
+        | TripleOp::ObjectScan { scope, .. }
+        | TripleOp::FullScan { scope, .. } => Some(scope),
         TripleOp::PropertyPath { .. } => None,
     }
 }
@@ -526,7 +529,9 @@ fn describe_op(op: &TripleOp) -> String {
         TripleOp::SubjectLookup { subject, .. } => format!("a subject lookup of <{subject}>"),
         TripleOp::PredicateScan { predicate, .. } => format!("a scan for predicate <{predicate}>"),
         TripleOp::ObjectScan { object, .. } => format!("a scan for object '{object}'"),
-        TripleOp::FullScan { graph } => format!("a full scan of graph '{graph}'"),
+        TripleOp::FullScan { scope } => {
+            format!("a full scan of graph '{}'", scope.graph)
+        }
         TripleOp::PropertyPath { .. } => "a property path".to_string(),
     }
 }
@@ -594,10 +599,13 @@ async fn for_each_triple<F>(
 where
     F: FnMut(FetchedTriple) -> Result<ControlFlow<()>, SparqlError>,
 {
-    let Some(graph) = op_graph(op) else {
+    let Some(scope) = op_scope(op) else {
         return Ok(());
     };
-    let table_id = triple_store::triples_table_id(graph);
+    // The TABLE is named by the keyspace; the partition key is (GRAPH, subject).
+    // These were the same value until this fix, which is why a point read
+    // missed rows a scan of the same table found.
+    let table_id = triple_store::triples_table_id(&scope.keyspace);
     let mut scan = Scan {
         op,
         limits,
@@ -608,7 +616,7 @@ where
     match op {
         TripleOp::SubjectLookup { subject, .. } => {
             // Point read: bounded by one partition's row count by construction.
-            let key = triple_store::partition_key(graph, subject);
+            let key = triple_store::partition_key(&scope.graph, subject);
             if let Some(partition) = write_path.read(&table_id, &key).await? {
                 // Exactly one partition: `Break` and `Continue` are equivalent
                 // here because there is nothing left to feed either way.
@@ -1094,7 +1102,7 @@ mod tests {
     #[test]
     fn predicate_scan_filters_by_predicate() {
         let op = TripleOp::PredicateScan {
-            graph: "default".into(),
+            scope: TripleScope::new("default", "default"),
             predicate: "http://foaf/name".into(),
         };
         assert!(triple_matches_op(
@@ -1110,7 +1118,7 @@ mod tests {
     #[test]
     fn object_scan_filters_by_object() {
         let op = TripleOp::ObjectScan {
-            graph: "default".into(),
+            scope: TripleScope::new("default", "default"),
             object: "Bob".into(),
         };
         assert!(!triple_matches_op(
@@ -1126,7 +1134,7 @@ mod tests {
     #[test]
     fn subject_lookup_filters_by_predicate_filter() {
         let op = TripleOp::SubjectLookup {
-            graph: "default".into(),
+            scope: TripleScope::new("default", "default"),
             subject: "s1".into(),
             predicate_filter: Some("http://foaf/name".into()),
         };
@@ -1143,7 +1151,7 @@ mod tests {
     #[test]
     fn full_scan_matches_every_triple() {
         let op = TripleOp::FullScan {
-            graph: "default".into(),
+            scope: TripleScope::new("default", "default"),
         };
         assert!(triple_matches_op(
             &op,

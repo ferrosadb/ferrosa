@@ -303,7 +303,11 @@ async fn exec_delete_insert(
         check_quad_graph_pattern(&tmpl.graph_name, keyspace, "INSERT")?;
     }
 
-    let plan = crate::planner::plan_where(pattern, keyspace)?;
+    // Same split as the read path: the keyspace names the table, the SPARQL
+    // default graph names the partition. Passing the keyspace as both is what
+    // made a bound-subject read miss rows this very function had written.
+    let scope = crate::planner::TripleScope::new(keyspace, "default");
+    let plan = crate::planner::plan_where(pattern, &scope)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
     let mut deleted = 0usize;
@@ -363,7 +367,8 @@ async fn exec_clear(
     let scan = spargebra::SparqlParser::new()
         .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
         .map_err(|e| SparqlError::Parse(format!("{e}")))?;
-    let plan = crate::planner::plan_query(&scan, keyspace)?;
+    let scope = crate::planner::TripleScope::new(keyspace, "default");
+    let plan = crate::planner::plan_query(&scan, &scope)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
     let mut deleted = 0usize;

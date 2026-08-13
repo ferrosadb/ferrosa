@@ -166,7 +166,11 @@ fn plan(query: &str) -> QueryPlan {
     let parsed = spargebra::SparqlParser::new()
         .parse_query(query)
         .expect("query must parse");
-    planner::plan_query(&parsed, KS).expect("query must plan")
+    // The scope carries the keyspace (which table) and the graph (which partition)
+    // separately. Passing one value for both was the bound-subject bug; these
+    // suites keep them equal because that is what their fixtures write.
+    let scope = planner::TripleScope::new(KS, KS);
+    planner::plan_query(&parsed, &scope).expect("query must plan")
 }
 
 /// Bound values of `var` across rows, in result order.

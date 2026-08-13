@@ -27,7 +27,7 @@ pub async fn evaluate_property_path(
     subject: &TermPattern,
     path: &PropertyPathExpression,
     object: &TermPattern,
-    graph: &str,
+    scope: &crate::planner::TripleScope,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
@@ -37,25 +37,25 @@ pub async fn evaluate_property_path(
                 subject,
                 predicate.as_str(),
                 object,
-                graph,
+                scope,
                 write_path,
                 limits,
             )
             .await
         }
         PropertyPathExpression::OneOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, write_path, limits, false).await
+            evaluate_closure(subject, inner, object, scope, write_path, limits, false).await
         }
         PropertyPathExpression::ZeroOrMore(inner) => {
-            evaluate_closure(subject, inner, object, graph, write_path, limits, true).await
+            evaluate_closure(subject, inner, object, scope, write_path, limits, true).await
         }
         PropertyPathExpression::ZeroOrOne(inner) => {
-            evaluate_zero_or_one(subject, inner, object, graph, write_path, limits).await
+            evaluate_zero_or_one(subject, inner, object, scope, write_path, limits).await
         }
         PropertyPathExpression::Reverse(inner) => {
             // Swap subject and object, evaluate, then swap results back.
             let results = Box::pin(evaluate_property_path(
-                object, inner, subject, graph, write_path, limits,
+                object, inner, subject, scope, write_path, limits,
             ))
             .await?;
             Ok(results.into_iter().map(|(s, o)| (o, s)).collect())
@@ -71,11 +71,11 @@ async fn evaluate_single_hop(
     subject: &TermPattern,
     predicate: &str,
     object: &TermPattern,
-    graph: &str,
+    scope: &crate::planner::TripleScope,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
-    let triples = fetch_triples_for_predicate(graph, predicate, write_path, limits).await?;
+    let triples = fetch_triples_for_predicate(scope, predicate, write_path, limits).await?;
     filter_by_endpoints(subject, object, &triples)
 }
 
@@ -87,13 +87,13 @@ async fn evaluate_closure(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
-    graph: &str,
+    scope: &crate::planner::TripleScope,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
     include_start: bool,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path, limits).await?;
+    let adjacency = fetch_triples_for_predicate(scope, &predicate, write_path, limits).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -110,12 +110,12 @@ async fn evaluate_zero_or_one(
     subject: &TermPattern,
     inner: &PropertyPathExpression,
     object: &TermPattern,
-    graph: &str,
+    scope: &crate::planner::TripleScope,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<PathResult, SparqlError> {
     let predicate = extract_single_predicate(inner)?;
-    let adjacency = fetch_triples_for_predicate(graph, &predicate, write_path, limits).await?;
+    let adjacency = fetch_triples_for_predicate(scope, &predicate, write_path, limits).await?;
     let starts = collect_start_nodes(subject, &adjacency);
 
     let mut results = Vec::new();
@@ -192,12 +192,12 @@ fn extract_single_predicate(path: &PropertyPathExpression) -> Result<String, Spa
 /// crossing the bound is a loud error, never a silent partial traversal (a
 /// partial adjacency would produce a wrong answer that looks complete).
 async fn fetch_triples_for_predicate(
-    graph: &str,
+    scope: &crate::planner::TripleScope,
     predicate: &str,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<Vec<(String, String)>, SparqlError> {
-    let table_id = triple_store::triples_table_id(graph);
+    let table_id = triple_store::triples_table_id(&scope.keyspace);
     let mut partitions = write_path.range_read_stream_all(&table_id, 0).await?;
 
     let mut pairs = Vec::new();
