@@ -56,6 +56,7 @@ The sequence is strict because later steps consume the handles produced earlier
 cluster view, the `SharedState` before the CQL/Flight servers). See
 [specs/data-flow.md](specs/data-flow.md) for the full diagram.
 
+0. **CLI meta flags** — `--version`/`-V` and `--help`/`-h` print one line (`ferrosa <semver>`) and exit *before* tracing or config, so the output is parseable rather than interleaved with startup logs. Any other argument falls through to normal startup, so existing wrappers that pass extra flags are unaffected. Previously these flags were ignored and the **daemon started**, which meant anything probing the binary for its version silently launched a database.
 1. **Tracing** — non-blocking writer (`tracing-appender`); optional OTel layer when `FERROSA_TELEMETRY_ENABLED=true` (`--features otel`).
 2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); file values win over environment values, which win over built-in defaults.
 3. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
