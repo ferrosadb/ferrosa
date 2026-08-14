@@ -808,8 +808,65 @@ async fn persist_schema_to_s3(
     }
 }
 
+/// Handle `--version` / `-V` / `--help` / `-h` and report whether we consumed
+/// the invocation.
+///
+/// Returns `true` when the caller should exit without starting the server.
+///
+/// Deliberately hand-rolled rather than pulling clap into the daemon: the
+/// daemon takes no other arguments (it is configured entirely by
+/// `FERROSA_CONFIG` / env), so a full parser would be more surface than
+/// behaviour. Unrecognised arguments are intentionally NOT rejected here, to
+/// avoid breaking any existing wrapper that passes extra flags.
+fn handle_cli_meta_flags() -> bool {
+    match cli_meta_output(std::env::args().skip(1)) {
+        Some(output) => {
+            println!("{output}");
+            true
+        }
+        None => false,
+    }
+}
+
+/// The exact text `--version` / `--help` should print, or `None` to start the
+/// server. Pure so it can be tested without spawning a process.
+fn cli_meta_output(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let version = format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    for arg in args {
+        match arg.as_str() {
+            "--version" | "-V" => return Some(version),
+            "--help" | "-h" => {
+                return Some(format!(
+                    "{version}\n\n\
+The Ferrosa database server. Configuration comes from the TOML file\n\
+named by FERROSA_CONFIG (default /etc/ferrosa/ferrosa.toml) and from\n\
+FERROSA_* environment variables; the server takes no other arguments.\n\n\
+  -V, --version    print the version and exit\n\
+  -h, --help       print this help and exit"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 0. Version/help, before ANYTHING else.
+    //
+    // This must run before tracing is initialised and before any config or
+    // storage work, for two reasons:
+    //   - the output has to be a single clean line a caller can parse, not
+    //     interleaved with startup logs;
+    //   - previously `ferrosa --version` did not print a version at all. The
+    //     flag was simply ignored and the DAEMON STARTED. Anything probing the
+    //     binary for its version silently launched a database instead, which is
+    //     exactly what installers and update checks want to do.
+    if handle_cli_meta_flags() {
+        return Ok(());
+    }
+
     // 1. Initialize tracing.
     //
     // Non-blocking writer: every `tracing::info!` etc. goes through
@@ -2570,6 +2627,55 @@ mod tests {
 
     fn empty_config() -> toml::Value {
         toml::Value::Table(toml::map::Map::new())
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// `--version` previously did NOT print a version: the flag was ignored and
+    /// the daemon started. Anything probing this binary for its version — an
+    /// installer, an update check — silently launched a database instead.
+    #[test]
+    fn version_flag_prints_a_single_parseable_line() {
+        for flag in ["--version", "-V"] {
+            let output = cli_meta_output(args(&[flag]))
+                .unwrap_or_else(|| panic!("{flag} must not fall through to starting the server"));
+            assert_eq!(output.lines().count(), 1, "{flag} output: {output}");
+            assert_eq!(
+                output,
+                format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+            );
+            // "<name> <semver>" is the shape callers parse.
+            let (name, version) = output.split_once(' ').expect("name and version");
+            assert_eq!(name, "ferrosa");
+            assert_eq!(version.split('.').count(), 3, "semver: {version}");
+        }
+    }
+
+    #[test]
+    fn help_flag_reports_the_version_and_exits() {
+        for flag in ["--help", "-h"] {
+            let output = cli_meta_output(args(&[flag])).expect("help must be handled");
+            assert!(output.starts_with("ferrosa "), "{output}");
+            assert!(output.contains("FERROSA_CONFIG"), "{output}");
+        }
+    }
+
+    /// No meta flag means start the server, and unknown flags must not be
+    /// rejected here — existing wrappers pass extra arguments.
+    #[test]
+    fn other_arguments_still_start_the_server() {
+        assert!(cli_meta_output(args(&[])).is_none());
+        assert!(cli_meta_output(args(&["--not-a-flag"])).is_none());
+        assert!(cli_meta_output(args(&["serve", "--foo=bar"])).is_none());
+    }
+
+    /// A meta flag anywhere in the argument list is still honoured.
+    #[test]
+    fn version_flag_is_found_after_other_arguments() {
+        let output = cli_meta_output(args(&["--foo", "--version"])).expect("handled");
+        assert!(output.starts_with("ferrosa "), "{output}");
     }
 
     /// Gap 1: with no auth env vars set and the storage default
