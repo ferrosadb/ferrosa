@@ -206,8 +206,13 @@ pub struct RepairPlan {
     pub a_to_b: Vec<Partition>,
     /// Partitions to stream B → A (A is missing them or has staler content).
     pub b_to_a: Vec<Partition>,
-    /// Partition keys where both sides have identical max timestamps but
-    /// different content digests. Operator must reconcile manually.
+    /// Partitions holding at least one row that had to be settled by comparing
+    /// values at an equal timestamp, rather than by timestamp alone.
+    ///
+    /// Observability, not an unresolved state: those rows are converged like
+    /// any other, using the storage engine's deterministic last-write-wins. A
+    /// non-zero count means writes collided at identical timestamps somewhere,
+    /// which is worth an operator's attention even though repair settled it.
     pub timestamp_ties: Vec<ferrosa_common::DecoratedKey>,
 }
 
@@ -242,17 +247,15 @@ fn newest_partition_timestamp(p: &Partition) -> i64 {
 enum RowVerdict {
     /// Both copies carry identical content — nothing to do.
     Agree,
-    /// A's copy carries cells B lacks, or is newer. Stream A's row to B.
-    TakeA,
-    TakeB,
-    /// Each side holds cells the other lacks and nothing they share
-    /// contradicts. The engine merges rows cell-wise, so streaming both
-    /// directions converges both replicas on the union.
-    TakeBoth,
-    /// Both sides hold the same cell at the same timestamp with different
-    /// values. Last-write-wins is undefined there, so surface it rather than
-    /// silently discard someone's write.
-    Conflict,
+    /// The copies differ. Both replicas are sent the merged row, so both land
+    /// on the same content whichever side ran the diff. `tiebreak` is true when
+    /// the merge had to settle a same-cell, same-timestamp disagreement by the
+    /// deterministic value comparison rather than by timestamp — recorded for
+    /// observability, not because it blocks anything.
+    Merge {
+        merged: Box<ferrosa_sstable::types::Row>,
+        tiebreak: bool,
+    },
 }
 
 /// Newest timestamp anywhere in a single row.
@@ -277,7 +280,7 @@ fn newest_row_timestamp(row: &ferrosa_sstable::types::Row) -> i64 {
 ///
 /// Keying by column alone would treat two elements of a collection as competing
 /// writes and collapse the collection, exactly as
-/// [`ferrosa_storage::merge::merge_rows`] documents.
+/// `ferrosa_storage::merge::merge_rows` documents.
 fn cells_by_column(
     row: &ferrosa_sstable::types::Row,
 ) -> std::collections::BTreeMap<(u16, Option<Vec<u8>>), &ferrosa_common::CellValue> {
@@ -287,73 +290,59 @@ fn cells_by_column(
         .collect()
 }
 
+/// True when both rows hold the same cell at the same timestamp with different
+/// values — the case where "newest wins" does not decide a winner on its own.
+fn has_equal_timestamp_cell_conflict(
+    a: &ferrosa_sstable::types::Row,
+    b: &ferrosa_sstable::types::Row,
+) -> bool {
+    let cells_b = cells_by_column(b);
+    cells_by_column(a).iter().any(|(key, cell_a)| {
+        cells_b.get(key).is_some_and(|cell_b| {
+            cell_a.timestamp == cell_b.timestamp && cell_a.value != cell_b.value
+        })
+    })
+}
+
 /// Decide what to do with one row both replicas hold.
 ///
 /// Reconciliation happens per ROW because that is the granularity the data has.
 /// With `PRIMARY KEY ((tenant_id, session_id), entity_id)` a single partition
 /// holds thousands of unrelated entities, so a verdict reached for the
 /// partition is a verdict imposed on rows that had nothing to do with it.
+///
+/// The merge itself is delegated to `ferrosa_storage::merge::merge_rows`, the
+/// same cell-level last-write-wins the storage engine applies on every read and
+/// compaction. Repair therefore converges replicas on exactly the row the
+/// engine would have produced, and — because that merge is a total order over
+/// `(timestamp, has_value, value_bytes, local_deletion_time)` — every replica
+/// computes the same winner regardless of which side it calls "local".
 fn reconcile_row(a: &ferrosa_sstable::types::Row, b: &ferrosa_sstable::types::Row) -> RowVerdict {
     if row_content_hash(a) == row_content_hash(b) {
         return RowVerdict::Agree;
     }
-
-    let ts_a = newest_row_timestamp(a);
-    let ts_b = newest_row_timestamp(b);
-    if ts_a > ts_b {
-        return RowVerdict::TakeA;
-    }
-    if ts_b > ts_a {
-        return RowVerdict::TakeB;
-    }
-
-    // Equal row timestamps. A row-level tombstone is not something a cell union
-    // reconciles, so a difference there stays a conflict.
-    if a.deletion != b.deletion {
-        return RowVerdict::Conflict;
-    }
-
-    // Otherwise compare the cells themselves. A row holding a strict SUBSET of
-    // the other's cells, agreeing on every cell they share, is NOT a conflict:
-    // taking the superset cannot discard a value the subset side never held.
-    // The empty row marker — a primary key with no cells at all — is the
-    // limiting case, and calling it a conflict is what left a replica
-    // permanently short of rows its peers held in full.
-    let cells_a = cells_by_column(a);
-    let cells_b = cells_by_column(b);
-    let mut a_has_extra = false;
-    for (key, cell_a) in &cells_a {
-        match cells_b.get(key) {
-            None => a_has_extra = true,
-            Some(cell_b) => {
-                if cell_a.value != cell_b.value || cell_a.timestamp != cell_b.timestamp {
-                    return RowVerdict::Conflict;
-                }
-            }
-        }
-    }
-    let b_has_extra = cells_b.keys().any(|key| !cells_a.contains_key(key));
-
-    match (a_has_extra, b_has_extra) {
-        (true, false) => RowVerdict::TakeA,
-        (false, true) => RowVerdict::TakeB,
-        (true, true) => RowVerdict::TakeBoth,
-        // Same cells at the same timestamps, yet the rows hashed differently —
-        // liveness or some other row state diverged. Do not guess.
-        (false, false) => RowVerdict::Conflict,
+    let tiebreak = newest_row_timestamp(a) == newest_row_timestamp(b)
+        && has_equal_timestamp_cell_conflict(a, b);
+    let merged = ferrosa_storage::merge::merge_rows(a.clone(), b.clone());
+    RowVerdict::Merge {
+        merged: Box::new(merged),
+        tiebreak,
     }
 }
 
 /// The rows each replica is missing, and whether anything was genuinely
-/// contested.
+/// The rows each replica is missing, and whether any of them needed the
+/// value-comparison tiebreak.
 #[derive(Default)]
 struct PartitionMerge {
     /// Rows to stream A→B.
     to_b: Vec<ferrosa_sstable::types::Row>,
     /// Rows to stream B→A.
     to_a: Vec<ferrosa_sstable::types::Row>,
-    /// At least one row could not be reconciled.
-    conflict: bool,
+    /// At least one row was settled by comparing values at an equal timestamp
+    /// rather than by timestamp alone. Reported as `timestamp_ties` for
+    /// observability — the replicas still converge.
+    tiebreak_used: bool,
 }
 
 /// Reconcile two copies of the same partition, row by row.
@@ -364,11 +353,11 @@ struct PartitionMerge {
 fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     let mut merge = PartitionMerge::default();
 
-    // Partition-level state is not row data. A difference here cannot be
-    // reconciled by a row union, so record it — but keep going, because the
-    // rows below it are still repairable and stranding them is the bug.
+    // Partition-level state is not row data, so a row merge does not reconcile
+    // it. Flag it and keep going: the rows below it are still repairable, and
+    // stranding them because of it is the bug this fixes.
     if a.deletion != b.deletion || a.static_row != b.static_row {
-        merge.conflict = true;
+        merge.tiebreak_used = true;
     }
 
     let rows_b: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = b
@@ -388,13 +377,21 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
             None => merge.to_b.push((*row_a).clone()),
             Some(row_b) => match reconcile_row(row_a, row_b) {
                 RowVerdict::Agree => {}
-                RowVerdict::TakeA => merge.to_b.push((*row_a).clone()),
-                RowVerdict::TakeB => merge.to_a.push((*row_b).clone()),
-                RowVerdict::TakeBoth => {
-                    merge.to_b.push((*row_a).clone());
-                    merge.to_a.push((*row_b).clone());
+                RowVerdict::Merge { merged, tiebreak } => {
+                    // Send the merged row to whichever side does not already
+                    // hold it. Both sides receive identical content, so they
+                    // converge on the same row no matter which one ran the diff.
+                    let merged_hash = row_content_hash(&merged);
+                    if merged_hash != row_content_hash(row_a) {
+                        merge.to_a.push((*merged).clone());
+                    }
+                    if merged_hash != row_content_hash(row_b) {
+                        merge.to_b.push((*merged).clone());
+                    }
+                    if tiebreak {
+                        merge.tiebreak_used = true;
+                    }
                 }
-                RowVerdict::Conflict => merge.conflict = true,
             },
         }
     }
@@ -425,7 +422,7 @@ fn push_merge_into_plan(a: &Partition, b: &Partition, plan: &mut RepairPlan) {
     if !merge.to_a.is_empty() {
         plan.b_to_a.push(partition_with_rows(b, merge.to_a));
     }
-    if merge.conflict {
+    if merge.tiebreak_used {
         plan.timestamp_ties.push(a.key.clone());
     }
 }
@@ -462,13 +459,19 @@ fn row_content_hash(row: &ferrosa_sstable::types::Row) -> u64 {
 /// other side held, and treating any contested row as a partition-level
 /// conflict stranded all its innocent neighbours.
 ///
-/// Per row: a row only one side holds is streamed (no ambiguity); a row both
-/// hold is settled by the newer row timestamp; at equal timestamps a row whose
-/// cells are a subset of the other's loses, because taking the superset cannot
-/// discard a value the subset side never held. Only a cell held by both sides
-/// at the same timestamp with different values is recorded in `timestamp_ties`
-/// and left alone — last-write-wins is undefined there and picking a side
-/// silently would discard someone's write.
+/// Per row: a row only one side holds is streamed. A row both hold is merged
+/// with [`ferrosa_storage::merge::merge_rows`] — the same cell-level
+/// last-write-wins the storage engine applies on every read and compaction —
+/// and the merged row is sent to whichever side does not already hold it.
+/// Because that merge is a total order over
+/// `(timestamp, has_value, value_bytes, local_deletion_time)`, every replica
+/// computes the same winner regardless of which side it calls "local", so the
+/// replicas converge instead of oscillating.
+///
+/// `timestamp_ties` counts rows where the merge had to compare values at an
+/// equal timestamp rather than settle it by timestamp alone. That is
+/// observability, not a blocker: repair converges those rows too, because
+/// leaving them alone left replicas divergent forever while reporting success.
 pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
     use std::collections::HashMap;
     // Key the lookups by raw partition-key bytes — DecoratedKey isn't Hash.
@@ -512,9 +515,10 @@ pub enum RepairDecision {
     /// Partition exists only in / is newer on side B — stream the
     /// owned partition to side A.
     BToA(Partition),
-    /// Both sides have it with the same max timestamp but
-    /// different content. Operator must reconcile manually.
-    /// Caller may record the count for observability.
+    /// At least one row in this partition was settled by comparing values at an
+    /// equal timestamp rather than by timestamp alone. The rows themselves are
+    /// converged via the `AToB`/`BToA` decisions; this is emitted purely so the
+    /// caller can count how often writes collided.
     Tie(ferrosa_common::DecoratedKey),
 }
 
@@ -590,7 +594,7 @@ where
                             if !merge.to_a.is_empty() {
                                 emit(RepairDecision::BToA(partition_with_rows(&b, merge.to_a)))?;
                             }
-                            if merge.conflict {
+                            if merge.tiebreak_used {
                                 emit(RepairDecision::Tie(a.key.clone()))?;
                             }
                         }
@@ -951,8 +955,8 @@ mod tests {
              the same partition is contested: {to_a:?}"
         );
         assert!(
-            !to_a.contains(b"tied".as_slice()),
-            "the genuinely contested row must NOT be picked for A: {to_a:?}"
+            to_a.contains(b"tied".as_slice()),
+            "the contested row now converges by deterministic LWW: {to_a:?}"
         );
         assert!(
             !to_a.contains(b"agreed".as_slice()),
@@ -962,6 +966,79 @@ mod tests {
             plan.timestamp_ties.len(),
             1,
             "the genuine conflict must still be surfaced"
+        );
+    }
+
+    /// Both replicas must land on the SAME row after a tie, or repair oscillates.
+    ///
+    /// Leaving equal-timestamp conflicts alone left replicas divergent forever
+    /// while repair reported success. Converging them is only safe if every node
+    /// picks the same winner, so the merge must not depend on which side is
+    /// "local" -- otherwise each node keeps its own copy and repair never
+    /// converges no matter how often it runs.
+    #[test]
+    fn an_equal_timestamp_conflict_converges_both_replicas_on_one_row() {
+        let a = vec![multi_row_partition(b"k1", vec![row_at(b"c", b"left", 500)])];
+        let b = vec![multi_row_partition(
+            b"k1",
+            vec![row_at(b"c", b"right", 500)],
+        )];
+
+        let plan = diff_partition_sets(&a, &b);
+
+        let to_a: Vec<_> = plan.b_to_a.iter().flat_map(|p| p.rows.iter()).collect();
+        let to_b: Vec<_> = plan.a_to_b.iter().flat_map(|p| p.rows.iter()).collect();
+
+        // Exactly one side is short: the winner already sits on the other, and
+        // re-sending it there would be pure write amplification.
+        assert_eq!(
+            to_a.len() + to_b.len(),
+            1,
+            "only the losing replica needs the row"
+        );
+        let (streamed, already_held) = if to_a.len() == 1 {
+            (to_a[0], &b[0].rows[0])
+        } else {
+            (to_b[0], &a[0].rows[0])
+        };
+        assert_eq!(
+            row_content_hash(streamed),
+            row_content_hash(already_held),
+            "the streamed row must equal what the other replica already holds — \
+             that is what convergence means"
+        );
+        assert_eq!(plan.timestamp_ties.len(), 1, "the tie is still counted");
+    }
+
+    /// The deterministic winner must not depend on argument order.
+    ///
+    /// Each node runs the diff with ITSELF as one side. If the merge favoured
+    /// the left argument, every node would pick its own copy and repair would
+    /// never converge.
+    #[test]
+    fn the_equal_timestamp_winner_is_the_same_from_either_side() {
+        let left = multi_row_partition(b"k1", vec![row_at(b"c", b"left", 500)]);
+        let right = multi_row_partition(b"k1", vec![row_at(b"c", b"right", 500)]);
+
+        let forward =
+            diff_partition_sets(std::slice::from_ref(&left), std::slice::from_ref(&right));
+        let reverse =
+            diff_partition_sets(std::slice::from_ref(&right), std::slice::from_ref(&left));
+
+        let winner = |plan: &RepairPlan| -> u64 {
+            let row = plan
+                .a_to_b
+                .iter()
+                .chain(plan.b_to_a.iter())
+                .flat_map(|p| p.rows.iter())
+                .next()
+                .expect("a tie must produce a winning row");
+            row_content_hash(row)
+        };
+        assert_eq!(
+            winner(&forward),
+            winner(&reverse),
+            "the winner must be independent of which replica ran the diff"
         );
     }
 
@@ -1085,7 +1162,7 @@ mod tests {
             stream_to_a.contains(b"only-b".as_slice()) && stream_to_a.contains(b"shell".as_slice()),
             "the production path must repair the missing and shell rows: {stream_to_a:?}"
         );
-        assert_eq!(ties, 1, "only the genuinely contested row is a tie");
+        assert_eq!(ties, 1, "only the contested row is counted as a tie");
     }
 
     // ---- RepairSession::diff_partition_sets contracts ----
@@ -1289,7 +1366,8 @@ mod tests {
             static_row: None,
             rows,
         };
-        // Same clustering, same timestamp, different value: nobody wins.
+        // Same clustering, same timestamp, different value: the timestamp alone
+        // does not pick a winner.
         let a = vec![part(vec![row(b"left", 500)])];
         let b = vec![part(vec![row(b"right", 500)])];
 
@@ -1299,11 +1377,14 @@ mod tests {
             1,
             "a genuine conflict must surface"
         );
-        assert!(
-            plan.a_to_b.is_empty(),
-            "and must not be streamed either way"
-        );
-        assert!(plan.b_to_a.is_empty());
+        // Superseded semantics: this used to assert the row was streamed
+        // NOWHERE, which left the replicas divergent forever while repair
+        // reported success. Repair now settles it with the same deterministic
+        // last-write-wins the storage engine applies on every read, so the
+        // replicas converge and the counter becomes observability rather than
+        // an unresolved state.
+        let streamed = plan.a_to_b.len() + plan.b_to_a.len();
+        assert_eq!(streamed, 1, "the losing replica must receive the winner");
     }
 
     /// A difference in partition-level state is not something a row-set union
@@ -1344,14 +1425,21 @@ mod tests {
     }
 
     #[test]
-    fn diff_partition_sets_equal_timestamp_different_content_is_a_tie() {
+    fn diff_partition_sets_equal_timestamp_different_content_converges_and_is_counted() {
+        // Semantics changed deliberately: repair now converges equal-timestamp
+        // cell conflicts by the same deterministic last-write-wins rule the
+        // storage engine already applies, rather than leaving the replicas
+        // divergent forever. The tie is still COUNTED, so the operator keeps the
+        // signal without paying permanent divergence for it.
         let a = vec![test_partition(b"k1", b"left", 500)];
         let b = vec![test_partition(b"k1", b"right", 500)];
         let plan = diff_partition_sets(&a, &b);
-        assert!(plan.a_to_b.is_empty(), "ties must not be streamed");
-        assert!(plan.b_to_a.is_empty(), "ties must not be streamed");
-        assert_eq!(plan.timestamp_ties.len(), 1);
+        assert_eq!(plan.timestamp_ties.len(), 1, "the tie is still reported");
         assert_eq!(plan.timestamp_ties[0].key.as_bytes(), b"k1");
+        assert!(
+            !plan.a_to_b.is_empty() || !plan.b_to_a.is_empty(),
+            "a tie must now converge the replicas instead of being a no-op"
+        );
     }
 
     #[test]

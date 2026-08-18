@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_executor_records_timestamp_ties_without_streaming() {
+    async fn local_executor_converges_a_timestamp_tie_and_still_counts_it() {
         let a = Arc::new(InMemoryRepairStore::new());
         let b = Arc::new(InMemoryRepairStore::new());
         a.insert(test_partition_at(100_000_000, b"k", b"a-value", 500))
@@ -864,15 +864,24 @@ mod tests {
             .run_session(&TableId::new("ks", "tbl"), i64::MIN, i64::MAX, 7)
             .await
             .unwrap();
-        assert_eq!(stats.timestamp_ties, 1);
-        assert_eq!(stats.partitions_streamed_out, 0);
-        assert_eq!(stats.partitions_streamed_in, 0);
+        assert_eq!(stats.timestamp_ties, 1, "the tie is still reported");
+        assert_eq!(
+            stats.partitions_streamed_out + stats.partitions_streamed_in,
+            1,
+            "the losing replica must receive the winner"
+        );
 
-        // Both sides keep their original (now-known-divergent) values.
+        // Superseded semantics: this used to assert both sides KEPT their
+        // divergent values and nothing streamed, which is repair declining to
+        // do its job — the replicas stayed split forever while the session
+        // reported success. Repair now settles the tie with the storage
+        // engine's own cell-level last-write-wins, so the two converge.
         let a_val = value_for_key(&a.snapshot().await, b"k").unwrap().to_vec();
         let b_val = value_for_key(&b.snapshot().await, b"k").unwrap().to_vec();
-        assert_eq!(a_val, b"a-value");
-        assert_eq!(b_val, b"b-value");
+        assert_eq!(a_val, b_val, "the replicas must converge");
+        // And on the deterministic winner: at equal timestamps the larger value
+        // bytes win, so every replica computes the same answer independently.
+        assert_eq!(a_val, b"b-value");
     }
 }
 
