@@ -671,10 +671,28 @@ impl FerrosStateMachine {
             }
         }
 
-        // Re-register all tables with engine if present.
+        // Land every table's schema on the engine if present.
+        //
+        // `register_table` early-returns for a table the engine already knows
+        // and DISCARDS the incoming schema, so it can introduce a table but
+        // never correct one. A node whose engine holds a stale column set —
+        // from an older schema.json, or from missing an ALTER — would then keep
+        // serving it forever while its own Raft state carried the right one,
+        // and since regular columns are ordered alphabetically, a single
+        // missing column shifts every later ordinal and makes cross-node row
+        // transfers decode against the wrong types.
+        //
+        // The ALTER apply path already uses `update_table_schema`; use it here
+        // too so both paths land a schema the same way.
         if let Some(engine) = &self.engine {
             for table in self.state.tables.values() {
-                if let Err(e) = engine.register_table(table.to_storage_schema()) {
+                let schema = table.to_storage_schema();
+                let table_id = TableId::new(&schema.keyspace, &schema.table);
+                if engine.table_schema(&table_id).is_some() {
+                    if let Err(e) = engine.update_table_schema(&table_id, schema) {
+                        tracing::error!(%e, %context, %table_id, "update_table_schema failed — node may serve a schema its Raft state contradicts");
+                    }
+                } else if let Err(e) = engine.register_table(schema) {
                     tracing::error!(%e, %context, "register_table failed");
                 }
             }
@@ -2684,6 +2702,85 @@ mod tests {
         engine
             .write(&table_id, &key, row, 1)
             .expect("recovered Raft snapshot must also register the table with StorageEngine");
+    }
+
+    /// REGRESSION: a Raft snapshot must be able to CORRECT the columns of a
+    /// table the engine has already registered, not just introduce new tables.
+    ///
+    /// `sync_schema_and_engine_from_state` landed schema with
+    /// `engine.register_table`, which early-returns when the table is already
+    /// registered and discards the incoming schema. The ALTER apply path calls
+    /// `engine.update_table_schema` instead, so the two paths disagreed about
+    /// how to land a schema: a node whose engine held a stale column set could
+    /// never recover it, no matter how many snapshots it installed.
+    ///
+    /// Observed on the native 3-node cluster: node3 served 11 columns for
+    /// agent_memory.entity_store while its own Raft state machine carried the
+    /// full 19. Regular columns are ordered alphabetically, so the missing
+    /// columns shifted every later ordinal and repair rejected the transfer —
+    /// `column "created_at", index 3: TimestampType expects 8 raw bytes but
+    /// value provided 3072` (3072 = vector<float,768>, the column that actually
+    /// sits at index 3 in the stale ordering). It survived restarts, a snapshot
+    /// install and a full raft reset.
+    #[tokio::test]
+    async fn recovering_a_snapshot_corrects_an_already_registered_stale_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("sm.snapshot");
+
+        // Source node: a table carrying an EXTRA column, snapshotted.
+        let mut source = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        let mut extended = simple_table("agent_memory", "entity_store");
+        extended.columns.insert(
+            "description".to_string(),
+            ColumnMetadata {
+                name: "description".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        let extended_columns = extended.to_storage_schema().regular_columns.len();
+        source
+            .apply(vec![make_entry(
+                1,
+                1,
+                RaftOp::CreateTable(Box::new(extended)),
+            )])
+            .await
+            .unwrap();
+        source.build_snapshot().await.unwrap();
+
+        // Recovering node: engine ALREADY holds the table, with the stale
+        // (pre-ALTER) column set — the situation node3 was stuck in.
+        let engine = test_engine(dir.path());
+        let stale = simple_table("agent_memory", "entity_store").to_storage_schema();
+        let stale_columns = stale.regular_columns.len();
+        engine.register_table(stale).unwrap();
+        assert!(
+            stale_columns < extended_columns,
+            "the test must start with the engine holding FEWER columns"
+        );
+
+        let table_id = TableId::new("agent_memory", "entity_store");
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::new(test_schema_instance()),
+            Arc::clone(&engine),
+            snapshot_path,
+        );
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+
+        assert_eq!(
+            engine
+                .table_schema(&table_id)
+                .expect("table registered")
+                .regular_columns
+                .len(),
+            extended_columns,
+            "the snapshot's column set must reach the engine, or the node serves \
+             a schema its own Raft state contradicts"
+        );
     }
 
     #[tokio::test]

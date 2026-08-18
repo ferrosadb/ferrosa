@@ -930,7 +930,6 @@ pub struct StorageEngine {
 
 /// Per-table state: schema + store + optional NVMe pin config.
 struct TableState {
-    #[allow(dead_code)]
     schema: TableSchema,
     store: TableStore<FileFlushTarget>,
     /// When `Some`, this table is pinned to NVMe. S3 upload is skipped for
@@ -5460,6 +5459,17 @@ impl StorageEngine {
     /// Number of tables currently registered.
     pub fn table_count(&self) -> usize {
         self.tables.read().len()
+    }
+
+    /// The schema currently registered for `table_id`, if the table is known.
+    ///
+    /// Exists so callers can verify which column set the engine is actually
+    /// serving. A node can hold a schema in its Raft state while the engine
+    /// serves an older one, and without a way to read the engine's own view
+    /// that divergence is invisible until a cross-node row transfer decodes
+    /// against the wrong ordinals.
+    pub fn table_schema(&self, table_id: &TableId) -> Option<TableSchema> {
+        self.tables.read().get(table_id).map(|s| s.schema.clone())
     }
 
     /// The `TableId`s currently registered with this engine. Used by the
