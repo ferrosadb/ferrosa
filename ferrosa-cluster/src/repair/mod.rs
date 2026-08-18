@@ -237,6 +237,89 @@ fn newest_partition_timestamp(p: &Partition) -> i64 {
     ts
 }
 
+/// How an equal-max-timestamp divergence between two copies of a partition
+/// should be resolved.
+#[derive(Debug, PartialEq, Eq)]
+enum EqualTimestampVerdict {
+    /// One side holds every row the other does, plus more, and every shared row
+    /// is identical. The union is the only sensible answer.
+    StreamAToB,
+    StreamBToA,
+    /// Each side holds rows the other lacks, and everything shared agrees.
+    /// Streaming both ways converges both replicas on the union.
+    StreamBothWays,
+    /// A row exists on both sides with the same timestamp and different
+    /// content, or the partition-level state differs. Last-write-wins is
+    /// undefined here, so surface it rather than pick a side.
+    Conflict,
+}
+
+/// Decide what to do when two copies of a partition share a max timestamp but
+/// hash differently.
+///
+/// The max timestamp is a partition-wide maximum, so it says nothing about rows
+/// BELOW it. A replica can be missing whole rows while its newest surviving cell
+/// matches the other side, and comparing only the maximum classifies that as an
+/// unresolvable tie. Nothing is then streamed and the replica stays short
+/// forever while repair reports success.
+///
+/// Comparing the row sets separates the two cases that were conflated: a missing
+/// row (no ambiguity — take the union) from a genuine conflicting write (real
+/// ambiguity — surface it).
+fn classify_equal_timestamp(a: &Partition, b: &Partition) -> EqualTimestampVerdict {
+    // Partition-level state is not row data; a difference here is not something
+    // a row-set union can reconcile.
+    if a.deletion != b.deletion || a.static_row != b.static_row {
+        return EqualTimestampVerdict::Conflict;
+    }
+
+    let index = |p: &Partition| -> std::collections::BTreeMap<Vec<u8>, u64> {
+        p.rows
+            .iter()
+            .map(|row| (row.clustering.clone(), row_content_hash(row)))
+            .collect()
+    };
+    let rows_a = index(a);
+    let rows_b = index(b);
+
+    // Any row present on both sides with different content is a real conflict:
+    // two writers disagreed at the same timestamp and neither wins.
+    for (clustering, hash_a) in &rows_a {
+        if let Some(hash_b) = rows_b.get(clustering) {
+            if hash_a != hash_b {
+                return EqualTimestampVerdict::Conflict;
+            }
+        }
+    }
+
+    let a_has_extra = rows_a.keys().any(|k| !rows_b.contains_key(k));
+    let b_has_extra = rows_b.keys().any(|k| !rows_a.contains_key(k));
+    match (a_has_extra, b_has_extra) {
+        (true, false) => EqualTimestampVerdict::StreamAToB,
+        (false, true) => EqualTimestampVerdict::StreamBToA,
+        (true, true) => EqualTimestampVerdict::StreamBothWays,
+        // Shared rows all agree and neither side has extras, yet the partition
+        // hashes differed. Something outside the row set diverged; do not
+        // pretend the union resolves it.
+        (false, false) => EqualTimestampVerdict::Conflict,
+    }
+}
+
+/// Content hash of a single row, for comparing row sets across replicas.
+fn row_content_hash(row: &ferrosa_sstable::types::Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    row.clustering.hash(&mut hasher);
+    for (idx, cell) in &row.cells {
+        idx.hash(&mut hasher);
+        cell.value.hash(&mut hasher);
+        cell.timestamp.hash(&mut hasher);
+    }
+    format!("{:?}", row.deletion).hash(&mut hasher);
+    format!("{:?}", row.primary_key_liveness).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Diff two partition sets known to cover the same token sub-range (typically
 /// the leaves identified as divergent by [`MerkleTree::divergent_leaf_ranges`]).
 ///
@@ -244,10 +327,12 @@ fn newest_partition_timestamp(p: &Partition) -> i64 {
 /// - present on only one side → stream that side's copy to the other.
 /// - present on both with different max timestamps → newer wins, stream to
 ///   the older side.
-/// - present on both with equal max timestamps but different content digests
-///   → record in `timestamp_ties`, do not stream. Last-write-wins with equal
-///   timestamps is undefined under Cassandra's data model; better to surface
-///   the conflict than silently pick a side.
+/// - present on both with equal max timestamps but different content →
+///   the row sets are compared. A replica merely MISSING rows is
+///   repaired by streaming the union; only a row that exists on both sides at
+///   the same timestamp with different content is recorded in `timestamp_ties`
+///   and left alone, because last-write-wins is undefined there and picking a
+///   side silently would discard someone's write.
 /// - present on both with equal max timestamps AND equal content → no-op.
 pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
     use std::collections::HashMap;
@@ -269,7 +354,21 @@ pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
                 } else if ts_b > ts_a {
                     plan.b_to_a.push((*p_b).clone());
                 } else if partition_merkle_hash(p_a) != partition_merkle_hash(p_b) {
-                    plan.timestamp_ties.push(p_a.key.clone());
+                    // Equal max timestamps, different content. That is not
+                    // automatically a conflict: the maximum says nothing about
+                    // rows below it, so a replica missing whole rows lands here
+                    // too. Separate the two before giving up on it.
+                    match classify_equal_timestamp(p_a, p_b) {
+                        EqualTimestampVerdict::StreamAToB => plan.a_to_b.push((*p_a).clone()),
+                        EqualTimestampVerdict::StreamBToA => plan.b_to_a.push((*p_b).clone()),
+                        EqualTimestampVerdict::StreamBothWays => {
+                            plan.a_to_b.push((*p_a).clone());
+                            plan.b_to_a.push((*p_b).clone());
+                        }
+                        EqualTimestampVerdict::Conflict => {
+                            plan.timestamp_ties.push(p_a.key.clone())
+                        }
+                    }
                 }
                 // equal ts + equal hash: no-op.
             }
@@ -713,6 +812,190 @@ mod tests {
             Some(b"new".to_vec())
         );
         assert!(plan.b_to_a.is_empty());
+    }
+
+    /// A partition where one replica simply LACKS rows must be repaired, not
+    /// written off as an unresolvable tie.
+    ///
+    /// Ties are decided on the partition's MAX timestamp. That is too coarse: a
+    /// replica can be missing whole rows while its newest surviving cell shares
+    /// a timestamp with the other side, so the partition is classified as a tie
+    /// and nothing is streamed. The replica then stays short forever while
+    /// repair reports success.
+    ///
+    /// There is no ambiguity to protect here. Every row the thin side holds is
+    /// present and identical on the fat side, so the fat side is a strict
+    /// superset — the union is the only sensible answer, and picking it does not
+    /// require guessing at a last-write-wins order.
+    ///
+    /// Observed on the host cluster 2026-08-17: node1 held 78,494 distinct
+    /// entity ids to node2/node3's 78,499, strictly missing 5 with none unique
+    /// to itself, while repair from all three coordinators reported
+    /// `partitions_streamed_in: 0, out: 0` and `timestamp_ties: 7`.
+    #[test]
+    fn a_strict_subset_partition_is_repaired_rather_than_called_a_tie() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        fn row_at(clustering: &[u8], value: &[u8], ts: i64) -> Row {
+            Row {
+                clustering: clustering.to_vec(),
+                cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }
+        }
+        fn partition_of(rows: Vec<Row>) -> Partition {
+            Partition {
+                key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows,
+            }
+        }
+
+        // Both sides agree on r1 at ts=500 — so both partitions report a max
+        // timestamp of 500. The fat side additionally holds r2, written EARLIER,
+        // which is exactly the shape that hides behind a max-timestamp compare.
+        let thin = vec![partition_of(vec![row_at(b"r1", b"same", 500)])];
+        let fat = vec![partition_of(vec![
+            row_at(b"r1", b"same", 500),
+            row_at(b"r2", b"only-on-fat", 300),
+        ])];
+
+        let plan = diff_partition_sets(&thin, &fat);
+
+        assert!(
+            plan.timestamp_ties.is_empty(),
+            "a strict subset is a missing row, not a conflict: {:?}",
+            plan.timestamp_ties
+        );
+        assert_eq!(
+            plan.b_to_a.len(),
+            1,
+            "the side holding the extra row must be streamed to the side missing it"
+        );
+        assert!(
+            plan.a_to_b.is_empty(),
+            "the thin side has nothing the fat side lacks"
+        );
+
+        // Symmetric: swapping the arguments must reach the same conclusion in
+        // the other direction, or repair depends on which node initiated it.
+        let plan = diff_partition_sets(&fat, &thin);
+        assert!(plan.timestamp_ties.is_empty());
+        assert_eq!(plan.a_to_b.len(), 1);
+        assert!(plan.b_to_a.is_empty());
+    }
+
+    /// Both replicas hold rows the other lacks, and everything shared agrees.
+    /// Streaming both ways converges both on the union; calling it a tie leaves
+    /// both permanently short of different rows.
+    #[test]
+    fn each_side_missing_different_rows_converges_on_the_union() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let row = |clustering: &[u8], value: &[u8], ts: i64| Row {
+            clustering: clustering.to_vec(),
+            cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let part = |rows: Vec<Row>| Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+        let a = vec![part(vec![
+            row(b"shared", b"same", 500),
+            row(b"only-a", b"a", 200),
+        ])];
+        let b = vec![part(vec![
+            row(b"shared", b"same", 500),
+            row(b"only-b", b"b", 200),
+        ])];
+
+        let plan = diff_partition_sets(&a, &b);
+        assert!(
+            plan.timestamp_ties.is_empty(),
+            "disjoint extras are not a conflict"
+        );
+        assert_eq!(plan.a_to_b.len(), 1);
+        assert_eq!(plan.b_to_a.len(), 1);
+    }
+
+    /// A row present on both sides at the same timestamp with DIFFERENT content
+    /// is a real conflict and must still be surfaced, not silently merged.
+    /// This is the case the tie was introduced for, and it must survive.
+    #[test]
+    fn a_conflicting_row_at_the_same_timestamp_is_still_a_tie() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let row = |value: &[u8], ts: i64| Row {
+            clustering: b"same-row".to_vec(),
+            cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let part = |rows: Vec<Row>| Partition {
+            key: DecoratedKey::new(PartitionKey::new(b"k1".to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+        // Same clustering, same timestamp, different value: nobody wins.
+        let a = vec![part(vec![row(b"left", 500)])];
+        let b = vec![part(vec![row(b"right", 500)])];
+
+        let plan = diff_partition_sets(&a, &b);
+        assert_eq!(
+            plan.timestamp_ties.len(),
+            1,
+            "a genuine conflict must surface"
+        );
+        assert!(
+            plan.a_to_b.is_empty(),
+            "and must not be streamed either way"
+        );
+        assert!(plan.b_to_a.is_empty());
+    }
+
+    /// A difference in partition-level state is not something a row-set union
+    /// can reconcile, so it stays a tie even when the row sets nest cleanly.
+    #[test]
+    fn differing_partition_deletion_is_not_resolved_by_a_row_union() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let row = |ts: i64| Row {
+            clustering: b"r".to_vec(),
+            cells: vec![(0, CellValue::live(b"v".to_vec(), ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        let key = DecoratedKey::new(PartitionKey::new(b"k1".to_vec()));
+        let a = vec![Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![row(500)],
+        }];
+        let b = vec![Partition {
+            key,
+            deletion: DeletionTime {
+                marked_for_delete_at: 500,
+                local_deletion_time: 1,
+            },
+            static_row: None,
+            rows: vec![row(500)],
+        }];
+
+        let plan = diff_partition_sets(&a, &b);
+        assert_eq!(
+            plan.timestamp_ties.len(),
+            1,
+            "a partition-level deletion difference must not be papered over"
+        );
     }
 
     #[test]
