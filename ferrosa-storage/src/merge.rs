@@ -191,7 +191,18 @@ pub fn merge_rows(a: Row, b: Row) -> Row {
 /// a write (a cell with a value) beats a tombstone so equal-timestamp data is
 /// preserved; among writes the lexicographically greater value wins; two
 /// tombstones are broken by local deletion time.
-fn cell_supersedes(cand: &ferrosa_common::CellValue, cur: &ferrosa_common::CellValue) -> bool {
+/// Deterministic last-write-wins between two cells for the same
+/// `(column, path)`.
+///
+/// Newest timestamp wins; at equal timestamps the order is
+/// `(has_value, value_bytes, local_deletion_time)`. That is a total order, so
+/// every replica computes the same winner independently — which is what lets
+/// anti-entropy repair decide what to stream without each node preferring its
+/// own copy.
+///
+/// Public so the cluster repair crate can agree with the engine rather than
+/// reimplementing this rule and drifting from it.
+pub fn cell_supersedes(cand: &ferrosa_common::CellValue, cur: &ferrosa_common::CellValue) -> bool {
     if cand.timestamp != cur.timestamp {
         return cand.timestamp > cur.timestamp;
     }

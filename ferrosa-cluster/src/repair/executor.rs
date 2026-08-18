@@ -541,12 +541,41 @@ impl InMemoryRepairStore {
     async fn apply_one(&self, p: Partition) {
         let mut store = self.inner.lock().await;
         if let Some(slot) = store.iter_mut().find(|(k, _)| k == &p.key) {
-            if super::newest_partition_timestamp(&p) >= super::newest_partition_timestamp(&slot.1) {
-                slot.1 = p;
-            }
+            Self::merge_into(&mut slot.1, p);
         } else {
             store.push((p.key.clone(), p));
         }
+    }
+
+    /// Merge an incoming partition into the stored one, row by row.
+    ///
+    /// This models what the real apply path does: `apply_partitions` writes
+    /// each row through `engine.write`, and the engine merges cell-wise on
+    /// read. It previously swapped the whole partition whenever the incoming
+    /// copy had a newer max timestamp, which models nothing the engine does —
+    /// it discarded rows the receiver held and could drop an incoming partition
+    /// entirely. Repair streams only the rows a replica is missing, so a double
+    /// that replaces rather than merges cannot converge on them.
+    fn merge_into(dst: &mut Partition, src: Partition) {
+        if src.deletion.marked_for_delete_at > dst.deletion.marked_for_delete_at {
+            dst.deletion = src.deletion;
+        }
+        dst.static_row = match (dst.static_row.take(), src.static_row) {
+            (Some(d), Some(s)) => Some(ferrosa_storage::merge::merge_rows(d, s)),
+            (Some(d), None) => Some(d),
+            (None, s) => s,
+        };
+        for row in src.rows {
+            match dst.rows.iter().position(|r| r.clustering == row.clustering) {
+                Some(i) => {
+                    let existing = dst.rows.remove(i);
+                    dst.rows
+                        .insert(i, ferrosa_storage::merge::merge_rows(existing, row));
+                }
+                None => dst.rows.push(row),
+            }
+        }
+        dst.rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
     }
 
     /// Snapshot the current contents — used in test assertions.
@@ -845,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_executor_records_timestamp_ties_without_streaming() {
+    async fn local_executor_converges_a_timestamp_tie_and_still_counts_it() {
         let a = Arc::new(InMemoryRepairStore::new());
         let b = Arc::new(InMemoryRepairStore::new());
         a.insert(test_partition_at(100_000_000, b"k", b"a-value", 500))
@@ -864,15 +893,24 @@ mod tests {
             .run_session(&TableId::new("ks", "tbl"), i64::MIN, i64::MAX, 7)
             .await
             .unwrap();
-        assert_eq!(stats.timestamp_ties, 1);
-        assert_eq!(stats.partitions_streamed_out, 0);
-        assert_eq!(stats.partitions_streamed_in, 0);
+        assert_eq!(stats.timestamp_ties, 1, "the tie is still reported");
+        assert_eq!(
+            stats.partitions_streamed_out + stats.partitions_streamed_in,
+            1,
+            "the losing replica must receive the winner"
+        );
 
-        // Both sides keep their original (now-known-divergent) values.
+        // Superseded semantics: this used to assert both sides KEPT their
+        // divergent values and nothing streamed, which is repair declining to
+        // do its job — the replicas stayed split forever while the session
+        // reported success. Repair now settles the tie with the storage
+        // engine's own cell-level last-write-wins, so the two converge.
         let a_val = value_for_key(&a.snapshot().await, b"k").unwrap().to_vec();
         let b_val = value_for_key(&b.snapshot().await, b"k").unwrap().to_vec();
-        assert_eq!(a_val, b"a-value");
-        assert_eq!(b_val, b"b-value");
+        assert_eq!(a_val, b_val, "the replicas must converge");
+        // And on the deterministic winner: at equal timestamps the larger value
+        // bytes win, so every replica computes the same answer independently.
+        assert_eq!(a_val, b"b-value");
     }
 }
 
