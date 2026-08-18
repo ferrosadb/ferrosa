@@ -247,13 +247,12 @@ fn newest_partition_timestamp(p: &Partition) -> i64 {
 enum RowVerdict {
     /// Both copies carry identical content — nothing to do.
     Agree,
-    /// The copies differ. Both replicas are sent the merged row, so both land
-    /// on the same content whichever side ran the diff. `tiebreak` is true when
-    /// the merge had to settle a same-cell, same-timestamp disagreement by the
-    /// deterministic value comparison rather than by timestamp — recorded for
-    /// observability, not because it blocks anything.
-    Merge {
-        merged: Box<ferrosa_sstable::types::Row>,
+    /// Which replicas need the other's copy, and whether settling this row
+    /// required comparing values at an equal timestamp rather than deciding it
+    /// by timestamp alone.
+    Stream {
+        to_a: bool,
+        to_b: bool,
         tiebreak: bool,
     },
 }
@@ -290,6 +289,30 @@ fn cells_by_column(
         .collect()
 }
 
+/// True when `from` carries anything that would change `to` once the engine
+/// merges them — a cell `to` lacks, a cell that supersedes `to`'s, or newer
+/// row-level state.
+///
+/// This is what decides whether a row needs to be streamed. Repair does not
+/// build the merged row itself: the apply path writes row-by-row through the
+/// engine, which merges cell-wise with the same last-write-wins rule. Sending
+/// `from`'s copy therefore lands `merge(from, to)` on the receiver, so asking
+/// "would this change them?" is exactly the right question — and it answers it
+/// without copying either row.
+fn contributes_to(from: &ferrosa_sstable::types::Row, to: &ferrosa_sstable::types::Row) -> bool {
+    if from.deletion.marked_for_delete_at > to.deletion.marked_for_delete_at
+        || from.primary_key_liveness.timestamp > to.primary_key_liveness.timestamp
+    {
+        return true;
+    }
+    let to_cells = cells_by_column(to);
+    cells_by_column(from).iter().any(|(key, cell)| {
+        to_cells
+            .get(key)
+            .is_none_or(|existing| ferrosa_storage::merge::cell_supersedes(cell, existing))
+    })
+}
+
 /// True when both rows hold the same cell at the same timestamp with different
 /// values — the case where "newest wins" does not decide a winner on its own.
 fn has_equal_timestamp_cell_conflict(
@@ -311,26 +334,29 @@ fn has_equal_timestamp_cell_conflict(
 /// holds thousands of unrelated entities, so a verdict reached for the
 /// partition is a verdict imposed on rows that had nothing to do with it.
 ///
-/// The merge itself is delegated to `ferrosa_storage::merge::merge_rows`, the
-/// same cell-level last-write-wins the storage engine applies on every read and
-/// compaction. Repair therefore converges replicas on exactly the row the
-/// engine would have produced, and — because that merge is a total order over
-/// `(timestamp, has_value, value_bytes, local_deletion_time)` — every replica
-/// computes the same winner regardless of which side it calls "local".
+/// Conflicts are settled by the storage engine's own cell-level last-write-wins
+/// (`ferrosa_storage::merge::cell_supersedes`) rather than being left alone.
+/// Because that rule is a total order over
+/// `(timestamp, has_value, value_bytes, local_deletion_time)`, both replicas
+/// arrive at the same row: each applies the copy it receives against its own,
+/// and the merge is commutative. Leaving these rows alone instead left replicas
+/// divergent forever while repair reported success.
 fn reconcile_row(a: &ferrosa_sstable::types::Row, b: &ferrosa_sstable::types::Row) -> RowVerdict {
     if row_content_hash(a) == row_content_hash(b) {
         return RowVerdict::Agree;
     }
     let tiebreak = newest_row_timestamp(a) == newest_row_timestamp(b)
         && has_equal_timestamp_cell_conflict(a, b);
-    let merged = ferrosa_storage::merge::merge_rows(a.clone(), b.clone());
-    RowVerdict::Merge {
-        merged: Box::new(merged),
+    RowVerdict::Stream {
+        // B's copy changes A → A needs it, and vice versa. When each carries
+        // something the other lacks, both are sent and both converge.
+        to_a: contributes_to(b, a),
+        to_b: contributes_to(a, b),
         tiebreak,
     }
 }
 
-/// The rows each replica is missing, and whether anything was genuinely
+/// The rows each replica is missing, and whether any of them needed the
 /// The rows each replica is missing, and whether any of them needed the
 /// value-comparison tiebreak.
 #[derive(Default)]
@@ -377,18 +403,22 @@ fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
             None => merge.to_b.push((*row_a).clone()),
             Some(row_b) => match reconcile_row(row_a, row_b) {
                 RowVerdict::Agree => {}
-                RowVerdict::Merge { merged, tiebreak } => {
-                    // Send the merged row to whichever side does not already
-                    // hold it. Both sides receive identical content, so they
-                    // converge on the same row no matter which one ran the diff.
-                    let merged_hash = row_content_hash(&merged);
-                    if merged_hash != row_content_hash(row_a) {
-                        merge.to_a.push((*merged).clone());
+                RowVerdict::Stream {
+                    to_a,
+                    to_b,
+                    tiebreak,
+                } => {
+                    if to_a {
+                        merge.to_a.push((*row_b).clone());
                     }
-                    if merged_hash != row_content_hash(row_b) {
-                        merge.to_b.push((*merged).clone());
+                    if to_b {
+                        merge.to_b.push((*row_a).clone());
                     }
-                    if tiebreak {
+                    // The rows differ, yet neither carries anything that would
+                    // change the other: row-level state diverged in a way
+                    // cell-merge does not reconcile. Surface it rather than
+                    // leave a silent divergence.
+                    if tiebreak || !(to_a || to_b) {
                         merge.tiebreak_used = true;
                     }
                 }
