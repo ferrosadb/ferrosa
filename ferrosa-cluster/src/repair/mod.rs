@@ -216,32 +216,6 @@ pub struct RepairPlan {
     pub timestamp_ties: Vec<ferrosa_common::DecoratedKey>,
 }
 
-/// Max timestamp across every cell + liveness in a partition, including the
-/// static row. Returns `i64::MIN` for a fully-empty partition.
-fn newest_partition_timestamp(p: &Partition) -> i64 {
-    let mut ts = i64::MIN;
-    let bump = |row: &ferrosa_sstable::types::Row, ts: &mut i64| {
-        if row.primary_key_liveness.timestamp > *ts {
-            *ts = row.primary_key_liveness.timestamp;
-        }
-        for (_, cell) in &row.cells {
-            if cell.timestamp > *ts {
-                *ts = cell.timestamp;
-            }
-        }
-    };
-    if let Some(ref sr) = p.static_row {
-        bump(sr, &mut ts);
-    }
-    for row in &p.rows {
-        bump(row, &mut ts);
-    }
-    if p.deletion.marked_for_delete_at > ts {
-        ts = p.deletion.marked_for_delete_at;
-    }
-    ts
-}
-
 /// What to do with one row that both replicas hold.
 #[derive(Debug, PartialEq, Eq)]
 enum RowVerdict {
@@ -366,9 +340,15 @@ struct PartitionMerge {
     /// Rows to stream B→A.
     to_a: Vec<ferrosa_sstable::types::Row>,
     /// At least one row was settled by comparing values at an equal timestamp
-    /// rather than by timestamp alone. Reported as `timestamp_ties` for
-    /// observability — the replicas still converge.
+    /// rather than by timestamp alone, or partition-level state diverged.
+    /// Reported as `timestamp_ties` for observability — the replicas still
+    /// converge.
     tiebreak_used: bool,
+    /// Partition-level state diverged, so both sides must exchange partitions
+    /// even when no rows need to move: [`partition_with_rows`] carries the
+    /// sender's deletion and static row, which is the only way that state
+    /// travels.
+    partition_state_diverged: bool,
 }
 
 /// Reconcile two copies of the same partition, row by row.
@@ -379,11 +359,23 @@ struct PartitionMerge {
 fn merge_partition_rows(a: &Partition, b: &Partition) -> PartitionMerge {
     let mut merge = PartitionMerge::default();
 
-    // Partition-level state is not row data, so a row merge does not reconcile
-    // it. Flag it and keep going: the rows below it are still repairable, and
-    // stranding them because of it is the bug this fixes.
+    // Partition-level state — the partition tombstone and the static row — is
+    // not row data, and a per-row merge cannot carry it: a partition deleted at
+    // a newer timestamp on one replica has nothing row-shaped to stream. Fall
+    // back to whole-partition last-write-wins for these, sending the newer
+    // side's partition entire so its deletion and static row travel with it.
+    //
+    // Found by the repair fuzz harness: reconciling only rows left a partition
+    // tombstone stranded, and the replica without it stayed behind the LWW
+    // winner forever while repair reported success.
     if a.deletion != b.deletion || a.static_row != b.static_row {
         merge.tiebreak_used = true;
+        // Exchange in BOTH directions: each side merges what it receives
+        // against its own copy, so both land on the same partition state.
+        // Sending only the newer side would leave the sender un-updated and the
+        // next pass would stream again — repair has to be idempotent. Rows are
+        // still reconciled below; the two are independent.
+        merge.partition_state_diverged = true;
     }
 
     let rows_b: std::collections::BTreeMap<&[u8], &ferrosa_sstable::types::Row> = b
@@ -446,10 +438,11 @@ fn partition_with_rows(src: &Partition, rows: Vec<ferrosa_sstable::types::Row>) 
 /// Fold a per-row merge into a [`RepairPlan`].
 fn push_merge_into_plan(a: &Partition, b: &Partition, plan: &mut RepairPlan) {
     let merge = merge_partition_rows(a, b);
-    if !merge.to_b.is_empty() {
+    let force = merge.partition_state_diverged;
+    if force || !merge.to_b.is_empty() {
         plan.a_to_b.push(partition_with_rows(a, merge.to_b));
     }
-    if !merge.to_a.is_empty() {
+    if force || !merge.to_a.is_empty() {
         plan.b_to_a.push(partition_with_rows(b, merge.to_a));
     }
     if merge.tiebreak_used {
@@ -618,14 +611,18 @@ where
                     std::cmp::Ordering::Equal => {
                         if partition_merkle_hash(&a) != partition_merkle_hash(&b) {
                             let merge = merge_partition_rows(&a, &b);
-                            if !merge.to_b.is_empty() {
-                                emit(RepairDecision::AToB(partition_with_rows(&a, merge.to_b)))?;
-                            }
-                            if !merge.to_a.is_empty() {
-                                emit(RepairDecision::BToA(partition_with_rows(&b, merge.to_a)))?;
-                            }
                             if merge.tiebreak_used {
                                 emit(RepairDecision::Tie(a.key.clone()))?;
+                            }
+                            // Partition-level state travels only on a
+                            // partition, so a divergence there forces an
+                            // exchange even when no rows need to move.
+                            let force = merge.partition_state_diverged;
+                            if force || !merge.to_b.is_empty() {
+                                emit(RepairDecision::AToB(partition_with_rows(&a, merge.to_b)))?;
+                            }
+                            if force || !merge.to_a.is_empty() {
+                                emit(RepairDecision::BToA(partition_with_rows(&b, merge.to_a)))?;
                             }
                         }
                         a_head = a_sorted.pop();
