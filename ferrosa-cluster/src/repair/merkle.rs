@@ -42,18 +42,44 @@ impl MerkleTree {
 
     /// Insert a partition hash at the given token position.
     ///
-    /// XORs the hash into the appropriate leaf. Call `compute_root()` after
-    /// all inserts to propagate hashes up the tree.
+    /// Accumulates the hash into the appropriate leaf with wrapping addition.
+    /// Call `compute_root()` after all inserts to propagate hashes up the tree.
+    ///
+    /// # Why not XOR
+    ///
+    /// This combined with `^=` until 2026-08-17. XOR is order-independent, which
+    /// is the property a Merkle leaf needs -- and it is also SELF-INVERSE, which
+    /// silently destroys the property repair depends on: two partitions whose
+    /// content hashes are equal cancel to zero, so a leaf holding both hashes
+    /// identically to a leaf holding NEITHER. `divergent_leaf_ranges` then finds
+    /// nothing, and anti-entropy repair reports success having streamed nothing
+    /// while a replica is short those rows.
+    ///
+    /// That is not hypothetical. On the host cluster node1 held 78,492 distinct
+    /// entity ids against node3's 78,499 -- strictly missing 7, with zero rows
+    /// unique to node1 -- while repair run from all three coordinators reported
+    /// `partitions_streamed_in: 0, out: 0, errors: 0`. Equal content hashes are
+    /// ordinary: duplicate row content produces them directly.
+    ///
+    /// Wrapping addition keeps commutativity (so insert order still does not
+    /// matter) without being self-inverse, so duplicates accumulate instead of
+    /// cancelling. It is still a fixed-width sum, so collisions remain possible
+    /// in principle -- but they require a specific total, rather than being
+    /// triggered structurally by any duplicated pair.
     pub fn insert(&mut self, token: i64, hash: u64) {
         let leaf_idx = self.token_to_leaf(token);
         let num_leaves = 1usize << self.depth;
         let node_idx = (num_leaves - 1) + leaf_idx;
         if node_idx < self.nodes.len() {
-            self.nodes[node_idx] ^= hash;
+            self.nodes[node_idx] = self.nodes[node_idx].wrapping_add(hash);
         }
     }
 
     /// Propagate leaf hashes up to the root (post-order traversal).
+    ///
+    /// Combines children with wrapping addition for the same reason `insert`
+    /// does: XOR here would let two sibling subtrees with equal hashes cancel,
+    /// so a whole populated subtree could present as empty to a peer.
     pub fn compute_root(&mut self) {
         let num_leaves = 1usize << self.depth;
         let first_leaf = num_leaves - 1;
@@ -61,7 +87,7 @@ impl MerkleTree {
         for i in (0..first_leaf).rev() {
             let left = 2 * i + 1;
             let right = 2 * i + 2;
-            self.nodes[i] = self.nodes[left] ^ self.nodes[right];
+            self.nodes[i] = self.nodes[left].wrapping_add(self.nodes[right]);
         }
     }
 
@@ -154,6 +180,85 @@ impl MerkleTree {
 mod tests {
     use super::*;
 
+    /// A replica missing an EVEN number of equal-hash partitions must still be
+    /// detected as divergent.
+    ///
+    /// Leaves are combined with XOR (`nodes[i] ^= hash`), and XOR is
+    /// self-inverse: two partitions whose content hashes are equal cancel to
+    /// zero. So a leaf holding both hashes to exactly the same value as a leaf
+    /// holding neither, and `divergent_leaf_ranges` reports no divergence while
+    /// one replica is short two rows.
+    ///
+    /// Observed on the host cluster 2026-08-17: node1 held 78,492 distinct
+    /// entity ids against node3's 78,499 -- strictly missing 7, with zero rows
+    /// unique to node1 -- while anti-entropy repair run from all three
+    /// coordinators reported `partitions_streamed_in: 0`, `out: 0`, 0 errors.
+    /// Repair cannot fix what its comparison cannot see.
+    #[test]
+    fn a_replica_missing_two_equal_hash_partitions_is_still_divergent() {
+        // Two partitions in the same leaf whose content hashes coincide. Equal
+        // hashes are not exotic: identical row content, or any collision in the
+        // 64-bit space across a large table.
+        let duplicate_hash = 0xA5A5_A5A5_A5A5_A5A5u64;
+
+        let mut complete = MerkleTree::new(4, 0, 1000);
+        complete.insert(500, duplicate_hash);
+        complete.insert(501, duplicate_hash);
+        complete.compute_root();
+
+        // The replica that never received either partition.
+        let mut short = MerkleTree::new(4, 0, 1000);
+        short.compute_root();
+
+        assert!(
+            !complete.divergent_leaf_ranges(&short).is_empty(),
+            "a replica missing two equal-hash partitions must be reported as divergent; \
+             XOR cancels them and hides the gap"
+        );
+    }
+
+    /// The same cancellation at the root: a populated range must not present the
+    /// same root as an empty one.
+    #[test]
+    fn equal_hash_partitions_do_not_cancel_to_an_empty_looking_root() {
+        let duplicate_hash = 0x1234_5678_9ABC_DEF0u64;
+        let mut tree = MerkleTree::new(4, 0, 1000);
+        tree.insert(500, duplicate_hash);
+        tree.insert(501, duplicate_hash);
+        tree.compute_root();
+
+        assert_ne!(
+            tree.root_hash(),
+            0,
+            "two equal-hash partitions XOR to zero, making a populated range \
+             indistinguishable from an empty one"
+        );
+    }
+
+    /// Inserting the same hash twice must not undo itself.
+    ///
+    /// This is the exact property XOR lacked, stated directly rather than only
+    /// via the two-replica scenario above.
+    #[test]
+    fn inserting_the_same_hash_twice_does_not_cancel() {
+        let mut once = MerkleTree::new(4, 0, 1000);
+        once.insert(500, 0xFEED);
+        once.compute_root();
+
+        let mut twice = MerkleTree::new(4, 0, 1000);
+        twice.insert(500, 0xFEED);
+        twice.insert(500, 0xFEED);
+        twice.compute_root();
+
+        assert_ne!(
+            once.root_hash(),
+            twice.root_hash(),
+            "a duplicate insert must change the hash, or a replica holding two \
+             copies looks identical to one holding a single copy"
+        );
+        assert_ne!(twice.root_hash(), 0, "and must not cancel to empty");
+    }
+
     #[test]
     fn empty_tree_has_zero_root() {
         let mut tree = MerkleTree::new(4, 0, 1000);
@@ -201,8 +306,16 @@ mod tests {
         assert_ne!(t1.root_hash(), t2.root_hash());
     }
 
+    /// Insert order must not affect the hash: replicas scan their own SSTables
+    /// and reach the same partitions in different orders, so an order-sensitive
+    /// combiner would report divergence between identical replicas.
+    ///
+    /// Was `xor_is_order_independent`. Order independence is the property that
+    /// was actually wanted; XOR merely happened to provide it, along with the
+    /// self-inverse behaviour that hid missing rows. Wrapping addition keeps the
+    /// wanted half.
     #[test]
-    fn xor_is_order_independent() {
+    fn combining_is_order_independent() {
         let mut t1 = MerkleTree::new(4, 0, 1000);
         let mut t2 = MerkleTree::new(4, 0, 1000);
 
