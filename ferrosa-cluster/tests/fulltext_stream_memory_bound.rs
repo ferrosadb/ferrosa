@@ -77,7 +77,17 @@ unsafe impl GlobalAlloc for TrackingAlloc {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ARMED.load(Ordering::Relaxed) {
-            LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+            // Clamp at zero. `measure_peak` zeroes LIVE at arm time, so a free
+            // of memory allocated BEFORE the window would otherwise push the
+            // counter negative — and because PEAK is a running maximum of LIVE,
+            // every later allocation would be measured against that negative
+            // baseline and the peak would collapse toward zero. Seeding runs
+            // outside the window by design, so how much of it is released
+            // inside the window is pure timing: that is what made these peaks
+            // flaky across machines.
+            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                Some((live - layout.size() as i64).max(0))
+            });
         }
         unsafe { System.dealloc(ptr, layout) };
     }
@@ -96,6 +106,39 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
     let out = f();
     ARMED.store(false, Ordering::SeqCst);
     (out, PEAK.load(Ordering::SeqCst))
+}
+
+/// The tracker must report the working set of the measured region even when the
+/// region frees memory that was allocated *before* the window opened.
+///
+/// `measure_peak` zeroes `LIVE` at arm time, but `dealloc` decrements it for
+/// every free while armed — including frees of pre-window allocations. Those
+/// frees drive `LIVE` negative, and since the peak is a running maximum of
+/// `LIVE`, a later genuine allocation is measured against that negative
+/// baseline and all but disappears.
+///
+/// This is what made `cluster_fulltext_stream_peak_bounded_and_doc_size_independent`
+/// flaky. The seeding phase runs outside the window by design, so how much of
+/// its memory happens to be released *inside* the window is pure timing. On a
+/// GitHub runner the 64 B arm measured 85 587 B against the 4096 B arm's stable
+/// 1 240 828 B — a 14.5x "doc size leak" that was really just a suppressed
+/// baseline, failing a test whose subject had not regressed at all.
+#[test]
+fn peak_survives_frees_of_pre_window_allocations() {
+    let pre_window = vec![0u8; 4 * 1024 * 1024];
+
+    let (_, peak) = measure_peak(|| {
+        // Released inside the window: must not lower the floor.
+        drop(pre_window);
+        let working_set = vec![0u8; 1024 * 1024];
+        std::hint::black_box(working_set.len())
+    });
+
+    assert!(
+        peak >= 1_000_000,
+        "peak {peak} B lost the 1 MiB working set — a pre-window free drove the \
+         live counter negative and suppressed the measurement"
+    );
 }
 
 const KS: &str = "agent_memory";
