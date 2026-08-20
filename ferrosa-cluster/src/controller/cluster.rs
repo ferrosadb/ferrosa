@@ -274,6 +274,40 @@ where
 /// the marker would be written where nobody looks, and the node would forget
 /// it was a member -- the exact bug this is fixing, reintroduced by a
 /// duplicated expression.
+impl ModeController {
+    /// Move a stranded Raft directory aside and start a clean one, keeping the
+    /// `cluster-member` marker.
+    ///
+    /// The marker has to survive. It is what tells the restarted node it was a
+    /// cluster member, so it comes back as `DegradedCluster` -- refusing
+    /// queries until it has real data -- instead of forming a fresh pair on
+    /// top of a cluster it is still a committed member of. Losing it here
+    /// would turn a recoverable strand into the split brain the deployment
+    /// mode work exists to prevent.
+    ///
+    /// The old directory is retained rather than deleted: it is the only
+    /// evidence of how the node got stranded.
+    pub(crate) fn reset_stranded_raft_state(
+        raft_dir: &std::path::Path,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
+        let marker = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
+        let saved_marker = match std::fs::read(&marker) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        let counts = crate::raft::log_store::SledLogStore::reset(raft_dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if let Some(bytes) = saved_marker {
+            std::fs::write(raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER), bytes)?;
+        }
+
+        Ok(counts.backup_path)
+    }
+}
+
 pub fn resolve_raft_dir(config: &crate::config::ClusterConfig) -> std::path::PathBuf {
     let local_dc = config.data_center.clone();
     let base = if let Some(dir) = config.raft_data_dir_for_dc(&local_dc) {
@@ -727,12 +761,72 @@ impl ModeController {
             }
         };
 
-        // Recover last_applied from the log store's purge point if the state
-        // machine was lost (e.g., OOM kill before snapshot persisted). Without
-        // this, openraft tries to replay from index 0 but purged entries are
-        // gone, causing a fatal "expected index [0, N)" error on startup.
+        // Reconcile the state machine against the log store's purge point
+        // BEFORE openraft reads either. Two durable facts have to agree for a
+        // node to restart on its own log, and until 2026-08-20 nothing checked
+        // that they did -- openraft found out during re-apply and failed Fatal
+        // with an index range and no cause. See `crate::raft::local_state`.
         match log_store.last_purged_log_id() {
-            Ok(purge_point) => state_machine.recover_from_purge_point(purge_point),
+            Ok(purge_point) => {
+                let classification = crate::raft::local_state::classify_local_raft_state(
+                    state_machine.last_applied_index(),
+                    purge_point.map(|log_id| log_id.index),
+                );
+                match classification {
+                    crate::raft::local_state::LocalRaftState::StrandedBehindPurge {
+                        last_applied,
+                        last_purged,
+                    } => {
+                        tracing::error!(
+                            last_applied,
+                            last_purged,
+                            missing = format!("{}..={}", last_applied + 1, last_purged),
+                            dir = %raft_dir.display(),
+                            "local Raft state is unusable: entries were purged before they \
+                             were applied, so this node holds no copy of them. Resetting \
+                             local Raft state (retained for inspection) and rejoining to \
+                             receive a snapshot from the leader."
+                        );
+                        match Self::reset_stranded_raft_state(&raft_dir) {
+                            Ok(backup) => {
+                                tracing::warn!(
+                                    backup = %backup.as_deref().unwrap_or(std::path::Path::new("<none>")).display(),
+                                    "stranded Raft state moved aside; rebuilding from the leader"
+                                );
+                                match SledLogStore::new(&raft_dir) {
+                                    Ok(fresh) => {
+                                        log_store = fresh;
+                                        state_machine =
+                                            FerrosStateMachine::with_side_effects_and_snapshot_path(
+                                                self.schema.clone(),
+                                                self.storage.clone(),
+                                                raft_dir.join("state-machine.snapshot.bin"),
+                                            );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(%e, "failed to recreate Raft log store after reset");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    %e,
+                                    "could not reset stranded Raft state; this node cannot \
+                                     rejoin and needs operator repair"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    crate::raft::local_state::LocalRaftState::NeedsPurgePointBaseline {
+                        ..
+                    } => {
+                        state_machine.recover_from_purge_point(purge_point);
+                    }
+                    crate::raft::local_state::LocalRaftState::Usable => {}
+                }
+            }
             Err(e) => tracing::warn!(%e, "failed to read last_purged from log store"),
         }
 

@@ -9,6 +9,7 @@ pub mod consensus_metrics;
 pub mod election_guard;
 pub mod group_id;
 pub mod handlers;
+pub mod local_state;
 pub mod log_store;
 pub mod multi_dc_apply;
 pub mod network;

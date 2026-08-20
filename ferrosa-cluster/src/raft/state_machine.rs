@@ -379,6 +379,14 @@ impl FerrosStateMachine {
         }
     }
 
+    /// This state machine's persisted `last_applied` index, if any.
+    ///
+    /// Exposed so startup can compare it against the log store's purge point
+    /// before openraft does; see `crate::raft::local_state`.
+    pub fn last_applied_index(&self) -> Option<u64> {
+        self.last_applied.map(|log_id| log_id.index)
+    }
+
     /// Recover `last_applied` from the log store's purge point.
     ///
     /// After an OOM kill, the in-memory `last_applied` is lost (reverts to
