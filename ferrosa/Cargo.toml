@@ -81,6 +81,10 @@ optional = true
 features = ["rt-tokio"]
 
 [dev-dependencies]
+# Parses the committed docker-compose stacks in
+# tests/pair_primary_is_deterministic.rs so the pinned FERROSA_HOST_ID values
+# are checked against the ordering choose_pair_role elects on.
+serde_yaml = "0.9"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

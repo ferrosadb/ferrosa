@@ -1812,6 +1812,54 @@ async fn decommission_requires_raft() {
 
 // ---- is_cql_ready tests ------------------------------------------------
 
+/// The pair role must be decided by host_id ordering, lowest wins.
+///
+/// `docker-compose.yml` pins node1 to the lowest `FERROSA_HOST_ID` precisely so
+/// it always takes `Primary`; `tests/docker-smoke.sh` then drives every
+/// pair-mode CQL statement at node1 and promotes node2 in Phase 3. Before those
+/// ids were pinned the comparison ran against a per-boot random UUID, so node1
+/// was primary only about half the time — and on the other runs it came up a
+/// secondary that refuses client CQL while still reporting healthy on
+/// `/readyz`, hanging the nightly smoke test in `wait_cql` until it timed out.
+///
+/// Pinned here as well as in `ferrosa`'s `pair_primary_is_deterministic` so
+/// that flipping this comparison fails a unit test, not just a nightly run.
+#[test]
+fn lower_host_id_takes_primary_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    // local < peer, so this node must win the primary role.
+    let local_id = Uuid::from_u128(1);
+    let peer_id = Uuid::from_u128(2);
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+    controller.on_peer_connected((peer_id, peer_addr));
+
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+    assert_eq!(
+        controller.role(),
+        Some(PairRole::Primary),
+        "the lower host_id must take Primary — docker-compose.yml pins node1 \
+         lowest so the pair smoke test has a deterministic primary"
+    );
+}
+
 #[test]
 fn is_cql_ready_standalone_returns_true() {
     let dir = tempfile::tempdir().unwrap();
