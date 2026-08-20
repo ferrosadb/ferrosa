@@ -192,6 +192,19 @@ impl ModeController {
                     invite_sent = true;
                     self.send_cluster_invite_to(host_id);
                 }
+                PeerEventAction::RejoinClusterWithRaftInit => {
+                    // This node came back holding a `cluster-member` marker,
+                    // so it started in DegradedCluster with no Raft in this
+                    // process. Quorum is now reachable, so rebuild Raft from
+                    // persisted state rather than flipping the mode label and
+                    // leaving the node in Cluster with nothing behind it.
+                    tracing::info!(
+                        peers = all_peers_after_track.len(),
+                        "returning cluster member reached quorum with no Raft in \
+                         this process; initialising Raft to rejoin"
+                    );
+                    self.transition_to_cluster(all_peers_after_track.to_vec());
+                }
                 PeerEventAction::RestoreClusterMode => {
                     tracing::info!("quorum restored — transitioning back to Cluster");
                     self.try_transition_mode(DeploymentMode::Cluster);
@@ -279,6 +292,7 @@ impl PeerEventListener for ModeController {
             now: std::time::Instant::now(),
             cql_broadcast,
             internode_broadcast,
+            raft_initialized: self.raft().is_some(),
         });
         self.execute_peer_event_plan(plan, &all_peers, false);
 
@@ -456,6 +470,7 @@ impl InboundPeerCallback for ModeController {
             now: std::time::Instant::now(),
             cql_broadcast,
             internode_broadcast,
+            raft_initialized: self.raft().is_some(),
         });
         self.execute_peer_event_plan(plan, &all_peers, true);
     }
