@@ -2284,6 +2284,8 @@ dependencies = [
  "num-bigint",
  "proptest",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
