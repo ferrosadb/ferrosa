@@ -292,6 +292,19 @@ integration files (`tests/`), including proptest property suites
 `test-generators`/`fuzz-fileio`). Live-infra tests are behind the
 `live-infra-tests` feature + `FERROSA_TEST_*` env vars. No `#[ignore]`.
 
+The read-vs-compaction race stress (`race-stress` feature,
+`read_compaction_race_stress`) has **no CI job**. It ran nightly on a throwaway
+shared-cpu Fly machine until that job was removed for leaking a Fly app per run
+(the runner cancels the step at the job timeout, killing the script before its
+cleanup trap can destroy the app). Run it by hand on a CPU-starved host:
+
+```bash
+cargo test -p ferrosa-storage --features race-stress --release \
+  read_compaction_race_stress -- --nocapture
+```
+
+Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
