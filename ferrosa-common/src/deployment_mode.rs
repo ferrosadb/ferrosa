@@ -74,6 +74,35 @@ impl DeploymentMode {
         }
     }
 
+    /// The mode a node must start in, given whether it was already a member of
+    /// a Raft cluster.
+    ///
+    /// Deployment mode lives only in memory: every controller starts at
+    /// `Standalone` and walks up from peer connections. So a node that WAS a
+    /// committed cluster member forgets that on restart and re-derives its
+    /// shape from whoever it reconnects to first -- which, for a node whose
+    /// only seed is one peer, is `Pair`.
+    ///
+    /// Observed on node1, 2026-08-20. The cluster still had it in the
+    /// membership: the leader was sending it AppendEntries every 3.5 seconds
+    /// and timing out. Locally it believed it was half of a pair. The cluster's
+    /// view and the node's view of the same node disagreed, and the node's view
+    /// was the one deciding how it replicated.
+    ///
+    /// Raft membership on disk is the evidence and it outranks a peer count. A
+    /// returning member starts `DegradedCluster` -- a cluster member with no
+    /// quorum yet -- from which the only exit is `Cluster`. That is what makes
+    /// the no-going-back rule survive a process restart rather than only a mode
+    /// change within one.
+    #[must_use]
+    pub fn initial_for_restart(was_cluster_member: bool) -> Self {
+        if was_cluster_member {
+            Self::DegradedCluster
+        } else {
+            Self::Standalone
+        }
+    }
+
     /// Check if transitioning from `self` to `target` is allowed.
     ///
     /// Valid transitions:
@@ -112,6 +141,14 @@ impl DeploymentMode {
                 | (Self::DegradedCluster, Self::Cluster)
                 // Operator demote from degraded pair
                 | (Self::DegradedPair, Self::Standalone)
+                // A degraded pair that regains enough peers forms a cluster
+                // directly. Second gap found by the cross-check property test.
+                // Consistent with the Pair -> Cluster allowance below: a
+                // degraded pair IS a pair that lost its peer, so if peers
+                // return in cluster numbers there is no reason to route it
+                // through Pair first -- and doing so would briefly assert
+                // "pair" about a node that can see two peers.
+                | (Self::DegradedPair, Self::Cluster)
                 // Legacy direct transitions (backward compat)
                 | (Self::Standalone, Self::Cluster)
                 | (Self::Pair, Self::Cluster)
@@ -162,6 +199,55 @@ mod tests {
     /// would have refused get accepted by whichever node still believes it is
     /// primary -- and on 2026-08-20 node1 did exactly that, sitting in pair
     /// mode with an empty schema while answering CQL.
+    /// A node that was already a cluster member must come back as one.
+    ///
+    /// "A cluster never becomes a pair" is worthless if a restart resets the
+    /// node to Standalone and lets it walk back up to Pair -- which is what
+    /// node1 did while the leader was still replicating to it.
+    #[test]
+    fn a_returning_cluster_member_never_restarts_as_a_pair() {
+        let mode = DeploymentMode::initial_for_restart(true);
+        assert_eq!(
+            mode,
+            DeploymentMode::DegradedCluster,
+            "a committed member with no quorum yet is a degraded cluster"
+        );
+        for forbidden in [
+            DeploymentMode::Pair,
+            DeploymentMode::Standalone,
+            DeploymentMode::DegradedPair,
+        ] {
+            assert!(
+                !mode.can_transition_to(forbidden),
+                "a returning member must not be able to reach {forbidden}"
+            );
+        }
+        assert!(
+            mode.can_transition_to(DeploymentMode::Cluster),
+            "rejoining the quorum is the only way out"
+        );
+    }
+
+    /// A genuinely new node still starts standalone. The fix must not turn
+    /// every first boot into a phantom cluster member.
+    #[test]
+    fn a_node_with_no_history_still_starts_standalone() {
+        assert_eq!(
+            DeploymentMode::initial_for_restart(false),
+            DeploymentMode::Standalone
+        );
+    }
+
+    /// The two mechanisms must agree: a returning member cannot be walked back
+    /// to a pair by peer count either.
+    #[test]
+    fn a_returning_member_with_one_peer_stays_a_cluster() {
+        let mode = DeploymentMode::initial_for_restart(true);
+        assert_eq!(mode.next_mode(1), DeploymentMode::DegradedCluster);
+        assert_eq!(mode.next_mode(0), DeploymentMode::DegradedCluster);
+        assert_eq!(mode.next_mode(2), DeploymentMode::Cluster);
+    }
+
     #[test]
     fn a_cluster_never_degrades_into_a_pair() {
         for target in [

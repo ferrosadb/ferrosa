@@ -18,3 +18,6 @@ test-generators = ["proptest"]
 
 [dev-dependencies]
 proptest = "1"
+# The deployment-mode tests round-trip the enum; it moved here from
+# ferrosa-cluster, which already had serde_json.
+serde_json = "1"
