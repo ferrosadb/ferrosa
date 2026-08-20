@@ -2233,11 +2233,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (TOML-wins precedence), so a committed node config can join a cluster
     // with no env wiring. Both accept a comma-separated list; entries may be
     // hostnames (resolved via DNS in the background task below).
-    let seed_strs: Vec<String> = config_val("FERROSA_SEED", &file_config, "internode", "seed", "")
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let seed_strs: Vec<String> = parse_seed_list(&config_val(
+        "FERROSA_SEED",
+        &file_config,
+        "internode",
+        "seed",
+        "",
+    ));
 
     if !seed_strs.is_empty() {
         let net_cfg = net_config.clone();
@@ -2610,6 +2612,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// connections — "max connections reached". The lane actor's alive watcher
 /// handles reconnection if a live seed drops, so the seed loop only needs
 /// to drive the *initial* connection for each seed.
+/// Split a seed setting into individual `host:port` entries.
+///
+/// Both `[internode] seed` and `FERROSA_SEED` accept a comma-separated list.
+/// That matters more than it looks: a node with a single seed only ever learns
+/// about the peers that seed tells it about, so in a hub-and-spoke layout it
+/// can never satisfy a promotion rule counting local connections. Giving every
+/// node the full list is what makes the mesh reachable without depending on
+/// invite delivery.
+///
+/// Shared with the tests deliberately. The test for this used to re-implement
+/// the split inline, so it verified a copy of the logic rather than the logic,
+/// and a change here could not fail it.
+fn parse_seed_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn seeds_to_connect(
     seeds: &[String],
     connected: &std::collections::HashSet<String>,
@@ -2986,6 +3007,40 @@ mod tests {
         assert_eq!(cfg.bind_addr, default_bind);
     }
 
+    /// A seed *list* in TOML must parse to every entry.
+    ///
+    /// Only the env path had list coverage, and the config file is the path
+    /// that ships: `~/.ferrosa/config/ferrosa-nodeN.toml`. The native cluster
+    /// gave node1 and node2 a single seed (node3) and node3 none, so node1 and
+    /// node2 could each only ever see one peer and never satisfied the
+    /// two-peer promotion condition -- they reached Cluster only because node3
+    /// pushed them an invite, and when one of those invites failed to deliver
+    /// on 2026-08-20 node1 sat in Pair mode indefinitely.
+    ///
+    /// Giving every node the full list removes that dependency, and this test
+    /// is what stops the list being silently parsed as one malformed address.
+    #[test]
+    #[serial_test::serial(env)]
+    fn a_seed_list_in_toml_parses_to_every_entry() {
+        std::env::remove_var("FERROSA_SEED");
+
+        let cfg: toml::Value = toml::from_str(
+            "[internode]\nseed = \"127.0.0.1:17000, 127.0.0.1:17001,127.0.0.1:17002\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_seed_list(&config_val("FERROSA_SEED", &cfg, "internode", "seed", "")),
+            vec![
+                "127.0.0.1:17000".to_string(),
+                "127.0.0.1:17001".to_string(),
+                "127.0.0.1:17002".to_string(),
+            ],
+            "a comma-separated seed list in the config file must yield one \
+             entry per peer, with surrounding whitespace trimmed"
+        );
+    }
+
     /// Seed list resolves from `[internode] seed` in the config file (so a
     /// committed node config can join a cluster with no env wiring), with
     /// `FERROSA_SEED` as the fallback and TOML winning when both are set. This
@@ -2993,12 +3048,7 @@ mod tests {
     #[test]
     #[serial_test::serial(env)]
     fn seed_resolves_from_toml_over_env() {
-        fn seeds(raw: &str) -> Vec<String> {
-            raw.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        }
+        let seeds = parse_seed_list;
 
         std::env::remove_var("FERROSA_SEED");
 
