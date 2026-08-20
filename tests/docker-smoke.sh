@@ -323,11 +323,19 @@ info "=== Phase 1: Bidirectional reads and writes ==="
 info "Building and starting pair services..."
 docker compose up -d --build node1 node2
 
+# Roles are deterministic: `choose_pair_role` gives Primary to the lowest
+# host_id and docker-compose.yml pins node1 below node2. Assert the role before
+# waiting on CQL — when the pins regress, node1 comes up a secondary that
+# refuses CQL while still reporting healthy on /readyz, and a bare `wait_cql`
+# would burn the full timeout before failing with no explanation.
+info "Waiting for node1 to become the pair primary..."
+wait_for_cluster_role 9090 "node1" "primary" "$PAIR_CQL_TIMEOUT"
+
 wait_cql 9042 "node1" "$PAIR_CQL_TIMEOUT"
 
-# In pair mode, node2 becomes the secondary. The CQL server rejects all
-# connections on secondaries (only the primary serves CQL), so wait for the
-# explicit role rather than treating a rejected CQL connection as unready.
+# node2 is the secondary. The CQL server rejects all connections on secondaries
+# (only the primary serves CQL), so wait for the explicit role rather than
+# treating a rejected CQL connection as unready.
 info "Waiting for node2 to become the pair secondary..."
 wait_for_cluster_role 9091 "node2" "secondary" "$PAIR_CQL_TIMEOUT"
 
