@@ -3317,3 +3317,54 @@ async fn resetting_a_stranded_node_keeps_its_cluster_membership() {
         "the stranded log is the only evidence of how the node got stranded"
     );
 }
+
+/// A controller's initial mode must come from its config, not from the host.
+///
+/// `ModeController::new` reads the `cluster-member` marker to decide whether to
+/// come up as a returning cluster member -- which decides whether it serves
+/// queries at all. With a default config that lookup used to resolve to the
+/// machine-global `/var/lib/ferrosa`, so on a host with `FERROSA_DATA_DIR`
+/// exported, or where `/var/lib` is unreadable (`was_cluster_member`
+/// deliberately assumes membership when the marker cannot be read), an
+/// unconfigured controller would start in `DegradedCluster` and refuse traffic
+/// while every test asserting `Standalone` or `Pair` failed for reasons
+/// nothing in the test mentioned.
+#[tokio::test]
+#[serial_test::serial(env)]
+async fn an_unconfigured_controller_ignores_a_marker_on_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A marker exists exactly where the compiled-in default would look.
+    let planted = dir.path().join("raft").join("datacenter1");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join(DeploymentMode::CLUSTER_MEMBER_MARKER),
+        b"planted by the host",
+    )
+    .unwrap();
+
+    let prior = std::env::var("FERROSA_DATA_DIR").ok();
+    std::env::set_var("FERROSA_DATA_DIR", dir.path());
+
+    // With FERROSA_DATA_DIR set, the raft dir IS configured, so the marker
+    // counts and this node knows it was a member.
+    assert_eq!(
+        super::cluster::configured_raft_dir(&ClusterConfig::default()),
+        Some(planted.clone()),
+        "FERROSA_DATA_DIR is an explicit answer about where Raft state lives"
+    );
+
+    // With nothing configured, there is no answer, and the host's marker must
+    // not be consulted.
+    std::env::remove_var("FERROSA_DATA_DIR");
+    assert_eq!(
+        super::cluster::configured_raft_dir(&ClusterConfig::default()),
+        None,
+        "an unconfigured controller must not adopt a machine-global raft dir"
+    );
+
+    match prior {
+        Some(v) => std::env::set_var("FERROSA_DATA_DIR", v),
+        None => std::env::remove_var("FERROSA_DATA_DIR"),
+    }
+}

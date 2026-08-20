@@ -309,15 +309,40 @@ impl ModeController {
 }
 
 pub fn resolve_raft_dir(config: &crate::config::ClusterConfig) -> std::path::PathBuf {
+    configured_raft_dir(config)
+        .unwrap_or_else(|| raft_log_dir_for_dc(&default_raft_base(), &config.data_center))
+}
+
+/// Where this config *says* its Raft state lives, if it says at all.
+///
+/// `None` means neither `raft_data_dir` nor `FERROSA_DATA_DIR` was set and the
+/// caller would be falling back to the compiled-in `/var/lib/ferrosa`.
+///
+/// The distinction matters for decisions that read the filesystem to work out
+/// what this node *is*. `ModeController::new` consults the `cluster-member`
+/// marker to decide whether to come up as a returning cluster member, and with
+/// a default-constructed config that lookup lands on a machine-global path --
+/// so a controller's initial mode, and therefore whether it will serve
+/// queries, would depend on ambient host state rather than on its
+/// configuration. Unit tests build controllers with `ClusterConfig::default()`
+/// all the time; on a host with `FERROSA_DATA_DIR` exported, or where
+/// `/var/lib` is unreadable (`was_cluster_member` deliberately assumes
+/// membership on an unreadable marker), they would silently start in a
+/// different mode than the one they assert.
+pub fn configured_raft_dir(config: &crate::config::ClusterConfig) -> Option<std::path::PathBuf> {
     let local_dc = config.data_center.clone();
-    let base = if let Some(dir) = config.raft_data_dir_for_dc(&local_dc) {
-        dir
-    } else {
-        let data_dir =
-            std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
-        std::path::Path::new(&data_dir).join("raft")
+    let base = match config.raft_data_dir_for_dc(&local_dc) {
+        Some(dir) => dir,
+        None => std::path::Path::new(&std::env::var("FERROSA_DATA_DIR").ok()?).join("raft"),
     };
-    raft_log_dir_for_dc(&base, &local_dc)
+    Some(raft_log_dir_for_dc(&base, &local_dc))
+}
+
+fn default_raft_base() -> std::path::PathBuf {
+    std::path::Path::new(
+        &std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into()),
+    )
+    .join("raft")
 }
 
 pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::PathBuf {
@@ -780,6 +805,11 @@ impl ModeController {
             self.storage.clone(),
             snapshot_path,
         );
+        // Join the two halves of the purge guard. The log store will not purge
+        // past what this state machine reports durable; without this handshake
+        // the watermark stays 0 and the guard is inert.
+        state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
+
         let recovered_persisted_snapshot = match state_machine.recover_from_persisted_snapshot() {
             Ok(recovered) => recovered,
             Err(e) => {
@@ -829,6 +859,9 @@ impl ModeController {
                                                 self.storage.clone(),
                                                 raft_dir.join("state-machine.snapshot.bin"),
                                             );
+                                        state_machine.set_durable_applied_handle(
+                                            log_store.durable_applied_handle(),
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::error!(%e, "failed to recreate Raft log store after reset");

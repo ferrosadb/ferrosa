@@ -77,9 +77,119 @@ pub fn classify_local_raft_state(
     }
 }
 
+/// What a purge request is allowed to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeDecision {
+    /// Delete entries up to and including this index, as asked.
+    Purge { through: u64 },
+
+    /// Delete less than asked. Everything above `through` is not yet durably
+    /// applied, so deleting it would destroy the only copy on this node.
+    Clamp { through: u64, requested: u64 },
+
+    /// Delete nothing: no snapshot is known to be durable, so no entry is
+    /// known to be safely reconstructable.
+    Skip { requested: u64 },
+}
+
+/// Decide how far a purge may go, given what is *durably* applied.
+///
+/// openraft only asks to purge up to a snapshot it believes exists, so in a
+/// correct system `requested <= durable_applied` always holds and this returns
+/// `Purge` unchanged. It exists for the case where that belief and the disk
+/// disagree -- which is how node3 was stranded on 2026-08-20.
+///
+/// Purging *less* than asked is always safe: the cost is disk, and the entries
+/// are deleted on the next purge once the snapshot covering them is durable.
+/// Purging *more* than is durable is unrecoverable, because the entries exist
+/// nowhere else on this node. That asymmetry is the whole argument for
+/// clamping rather than trusting the request.
+pub fn purge_ceiling(requested: u64, durable_applied: Option<u64>) -> PurgeDecision {
+    match durable_applied {
+        // Nothing is known to be durably applied, so nothing is known to be
+        // reconstructable. Keep the log.
+        None => PurgeDecision::Skip { requested },
+        Some(0) => PurgeDecision::Skip { requested },
+        Some(applied) if requested <= applied => PurgeDecision::Purge { through: requested },
+        Some(applied) => PurgeDecision::Clamp {
+            through: applied,
+            requested,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- purge_ceiling ----------------------------------------------------
+
+    /// The normal case: the snapshot covers the purge point, so purge as asked.
+    #[test]
+    fn a_purge_covered_by_a_durable_snapshot_proceeds() {
+        assert_eq!(
+            purge_ceiling(3065, Some(3065)),
+            PurgeDecision::Purge { through: 3065 }
+        );
+        assert_eq!(
+            purge_ceiling(3000, Some(3065)),
+            PurgeDecision::Purge { through: 3000 }
+        );
+    }
+
+    /// The case that stranded node3: the request runs past what is durably
+    /// applied. Deleting 2906..=3065 there removed the node's only copy of
+    /// those entries. Clamp to what the snapshot actually covers.
+    #[test]
+    fn a_purge_past_durable_applied_is_clamped_not_obeyed() {
+        assert_eq!(
+            purge_ceiling(3065, Some(2905)),
+            PurgeDecision::Clamp {
+                through: 2905,
+                requested: 3065,
+            },
+            "entries above the durable applied index exist nowhere else on \
+             this node, so a purge may not delete them"
+        );
+    }
+
+    /// No durable snapshot means no entry is known to be reconstructable.
+    #[test]
+    fn a_purge_with_no_durable_snapshot_deletes_nothing() {
+        assert_eq!(
+            purge_ceiling(500, None),
+            PurgeDecision::Skip { requested: 500 }
+        );
+        assert_eq!(
+            purge_ceiling(500, Some(0)),
+            PurgeDecision::Skip { requested: 500 }
+        );
+    }
+
+    /// Whatever a purge is permitted to delete, the surviving state must still
+    /// classify as `Usable` -- the guard must not be able to create the strand
+    /// it exists to prevent.
+    #[test]
+    fn no_permitted_purge_can_strand_this_node() {
+        let durable_applied = 2905u64;
+        for requested in 0u64..4000 {
+            let permitted = match purge_ceiling(requested, Some(durable_applied)) {
+                PurgeDecision::Purge { through } => through,
+                PurgeDecision::Clamp { through, .. } => through,
+                PurgeDecision::Skip { .. } => continue,
+            };
+            assert!(
+                permitted <= durable_applied,
+                "purge of {requested} was permitted to {permitted}, past the \
+                 durable applied index {durable_applied}"
+            );
+            assert_eq!(
+                classify_local_raft_state(Some(durable_applied), Some(permitted)),
+                LocalRaftState::Usable,
+                "a permitted purge to {permitted} left the node stranded"
+            );
+        }
+    }
 
     /// The exact state node3 restarted in on 2026-08-20.
     #[test]
