@@ -317,23 +317,34 @@ mod tests {
         }
     }
 
+    /// Draining a medium batch pushed in reverse arrival order returns every
+    /// message, ordered by `t0`.
+    ///
+    /// This deliberately asserts no wall-clock bound. It used to also require
+    /// the drain to finish in under 10 ms, which measures the RUNNER rather
+    /// than the code: a contended merge-group build clocked it at 10.2 ms and
+    /// ejected PR #343 from the merge queue. That is the same failure
+    /// `accord::perf_regression` was created to contain — see its module docs,
+    /// which record an earlier 52.8 ms ejection of a docs-only PR
+    /// (forge t_430e21f7) — and `ci.yml` skips that module in the per-PR lane
+    /// for exactly this reason.
+    ///
+    /// The timing guard is not lost: `perf_regression` already asserts the
+    /// identical bound (1000-message drain under 10 ms) on the nightly
+    /// `perf-regression` job, where a threshold trip can be investigated
+    /// without blocking a merge. This test keeps the deterministic half —
+    /// completeness and ordering — which is what belongs in the merge lane.
     #[test]
-    fn reorder_buffer_drains_medium_deterministic_batch_under_tight_bound() {
+    fn reorder_buffer_drains_medium_batch_completely_and_in_t0_order() {
         let timing = default_timing();
         let mut buf = ReorderBuffer::new(DEFAULT_CAPACITY, timing);
         for i in (0..1_000i64).rev() {
             buf.push(msg(i, (i % 251) as u8)).unwrap();
         }
 
-        let started = std::time::Instant::now();
         let drained = buf.drain_all();
-        let elapsed = started.elapsed();
 
         assert_eq!(drained.len(), 1_000);
         assert!(drained.windows(2).all(|w| w[0].t0 <= w[1].t0));
-        assert!(
-            elapsed < std::time::Duration::from_millis(10),
-            "draining 1000 deterministic Accord messages took {elapsed:?}"
-        );
     }
 }
