@@ -43,6 +43,29 @@ impl ModeController {
         peer_addr: SocketAddr,
         need_reverse: bool,
     ) {
+        // Refuse before touching anything, not after.
+        //
+        // This function installs `WritePath::pair(...)` -- which accepts writes
+        // as a pair primary -- well before it asks whether the mode change is
+        // allowed. Checking only at the end is not a guard: a refused call
+        // leaves `mode = Cluster` on a node whose write path has already become
+        // a pair coordinator, so it accepts writes outside Raft while the rest
+        // of the cluster keeps running consensus, and every mode-based check
+        // still reports Cluster. That is the split brain T8b of
+        // `specs/reference/cluster-formation-state-machine.md` exists to
+        // prevent, made harder to see rather than easier.
+        //
+        // Callers hold `transition_guard`, so the mode cannot change between
+        // this check and the commit below.
+        let current = **self.mode.load();
+        if !current.can_transition_to(DeploymentMode::Pair) {
+            tracing::error!(
+                %current,
+                "refused illegal transition to pair; write path left untouched"
+            );
+            return;
+        }
+
         let peer_manager = match &**self.peer_manager.load() {
             Some(pm) => pm.clone(),
             None => {

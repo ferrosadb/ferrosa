@@ -3212,3 +3212,66 @@ force_mode_override if an operator is deliberately overriding it:\n  {}",
         offenders.join("\n  ")
     );
 }
+
+/// A cluster node must never end up holding a *pair* write path.
+///
+/// `transition_to_pair` installs `WritePath::pair(...)` -- which accepts writes
+/// as a pair primary -- and only afterwards asks whether the mode change is
+/// legal. Guarding the mode alone is not enough: if the call is refused, the
+/// node keeps `mode = Cluster` while its write path has already become a pair
+/// coordinator, so it accepts writes outside Raft while the rest of the
+/// cluster keeps running consensus. That is the split brain
+/// `specs/reference/cluster-formation-state-machine.md` T8b exists to prevent,
+/// and the disagreement also hides it: every mode-based check still reports
+/// `Cluster`.
+///
+/// The refusal must therefore come first and leave the write path untouched.
+#[tokio::test]
+async fn a_refused_pair_transition_must_not_leave_a_pair_write_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    let peer1_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    let peer2_addr: SocketAddr = "127.0.0.2:7002".parse().unwrap();
+    controller.transition_to_cluster(vec![(peer1_id, peer1_addr), (peer2_id, peer2_addr)]);
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    // A stray caller tries to pair this cluster node with a peer.
+    controller.transition_to_pair(peer1_id, peer1_addr, false);
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "the guard must refuse Cluster -> Pair"
+    );
+
+    let write_path = controller.write_path.load();
+    assert!(
+        !matches!(&**write_path, WritePath::Pair(_)),
+        "a refused pair transition left this cluster node with a pair write \
+         path: it would accept writes as a pair primary while the rest of the \
+         cluster runs Raft, and every mode-based check would still say Cluster"
+    );
+}
