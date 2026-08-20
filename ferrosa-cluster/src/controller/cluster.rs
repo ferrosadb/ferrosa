@@ -502,12 +502,13 @@ impl ModeController {
         else {
             return;
         };
+        let reserved_at = std::time::Instant::now();
         {
             let mut recent = self.recent_reconnect_invites.lock();
             if !super::invite::reserve_reconnect_invite(
                 &mut recent,
                 recipient,
-                std::time::Instant::now(),
+                reserved_at,
                 super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
                 super::MAX_CONNECTED_PEERS,
             ) {
@@ -520,7 +521,9 @@ impl ModeController {
             peers: plan.peers,
         };
         let pm_clone = pm.clone();
+        let recent_invites = self.recent_reconnect_invites.clone();
         self.spawn_tracked(async move {
+            let mut last_error = None;
             for attempt in 0..10 {
                 match pm_clone.send(recipient, invite.clone(), Lane::Data).await {
                     Ok(_) => {
@@ -537,15 +540,39 @@ impl ModeController {
                                 "ClusterInvite delivery retry (cluster-mode reconnect)"
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        } else {
-                            tracing::warn!(
-                                peer = %recipient,
-                                "ClusterInvite delivery failed after 10 attempts (cluster-mode reconnect)"
-                            );
                         }
+                        last_error = Some(e.to_string());
                     }
                 }
             }
+
+            // Report the reason, and give the cooldown back.
+            //
+            // This branch used to log a WARN without the error -- the retries
+            // carried `%e` at debug, which is off by default, so operators
+            // learned that delivery failed and never why. The peer this invite
+            // was for cannot join the cluster without it, and the function's
+            // own doc comment says as much: failing here "silently breaks Raft
+            // quorum forever".
+            //
+            // Releasing the reservation matters as much as the log line.
+            // Nothing re-triggers an invite except a peer-connect event, and
+            // the reservation taken above would suppress the next one for the
+            // rest of the cooldown -- so a single failed delivery could strand
+            // a peer in Pair mode indefinitely, which is what happened to
+            // node1 on 2026-08-20.
+            tracing::warn!(
+                peer = %recipient,
+                error = last_error.as_deref().unwrap_or("unknown"),
+                "ClusterInvite delivery failed after 10 attempts (cluster-mode \
+                 reconnect); this peer cannot join until an invite reaches it. \
+                 Releasing the cooldown so the next peer event can retry."
+            );
+            super::invite::release_reconnect_invite(
+                &mut recent_invites.lock(),
+                recipient,
+                reserved_at,
+            );
         });
     }
 

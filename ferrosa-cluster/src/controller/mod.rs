@@ -217,7 +217,9 @@ pub struct ModeController {
     /// Prevents duplicate inbound/outbound reconnect callbacks from swapping
     /// lanes and destabilising Raft while still allowing a recreated peer to
     /// receive a fresh invite after startup.
-    pub(super) recent_reconnect_invites: Mutex<BTreeMap<Uuid, std::time::Instant>>,
+    /// Shared so a failed delivery can hand its reservation back from the
+    /// spawned send task, which outlives the `&self` that started it.
+    pub(super) recent_reconnect_invites: Arc<Mutex<BTreeMap<Uuid, std::time::Instant>>>,
     /// Last time this node attempted to OPEN a connection to a peer discovered
     /// in an inbound `ClusterInvite`. Without this, a discovered peer that can
     /// never be reached (e.g. a stale host_id whose address resolves to a dead
@@ -372,7 +374,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -484,7 +486,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -547,7 +549,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
