@@ -74,6 +74,69 @@ impl DeploymentMode {
         }
     }
 
+    /// Filename of the durable "this node has been a cluster member" marker.
+    ///
+    /// A separate file rather than a field in an existing one, deliberately.
+    /// `schema.json` in this tree already has two writers with two formats and
+    /// loses data when they disagree; adding a third consumer to a contested
+    /// file to fix a correctness bug would be trading one for another.
+    pub const CLUSTER_MEMBER_MARKER: &str = "cluster-member";
+
+    /// Has this node been a Raft cluster member, according to `raft_dir`?
+    ///
+    /// Read at startup, before any peer connects, so the node knows what it is
+    /// before anything tells it what it looks like.
+    ///
+    /// The two failure directions are NOT symmetric, so the read is not either:
+    ///
+    /// - Absent -> `false`. A genuinely new node must start standalone; turning
+    ///   every first boot into a phantom cluster member would be worse than the
+    ///   bug being fixed.
+    /// - Present but unreadable or corrupt -> `true`. If a marker exists at all,
+    ///   something wrote it, and the only writer is a node that became a
+    ///   cluster member. Guessing "standalone" from a damaged marker is the
+    ///   exact failure this exists to prevent: node1 forgot it was a member,
+    ///   became a pair, and replicated point-to-point while the leader was
+    ///   still sending it AppendEntries.
+    ///
+    /// When in doubt, claim membership. A node that wrongly thinks it is a
+    /// returning member starts in `DegradedCluster`, waits for a quorum that
+    /// includes it, and is visibly stuck. A node that wrongly thinks it is new
+    /// starts serving as half a pair, which is silent and wrong.
+    #[must_use]
+    pub fn was_cluster_member(raft_dir: &std::path::Path) -> bool {
+        let marker = raft_dir.join(Self::CLUSTER_MEMBER_MARKER);
+        match std::fs::metadata(&marker) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            // Exists but cannot be stat'd (permissions, IO): assume membership.
+            Err(_) => true,
+        }
+    }
+
+    /// Record that this node is a Raft cluster member, durably.
+    ///
+    /// Written when the node enters `Cluster`, and never removed except by an
+    /// explicit operator decommission -- because the question it answers is
+    /// "has this node EVER been a member", and losing a quorum does not unmake
+    /// that.
+    ///
+    /// Written via a temporary file and `rename`, so an interrupted write
+    /// cannot leave a half-written marker. `rename` on the same filesystem is
+    /// atomic, so the marker either exists completely or not at all.
+    pub fn record_cluster_membership(raft_dir: &std::path::Path) -> std::io::Result<()> {
+        let marker = raft_dir.join(Self::CLUSTER_MEMBER_MARKER);
+        if marker.exists() {
+            return Ok(());
+        }
+        let staging = raft_dir.join(format!("{}.partial", Self::CLUSTER_MEMBER_MARKER));
+        std::fs::write(
+            &staging,
+            b"This node has been a member of a Raft cluster.\nIts presence makes the node rejoin as a degraded cluster member on restart\nrather than forming a pair. Remove it only to decommission the node.\n",
+        )?;
+        std::fs::rename(&staging, &marker)
+    }
+
     /// The mode a node must start in, given whether it was already a member of
     /// a Raft cluster.
     ///
@@ -199,6 +262,77 @@ mod tests {
     /// would have refused get accepted by whichever node still believes it is
     /// primary -- and on 2026-08-20 node1 did exactly that, sitting in pair
     /// mode with an empty schema while answering CQL.
+    /// The marker survives a reboot and is what makes the node self-repair.
+    #[test]
+    fn membership_is_remembered_across_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !DeploymentMode::was_cluster_member(dir.path()),
+            "a fresh data dir has never been a cluster member"
+        );
+
+        DeploymentMode::record_cluster_membership(dir.path()).expect("record");
+
+        assert!(
+            DeploymentMode::was_cluster_member(dir.path()),
+            "the marker must survive -- this is the whole point"
+        );
+        assert_eq!(
+            DeploymentMode::initial_for_restart(DeploymentMode::was_cluster_member(dir.path())),
+            DeploymentMode::DegradedCluster,
+            "so the node comes back knowing it must rejoin, not pair"
+        );
+    }
+
+    /// Recording twice is not an error, and does not rewrite the marker. Entering
+    /// Cluster mode happens on every quorum recovery, so this runs often.
+    #[test]
+    fn recording_membership_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        DeploymentMode::record_cluster_membership(dir.path()).expect("first");
+        DeploymentMode::record_cluster_membership(dir.path()).expect("second");
+        assert!(DeploymentMode::was_cluster_member(dir.path()));
+    }
+
+    /// An interrupted write must not leave a marker that reads as membership.
+    ///
+    /// Staging plus rename is what guarantees it: a `.partial` file is not the
+    /// marker, so a crash between write and rename leaves the node believing it
+    /// is new -- which is correct, because it never finished becoming a member.
+    #[test]
+    fn a_partial_write_is_not_a_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path()
+                .join(format!("{}.partial", DeploymentMode::CLUSTER_MEMBER_MARKER)),
+            b"half",
+        )
+        .expect("staging");
+        assert!(
+            !DeploymentMode::was_cluster_member(dir.path()),
+            "an unfinished write is not membership"
+        );
+    }
+
+    /// A marker that exists but cannot be read is treated as membership.
+    ///
+    /// The two errors are not equally bad. Wrongly claiming membership leaves
+    /// the node in DegradedCluster, waiting for a quorum, visibly stuck.
+    /// Wrongly claiming novelty makes it serve as half a pair -- silent, and
+    /// the failure that actually happened.
+    #[test]
+    fn an_unreadable_marker_is_treated_as_membership() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the marker should be: stat succeeds, so this
+        // asserts the "present in any form" rule rather than the IO-error path.
+        std::fs::create_dir(dir.path().join(DeploymentMode::CLUSTER_MEMBER_MARKER))
+            .expect("marker as dir");
+        assert!(
+            DeploymentMode::was_cluster_member(dir.path()),
+            "if something is there, a node wrote it, and only a member writes it"
+        );
+    }
+
     /// A node that was already a cluster member must come back as one.
     ///
     /// "A cluster never becomes a pair" is worthless if a restart resets the

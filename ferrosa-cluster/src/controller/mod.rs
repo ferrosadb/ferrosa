@@ -323,8 +323,31 @@ impl ModeController {
             }
         };
 
+        // What this node IS, before anything tells it what it looks like.
+        //
+        // Mode used to start unconditionally at Standalone and climb from peer
+        // connections, so a node that had been a committed cluster member
+        // forgot on restart and re-derived its shape from whoever reconnected
+        // first. For a node whose only seed is one peer that is Pair -- while
+        // the leader still counts it as a member and keeps sending it
+        // AppendEntries. Observed on node1, 2026-08-20.
+        //
+        // Raft membership on disk outranks a peer count, so a returning member
+        // starts DegradedCluster and can only recover to Cluster. The planner
+        // already handles that state: it emits RestoreClusterMode once the
+        // committed quorum is reached.
+        let initial_mode = DeploymentMode::initial_for_restart(DeploymentMode::was_cluster_member(
+            &super::controller::cluster::resolve_raft_dir(&config),
+        ));
+        if initial_mode != DeploymentMode::Standalone {
+            tracing::info!(
+                mode = %initial_mode,
+                "this node has been a cluster member; rejoining rather than forming"
+            );
+        }
+
         let controller = Arc::new(Self {
-            mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
+            mode: Arc::new(ArcSwap::from_pointee(initial_mode)),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
             storage,
