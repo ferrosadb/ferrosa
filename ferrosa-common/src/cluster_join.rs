@@ -27,13 +27,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The token range a node is responsible for serving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenRange {
-    pub start: i64,
-    pub end: i64,
-}
-
 /// What a peer replies when asked "am I a member of this cluster?".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipAnswer {
@@ -53,11 +46,16 @@ pub enum MembershipAnswer {
         by: String,
     },
     /// This node is in committed membership and must rejoin.
+    ///
+    /// Carries no token assignment, deliberately. Ownership is decided by
+    /// `AssignTokens` over Raft and nowhere else; putting it here too would
+    /// create a second source of truth for which node serves which keys, and
+    /// the two could disagree -- the same shape as the two DeploymentMode
+    /// copies this branch removed. The answer says the node must rejoin and
+    /// whether a replay can carry it; Raft says what it then owns.
     Member {
         /// Whether the cluster currently has quorum WITHOUT this node.
         cluster_degraded: bool,
-        /// The tokens this node is responsible for once it is serving.
-        tokens: Vec<TokenRange>,
         /// The oldest log index the cluster can still replay to this node.
         /// `None` when the log has not been purged at all.
         earliest_available_log_index: Option<u64>,
@@ -71,8 +69,12 @@ pub enum CatchUp {
     /// replication will carry it forward. Seconds, not minutes.
     RaftLog,
     /// The log was purged past this node's position, so there is no path from
-    /// where it is to where the cluster is. Its owned tokens must be streamed.
-    StreamTokens(Vec<TokenRange>),
+    /// where it is to where the cluster is. A full stream is required.
+    ///
+    /// Which tokens is not stated here and cannot be: the node learns that from
+    /// `AssignTokens` over Raft after it rejoins. The order is deliberate --
+    /// rejoin, be told what you own, stream that, then serve.
+    StreamOwnedTokens,
 }
 
 /// What the joining node does with the answer it got.
@@ -84,11 +86,8 @@ pub enum JoinAction {
     FormStandalone,
     /// Removed deliberately. Do not rejoin, and say why.
     RefuseDecommissioned { at: u64, by: String },
-    /// Rejoin. Reform Raft, get current, and only then serve.
-    Rejoin {
-        catch_up: CatchUp,
-        tokens: Vec<TokenRange>,
-    },
+    /// Rejoin. Reform Raft, learn what this node owns, get current, then serve.
+    Rejoin { catch_up: CatchUp },
 }
 
 impl JoinAction {
@@ -121,8 +120,6 @@ pub struct PeerKnowledge {
     pub decommissioned: Option<(u64, String)>,
     /// Does the cluster have quorum WITHOUT the asking node?
     pub quorum_without_asker: bool,
-    /// Tokens committed to the asking node.
-    pub tokens: Vec<TokenRange>,
     /// Oldest log index still replayable, if the log has been purged.
     pub earliest_available_log_index: Option<u64>,
 }
@@ -155,7 +152,6 @@ pub fn answer_membership(knowledge: &PeerKnowledge) -> MembershipAnswer {
     MembershipAnswer::Member {
         // Degraded from the ASKER's point of view: the cluster is missing it.
         cluster_degraded: !knowledge.quorum_without_asker,
-        tokens: knowledge.tokens.clone(),
         earliest_available_log_index: knowledge.earliest_available_log_index,
     }
 }
@@ -175,25 +171,21 @@ pub fn plan_join(answer: &MembershipAnswer, local_last_log_index: Option<u64>) -
             by: by.clone(),
         },
         MembershipAnswer::Member {
-            tokens,
             earliest_available_log_index,
             ..
         } => {
             let catch_up = match (local_last_log_index, earliest_available_log_index) {
-                // The cluster has purged past where this node stopped, so no
+                // The cluster purged past where this node stopped, so no
                 // sequence of log entries connects them.
                 (Some(local), Some(earliest)) if local + 1 < *earliest => {
-                    CatchUp::StreamTokens(tokens.clone())
+                    CatchUp::StreamOwnedTokens
                 }
                 // A member with no log at all -- reimaged clean -- cannot be
                 // caught up by replay either.
-                (None, _) => CatchUp::StreamTokens(tokens.clone()),
+                (None, _) => CatchUp::StreamOwnedTokens,
                 _ => CatchUp::RaftLog,
             };
-            JoinAction::Rejoin {
-                catch_up,
-                tokens: tokens.clone(),
-            }
+            JoinAction::Rejoin { catch_up }
         }
     }
 }
@@ -202,17 +194,9 @@ pub fn plan_join(answer: &MembershipAnswer, local_last_log_index: Option<u64>) -
 mod tests {
     use super::*;
 
-    fn tokens() -> Vec<TokenRange> {
-        vec![TokenRange {
-            start: 4000,
-            end: 8000,
-        }]
-    }
-
     fn member(earliest: Option<u64>) -> MembershipAnswer {
         MembershipAnswer::Member {
             cluster_degraded: true,
-            tokens: tokens(),
             earliest_available_log_index: earliest,
         }
     }
@@ -223,9 +207,56 @@ mod tests {
             in_committed_membership: true,
             decommissioned: None,
             quorum_without_asker: false,
-            tokens: tokens(),
             earliest_available_log_index: Some(900),
         }
+    }
+
+    /// The join answer must NOT carry token ownership.
+    ///
+    /// The node gets its tokens FROM THE CLUSTER -- but from `AssignTokens`
+    /// over Raft, which is the one authority for who serves which keys, not
+    /// from the join handshake. Carrying them in both places would create two
+    /// sources of truth that can disagree, the shape of defect this branch
+    /// already removed once by deleting the duplicate DeploymentMode.
+    ///
+    /// The sequence is: rejoin, be told what you own, stream that, then serve.
+    /// This pins the first half -- the answer says only whether a replay can
+    /// carry the node, never what it will own.
+    ///
+    /// Enforced structurally: `MembershipAnswer::Member` has no token field, so
+    /// adding one back breaks this construction at compile time rather than
+    /// slipping through as an unused extra.
+    #[test]
+    fn the_membership_answer_never_states_token_ownership() {
+        let answer = MembershipAnswer::Member {
+            cluster_degraded: true,
+            earliest_available_log_index: Some(900),
+        };
+        assert_eq!(
+            plan_join(&answer, None),
+            JoinAction::Rejoin {
+                catch_up: CatchUp::StreamOwnedTokens
+            },
+            "the decision is WHETHER to stream; Raft supplies what"
+        );
+    }
+
+    /// A node told to stream still must not serve, because at that moment it
+    /// does not even know what it owns yet.
+    #[test]
+    fn a_node_awaiting_its_token_assignment_cannot_serve() {
+        let action = plan_join(&member(None), None);
+        assert_eq!(
+            action,
+            JoinAction::Rejoin {
+                catch_up: CatchUp::StreamOwnedTokens
+            }
+        );
+        assert!(
+            !action.may_serve_queries(),
+            "it has not been told what it owns, so any answer would be about keys \
+it may not hold"
+        );
     }
 
     /// A peer that cannot see a quorum says so, whatever else it believes.
@@ -316,8 +347,7 @@ mod tests {
         assert_eq!(
             action,
             JoinAction::Rejoin {
-                catch_up: CatchUp::StreamTokens(tokens()),
-                tokens: tokens(),
+                catch_up: CatchUp::StreamOwnedTokens
             }
         );
         assert!(!action.may_serve_queries());
@@ -336,10 +366,9 @@ mod tests {
         assert_eq!(
             action,
             JoinAction::Rejoin {
-                catch_up: CatchUp::StreamTokens(tokens()),
-                tokens: tokens(),
+                catch_up: CatchUp::StreamOwnedTokens
             },
-            "no local log means no replay is possible; its tokens must be streamed"
+            "no local log means no replay is possible; a full stream is required"
         );
         assert!(
             !action.may_serve_queries(),
@@ -354,8 +383,7 @@ mod tests {
         assert_eq!(
             action,
             JoinAction::Rejoin {
-                catch_up: CatchUp::RaftLog,
-                tokens: tokens()
+                catch_up: CatchUp::RaftLog
             },
             "the log still reaches this node, so replication is enough"
         );
@@ -369,8 +397,7 @@ mod tests {
         assert_eq!(
             action,
             JoinAction::Rejoin {
-                catch_up: CatchUp::StreamTokens(tokens()),
-                tokens: tokens(),
+                catch_up: CatchUp::StreamOwnedTokens
             }
         );
     }
@@ -382,17 +409,15 @@ mod tests {
         assert_eq!(
             plan_join(&member(Some(900)), Some(899)),
             JoinAction::Rejoin {
-                catch_up: CatchUp::RaftLog,
-                tokens: tokens()
+                catch_up: CatchUp::RaftLog
             }
         );
-        assert!(matches!(
+        assert_eq!(
             plan_join(&member(Some(900)), Some(898)),
             JoinAction::Rejoin {
-                catch_up: CatchUp::StreamTokens(_),
-                ..
+                catch_up: CatchUp::StreamOwnedTokens
             }
-        ));
+        );
     }
 
     /// A peer without quorum must not be believed, in either direction.
