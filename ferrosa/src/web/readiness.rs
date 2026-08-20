@@ -72,7 +72,7 @@ pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCod
 
         // Pair modes: primary accepts connections, degraded pair allows stale
         // reads. Mirrors `is_cql_ready()` — if CQL is ready, so is the probe.
-        DeploymentMode::Pair | DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
+        DeploymentMode::Pair | DeploymentMode::DegradedPair => {
             (StatusCode::OK, Json(json!({"ready": true})))
         }
 
