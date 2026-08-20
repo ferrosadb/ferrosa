@@ -30,6 +30,15 @@ pub(super) enum PeerEventAction {
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
     },
+    /// Reached committed quorum while this node has no in-process Raft.
+    ///
+    /// `RestoreClusterMode` only flips the mode; it assumes Raft is already
+    /// running, which is true when DegradedCluster was reached by losing
+    /// quorum inside a live process. It is false for a node that *started*
+    /// in DegradedCluster from its `cluster-member` marker: that process has
+    /// never initialised Raft, so flipping the mode leaves it in Cluster with
+    /// no Raft, refusing every query forever.
+    RejoinClusterWithRaftInit,
     SendClusterInvite {
         host_id: Uuid,
         force: bool,
@@ -53,6 +62,8 @@ pub(super) struct PeerConnectPlanInput {
     pub(super) now: Instant,
     pub(super) cql_broadcast: Option<String>,
     pub(super) internode_broadcast: Option<String>,
+    /// Whether this process already has a Raft instance installed.
+    pub(super) raft_initialized: bool,
 }
 
 #[cfg(test)]
@@ -104,6 +115,7 @@ pub(super) fn plan_connected_peer(input: ConnectedPeerInput) -> ConnectedPeerPla
             now: input.now,
             cql_broadcast: input.cql_broadcast,
             internode_broadcast: input.internode_broadcast,
+            raft_initialized: true,
         })
         .into_iter()
         .filter(|action| !matches!(action, PeerEventAction::TrackPeer { .. }))
@@ -148,7 +160,11 @@ pub(super) fn plan_peer_connected(input: PeerConnectPlanInput) -> Vec<PeerEventA
                 input.connected_peers_after_track.len(),
                 input.committed_cluster_size,
             ) {
-                actions.push(PeerEventAction::RestoreClusterMode);
+                if input.raft_initialized {
+                    actions.push(PeerEventAction::RestoreClusterMode);
+                } else {
+                    actions.push(PeerEventAction::RejoinClusterWithRaftInit);
+                }
             }
         }
     }
@@ -235,6 +251,7 @@ mod tests {
             now,
             cql_broadcast: Some("127.0.0.1:9043".to_string()),
             internode_broadcast: Some("peer-node:7001".to_string()),
+            raft_initialized: true,
         });
 
         assert_eq!(
@@ -275,6 +292,7 @@ mod tests {
             now,
             cql_broadcast: None,
             internode_broadcast: None,
+            raft_initialized: true,
         });
 
         assert!(actions.contains(&PeerEventAction::TriggerClusterJoin {
@@ -289,6 +307,74 @@ mod tests {
                 PeerEventAction::SendClusterInvite { host_id, .. } if *host_id == peer
             )),
             "recent invite reservation should suppress only duplicate invite delivery, not join planning"
+        );
+    }
+
+    /// A node that *starts* in DegradedCluster from its `cluster-member`
+    /// marker has never initialised Raft in this process. Reaching quorum
+    /// must therefore rebuild Raft, not merely flip the mode.
+    ///
+    /// Observed live on 2026-08-20: node3 restarted, read its marker, came up
+    /// DegradedCluster, reached quorum, flipped to Cluster -- and then sat at
+    /// `503 {"detail":"raft not yet initialized"}` for thirteen minutes,
+    /// because `RestoreClusterMode` assumes a Raft that a restart destroyed.
+    #[test]
+    fn returning_member_without_raft_rejoins_by_initialising_it() {
+        let peer = host(2);
+        let plan = plan_peer_connected(PeerConnectPlanInput {
+            mode: DeploymentMode::DegradedCluster,
+            host_id: peer,
+            addr: addr(7001),
+            inbound: false,
+            connected_peers_after_track: vec![(peer, addr(7001)), (host(3), addr(7002))],
+            committed_cluster_size: 3,
+            join_enqueued: false,
+            last_invite_sent: None,
+            now: Instant::now(),
+            cql_broadcast: None,
+            internode_broadcast: None,
+            raft_initialized: false,
+        });
+
+        assert!(
+            plan.contains(&PeerEventAction::RejoinClusterWithRaftInit),
+            "a returning member with no Raft must be told to initialise it, \
+             not just to change its mode label: {plan:?}"
+        );
+        assert!(
+            !plan.contains(&PeerEventAction::RestoreClusterMode),
+            "RestoreClusterMode only flips the mode and would leave this node \
+             in Cluster with no Raft, refusing every query: {plan:?}"
+        );
+    }
+
+    /// The in-process case is unchanged: quorum was lost and regained without
+    /// a restart, so Raft is still installed and only the mode needs restoring.
+    #[test]
+    fn quorum_regained_in_process_only_restores_the_mode() {
+        let peer = host(2);
+        let plan = plan_peer_connected(PeerConnectPlanInput {
+            mode: DeploymentMode::DegradedCluster,
+            host_id: peer,
+            addr: addr(7001),
+            inbound: false,
+            connected_peers_after_track: vec![(peer, addr(7001)), (host(3), addr(7002))],
+            committed_cluster_size: 3,
+            join_enqueued: false,
+            last_invite_sent: None,
+            now: Instant::now(),
+            cql_broadcast: None,
+            internode_broadcast: None,
+            raft_initialized: true,
+        });
+
+        assert!(
+            plan.contains(&PeerEventAction::RestoreClusterMode),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.contains(&PeerEventAction::RejoinClusterWithRaftInit),
+            "re-initialising a live Raft would discard in-flight state: {plan:?}"
         );
     }
 
@@ -311,6 +397,7 @@ mod tests {
             now,
             cql_broadcast: None,
             internode_broadcast: None,
+            raft_initialized: true,
         });
         assert!(!no_quorum.contains(&PeerEventAction::RestoreClusterMode));
 
@@ -326,6 +413,7 @@ mod tests {
             now,
             cql_broadcast: None,
             internode_broadcast: None,
+            raft_initialized: true,
         });
         assert!(quorum.contains(&PeerEventAction::RestoreClusterMode));
     }
