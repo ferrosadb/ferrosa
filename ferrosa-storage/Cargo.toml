@@ -94,8 +94,9 @@ fuzz-fileio = ["test-generators"]
 # (`--features test-generators,repair-fuzz-known-failures`) keep working.
 repair-fuzz-known-failures = ["test-generators"]
 # Nightly real-concurrency read-vs-compaction stress (engine.rs
-# read_compaction_race_stress). Off by default so the per-PR gate stays fast;
-# the nightly fuzz workflow runs it on a shared-cpu Fly machine, env-scaled via
+# read_compaction_race_stress). Off by default so the per-PR gate stays fast.
+# No CI job runs it today — the nightly Fly runner was removed because it leaked
+# a Fly app per run. Run it by hand on a CPU-starved host, env-scaled via
 # RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
 race-stress = []
 

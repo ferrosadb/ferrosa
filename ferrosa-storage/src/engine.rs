@@ -14490,8 +14490,20 @@ mod tests {
     ///
     /// Feature-gated (`race-stress`) so it stays out of the per-PR gate (the
     /// fast hand-written barrier tests above are the per-PR deterministic tier).
-    /// The nightly fuzz workflow runs this on a shared-cpu Fly machine whose
-    /// ~6.5% baseline starves the compaction executor and widens the window.
+    ///
+    /// **No CI job runs this today.** It used to run nightly on a throwaway
+    /// shared-cpu Fly machine, whose ~6.5% baseline starves the compaction
+    /// executor and widens the race window. That job was removed because it
+    /// leaked a Fly app per run: the runner cancels the step at the job
+    /// timeout, which kills the script before its `trap ... EXIT` can call
+    /// `fly apps destroy`, and each run used a unique app name. Run it by hand
+    /// on a CPU-starved host:
+    ///
+    /// ```text
+    /// cargo test -p ferrosa-storage --features race-stress --release \
+    ///   read_compaction_race_stress -- --nocapture
+    /// ```
+    ///
     /// Scale via env: RACE_KEYS, RACE_READERS, RACE_SECS, RACE_FLUSH_EVERY.
     #[cfg(feature = "race-stress")]
     mod read_compaction_race_stress {
