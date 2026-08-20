@@ -217,7 +217,9 @@ pub struct ModeController {
     /// Prevents duplicate inbound/outbound reconnect callbacks from swapping
     /// lanes and destabilising Raft while still allowing a recreated peer to
     /// receive a fresh invite after startup.
-    pub(super) recent_reconnect_invites: Mutex<BTreeMap<Uuid, std::time::Instant>>,
+    /// Shared so a failed delivery can hand its reservation back from the
+    /// spawned send task, which outlives the `&self` that started it.
+    pub(super) recent_reconnect_invites: Arc<Mutex<BTreeMap<Uuid, std::time::Instant>>>,
     /// Last time this node attempted to OPEN a connection to a peer discovered
     /// in an inbound `ClusterInvite`. Without this, a discovered peer that can
     /// never be reached (e.g. a stale host_id whose address resolves to a dead
@@ -336,9 +338,26 @@ impl ModeController {
         // starts DegradedCluster and can only recover to Cluster. The planner
         // already handles that state: it emits RestoreClusterMode once the
         // committed quorum is reached.
-        let initial_mode = DeploymentMode::initial_for_restart(DeploymentMode::was_cluster_member(
-            &super::controller::cluster::resolve_raft_dir(&config),
-        ));
+        // Only ask the filesystem when the config says where to look.
+        //
+        // Falling back to the compiled-in `/var/lib/ferrosa` here would make a
+        // controller's initial mode -- and so whether it serves queries --
+        // depend on ambient host state instead of its configuration. A node
+        // that genuinely keeps Raft state there sets `raft_data_dir` or
+        // `FERROSA_DATA_DIR`; anything else is an unconfigured controller,
+        // which in practice means a test.
+        let initial_mode = match super::controller::cluster::configured_raft_dir(&config) {
+            Some(raft_dir) => {
+                DeploymentMode::initial_for_restart(DeploymentMode::was_cluster_member(&raft_dir))
+            }
+            None => {
+                tracing::debug!(
+                    "no raft_data_dir or FERROSA_DATA_DIR configured; not reading a \
+                     cluster-member marker from the default location"
+                );
+                DeploymentMode::Standalone
+            }
+        };
         if initial_mode != DeploymentMode::Standalone {
             tracing::info!(
                 mode = %initial_mode,
@@ -372,7 +391,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -484,7 +503,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -547,7 +566,7 @@ impl ModeController {
             transition_guard: Mutex::new(()),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
-            recent_reconnect_invites: Mutex::new(BTreeMap::new()),
+            recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
             recent_invite_connects: Mutex::new(BTreeMap::new()),
             background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             cancel: tokio_util::sync::CancellationToken::new(),

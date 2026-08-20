@@ -3323,3 +3323,96 @@ async fn a_refused_pair_transition_must_not_leave_a_pair_write_path() {
          cluster runs Raft, and every mode-based check would still say Cluster"
     );
 }
+
+/// A stranded node must not forget it was a cluster member while it repairs.
+///
+/// `reset_stranded_raft_state` deletes the local Raft log so the leader can
+/// resend it. If the `cluster-member` marker went with it, the node would come
+/// back as `Standalone`, form a pair with the first peer it meets, and start
+/// serving as a pair primary while still being a committed member of a Raft
+/// cluster -- the exact split brain the marker exists to prevent. The repair
+/// must not create the failure it repairs.
+#[tokio::test]
+async fn resetting_a_stranded_node_keeps_its_cluster_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let raft_dir = dir.path().join("raft").join("datacenter1");
+    std::fs::create_dir_all(&raft_dir).unwrap();
+
+    let marker = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
+    std::fs::write(&marker, b"member-since=whenever").unwrap();
+    std::fs::write(raft_dir.join("db"), b"stranded log bytes").unwrap();
+
+    let backup = ModeController::reset_stranded_raft_state(&raft_dir).expect("reset must succeed");
+
+    assert!(
+        DeploymentMode::was_cluster_member(&raft_dir),
+        "the node must still know it was a cluster member after the reset"
+    );
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"member-since=whenever",
+        "the marker contents must survive verbatim"
+    );
+    assert!(
+        !raft_dir.join("db").exists(),
+        "the stranded log must be gone, or openraft reads it again"
+    );
+
+    let backup = backup.expect("the stranded state must be retained, not deleted");
+    assert_eq!(
+        std::fs::read(backup.join("db")).unwrap(),
+        b"stranded log bytes",
+        "the stranded log is the only evidence of how the node got stranded"
+    );
+}
+
+/// A controller's initial mode must come from its config, not from the host.
+///
+/// `ModeController::new` reads the `cluster-member` marker to decide whether to
+/// come up as a returning cluster member -- which decides whether it serves
+/// queries at all. With a default config that lookup used to resolve to the
+/// machine-global `/var/lib/ferrosa`, so on a host with `FERROSA_DATA_DIR`
+/// exported, or where `/var/lib` is unreadable (`was_cluster_member`
+/// deliberately assumes membership when the marker cannot be read), an
+/// unconfigured controller would start in `DegradedCluster` and refuse traffic
+/// while every test asserting `Standalone` or `Pair` failed for reasons
+/// nothing in the test mentioned.
+#[tokio::test]
+#[serial_test::serial(env)]
+async fn an_unconfigured_controller_ignores_a_marker_on_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A marker exists exactly where the compiled-in default would look.
+    let planted = dir.path().join("raft").join("datacenter1");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join(DeploymentMode::CLUSTER_MEMBER_MARKER),
+        b"planted by the host",
+    )
+    .unwrap();
+
+    let prior = std::env::var("FERROSA_DATA_DIR").ok();
+    std::env::set_var("FERROSA_DATA_DIR", dir.path());
+
+    // With FERROSA_DATA_DIR set, the raft dir IS configured, so the marker
+    // counts and this node knows it was a member.
+    assert_eq!(
+        super::cluster::configured_raft_dir(&ClusterConfig::default()),
+        Some(planted.clone()),
+        "FERROSA_DATA_DIR is an explicit answer about where Raft state lives"
+    );
+
+    // With nothing configured, there is no answer, and the host's marker must
+    // not be consulted.
+    std::env::remove_var("FERROSA_DATA_DIR");
+    assert_eq!(
+        super::cluster::configured_raft_dir(&ClusterConfig::default()),
+        None,
+        "an unconfigured controller must not adopt a machine-global raft dir"
+    );
+
+    match prior {
+        Some(v) => std::env::set_var("FERROSA_DATA_DIR", v),
+        None => std::env::remove_var("FERROSA_DATA_DIR"),
+    }
+}

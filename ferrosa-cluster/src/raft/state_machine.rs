@@ -318,6 +318,13 @@ pub struct FerrosStateMachine {
     system_writer: Option<SystemTableWriter>,
     /// Optional on-disk snapshot file for restart recovery.
     snapshot_path: Option<PathBuf>,
+    /// Shared with the log store: the highest log index this state machine has
+    /// durably persisted. The log store will not purge past it.
+    ///
+    /// Raised only after `persist_snapshot_to_disk` returns, which now means
+    /// fsynced. Raising it earlier would restore the exact window that
+    /// stranded node3 -- a purge point that outran the snapshot backing it.
+    durable_applied: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl FerrosStateMachine {
@@ -376,7 +383,37 @@ impl FerrosStateMachine {
             ring_observer: None,
             system_writer: None,
             snapshot_path: None,
+            durable_applied: None,
         }
+    }
+
+    /// Share the log store's durable-applied watermark.
+    ///
+    /// Handed over at construction because openraft owns the log store and the
+    /// state machine separately once Raft is running, and the guard only works
+    /// if both halves read and write the same cell.
+    pub fn set_durable_applied_handle(&mut self, handle: Arc<std::sync::atomic::AtomicU64>) {
+        self.durable_applied = Some(handle);
+    }
+
+    /// Record that everything up to `log_id` is now durable on disk.
+    ///
+    /// Monotonic: a stale snapshot completing after a newer one must never
+    /// lower the watermark, or the log store would be told it may purge less
+    /// than it already has.
+    fn mark_durably_applied(&self, log_id: Option<LogId<u64>>) {
+        let (Some(handle), Some(log_id)) = (self.durable_applied.as_ref(), log_id) else {
+            return;
+        };
+        handle.fetch_max(log_id.index, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// This state machine's persisted `last_applied` index, if any.
+    ///
+    /// Exposed so startup can compare it against the log store's purge point
+    /// before openraft does; see `crate::raft::local_state`.
+    pub fn last_applied_index(&self) -> Option<u64> {
+        self.last_applied.map(|log_id| log_id.index)
     }
 
     /// Recover `last_applied` from the log store's purge point.
@@ -530,6 +567,7 @@ impl FerrosStateMachine {
             ring_observer: None,
             system_writer,
             snapshot_path: None,
+            durable_applied: None,
         }
     }
 
@@ -715,11 +753,45 @@ impl FerrosStateMachine {
             std::fs::create_dir_all(parent)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
+        // Durable, not merely written.
+        //
+        // This used to be write-then-rename with no fsync of either the file
+        // or its directory, so the function returned Ok while the snapshot
+        // could still be entirely in the page cache. Meanwhile the log store
+        // is free to purge the entries this snapshot is supposed to replace.
+        // A crash in that window leaves a node whose log has been truncated
+        // past a snapshot that never reached the disk -- purged to 3065,
+        // applied to 2905, and the entries in between gone. That is how node3
+        // was stranded on 2026-08-20.
+        //
+        // Returning Ok for a write that may not survive a crash is the "never
+        // fake success" failure, and the caller cannot tell the difference.
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, encoded)
-            .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        {
+            let file = std::fs::File::create(&tmp)
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            {
+                let mut writer = std::io::BufWriter::new(&file);
+                std::io::Write::write_all(&mut writer, &encoded)
+                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+                std::io::Write::flush(&mut writer)
+                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            }
+            file.sync_all()
+                .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+        }
         std::fs::rename(&tmp, path)
             .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+
+        // fsync the directory too, or the rename itself can be lost while the
+        // file contents survive -- leaving the snapshot under its temp name
+        // and the node with no snapshot at all.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                dir.sync_all()
+                    .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
+            }
+        }
         Ok(())
     }
 
@@ -1734,6 +1806,7 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
                 })
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+            self.mark_durably_applied(meta.last_log_id);
         }
 
         Ok(Snapshot {
@@ -1804,6 +1877,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
             ring_observer: None, // snapshot builder doesn't need observability ring
             system_writer: None, // snapshot builder doesn't need system writer
             snapshot_path: self.snapshot_path.clone(),
+            durable_applied: self.durable_applied.clone(),
         }
     }
 
@@ -1829,6 +1903,7 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
                 })
                 .await
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))??;
+            self.mark_durably_applied(meta.last_log_id);
         }
 
         Ok(())

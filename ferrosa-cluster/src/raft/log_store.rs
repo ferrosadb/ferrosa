@@ -279,6 +279,14 @@ pub struct SledLogStore {
     log: sled::Tree,
     /// Tree for metadata: vote, committed, last_purged.
     meta: sled::Tree,
+    /// Highest log index the state machine has *durably* persisted, or 0 when
+    /// nothing is known to be durable yet.
+    ///
+    /// Shared with the state machine, which raises it only after a snapshot
+    /// has been fsynced. `purge` will not delete past it: entries above this
+    /// index exist nowhere else on this node, so deleting them is
+    /// unrecoverable. See `crate::raft::local_state::purge_ceiling`.
+    durable_applied: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Counts of entries cleared by [`SledLogStore::reset`].
@@ -400,7 +408,22 @@ impl SledLogStore {
         let db = Self::open_sled_db_with_lock_retry(path)?;
         let log = db.open_tree("log")?;
         let meta = db.open_tree("meta")?;
-        Ok(Self { db, log, meta })
+        Ok(Self {
+            db,
+            log,
+            meta,
+            durable_applied: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// Share this store's durable-applied watermark with the state machine.
+    ///
+    /// The state machine raises it after each fsynced snapshot; this store
+    /// reads it to bound `purge`. They must be the same cell, which is why it
+    /// is handed over at construction rather than passed per call -- openraft
+    /// owns the two halves separately once Raft is running.
+    pub fn durable_applied_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.durable_applied.clone()
     }
 
     /// Open a sled `Db` at `path`, retrying through **transient** directory-lock
@@ -762,6 +785,25 @@ impl SledLogStore {
         })
     }
 
+    /// The `LogId` of the entry stored at `index`, if it is still present.
+    ///
+    /// A clamped purge has to name a real `LogId`, not just an index -- the
+    /// term at the clamp point is not necessarily the term of the purge
+    /// request that was refused.
+    fn log_id_at(&self, index: u64) -> Result<Option<LogId<u64>>, StorageIOError<u64>> {
+        let key = Self::index_key(index);
+        match self
+            .log
+            .get(key)
+            .map_err(|e| StorageIOError::read_logs(to_any_error(e)))?
+        {
+            Some(bytes) => Ok(Some(
+                Self::deserialize_entry_at(&Self::index_key(index), &bytes)?.log_id,
+            )),
+            None => Ok(None),
+        }
+    }
+
     fn save_meta<T: serde::Serialize>(
         meta: &sled::Tree,
         key: &[u8],
@@ -941,6 +983,9 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
             db: self.db.clone(),
             log: self.log.clone(),
             meta: self.meta.clone(),
+            // Same cell, not a copy: a reader that purges must see the same
+            // durable watermark the writer does.
+            durable_applied: self.durable_applied.clone(),
         }
     }
 
@@ -1043,6 +1088,62 @@ impl openraft::storage::RaftLogStorage<FerrosRaftConfig> for SledLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+        // Never delete past what the state machine has durably applied.
+        //
+        // openraft only asks to purge up to a snapshot it believes exists, so
+        // normally this passes the request through untouched. It exists for
+        // when that belief and the disk disagree: the snapshot is a separate
+        // file with its own durability, so a crash between "snapshot written"
+        // and "snapshot durable" leaves this store free to delete entries that
+        // survive nowhere else on this node. That is how node3 was stranded on
+        // 2026-08-20 -- purged to 3065, applied to 2905, and the entries in
+        // between gone for good.
+        //
+        // Purging less than asked costs disk until the next purge. Purging
+        // more than is durable cannot be undone.
+        let durable = self
+            .durable_applied
+            .load(std::sync::atomic::Ordering::Acquire);
+        let log_id = match crate::raft::local_state::purge_ceiling(log_id.index, Some(durable)) {
+            crate::raft::local_state::PurgeDecision::Purge { .. } => log_id,
+            crate::raft::local_state::PurgeDecision::Clamp { through, requested } => {
+                tracing::warn!(
+                    requested,
+                    clamped_to = through,
+                    "refusing to purge Raft log past the durably applied index; \
+                     the entries above it exist nowhere else on this node. \
+                     Purging only what the persisted snapshot covers."
+                );
+                match self.log_id_at(through) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        tracing::warn!(
+                            through,
+                            "clamped purge point is not present in the log; \
+                             skipping this purge"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %e,
+                            through,
+                            "could not read the clamped purge point; skipping this purge"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            crate::raft::local_state::PurgeDecision::Skip { requested } => {
+                tracing::warn!(
+                    requested,
+                    "refusing to purge Raft log: no snapshot is known to be durable, \
+                     so no entry is known to be reconstructable"
+                );
+                return Ok(());
+            }
+        };
+
         // Persist the purge point first so recovery can reconstruct state.
         Self::save_meta(&self.meta, META_LAST_PURGED, &log_id)?;
 
@@ -1153,6 +1254,65 @@ mod tests {
 
     // -- purge_removes_old_entries ----------------------------------------
 
+    /// The guard has to hold through the real `purge`, not only in the pure
+    /// decision function -- an inert guard reads exactly like a working one.
+    ///
+    /// Entries 1..=5 exist and the snapshot covers 3. openraft asks to purge
+    /// through 5. Deleting 4 and 5 would remove this node's only copy of them,
+    /// which is what stranded node3 on 2026-08-20, so the purge must stop at 3.
+    #[tokio::test]
+    async fn purge_stops_at_the_durably_applied_index() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        {
+            let mut batch = sled::Batch::default();
+            for idx in 1u64..=5 {
+                let entry = blank_entry(1, idx);
+                batch.insert(
+                    &SledLogStore::index_key(idx),
+                    SledLogStore::serialize_entry(&entry).unwrap(),
+                );
+            }
+            store.log.apply_batch(batch).unwrap();
+        }
+
+        // The snapshot on disk only covers index 3.
+        store
+            .durable_applied
+            .store(3, std::sync::atomic::Ordering::Release);
+
+        store
+            .purge(LogId::new(CommittedLeaderId::new(1, 0), 5))
+            .await
+            .unwrap();
+
+        let remaining = store.try_get_log_entries(1u64..6u64).await.unwrap();
+        let indexes: Vec<u64> = remaining.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(
+            indexes,
+            vec![4, 5],
+            "entries above the durable snapshot must survive the purge"
+        );
+
+        let state = <SledLogStore as RaftLogStorage<FerrosRaftConfig>>::get_log_state(&mut store)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.last_purged_log_id.map(|id| id.index),
+            Some(3),
+            "the recorded purge point must match what was actually deleted, or \
+             the node restarts believing entries are gone that are not"
+        );
+
+        assert_eq!(
+            crate::raft::local_state::classify_local_raft_state(Some(3), Some(3)),
+            crate::raft::local_state::LocalRaftState::Usable
+        );
+    }
+
     #[tokio::test]
     async fn purge_removes_old_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -1169,6 +1329,14 @@ mod tests {
             }
             store.log.apply_batch(batch).unwrap();
         }
+
+        // A purge may not run past what the state machine has durably applied,
+        // so say that a snapshot covering these entries exists. Without this
+        // the store correctly refuses to delete anything -- deleting entries
+        // no snapshot covers is what strands a node.
+        store
+            .durable_applied
+            .store(5, std::sync::atomic::Ordering::Release);
 
         // Purge up to index 3 (inclusive).
         let purge_id = LogId::new(CommittedLeaderId::new(1, 0), 3);
@@ -1793,6 +1961,12 @@ mod tests {
         // Run the purge. With spawn_blocking inside purge, the
         // current_thread runtime is free to keep ticking the heartbeat
         // task while the sled work runs on a blocking thread.
+        // Declare a durable snapshot covering the range, or the purge guard
+        // refuses and this stops measuring what it means to measure.
+        store
+            .durable_applied
+            .store(1000, std::sync::atomic::Ordering::Release);
+
         let purge_id = LogId::new(CommittedLeaderId::new(1, 0), 1000);
         store.purge(purge_id).await.unwrap();
 

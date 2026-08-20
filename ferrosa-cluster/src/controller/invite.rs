@@ -75,9 +75,116 @@ pub(super) fn reserve_reconnect_invite(
     true
 }
 
+/// Give back a reservation whose delivery failed.
+///
+/// `reserve_reconnect_invite` records the attempt *before* it is made, which is
+/// right for storm prevention and wrong for failure: an invite that never
+/// arrived still occupies the cooldown, so every retrigger inside the window is
+/// suppressed at `debug` level and the peer is left waiting for an invite that
+/// is not coming. On 2026-08-20 that combination -- delivery failed after 10
+/// attempts, nothing re-triggers, cooldown swallows what would have -- kept
+/// node1 in Pair mode indefinitely while node3 ran a cluster without it.
+///
+/// Only clears the reservation the caller made. A later successful reservation
+/// for the same peer is left alone, so a slow failure cannot reopen the window
+/// on a delivery that has since succeeded.
+pub(super) fn release_reconnect_invite(
+    recent: &mut BTreeMap<Uuid, Instant>,
+    recipient: Uuid,
+    reserved_at: Instant,
+) {
+    if recent.get(&recipient) == Some(&reserved_at) {
+        recent.remove(&recipient);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed delivery must not hold the cooldown. Otherwise the peer waits
+    /// out a window for an invite that was never delivered, and the retry is
+    /// suppressed at debug level so nothing says why.
+    #[test]
+    fn a_released_reservation_lets_the_next_attempt_through() {
+        let mut recent = BTreeMap::new();
+        let peer = Uuid::from_u128(1);
+        let cooldown = Duration::from_secs(30);
+        let now = Instant::now();
+
+        assert!(reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            now,
+            cooldown,
+            16
+        ));
+
+        // Delivery failed — give the reservation back.
+        release_reconnect_invite(&mut recent, peer, now);
+
+        assert!(
+            reserve_reconnect_invite(&mut recent, peer, now, cooldown, 16),
+            "a retry inside the cooldown must be allowed once the failed \
+             delivery released its reservation"
+        );
+    }
+
+    /// The storm-prevention contract is unchanged for deliveries that worked.
+    #[test]
+    fn a_successful_delivery_still_holds_the_cooldown() {
+        let mut recent = BTreeMap::new();
+        let peer = Uuid::from_u128(1);
+        let cooldown = Duration::from_secs(30);
+        let now = Instant::now();
+
+        assert!(reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            now,
+            cooldown,
+            16
+        ));
+        assert!(
+            !reserve_reconnect_invite(&mut recent, peer, now, cooldown, 16),
+            "without a release, the cooldown must still suppress"
+        );
+    }
+
+    /// A late failure must not reopen a window that a newer, successful
+    /// delivery has since taken.
+    #[test]
+    fn releasing_a_stale_reservation_does_not_clear_a_newer_one() {
+        let mut recent = BTreeMap::new();
+        let peer = Uuid::from_u128(1);
+        let cooldown = Duration::from_secs(30);
+        let first = Instant::now();
+        let second = first + Duration::from_secs(31);
+
+        assert!(reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            first,
+            cooldown,
+            16
+        ));
+        assert!(reserve_reconnect_invite(
+            &mut recent,
+            peer,
+            second,
+            cooldown,
+            16
+        ));
+
+        // The first attempt finally reports failure, long after the second
+        // reservation replaced it.
+        release_reconnect_invite(&mut recent, peer, first);
+
+        assert!(
+            !reserve_reconnect_invite(&mut recent, peer, second, cooldown, 16),
+            "the newer reservation must survive a stale release"
+        );
+    }
 
     /// Storm-prevention contract for the invite *connect* path
     /// (`recent_invite_connects`): a set of unreachable discovered peers

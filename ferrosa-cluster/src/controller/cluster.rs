@@ -274,16 +274,75 @@ where
 /// the marker would be written where nobody looks, and the node would forget
 /// it was a member -- the exact bug this is fixing, reintroduced by a
 /// duplicated expression.
+impl ModeController {
+    /// Move a stranded Raft directory aside and start a clean one, keeping the
+    /// `cluster-member` marker.
+    ///
+    /// The marker has to survive. It is what tells the restarted node it was a
+    /// cluster member, so it comes back as `DegradedCluster` -- refusing
+    /// queries until it has real data -- instead of forming a fresh pair on
+    /// top of a cluster it is still a committed member of. Losing it here
+    /// would turn a recoverable strand into the split brain the deployment
+    /// mode work exists to prevent.
+    ///
+    /// The old directory is retained rather than deleted: it is the only
+    /// evidence of how the node got stranded.
+    pub(crate) fn reset_stranded_raft_state(
+        raft_dir: &std::path::Path,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
+        let marker = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
+        let saved_marker = match std::fs::read(&marker) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+
+        let counts = crate::raft::log_store::SledLogStore::reset(raft_dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if let Some(bytes) = saved_marker {
+            std::fs::write(raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER), bytes)?;
+        }
+
+        Ok(counts.backup_path)
+    }
+}
+
 pub fn resolve_raft_dir(config: &crate::config::ClusterConfig) -> std::path::PathBuf {
+    configured_raft_dir(config)
+        .unwrap_or_else(|| raft_log_dir_for_dc(&default_raft_base(), &config.data_center))
+}
+
+/// Where this config *says* its Raft state lives, if it says at all.
+///
+/// `None` means neither `raft_data_dir` nor `FERROSA_DATA_DIR` was set and the
+/// caller would be falling back to the compiled-in `/var/lib/ferrosa`.
+///
+/// The distinction matters for decisions that read the filesystem to work out
+/// what this node *is*. `ModeController::new` consults the `cluster-member`
+/// marker to decide whether to come up as a returning cluster member, and with
+/// a default-constructed config that lookup lands on a machine-global path --
+/// so a controller's initial mode, and therefore whether it will serve
+/// queries, would depend on ambient host state rather than on its
+/// configuration. Unit tests build controllers with `ClusterConfig::default()`
+/// all the time; on a host with `FERROSA_DATA_DIR` exported, or where
+/// `/var/lib` is unreadable (`was_cluster_member` deliberately assumes
+/// membership on an unreadable marker), they would silently start in a
+/// different mode than the one they assert.
+pub fn configured_raft_dir(config: &crate::config::ClusterConfig) -> Option<std::path::PathBuf> {
     let local_dc = config.data_center.clone();
-    let base = if let Some(dir) = config.raft_data_dir_for_dc(&local_dc) {
-        dir
-    } else {
-        let data_dir =
-            std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
-        std::path::Path::new(&data_dir).join("raft")
+    let base = match config.raft_data_dir_for_dc(&local_dc) {
+        Some(dir) => dir,
+        None => std::path::Path::new(&std::env::var("FERROSA_DATA_DIR").ok()?).join("raft"),
     };
-    raft_log_dir_for_dc(&base, &local_dc)
+    Some(raft_log_dir_for_dc(&base, &local_dc))
+}
+
+fn default_raft_base() -> std::path::PathBuf {
+    std::path::Path::new(
+        &std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into()),
+    )
+    .join("raft")
 }
 
 pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::PathBuf {
@@ -468,12 +527,13 @@ impl ModeController {
         else {
             return;
         };
+        let reserved_at = std::time::Instant::now();
         {
             let mut recent = self.recent_reconnect_invites.lock();
             if !super::invite::reserve_reconnect_invite(
                 &mut recent,
                 recipient,
-                std::time::Instant::now(),
+                reserved_at,
                 super::CLUSTER_RECONNECT_INVITE_COOLDOWN,
                 super::MAX_CONNECTED_PEERS,
             ) {
@@ -486,7 +546,9 @@ impl ModeController {
             peers: plan.peers,
         };
         let pm_clone = pm.clone();
+        let recent_invites = self.recent_reconnect_invites.clone();
         self.spawn_tracked(async move {
+            let mut last_error = None;
             for attempt in 0..10 {
                 match pm_clone.send(recipient, invite.clone(), Lane::Data).await {
                     Ok(_) => {
@@ -503,15 +565,39 @@ impl ModeController {
                                 "ClusterInvite delivery retry (cluster-mode reconnect)"
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        } else {
-                            tracing::warn!(
-                                peer = %recipient,
-                                "ClusterInvite delivery failed after 10 attempts (cluster-mode reconnect)"
-                            );
                         }
+                        last_error = Some(e.to_string());
                     }
                 }
             }
+
+            // Report the reason, and give the cooldown back.
+            //
+            // This branch used to log a WARN without the error -- the retries
+            // carried `%e` at debug, which is off by default, so operators
+            // learned that delivery failed and never why. The peer this invite
+            // was for cannot join the cluster without it, and the function's
+            // own doc comment says as much: failing here "silently breaks Raft
+            // quorum forever".
+            //
+            // Releasing the reservation matters as much as the log line.
+            // Nothing re-triggers an invite except a peer-connect event, and
+            // the reservation taken above would suppress the next one for the
+            // rest of the cooldown -- so a single failed delivery could strand
+            // a peer in Pair mode indefinitely, which is what happened to
+            // node1 on 2026-08-20.
+            tracing::warn!(
+                peer = %recipient,
+                error = last_error.as_deref().unwrap_or("unknown"),
+                "ClusterInvite delivery failed after 10 attempts (cluster-mode \
+                 reconnect); this peer cannot join until an invite reaches it. \
+                 Releasing the cooldown so the next peer event can retry."
+            );
+            super::invite::release_reconnect_invite(
+                &mut recent_invites.lock(),
+                recipient,
+                reserved_at,
+            );
         });
     }
 
@@ -719,6 +805,11 @@ impl ModeController {
             self.storage.clone(),
             snapshot_path,
         );
+        // Join the two halves of the purge guard. The log store will not purge
+        // past what this state machine reports durable; without this handshake
+        // the watermark stays 0 and the guard is inert.
+        state_machine.set_durable_applied_handle(log_store.durable_applied_handle());
+
         let recovered_persisted_snapshot = match state_machine.recover_from_persisted_snapshot() {
             Ok(recovered) => recovered,
             Err(e) => {
@@ -727,12 +818,75 @@ impl ModeController {
             }
         };
 
-        // Recover last_applied from the log store's purge point if the state
-        // machine was lost (e.g., OOM kill before snapshot persisted). Without
-        // this, openraft tries to replay from index 0 but purged entries are
-        // gone, causing a fatal "expected index [0, N)" error on startup.
+        // Reconcile the state machine against the log store's purge point
+        // BEFORE openraft reads either. Two durable facts have to agree for a
+        // node to restart on its own log, and until 2026-08-20 nothing checked
+        // that they did -- openraft found out during re-apply and failed Fatal
+        // with an index range and no cause. See `crate::raft::local_state`.
         match log_store.last_purged_log_id() {
-            Ok(purge_point) => state_machine.recover_from_purge_point(purge_point),
+            Ok(purge_point) => {
+                let classification = crate::raft::local_state::classify_local_raft_state(
+                    state_machine.last_applied_index(),
+                    purge_point.map(|log_id| log_id.index),
+                );
+                match classification {
+                    crate::raft::local_state::LocalRaftState::StrandedBehindPurge {
+                        last_applied,
+                        last_purged,
+                    } => {
+                        tracing::error!(
+                            last_applied,
+                            last_purged,
+                            missing = format!("{}..={}", last_applied + 1, last_purged),
+                            dir = %raft_dir.display(),
+                            "local Raft state is unusable: entries were purged before they \
+                             were applied, so this node holds no copy of them. Resetting \
+                             local Raft state (retained for inspection) and rejoining to \
+                             receive a snapshot from the leader."
+                        );
+                        match Self::reset_stranded_raft_state(&raft_dir) {
+                            Ok(backup) => {
+                                tracing::warn!(
+                                    backup = %backup.as_deref().unwrap_or(std::path::Path::new("<none>")).display(),
+                                    "stranded Raft state moved aside; rebuilding from the leader"
+                                );
+                                match SledLogStore::new(&raft_dir) {
+                                    Ok(fresh) => {
+                                        log_store = fresh;
+                                        state_machine =
+                                            FerrosStateMachine::with_side_effects_and_snapshot_path(
+                                                self.schema.clone(),
+                                                self.storage.clone(),
+                                                raft_dir.join("state-machine.snapshot.bin"),
+                                            );
+                                        state_machine.set_durable_applied_handle(
+                                            log_store.durable_applied_handle(),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(%e, "failed to recreate Raft log store after reset");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    %e,
+                                    "could not reset stranded Raft state; this node cannot \
+                                     rejoin and needs operator repair"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    crate::raft::local_state::LocalRaftState::NeedsPurgePointBaseline {
+                        ..
+                    } => {
+                        state_machine.recover_from_purge_point(purge_point);
+                    }
+                    crate::raft::local_state::LocalRaftState::Usable => {}
+                }
+            }
             Err(e) => tracing::warn!(%e, "failed to read last_purged from log store"),
         }
 
