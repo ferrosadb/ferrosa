@@ -879,12 +879,16 @@ mod tests {
         let hlc = HybridLogicalClock::new(1, max_drift);
         let before = hlc.now();
 
-        // Use a remote time far enough ahead that even with wall-clock
-        // advancement between computing the remote time and the merge
-        // call, the drift is still clearly excessive.
+        // One hour ahead. The offset must dwarf any pause this thread could
+        // take, not merely exceed `max_drift`: the assertion below distinguishes
+        // "clock stayed local" from "clock adopted the remote" by comparing
+        // against a later wall-clock sample, and a small offset lets the local
+        // clock simply catch up, masking a real adoption bug. An hour cannot be
+        // caught up to inside a unit test.
+        const FAR_FUTURE_NS: u64 = 3_600 * 1_000_000_000;
         let remote = Timestamp {
             epoch: 0,
-            time: HybridLogicalClock::wall_clock_ns() + max_drift * 10,
+            time: HybridLogicalClock::wall_clock_ns() + FAR_FUTURE_NS,
             seq: 0,
             node: 99,
         };
@@ -892,12 +896,40 @@ mod tests {
         let result = hlc.merge(remote);
         assert!(result.is_err(), "merge must reject excessive drift");
 
-        // Local HLC should be unchanged (or only advanced by wall clock).
+        // Deliberate stall, far longer than the old `max_drift * 10` bound.
+        //
+        // This is a regression guard, not padding. The assertion below must
+        // hold no matter how much real time passes here. The previous version
+        // asserted `after.time <= before.time + max_drift * 10`, which is a
+        // statement about how long the THREAD was descheduled, not about what
+        // the clock did: any pause longer than 10 ms failed a perfectly correct
+        // HLC. That is what ejected PR #345 from the merge queue, on a
+        // coverage-instrumented shared runner. Keeping the stall here means a
+        // future elapsed-time-based assertion fails immediately and
+        // deterministically instead of once in a while on CI.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
         let after = hlc.now();
+        let local_wall = HybridLogicalClock::wall_clock_ns();
+
+        // The real invariant: a rejected merge must leave the clock tracking
+        // LOCAL time. `now()` yields `max(wall_clock_ns(), last_time)`, so a
+        // clock that never adopted the remote timestamp cannot read ahead of a
+        // wall-clock sample taken after it. Had the merge been applied, `after`
+        // would carry `remote.time`, which is `max_drift * 10` in the future.
+        // Sampling the wall clock rather than assuming a bound on elapsed time
+        // makes this immune to scheduler stalls in either direction.
         assert!(
-            after.time <= before.time + max_drift * 10,
-            "HLC must not have jumped to remote time: after={:?}",
-            after,
+            after.time <= local_wall,
+            "rejected merge must leave the HLC on local time, not the remote's: \
+             after={after:?} local_wall={local_wall} rejected_remote={}",
+            remote.time,
+        );
+
+        // A rejected merge must not move the clock backwards either.
+        assert!(
+            after.time >= before.time,
+            "HLC must be monotonic: before={before:?} after={after:?}",
         );
     }
 
