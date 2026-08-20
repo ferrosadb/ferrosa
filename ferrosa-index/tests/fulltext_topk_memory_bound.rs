@@ -44,7 +44,14 @@ unsafe impl GlobalAlloc for TrackingAlloc {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ARMED.load(Ordering::Relaxed) {
-            LIVE.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+            // Clamp at zero: `measure_peak` zeroes LIVE at arm time, so a free
+            // of memory allocated BEFORE the window would drive the counter
+            // negative and, because PEAK is a running maximum of LIVE, suppress
+            // every later allocation. Seeding runs outside the window by design,
+            // so how much of it is released inside the window is pure timing.
+            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                Some((live - layout.size() as i64).max(0))
+            });
         }
         unsafe { System.dealloc(ptr, layout) };
     }
