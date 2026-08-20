@@ -795,6 +795,65 @@ impl ModeController {
     pub fn set_mode_for_test(&self, mode: DeploymentMode) {
         self.mode.store(Arc::new(mode));
     }
+
+    /// Move to `target`, refusing any transition the state machine forbids.
+    ///
+    /// Every mode change went through a bare `self.mode.store(...)` that asked
+    /// nothing about the current state, so `DeploymentMode::can_transition_to`
+    /// -- which encodes the rules correctly and has its own tests -- was never
+    /// called by production code at all. A guard nothing consults is a comment.
+    ///
+    /// That is how a node that had been a multi-node Raft cluster ended up in
+    /// pair mode (node1, 2026-08-20): `enter_pair_mode` stored `Pair`
+    /// unconditionally. It then replicated DDL point-to-point instead of
+    /// through a quorum, timed out, and served CQL with an empty schema.
+    ///
+    /// Returns whether the move happened. A refusal is logged at ERROR and
+    /// leaves the mode untouched: continuing in the current mode is always
+    /// safer than entering one the machine says is unreachable, because the
+    /// forbidden directions are precisely the ones that weaken consistency.
+    /// Set the mode in defiance of the state machine, at an operator's request.
+    ///
+    /// Separate from [`Self::try_transition_mode`] and deliberately not
+    /// guarded. `force_promote_to_standalone` exists so a human can break a
+    /// split brain by declaring one node authoritative, and the machine
+    /// correctly forbids `Cluster -> Standalone` -- so routing that through the
+    /// guard would refuse the recovery action the operator invoked precisely
+    /// because the cluster is already broken.
+    ///
+    /// The distinction is the point: automatic lifecycle changes are guarded,
+    /// operator overrides are not, and the two must not share a code path or
+    /// the exception silently becomes the rule. Logged at WARN with both modes
+    /// so an override is never mistaken for a normal transition when reading
+    /// logs afterwards.
+    pub(super) fn force_mode_override(&self, target: DeploymentMode, reason: &str) {
+        let current = **self.mode.load();
+        tracing::warn!(
+            %current,
+            %target,
+            reason,
+            "operator override: setting mode outside the state machine"
+        );
+        self.mode.store(Arc::new(target));
+    }
+
+    pub(super) fn try_transition_mode(&self, target: DeploymentMode) -> bool {
+        let current = **self.mode.load();
+        if current == target {
+            return true;
+        }
+        if !current.can_transition_to(target) {
+            tracing::error!(
+                %current,
+                %target,
+                "refused illegal mode transition; staying in the current mode"
+            );
+            return false;
+        }
+        self.mode.store(Arc::new(target));
+        tracing::info!(%current, %target, "mode transition");
+        true
+    }
 }
 
 #[cfg(test)]

@@ -3142,3 +3142,73 @@ async fn transition_to_cluster_uses_keyspace_rf_not_hardcoded_1() {
         "coordinator default_rf must be 3 (from keyspace schema), not the hardcoded 1"
     );
 }
+
+/// No production code may set the deployment mode without going through the
+/// state machine.
+///
+/// A source-level check, because the defect it guards was not a wrong rule --
+/// `DeploymentMode::can_transition_to` encoded the rules correctly and passed
+/// its own tests -- but a rule nothing consulted. Every mode change was a bare
+/// `self.mode.store(...)`, so the guard was dead code while a bypass shipped,
+/// and a node that had been a multi-node Raft cluster could be put back into
+/// pair mode by one unconditional store.
+///
+/// A behavioural test cannot catch that: each call site behaves correctly in
+/// isolation. What must be asserted is that the bypass does not EXIST.
+///
+/// Two exemptions, named so a third has to be added deliberately:
+/// `set_mode_for_test` (documented test escape hatch) and `force_mode_override`
+/// (operator split-brain recovery, which must defy the machine and says so).
+#[test]
+fn no_controller_code_sets_the_mode_outside_the_state_machine() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
+    let exempt = [
+        "set_mode_for_test",
+        "force_mode_override",
+        "try_transition_mode",
+    ];
+    let mut offenders = Vec::new();
+
+    for entry in std::fs::read_dir(&dir).expect("controller dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        // Skip this file. It contains the detector string itself, so scanning
+        // it makes the check fail on its own source -- a self-detection trap
+        // that a check written to find a literal will always walk into unless
+        // it excludes itself. The scan is over PRODUCTION code.
+        if file_name == "tests.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read source");
+        let is_mod = file_name == "mod.rs";
+        for (n, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.contains("mode.store(") || trimmed.starts_with("//") {
+                continue;
+            }
+            if is_mod {
+                let preceding: String = source.lines().take(n).collect::<Vec<_>>().join("\n");
+                if exempt
+                    .iter()
+                    .any(|f| preceding.contains(&format!("fn {f}")))
+                {
+                    continue;
+                }
+            }
+            offenders.push(format!("{}:{}: {trimmed}", path.display(), n + 1));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "mode set without the state machine -- use try_transition_mode, or \
+force_mode_override if an operator is deliberately overriding it:\n  {}",
+        offenders.join("\n  ")
+    );
+}

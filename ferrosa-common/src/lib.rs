@@ -15,6 +15,11 @@ pub mod cell;
 pub mod complex_cell;
 pub mod cql_type;
 pub mod data_type;
+/// Cluster formation lifecycle. Lives here, not in ferrosa-cluster, because
+/// ferrosa-sim needs the same state machine and deliberately cannot depend on
+/// ferrosa-cluster (openraft + sled + the network stack). Two hand-synchronised
+/// copies is what let a bypass ship in one of them.
+pub mod deployment_mode;
 pub mod error;
 pub mod geometry;
 pub mod key;

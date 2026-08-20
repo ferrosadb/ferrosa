@@ -504,7 +504,7 @@ impl ModeController {
             return;
         }
 
-        self.mode.store(Arc::new(DeploymentMode::Forming));
+        self.try_transition_mode(DeploymentMode::Forming);
         // Record committed cluster size for quorum calculations (peers + self).
         self.committed_cluster_size
             .store(peers.len() + 1, std::sync::atomic::Ordering::Relaxed);
@@ -960,7 +960,7 @@ impl ModeController {
         // Clear pair context — no longer in pair mode
         *self.pair_context.lock() = None;
 
-        self.mode.store(Arc::new(DeploymentMode::Cluster));
+        self.try_transition_mode(DeploymentMode::Cluster);
 
         tracing::info!(
             node_id = local_node_id,

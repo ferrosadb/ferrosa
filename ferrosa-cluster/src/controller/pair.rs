@@ -136,7 +136,7 @@ impl ModeController {
             peer_addr,
         });
 
-        self.mode.store(Arc::new(DeploymentMode::Pair));
+        self.try_transition_mode(DeploymentMode::Pair);
         tracing::info!(
             %role,
             peer = %peer_host_id,

@@ -194,7 +194,7 @@ impl ModeController {
                 }
                 PeerEventAction::RestoreClusterMode => {
                     tracing::info!("quorum restored — transitioning back to Cluster");
-                    self.mode.store(Arc::new(DeploymentMode::Cluster));
+                    self.try_transition_mode(DeploymentMode::Cluster);
                     // Raft will resume accepting writes once leader is re-elected.
                     // Write path and DDL path are restored by the Raft leader
                     // election callback (already in transition_to_cluster's async task).
@@ -327,7 +327,7 @@ impl PeerEventListener for ModeController {
                         quorum,
                         "quorum lost — transitioning to DegradedCluster"
                     );
-                    self.mode.store(Arc::new(DeploymentMode::DegradedCluster));
+                    self.try_transition_mode(DeploymentMode::DegradedCluster);
                     self.write_path
                         .store(Arc::new(crate::write_path::WritePath::unavailable()));
                     // DDL unavailable without quorum
