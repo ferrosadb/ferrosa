@@ -105,6 +105,61 @@ impl JoinAction {
     }
 }
 
+/// What the answering peer knows when a node asks about its membership.
+///
+/// Deliberately plain data. The peer side is where a wrong answer does the
+/// most damage -- it is authoritative for another node's identity -- so the
+/// decision is separated from the Raft handles that produce these facts, and
+/// tested without them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerKnowledge {
+    /// Can this peer currently see a committed quorum?
+    pub has_quorum: bool,
+    /// Is the asking node in committed Raft membership?
+    pub in_committed_membership: bool,
+    /// A recorded decommission for the asking node, if there is one.
+    pub decommissioned: Option<(u64, String)>,
+    /// Does the cluster have quorum WITHOUT the asking node?
+    pub quorum_without_asker: bool,
+    /// Tokens committed to the asking node.
+    pub tokens: Vec<TokenRange>,
+    /// Oldest log index still replayable, if the log has been purged.
+    pub earliest_available_log_index: Option<u64>,
+}
+
+/// Answer a membership question, from one peer's knowledge.
+///
+/// Quorum is checked FIRST and unconditionally. A peer that cannot see a
+/// committed quorum knows nothing it may assert about another node, including
+/// that the node is unknown to it -- a partitioned minority has every reason to
+/// believe a member it cannot reach is not a member.
+///
+/// The decommission record is checked BEFORE membership, because removal is the
+/// stronger statement. A node can be absent from current membership precisely
+/// because it was removed, and reporting that as "never seen" loses the reason
+/// and invites it to rejoin as a new node carrying data it no longer owns.
+#[must_use]
+pub fn answer_membership(knowledge: &PeerKnowledge) -> MembershipAnswer {
+    if !knowledge.has_quorum {
+        return MembershipAnswer::NoQuorum;
+    }
+    if let Some((at, by)) = &knowledge.decommissioned {
+        return MembershipAnswer::Decommissioned {
+            at: *at,
+            by: by.clone(),
+        };
+    }
+    if !knowledge.in_committed_membership {
+        return MembershipAnswer::NotAMember;
+    }
+    MembershipAnswer::Member {
+        // Degraded from the ASKER's point of view: the cluster is missing it.
+        cluster_degraded: !knowledge.quorum_without_asker,
+        tokens: knowledge.tokens.clone(),
+        earliest_available_log_index: knowledge.earliest_available_log_index,
+    }
+}
+
 /// Decide what to do with a peer's answer.
 ///
 /// `local_last_log_index` is where this node's Raft log stops. It decides
@@ -160,6 +215,112 @@ mod tests {
             tokens: tokens(),
             earliest_available_log_index: earliest,
         }
+    }
+
+    fn knows(has_quorum: bool) -> PeerKnowledge {
+        PeerKnowledge {
+            has_quorum,
+            in_committed_membership: true,
+            decommissioned: None,
+            quorum_without_asker: false,
+            tokens: tokens(),
+            earliest_available_log_index: Some(900),
+        }
+    }
+
+    /// A peer that cannot see a quorum says so, whatever else it believes.
+    ///
+    /// Checked FIRST and unconditionally. A partitioned minority has every
+    /// reason to believe a member it cannot reach is not a member -- its
+    /// membership view may be stale, its peer list short. It knows nothing it
+    /// may assert about another node's identity, including that the node is
+    /// unknown.
+    #[test]
+    fn a_peer_without_quorum_asserts_nothing() {
+        let mut knowledge = knows(false);
+        knowledge.in_committed_membership = false;
+        assert_eq!(answer_membership(&knowledge), MembershipAnswer::NoQuorum);
+
+        knowledge.in_committed_membership = true;
+        knowledge.decommissioned = Some((1, "op".into()));
+        assert_eq!(
+            answer_membership(&knowledge),
+            MembershipAnswer::NoQuorum,
+            "not even a decommission record may be asserted without quorum"
+        );
+    }
+
+    /// Removal outranks absence from membership.
+    ///
+    /// A removed node is ALSO absent from current membership -- that is what
+    /// removal does. Checking membership first would report it as "never seen",
+    /// losing the reason and inviting it to rejoin as a new node while holding
+    /// data it no longer owns.
+    #[test]
+    fn a_decommission_is_reported_even_though_the_node_is_also_absent() {
+        let mut knowledge = knows(true);
+        knowledge.in_committed_membership = false;
+        knowledge.decommissioned = Some((1_787_000_000, "bkearns".into()));
+        assert_eq!(
+            answer_membership(&knowledge),
+            MembershipAnswer::Decommissioned {
+                at: 1_787_000_000,
+                by: "bkearns".into()
+            },
+            "removal is the stronger statement and must survive the node's absence"
+        );
+    }
+
+    /// A node the cluster has never seen is told so, and forms standalone.
+    #[test]
+    fn an_unknown_node_is_told_it_is_not_a_member() {
+        let mut knowledge = knows(true);
+        knowledge.in_committed_membership = false;
+        assert_eq!(answer_membership(&knowledge), MembershipAnswer::NotAMember);
+        assert_eq!(
+            plan_join(&answer_membership(&knowledge), None),
+            JoinAction::FormStandalone
+        );
+    }
+
+    /// "Degraded" is from the ASKER's point of view: the cluster is missing it.
+    #[test]
+    fn degraded_means_the_cluster_lacks_quorum_without_the_asker() {
+        let mut knowledge = knows(true);
+        knowledge.quorum_without_asker = false;
+        assert!(matches!(
+            answer_membership(&knowledge),
+            MembershipAnswer::Member {
+                cluster_degraded: true,
+                ..
+            }
+        ));
+
+        knowledge.quorum_without_asker = true;
+        assert!(matches!(
+            answer_membership(&knowledge),
+            MembershipAnswer::Member {
+                cluster_degraded: false,
+                ..
+            }
+        ));
+    }
+
+    /// End to end: the peer answers, the joiner acts, and the result is a
+    /// rejoin that streams and does not serve. The node1 case, with the
+    /// authority in the right place.
+    #[test]
+    fn a_clean_member_asking_a_healthy_peer_rejoins_without_serving() {
+        let knowledge = knows(true);
+        let action = plan_join(&answer_membership(&knowledge), None);
+        assert_eq!(
+            action,
+            JoinAction::Rejoin {
+                catch_up: CatchUp::StreamTokens(tokens()),
+                tokens: tokens(),
+            }
+        );
+        assert!(!action.may_serve_queries());
     }
 
     /// The case that started this: a node reimaged clean, with no local memory
