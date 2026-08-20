@@ -70,11 +70,35 @@ pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCod
         // Standalone always ready: no peers, no Raft.
         DeploymentMode::Standalone => (StatusCode::OK, Json(json!({"ready": true}))),
 
-        // Pair modes: primary accepts connections, degraded mode allows stale reads.
-        // Mirror the `is_cql_ready()` logic — if CQL is ready, so is the readiness probe.
+        // Pair modes: primary accepts connections, degraded pair allows stale
+        // reads. Mirrors `is_cql_ready()` — if CQL is ready, so is the probe.
         DeploymentMode::Pair | DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => {
             (StatusCode::OK, Json(json!({"ready": true})))
         }
+
+        // A degraded CLUSTER is not ready, and grouping it with the pair modes
+        // above is what made the 2026-08-20 outage invisible. node1 sat outside
+        // the cluster for hours -- no Raft handler, no schema, answering
+        // `keyspace 'agent_memory' not found` to every query -- while this
+        // endpoint returned 200 {"ready":true} throughout. Every health check
+        // believed it, so nothing routed away and nobody was paged; it was
+        // found by a person noticing their task board was down.
+        //
+        // A degraded cluster member is a member WITHOUT quorum. It cannot serve
+        // a consistent read, so reporting ready makes it indistinguishable from
+        // a healthy member -- exactly the distinction a readiness probe exists
+        // to draw. A degraded PAIR is different and stays ready: that shape has
+        // no quorum to lose and its stale-read behaviour is deliberate.
+        DeploymentMode::DegradedCluster => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "mode": "degraded-cluster",
+                "waiting_for": "raft_quorum",
+                "detail": "this node is a cluster member without quorum; it cannot \
+            serve consistent reads until the quorum is restored"
+            })),
+        ),
 
         // Forming / Cluster: gate on Raft leader presence.
         DeploymentMode::Forming | DeploymentMode::Cluster => {
@@ -292,6 +316,75 @@ mod tests {
             parsed.is_ok(),
             "GET /readyz must return valid JSON, got: {}",
             String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A degraded cluster member must NOT report itself ready.
+    ///
+    /// This is why the 2026-08-20 outage was silent. node1 sat outside the
+    /// cluster for hours -- no Raft handler, no schema, answering
+    /// `keyspace 'agent_memory' not found` to every query -- and `/readyz`
+    /// returned 200 `{"ready":true}` the entire time, because DegradedCluster
+    /// was grouped with the pair modes and answered unconditionally.
+    ///
+    /// Every health check believed it. A load balancer would have kept routing
+    /// to it; an orchestrator would not have restarted it; nobody was paged.
+    /// The node was found by a person noticing their task board was down.
+    ///
+    /// A degraded cluster member is a member WITHOUT quorum. It cannot serve a
+    /// consistent read, so reporting ready makes it indistinguishable from a
+    /// healthy member -- which is precisely the distinction a readiness probe
+    /// exists to draw.
+    #[tokio::test]
+    async fn readyz_degraded_cluster_is_not_ready() {
+        let state = make_state();
+        state
+            .mode_controller
+            .set_mode_for_test(DeploymentMode::DegradedCluster);
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a cluster member without quorum must not report ready; saying so is \
+what made this failure invisible"
+        );
+    }
+
+    /// The 503 must say what is wrong, not merely refuse.
+    ///
+    /// An operator reading `{"ready":false}` learns nothing actionable. The
+    /// whole cost of this outage was diagnosis time, so the probe names the
+    /// state and what it is waiting for.
+    #[tokio::test]
+    async fn readyz_degraded_cluster_says_why() {
+        let state = make_state();
+        state
+            .mode_controller
+            .set_mode_for_test(DeploymentMode::DegradedCluster);
+
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("quorum"),
+            "the reason must name quorum so an operator knows what to look at: {text}"
+        );
+        assert!(
+            text.contains("degraded-cluster"),
+            "and the mode it is actually in: {text}"
         );
     }
 
