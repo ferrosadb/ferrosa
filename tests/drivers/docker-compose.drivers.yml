@@ -16,12 +16,32 @@ services:
   # -------------------------------------------------------------------------
   # Volume permissions -- RustFS runs as UID 10001
   # -------------------------------------------------------------------------
+  # Idempotent on purpose. `docker compose run <svc>` re-runs completed
+  # dependencies, so this container starts once per driver suite -- four times
+  # in a full Driver Smoke job -- and every run after the first walks a volume
+  # that a live RustFS is writing to. `chown -R` is not safe against concurrent
+  # mutation: a file removed mid-walk makes it report a failure and exit 1,
+  # which fails the whole suite with no test having run. Observed 2026-08-20:
+  # three invocations exited 0 and the second exited 1, same command, same
+  # volume.
+  #
+  # The sentinel makes the later runs no-ops instead of races. It deliberately
+  # does not swallow the error with `|| true`: a genuine permission failure on
+  # the first run must still fail loudly, because RustFS cannot start without
+  # it.
   volume-permissions:
     image: alpine
     volumes:
       - rustfs-data:/data
     command: >
-      sh -c "chown -R 10001:10001 /data && echo 'permissions fixed'"
+      sh -c "if [ -e /data/.permissions-fixed ]; then
+               echo 'permissions already fixed; skipping chown of a live volume';
+               exit 0;
+             fi;
+             chown -R 10001:10001 /data &&
+             touch /data/.permissions-fixed &&
+             chown 10001:10001 /data/.permissions-fixed &&
+             echo 'permissions fixed'"
     restart: "no"
 
   # -------------------------------------------------------------------------
