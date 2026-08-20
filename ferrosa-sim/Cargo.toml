@@ -12,6 +12,10 @@ edition = "2021"
 # a full process simulator.  See `specs/in-process/sprint-05-progress.md`.
 
 [dependencies]
+# The deployment-mode state machine only. ferrosa-common carries no openraft,
+# no sled and no network stack, so the ADR-017 reason for avoiding
+# ferrosa-cluster is untouched.
+ferrosa-common = { path = "../ferrosa-common" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 

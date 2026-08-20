@@ -266,6 +266,26 @@ where
 /// deployments transparently land under
 /// `raft_data_dir/<DEFAULT_DC_NAME>/` — readers tolerant to legacy
 /// `raft_data_dir/` layouts must migrate at upgrade (ADR-015 R3).
+/// Where this node's Raft state lives, from config alone.
+///
+/// Extracted so startup and runtime cannot disagree about the path. The
+/// cluster-membership marker is written by `transition_to_cluster` and read
+/// before any peer connects; if those two computed the directory differently
+/// the marker would be written where nobody looks, and the node would forget
+/// it was a member -- the exact bug this is fixing, reintroduced by a
+/// duplicated expression.
+pub fn resolve_raft_dir(config: &crate::config::ClusterConfig) -> std::path::PathBuf {
+    let local_dc = config.data_center.clone();
+    let base = if let Some(dir) = config.raft_data_dir_for_dc(&local_dc) {
+        dir
+    } else {
+        let data_dir =
+            std::env::var("FERROSA_DATA_DIR").unwrap_or_else(|_| "/var/lib/ferrosa".into());
+        std::path::Path::new(&data_dir).join("raft")
+    };
+    raft_log_dir_for_dc(&base, &local_dc)
+}
+
 pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::PathBuf {
     base.join(dc_name)
 }
@@ -504,7 +524,7 @@ impl ModeController {
             return;
         }
 
-        self.mode.store(Arc::new(DeploymentMode::Forming));
+        self.try_transition_mode(DeploymentMode::Forming);
         // Record committed cluster size for quorum calculations (peers + self).
         self.committed_cluster_size
             .store(peers.len() + 1, std::sync::atomic::Ordering::Relaxed);
@@ -960,7 +980,26 @@ impl ModeController {
         // Clear pair context — no longer in pair mode
         *self.pair_context.lock() = None;
 
-        self.mode.store(Arc::new(DeploymentMode::Cluster));
+        self.try_transition_mode(DeploymentMode::Cluster);
+
+        // Durably record that this node has been a cluster member, BEFORE
+        // announcing the transition. On restart this is what stops the node
+        // re-deriving its shape from whichever peer reconnects first and
+        // settling into a pair while the leader is still replicating to it.
+        //
+        // A failure here is logged, not fatal: the node is a working cluster
+        // member right now, and refusing to run because a marker could not be
+        // written would turn a future recovery problem into a present outage.
+        // It does mean a restart would forget, so it is an ERROR.
+        let raft_dir = resolve_raft_dir(&self.config);
+        if let Err(error) = DeploymentMode::record_cluster_membership(&raft_dir) {
+            tracing::error!(
+                %error,
+                dir = %raft_dir.display(),
+                "could not record cluster membership; this node will forget it was \
+            a member if it restarts, and may rejoin as a pair"
+            );
+        }
 
         tracing::info!(
             node_id = local_node_id,

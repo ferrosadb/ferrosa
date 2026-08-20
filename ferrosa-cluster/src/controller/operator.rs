@@ -25,7 +25,10 @@ impl ModeController {
         }));
         self.cluster_state
             .store(Arc::new(ClusterStateHolder::Standalone));
-        self.mode.store(Arc::new(DeploymentMode::Standalone));
+        self.force_mode_override(
+            DeploymentMode::Standalone,
+            "force promote to standalone primary",
+        );
         self.force_promoted.store(true, Ordering::Release);
         *self.pair_context.lock() = None;
         self.connected_peers.lock().clear();
@@ -93,7 +96,7 @@ impl ModeController {
         self.write_path.store(Arc::new(degraded));
         self.ddl_path.store(Arc::new(DdlPath::Unavailable));
         // Keep pair cluster state — the peer info is still valid for recovery.
-        self.mode.store(Arc::new(DeploymentMode::DegradedPair));
+        self.try_transition_mode(DeploymentMode::DegradedPair);
         // Do NOT clear pair_context — we need it for recovery on reconnect.
         // Do NOT clear connected_peers — the disconnected peer will be
         // removed by on_peer_disconnected, remaining peers stay tracked.

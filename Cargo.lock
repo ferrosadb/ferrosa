@@ -2217,6 +2217,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "tempfile",
  "tikv-jemallocator",
@@ -2284,6 +2285,8 @@ dependencies = [
  "num-bigint",
  "proptest",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2638,6 +2641,7 @@ dependencies = [
 name = "ferrosa-sim"
 version = "0.17.0"
 dependencies = [
+ "ferrosa-common",
  "proptest",
  "serde",
  "tracing",

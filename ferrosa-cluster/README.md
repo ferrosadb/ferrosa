@@ -219,6 +219,14 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   `CLUSTER_REJOIN_ATTEMPTS_TOTAL` / `_FAILURES_TOTAL`.
 - `pair/` — two-node primary/secondary coordination (deterministic host-ID
   ordering, independent of which TCP direction wins), switchover, catch-up.
+  `ModeController::choose_pair_role` gives `Primary` to the **lowest** host_id
+  (`local_host_id <= peer_host_id`). A node with no `FERROSA_HOST_ID` generates
+  a random UUID on first boot, so any deployment that needs a predictable
+  primary must pin the ids — every `docker-compose*.yml` in this repo does, and
+  `ferrosa`'s `pair_primary_is_deterministic` test enforces it. An unpromoted
+  secondary refuses client CQL entirely (`is_cql_ready()` is false) while still
+  reporting healthy on `/readyz`, so an unpinned stack can hand you a node that
+  looks up but serves nothing.
 - `rebalance.rs` — token-skew rebalancing with data streaming.
 
 ### Repair & hints (`repair/`, `hints/`)

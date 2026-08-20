@@ -1,36 +1,14 @@
-//! Mirror of `ferrosa-cluster::mode::DeploymentMode`.
+//! Cluster formation lifecycle, shared with `ferrosa-cluster`.
 //!
-//! Owned here so `ferrosa-sim` can stay free of ferrosa-cluster's
-//! storage stack.  The two enums are kept in lock-step manually; a
-//! Sprint 5 follow-up could lift this into `ferrosa-common`, but
-//! today nothing else in the workspace needs it.
+//! This file used to hold a SECOND copy of `DeploymentMode`, with the comment
+//! "the two enums are kept in lock-step manually". They were not. The mirror
+//! had four variants where the real one has six -- no `DegradedPair`, no
+//! `DegradedCluster` -- so the simulator could not represent a degraded
+//! cluster, and therefore could not simulate the failure that matters most:
+//! a node that has held a quorum losing one.
+//!
+//! Both now use the definition in `ferrosa-common`, which depends on neither
+//! openraft nor sled, so the reason `ferrosa-sim` avoids `ferrosa-cluster`
+//! (ADR-017) still holds.
 
-use serde::{Deserialize, Serialize};
-
-/// Cluster lifecycle mode mirrored from
-/// `ferrosa_cluster::mode::DeploymentMode`.
-///
-/// Only the fields the simulator transitions through are modelled;
-/// the full state machine lives in `ferrosa-cluster`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeploymentMode {
-    /// Single-node, no peers.
-    Standalone,
-    /// Two-node, mesh forming.
-    Pair,
-    /// 3rd peer seen, awaiting Raft init.
-    Forming,
-    /// Steady-state cluster with a leader.
-    Cluster,
-}
-
-impl DeploymentMode {
-    /// Infer the mode from peer count (excluding self).
-    pub fn from_peer_count(count: usize) -> Self {
-        match count {
-            0 => Self::Standalone,
-            1 => Self::Pair,
-            _ => Self::Cluster,
-        }
-    }
-}
+pub use ferrosa_common::deployment_mode::DeploymentMode;
