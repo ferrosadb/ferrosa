@@ -276,7 +276,6 @@ mod tests {
         assert!(!panic_is_fatal(Some("raft-rt-something-else")));
     }
 
-
     /// T0.2 (t_88223ad0): the runtime tunable parser prefers a valid env value
     /// over the default and falls back safely on unset / non-positive /
     /// unparseable input. Pure — no `set_var`, so no cross-test env races.
