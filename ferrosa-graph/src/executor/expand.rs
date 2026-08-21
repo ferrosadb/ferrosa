@@ -5893,8 +5893,24 @@ async fn execute_aggregate(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
-    // Step 1: Execute inner plan to get all rows.
-    let inner_result = Box::pin(execute(
+    // Step 1: stream the inner plan.
+    //
+    // This used to run the buffered `execute` and hold `inner_result.rows` for
+    // the whole aggregation, then group them into
+    // `BTreeMap<String, Vec<&Vec<Value>>>` — a reference to EVERY input row.
+    // So `RETURN count(n)` over a billion rows held the billion to produce one
+    // number: memory proportional to the INPUT for an output proportional to
+    // the number of groups.
+    //
+    // Nothing required that. `Accumulator` is already incremental
+    // (`accumulate(&mut self, value)`), and the only per-row state the output
+    // needs is one row per group, for the GroupKey projections. So fold each
+    // row as it arrives and keep the first row of each group, never the rest.
+    //
+    // Memory is now proportional to the number of groups, which
+    // `config.max_groups` already bounds (FMEA F7) — a bound on STATE, not on
+    // results.
+    let (inner_columns, mut inner_rows, inner_stats) = Box::pin(execute_streaming(
         inner,
         write_path,
         keyspace,
@@ -5904,73 +5920,75 @@ async fn execute_aggregate(
     ))
     .await?;
     check_timeout(start, config.query_timeout)?;
+    let inner_columns = &inner_columns;
 
-    let inner_columns = &inner_result.columns;
-    let inner_rows = &inner_result.rows;
+    /// One group's running state: its accumulators and the single row the
+    /// GroupKey projections read from.
+    struct GroupState {
+        first_row: Vec<serde_json::Value>,
+        accumulators: Vec<Option<Box<dyn Accumulator>>>,
+        seen_distinct: Vec<std::collections::HashSet<String>>,
+    }
 
-    // Step 2: Group rows by group key values.
-    // Use a BTreeMap keyed by serialized group key for deterministic ordering.
-    let mut groups: std::collections::BTreeMap<String, Vec<&Vec<serde_json::Value>>> =
+    let new_group_state = |first_row: Vec<serde_json::Value>| -> Result<GroupState> {
+        Ok(GroupState {
+            first_row,
+            accumulators: projections
+                .iter()
+                .map(|proj| match proj {
+                    AggregateProjection::GroupKey(_) => Ok(None),
+                    AggregateProjection::AggregateFunc { name, arg, .. } => {
+                        let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
+                        create_accumulator(name, count_star, config.max_collect_size).map(Some)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            seen_distinct: projections
+                .iter()
+                .map(|_| std::collections::HashSet::new())
+                .collect(),
+        })
+    };
+
+    // Step 2: fold each row into its group as it arrives.
+    let mut groups: std::collections::BTreeMap<String, GroupState> =
         std::collections::BTreeMap::new();
 
-    for row in inner_rows {
-        // Build group key from the group_keys indices.
-        let group_key_values: Vec<&serde_json::Value> = group_keys
-            .iter()
-            .map(|&idx| row.get(idx).unwrap_or(&serde_json::Value::Null))
-            .collect();
+    {
+        use futures::StreamExt as _;
+        while let Some(row) = inner_rows.next().await {
+            let row = row?;
+            check_timeout(start, config.query_timeout)?;
 
-        let group_key_str = serde_json::to_string(&group_key_values).unwrap_or_default();
+            let group_key_values: Vec<&serde_json::Value> = group_keys
+                .iter()
+                .map(|&idx| row.get(idx).unwrap_or(&serde_json::Value::Null))
+                .collect();
+            let group_key_str = serde_json::to_string(&group_key_values).unwrap_or_default();
 
-        // Check group count limit (FMEA F7).
-        if !groups.contains_key(&group_key_str) && groups.len() >= config.max_groups {
-            return Err(GraphError::ResourceLimit(format!(
-                "aggregation group count limit exceeded: {} (limit: {})",
-                groups.len(),
-                config.max_groups
-            )));
-        }
+            // Check group count limit (FMEA F7).
+            if !groups.contains_key(&group_key_str) && groups.len() >= config.max_groups {
+                return Err(GraphError::ResourceLimit(format!(
+                    "aggregation group count limit exceeded: {} (limit: {})",
+                    groups.len(),
+                    config.max_groups
+                )));
+            }
 
-        groups.entry(group_key_str).or_default().push(row);
-    }
-
-    // If there are no group keys and no rows, produce a single group with empty rows
-    // so aggregates like count(*) return 0 rather than no rows.
-    if group_keys.is_empty() && groups.is_empty() {
-        groups.insert(String::new(), Vec::new());
-    }
-
-    // Step 3: Build output rows.
-    let columns = build_columns(return_clause);
-    let mut result_rows = Vec::new();
-
-    for group_rows in groups.values() {
-        // Create accumulators for each aggregate projection.
-        let mut accumulators: Vec<Option<Box<dyn Accumulator>>> = projections
-            .iter()
-            .map(|proj| match proj {
-                AggregateProjection::GroupKey(_) => Ok(None),
-                AggregateProjection::AggregateFunc { name, arg, .. } => {
-                    let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
-                    create_accumulator(name, count_star, config.max_collect_size).map(Some)
+            let state = match groups.entry(group_key_str) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(new_group_state(row.clone())?)
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
 
-        let mut seen_distinct: Vec<std::collections::HashSet<String>> = projections
-            .iter()
-            .map(|_| std::collections::HashSet::new())
-            .collect();
-
-        // Feed rows into accumulators.
-        for row in group_rows {
             for (proj_idx, proj) in projections.iter().enumerate() {
                 if let AggregateProjection::AggregateFunc { arg, distinct, .. } = proj {
-                    if let Some(ref mut acc) = accumulators[proj_idx] {
-                        let value = eval_aggregate_arg(arg, row, inner_columns);
+                    if let Some(ref mut acc) = state.accumulators[proj_idx] {
+                        let value = eval_aggregate_arg(arg, &row, inner_columns);
                         if *distinct {
                             let key = serde_json::to_string(&value).unwrap_or_default();
-                            if !seen_distinct[proj_idx].insert(key) {
+                            if !state.seen_distinct[proj_idx].insert(key) {
                                 continue;
                             }
                         }
@@ -5979,9 +5997,22 @@ async fn execute_aggregate(
                 }
             }
         }
+    }
 
+    // No group keys and no rows: one empty group, so `count(*)` returns 0
+    // rather than no rows at all.
+    if group_keys.is_empty() && groups.is_empty() {
+        groups.insert(String::new(), new_group_state(Vec::new())?);
+    }
+
+    // Step 3: Build output rows. The accumulators were fed as rows arrived, so
+    // there is nothing left to iterate but the groups themselves.
+    let columns = build_columns(return_clause);
+    let mut result_rows = Vec::new();
+
+    for state in groups.values() {
         // Check collect size limit (FMEA F6).
-        for acc in accumulators.iter().flatten() {
+        for acc in state.accumulators.iter().flatten() {
             if acc.name() == "collect" {
                 let result = acc.finish();
                 if let serde_json::Value::Array(arr) = &result {
@@ -5998,20 +6029,19 @@ async fn execute_aggregate(
 
         // Build the output row.
         let mut output_row = Vec::new();
-        let first_row = group_rows.first();
-
         for (proj_idx, proj) in projections.iter().enumerate() {
             match proj {
                 AggregateProjection::GroupKey(key_idx) => {
                     let col_idx = group_keys.get(*key_idx).copied().unwrap_or(0);
-                    let value = first_row
-                        .and_then(|r| r.get(col_idx))
+                    let value = state
+                        .first_row
+                        .get(col_idx)
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     output_row.push(value);
                 }
                 AggregateProjection::AggregateFunc { .. } => {
-                    let value = accumulators[proj_idx]
+                    let value = state.accumulators[proj_idx]
                         .as_ref()
                         .map(|a| a.finish())
                         .unwrap_or(serde_json::Value::Null);
@@ -6023,10 +6053,12 @@ async fn execute_aggregate(
         result_rows.push(output_row);
     }
 
-    let mut stats = QueryStats::default();
-    stats.vertices_read = inner_result.stats.vertices_read;
-    stats.edges_read = inner_result.stats.edges_read;
-    stats.execution_ms = start.elapsed().as_millis() as u64;
+    let stats = QueryStats {
+        vertices_read: inner_stats.vertices_read,
+        edges_read: inner_stats.edges_read,
+        execution_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
 
     Ok(GraphResult {
         columns,
@@ -6479,6 +6511,44 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Aggregation must fold its input, not hold it.
+    ///
+    /// It used to run the buffered `execute` and group into
+    /// `BTreeMap<String, Vec<&Vec<Value>>>` — a reference to every input row —
+    /// so `RETURN count(n)` over a billion rows held the billion to produce one
+    /// number. `Accumulator` was already incremental; only the grouping step
+    /// stood in the way.
+    ///
+    /// Asserted on the source because the regression is invisible in results:
+    /// collecting the rows first returns exactly the same aggregates, just with
+    /// memory proportional to the input, and no output-shaped test can tell the
+    /// difference without a data set larger than the machine.
+    #[test]
+    fn aggregation_folds_its_input_instead_of_collecting_it() {
+        let src = include_str!("expand.rs");
+        let body = src
+            .split("async fn execute_aggregate")
+            .nth(1)
+            .expect("execute_aggregate must exist");
+        let body = &body[..body
+            .find("stats.execution_ms")
+            .expect("the aggregate body must end with its stats")];
+
+        assert!(
+            body.contains("execute_streaming("),
+            "the inner plan must be streamed; the buffered `execute` \
+             materialises every input row before aggregation starts"
+        );
+        assert!(
+            !body.contains("Vec<&Vec<serde_json::Value>>"),
+            "groups must hold running state, not references to every input row"
+        );
+        assert!(
+            body.contains("acc.accumulate(&value)") && body.contains("while let Some(row)"),
+            "rows must be accumulated as they arrive"
+        );
+    }
 
     /// No executor path may truncate a result on `max_result_rows`.
     ///
