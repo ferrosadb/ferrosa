@@ -1534,13 +1534,16 @@ async fn execute_expand_streaming<'a>(
     // final until every row is projected. But "must see every row" does not
     // mean "must hold every row": when the spilling sorter applies, project
     // each state straight INTO it and stream the merged output — the full
-    // result set is never resident (t_3f2f961a). DISTINCT still takes the
-    // buffered tail: its buffered semantics re-sort by debug string after the
-    // ORDER BY sort (t_363c1316 tracks that bug), and this path must not
-    // change observable behavior.
+    // result set is never resident (t_3f2f961a).
+    //
+    // DISTINCT used to be excluded here because the buffered tail re-sorted by
+    // debug string after the ORDER BY sort, so streaming it would have changed
+    // observable behaviour. That re-sort was a bug — it discarded the query's
+    // ORDER BY — and now that the buffered tail dedups without reordering, both
+    // forms are first-seen order and the exclusion has nothing left to protect.
     if !parts.return_clause.order_by.is_empty() {
         let columns = build_columns(&parts.return_clause);
-        if !parts.return_clause.distinct {
+        {
             if let Some(mut sink) = crate::executor::spill::SpillSortSink::try_new(
                 &columns,
                 &parts.return_clause,
@@ -1569,9 +1572,24 @@ async fn execute_expand_streaming<'a>(
                 .await?;
                 stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
                 let mut sorted = sink.finish_stream()?;
-                // LIMIT applies to the sorted output. Taking it here is what
-                // lets the sink accept a LIMIT at all: the sort still sees
-                // every candidate row, but only `limit` of them are pulled.
+
+                // DISTINCT on the sorted stream, in the same order the buffered
+                // tail applies it: sort, then dedup, then limit.
+                //
+                // `dedup_stream` hashes every row it has emitted, so this is
+                // bounded by the number of DISTINCT rows rather than by the
+                // number of candidate rows — inherent to DISTINCT without a
+                // spilling set, and still far below materialising everything.
+                // Adjacent-only dedup would be O(1) but WRONG here: the stream
+                // is sorted by the ORDER BY terms, which may be a subset of the
+                // projected columns, so equal rows are not necessarily adjacent.
+                if parts.return_clause.distinct {
+                    sorted = crate::executor::stream::dedup_stream(sorted);
+                }
+
+                // LIMIT applies to the sorted, deduplicated output. Taking it
+                // here is what lets the sink accept a LIMIT at all: the sort
+                // still sees every candidate row, but only `limit` are pulled.
                 if let Some(limit) = parts.return_clause.limit {
                     use futures::StreamExt as _;
                     sorted = Box::pin(sorted.take(limit.max(0) as usize));
@@ -6446,6 +6464,40 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `ORDER BY` with `DISTINCT` must reach the spilling sorter.
+    ///
+    /// DISTINCT was excluded from this path because the buffered tail re-sorted
+    /// by debug string afterwards, so streaming would have changed the observed
+    /// order. That re-sort was the bug (it discarded the ORDER BY); with it
+    /// gone, excluding DISTINCT only forces the whole result into memory for no
+    /// behavioural reason.
+    ///
+    /// Asserted on the source because the regression is a routing one: putting
+    /// the `!distinct` guard back still returns correct rows, merely
+    /// materialised, so no result-shaped assertion would catch it.
+    #[test]
+    fn distinct_is_not_excluded_from_the_streaming_order_by_path() {
+        let src = include_str!("expand.rs");
+        let body = src
+            .split("ORDER BY (with or without DISTINCT) is a pipeline breaker")
+            .nth(1)
+            .expect("the streaming ORDER BY arm must exist");
+        let arm = &body[..body
+            .find("// Fallback:")
+            .expect("the fallback comment must exist")];
+
+        assert!(
+            !arm.contains("if !parts.return_clause.distinct"),
+            "DISTINCT must not be routed away from the spilling sorter: the \
+             buffered tail no longer reorders, so there is nothing left to \
+             preserve by materialising"
+        );
+        assert!(
+            arm.contains("dedup_stream"),
+            "the streaming arm must apply DISTINCT to the sorted stream"
+        );
+    }
 
     /// DISTINCT must not discard the ORDER BY the query asked for.
     ///
