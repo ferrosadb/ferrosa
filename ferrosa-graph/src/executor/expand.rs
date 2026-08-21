@@ -1544,7 +1544,15 @@ async fn execute_expand_streaming<'a>(
                 )
                 .await?;
                 stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
-                return Ok((columns, sink.finish_stream()?, stats));
+                let mut sorted = sink.finish_stream()?;
+                // LIMIT applies to the sorted output. Taking it here is what
+                // lets the sink accept a LIMIT at all: the sort still sees
+                // every candidate row, but only `limit` of them are pulled.
+                if let Some(limit) = parts.return_clause.limit {
+                    use futures::StreamExt as _;
+                    sorted = Box::pin(sorted.take(limit.max(0) as usize));
+                }
+                return Ok((columns, sorted, stats));
             }
         }
         // Fallback: no spill backend, LIMIT present, an order term that is not
