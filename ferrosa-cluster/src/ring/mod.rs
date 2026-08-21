@@ -77,7 +77,7 @@ impl TokenRing {
         }
 
         // Wrap around to the beginning of the ring
-        for (_, &node_id) in self.ring.iter() {
+        for &node_id in self.ring.values() {
             if seen.insert(node_id) && is_normal(node_id) {
                 result.push(node_id);
                 if result.len() >= rf {

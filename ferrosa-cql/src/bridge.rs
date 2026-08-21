@@ -297,9 +297,14 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             ))),
             CqlType::Vector(_, dim) if b.len() == *dim * 4 => {
                 // Raw vector bytes: N big-endian f32 values
+                // `as_chunks::<4>()` yields `&[[u8; 4]]`, so `from_be_bytes`
+                // takes the array directly — no `try_into().unwrap()` on a
+                // slice whose length the compiler cannot see.
                 let floats: Vec<u32> = b
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_be_bytes(*chunk))
                     .collect();
                 Ok(CqlValue::Vector(floats))
             }

@@ -506,28 +506,26 @@ impl TimeSeriesAggregator {
             let cell = row.cells.iter().find(|(idx, _)| *idx == col_idx);
             match cell {
                 Some((_, cv)) => {
-                    if let Some(ref bytes) = cv.value {
-                        let decoded = if has_types {
-                            decode_typed_numeric(bytes, &self.column_types[i])
-                        } else {
-                            decode_numeric_bytes(bytes)
-                        };
-                        if let Some(v) = decoded {
-                            values.push(v);
-                        } else {
-                            tracing::warn!(
-                                table = %self.table_id.table,
-                                column_index = col_idx,
-                                byte_len = bytes.len(),
-                                "failed to decode numeric bytes for consolidation column"
-                            );
-                            if let Some(ref m) = self.shared_metrics {
-                                m.decode_failures.fetch_add(1, Ordering::Relaxed);
-                            }
-                            return None; // non-decodable value, skip this row
-                        }
+                    // No value is a tombstone: skip the row.
+                    let bytes = cv.value.as_ref()?;
+                    let decoded = if has_types {
+                        decode_typed_numeric(bytes, &self.column_types[i])
                     } else {
-                        return None; // tombstone, skip
+                        decode_numeric_bytes(bytes)
+                    };
+                    if let Some(v) = decoded {
+                        values.push(v);
+                    } else {
+                        tracing::warn!(
+                            table = %self.table_id.table,
+                            column_index = col_idx,
+                            byte_len = bytes.len(),
+                            "failed to decode numeric bytes for consolidation column"
+                        );
+                        if let Some(ref m) = self.shared_metrics {
+                            m.decode_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return None; // non-decodable value, skip this row
                     }
                 }
                 None => return None, // column not present

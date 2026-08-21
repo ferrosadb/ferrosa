@@ -184,18 +184,15 @@ pub fn normalize(query: &str) -> Option<Normalized> {
 fn scan_string(b: &[u8], open: usize) -> Option<usize> {
     let mut i = open + 1;
     while i < b.len() {
-        match memchr::memchr(b'\'', &b[i..]) {
-            Some(rel) => {
-                let q = i + rel;
-                if q + 1 < b.len() && b[q + 1] == b'\'' {
-                    // Escaped quote: skip both, keep scanning.
-                    i = q + 2;
-                    continue;
-                }
-                return Some(q + 1);
-            }
-            None => return None,
+        // No further quote means the string is unterminated.
+        let rel = memchr::memchr(b'\'', &b[i..])?;
+        let q = i + rel;
+        if q + 1 < b.len() && b[q + 1] == b'\'' {
+            // Escaped quote: skip both, keep scanning.
+            i = q + 2;
+            continue;
         }
+        return Some(q + 1);
     }
     None
 }
@@ -237,17 +234,14 @@ fn scan_numeric_or_hex(b: &[u8], start: usize) -> (usize, LiteralKind) {
 fn scan_quoted_ident(b: &[u8], open: usize) -> Option<usize> {
     let mut i = open + 1;
     while i < b.len() {
-        match memchr::memchr(b'"', &b[i..]) {
-            Some(rel) => {
-                let q = i + rel;
-                if q + 1 < b.len() && b[q + 1] == b'"' {
-                    i = q + 2;
-                    continue;
-                }
-                return Some(q + 1);
-            }
-            None => return None,
+        // No further quote means the identifier is unterminated.
+        let rel = memchr::memchr(b'"', &b[i..])?;
+        let q = i + rel;
+        if q + 1 < b.len() && b[q + 1] == b'"' {
+            i = q + 2;
+            continue;
         }
+        return Some(q + 1);
     }
     None
 }

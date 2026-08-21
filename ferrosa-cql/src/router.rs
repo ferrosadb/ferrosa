@@ -373,11 +373,13 @@ fn projection_storage_ordinals(
 
     let mut wanted: Vec<u16> = Vec::new();
     for name in &names {
-        if let Some(col) = table_meta
+        // Unknown column name — bail out so the legacy path returns the right
+        // error.
+        let col = table_meta
             .columns
             .iter()
             .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
-            .map(|(_, c)| c)
+            .map(|(_, c)| c)?;
         {
             match col.kind {
                 ColumnKind::Regular => {
@@ -402,10 +404,6 @@ fn projection_storage_ordinals(
                     return None;
                 }
             }
-        } else {
-            // Unknown column name — bail out so the legacy path
-            // returns the right error.
-            return None;
         }
     }
     // An empty `wanted` is intentional and valid: SELECT pk, ck
@@ -6675,17 +6673,18 @@ fn geo_explain_plan(
     ks: &str,
     s: &SelectStatement,
 ) -> Option<ScanPlan> {
-    let (column, op) = if let Some(gn) = &s.geo_nearest {
-        (gn.column.clone(), "GeoNearest")
-    } else if let Some(pred) = s.geo_predicates.first() {
-        let op = match pred {
-            GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
-            GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
-            GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
-        };
-        (pred.column().to_string(), op)
-    } else {
-        return None;
+    let (column, op) = match &s.geo_nearest {
+        Some(gn) => (gn.column.clone(), "GeoNearest"),
+        // No geo operation at all: leave it to the generic planner.
+        None => {
+            let pred = s.geo_predicates.first()?;
+            let op = match pred {
+                GeoPredicate::WithinRadius { .. } => "GeoWithinRadius",
+                GeoPredicate::WithinBbox { .. } => "GeoWithinBbox",
+                GeoPredicate::WithinPolygon { .. } => "GeoWithinPolygon",
+            };
+            (pred.column().to_string(), op)
+        }
     };
     let index_name = resolve_geo_index_name(snap, ks, &s.table, &column)?;
     Some(ScanPlan::GeoIndex {

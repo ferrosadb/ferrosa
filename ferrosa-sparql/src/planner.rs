@@ -137,10 +137,7 @@ pub fn plan_query(query: &Query, scope: &TripleScope) -> Result<QueryPlan, Sparq
             Ok(plan)
         }
         Query::Construct {
-            template,
-            pattern,
-            base_iri: _,
-            ..
+            template, pattern, ..
         } => {
             // Plan the WHERE clause exactly like SELECT so the executor can
             // bind solutions; then attach the CONSTRUCT template.
@@ -371,7 +368,7 @@ fn collect_ops(
                 right, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
         }
-        GraphPattern::LeftJoin { left, right: _, .. } => {
+        GraphPattern::LeftJoin { left, .. } => {
             // OPTIONAL → evaluate left side; right side patterns are optional.
             // For now, just evaluate the left side (inner patterns).
             collect_ops(

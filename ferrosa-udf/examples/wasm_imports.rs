@@ -52,7 +52,7 @@ fn main() {
             "  {:3}x  {}   e.g. {}",
             names.len(),
             sig,
-            &names[..names.len().min(6)].join(",")
+            names[..names.len().min(6)].join(",")
         );
     }
     if !other.is_empty() {
