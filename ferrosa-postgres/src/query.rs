@@ -391,7 +391,10 @@ fn decode_bytea_hex_text(s: &str) -> Option<SqlValue> {
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let chars: Vec<u8> = hex.bytes().collect();
-    for pair in chars.chunks_exact(2) {
+    // `as_chunks::<2>()` gives `&[[u8; 2]]`, so the pair is indexed without a
+    // bounds check the compiler cannot elide from a slice.
+    let (pairs, _remainder) = chars.as_chunks::<2>();
+    for pair in pairs {
         let hi = hex_value(pair[0])?;
         let lo = hex_value(pair[1])?;
         bytes.push((hi << 4) | lo);

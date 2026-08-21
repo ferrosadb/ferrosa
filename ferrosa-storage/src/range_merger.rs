@@ -618,10 +618,7 @@ impl<'a, R: ReadAt> SsTableRunIter<'a, R> {
                 if self.cursor >= self.sstables.len() {
                     return Ok(());
                 }
-                match self.sstables[self.cursor].partitions_iter() {
-                    Ok(it) => self.current = Some(it),
-                    Err(e) => return Err(e),
-                }
+                self.current = Some(self.sstables[self.cursor].partitions_iter()?);
             }
             let it = self.current.as_mut().expect("just initialised");
             it.skip_to_next_partition()?;

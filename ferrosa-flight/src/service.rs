@@ -212,6 +212,14 @@ impl FerrosaFlight {
     /// Execute a CQL SELECT under `auth` and convert one (small) page to a single
     /// Arrow batch — used by `GetFlightInfo`/`GetSchema`, which only need the
     /// schema, so this fetches just one page rather than the whole result.
+    ///
+    /// `clippy::result_large_err`: the error is `tonic::Status`, which is 176
+    /// bytes by tonic's design and is what the Arrow Flight trait requires
+    /// every method in this service to return. Boxing it here would only move
+    /// the cost — the `Status` is unboxed again at the trait boundary a few
+    /// frames up — so the lint's remedy does not apply to a type we do not own
+    /// and cannot change at the point that matters.
+    #[allow(clippy::result_large_err)]
     async fn query_to_batch(
         &self,
         cql: &str,
