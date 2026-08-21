@@ -6153,8 +6153,6 @@ fn execute_virtual_anchor(
             ))
         })?;
 
-    let virtual_rows = vtable.read(None);
-    stats.vertices_read = virtual_rows.len();
     check_timeout(start, config.query_timeout)?;
 
     let vtable_columns = vtable.columns();
@@ -6163,11 +6161,27 @@ fn execute_virtual_anchor(
     // Build a JSON object for each virtual row so eval_expr can project.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
 
+    // `visit_rows`, not `read(None)`, and no result cap.
+    //
+    // This read the whole virtual table into a `Vec` and then stopped
+    // projecting at `config.max_result_rows` — a silent truncation with no
+    // error and no flag, so a client could not tell a partial answer from a
+    // complete one. It also saved nothing: the rows it declined to project were
+    // already resident, because `read(None)` had materialised all of them
+    // first. A bound on a RESULT, paid for with a wrong answer and buying
+    // nothing.
+    //
+    // `visit_rows` exists for exactly this: its doc says "streaming or live
+    // tables should override this method and emit one row at a time", so using
+    // it lets a large or live virtual table avoid the intermediate `Vec`
+    // entirely, while the default adapter keeps every existing table working.
+    //
+    // The body is sync and infallible (`eval_expr(..).unwrap_or(Null)`), so it
+    // drops into the visitor closure unchanged.
     let mut rows = Vec::new();
-    for vrow in &virtual_rows {
-        if rows.len() >= config.max_result_rows {
-            break;
-        }
+    let mut vertices_read = 0usize;
+    vtable.visit_rows(None, &mut |vrow| {
+        vertices_read += 1;
 
         // Construct a JSON object from virtual row cells, keyed by column name.
         let mut obj = serde_json::Map::new();
@@ -6187,7 +6201,8 @@ fn execute_virtual_anchor(
             .collect();
 
         rows.push(row);
-    }
+    });
+    stats.vertices_read = vertices_read;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
@@ -6464,6 +6479,49 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// No executor path may truncate a result on `max_result_rows`.
+    ///
+    /// Every such site silently dropped answers: no error, no flag, and a
+    /// client could not distinguish a partial result from a complete one. They
+    /// have all been removed -- leapfrog's intersection cap, the ORDER BY bail,
+    /// and the virtual-table projection break -- and this is what stops the
+    /// next one being added, because a reintroduced cap produces plausible
+    /// output and breaks nothing a result-shaped test would catch.
+    ///
+    /// Reading the source is deliberate: the property is "this comparison does
+    /// not appear", which cannot be observed from behaviour without knowing the
+    /// data set is larger than the cap.
+    #[test]
+    fn no_executor_path_truncates_on_max_result_rows() {
+        let sources = [
+            ("expand.rs", include_str!("expand.rs")),
+            ("leapfrog.rs", include_str!("leapfrog.rs")),
+            ("varpath.rs", include_str!("varpath.rs")),
+            ("spill.rs", include_str!("spill.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+        ];
+
+        for (name, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if !code.contains("max_result_rows") {
+                    continue;
+                }
+                // A declaration or a default is fine; a comparison is a cap.
+                let is_cap = code.contains(">=")
+                    || code.contains(" > ")
+                    || code.contains("take(")
+                    || code.contains("truncate(");
+                assert!(
+                    !is_cap,
+                    "{name}:{} truncates on max_result_rows: {}",
+                    n + 1,
+                    code.trim()
+                );
+            }
+        }
+    }
 
     /// `ORDER BY` with `DISTINCT` must reach the spilling sorter.
     ///
@@ -7805,7 +7863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_virtual_table_respects_max_rows() {
+    async fn execute_virtual_table_returns_every_row() {
         let registry = VirtualTableRegistry::new();
         // Create a virtual table with many rows.
         let rows: Vec<VirtualRow> = (0..100)
@@ -7830,6 +7888,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
 
+        // A low `max_result_rows` must NOT shorten the answer. It used to:
+        // the projection loop broke at this value after `read(None)` had
+        // already materialised every row, so it discarded answers without
+        // saving anything.
         let config = GraphEngineConfig {
             max_result_rows: 5,
             ..Default::default()
@@ -7846,7 +7908,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.rows.len(), 5);
+        assert_eq!(
+            result.rows.len(),
+            100,
+            "every row in the virtual table is an answer; `max_result_rows` \
+             must not silently drop 95 of them"
+        );
     }
 
     #[test]
