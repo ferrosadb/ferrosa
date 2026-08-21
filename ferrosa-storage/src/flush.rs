@@ -1954,7 +1954,7 @@ mod tests {
     /// across all flush targets on this node". It does not. Each target owns a
     /// separate counter and seeds it from the same wall clock:
     ///
-    /// ```ignore
+    /// ```text
     /// self.generation.fetch_max(ts, SeqCst);
     /// self.generation.fetch_add(1, SeqCst) + 1
     /// ```
