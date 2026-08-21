@@ -505,6 +505,30 @@ fn execute_streaming_inner<'a>(
     })
 }
 
+/// Remove duplicate rows, keeping the first occurrence and the existing order.
+///
+/// The previous form sorted by debug representation and then `dedup()`ed:
+///
+/// ```ignore
+/// rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+/// rows.dedup();
+/// ```
+///
+/// `Vec::dedup` only removes *consecutive* duplicates, so the sort was there to
+/// make duplicates adjacent — but it ran **after** the ORDER BY sort and
+/// therefore destroyed it. `RETURN DISTINCT x ORDER BY x DESC` came back in
+/// debug-string ascending order, with no indication the requested order had
+/// been discarded.
+///
+/// Deduplicating on a hash of the row keeps every duplicate out without
+/// touching the order, so ORDER BY survives. First-seen order also matches what
+/// the streaming paths already do (`dedup_stream`, t_4ce82a3e), so the two
+/// forms of DISTINCT now agree instead of differing by which path a query took.
+fn dedup_preserving_order(rows: &mut Vec<super::stream::RowVals>) {
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
+}
+
 /// `RETURN <exprs>` with no MATCH: at most one row, built on pull.
 ///
 /// The buffered form projected the row, ran `sort_rows`, then
@@ -2078,9 +2102,7 @@ async fn finish_expand_buffered(
 
     // Apply DISTINCT.
     if return_clause.distinct {
-        // serde_json::Value doesn't impl Ord; use string repr for dedup.
-        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        rows.dedup();
+        dedup_preserving_order(&mut rows);
     }
 
     // Apply LIMIT.
@@ -6424,6 +6446,38 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// DISTINCT must not discard the ORDER BY the query asked for.
+    ///
+    /// The buffered tail sorted by debug representation and then `dedup()`ed,
+    /// because `Vec::dedup` only removes consecutive duplicates. That sort ran
+    /// AFTER the ORDER BY sort, so `RETURN DISTINCT x ORDER BY x DESC` came
+    /// back in debug-string ascending order — the requested order silently
+    /// replaced, with no error and nothing in the result to show it.
+    #[test]
+    fn distinct_dedups_without_reordering() {
+        use serde_json::json;
+
+        // Already in the order an `ORDER BY n DESC` would have produced, with
+        // duplicates that are not adjacent.
+        let mut rows: Vec<super::super::stream::RowVals> = vec![
+            vec![json!(30)],
+            vec![json!(20)],
+            vec![json!(30)],
+            vec![json!(10)],
+            vec![json!(20)],
+        ];
+
+        super::dedup_preserving_order(&mut rows);
+
+        let got: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        assert_eq!(
+            got,
+            vec![30, 20, 10],
+            "duplicates must go and the descending order must stay; sorting to \
+             make duplicates adjacent throws away the ORDER BY"
+        );
+    }
 
     /// `WcoJoin` must reach the transport as a stream, not as a collected Vec.
     ///
