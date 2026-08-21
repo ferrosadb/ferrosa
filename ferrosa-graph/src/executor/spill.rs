@@ -178,9 +178,20 @@ impl SpillSortSink {
         let Some(reserver) = config.spill.as_ref() else {
             return Ok(None);
         };
-        if return_clause.order_by.is_empty() || return_clause.limit.is_some() {
+        if return_clause.order_by.is_empty() {
             return Ok(None);
         }
+        // A LIMIT deliberately does NOT disqualify the sink.
+        //
+        // It used to: `|| return_clause.limit.is_some()` sent every
+        // `ORDER BY ... LIMIT n` to the in-memory path. That is backwards. The
+        // sort has to consider every candidate row whatever the limit is, so
+        // the limit shrinks the OUTPUT, not the work — and bailing meant a
+        // ten-row answer first materialised every candidate row, which is the
+        // shape most likely to be large.
+        //
+        // The caller takes `limit` from the sorted stream, which yields the
+        // same rows in the same order while the sink keeps the sort bounded.
         // Resolve every order term to a projected column index; bail to the
         // in-memory path if any term is not projected.
         let mut terms = Vec::with_capacity(return_clause.order_by.len());
@@ -424,6 +435,46 @@ mod tests {
 
     /// `finish_stream` yields the merged rows in sorted order WITHOUT
     /// re-materializing, and the temp dir lives exactly as long as the stream.
+    /// `ORDER BY n LIMIT k` yields the k smallest, sorted, without the whole
+    /// result being resident.
+    ///
+    /// A LIMIT used to disqualify the sink outright, so this shape took the
+    /// in-memory path and materialised every candidate row to return a handful.
+    /// The sort still has to see every row -- that is inherent -- but only the
+    /// rows the caller takes are ever pulled out of the merge.
+    #[tokio::test]
+    async fn order_by_with_a_limit_streams_the_smallest_rows_in_order() {
+        use futures::StreamExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reserver = TempDirReserver::new(dir.path());
+        let config = spilling_config(reserver.clone());
+        let mut clause = order_by_n_return_clause();
+        clause.limit = Some(3);
+
+        let mut sink = SpillSortSink::try_new(&["n".to_string()], &clause, &config, "test")
+            .unwrap()
+            .expect("a LIMIT must not disqualify the spilling sort");
+
+        // Pushed out of order, and more rows than the limit.
+        for n in [9i64, 2, 7, 1, 8, 3] {
+            sink.push(vec![serde_json::json!(n)]).unwrap();
+        }
+
+        let sorted = sink.finish_stream().unwrap();
+        let taken: Vec<i64> = Box::pin(sorted.take(3))
+            .map(|row| row.unwrap()[0].as_i64().unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(
+            taken,
+            vec![1, 2, 3],
+            "the limit must be applied to the SORTED stream, so it returns the \
+             smallest rows rather than the first three pushed"
+        );
+    }
+
     #[tokio::test]
     async fn finish_stream_yields_sorted_rows_then_cleans_up_on_drop() {
         use futures::StreamExt as _;
@@ -475,12 +526,20 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // LIMIT present.
+        // LIMIT present: the sink still applies. `ORDER BY x LIMIT 10` is the
+        // shape that most needs it -- the sort is over the whole result no
+        // matter how small the limit, so bailing to the in-memory path made a
+        // ten-row answer materialise every candidate row first. The caller
+        // takes the limit from the sorted stream.
         let mut with_limit = order_by_n_return_clause();
         with_limit.limit = Some(10);
-        assert!(SpillSortSink::try_new(&columns, &with_limit, &config, "t")
-            .unwrap()
-            .is_none());
+        assert!(
+            SpillSortSink::try_new(&columns, &with_limit, &config, "t")
+                .unwrap()
+                .is_some(),
+            "a LIMIT bounds the OUTPUT, not the sort; it must not force the \
+             whole result set to be sorted in memory"
+        );
         // Order term not projected (needs binding context downstream).
         assert!(SpillSortSink::try_new(
             &["other".to_string()],

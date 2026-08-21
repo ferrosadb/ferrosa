@@ -367,9 +367,13 @@ pub async fn execute_var_length(
     }
 
     // Apply DISTINCT.
+    //
+    // Same bug the expand tail had: `Vec::dedup` only removes consecutive
+    // duplicates, so this sorted by debug representation to make them adjacent
+    // — AFTER the ORDER BY sort immediately above, silently replacing the order
+    // the query asked for. Deduplicating on a hash leaves the order alone.
     if return_clause.distinct {
-        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        rows.dedup();
+        super::expand::dedup_preserving_order(&mut rows);
     }
 
     // Apply LIMIT.

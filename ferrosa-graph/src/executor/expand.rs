@@ -191,8 +191,12 @@ pub async fn execute(
 /// Everything else, including `UNION` *without* `ALL` (its `HashSet` dedup
 /// spans the whole concatenation), `DeleteNodes` (it walks the matched rows
 /// twice — validate every vertex, then tombstone — and streaming it would
-/// partially delete), `Aggregate`, DISTINCT, ORDER BY, `WcoJoin`, and
+/// partially delete), `Aggregate`, DISTINCT, ORDER BY, and
 /// `ExpandVarLength`.
+///
+/// `WcoJoin` moved into the streaming set: its accumulator already spilled to
+/// disk, and only the final `finish_rows()` was pulling the result back into
+/// memory.
 ///
 /// # Stats
 ///
@@ -462,6 +466,27 @@ fn execute_streaming_inner<'a>(
                 .await
             }
 
+            // Worst-case-optimal join. Its accumulator already spilled while
+            // accumulating; routing it here is what lets the spill survive to
+            // the transport instead of being collected back into a Vec by the
+            // fallback below.
+            PhysicalPlan::WcoJoin {
+                plan,
+                return_clause,
+            } => {
+                super::leapfrog::execute_wco_join_streaming(
+                    write_path,
+                    keyspace,
+                    &plan,
+                    &return_clause,
+                    config,
+                    start,
+                    virtual_tables,
+                    schema,
+                )
+                .await
+            }
+
             // --- everything else: today's buffered result, wrapped -----------
             other => {
                 let result = execute_buffered(
@@ -478,6 +503,34 @@ fn execute_streaming_inner<'a>(
             }
         }
     })
+}
+
+/// Remove duplicate rows, keeping the first occurrence and the existing order.
+///
+/// The previous form sorted by debug representation and then `dedup()`ed:
+///
+/// (`text`, not `ignore`: the Cluster CI job runs `cargo test -- --ignored`,
+/// which forces ```ignore doctests to compile — and this snippet is an
+/// illustration of deleted code, not something that can compile.)
+///
+/// ```text
+/// rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+/// rows.dedup();
+/// ```
+///
+/// `Vec::dedup` only removes *consecutive* duplicates, so the sort was there to
+/// make duplicates adjacent — but it ran **after** the ORDER BY sort and
+/// therefore destroyed it. `RETURN DISTINCT x ORDER BY x DESC` came back in
+/// debug-string ascending order, with no indication the requested order had
+/// been discarded.
+///
+/// Deduplicating on a hash of the row keeps every duplicate out without
+/// touching the order, so ORDER BY survives. First-seen order also matches what
+/// the streaming paths already do (`dedup_stream`, t_4ce82a3e), so the two
+/// forms of DISTINCT now agree instead of differing by which path a query took.
+pub(super) fn dedup_preserving_order(rows: &mut Vec<super::stream::RowVals>) {
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
 }
 
 /// `RETURN <exprs>` with no MATCH: at most one row, built on pull.
@@ -1485,13 +1538,16 @@ async fn execute_expand_streaming<'a>(
     // final until every row is projected. But "must see every row" does not
     // mean "must hold every row": when the spilling sorter applies, project
     // each state straight INTO it and stream the merged output — the full
-    // result set is never resident (t_3f2f961a). DISTINCT still takes the
-    // buffered tail: its buffered semantics re-sort by debug string after the
-    // ORDER BY sort (t_363c1316 tracks that bug), and this path must not
-    // change observable behavior.
+    // result set is never resident (t_3f2f961a).
+    //
+    // DISTINCT used to be excluded here because the buffered tail re-sorted by
+    // debug string after the ORDER BY sort, so streaming it would have changed
+    // observable behaviour. That re-sort was a bug — it discarded the query's
+    // ORDER BY — and now that the buffered tail dedups without reordering, both
+    // forms are first-seen order and the exclusion has nothing left to protect.
     if !parts.return_clause.order_by.is_empty() {
         let columns = build_columns(&parts.return_clause);
-        if !parts.return_clause.distinct {
+        {
             if let Some(mut sink) = crate::executor::spill::SpillSortSink::try_new(
                 &columns,
                 &parts.return_clause,
@@ -1519,7 +1575,30 @@ async fn execute_expand_streaming<'a>(
                 )
                 .await?;
                 stats.execution_ms = ctx.start.elapsed().as_millis() as u64;
-                return Ok((columns, sink.finish_stream()?, stats));
+                let mut sorted = sink.finish_stream()?;
+
+                // DISTINCT on the sorted stream, in the same order the buffered
+                // tail applies it: sort, then dedup, then limit.
+                //
+                // `dedup_stream` hashes every row it has emitted, so this is
+                // bounded by the number of DISTINCT rows rather than by the
+                // number of candidate rows — inherent to DISTINCT without a
+                // spilling set, and still far below materialising everything.
+                // Adjacent-only dedup would be O(1) but WRONG here: the stream
+                // is sorted by the ORDER BY terms, which may be a subset of the
+                // projected columns, so equal rows are not necessarily adjacent.
+                if parts.return_clause.distinct {
+                    sorted = crate::executor::stream::dedup_stream(sorted);
+                }
+
+                // LIMIT applies to the sorted, deduplicated output. Taking it
+                // here is what lets the sink accept a LIMIT at all: the sort
+                // still sees every candidate row, but only `limit` are pulled.
+                if let Some(limit) = parts.return_clause.limit {
+                    use futures::StreamExt as _;
+                    sorted = Box::pin(sorted.take(limit.max(0) as usize));
+                }
+                return Ok((columns, sorted, stats));
             }
         }
         // Fallback: no spill backend, LIMIT present, an order term that is not
@@ -2045,9 +2124,7 @@ async fn finish_expand_buffered(
 
     // Apply DISTINCT.
     if return_clause.distinct {
-        // serde_json::Value doesn't impl Ord; use string repr for dedup.
-        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        rows.dedup();
+        dedup_preserving_order(&mut rows);
     }
 
     // Apply LIMIT.
@@ -5820,8 +5897,24 @@ async fn execute_aggregate(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
-    // Step 1: Execute inner plan to get all rows.
-    let inner_result = Box::pin(execute(
+    // Step 1: stream the inner plan.
+    //
+    // This used to run the buffered `execute` and hold `inner_result.rows` for
+    // the whole aggregation, then group them into
+    // `BTreeMap<String, Vec<&Vec<Value>>>` — a reference to EVERY input row.
+    // So `RETURN count(n)` over a billion rows held the billion to produce one
+    // number: memory proportional to the INPUT for an output proportional to
+    // the number of groups.
+    //
+    // Nothing required that. `Accumulator` is already incremental
+    // (`accumulate(&mut self, value)`), and the only per-row state the output
+    // needs is one row per group, for the GroupKey projections. So fold each
+    // row as it arrives and keep the first row of each group, never the rest.
+    //
+    // Memory is now proportional to the number of groups, which
+    // `config.max_groups` already bounds (FMEA F7) — a bound on STATE, not on
+    // results.
+    let (inner_columns, mut inner_rows, inner_stats) = Box::pin(execute_streaming(
         inner,
         write_path,
         keyspace,
@@ -5831,73 +5924,75 @@ async fn execute_aggregate(
     ))
     .await?;
     check_timeout(start, config.query_timeout)?;
+    let inner_columns = &inner_columns;
 
-    let inner_columns = &inner_result.columns;
-    let inner_rows = &inner_result.rows;
+    /// One group's running state: its accumulators and the single row the
+    /// GroupKey projections read from.
+    struct GroupState {
+        first_row: Vec<serde_json::Value>,
+        accumulators: Vec<Option<Box<dyn Accumulator>>>,
+        seen_distinct: Vec<std::collections::HashSet<String>>,
+    }
 
-    // Step 2: Group rows by group key values.
-    // Use a BTreeMap keyed by serialized group key for deterministic ordering.
-    let mut groups: std::collections::BTreeMap<String, Vec<&Vec<serde_json::Value>>> =
+    let new_group_state = |first_row: Vec<serde_json::Value>| -> Result<GroupState> {
+        Ok(GroupState {
+            first_row,
+            accumulators: projections
+                .iter()
+                .map(|proj| match proj {
+                    AggregateProjection::GroupKey(_) => Ok(None),
+                    AggregateProjection::AggregateFunc { name, arg, .. } => {
+                        let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
+                        create_accumulator(name, count_star, config.max_collect_size).map(Some)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+            seen_distinct: projections
+                .iter()
+                .map(|_| std::collections::HashSet::new())
+                .collect(),
+        })
+    };
+
+    // Step 2: fold each row into its group as it arrives.
+    let mut groups: std::collections::BTreeMap<String, GroupState> =
         std::collections::BTreeMap::new();
 
-    for row in inner_rows {
-        // Build group key from the group_keys indices.
-        let group_key_values: Vec<&serde_json::Value> = group_keys
-            .iter()
-            .map(|&idx| row.get(idx).unwrap_or(&serde_json::Value::Null))
-            .collect();
+    {
+        use futures::StreamExt as _;
+        while let Some(row) = inner_rows.next().await {
+            let row = row?;
+            check_timeout(start, config.query_timeout)?;
 
-        let group_key_str = serde_json::to_string(&group_key_values).unwrap_or_default();
+            let group_key_values: Vec<&serde_json::Value> = group_keys
+                .iter()
+                .map(|&idx| row.get(idx).unwrap_or(&serde_json::Value::Null))
+                .collect();
+            let group_key_str = serde_json::to_string(&group_key_values).unwrap_or_default();
 
-        // Check group count limit (FMEA F7).
-        if !groups.contains_key(&group_key_str) && groups.len() >= config.max_groups {
-            return Err(GraphError::ResourceLimit(format!(
-                "aggregation group count limit exceeded: {} (limit: {})",
-                groups.len(),
-                config.max_groups
-            )));
-        }
+            // Check group count limit (FMEA F7).
+            if !groups.contains_key(&group_key_str) && groups.len() >= config.max_groups {
+                return Err(GraphError::ResourceLimit(format!(
+                    "aggregation group count limit exceeded: {} (limit: {})",
+                    groups.len(),
+                    config.max_groups
+                )));
+            }
 
-        groups.entry(group_key_str).or_default().push(row);
-    }
-
-    // If there are no group keys and no rows, produce a single group with empty rows
-    // so aggregates like count(*) return 0 rather than no rows.
-    if group_keys.is_empty() && groups.is_empty() {
-        groups.insert(String::new(), Vec::new());
-    }
-
-    // Step 3: Build output rows.
-    let columns = build_columns(return_clause);
-    let mut result_rows = Vec::new();
-
-    for group_rows in groups.values() {
-        // Create accumulators for each aggregate projection.
-        let mut accumulators: Vec<Option<Box<dyn Accumulator>>> = projections
-            .iter()
-            .map(|proj| match proj {
-                AggregateProjection::GroupKey(_) => Ok(None),
-                AggregateProjection::AggregateFunc { name, arg, .. } => {
-                    let count_star = name == "count" && matches!(arg, Expr::Var(v) if v == "*");
-                    create_accumulator(name, count_star, config.max_collect_size).map(Some)
+            let state = match groups.entry(group_key_str) {
+                std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(new_group_state(row.clone())?)
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
 
-        let mut seen_distinct: Vec<std::collections::HashSet<String>> = projections
-            .iter()
-            .map(|_| std::collections::HashSet::new())
-            .collect();
-
-        // Feed rows into accumulators.
-        for row in group_rows {
             for (proj_idx, proj) in projections.iter().enumerate() {
                 if let AggregateProjection::AggregateFunc { arg, distinct, .. } = proj {
-                    if let Some(ref mut acc) = accumulators[proj_idx] {
-                        let value = eval_aggregate_arg(arg, row, inner_columns);
+                    if let Some(ref mut acc) = state.accumulators[proj_idx] {
+                        let value = eval_aggregate_arg(arg, &row, inner_columns);
                         if *distinct {
                             let key = serde_json::to_string(&value).unwrap_or_default();
-                            if !seen_distinct[proj_idx].insert(key) {
+                            if !state.seen_distinct[proj_idx].insert(key) {
                                 continue;
                             }
                         }
@@ -5906,9 +6001,22 @@ async fn execute_aggregate(
                 }
             }
         }
+    }
 
+    // No group keys and no rows: one empty group, so `count(*)` returns 0
+    // rather than no rows at all.
+    if group_keys.is_empty() && groups.is_empty() {
+        groups.insert(String::new(), new_group_state(Vec::new())?);
+    }
+
+    // Step 3: Build output rows. The accumulators were fed as rows arrived, so
+    // there is nothing left to iterate but the groups themselves.
+    let columns = build_columns(return_clause);
+    let mut result_rows = Vec::new();
+
+    for state in groups.values() {
         // Check collect size limit (FMEA F6).
-        for acc in accumulators.iter().flatten() {
+        for acc in state.accumulators.iter().flatten() {
             if acc.name() == "collect" {
                 let result = acc.finish();
                 if let serde_json::Value::Array(arr) = &result {
@@ -5925,20 +6033,19 @@ async fn execute_aggregate(
 
         // Build the output row.
         let mut output_row = Vec::new();
-        let first_row = group_rows.first();
-
         for (proj_idx, proj) in projections.iter().enumerate() {
             match proj {
                 AggregateProjection::GroupKey(key_idx) => {
                     let col_idx = group_keys.get(*key_idx).copied().unwrap_or(0);
-                    let value = first_row
-                        .and_then(|r| r.get(col_idx))
+                    let value = state
+                        .first_row
+                        .get(col_idx)
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     output_row.push(value);
                 }
                 AggregateProjection::AggregateFunc { .. } => {
-                    let value = accumulators[proj_idx]
+                    let value = state.accumulators[proj_idx]
                         .as_ref()
                         .map(|a| a.finish())
                         .unwrap_or(serde_json::Value::Null);
@@ -5950,10 +6057,12 @@ async fn execute_aggregate(
         result_rows.push(output_row);
     }
 
-    let mut stats = QueryStats::default();
-    stats.vertices_read = inner_result.stats.vertices_read;
-    stats.edges_read = inner_result.stats.edges_read;
-    stats.execution_ms = start.elapsed().as_millis() as u64;
+    let stats = QueryStats {
+        vertices_read: inner_stats.vertices_read,
+        edges_read: inner_stats.edges_read,
+        execution_ms: start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
 
     Ok(GraphResult {
         columns,
@@ -6080,8 +6189,6 @@ fn execute_virtual_anchor(
             ))
         })?;
 
-    let virtual_rows = vtable.read(None);
-    stats.vertices_read = virtual_rows.len();
     check_timeout(start, config.query_timeout)?;
 
     let vtable_columns = vtable.columns();
@@ -6090,11 +6197,27 @@ fn execute_virtual_anchor(
     // Build a JSON object for each virtual row so eval_expr can project.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
 
+    // `visit_rows`, not `read(None)`, and no result cap.
+    //
+    // This read the whole virtual table into a `Vec` and then stopped
+    // projecting at `config.max_result_rows` — a silent truncation with no
+    // error and no flag, so a client could not tell a partial answer from a
+    // complete one. It also saved nothing: the rows it declined to project were
+    // already resident, because `read(None)` had materialised all of them
+    // first. A bound on a RESULT, paid for with a wrong answer and buying
+    // nothing.
+    //
+    // `visit_rows` exists for exactly this: its doc says "streaming or live
+    // tables should override this method and emit one row at a time", so using
+    // it lets a large or live virtual table avoid the intermediate `Vec`
+    // entirely, while the default adapter keeps every existing table working.
+    //
+    // The body is sync and infallible (`eval_expr(..).unwrap_or(Null)`), so it
+    // drops into the visitor closure unchanged.
     let mut rows = Vec::new();
-    for vrow in &virtual_rows {
-        if rows.len() >= config.max_result_rows {
-            break;
-        }
+    let mut vertices_read = 0usize;
+    vtable.visit_rows(None, &mut |vrow| {
+        vertices_read += 1;
 
         // Construct a JSON object from virtual row cells, keyed by column name.
         let mut obj = serde_json::Map::new();
@@ -6114,7 +6237,8 @@ fn execute_virtual_anchor(
             .collect();
 
         rows.push(row);
-    }
+    });
+    stats.vertices_read = vertices_read;
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
@@ -6391,6 +6515,187 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Aggregation must fold its input, not hold it.
+    ///
+    /// It used to run the buffered `execute` and group into
+    /// `BTreeMap<String, Vec<&Vec<Value>>>` — a reference to every input row —
+    /// so `RETURN count(n)` over a billion rows held the billion to produce one
+    /// number. `Accumulator` was already incremental; only the grouping step
+    /// stood in the way.
+    ///
+    /// Asserted on the source because the regression is invisible in results:
+    /// collecting the rows first returns exactly the same aggregates, just with
+    /// memory proportional to the input, and no output-shaped test can tell the
+    /// difference without a data set larger than the machine.
+    #[test]
+    fn aggregation_folds_its_input_instead_of_collecting_it() {
+        let src = include_str!("expand.rs");
+        let body = src
+            .split("async fn execute_aggregate")
+            .nth(1)
+            .expect("execute_aggregate must exist");
+        let body = &body[..body
+            .find("stats.execution_ms")
+            .expect("the aggregate body must end with its stats")];
+
+        assert!(
+            body.contains("execute_streaming("),
+            "the inner plan must be streamed; the buffered `execute` \
+             materialises every input row before aggregation starts"
+        );
+        assert!(
+            !body.contains("Vec<&Vec<serde_json::Value>>"),
+            "groups must hold running state, not references to every input row"
+        );
+        assert!(
+            body.contains("acc.accumulate(&value)") && body.contains("while let Some(row)"),
+            "rows must be accumulated as they arrive"
+        );
+    }
+
+    /// No executor path may truncate a result on `max_result_rows`.
+    ///
+    /// Every such site silently dropped answers: no error, no flag, and a
+    /// client could not distinguish a partial result from a complete one. They
+    /// have all been removed -- leapfrog's intersection cap, the ORDER BY bail,
+    /// and the virtual-table projection break -- and this is what stops the
+    /// next one being added, because a reintroduced cap produces plausible
+    /// output and breaks nothing a result-shaped test would catch.
+    ///
+    /// Reading the source is deliberate: the property is "this comparison does
+    /// not appear", which cannot be observed from behaviour without knowing the
+    /// data set is larger than the cap.
+    #[test]
+    fn no_executor_path_truncates_on_max_result_rows() {
+        let sources = [
+            ("expand.rs", include_str!("expand.rs")),
+            ("leapfrog.rs", include_str!("leapfrog.rs")),
+            ("varpath.rs", include_str!("varpath.rs")),
+            ("spill.rs", include_str!("spill.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+        ];
+
+        for (name, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if !code.contains("max_result_rows") {
+                    continue;
+                }
+                // A declaration or a default is fine; a comparison is a cap.
+                let is_cap = code.contains(">=")
+                    || code.contains(" > ")
+                    || code.contains("take(")
+                    || code.contains("truncate(");
+                assert!(
+                    !is_cap,
+                    "{name}:{} truncates on max_result_rows: {}",
+                    n + 1,
+                    code.trim()
+                );
+            }
+        }
+    }
+
+    /// `ORDER BY` with `DISTINCT` must reach the spilling sorter.
+    ///
+    /// DISTINCT was excluded from this path because the buffered tail re-sorted
+    /// by debug string afterwards, so streaming would have changed the observed
+    /// order. That re-sort was the bug (it discarded the ORDER BY); with it
+    /// gone, excluding DISTINCT only forces the whole result into memory for no
+    /// behavioural reason.
+    ///
+    /// Asserted on the source because the regression is a routing one: putting
+    /// the `!distinct` guard back still returns correct rows, merely
+    /// materialised, so no result-shaped assertion would catch it.
+    #[test]
+    fn distinct_is_not_excluded_from_the_streaming_order_by_path() {
+        let src = include_str!("expand.rs");
+        let body = src
+            .split("ORDER BY (with or without DISTINCT) is a pipeline breaker")
+            .nth(1)
+            .expect("the streaming ORDER BY arm must exist");
+        let arm = &body[..body
+            .find("// Fallback:")
+            .expect("the fallback comment must exist")];
+
+        assert!(
+            !arm.contains("if !parts.return_clause.distinct"),
+            "DISTINCT must not be routed away from the spilling sorter: the \
+             buffered tail no longer reorders, so there is nothing left to \
+             preserve by materialising"
+        );
+        assert!(
+            arm.contains("dedup_stream"),
+            "the streaming arm must apply DISTINCT to the sorted stream"
+        );
+    }
+
+    /// DISTINCT must not discard the ORDER BY the query asked for.
+    ///
+    /// The buffered tail sorted by debug representation and then `dedup()`ed,
+    /// because `Vec::dedup` only removes consecutive duplicates. That sort ran
+    /// AFTER the ORDER BY sort, so `RETURN DISTINCT x ORDER BY x DESC` came
+    /// back in debug-string ascending order — the requested order silently
+    /// replaced, with no error and nothing in the result to show it.
+    #[test]
+    fn distinct_dedups_without_reordering() {
+        use serde_json::json;
+
+        // Already in the order an `ORDER BY n DESC` would have produced, with
+        // duplicates that are not adjacent.
+        let mut rows: Vec<super::super::stream::RowVals> = vec![
+            vec![json!(30)],
+            vec![json!(20)],
+            vec![json!(30)],
+            vec![json!(10)],
+            vec![json!(20)],
+        ];
+
+        super::dedup_preserving_order(&mut rows);
+
+        let got: Vec<i64> = rows.iter().map(|r| r[0].as_i64().unwrap()).collect();
+        assert_eq!(
+            got,
+            vec![30, 20, 10],
+            "duplicates must go and the descending order must stay; sorting to \
+             make duplicates adjacent throws away the ORDER BY"
+        );
+    }
+
+    /// `WcoJoin` must reach the transport as a stream, not as a collected Vec.
+    ///
+    /// Its accumulator already spilled to disk while accumulating, and then
+    /// `finish_rows()` pulled every row back into memory to build a
+    /// `GraphResult` — so the spill was undone at the last step and a large
+    /// result still landed in RAM. Routing the plan through the streaming
+    /// dispatch is what keeps the spill alive to the consumer.
+    ///
+    /// This asserts the routing, which is the part that regresses silently: if
+    /// `WcoJoin` falls back to `other =>` again it still returns correct rows,
+    /// just materialised, and no result-shaped assertion would notice.
+    #[test]
+    fn wco_join_is_routed_to_the_streaming_dispatch_not_the_buffered_fallback() {
+        let src = include_str!("expand.rs");
+        let dispatch = src
+            .split("fn execute_streaming_inner")
+            .nth(1)
+            .expect("execute_streaming_inner must exist");
+        let dispatch = &dispatch[..dispatch
+            .find("// --- everything else")
+            .expect("the buffered fallback arm must exist")];
+
+        assert!(
+            dispatch.contains("PhysicalPlan::WcoJoin"),
+            "WcoJoin must be handled BEFORE the buffered fallback; falling \
+             through to `other =>` collects the spilled result back into a Vec"
+        );
+        assert!(
+            dispatch.contains("execute_wco_join_streaming"),
+            "the WcoJoin arm must call the streaming form, not the collecting \
+             wrapper"
+        );
+    }
     use super::*;
 
     use crate::adjacency::observer::make_adjacency_mutation;
@@ -7632,7 +7937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_virtual_table_respects_max_rows() {
+    async fn execute_virtual_table_returns_every_row() {
         let registry = VirtualTableRegistry::new();
         // Create a virtual table with many rows.
         let rows: Vec<VirtualRow> = (0..100)
@@ -7657,6 +7962,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = test_storage_engine(tmp.path());
 
+        // A low `max_result_rows` must NOT shorten the answer. It used to:
+        // the projection loop broke at this value after `read(None)` had
+        // already materialised every row, so it discarded answers without
+        // saving anything.
         let config = GraphEngineConfig {
             max_result_rows: 5,
             ..Default::default()
@@ -7673,7 +7982,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.rows.len(), 5);
+        assert_eq!(
+            result.rows.len(),
+            100,
+            "every row in the virtual table is an answer; `max_result_rows` \
+             must not silently drop 95 of them"
+        );
     }
 
     #[test]

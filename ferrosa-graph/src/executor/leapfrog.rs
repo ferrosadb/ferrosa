@@ -125,56 +125,60 @@ impl AdjacencyIterator {
     }
 }
 
-/// Leapfrog join: intersect multiple sorted iterators.
-/// Returns the set of values present in ALL iterators.
-fn leapfrog_join(iterators: &mut [AdjacencyIterator], max_results: usize) -> Vec<Vec<u8>> {
+/// Advance a set of sorted iterators to their next common value.
+///
+/// Returns `None` once any iterator is exhausted, at which point the
+/// intersection is complete.
+///
+/// **Streams; does not materialise.** This used to be `leapfrog_join`, which
+/// collected the whole intersection into a `Vec<Vec<u8>>` and took a
+/// `max_results` argument that every production call defeated with
+/// `usize::MAX`. That combination is the worst of both: a cap that drops
+/// ANSWERS silently when it is honoured, and an unbounded in-memory Vec when it
+/// is not.
+///
+/// Neither is necessary. Leapfrog converges on one common value per round by
+/// seeking every iterator to the current maximum, so the intersection is
+/// naturally incremental — building a Vec was gratuitous. Yielding one value at
+/// a time removes the cap and the allocation together, so there is nothing to
+/// spill.
+///
+/// Work is bounded by the caller's `check_timeout`, which fails loud.
+fn next_common_value(iterators: &mut [AdjacencyIterator]) -> Option<Vec<u8>> {
     if iterators.is_empty() || iterators.iter().any(|it| it.is_exhausted()) {
-        return vec![];
+        return None;
     }
 
-    let mut results = Vec::new();
-
     loop {
-        if results.len() >= max_results {
-            break;
-        }
-
         // Find the iterator with the maximum current value.
         let max_val = iterators
             .iter()
             .filter_map(|it| it.current())
             .max()
-            .map(|v| v.to_vec());
-
-        let max_val = match max_val {
-            Some(v) => v,
-            None => break, // Some iterator exhausted
-        };
+            .map(|v| v.to_vec())?;
 
         // Seek all iterators to >= max_val.
         for it in iterators.iter_mut() {
             it.seek(&max_val);
             if it.is_exhausted() {
-                return results;
+                return None;
             }
         }
 
-        // Check if all iterators are at the same value.
+        // All at the same value means it is in every iterator.
         let all_equal = iterators
             .iter()
             .all(|it| it.current() == Some(max_val.as_slice()));
 
         if all_equal {
-            results.push(max_val);
-            // Advance all iterators past the match.
+            // Advance past the match so the next call makes progress.
             for it in iterators.iter_mut() {
                 it.next();
             }
+            return Some(max_val);
         }
-        // Otherwise, the next iteration will converge on the new max.
+        // Otherwise the next round converges on the new maximum.
     }
-
-    results
 }
 
 /// Execute a worst-case optimal join plan using leapfrog triejoin.
@@ -198,16 +202,58 @@ pub async fn execute_wco_join(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<GraphResult> {
+    // One implementation. This collects the streaming one for the callers that
+    // still want a whole result, rather than keeping a second executor that
+    // could drift from it.
+    let (columns, rows, stats) = execute_wco_join_streaming(
+        write_path,
+        keyspace,
+        plan,
+        return_clause,
+        config,
+        start,
+        virtual_tables,
+        schema,
+    )
+    .await?;
+    // `usize::MAX`, deliberately NOT `config.max_result_rows`: this bridge
+    // truncates silently at whatever it is given, and a caller asking for a
+    // whole result must get the whole result. The materialisation here is the
+    // caller's choice; a cap would be a wrong answer.
+    crate::executor::collect_to_graph_result(columns, rows, stats, usize::MAX).await
+}
+
+/// The streaming form: rows are produced on pull and never all held at once.
+///
+/// The accumulator already spilled to disk while accumulating, and then
+/// `finish_rows()` loaded every row back into a `Vec` to build a `GraphResult`
+/// — so the spill was undone at the last step and a large result still landed
+/// in RAM. `finish_stream()` was sitting next to it, unused from here.
+///
+/// DISTINCT and LIMIT move onto the stream for the same reason: a `Vec::dedup`
+/// after a full sort, and a `Vec::truncate`, both require the whole result to
+/// exist first. `dedup_stream` and `take` do not.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_wco_join_streaming<'a>(
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    plan: &WcoJoinPlan,
+    return_clause: &ReturnClause,
+    config: &'a GraphEngineConfig,
+    start: Instant,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&ferrosa_schema::Schema>,
+) -> Result<(Vec<String>, crate::executor::RowStream<'static>, QueryStats)> {
     let _ = virtual_tables; // Reserved for future virtual table support.
     let mut stats = QueryStats::default();
 
     if plan.variables.is_empty() || plan.relations.is_empty() {
         stats.execution_ms = start.elapsed().as_millis() as u64;
-        return Ok(GraphResult {
-            columns: build_columns(return_clause),
-            rows: vec![],
+        return Ok((
+            build_columns(return_clause),
+            crate::executor::stream::stream_from_rows(vec![]),
             stats,
-        });
+        ));
     }
 
     let adj_ks = adjacency_keyspace_name(keyspace);
@@ -270,36 +316,39 @@ pub async fn execute_wco_join(
     }
 
     // Terminal ORDER BY: the spilling accumulator already sorted while
-    // accumulating; the buffered fallback sorts in memory exactly as before.
-    let mut result_rows = match acc {
-        RowAcc::Spilling(sink) => sink.finish_rows()?,
-        RowAcc::Buffered(mut rows) => {
+    // accumulating and hands back a stream that reads its spilled runs on pull;
+    // the buffered fallback sorts in memory, which is bounded by the threshold
+    // that would have made it spill.
+    let mut rows: crate::executor::RowStream<'static> = match acc {
+        RowAcc::Spilling(sink) => sink.finish_stream()?,
+        RowAcc::Buffered(mut buffered) => {
             if !return_clause.order_by.is_empty() {
-                sort_rows(&mut rows, &columns, &return_clause.order_by);
+                sort_rows(&mut buffered, &columns, &return_clause.order_by);
             }
-            rows
+            crate::executor::stream::stream_from_rows(buffered)
         }
     };
 
-    // Apply DISTINCT.
+    // DISTINCT on the stream. The buffered form sorted the whole result by its
+    // debug representation and then deduped, which needed every row present at
+    // once — and incidentally returned RETURN DISTINCT in string-repr sorted
+    // order. `dedup_stream` is first-seen order, matching the streaming paths
+    // that already made that change deliberately (t_4ce82a3e).
     if return_clause.distinct {
-        result_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        result_rows.dedup();
+        rows = crate::executor::stream::dedup_stream(rows);
     }
 
-    // Apply LIMIT.
+    // LIMIT on the stream. `Vec::truncate` had to build the whole result before
+    // discarding most of it; `take` stops pulling.
     if let Some(limit) = return_clause.limit {
+        use futures::StreamExt as _;
         let limit = limit.max(0) as usize;
-        result_rows.truncate(limit);
+        rows = Box::pin(rows.take(limit));
     }
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
-    Ok(GraphResult {
-        columns,
-        rows: result_rows,
-        stats,
-    })
+    Ok((columns, rows, stats))
 }
 
 /// Recursively enumerate valid variable bindings.
@@ -434,10 +483,12 @@ async fn enumerate_bindings(
     // intersection is bounded by the smallest adjacency list, which is already
     // resident — truncating it (`max_result_rows`, removed) only dropped valid
     // join results without saving memory.
-    let valid_bindings = leapfrog_join(&mut iterators, usize::MAX);
-
-    for binding in &valid_bindings {
-        var_bindings.insert(current_var.clone(), binding.clone());
+    // Stream the intersection. Nothing is collected: each common value is
+    // consumed and its subtree enumerated before the next is produced, so a
+    // large intersection costs no memory here regardless of size.
+    while let Some(binding) = next_common_value(&mut iterators) {
+        check_timeout(start, config.query_timeout)?;
+        var_bindings.insert(current_var.clone(), binding);
         Box::pin(enumerate_bindings(
             write_path,
             adj_table_id,
@@ -565,6 +616,14 @@ mod tests {
         out
     }
 
+    /// Drain the streaming intersection for assertions.
+    ///
+    /// Test-only on purpose: production consumes `next_common_value` one value
+    /// at a time and never holds the intersection in memory.
+    fn drain_intersection(iterators: &mut [AdjacencyIterator]) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| next_common_value(iterators)).collect()
+    }
+
     #[test]
     fn leapfrog_join_basic() {
         // Three sorted iterators with known intersection {3, 5}.
@@ -574,7 +633,7 @@ mod tests {
             AdjacencyIterator::from_sorted(vec![vec![3], vec![4], vec![5], vec![8]]),
         ];
 
-        let results = leapfrog_join(&mut iters, 100);
+        let results = drain_intersection(&mut iters);
         assert_eq!(results, vec![vec![3], vec![5]]);
     }
 
@@ -586,7 +645,7 @@ mod tests {
             AdjacencyIterator::from_sorted(vec![vec![5], vec![6]]),
         ];
 
-        let results = leapfrog_join(&mut iters, 100);
+        let results = drain_intersection(&mut iters);
         assert!(results.is_empty());
     }
 
@@ -599,26 +658,79 @@ mod tests {
             vec![3],
         ])];
 
-        let results = leapfrog_join(&mut iters, 100);
+        let results = drain_intersection(&mut iters);
         assert_eq!(results, vec![vec![1], vec![2], vec![3]]);
     }
 
+    /// The intersection is produced incrementally, not collected.
+    ///
+    /// Completeness alone would still pass if the implementation built the
+    /// whole `Vec` first, which is what it used to do -- and a result set that
+    /// must fit in RAM to be correct is a cap waiting to be reintroduced. This
+    /// pins the shape: one value per call, with the iterators left positioned
+    /// for the next, so a caller can consume an intersection larger than
+    /// memory.
     #[test]
-    fn leapfrog_join_respects_max_results() {
+    fn the_intersection_is_produced_one_value_at_a_time() {
+        let shared: Vec<Vec<u8>> = (0..500u32).map(|i| i.to_be_bytes().to_vec()).collect();
         let mut iters = vec![
-            AdjacencyIterator::from_sorted(vec![vec![1], vec![2], vec![3], vec![4]]),
-            AdjacencyIterator::from_sorted(vec![vec![1], vec![2], vec![3], vec![4]]),
+            AdjacencyIterator::from_sorted(shared.clone()),
+            AdjacencyIterator::from_sorted(shared.clone()),
         ];
 
-        let results = leapfrog_join(&mut iters, 2);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results, vec![vec![1], vec![2]]);
+        // Take three values and stop. A collecting implementation would have
+        // computed all 500 to hand back the first.
+        let first = next_common_value(&mut iters).expect("first");
+        let second = next_common_value(&mut iters).expect("second");
+        let third = next_common_value(&mut iters).expect("third");
+        assert_eq!(vec![first, second, third], shared[..3].to_vec());
+
+        // Resuming continues from where it stopped rather than restarting.
+        let rest: Vec<Vec<u8>> = std::iter::from_fn(|| next_common_value(&mut iters)).collect();
+        assert_eq!(
+            rest,
+            shared[3..].to_vec(),
+            "the iterators must stay positioned between calls; restarting would \
+             duplicate answers and re-read the adjacency lists"
+        );
+
+        // Exhausted means exhausted, not wrapped.
+        assert!(next_common_value(&mut iters).is_none());
+    }
+
+    /// The intersection is returned complete, however large it is.
+    ///
+    /// Replaces `leapfrog_join_respects_max_results`, which asserted the
+    /// opposite: that the join stopped at a caller-supplied count. It passed
+    /// while the production call site defeated the cap with `usize::MAX`, so
+    /// the only thing it pinned was the ability to truncate a result set — the
+    /// behaviour worth preventing, not preserving.
+    ///
+    /// 500 sits well past the old 100-row default, so a reintroduced cap fails
+    /// here rather than in a query someone runs later.
+    #[test]
+    fn leapfrog_join_returns_the_complete_intersection() {
+        let shared: Vec<Vec<u8>> = (0..500u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let mut iters = vec![
+            AdjacencyIterator::from_sorted(shared.clone()),
+            AdjacencyIterator::from_sorted(shared.clone()),
+        ];
+
+        let results = drain_intersection(&mut iters);
+
+        assert_eq!(
+            results.len(),
+            shared.len(),
+            "every value present in both iterators is an answer; dropping one \
+             returns a wrong result, not a partial one"
+        );
+        assert_eq!(results, shared);
     }
 
     #[test]
     fn leapfrog_join_empty_iterators() {
         let mut iters: Vec<AdjacencyIterator> = vec![];
-        let results = leapfrog_join(&mut iters, 100);
+        let results = drain_intersection(&mut iters);
         assert!(results.is_empty());
     }
 
@@ -629,7 +741,7 @@ mod tests {
             AdjacencyIterator::from_sorted(vec![]),
         ];
 
-        let results = leapfrog_join(&mut iters, 100);
+        let results = drain_intersection(&mut iters);
         assert!(results.is_empty());
     }
 
