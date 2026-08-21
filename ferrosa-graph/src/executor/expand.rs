@@ -524,7 +524,7 @@ fn execute_streaming_inner<'a>(
 /// touching the order, so ORDER BY survives. First-seen order also matches what
 /// the streaming paths already do (`dedup_stream`, t_4ce82a3e), so the two
 /// forms of DISTINCT now agree instead of differing by which path a query took.
-fn dedup_preserving_order(rows: &mut Vec<super::stream::RowVals>) {
+pub(super) fn dedup_preserving_order(rows: &mut Vec<super::stream::RowVals>) {
     let mut seen = std::collections::HashSet::new();
     rows.retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
 }
