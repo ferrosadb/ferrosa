@@ -202,16 +202,58 @@ pub async fn execute_wco_join(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&ferrosa_schema::Schema>,
 ) -> Result<GraphResult> {
+    // One implementation. This collects the streaming one for the callers that
+    // still want a whole result, rather than keeping a second executor that
+    // could drift from it.
+    let (columns, rows, stats) = execute_wco_join_streaming(
+        write_path,
+        keyspace,
+        plan,
+        return_clause,
+        config,
+        start,
+        virtual_tables,
+        schema,
+    )
+    .await?;
+    // `usize::MAX`, deliberately NOT `config.max_result_rows`: this bridge
+    // truncates silently at whatever it is given, and a caller asking for a
+    // whole result must get the whole result. The materialisation here is the
+    // caller's choice; a cap would be a wrong answer.
+    crate::executor::collect_to_graph_result(columns, rows, stats, usize::MAX).await
+}
+
+/// The streaming form: rows are produced on pull and never all held at once.
+///
+/// The accumulator already spilled to disk while accumulating, and then
+/// `finish_rows()` loaded every row back into a `Vec` to build a `GraphResult`
+/// — so the spill was undone at the last step and a large result still landed
+/// in RAM. `finish_stream()` was sitting next to it, unused from here.
+///
+/// DISTINCT and LIMIT move onto the stream for the same reason: a `Vec::dedup`
+/// after a full sort, and a `Vec::truncate`, both require the whole result to
+/// exist first. `dedup_stream` and `take` do not.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_wco_join_streaming<'a>(
+    write_path: &'a WritePath,
+    keyspace: &'a str,
+    plan: &WcoJoinPlan,
+    return_clause: &ReturnClause,
+    config: &'a GraphEngineConfig,
+    start: Instant,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&ferrosa_schema::Schema>,
+) -> Result<(Vec<String>, crate::executor::RowStream<'static>, QueryStats)> {
     let _ = virtual_tables; // Reserved for future virtual table support.
     let mut stats = QueryStats::default();
 
     if plan.variables.is_empty() || plan.relations.is_empty() {
         stats.execution_ms = start.elapsed().as_millis() as u64;
-        return Ok(GraphResult {
-            columns: build_columns(return_clause),
-            rows: vec![],
+        return Ok((
+            build_columns(return_clause),
+            crate::executor::stream::stream_from_rows(vec![]),
             stats,
-        });
+        ));
     }
 
     let adj_ks = adjacency_keyspace_name(keyspace);
@@ -274,36 +316,39 @@ pub async fn execute_wco_join(
     }
 
     // Terminal ORDER BY: the spilling accumulator already sorted while
-    // accumulating; the buffered fallback sorts in memory exactly as before.
-    let mut result_rows = match acc {
-        RowAcc::Spilling(sink) => sink.finish_rows()?,
-        RowAcc::Buffered(mut rows) => {
+    // accumulating and hands back a stream that reads its spilled runs on pull;
+    // the buffered fallback sorts in memory, which is bounded by the threshold
+    // that would have made it spill.
+    let mut rows: crate::executor::RowStream<'static> = match acc {
+        RowAcc::Spilling(sink) => sink.finish_stream()?,
+        RowAcc::Buffered(mut buffered) => {
             if !return_clause.order_by.is_empty() {
-                sort_rows(&mut rows, &columns, &return_clause.order_by);
+                sort_rows(&mut buffered, &columns, &return_clause.order_by);
             }
-            rows
+            crate::executor::stream::stream_from_rows(buffered)
         }
     };
 
-    // Apply DISTINCT.
+    // DISTINCT on the stream. The buffered form sorted the whole result by its
+    // debug representation and then deduped, which needed every row present at
+    // once — and incidentally returned RETURN DISTINCT in string-repr sorted
+    // order. `dedup_stream` is first-seen order, matching the streaming paths
+    // that already made that change deliberately (t_4ce82a3e).
     if return_clause.distinct {
-        result_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        result_rows.dedup();
+        rows = crate::executor::stream::dedup_stream(rows);
     }
 
-    // Apply LIMIT.
+    // LIMIT on the stream. `Vec::truncate` had to build the whole result before
+    // discarding most of it; `take` stops pulling.
     if let Some(limit) = return_clause.limit {
+        use futures::StreamExt as _;
         let limit = limit.max(0) as usize;
-        result_rows.truncate(limit);
+        rows = Box::pin(rows.take(limit));
     }
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
 
-    Ok(GraphResult {
-        columns,
-        rows: result_rows,
-        stats,
-    })
+    Ok((columns, rows, stats))
 }
 
 /// Recursively enumerate valid variable bindings.

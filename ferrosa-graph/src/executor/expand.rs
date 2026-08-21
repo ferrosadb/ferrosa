@@ -191,8 +191,12 @@ pub async fn execute(
 /// Everything else, including `UNION` *without* `ALL` (its `HashSet` dedup
 /// spans the whole concatenation), `DeleteNodes` (it walks the matched rows
 /// twice — validate every vertex, then tombstone — and streaming it would
-/// partially delete), `Aggregate`, DISTINCT, ORDER BY, `WcoJoin`, and
+/// partially delete), `Aggregate`, DISTINCT, ORDER BY, and
 /// `ExpandVarLength`.
+///
+/// `WcoJoin` moved into the streaming set: its accumulator already spilled to
+/// disk, and only the final `finish_rows()` was pulling the result back into
+/// memory.
 ///
 /// # Stats
 ///
@@ -458,6 +462,27 @@ fn execute_streaming_inner<'a>(
                         schema,
                         start,
                     },
+                )
+                .await
+            }
+
+            // Worst-case-optimal join. Its accumulator already spilled while
+            // accumulating; routing it here is what lets the spill survive to
+            // the transport instead of being collected back into a Vec by the
+            // fallback below.
+            PhysicalPlan::WcoJoin {
+                plan,
+                return_clause,
+            } => {
+                super::leapfrog::execute_wco_join_streaming(
+                    write_path,
+                    keyspace,
+                    &plan,
+                    &return_clause,
+                    config,
+                    start,
+                    virtual_tables,
+                    schema,
                 )
                 .await
             }
@@ -6391,6 +6416,40 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `WcoJoin` must reach the transport as a stream, not as a collected Vec.
+    ///
+    /// Its accumulator already spilled to disk while accumulating, and then
+    /// `finish_rows()` pulled every row back into memory to build a
+    /// `GraphResult` — so the spill was undone at the last step and a large
+    /// result still landed in RAM. Routing the plan through the streaming
+    /// dispatch is what keeps the spill alive to the consumer.
+    ///
+    /// This asserts the routing, which is the part that regresses silently: if
+    /// `WcoJoin` falls back to `other =>` again it still returns correct rows,
+    /// just materialised, and no result-shaped assertion would notice.
+    #[test]
+    fn wco_join_is_routed_to_the_streaming_dispatch_not_the_buffered_fallback() {
+        let src = include_str!("expand.rs");
+        let dispatch = src
+            .split("fn execute_streaming_inner")
+            .nth(1)
+            .expect("execute_streaming_inner must exist");
+        let dispatch = &dispatch[..dispatch
+            .find("// --- everything else")
+            .expect("the buffered fallback arm must exist")];
+
+        assert!(
+            dispatch.contains("PhysicalPlan::WcoJoin"),
+            "WcoJoin must be handled BEFORE the buffered fallback; falling \
+             through to `other =>` collects the spilled result back into a Vec"
+        );
+        assert!(
+            dispatch.contains("execute_wco_join_streaming"),
+            "the WcoJoin arm must call the streaming form, not the collecting \
+             wrapper"
+        );
+    }
     use super::*;
 
     use crate::adjacency::observer::make_adjacency_mutation;
