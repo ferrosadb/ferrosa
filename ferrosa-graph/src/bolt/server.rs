@@ -19,7 +19,6 @@ use crate::bolt::handshake::{negotiate_version, rejection_response, version_resp
 use crate::bolt::message::BoltMessage;
 use crate::engine::GraphEngine;
 use crate::error::GraphError;
-use crate::executor::result::GraphResult;
 
 /// Configuration for the Bolt server.
 #[derive(Debug, Clone)]
@@ -52,7 +51,12 @@ struct ConnectionState {
     /// Current keyspace / graph database.
     keyspace: String,
     /// Pending result from the last RUN.
-    pending_result: Option<GraphResult>,
+    /// The unconsumed remainder of the running query, as a stream.
+    ///
+    /// Held as a stream rather than a `GraphResult` so the server does not keep
+    /// the whole result in memory between PULLs. The client already paged
+    /// correctly; the server did not.
+    pending_result: Option<PendingRows>,
     /// Auth context for permission checks (set after HELLO/LOGON).
     auth_context: Option<AuthContext>,
 }
@@ -369,26 +373,26 @@ async fn process_message(
             let params = pack_params_to_json(params);
 
             match engine
-                .execute_with_params(&query, &keyspace, &auth, &params)
+                .execute_stream_with_params(&query, &keyspace, &auth, &params)
                 .await
             {
-                Ok(result) => {
-                    let fields: Vec<PackValue> = result
-                        .columns
+                Ok((columns, rows, stats)) => {
+                    let fields: Vec<PackValue> = columns
                         .iter()
                         .map(|c| PackValue::String(c.clone()))
                         .collect();
                     let success = BoltMessage::Success {
                         metadata: vec![
                             ("fields".into(), PackValue::List(fields)),
-                            (
-                                "t_first".into(),
-                                PackValue::Int(result.stats.execution_ms as i64),
-                            ),
+                            ("t_first".into(), PackValue::Int(stats.execution_ms as i64)),
                             ("qid".into(), PackValue::Int(0)),
                         ],
                     };
-                    state.pending_result = Some(result);
+                    state.pending_result = Some(PendingRows {
+                        stats,
+                        rows,
+                        peeked: None,
+                    });
                     Ok(vec![success])
                 }
                 Err(e) => {
@@ -419,7 +423,11 @@ async fn process_message(
                 // has_more hardcoded false, so a client asking for 10 rows got
                 // the entire result — a protocol violation, and unbounded
                 // client-side memory for a large query.
-                let (batch, has_more) = take_batch(&mut result.rows, requested_batch_size(&extra));
+                //
+                // The remainder is now a stream, so the SERVER no longer holds
+                // every undelivered row either: this pulls `n` from the query
+                // and looks one past them to answer `has_more`.
+                let (batch, has_more) = result.take_batch(requested_batch_size(&extra)).await?;
 
                 // Send a RECORD for each row in this batch.
                 for row in &batch {
@@ -430,8 +438,8 @@ async fn process_message(
                 // Keep the rest for the next PULL. Stats travel with the FINAL
                 // batch, matching Bolt's summary semantics.
                 if has_more {
-                    // `result.rows` already holds exactly the unconsumed
-                    // remainder, so this is a move, not a copy.
+                    // The stream is positioned at the next undelivered row, so
+                    // this is a move of a cursor, not of the remaining rows.
                     state.pending_result = Some(result);
                     replies.push(BoltMessage::Success {
                         metadata: vec![("has_more".into(), PackValue::Bool(true))],
@@ -489,8 +497,11 @@ async fn process_message(
             // `n` absent or negative means discard everything (t_4ce82a3e).
             match state.pending_result.take() {
                 Some(mut result) => {
+                    // DISCARD {n} drops n records and keeps the rest; it is
+                    // not "throw the whole result away". Pulling them from the
+                    // stream discards without materialising them.
                     let (_dropped, has_more) =
-                        take_batch(&mut result.rows, requested_batch_size(&extra));
+                        result.take_batch(requested_batch_size(&extra)).await?;
                     if has_more {
                         state.pending_result = Some(result);
                         return Ok(vec![BoltMessage::Success {
@@ -746,21 +757,66 @@ fn requested_batch_size(extra: &[(String, PackValue)]) -> Option<usize> {
 /// PULL and DISCARD share this contract exactly and differ only in what they do
 /// with the batch — PULL serializes it into RECORDs, DISCARD drops it — so the
 /// consumption lives here rather than being written twice and drifting.
-fn take_batch(
-    rows: &mut Vec<Vec<serde_json::Value>>,
-    requested: Option<usize>,
-) -> (Vec<Vec<serde_json::Value>>, bool) {
-    let (take, has_more) = batch_split(requested, rows.len());
-    let remainder = rows.split_off(take);
-    // `rows` now holds the batch and `remainder` the rest; swap so the caller's
-    // pending buffer is left holding exactly the unconsumed records.
-    let batch = std::mem::replace(rows, remainder);
-    (batch, has_more)
+/// A query whose rows have not all been delivered yet.
+///
+/// Bolt's PULL is inherently incremental — the client asks for `n` records at a
+/// time — so the natural shape for the remainder is a stream, not a `Vec`. It
+/// used to be a `GraphResult`: the client paged, and the server held every row
+/// of every open result until the last PULL.
+///
+/// Holding the stream also keeps the ORDER BY spill alive for exactly as long
+/// as it can still be pulled from. `SpillSortSink::finish_stream` moves the
+/// temp-dir reservation into the stream, so the spilled runs are removed when
+/// this is dropped — a client that disconnects mid-result cleans up with it.
+struct PendingRows {
+    stats: crate::executor::result::QueryStats,
+    rows: crate::executor::RowStream<'static>,
+    /// One row pulled ahead to answer `has_more` without consuming it.
+    ///
+    /// A stream cannot say whether it is empty without being polled, and Bolt
+    /// must report `has_more` in the same SUCCESS as the batch. Pulling one
+    /// extra and holding it costs a single row.
+    peeked: Option<Vec<serde_json::Value>>,
 }
 
-fn batch_split(requested: Option<usize>, total: usize) -> (usize, bool) {
-    let take = requested.map_or(total, |n| n.min(total));
-    (take, take < total)
+impl PendingRows {
+    /// Take up to `requested` rows, reporting whether any remain.
+    ///
+    /// `None` means "fetch all" (Bolt's canonical `n = -1`).
+    async fn take_batch(
+        &mut self,
+        requested: Option<usize>,
+    ) -> Result<(Vec<Vec<serde_json::Value>>, bool), GraphError> {
+        use futures::StreamExt as _;
+
+        let mut batch = Vec::new();
+        let wanted = requested.unwrap_or(usize::MAX);
+
+        while batch.len() < wanted {
+            let next = match self.peeked.take() {
+                Some(row) => Some(row),
+                None => match self.rows.next().await {
+                    Some(row) => Some(row?),
+                    None => None,
+                },
+            };
+            match next {
+                Some(row) => batch.push(row),
+                None => return Ok((batch, false)),
+            }
+        }
+
+        // Look one past the batch so `has_more` is accurate without delivering
+        // a row the client did not ask for.
+        let has_more = match self.rows.next().await {
+            Some(row) => {
+                self.peeked = Some(row?);
+                true
+            }
+            None => false,
+        };
+        Ok((batch, has_more))
+    }
 }
 
 fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
@@ -811,77 +867,65 @@ mod tests {
     /// what they do with the consumed batch (serialize it vs drop it), so the
     /// consumption itself lives in one tested function — a second copy in the
     /// DISCARD arm is how the two drift apart.
-    #[test]
-    fn take_batch_consumes_at_most_n_and_leaves_the_remainder() {
-        let rows = || -> Vec<Vec<serde_json::Value>> {
-            (1..=5).map(|i| vec![serde_json::json!(i)]).collect()
-        };
+    #[tokio::test]
+    async fn take_batch_consumes_at_most_n_and_leaves_the_remainder() {
+        fn pending(n: i64) -> PendingRows {
+            PendingRows {
+                stats: Default::default(),
+                rows: crate::executor::stream::stream_from_rows(
+                    (1..=n).map(|i| vec![serde_json::json!(i)]).collect(),
+                ),
+                peeked: None,
+            }
+        }
 
-        // Partial: batch is the first n, remainder stays for the next message.
-        let mut r = rows();
-        let (batch, has_more) = take_batch(&mut r, Some(2));
+        // Partial: batch is the first n, the rest stay reachable.
+        let mut r = pending(5);
+        let (batch, has_more) = r.take_batch(Some(2)).await.unwrap();
         assert_eq!(
             batch,
             vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]]
         );
+        assert!(has_more, "3 rows remain");
+        let (rest, has_more) = r.take_batch(None).await.unwrap();
         assert_eq!(
-            r,
+            rest,
             vec![
                 vec![serde_json::json!(3)],
                 vec![serde_json::json!(4)],
                 vec![serde_json::json!(5)],
-            ]
+            ],
+            "the peeked row must be delivered, not dropped"
         );
-        assert!(has_more, "3 rows remain");
+        assert!(!has_more);
 
-        // n == len: exact drain must NOT report more, or the client loops forever.
-        let mut r = rows();
-        let (batch, has_more) = take_batch(&mut r, Some(5));
+        // n == len: an exact drain must NOT report more, or the client loops
+        // forever asking for rows that do not exist.
+        let mut r = pending(5);
+        let (batch, has_more) = r.take_batch(Some(5)).await.unwrap();
         assert_eq!(batch.len(), 5);
-        assert!(r.is_empty());
         assert!(!has_more);
 
         // Fetch-all (n absent / negative) drains everything.
-        let mut r = rows();
-        let (batch, has_more) = take_batch(&mut r, None);
+        let mut r = pending(5);
+        let (batch, has_more) = r.take_batch(None).await.unwrap();
         assert_eq!(batch.len(), 5);
-        assert!(r.is_empty());
         assert!(!has_more);
 
         // n == 0 consumes nothing but must still report more, else the
         // remaining rows become unreachable.
-        let mut r = rows();
-        let (batch, has_more) = take_batch(&mut r, Some(0));
+        let mut r = pending(5);
+        let (batch, has_more) = r.take_batch(Some(0)).await.unwrap();
         assert!(batch.is_empty());
-        assert_eq!(r.len(), 5, "nothing consumed");
         assert!(has_more);
+        let (rest, _) = r.take_batch(None).await.unwrap();
+        assert_eq!(rest.len(), 5, "nothing was consumed by the zero-batch");
 
-        // Empty pending result: no panic, nothing more.
-        let mut r: Vec<Vec<serde_json::Value>> = Vec::new();
-        let (batch, has_more) = take_batch(&mut r, Some(3));
+        // Empty result: no panic, nothing more.
+        let mut r = pending(0);
+        let (batch, has_more) = r.take_batch(Some(3)).await.unwrap();
         assert!(batch.is_empty());
         assert!(!has_more);
-    }
-
-    /// The paging arithmetic, including the edges that decide whether a client
-    /// ever sees the rest of its result (t_4ce82a3e inc 7).
-    #[test]
-    fn batch_split_pages_and_signals_has_more() {
-        // Bounded batch smaller than the result: more remains.
-        assert_eq!(batch_split(Some(2), 5), (2, true));
-        // Exactly the result size: no more (must NOT claim has_more, which would
-        // make a client PULL forever).
-        assert_eq!(batch_split(Some(5), 5), (5, false));
-        // Asking for more than exists is clamped, and completes.
-        assert_eq!(batch_split(Some(99), 5), (5, false));
-        // n = 0 sends nothing but must still report more to come.
-        assert_eq!(batch_split(Some(0), 5), (0, true));
-        // ...unless there is nothing to send at all.
-        assert_eq!(batch_split(Some(0), 0), (0, false));
-        // Fetch-all takes everything and completes — the pre-existing behavior,
-        // which must be preserved for clients that send n = -1 or omit it.
-        assert_eq!(batch_split(None, 5), (5, false));
-        assert_eq!(batch_split(None, 0), (0, false));
     }
 
     /// Bolt PULL {n} must deliver AT MOST n records. `n` absent/negative means
