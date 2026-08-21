@@ -509,7 +509,11 @@ fn execute_streaming_inner<'a>(
 ///
 /// The previous form sorted by debug representation and then `dedup()`ed:
 ///
-/// ```ignore
+/// (`text`, not `ignore`: the Cluster CI job runs `cargo test -- --ignored`,
+/// which forces ```ignore doctests to compile — and this snippet is an
+/// illustration of deleted code, not something that can compile.)
+///
+/// ```text
 /// rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
 /// rows.dedup();
 /// ```
