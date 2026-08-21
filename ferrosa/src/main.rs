@@ -867,6 +867,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // 0.5. A panic on the consensus runtime must kill this process.
+    //
+    // Installed before tracing so it is in place for the whole run, and after
+    // the meta flags so `--version` stays a pure, side-effect-free query.
+    //
+    // A panic unwinds one thread. When that thread is `raft-rt`, the node stops
+    // replicating and loses its RaftAppendEntries handler while the process
+    // keeps serving CQL from whatever state it last held -- a live endpoint
+    // returning wrong answers, which clients cannot fail over from. Observed on
+    // node1, 2026-08-20: hours of `no handler registered` while every query
+    // returned `keyspace 'agent_memory' not found`.
+    //
+    // launchd already has KeepAlive { Crashed = true }. This is what lets it
+    // fire.
+    runtime::install_fatal_panic_hook();
+
     // 1. Initialize tracing.
     //
     // Non-blocking writer: every `tracing::info!` etc. goes through

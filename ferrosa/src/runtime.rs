@@ -157,9 +157,124 @@ impl RuntimeManager {
     }
 }
 
+/// The runtime whose panic means this node can no longer be a cluster member.
+const CONSENSUS_RUNTIME_THREAD: &str = "raft-rt";
+
+/// Must a panic on this thread take the whole process down?
+///
+/// A Rust panic unwinds one thread. For most of them that is the right scope —
+/// CQL already wraps request handling in `catch_unwind` so a bad request kills
+/// a connection, not a node. For consensus it is exactly wrong: when the raft
+/// runtime dies the node stops replicating, loses its RaftAppendEntries
+/// handler, and keeps answering CQL with whatever stale state it holds.
+///
+/// That happened here (2026-08-20, node1): a panic inside openraft left the
+/// process alive for hours, logging `no handler registered` every 3.5 seconds
+/// while serving `keyspace 'agent_memory' not found` to every client. launchd's
+/// `KeepAlive { Crashed = true }` never fired because nothing crashed.
+///
+/// Matching is exact. `raft-log-store` is the sled blocking pool, and a panic
+/// there is a storage fault with its own error path — aborting on a substring
+/// match would turn a contained failure into an outage.
+pub(crate) fn panic_is_fatal(thread_name: Option<&str>) -> bool {
+    thread_name == Some(CONSENSUS_RUNTIME_THREAD)
+}
+
+/// Make a consensus panic kill the process instead of only its thread.
+///
+/// Chains the previous hook so the panic message and backtrace are still
+/// printed before aborting — a silent abort would replace one undiagnosable
+/// failure with another.
+///
+/// `abort`, not `exit`: unwinding out of a poisoned consensus runtime can block
+/// on the very locks the panic left held, and a node that hangs on shutdown is
+/// the same "alive but useless" state this exists to end.
+pub fn install_fatal_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let name = std::thread::current().name().map(str::to_owned);
+        if panic_is_fatal(name.as_deref()) {
+            eprintln!(
+                "FATAL: panic on the consensus runtime ({}). This node can no \
+longer replicate, so it must not keep serving reads. Aborting so the supervisor \
+restarts it.",
+                name.as_deref().unwrap_or("unnamed")
+            );
+            std::process::abort();
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic on the consensus runtime must be fatal to the PROCESS.
+    ///
+    /// Observed on node1 of the local three-node cluster, 2026-08-20. The raft
+    /// thread panicked inside openraft:
+    ///
+    ///     thread 'raft-rt' panicked at raft_core.rs:769:35:
+    ///     index out of bounds: the len is 0 but the index is 18446744073709551615
+    ///
+    /// A panic unwinds only its own thread, so the process stayed alive. What
+    /// died with that thread was the node's participation in the cluster: the
+    /// RaftAppendEntries handler went with it, and the leader logged
+    ///
+    ///     WARN no handler registered msg_type=RaftAppendEntries
+    ///
+    /// every 3.5 seconds for hours, into a file nobody was reading. The node
+    /// kept accepting CQL connections the whole time and answered every query
+    /// with `keyspace 'agent_memory' not found`, because it could no longer
+    /// receive schema. A live endpoint returning a wrong answer is worse than a
+    /// dead one: clients cannot fail over from it.
+    ///
+    /// launchd is configured `KeepAlive { Crashed = true }`, which would have
+    /// restarted the node — and never fired, because nothing crashed. Making
+    /// the panic fatal is what connects the existing supervision to the actual
+    /// failure.
+    #[test]
+    fn a_panic_on_the_consensus_runtime_is_fatal() {
+        assert!(
+            panic_is_fatal(Some("raft-rt")),
+            "consensus is not optional: a node that cannot replicate must stop serving"
+        );
+    }
+
+    /// Runtimes whose panic is survivable must NOT take the node down.
+    ///
+    /// CQL already wraps request handling in catch_unwind, so one bad request
+    /// kills a connection rather than a process. Aborting on those would turn a
+    /// contained fault into an outage — the opposite mistake, and an easy one
+    /// to make while fixing the first.
+    #[test]
+    fn a_panic_on_a_request_runtime_is_not_fatal() {
+        assert!(!panic_is_fatal(Some("cql-rt")));
+        assert!(!panic_is_fatal(Some("data-rt")));
+        assert!(!panic_is_fatal(Some("background-rt")));
+    }
+
+    /// An unnamed thread is not assumed fatal. Tokio names its workers, so an
+    /// unnamed panic is something else entirely, and guessing would make every
+    /// unrelated library panic an outage.
+    #[test]
+    fn an_unnamed_thread_is_not_fatal() {
+        assert!(!panic_is_fatal(None));
+        assert!(!panic_is_fatal(Some("")));
+    }
+
+    /// Matching must be exact. A substring match on "raft" would catch
+    /// "raft-log-store", which is a blocking pool for sled IO -- a panic there
+    /// is a storage error, not a consensus failure.
+    #[test]
+    fn matching_is_exact_not_a_substring() {
+        assert!(
+            !panic_is_fatal(Some("raft-log-store")),
+            "the sled blocking pool is not the consensus runtime"
+        );
+        assert!(!panic_is_fatal(Some("raft-rt-something-else")));
+    }
 
     /// T0.2 (t_88223ad0): the runtime tunable parser prefers a valid env value
     /// over the default and falls back safely on unset / non-positive /
