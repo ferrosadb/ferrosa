@@ -121,7 +121,12 @@ impl QvecContainer {
 
         let artifact_len = payload_end;
         let mut pages = Vec::with_capacity(page_count as usize);
-        for (index, entry) in page_table.chunks_exact(QVEC_PAGE_ENTRY_LEN).enumerate() {
+        // `as_chunks` gives fixed-size `&[u8; QVEC_PAGE_ENTRY_LEN]` entries, so
+        // the reserved-byte slice below is bounds-checked at compile time
+        // rather than at run time. A trailing partial entry is dropped, as
+        // `chunks_exact` did; the page-table length is validated above.
+        let (entries, _partial) = page_table.as_chunks::<QVEC_PAGE_ENTRY_LEN>();
+        for (index, entry) in entries.iter().enumerate() {
             let offset = read_u64(entry, 0)?;
             let len = read_u32(entry, 8)?;
             let kind = entry[12];
