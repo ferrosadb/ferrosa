@@ -43,18 +43,34 @@ pub trait RefillScheduler {
     fn schedule_refill(&self, table: &TableKey, generations: &[u64]);
 }
 
-/// A refill scheduler that only logs — the placeholder until the converge
-/// (anti-entropy repair) follow-up lands.
+/// The placeholder scheduler: there is no converge (anti-entropy repair)
+/// implementation yet, so it cannot refill anything.
+///
+/// It used to log at INFO that a refill had been "scheduled ... recorded as
+/// pending", which reads like work is queued. Nothing was queued and nothing
+/// would run. On 2026-08-20 node2 quarantined a corrupt generation of
+/// `agent_memory.session_task_focus_stack`, logged that line, and over an hour
+/// later the table still failed every read on that node -- the files having
+/// been moved out from under a live view with nothing to restore them.
+///
+/// `execute_action` moves files only when `posture.can_refill()` says a
+/// healthy replica could supply them (FMEA #1). That precondition is checked
+/// and the action it authorises never happens, so the node must not go on
+/// reporting healthy: it marks itself degraded and says plainly that an
+/// operator repair is required.
 pub struct LoggingRefillScheduler;
 
 impl RefillScheduler for LoggingRefillScheduler {
     fn schedule_refill(&self, table: &TableKey, generations: &[u64]) {
-        tracing::info!(
+        metrics::set_degraded(true);
+        tracing::error!(
             keyspace = %table.keyspace,
             table = %table.table,
             generations = ?generations,
-            "self-heal: scheduled refill-from-replica for quarantined generations \
-             (converge action is a follow-up; recorded as pending)"
+            "self-heal: quarantined generations CANNOT be refilled automatically — no \
+             converge (anti-entropy repair) implementation exists. The rows in these \
+             generations are not present on this node and nothing will restore them. \
+             Health=degraded; run a repair against a healthy replica."
         );
     }
 }
@@ -183,6 +199,57 @@ mod tests {
         fn schedule_refill(&self, _t: &TableKey, _g: &[u64]) {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Quarantine is licensed by a promise the shipped code does not keep.
+    ///
+    /// `execute_action` refuses to move files unless `posture.can_refill()` --
+    /// FMEA #1, never lose data -- and then hands the repair to
+    /// `LoggingRefillScheduler`, which only logs. The one implementation wired
+    /// in production performs no refill, so the precondition is checked and the
+    /// action it authorises never happens.
+    ///
+    /// Observed on node2, 2026-08-20: gen 1787264767139613 quarantined at
+    /// 22:26:37 with `scheduled refill-from-replica ... recorded as pending`
+    /// logged at INFO. Over an hour later nothing had refilled, and
+    /// `agent_memory.session_task_focus_stack` still failed every read on that
+    /// node with `No such file or directory` -- the quarantine having moved the
+    /// files out from under a live view.
+    ///
+    /// Until a converge implementation exists, moving the files must leave the
+    /// node visibly degraded. Reporting healthy after relocating data that
+    /// nothing will restore is the "never fake success" failure: the log reads
+    /// like self-healing while the table is unreadable.
+    #[test]
+    #[serial]
+    fn the_shipped_refill_scheduler_must_not_leave_the_node_looking_healthy() {
+        metrics::_reset_self_heal_metrics_for_tests();
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        let gen = corrupt_one_generation(&table_dir);
+
+        let dirs = FixedDir(table_dir.clone());
+        let action = Action::QuarantineCorrupt {
+            table: TableKey::new("test_ks", "test_table"),
+            generations: vec![gen],
+        };
+
+        // The scheduler that actually ships.
+        let outcome = execute_action(
+            action,
+            ReplicaPosture::HealthyReplicaAvailable,
+            &dirs,
+            &LoggingRefillScheduler,
+        );
+
+        assert!(
+            matches!(outcome, ActionOutcome::Quarantined { .. }),
+            "the files were moved, so the outcome is a quarantine"
+        );
+        assert!(
+            metrics::self_heal_metrics().degraded,
+            "the node moved data on the promise of a refill that the shipped \
+             scheduler does not perform; it must not go on reporting healthy"
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+use super::framed_log::{frame_record, FRAMED_LOG_MAGIC};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -94,6 +96,19 @@ impl FileSyncWriter {
 }
 
 impl SyncWriter for FileSyncWriter {
+    /// Append `data` as ONE length-framed record and fsync it.
+    ///
+    /// Records carry a `[u32 LE length]` prefix, behind a one-time
+    /// [`FRAMED_LOG_MAGIC`] header, so the log can be split back into entries at
+    /// startup. Before framing existed the file was raw concatenated bytes,
+    /// which `AccordProtocolEntry::deserialize` cannot delimit (it reads the CRC
+    /// from the final four bytes of whatever slice it is handed) — so the log
+    /// was durable but unreadable, and nothing replayed it. See
+    /// [`super::framed_log`].
+    ///
+    /// The length prefix and payload go out in a SINGLE `write_all`, so a crash
+    /// can tear the tail but cannot interleave a prefix with another record's
+    /// payload. A torn tail is detected on read and reported.
     fn write_and_sync(&self, data: &[u8]) -> SyncWriteResult {
         let file_result = OpenOptions::new()
             .create(true)
@@ -105,7 +120,21 @@ impl SyncWriter for FileSyncWriter {
             Err(e) => return SyncWriteResult::FsyncFailed(e),
         };
 
-        if let Err(e) = file.write_all(data) {
+        // Stamp the magic exactly once, when the log is first created. Checked
+        // per call because `write_and_sync` is stateless by contract (open →
+        // write → sync → close), and an empty file is cheap to detect.
+        let needs_magic = match file.metadata() {
+            Ok(m) => m.len() == 0,
+            Err(e) => return SyncWriteResult::FsyncFailed(e),
+        };
+
+        let mut out = Vec::with_capacity(data.len() + 12);
+        if needs_magic {
+            out.extend_from_slice(FRAMED_LOG_MAGIC);
+        }
+        out.extend_from_slice(&frame_record(data));
+
+        if let Err(e) = file.write_all(&out) {
             return SyncWriteResult::FsyncFailed(e);
         }
 
@@ -215,8 +244,13 @@ mod tests {
             result.is_ok(),
             "write_and_sync to a real file must succeed, got {result:?}"
         );
-        let persisted = std::fs::read(&log_path).expect("log file must exist");
-        assert_eq!(persisted, b"PreAccepted:1:2");
+        // The payload is now length-framed behind a one-time magic header so
+        // the log can be split back into records at startup. Assert the record
+        // survives a real read-back rather than asserting raw bytes.
+        let read = crate::accord::framed_log::read_framed_log(&log_path)
+            .expect("the writer must produce a readable framed log");
+        assert_eq!(read.records, vec![b"PreAccepted:1:2".to_vec()]);
+        assert!(!read.truncated_tail);
     }
 
     /// Fail loud: constructing a `FileSyncWriter` on an existing DIRECTORY is a
@@ -410,8 +444,26 @@ mod tests {
         let result = writer.write_and_sync(b"entry-2");
         assert!(result.is_ok(), "second write should succeed");
 
-        // Verify file contents (both entries appended).
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"entry-1entry-2");
+        // Both entries append as SEPARATE framed records — the property that
+        // makes replay possible. The old assertion (`b"entry-1entry-2"`) was
+        // exactly the problem: concatenated bytes with no boundary between them
+        // cannot be split back into entries.
+        let read =
+            crate::accord::framed_log::read_framed_log(&path).expect("framed log reads back");
+        assert_eq!(
+            read.records,
+            vec![b"entry-1".to_vec(), b"entry-2".to_vec()],
+            "records must stay individually delimited, not concatenated"
+        );
+        assert!(!read.truncated_tail);
+
+        // The magic is stamped once, not per record.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[..8], crate::accord::framed_log::FRAMED_LOG_MAGIC);
+        assert_eq!(
+            raw.len(),
+            8 + (4 + 7) + (4 + 7),
+            "magic once + two length-prefixed 7-byte records"
+        );
     }
 }

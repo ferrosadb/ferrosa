@@ -102,9 +102,31 @@ flowchart TD
   stamping every row at the Accord execution timestamp (intents → committed versions),
   through the same all-or-nothing `apply_writeset` Accord already uses. The temp table is
   then dropped.
-- **Abort / expire / crash-recover:** the temp table is dropped (NVMe reclaimed). Because
-  temp tables are on-disk, a coordinator restart can enumerate orphan temp tables and
-  abort/GC them (recoverable intent cleanup).
+- **Abort / expire:** the temp table is dropped (NVMe reclaimed).
+- **Crash-recover — resolve against Accord, NEVER blind-abort.** The temp table is
+  **commit-log-equivalent durable state**, not scratch space: it must survive process
+  death with the same durability guarantee as the commit log, because it may hold the
+  only local record of a transaction Accord has already agreed to commit.
+
+  On restart the coordinator enumerates orphan temp tables and resolves **each** against
+  that transaction's **Accord status**:
+
+  | Accord decision | Action |
+  |---|---|
+  | Committed | **Promote** the temp table (finish the commit at the agreed execution ts). Idempotent — promotion may already have partially run. |
+  | Aborted | Drop the temp table. |
+  | Undecided / in-doubt | Drive Accord recovery to a decision, *then* act. Never unilaterally abort. |
+  | Never proposed (crash before PreAccept) | Drop — no decision can exist. |
+
+  Blind `abort/GC` on restart is a **data-loss bug**: a transaction whose commit Accord
+  had already decided, but whose promotion had not yet run locally, would be silently
+  discarded — an acked commit vanishing after a restart. This is the standard in-doubt
+  resolution obligation of any consensus-committed transaction, and it is a correctness
+  requirement, not cleanup convenience.
+
+  Promotion must therefore be **idempotent and restartable**: a crash *during* promotion
+  must be resumable without double-applying, since intents are stamped at the Accord
+  execution timestamp (replaying the same stamped rows is naturally idempotent).
 - **NVMe budget:** a transaction whose temp table would exceed the configured NVMe budget
   fails loud and aborts — never silently truncates or spills a live transaction's data.
 
@@ -185,3 +207,9 @@ sequenceDiagram
   addition and the enabler of interactive SQL isolation.
 - **Durable/recoverable txn state** — replicate registry entries (or make them
   reconstructable) so a coordinator failure does not lose a long interactive transaction.
+  Note this is a **correctness** requirement, not only an availability one: the
+  restart path must resolve every orphan temp table against its Accord status
+  (commit / roll back), so it needs enough durable state to identify each
+  transaction and ask. See "Crash-recover" above — losing that state means being
+  unable to distinguish a committed transaction from an aborted one, which forces
+  exactly the blind abort that would drop an acked commit.
