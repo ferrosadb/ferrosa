@@ -18,6 +18,7 @@
 pub mod conflict_index;
 pub mod crash_recovery;
 pub mod entries;
+pub mod framed_log;
 pub mod oversized_entry;
 pub mod protocol_log;
 pub mod read_2i;
@@ -28,7 +29,8 @@ pub mod write_gate;
 
 pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
 pub use crash_recovery::{
-    CrashRecoveryReplay, ReplayedConflictEntry, ReplayedPhase, ReplayedTxnState,
+    resolve_orphan_intent, CrashRecoveryReplay, OrphanResolution, ReplayedConflictEntry,
+    ReplayedPhase, ReplayedTxnState,
 };
 pub use entries::{AccordAppliedEntry, AccordProtocolEntry};
 pub use protocol_log::ProtocolLog;

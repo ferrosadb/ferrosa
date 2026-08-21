@@ -232,6 +232,91 @@ impl Default for CrashRecoveryReplay {
 }
 
 // ---------------------------------------------------------------------------
+// Orphan intent resolution
+// ---------------------------------------------------------------------------
+
+/// What to do with an orphan per-transaction intent temp table found at startup.
+///
+/// The NVMe intent temp tables are commit-log-equivalent durable state, so a
+/// restart must resolve each one against its Accord decision rather than
+/// discarding it. See `specs/proposed/unified-transaction-manager/`
+/// architecture.md ("Crash-recover").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanResolution {
+    /// Accord decided COMMIT but the local apply had not finished. Finish it:
+    /// promote the temp table at the agreed execution timestamp. Must be
+    /// idempotent — promotion may already have partially run.
+    Promote,
+    /// The transaction is settled and the temp table is dead weight: aborted,
+    /// never proposed, or already applied.
+    Drop,
+    /// No local decision, and dropping could discard a commit. Drive Accord
+    /// recovery to a decision, then act on it. NEVER unilaterally abort.
+    Recover,
+    /// The temp table cannot be tied to a transaction id at all. Surface it and
+    /// leave it in place — guessing risks either losing a commit or resurrecting
+    /// an aborted write.
+    Quarantine,
+}
+
+/// Resolve one orphan intent temp table against replayed Accord state.
+///
+/// `phase` is the transaction's replayed phase, or `None` when the protocol log
+/// holds no entry for it. `past_deadline` reports whether the transaction
+/// outlived `transaction_open_timeout`. `replay_was_lossy` is
+/// [`CrashRecoveryReplay::skipped_count`] `> 0`.
+///
+/// # The decision rule
+///
+/// **The Accord decision always wins over the deadline.** A committed
+/// transaction is promoted no matter how far past its deadline the restart
+/// happens; honouring the deadline instead would silently drop an acked commit.
+/// The deadline only governs transactions Accord never decided.
+///
+/// # Why `replay_was_lossy` is load-bearing
+///
+/// `replay()` skips entries failing CRC — partial writes from a crash mid-write.
+/// So when any entry was skipped, "absent from `txn_states`" no longer proves
+/// "never proposed": the skipped record could have been this transaction's
+/// `Committed` entry. In that case the only safe answer is [`Recover`] — ask
+/// Accord — because [`Drop`] could discard a commit whose evidence was the
+/// corrupt entry.
+///
+/// [`Recover`]: OrphanResolution::Recover
+/// [`Drop`]: OrphanResolution::Drop
+pub fn resolve_orphan_intent(
+    phase: Option<ReplayedPhase>,
+    past_deadline: bool,
+    replay_was_lossy: bool,
+) -> OrphanResolution {
+    match phase {
+        // Decided: act on the decision, deadline irrelevant.
+        Some(ReplayedPhase::Applied) => OrphanResolution::Drop,
+        Some(ReplayedPhase::Committed) => OrphanResolution::Promote,
+
+        // Undecided locally. A lossy replay may be hiding a Commit record, so
+        // never expire on local evidence alone — ask Accord.
+        Some(ReplayedPhase::PreAccepted) | Some(ReplayedPhase::Accepted) => {
+            if replay_was_lossy || !past_deadline {
+                OrphanResolution::Recover
+            } else {
+                OrphanResolution::Drop
+            }
+        }
+
+        // No local record. Clean replay proves it was never proposed; a lossy
+        // one proves nothing.
+        None => {
+            if replay_was_lossy {
+                OrphanResolution::Recover
+            } else {
+                OrphanResolution::Drop
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -579,5 +664,142 @@ mod tests {
             3,
             "3 corrupt/partial entries should be skipped"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orphan intent resolution tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod orphan_resolution_tests {
+    use super::*;
+
+    /// THE headline case: Accord decided COMMIT, the node died before the local
+    /// apply finished, and the restart happens long past the 10s deadline.
+    /// Promoting is mandatory — dropping here silently discards an acked commit,
+    /// which is exactly what the spec used to prescribe.
+    #[test]
+    fn committed_is_promoted_however_far_past_the_deadline() {
+        assert_eq!(
+            resolve_orphan_intent(Some(ReplayedPhase::Committed), true, false),
+            OrphanResolution::Promote,
+            "a committed transaction must be promoted regardless of its deadline"
+        );
+        assert_eq!(
+            resolve_orphan_intent(Some(ReplayedPhase::Committed), false, false),
+            OrphanResolution::Promote
+        );
+    }
+
+    /// Already applied: the committed versions are in storage, so the temp table
+    /// is stale. Re-promoting would risk a double-apply.
+    #[test]
+    fn applied_drops_the_stale_temp_table() {
+        for past_deadline in [false, true] {
+            assert_eq!(
+                resolve_orphan_intent(Some(ReplayedPhase::Applied), past_deadline, false),
+                OrphanResolution::Drop
+            );
+        }
+    }
+
+    /// Undecided and within its deadline: the transaction may still be live, so
+    /// drive Accord to a decision rather than aborting on one node's opinion.
+    #[test]
+    fn undecided_within_deadline_recovers_never_aborts_unilaterally() {
+        for phase in [ReplayedPhase::PreAccepted, ReplayedPhase::Accepted] {
+            assert_eq!(
+                resolve_orphan_intent(Some(phase), false, false),
+                OrphanResolution::Recover,
+                "{phase:?} within deadline must ask Accord, not abort"
+            );
+        }
+    }
+
+    /// Undecided and expired, on a CLEAN replay: local evidence is complete and
+    /// says no decision was ever reached, so the timeout legitimately aborts it.
+    #[test]
+    fn undecided_past_deadline_drops_only_on_a_clean_replay() {
+        for phase in [ReplayedPhase::PreAccepted, ReplayedPhase::Accepted] {
+            assert_eq!(
+                resolve_orphan_intent(Some(phase), true, false),
+                OrphanResolution::Drop
+            );
+        }
+    }
+
+    /// A lossy replay dropped CRC-failed entries, any of which could have been
+    /// this transaction's Commit record. Expiring on incomplete local evidence
+    /// could discard a commit, so lossiness overrides the deadline.
+    #[test]
+    fn lossy_replay_overrides_the_deadline_for_undecided_transactions() {
+        for phase in [ReplayedPhase::PreAccepted, ReplayedPhase::Accepted] {
+            assert_eq!(
+                resolve_orphan_intent(Some(phase), true, true),
+                OrphanResolution::Recover,
+                "{phase:?}: a skipped entry may have been its Commit record"
+            );
+        }
+    }
+
+    /// No protocol-log entry at all. On a clean replay that proves the txn was
+    /// never proposed, so no decision can exist and the intents are garbage.
+    #[test]
+    fn absent_transaction_drops_on_a_clean_replay() {
+        assert_eq!(
+            resolve_orphan_intent(None, false, false),
+            OrphanResolution::Drop
+        );
+        assert_eq!(
+            resolve_orphan_intent(None, true, false),
+            OrphanResolution::Drop
+        );
+    }
+
+    /// Absent + lossy is the trap: "no entry" and "entry was corrupt" are
+    /// indistinguishable locally, so absence proves nothing and dropping could
+    /// discard a commit.
+    #[test]
+    fn absent_transaction_recovers_when_replay_was_lossy() {
+        for past_deadline in [false, true] {
+            assert_eq!(
+                resolve_orphan_intent(None, past_deadline, true),
+                OrphanResolution::Recover,
+                "absence is not proof of never-proposed when entries were skipped"
+            );
+        }
+    }
+
+    /// No input combination may silently discard a decided commit. This is the
+    /// invariant the old spec violated.
+    #[test]
+    fn a_committed_transaction_is_never_dropped_under_any_inputs() {
+        for past_deadline in [false, true] {
+            for lossy in [false, true] {
+                let r = resolve_orphan_intent(Some(ReplayedPhase::Committed), past_deadline, lossy);
+                assert_eq!(
+                    r,
+                    OrphanResolution::Promote,
+                    "committed must never be dropped (past_deadline={past_deadline}, lossy={lossy})"
+                );
+            }
+        }
+    }
+
+    /// Exhaustive sweep: an undecided transaction must never be Dropped while
+    /// local evidence is known-incomplete, in any combination.
+    #[test]
+    fn undecided_is_never_dropped_on_incomplete_evidence() {
+        for phase in [ReplayedPhase::PreAccepted, ReplayedPhase::Accepted] {
+            for past_deadline in [false, true] {
+                let r = resolve_orphan_intent(Some(phase), past_deadline, true);
+                assert_ne!(
+                    r,
+                    OrphanResolution::Drop,
+                    "{phase:?} must not be dropped when replay was lossy"
+                );
+            }
+        }
     }
 }

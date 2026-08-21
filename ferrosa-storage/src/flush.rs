@@ -840,18 +840,43 @@ impl FileFlushTarget {
     }
 
     fn next_generation(&self) -> u64 {
-        // Use a timestamp-based generation to guarantee global uniqueness.
-        // The sequential counter can collide between the table's flush target
-        // and the compaction executor's flush target (different instances with
-        // overlapping gen ranges). A microsecond timestamp ensures uniqueness
-        // across all flush targets on this node. The fetch_max + add ensures
-        // monotonicity even if two flushes happen in the same microsecond.
+        // Allocate from ONE cell shared by every flush target in the process.
+        //
+        // This used to be a per-target counter seeded from a microsecond clock,
+        // with the claim that "a microsecond timestamp ensures uniqueness
+        // across all flush targets on this node". It does not: each target owns
+        // its own `AtomicU64`, so two targets that seed from the same
+        // microsecond both `fetch_max` to the same `ts` and both return
+        // `ts + 1`. Interleaving two targets collides on roughly half of all
+        // allocations.
+        //
+        // Generations name files -- `{gen}-Data.db`, `{gen}-Partitions.db` --
+        // so a duplicate generation means two writes over the same names, and
+        // the SSTable that survives has one write's data with another's index.
+        // That is the 2026-08-20 node2 corruption, which surfaced as an extent
+        // pointing past the end of a file: `read_exact_at: wanted 17063 bytes,
+        // got 818`. The table's flush target and the compaction executor's
+        // target are exactly this pair, and compaction output is moved into the
+        // table's directory, so their filenames really do meet.
+        //
+        // The engine already knew they overlapped -- "Compaction output gen may
+        // collide with flush gen (different dirs)" -- and mitigated afterwards
+        // with `advance_gen_past`, which cannot repair a collision that has
+        // already been written.
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        self.generation.fetch_max(ts, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+
+        // Raise the shared floor to this target's own (directory scan and
+        // per-node offset) and to the clock, then take the next value.
+        let floor = self.generation.load(Ordering::SeqCst).max(ts);
+        NEXT_SSTABLE_GENERATION.fetch_max(floor, Ordering::SeqCst);
+        let gen = NEXT_SSTABLE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Keep the per-target view meaningful for `generation()`.
+        self.generation.fetch_max(gen, Ordering::SeqCst);
+        gen
     }
 
     fn component_paths(&self, gen: u64) -> FileComponentPaths {
@@ -1103,6 +1128,61 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     })
 }
 
+/// Process-wide SSTable generation allocator.
+///
+/// Every `FileFlushTarget` draws from this one cell. Per-target counters
+/// collide even when timestamp-seeded, and a generation is a filename, so a
+/// collision is two writes sharing `{gen}-*.db`.
+static NEXT_SSTABLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Walk every partition of a freshly promoted SSTable.
+///
+/// Opening a reader is not enough -- the 2026-08-20 corruption opened fine and
+/// failed on the first real read. Touching each partition's rows is what
+/// surfaces a bad partition index or a short Data.db.
+/// Each component's on-disk path paired with the byte length the writer
+/// produced for it.
+///
+/// Used by the pre-rename and post-rename guards so both check the whole
+/// SSTable rather than Data.db alone.
+fn component_expectations<'a>(
+    paths: &'a FileComponentPaths,
+    output: &'a SSTableOutput,
+) -> Vec<(&'static str, &'a Path, u64)> {
+    let mut v: Vec<(&'static str, &'a Path, u64)> = vec![
+        ("Data.db", &paths.data, output.data.len() as u64),
+        (
+            "Partitions.db",
+            &paths.partitions,
+            output.partitions.len() as u64,
+        ),
+        ("Rows.db", &paths.rows, output.rows.len() as u64),
+        ("Filter.db", &paths.filter, output.filter.len() as u64),
+        (
+            "Statistics.db",
+            &paths.statistics,
+            output.statistics.len() as u64,
+        ),
+        ("TOC.txt", &paths.toc, output.toc.len() as u64),
+    ];
+    if let Some(ci) = output.compression_info.as_ref() {
+        v.push((
+            "CompressionInfo.db",
+            &paths.compression_info,
+            ci.len() as u64,
+        ));
+    }
+    v
+}
+
+fn verify_promoted_sstable(reader: &SSTableReader<FileReadAt>) -> Result<()> {
+    let mut iter = reader.partitions_iter()?;
+    while let Some(partition) = iter.next_partition()? {
+        let _ = partition.rows.len();
+    }
+    Ok(())
+}
+
 impl FlushTarget for FileFlushTarget {
     type Reader = FileReadAt;
 
@@ -1259,19 +1339,18 @@ impl FlushTarget for FileFlushTarget {
         })?;
 
         // Verify tmp files were written completely before renaming.
-        // This catches the truncation bug: if the file on disk is shorter
-        // than the in-memory buffer, something overwrote or truncated it.
-        {
-            let expected_data_size = output.data.len() as u64;
-            let actual_data_size = std::fs::metadata(tmp(&paths.data))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if actual_data_size != expected_data_size {
+        //
+        // Every component, not just Data.db. An SSTable is only readable if its
+        // data and its indexes came from the same write; checking one of six
+        // catches a truncated Data.db and misses a truncated Partitions.db,
+        // which fails later as an extent pointing past the end of a file.
+        for (name, path, expected) in component_expectations(&paths, &output) {
+            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "FLUSH CORRUPTION: Data.db.tmp gen={gen} expected {expected_data_size} bytes, \
-                     got {actual_data_size} on disk. Buffer was {expected_data_size} bytes. \
-                     Path: {:?}",
-                    tmp(&paths.data)
+                    "FLUSH CORRUPTION: {name}.tmp gen={gen} expected {expected} bytes, \
+                     got {actual} on disk. Path: {:?}",
+                    tmp(path)
                 )));
             }
         }
@@ -1281,18 +1360,27 @@ impl FlushTarget for FileFlushTarget {
         // last because it is the generation discovery marker.
         Self::promote_tmp_components(&paths, has_compression_info)?;
 
-        // Verify the renamed Data.db file is the correct size.
-        // If it differs from the tmp file we just checked, something else
-        // wrote a file with the same name in between (gen collision).
-        {
-            let expected = output.data.len() as u64;
-            let actual = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0);
+        // Verify the renamed files are the correct size.
+        //
+        // If any differs from the tmp file just checked, something else wrote a
+        // file with the same name in between -- a generation collision. The
+        // engine's own compaction path documents that this is possible:
+        // "Compaction output gen may collide with flush gen (different dirs)",
+        // mitigated after the fact by `advance_gen_past`.
+        //
+        // This guard checked Data.db alone, so a collision landing on any other
+        // component was invisible and the SSTable was fsynced and published
+        // with mismatched parts -- an index describing more data than the file
+        // holds. That is the shape node2 hit on 2026-08-20:
+        // `read_exact_at: wanted 17063 bytes, got 818`.
+        for (name, path, expected) in component_expectations(&paths, &output) {
+            let actual = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if actual != expected {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "FLUSH COLLISION: Data.db gen={gen} was {expected} bytes after rename, \
+                    "FLUSH COLLISION: {name} gen={gen} was {expected} bytes after rename, \
                      now {actual} bytes. Another flush/compaction wrote the same file. \
                      Path: {:?}",
-                    paths.data
+                    path
                 )));
             }
         }
@@ -1337,14 +1425,43 @@ impl FlushTarget for FileFlushTarget {
             std::fs::rename(compression_info, tmp(&paths.compression_info))?;
         }
 
-        let actual_data_size = std::fs::metadata(tmp(&paths.data))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if actual_data_size != output.data_len {
-            return Err(ferrosa_common::Error::InvalidFormat(format!(
-                "FLUSH CORRUPTION: staged Data.db gen={gen} expected {} bytes, got {actual_data_size}",
-                output.data_len
-            )));
+        // Verify EVERY component's length, not just Data.db's.
+        //
+        // `SSTableOutputFiles` records a length for each component and this
+        // gate compared only `data_len`, so five of six were promoted
+        // unchecked. Cheap hardening -- one `metadata` call each -- but note
+        // what a length check cannot do: see the readback below. A file can be
+        // exactly the length the writer intended and still be unreadable.
+        //
+        // Rows.db is legitimately zero-length for small SSTables (see
+        // `StorageEngine::smoke_test_generation`, which deliberately excludes
+        // it from the zero-byte rule), so the comparison is against the
+        // recorded length rather than against zero.
+        let mut checks: Vec<(&str, &Path, u64)> = vec![
+            ("Data.db", &paths.data, output.data_len),
+            ("Partitions.db", &paths.partitions, output.partitions_len),
+            ("Rows.db", &paths.rows, output.rows_len),
+            ("Filter.db", &paths.filter, output.filter_len),
+            ("Statistics.db", &paths.statistics, output.statistics_len),
+            ("TOC.txt", &paths.toc, output.toc_len),
+        ];
+        if has_compression_info {
+            checks.push((
+                "CompressionInfo.db",
+                &paths.compression_info,
+                output.compression_info_len,
+            ));
+        }
+
+        for (name, path, expected) in checks {
+            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "FLUSH CORRUPTION: staged {name} gen={gen} expected {expected} bytes, \
+                     got {actual}. Refusing to promote a partially written SSTable; the \
+                     staged files are left in place for inspection."
+                )));
+            }
         }
 
         Self::promote_tmp_components(&paths, has_compression_info)?;
@@ -1369,6 +1486,44 @@ impl FlushTarget for FileFlushTarget {
             path = %paths.data.display(),
             "flush: staged Data.db promoted and fsynced"
         );
+
+        // Verify on a THROWAWAY reader, then hand back a clean one.
+        //
+        // Walking the partitions warms reader state, and the engine keeps the
+        // reader this function returns. Verifying through it would leave that
+        // cached state in place, so a file corrupted after the flush could be
+        // served from memory instead of being detected -- the verification
+        // would mask exactly the failures it exists to catch.
+        let probe = Self::open_reader_from_paths(&paths, has_compression_info)?;
+
+        // Read back the file that was PUBLISHED, not the one that was staged.
+        //
+        // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
+        // verified its output in the compaction staging directory -- "output
+        // verified (streaming readback matches merge) partitions=13 rows=17" --
+        // and nine seconds later the swap published it into the table directory
+        // under a different generation. That published file was corrupt:
+        //
+        //     read_exact_at: wanted 17063 bytes, got 818
+        //
+        // Nothing checked it. Opening a reader succeeds on a file whose
+        // partition index is wrong, and the length comparison above cannot see
+        // damage that does not change a length. So the SSTable entered the live
+        // view as healthy and was found thirty seconds later by the periodic
+        // self-heal scan -- at which point quarantining it broke every read of
+        // that table on that node.
+        //
+        // Verifying in staging and publishing something else is not
+        // verification. This walks the promoted partitions once, the same work
+        // the compaction path already pays, moved to the file that matters.
+        if let Err(e) = verify_promoted_sstable(&probe) {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "FLUSH CORRUPTION: promoted SSTable gen={gen} could not be read back: {e}. \
+                 Refusing to publish it; components are left in place at {} for salvage.",
+                paths.data.display()
+            )));
+        }
+        drop(probe);
 
         Self::open_reader_from_paths(&paths, has_compression_info)
     }
@@ -1681,6 +1836,299 @@ mod tests {
             assert_eq!(got.key.key.as_bytes(), p.key.key.as_bytes());
             assert_eq!(got.rows.len(), 1);
         }
+    }
+
+    /// The file flush path's collision guards must cover every component.
+    ///
+    /// Three guards exist in this file for exactly the generation-collision
+    /// failure -- a pre-rename completeness check, a post-rename check whose
+    /// message says "Another flush/compaction wrote the same file", and the
+    /// promote length check -- and all three used to inspect `Data.db` alone.
+    /// A collision landing on any other component was invisible, so the SSTable
+    /// was fsynced and published with mismatched parts.
+    ///
+    /// Simulated here by another writer replacing a component between the
+    /// writer recording its length and the promote reading it back, which is
+    /// what two writers sharing a generation do to each other.
+    #[test]
+    fn a_component_overwritten_by_another_writer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        assert!(output.filter_len > 0);
+
+        // A competing writer lands on this generation's Filter.db.
+        std::fs::write(&output.filter, b"another writer's filter").unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!(
+                "a component written by another writer must not be published; \
+                 the SSTable's parts would come from two different writes"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Filter.db"),
+            "the refusal must name the component that disagrees: {msg}"
+        );
+    }
+
+    /// Verifying a promoted SSTable must not warm the reader that is returned.
+    ///
+    /// The first version of the readback iterated the reader this function
+    /// hands to the engine. That left cached state behind, so a file corrupted
+    /// *after* the flush was served from memory instead of being detected --
+    /// the verification masked exactly the failures it exists to catch. Three
+    /// existing resilience tests caught it; this one says why.
+    #[test]
+    fn verification_does_not_warm_the_returned_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let reader = target.flush_files(output).expect("a clean flush succeeds");
+
+        // Damage the published Data.db after the flush returned.
+        let gen = target.generation();
+        let data_path = dir.path().join(format!("{gen}-Data.db"));
+        std::fs::write(&data_path, [0u8]).unwrap();
+
+        let key = partitions[0].key.clone();
+        assert!(
+            reader.get_partition(&key).is_err(),
+            "the returned reader must still hit the file; if verification left \
+             the partition cached, post-flush corruption becomes invisible"
+        );
+    }
+
+    /// Two flush targets on a node must never hand out the same generation.
+    ///
+    /// This is the root cause of the 2026-08-20 node2 corruption. Generations
+    /// name files -- `{gen}-Data.db`, `{gen}-Partitions.db` -- so two writers
+    /// issued the same generation write over each other's components, and the
+    /// published SSTable ends up with one write's data and another's index. It
+    /// surfaces later as an extent pointing past the end of a file:
+    ///
+    /// ```text
+    /// read_exact_at: wanted 17063 bytes, got 818
+    /// ```
+    ///
+    /// `next_generation` claims "a microsecond timestamp ensures uniqueness
+    /// across all flush targets on this node". It does not. Each target owns a
+    /// separate counter and seeds it from the same wall clock:
+    ///
+    /// ```ignore
+    /// self.generation.fetch_max(ts, SeqCst);
+    /// self.generation.fetch_add(1, SeqCst) + 1
+    /// ```
+    ///
+    /// Two targets that call this in the same microsecond both observe the same
+    /// `ts` and both return `ts + 1`. The engine knows they overlap -- the
+    /// compaction swap says so, "Compaction output gen may collide with flush
+    /// gen (different dirs)" -- and mitigates after the fact with
+    /// `advance_gen_past`, which cannot help a collision that already happened.
+    ///
+    /// The table's own flush target and the compaction executor's target are
+    /// exactly this pair, and the compaction output is moved into the table's
+    /// directory, so their names really do meet.
+    #[test]
+    fn two_flush_targets_never_issue_the_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let compaction_target = FileFlushTarget::new(dir.path().join("compaction")).unwrap();
+
+        // Interleave the way a flush and a compaction promote do.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut collisions = Vec::new();
+        for _ in 0..200 {
+            for gen in [
+                table_target.next_generation(),
+                compaction_target.next_generation(),
+            ] {
+                if !seen.insert(gen) {
+                    collisions.push(gen);
+                }
+            }
+        }
+
+        assert!(
+            collisions.is_empty(),
+            "two flush targets issued {} duplicate generation(s) {:?}; each one \
+             names the same {{gen}}-*.db files in a shared table directory, so \
+             one write's components overwrite another's",
+            collisions.len(),
+            &collisions[..collisions.len().min(5)]
+        );
+    }
+
+    /// Every component must match the length the writer recorded, not just
+    /// Data.db.
+    ///
+    /// `SSTableOutputFiles` records a length per component and the promote gate
+    /// compared only `data_len`, so five of six were published unchecked. A
+    /// truncated Partitions.db would have been renamed into place, fsynced, and
+    /// entered the live view.
+    ///
+    /// Rows.db is deliberately not asserted non-zero here: it is legitimately
+    /// zero-length for small SSTables, which is why
+    /// `StorageEngine::smoke_test_generation` excludes it from its zero-byte
+    /// rule. The gate compares against the recorded length, not against zero.
+    #[test]
+    fn promote_refuses_a_staged_sstable_whose_partitions_file_is_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        assert!(output.partitions_len > 0);
+
+        // Truncate after the writer recorded the length, so file and record
+        // disagree.
+        std::fs::write(&output.partitions, b"short").unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("a staged SSTable with a short Partitions.db must not be promoted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Partitions.db"),
+            "the refusal must name the component that is wrong, or an operator \
+             cannot tell which file to look at: {msg}"
+        );
+    }
+
+    /// The SSTable that enters the live view must be read back, not the one
+    /// that was staged.
+    ///
+    /// On 2026-08-20 node2 compacted `agent_memory.session_task_focus_stack`.
+    /// The streaming readback passed on the staged output in the compaction
+    /// directory -- `output verified (streaming readback matches merge)
+    /// partitions=13 rows=17` -- and nine seconds later the swap published it
+    /// into the table directory under a *different* generation, which was
+    /// corrupt:
+    ///
+    /// ```text
+    /// read_exact_at: wanted 17063 bytes, got 818
+    /// ```
+    ///
+    /// Nothing checked the published file. The promote gate compared lengths,
+    /// and the damage does not change a length -- so a corrupt SSTable entered
+    /// the live view as healthy and was only noticed thirty seconds later by
+    /// the periodic self-heal scan, by which point quarantining it broke every
+    /// read of that table on that node.
+    ///
+    /// Verifying in staging and publishing something else is not verification.
+    #[test]
+    fn promote_refuses_a_staged_sstable_whose_data_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+
+        // Damage the CONTENT while keeping the length exactly as recorded --
+        // the shape a length comparison cannot see, and the shape that
+        // actually occurred.
+        let good = std::fs::read(&output.data).unwrap();
+        assert_eq!(good.len() as u64, output.data_len);
+        let mut damaged = good.clone();
+        for b in damaged.iter_mut().skip(good.len() / 4) {
+            *b = 0xff;
+        }
+        assert_eq!(
+            damaged.len(),
+            good.len(),
+            "the damage must not change the length"
+        );
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!(
+                "an SSTable whose contents cannot be read back must not be \
+                 promoted into the live view"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("FLUSH CORRUPTION"),
+            "the refusal must be reported as flush corruption so it is \
+             attributable to the write that produced it: {msg}"
+        );
     }
 
     #[test]
