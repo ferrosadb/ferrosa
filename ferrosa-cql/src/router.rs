@@ -4769,7 +4769,15 @@ async fn route_select_user_table(
     let no_order_by = s.order_by.is_empty();
     let no_limit = s.limit.is_none();
     if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
-        let count = state.write_path.load().count_range(&table_id).await?;
+        // Pass the CLIENT's consistency, not the node default. The full
+        // SELECT path below threads `ctx.consistency`; if this fast path
+        // does not, the same table answers COUNT(*) and SELECT at two
+        // different consistency levels — silently, and under-reporting.
+        let count = state
+            .write_path
+            .load()
+            .count_range_with(&table_id, ctx.consistency)
+            .await?;
         return Ok(SelectRawResult {
             column_names: col_names.to_vec(),
             column_types: col_types.to_vec(),

@@ -4282,6 +4282,93 @@ mod tests {
     /// unreachable, COUNT(*) must FAIL LOUD (exactly like
     /// `coordinate_range_read`) rather than report local-only partial data as a
     /// complete count.
+    /// COUNT(*) must honour the CLIENT's consistency level, not the node's
+    /// configured default.
+    ///
+    /// `SELECT COUNT(*)` takes the ADR-020 fast path, which called
+    /// `coordinate_range_count(table_id)` — a signature with nowhere to put
+    /// the request's CL. It therefore used `self.default_cl`, while the full
+    /// `SELECT` path on the very same table threads `ctx.consistency`
+    /// through. Two ways of counting one table, answering at two different
+    /// consistency levels.
+    ///
+    /// The failure is silent and it under-reports. With RF == node_count and
+    /// a locally-satisfiable default (ONE/LOCAL_ONE), `range_read_remotes`
+    /// is empty and the count is served entirely from local storage — so a
+    /// client that explicitly asked for QUORUM or ALL receives a local-only
+    /// tally with no error and no indication the CL was ignored.
+    ///
+    /// Setup below: RF == node_count == 2 and `default_cl = ONE`, so the
+    /// default path legitimately counts locally. The client asks for ALL,
+    /// which requires the remote — and that remote is unreachable, so the
+    /// request MUST fail rather than quietly return the local subset.
+    #[tokio::test]
+    async fn range_count_honours_requested_cl_not_node_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let local_node_id = 1u64;
+        let remote_uuid_2 = Uuid::new_v4();
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        // Remote peer with no connection pool — any send to it fails.
+        pm.add_peer_entry((remote_uuid_2, "10.0.0.2:7000".parse().unwrap()))
+            .await;
+
+        let mut node2 = make_node("10.0.0.2:7000");
+        node2.host_id = remote_uuid_2;
+
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("10.0.0.1:7000"));
+        ring.add_node(2u64, node2);
+        ring.assign_tokens(local_node_id, &[50]);
+        ring.assign_tokens(2u64, &[150]);
+
+        // RF == node_count == 2 with default CL=ONE: the local replica owns
+        // every token range at that CL, so the default count path is exact
+        // and local-only.
+        let coordinator = make_coordinator(
+            ring,
+            pm,
+            local_node_id,
+            storage.clone(),
+            2,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage
+            .write(&table_id, &test_key(), test_row(1000), 1000)
+            .unwrap();
+
+        // Baseline: at the node's own default (ONE) the local count is a
+        // legitimate answer and must still work.
+        let at_default = coordinator.coordinate_range_count(&table_id).await;
+        assert_eq!(
+            at_default.expect("CL=ONE count is satisfied locally"),
+            1,
+            "the default-CL fast path must keep working"
+        );
+
+        // The client asked for ALL. That cannot be satisfied without the
+        // remote, and the remote is unreachable — so this must be an error,
+        // NOT a silent local-only count of 1.
+        let at_all = coordinator
+            .coordinate_range_count_with(&table_id, ConsistencyLevel::All)
+            .await;
+        assert!(
+            at_all.is_err(),
+            "COUNT(*) at CL=ALL must not silently return the local-only \
+             subset when a required remote is unreachable; got {:?}",
+            at_all.ok()
+        );
+    }
+
     #[tokio::test]
     async fn coordinate_range_count_errors_when_required_remote_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();

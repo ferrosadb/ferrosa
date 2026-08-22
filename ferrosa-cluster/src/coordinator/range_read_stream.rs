@@ -131,7 +131,12 @@ pub type ClusterPartitionStream =
 type BoxedFragmentStream = Pin<Box<dyn Stream<Item = Result<Partition, ClusterError>> + Send>>;
 
 impl ClusterCoordinator {
-    /// COUNT(*) over the whole token ring for `table_id`.
+    /// COUNT(*) over the whole token ring for `table_id`, at the NODE's
+    /// default consistency level.
+    ///
+    /// Use `coordinate_range_count_with` when the caller carries a
+    /// client-requested CL — passing the node default in that case silently
+    /// answers at the wrong consistency.
     ///
     /// Fast path: when the local node provably owns every token range at the
     /// configured consistency (`range_read_remotes` empty — e.g. CL=ONE with
@@ -145,6 +150,28 @@ impl ClusterCoordinator {
     /// count then drives the same CL-selected, token-deduped streaming
     /// range-read fan-out the full `SELECT` uses and sums the live rows.
     pub async fn coordinate_range_count(&self, table_id: &TableId) -> crate::error::Result<u64> {
+        self.coordinate_range_count_with(table_id, self.default_cl)
+            .await
+    }
+
+    /// COUNT(*) over the whole token ring at an EXPLICIT consistency level.
+    ///
+    /// Callers that carry a client-requested CL must use this. The
+    /// no-CL `coordinate_range_count` exists only for callers that
+    /// genuinely mean "the node default", and delegates here.
+    ///
+    /// Without this the ADR-020 COUNT(*) fast path had nowhere to put the
+    /// request's CL, so it substituted `self.default_cl` — while the full
+    /// `SELECT` path on the same table threads `ctx.consistency` through.
+    /// The two disagreed silently, and the disagreement UNDER-reports: with
+    /// RF == node_count and a locally-satisfiable default, `remotes` is
+    /// empty and the count is served from local storage alone, so a client
+    /// that asked for QUORUM or ALL got a local-only tally with no error.
+    pub async fn coordinate_range_count_with(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+    ) -> crate::error::Result<u64> {
         // Correctness over speed (forge t_8c4e44e8): the local replica only
         // holds the partitions whose tokens fall in ITS owned ranges. When the
         // keyspace RF does not span the whole ring (`RF < node_count`, or any
@@ -158,7 +185,7 @@ impl ClusterCoordinator {
         // token range at this CL, so the fast metadata path is exact. Otherwise
         // we MUST fan out across replicas and count the token-deduped result —
         // never the local subset.
-        let remotes = self.range_read_remotes(self.default_cl, self.default_rf);
+        let remotes = self.range_read_remotes(cl, self.default_rf);
         if remotes.is_empty() {
             return self
                 .storage
@@ -174,7 +201,7 @@ impl ClusterCoordinator {
         // `StorageEngine::count_range`'s COUNT(*) semantics (one per row, plus
         // one for a present static row) but over the WHOLE ring.
         let mut stream = self
-            .coordinate_range_read_stream_all_with(table_id, 0, self.default_cl, self.default_rf)
+            .coordinate_range_read_stream_all_with(table_id, 0, cl, self.default_rf)
             .await?;
         let mut total: u64 = 0;
         while let Some(item) = stream.next().await {
