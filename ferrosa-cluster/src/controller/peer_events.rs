@@ -393,6 +393,25 @@ impl InboundPeerCallback for ModeController {
         );
         tracing::info!(peer = %host_id, %addr, ?cql_broadcast, ?internode_broadcast, "inbound peer connected");
 
+        // Register the peer here too, not only in `on_peer_connected`.
+        //
+        // Which handler runs is decided by who dialled whom, and that has
+        // nothing to do with whether the leader needs to route Raft RPCs to
+        // this node. A seed is dialled BY its peers, so a leader that is also a
+        // seed sees every one of them inbound and registered none of them.
+        //
+        // Observed 2026-08-21 rolling the native cluster: node3 restarted
+        // first and initialised Raft with `peers=1`, node1 came up nine minutes
+        // later and dialled node3 as its seed, and node3 never learned node1's
+        // node_id. Every AppendEntries to it returned "registration pending"
+        // while node1 sat at "no raft leader elected yet" and the other two
+        // held a quorum without it.
+        //
+        // `trigger_cluster_join` cannot cover this: node1 was already in the
+        // recovered ring with unchanged metadata, so it returns early before
+        // reaching any registration. Idempotent, and a no-op before formation.
+        self.register_peer_in_raft_node_map(host_id);
+
         // Store the peer's CQL broadcast address (from handshake) in PeerManager
         // so system.peers can return it instead of the container-internal IP.
         if let Some(ref broadcast) = cql_broadcast {

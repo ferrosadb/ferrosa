@@ -3416,3 +3416,69 @@ async fn an_unconfigured_controller_ignores_a_marker_on_the_host() {
         None => std::env::remove_var("FERROSA_DATA_DIR"),
     }
 }
+
+/// An INBOUND peer must be registered in the raft node map, exactly as an
+/// outbound one is.
+///
+/// `on_peer_connected` registers (PR #277, for "an already-committed member
+/// that reconnects AFTER the leader restarted"). `on_inbound_peer` did not --
+/// and which handler runs is decided by who dialled whom, not by anything
+/// about the peer.
+///
+/// Observed 2026-08-21 rolling the native cluster. node3 was restarted first
+/// and initialised Raft with `peers=1`; node1 came up nine minutes later and
+/// dialled node3 as its seed, so node3 only ever saw it INBOUND. node3 never
+/// learned node1's node_id, and every AppendEntries to it failed:
+///
+///     UnresolvedRaftTarget: raft node 1229782938247303441
+///     has no registered host_id yet (registration pending)
+///
+/// node1 sat at `no raft leader elected yet` for the whole run while node2 and
+/// node3 held a quorum without it. `trigger_cluster_join` cannot cover this:
+/// node1 was already in node3's recovered ring with unchanged metadata, so it
+/// returns early before any registration happens.
+#[tokio::test]
+async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let inbound_peer = Uuid::from_u128(2);
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    // Stand in for the map `transition_to_cluster` installs at Raft init.
+    controller
+        .raft_node_map
+        .store(Some(Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        ))));
+
+    let addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    controller.on_inbound_peer((inbound_peer, addr), None, None);
+
+    let map = controller
+        .raft_node_map_snapshot()
+        .expect("the node map is installed");
+    assert!(
+        map.contains_key(&crate::raft::uuid_to_node_id(inbound_peer)),
+        "an inbound peer must be registered too; otherwise the leader cannot \
+         route Raft RPCs to a member that dialled IT, and every AppendEntries \
+         is 'registration pending' forever: {map:?}"
+    );
+}
