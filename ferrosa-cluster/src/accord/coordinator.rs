@@ -1736,7 +1736,7 @@ mod tests {
     #[test]
     fn fewer_reads_than_the_quorum_is_refused() {
         let a = b"row".to_vec();
-        assert_eq!(agreed_row(&[a.clone()], 2), None);
+        assert_eq!(agreed_row(std::slice::from_ref(&a), 2), None);
         assert_eq!(agreed_row(&[], 1), None);
     }
 
