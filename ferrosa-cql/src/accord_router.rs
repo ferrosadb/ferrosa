@@ -59,6 +59,26 @@ pub enum RouteDecision {
 /// UPDATE/DELETE IF condition) route through Accord for linearizability.
 /// Regular DML uses tunable consistency via the WritePath coordinator.
 /// In standalone mode, everything is local.
+/// Whether a statement carries a conditional (compare-and-set) clause.
+///
+/// These are the statements CQL calls lightweight transactions: `IF NOT
+/// EXISTS`, `IF EXISTS`, and `IF <column> <op> <value>`. Each asks the server
+/// to decide atomically whether the mutation applies -- a consensus question
+/// the tunable write path cannot answer correctly.
+///
+/// Deliberately keyed on the statement rather than the request's serial
+/// consistency: that field is optional in the protocol, so keying on it makes
+/// correctness depend on a driver sending something the server does not
+/// require.
+fn statement_is_lwt(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Insert(s) => s.if_not_exists,
+        Statement::Update(s) => s.if_exists || !s.if_conditions.is_empty(),
+        Statement::Delete(s) => s.if_exists || !s.if_conditions.is_empty(),
+        _ => false,
+    }
+}
+
 pub fn route_decision(
     mode: RoutingMode,
     stmt: &Statement,
@@ -68,9 +88,34 @@ pub fn route_decision(
         return RouteDecision::Local;
     }
 
-    // LWT: serial_consistency is set by the CQL protocol when the client
-    // uses IF NOT EXISTS / IF condition. This is the signal that Accord
-    // consensus is required for linearizability.
+    // LWT: decided by the STATEMENT, not by an optional protocol field.
+    //
+    // This used to read `if serial_consistency.is_some()`, on the stated
+    // assumption that "serial_consistency is set by the CQL protocol when the
+    // client uses IF NOT EXISTS / IF condition". That is not the protocol.
+    // Serial consistency is optional and defaults to SERIAL server-side, and
+    // drivers do not send it unless explicitly asked -- so an ordinary
+    // `UPDATE ... IF col = val` arrived with `None`, routed to `Local`, and the
+    // local write path applied the mutation while ignoring the condition.
+    //
+    // Verified against the live cluster on 2026-08-22:
+    //
+    //     seeded v='original'
+    //     UPDATE .. SET v='changed' WHERE k=1 IF v='WRONG'  ->  v='changed'
+    //
+    // A false condition, and the write landed. Every compare-and-set built on
+    // this silently degraded to an unconditional write; ferrosa-memory's
+    // consolidation lease is one casualty (it claimed 277 requests it believed
+    // it had lost, so each was marked leased and then skipped).
+    //
+    // `IF NOT EXISTS` escaped because the local path implements that one case,
+    // which is why the breakage looked selective.
+    if statement_is_lwt(stmt) {
+        return RouteDecision::Accord;
+    }
+
+    // A linearizable READ carries no conditions, so it is still requested the
+    // only way CQL allows: by asking for SERIAL consistency.
     if serial_consistency.is_some() {
         return match stmt {
             Statement::Insert(_)
@@ -472,6 +517,121 @@ fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Or
 
 #[cfg(test)]
 mod tests {
+
+    /// A conditional statement is an LWT whether or not the client asked for
+    /// SERIAL consistency.
+    ///
+    /// `route_decision` keyed the whole decision on
+    /// `serial_consistency.is_some()`, justified by the comment
+    /// "serial_consistency is set by the CQL protocol when the client uses IF
+    /// NOT EXISTS / IF condition". That is not so: serial consistency is an
+    /// OPTIONAL protocol field defaulting to SERIAL server-side, and drivers do
+    /// not send it unless asked. So `UPDATE ... IF col = val` from an ordinary
+    /// client routed to `Local`, and the local write path applies the mutation
+    /// while ignoring the conditions entirely.
+    ///
+    /// Measured on the live cluster 2026-08-22, on a scratch table:
+    ///
+    /// ```text
+    /// seeded v='original'
+    /// UPDATE .. SET v='changed' WHERE k=1 IF v='WRONG'   ->  v='changed'
+    /// ```
+    ///
+    /// The condition was false and the write applied anyway. Downstream that
+    /// silently broke every compare-and-set built on it: ferrosa-memory's
+    /// consolidation lease claimed 277 requests it believed it had lost, marked
+    /// each leased and skipped it, and consolidation never ran.
+    ///
+    /// `IF NOT EXISTS` is unaffected -- the local path implements that one --
+    /// which is why the failure looked selective rather than total.
+    #[test]
+    fn a_conditional_update_is_an_lwt_without_explicit_serial_consistency() {
+        let stmt = Statement::Update(UpdateStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            assignments: vec![Assignment::Simple {
+                column: "v".into(),
+                value: Term::IntegerLiteral(42),
+            }],
+            where_clauses: vec![WhereClause {
+                column: "id".into(),
+                op: ComparisonOp::Eq,
+                value: Term::IntegerLiteral(1),
+                token_fn: false,
+            }],
+            if_exists: false,
+            if_conditions: vec![IfCondition {
+                column: "state".into(),
+                operator: IfOperator::Eq,
+                value: Term::StringLiteral("pending".into()),
+            }],
+            using_timestamp: None,
+            using_ttl: None,
+        });
+
+        assert_eq!(
+            route_decision(RoutingMode::Cluster, &stmt, None),
+            RouteDecision::Accord,
+            "a statement carrying IF conditions must route as an LWT even when \
+             the client sent no serial consistency; routing it Local applies the \
+             mutation and drops the condition"
+        );
+    }
+
+    /// The same for `IF EXISTS`, which is equally a compare-and-set.
+    #[test]
+    fn a_conditional_delete_is_an_lwt_without_explicit_serial_consistency() {
+        let stmt = Statement::Delete(DeleteStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            columns: vec![],
+            where_clauses: vec![WhereClause {
+                column: "id".into(),
+                op: ComparisonOp::Eq,
+                value: Term::IntegerLiteral(1),
+                token_fn: false,
+            }],
+            if_exists: true,
+            if_conditions: vec![],
+            using_timestamp: None,
+        });
+
+        assert_eq!(
+            route_decision(RoutingMode::Cluster, &stmt, None),
+            RouteDecision::Accord,
+            "IF EXISTS is a condition too"
+        );
+    }
+
+    /// An unconditional write is unchanged: it must still take the tunable
+    /// WritePath, not consensus. Routing every write through Accord would be a
+    /// large and unintended performance change.
+    #[test]
+    fn an_unconditional_write_still_routes_local() {
+        let stmt = Statement::Update(UpdateStatement {
+            keyspace: Some("ks".into()),
+            table: "t".into(),
+            assignments: vec![Assignment::Simple {
+                column: "v".into(),
+                value: Term::IntegerLiteral(42),
+            }],
+            where_clauses: vec![WhereClause {
+                column: "id".into(),
+                op: ComparisonOp::Eq,
+                value: Term::IntegerLiteral(1),
+                token_fn: false,
+            }],
+            if_exists: false,
+            if_conditions: vec![],
+            using_timestamp: None,
+            using_ttl: None,
+        });
+
+        assert_eq!(
+            route_decision(RoutingMode::Cluster, &stmt, None),
+            RouteDecision::Local
+        );
+    }
     use super::*;
 
     // -----------------------------------------------------------------------
