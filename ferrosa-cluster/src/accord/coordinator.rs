@@ -294,6 +294,40 @@ impl AccordCoordinator {
         CoordinatorDecision::Pending
     }
 
+    /// Conclude the PreAccept phase when no further response can arrive.
+    ///
+    /// `handle_preaccept_ok` deliberately stays `Pending` while a fast quorum
+    /// is still reachable: with RF=3 the fast path needs all three replicas,
+    /// so two agreeing votes must keep waiting rather than spend a second RTT
+    /// on the Accept phase. That is correct *while responses are outstanding*.
+    ///
+    /// Once the fan-out is exhausted the fast path is provably unreachable.
+    /// If a slow quorum answered, the round can and must commit through the
+    /// Accept phase. Without this the coordinator sat at `Pending` forever and
+    /// the caller reported "Accord quorum unavailable" on a fully healthy
+    /// cluster — every LWT on a non-leaseholder RF=3 coordinator that lost a
+    /// single vote failed, even though two replicas had agreed.
+    ///
+    /// Returns `Pending` when fewer than a slow quorum responded (the round is
+    /// genuinely unavailable and the caller must fail loud) or when a decision
+    /// was already reached, in which case this is a no-op.
+    pub fn finalize_preaccept(&mut self) -> CoordinatorDecision {
+        if self.phase != CoordinatorPhase::PreAccepting {
+            return CoordinatorDecision::Pending;
+        }
+
+        if self.preaccept_responses.len() < slow_quorum_size(self.rf) {
+            return CoordinatorDecision::Pending;
+        }
+
+        self.phase = CoordinatorPhase::Accepting;
+        self.rtt_count = 1;
+        CoordinatorDecision::NeedAccept {
+            t: self.merged_t,
+            deps: self.merged_deps.clone(),
+        }
+    }
+
     /// Process an AcceptOK response (slow path).
     ///
     /// Returns `SlowPathCommit` once a slow quorum of AcceptOK responses
@@ -512,6 +546,41 @@ pub struct AccordCoordinatorDriver {
 /// any divergence means replicas disagree on the row state at `t`, which is a
 /// correctness failure. Returns `Some(bytes)` only when `reads.len() >= quorum`
 /// and every read is identical; `None` otherwise (caller aborts).
+/// Why a PreAccept fanout produced no vote from a replica.
+///
+/// The replica encodes every non-OK outcome as an EMPTY `AccordPreAcceptOK`:
+/// a `Nack`, a state machine that could not persist, and any unexpected
+/// response all arrive looking identical. The coordinator used to skip them
+/// with a bare `Ok(_) => {}`, so a transaction that failed for want of votes
+/// reported "quorum unavailable" and nothing else — which is how the 2026-06
+/// FileSyncWriter failure (PreAccept could not persist, so no replica voted)
+/// stayed undiagnosed.
+///
+/// Naming the outcomes does not make an empty response informative on its own,
+/// but it makes the count visible: how many peers answered, how many voted,
+/// and how many returned nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreAcceptOutcome {
+    /// A real vote carrying the replica's `t` and deps.
+    Vote,
+    /// The peer answered, but not with a usable vote (empty or unexpected).
+    NoVote,
+    /// The RPC itself failed — the peer never answered.
+    RpcFailed,
+}
+
+/// Classify one PreAccept fanout result.
+///
+/// Pure so the counting is testable without a cluster: the fanout itself is an
+/// inline async block over live peers and cannot be unit tested directly.
+pub fn classify_preaccept_response(result: Result<&Message, ()>) -> PreAcceptOutcome {
+    match result {
+        Ok(Message::AccordPreAcceptOK(b)) if !b.is_empty() => PreAcceptOutcome::Vote,
+        Ok(_) => PreAcceptOutcome::NoVote,
+        Err(()) => PreAcceptOutcome::RpcFailed,
+    }
+}
+
 fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     if quorum == 0 || reads.len() < quorum {
         return None;
@@ -1043,6 +1112,18 @@ impl AccordCoordinatorDriver {
                         t,
                         deps,
                     });
+                } else {
+                    // The local replica did not vote. Dropping this silently
+                    // costs the round a vote it was counting on and makes the
+                    // failure indistinguishable from a remote timeout: an
+                    // RF=3 non-leaseholder then holds only its two peer votes,
+                    // short of the 3-vote fast quorum. Say so.
+                    tracing::warn!(
+                        txn_id = ?txn_id,
+                        response = ?resp,
+                        "accord: local PreAccept self-vote was not PreAcceptOK; \
+                         this round proceeds without the coordinator's own vote"
+                    );
                 }
             }
         }
@@ -1068,11 +1149,20 @@ impl AccordCoordinatorDriver {
 
             let responses = futures::future::join_all(futs).await;
 
+            // Count the outcomes so a failed round says WHY, not just that it
+            // failed. An empty AccordPreAcceptOK is the replica's encoding for
+            // a Nack, a persist failure, and an unexpected state alike, so
+            // without this a quorum failure is indistinguishable from silence.
+            let mut votes = 0usize;
+            let mut no_votes = 0usize;
+            let mut rpc_failures = 0usize;
+
             for result in &responses {
                 match result {
                     Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
                         let ok: PreAcceptOkPayload = bincode::deserialize(b)
                             .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                        votes += 1;
                         let resp = PreAcceptResponse {
                             from: ok.from,
                             t: ok.t,
@@ -1083,10 +1173,20 @@ impl AccordCoordinatorDriver {
                             break;
                         }
                     }
-                    Ok(_) => {
-                        // Empty or unexpected response — treat as non-vote (skip).
+                    Ok((peer_id, _)) => {
+                        // The peer answered without a usable vote. The wire
+                        // shape cannot say whether that was a Nack, a persist
+                        // failure, or an unexpected state — so record it and
+                        // let the round summary carry the count.
+                        no_votes += 1;
+                        tracing::debug!(
+                            txn_id = ?txn_id,
+                            peer = ?peer_id,
+                            "accord: PreAccept returned no vote (empty or unexpected response)"
+                        );
                     }
                     Err(e) => {
+                        rpc_failures += 1;
                         tracing::warn!(
                             txn_id = ?txn_id,
                             error = %e,
@@ -1094,6 +1194,35 @@ impl AccordCoordinatorDriver {
                         );
                     }
                 }
+            }
+
+            // Every response that will ever arrive has arrived, so a fast
+            // quorum is now provably unreachable. If a slow quorum voted, the
+            // round commits through the Accept phase instead of stalling.
+            if decision == CoordinatorDecision::Pending {
+                decision = self.coordinator.finalize_preaccept();
+                if let CoordinatorDecision::NeedAccept { .. } = decision {
+                    tracing::debug!(
+                        txn_id = ?txn_id,
+                        votes,
+                        "accord: fan-out exhausted short of a fast quorum; \
+                         falling back to the Accept phase"
+                    );
+                }
+            }
+
+            if decision == CoordinatorDecision::Pending {
+                tracing::warn!(
+                    txn_id = ?txn_id,
+                    peers = responses.len(),
+                    votes,
+                    no_votes,
+                    rpc_failures,
+                    slow_quorum = slow_quorum_size(self.coordinator.rf),
+                    "accord: PreAccept round reached no decision; a replica that \
+                     answers without voting reports the same empty payload whether \
+                     it rejected the txn or failed to persist it"
+                );
             }
         }
 
@@ -1663,6 +1792,54 @@ impl AccordCoordinatorDriver {
 #[cfg(test)]
 mod tests {
 
+    /// A replica that answers without voting must be counted, not skipped.
+    ///
+    /// The replica encodes a `Nack`, a state machine that could not persist,
+    /// and any unexpected response all as an EMPTY `AccordPreAcceptOK`. The
+    /// coordinator skipped every one with a bare `Ok(_) => {}`, so a round that
+    /// collected no votes reported "quorum unavailable" and nothing more.
+    ///
+    /// That is how the 2026-06 FileSyncWriter failure hid: PreAccept could not
+    /// persist, so no replica voted, and the only symptom was an unexplained
+    /// quorum error. Counting the outcomes does not make an empty payload
+    /// informative by itself, but it distinguishes "nobody answered" from
+    /// "everybody answered and nobody voted" -- which are different bugs.
+    #[test]
+    fn a_reply_without_a_vote_is_counted_separately_from_a_failed_rpc() {
+        let voted = Message::AccordPreAcceptOK(bytes::Bytes::from_static(b"payload"));
+        let empty = Message::AccordPreAcceptOK(bytes::Bytes::new());
+
+        assert_eq!(
+            classify_preaccept_response(Ok(&voted)),
+            PreAcceptOutcome::Vote
+        );
+        assert_eq!(
+            classify_preaccept_response(Ok(&empty)),
+            PreAcceptOutcome::NoVote,
+            "an empty payload is an answer, not a missing one"
+        );
+        assert_eq!(
+            classify_preaccept_response(Err(())),
+            PreAcceptOutcome::RpcFailed,
+            "a peer that never answered is a different failure from one that \
+             answered without voting"
+        );
+    }
+
+    /// An unexpected message type is a non-vote, not a vote.
+    ///
+    /// Worth pinning: the vote arm matches a NON-EMPTY AccordPreAcceptOK
+    /// specifically, so a differently-shaped reply must not be mistaken for
+    /// agreement.
+    #[test]
+    fn an_unexpected_message_is_not_a_vote() {
+        let other = Message::AccordAcceptOK(bytes::Bytes::from_static(b"not-preaccept"));
+        assert_eq!(
+            classify_preaccept_response(Ok(&other)),
+            PreAcceptOutcome::NoVote
+        );
+    }
+
     /// F+1 agreement means a MAJORITY agrees, not that every replica does.
     ///
     /// `agreed_row` documented "Require F+1 replicas to agree on the SAME row
@@ -1870,6 +2047,130 @@ mod tests {
         );
         assert_eq!(coord.rtt_count(), 1);
         assert_eq!(coord.phase, CoordinatorPhase::FastPathCommit);
+    }
+
+    #[test]
+    fn finalize_preaccept_takes_slow_path_when_fanout_exhausts_with_slow_quorum() {
+        // RF=3, non-leaseholder. Only two replicas ever answer (the third is
+        // down, or the local self-vote was lost). Both AGREE with t0, so
+        // `handle_preaccept_ok` correctly stays Pending — a third agreeing
+        // vote would still unlock the 1-RTT fast path.
+        //
+        // But once the fan-out is exhausted no further response can arrive.
+        // A slow quorum (2 of 3) is present and sufficient to commit via the
+        // Accept phase, so the round MUST fall back to the slow path. Before
+        // this existed the coordinator sat at Pending forever and the caller
+        // reported "Accord quorum unavailable" on a healthy cluster.
+        let t0 = make_ts(1000);
+        let txn_id = make_txn_id(1, 1000);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key1".to_vec(), 1, 3, false);
+
+        for from in [1, 2] {
+            assert_eq!(
+                coord.handle_preaccept_ok(PreAcceptResponse {
+                    from,
+                    t: t0,
+                    deps: vec![],
+                }),
+                CoordinatorDecision::Pending,
+                "must keep waiting for a possible fast quorum"
+            );
+        }
+
+        assert_eq!(
+            coord.finalize_preaccept(),
+            CoordinatorDecision::NeedAccept {
+                t: t0,
+                deps: HashSet::new(),
+            }
+        );
+        assert_eq!(coord.phase, CoordinatorPhase::Accepting);
+        assert_eq!(coord.rtt_count(), 1);
+    }
+
+    #[test]
+    fn finalize_preaccept_stays_pending_below_slow_quorum() {
+        // One vote out of RF=3 is not enough to commit by any path. Finalizing
+        // must NOT invent a decision — the caller has to report the round as
+        // genuinely quorum-unavailable.
+        let t0 = make_ts(1000);
+        let txn_id = make_txn_id(1, 1000);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key1".to_vec(), 1, 3, false);
+
+        coord.handle_preaccept_ok(PreAcceptResponse {
+            from: 1,
+            t: t0,
+            deps: vec![],
+        });
+
+        assert_eq!(coord.finalize_preaccept(), CoordinatorDecision::Pending);
+        assert_eq!(coord.phase, CoordinatorPhase::PreAccepting);
+    }
+
+    #[test]
+    fn disagreement_at_slow_quorum_decides_without_waiting_for_finalize() {
+        // A response that proposes a different timestamp (or carries deps)
+        // makes the fast path unreachable immediately, so the EXISTING slow-
+        // quorum branch decides on the spot and `finalize_preaccept` never
+        // sees the round. This pins that split: `finalize_preaccept` is only
+        // ever reached in the all-agree case, which is why it can safely
+        // forward the merged state.
+        let t0 = make_ts(1000);
+        let later = make_ts(5000);
+        let dep = make_txn_id(9, 400);
+        let txn_id = make_txn_id(1, 1000);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key1".to_vec(), 1, 3, false);
+
+        coord.handle_preaccept_ok(PreAcceptResponse {
+            from: 1,
+            t: t0,
+            deps: vec![],
+        });
+        let decided = coord.handle_preaccept_ok(PreAcceptResponse {
+            from: 2,
+            t: later,
+            deps: vec![dep],
+        });
+
+        let mut expected = HashSet::new();
+        expected.insert(dep);
+        assert_eq!(
+            decided,
+            CoordinatorDecision::NeedAccept {
+                t: later,
+                deps: expected,
+            },
+            "a disagreeing vote at slow quorum must decide immediately"
+        );
+
+        // Already decided -> finalizing is a no-op and must not re-enter the
+        // phase transition or double-count the RTT.
+        assert_eq!(coord.finalize_preaccept(), CoordinatorDecision::Pending);
+        assert_eq!(coord.phase, CoordinatorPhase::Accepting);
+        assert_eq!(coord.rtt_count(), 1);
+    }
+
+    #[test]
+    fn finalize_preaccept_is_a_noop_once_a_decision_was_reached() {
+        // RF=1: the single response decides immediately. Finalizing after a
+        // decision must not re-run the phase transition or double-count an RTT.
+        let t0 = make_ts(1000);
+        let txn_id = make_txn_id(1, 1000);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key1".to_vec(), 1, 1, false);
+
+        let decided = coord.handle_preaccept_ok(PreAcceptResponse {
+            from: 1,
+            t: t0,
+            deps: vec![],
+        });
+        assert!(matches!(
+            decided,
+            CoordinatorDecision::FastPathCommit { .. }
+        ));
+
+        assert_eq!(coord.finalize_preaccept(), CoordinatorDecision::Pending);
+        assert_eq!(coord.phase, CoordinatorPhase::FastPathCommit);
+        assert_eq!(coord.rtt_count(), 1);
     }
 
     #[test]
