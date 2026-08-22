@@ -513,15 +513,37 @@ pub struct AccordCoordinatorDriver {
 /// correctness failure. Returns `Some(bytes)` only when `reads.len() >= quorum`
 /// and every read is identical; `None` otherwise (caller aborts).
 fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
-    if reads.len() < quorum {
+    if quorum == 0 || reads.len() < quorum {
         return None;
     }
-    let first = &reads[0];
-    if reads.iter().all(|r| r == first) {
-        Some(first.clone())
-    } else {
-        None
+
+    // Count votes per distinct value and take one that reaches the quorum.
+    //
+    // This asked `reads.iter().all(|r| r == first)` -- unanimity, not F+1. On
+    // RF=3 that let a single lagging replica veto a genuine 2-of-3 majority,
+    // so every generic-IF LWT was refused as non-linearizable while being
+    // perfectly decidable. Observed live on 2026-08-22:
+    //
+    //     generic IF read-vote lacked F+1 (2) agreement on the row at t
+    //     (got 3 reads) -- refusing a non-linearizable LWT
+    //
+    // Three reads, F+1 of two, and still refused. The function's own doc and
+    // that error message both said F+1; only the code said "all".
+    //
+    // At most one value can reach a quorum, because two disjoint groups of
+    // `quorum` votes would require `2 * quorum > reads.len()` to overlap --
+    // exactly the majority property the caller relies on for linearizability.
+    // So the first value to reach it is the only one, and returning it is
+    // unambiguous.
+    let mut counts: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+    for read in reads {
+        let n = counts.entry(read.as_slice()).or_insert(0);
+        *n += 1;
+        if *n >= quorum {
+            return Some(read.clone());
+        }
     }
+    None
 }
 
 impl AccordCoordinatorDriver {
@@ -1640,6 +1662,95 @@ impl AccordCoordinatorDriver {
 
 #[cfg(test)]
 mod tests {
+
+    /// F+1 agreement means a MAJORITY agrees, not that every replica does.
+    ///
+    /// `agreed_row` documented "Require F+1 replicas to agree on the SAME row
+    /// bytes at `t`", and the error it feeds says "lacked F+1 (2) agreement".
+    /// The implementation asked a different question:
+    ///
+    /// ```text
+    /// let first = &reads[0];
+    /// if reads.iter().all(|r| r == first) { ... }
+    /// ```
+    ///
+    /// That is unanimity. On RF=3 a single lagging or slow replica outvoted a
+    /// genuine 2-of-3 majority, so every generic-IF LWT was refused as
+    /// non-linearizable when it was in fact perfectly decidable.
+    ///
+    /// Observed live on 2026-08-22 against the three-node cluster:
+    ///
+    /// ```text
+    /// generic IF read-vote lacked F+1 (2) agreement on the row at t
+    /// (got 3 reads) — refusing a non-linearizable LWT
+    /// ```
+    ///
+    /// Three reads returned, F+1 was 2, and it still refused.
+    #[test]
+    fn a_majority_agreeing_is_enough_even_when_one_replica_differs() {
+        let a = b"row-at-t".to_vec();
+        let stale = b"stale-row".to_vec();
+
+        let agreed = agreed_row(&[a.clone(), a.clone(), stale], 2);
+
+        assert_eq!(
+            agreed,
+            Some(a),
+            "two of three replicas agreed and F+1 is two; a third disagreeing \
+             read must not veto a decidable quorum"
+        );
+    }
+
+    /// Unanimity still agrees — the common case must not regress.
+    #[test]
+    fn unanimous_reads_agree() {
+        let a = b"row".to_vec();
+        assert_eq!(agreed_row(&[a.clone(), a.clone(), a.clone()], 2), Some(a));
+    }
+
+    /// No value reaching F+1 is genuinely undecidable, and must stay refused.
+    /// This is the case the unanimity check was conflating with the one above.
+    #[test]
+    fn no_value_reaching_the_quorum_is_refused() {
+        assert_eq!(
+            agreed_row(&[b"x".to_vec(), b"y".to_vec(), b"z".to_vec()], 2),
+            None,
+            "three different reads means no value has two votes"
+        );
+    }
+
+    /// A split with no majority is refused even though a value repeats.
+    #[test]
+    fn a_tie_below_the_quorum_is_refused() {
+        assert_eq!(
+            agreed_row(
+                &[b"x".to_vec(), b"x".to_vec(), b"y".to_vec(), b"y".to_vec()],
+                3
+            ),
+            None,
+            "2 and 2 with a quorum of 3 leaves the row undecided"
+        );
+    }
+
+    /// Too few reads to decide at all.
+    #[test]
+    fn fewer_reads_than_the_quorum_is_refused() {
+        let a = b"row".to_vec();
+        assert_eq!(agreed_row(&[a.clone()], 2), None);
+        assert_eq!(agreed_row(&[], 1), None);
+    }
+
+    /// An empty row (the key does not exist) is a legitimate agreed VALUE, not
+    /// an absence of agreement. `IF v = ...` against a missing row must be able
+    /// to decide "condition not met" rather than fail the transaction.
+    #[test]
+    fn agreement_on_an_empty_row_is_still_agreement() {
+        assert_eq!(
+            agreed_row(&[Vec::new(), Vec::new(), b"other".to_vec()], 2),
+            Some(Vec::new()),
+            "two replicas agreeing the row is absent is a decided read"
+        );
+    }
     use super::*;
     use ferrosa_common::accord::{BallotNumber, Timestamp, TxnId};
 
