@@ -811,6 +811,29 @@ impl WritePath {
         }
     }
 
+    /// COUNT(*) at an EXPLICIT consistency level.
+    ///
+    /// The CQL layer must call this and pass `ctx.consistency`: the ADR-020
+    /// COUNT(*) fast path otherwise answers at the node's default CL while
+    /// the full `SELECT` on the same table answers at the client's, and the
+    /// mismatch under-reports silently.
+    ///
+    /// Only the clustered arm can honour a CL — the direct and pair arms are
+    /// a single local replica by construction, so they keep their local view
+    /// exactly as `count_range` does.
+    pub async fn count_range_with(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+    ) -> crate::error::Result<u64> {
+        match self {
+            Self::Cluster(coordinator) => {
+                coordinator.coordinate_range_count_with(table_id, cl).await
+            }
+            _ => self.count_range(table_id).await,
+        }
+    }
+
     /// Projection-aware streaming range read for query shapes that only need a
     /// subset of regular cells to evaluate predicates. This keeps COUNT(*) with
     /// ALLOW FILTERING on wide tables out of the Vec-returning materialization
