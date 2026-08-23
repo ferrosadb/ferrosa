@@ -231,8 +231,8 @@ pub fn eval_if_conditions(
         let expected = term_to_cql_value_simple(&cond.value);
 
         let matches = match cond.operator {
-            IfOperator::Eq => current_val == expected,
-            IfOperator::NotEq => current_val != expected,
+            IfOperator::Eq => values_eq(&current_val, &expected),
+            IfOperator::NotEq => !values_eq(&current_val, &expected),
             IfOperator::Lt => cmp_values(&current_val, &expected) == Some(std::cmp::Ordering::Less),
             IfOperator::Gt => {
                 cmp_values(&current_val, &expected) == Some(std::cmp::Ordering::Greater)
@@ -248,7 +248,7 @@ pub fn eval_if_conditions(
             IfOperator::In => match &cond.value {
                 Term::InList(items) => items.iter().any(|item| {
                     let item_val = term_to_cql_value_simple(item);
-                    current_val == item_val
+                    values_eq(&current_val, &item_val)
                 }),
                 _ => false,
             },
@@ -489,10 +489,53 @@ fn term_to_cql_value_simple(term: &Term) -> Option<CqlValue> {
     }
 }
 
+/// The integer value of a `CqlValue`, if it is one of the integer types.
+///
+/// CQL's integer family is spread across several `CqlValue` variants, and the
+/// width a literal lands in is an artefact of the parser, not of the column.
+/// Comparisons must therefore be made on the VALUE, not on the variant:
+/// `Bigint(321)` and `Int(321)` denote the same number and must compare equal.
+///
+/// `BigInt` rather than `i128` because `Varint` is arbitrary-precision, so any
+/// fixed-width normalisation would be lossy at the extremes.
+fn as_integer(value: &CqlValue) -> Option<num_bigint::BigInt> {
+    match value {
+        CqlValue::Int(n) => Some(num_bigint::BigInt::from(*n)),
+        CqlValue::Bigint(n) => Some(num_bigint::BigInt::from(*n)),
+        CqlValue::Counter(n) => Some(num_bigint::BigInt::from(*n)),
+        CqlValue::Smallint(n) => Some(num_bigint::BigInt::from(*n)),
+        CqlValue::Tinyint(n) => Some(num_bigint::BigInt::from(*n)),
+        CqlValue::Varint(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// Equality for LWT `IF` conditions.
+///
+/// Integers compare by value across widths; everything else keeps the derived
+/// `PartialEq`. Without this, `term_to_cql_value_simple` narrowing every
+/// integer literal to `Int(i32)` meant `IF <bigint_col> = ?` could never be
+/// true, and — worse — `IF <bigint_col> != ?` was always true, so a guarded
+/// update fired exactly when its guard said it must not.
+fn values_eq(a: &Option<CqlValue>, b: &Option<CqlValue>) -> bool {
+    if let (Some(a), Some(b)) = (a, b) {
+        if let (Some(a), Some(b)) = (as_integer(a), as_integer(b)) {
+            return a == b;
+        }
+    }
+    a == b
+}
+
 /// Compare two optional CqlValues for ordering.
 ///
 /// Returns None if the values are not comparable (different types or nulls).
 fn cmp_values(a: &Option<CqlValue>, b: &Option<CqlValue>) -> Option<std::cmp::Ordering> {
+    // Integers first, so widths are compared by value rather than by variant.
+    if let (Some(x), Some(y)) = (a, b) {
+        if let (Some(x), Some(y)) = (as_integer(x), as_integer(y)) {
+            return Some(x.cmp(&y));
+        }
+    }
     match (a, b) {
         (Some(CqlValue::Int(a)), Some(CqlValue::Int(b))) => Some(a.cmp(b)),
         (Some(CqlValue::Bigint(a)), Some(CqlValue::Bigint(b))) => Some(a.cmp(b)),
@@ -1493,6 +1536,167 @@ mod tests {
         assert!(
             !not_applied.applied,
             "present row -> INSERT IF NOT EXISTS must not apply"
+        );
+    }
+
+    /// An integer literal must compare equal to the column's ACTUAL integer
+    /// type, not to `Int` alone.
+    ///
+    /// `term_to_cql_value_simple` narrowed every integer literal to
+    /// `CqlValue::Int(i32)`, while a `bigint` column reads back as
+    /// `CqlValue::Bigint(i64)`. `Eq` compared `Option<CqlValue>` directly, so
+    /// `Bigint(321) == Int(321)` was FALSE — two variants of the same enum.
+    /// Compare-and-set on any 64-bit column could therefore never apply.
+    ///
+    /// Verified live 2026-08-22 against the 3-node cluster: an LWT issued with
+    /// the value just SELECTed came back `[applied]=false` with the returned
+    /// current value equal to the one the condition required. The caller (the
+    /// mobile-control cursor allocator) retried 32 times and reported
+    /// "remained contended", which sent two diagnosis cycles hunting a
+    /// competing writer that did not exist.
+    #[test]
+    fn if_eq_applies_across_every_integer_width() {
+        // (column value as stored, literal in the IF clause)
+        let cases: Vec<(&str, CqlValue)> = vec![
+            ("int", CqlValue::Int(321)),
+            ("bigint", CqlValue::Bigint(321)),
+            ("smallint", CqlValue::Smallint(321)),
+            ("tinyint", CqlValue::Tinyint(99)),
+            ("counter", CqlValue::Counter(321)),
+            ("varint", CqlValue::Varint(num_bigint::BigInt::from(321))),
+        ];
+
+        for (label, stored) in cases {
+            let literal = match &stored {
+                CqlValue::Tinyint(_) => 99i64,
+                _ => 321i64,
+            };
+            let mut row: HashMap<String, Option<CqlValue>> = HashMap::new();
+            row.insert("v".to_string(), Some(stored.clone()));
+
+            let conditions = vec![IfCondition {
+                column: "v".into(),
+                operator: IfOperator::Eq,
+                value: Term::IntegerLiteral(literal),
+            }];
+
+            let result = eval_if_conditions(&conditions, false, Some(&row));
+            assert!(
+                result.applied,
+                "IF v = {literal} must apply when the {label} column holds \
+                 {stored:?}"
+            );
+        }
+    }
+
+    /// `!=` is the DANGEROUS direction of the same defect.
+    ///
+    /// When the variants differ, `current_val != expected` is trivially true,
+    /// so `IF v != 321` APPLIED against a bigint column holding exactly 321 —
+    /// a conditional update firing precisely when its guard said it must not.
+    #[test]
+    fn if_not_eq_does_not_apply_when_the_bigint_value_is_equal() {
+        let mut row: HashMap<String, Option<CqlValue>> = HashMap::new();
+        row.insert("v".to_string(), Some(CqlValue::Bigint(321)));
+
+        let conditions = vec![IfCondition {
+            column: "v".into(),
+            operator: IfOperator::NotEq,
+            value: Term::IntegerLiteral(321),
+        }];
+
+        let result = eval_if_conditions(&conditions, false, Some(&row));
+        assert!(
+            !result.applied,
+            "IF v != 321 must NOT apply when the bigint column holds 321"
+        );
+    }
+
+    /// Ordering operators went through `cmp_values`, which only had
+    /// same-variant arms and returned `None` for anything else — so every
+    /// comparison silently evaluated to not-matching on a bigint column.
+    #[test]
+    fn if_ordering_operators_work_on_a_bigint_column() {
+        let mut row: HashMap<String, Option<CqlValue>> = HashMap::new();
+        row.insert("v".to_string(), Some(CqlValue::Bigint(321)));
+
+        let expect = |operator: IfOperator, literal: i64, want: bool, why: &str| {
+            let conditions = vec![IfCondition {
+                column: "v".into(),
+                operator,
+                value: Term::IntegerLiteral(literal),
+            }];
+            let result = eval_if_conditions(&conditions, false, Some(&row));
+            assert_eq!(result.applied, want, "{why}");
+        };
+
+        expect(IfOperator::Gt, 320, true, "321 > 320 must apply");
+        expect(IfOperator::Gt, 321, false, "321 > 321 must not apply");
+        expect(IfOperator::Lt, 322, true, "321 < 322 must apply");
+        expect(IfOperator::Lt, 321, false, "321 < 321 must not apply");
+        expect(IfOperator::GtEq, 321, true, "321 >= 321 must apply");
+        expect(IfOperator::LtEq, 321, true, "321 <= 321 must apply");
+        expect(IfOperator::GtEq, 322, false, "321 >= 322 must not apply");
+    }
+
+    /// The CAS shape real callers use: read a value, then conditionally write
+    /// using the value just read. This must succeed on the FIRST attempt.
+    ///
+    /// This is the regression that broke the cursor allocator. Note the first
+    /// CAS against a fresh table used to succeed and every later one failed —
+    /// not flakiness, but two different paths: with no row the caller uses
+    /// `INSERT ... IF NOT EXISTS` (an existence check, no value comparison),
+    /// and only once a row exists does it take the `IF col = ?` path.
+    #[test]
+    fn compare_and_set_on_a_bigint_cursor_applies_first_attempt() {
+        let mut row: HashMap<String, Option<CqlValue>> = HashMap::new();
+        row.insert("next_cursor".to_string(), Some(CqlValue::Bigint(65)));
+
+        // Read 65, then CAS on 65 — exactly what the allocator does.
+        let observed = match row.get("next_cursor") {
+            Some(Some(CqlValue::Bigint(n))) => *n,
+            other => panic!("expected a bigint cursor, got {other:?}"),
+        };
+
+        let conditions = vec![IfCondition {
+            column: "next_cursor".into(),
+            operator: IfOperator::Eq,
+            value: Term::IntegerLiteral(observed),
+        }];
+
+        let result = eval_if_conditions(&conditions, false, Some(&row));
+        assert!(
+            result.applied,
+            "a CAS using the value just read must apply on the first attempt; \
+             the allocator retried 32x and reported false contention"
+        );
+    }
+
+    /// `IN` used the same variant-sensitive `==`, so it failed on a bigint
+    /// column exactly as `=` did.
+    #[test]
+    fn if_in_matches_a_bigint_column() {
+        let mut row: HashMap<String, Option<CqlValue>> = HashMap::new();
+        row.insert("v".to_string(), Some(CqlValue::Bigint(321)));
+
+        let present = vec![IfCondition {
+            column: "v".into(),
+            operator: IfOperator::In,
+            value: Term::InList(vec![Term::IntegerLiteral(7), Term::IntegerLiteral(321)]),
+        }];
+        assert!(
+            eval_if_conditions(&present, false, Some(&row)).applied,
+            "IF v IN (7, 321) must apply when the bigint column holds 321"
+        );
+
+        let absent = vec![IfCondition {
+            column: "v".into(),
+            operator: IfOperator::In,
+            value: Term::InList(vec![Term::IntegerLiteral(7), Term::IntegerLiteral(8)]),
+        }];
+        assert!(
+            !eval_if_conditions(&absent, false, Some(&row)).applied,
+            "IF v IN (7, 8) must NOT apply when the bigint column holds 321"
         );
     }
 }
