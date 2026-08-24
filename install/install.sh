@@ -13,9 +13,9 @@
 #                       cut automatically each night. Resolves via /releases.
 #
 # Usage:
-#   curl -fsSL https://ferrosadb.com/install.sh | bash
-#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --channel nightly
-#   curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --version v0.16.0 --no-service
+#   curl -fsSL https://www.ferrosa.ai/install.sh | bash
+#   curl -fsSL https://www.ferrosa.ai/install.sh | bash -s -- --channel nightly
+#   curl -fsSL https://www.ferrosa.ai/install.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa"
@@ -299,7 +299,7 @@ If you didn't register a service, run manually:
   FERROSA_CONFIG="$CONFIG_DIR/ferrosa.toml" "$BIN_DIR/ferrosa"
 
 Upgrade later by re-running this installer (idempotent):
-  curl -fsSL https://ferrosadb.com/install.sh | bash -s -- --channel ${CHANNEL}
+  curl -fsSL https://www.ferrosa.ai/install.sh | bash -s -- --channel ${CHANNEL}
 
-Docs: https://ferrosadb.com/database/getting-started.html
+Docs: https://www.ferrosa.ai/database/getting-started.html
 EOF

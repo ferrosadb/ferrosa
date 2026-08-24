@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # ferrosa fast setup — installs prebuilt binaries via the LATEST file.
 #
-# Reads https://ferrosadb.com/LATEST (a plain-text version tag like "v0.16.0"),
+# Reads https://www.ferrosa.ai/LATEST (a plain-text version tag like "v0.16.0"),
 # downloads the matching release tarball from
 # https://github.com/ferrosadb/ferrosa/releases, verifies SHA256, installs to
 # ~/.ferrosa/, and optionally registers as a user service. No source clone,
 # no compile.
 #
 # Usage:
-#   curl -fsSL https://ferrosadb.com/setup.sh | bash
-#   curl -fsSL https://ferrosadb.com/setup.sh | bash -s -- --version v0.16.0 --no-service
+#   curl -fsSL https://www.ferrosa.ai/setup.sh | bash
+#   curl -fsSL https://www.ferrosa.ai/setup.sh | bash -s -- --version v0.16.0 --no-service
 #
 # Env overrides (mostly for testing):
-#   FERROSA_LATEST_URL   — where to fetch the version pointer (default https://ferrosadb.com/LATEST)
+#   FERROSA_LATEST_URL   — where to fetch the version pointer (default https://www.ferrosa.ai/LATEST)
 #   FERROSA_RELEASE_HOST — release artifact root (default github.com release URL)
 #   FERROSA_INSTALL_ROOT — install prefix (default $HOME/.ferrosa)
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa"
-LATEST_URL="${FERROSA_LATEST_URL:-https://ferrosadb.com/LATEST}"
+LATEST_URL="${FERROSA_LATEST_URL:-https://www.ferrosa.ai/LATEST}"
 RELEASE_HOST="${FERROSA_RELEASE_HOST:-https://github.com/${REPO}/releases}"
 INSTALL_ROOT="${FERROSA_INSTALL_ROOT:-${HOME}/.ferrosa}"
 BIN_DIR="${INSTALL_ROOT}/bin"
@@ -201,7 +201,7 @@ If you didn't register a service, run manually:
   FERROSA_CONFIG="$CONFIG_DIR/ferrosa.toml" "$BIN_DIR/ferrosa"
 
 For Ferrosa Memory + LLM onboarding, run:
-  curl -fsSL https://ferrosadb.com/setup-memory.sh | bash
+  curl -fsSL https://www.ferrosa.ai/setup-memory.sh | bash
 
-Docs: https://ferrosadb.com/database/getting-started.html
+Docs: https://www.ferrosa.ai/database/getting-started.html
 EOF

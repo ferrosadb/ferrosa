@@ -89,7 +89,7 @@ Priority: optional
 Architecture: ${ARCH}
 Depends: ca-certificates
 Maintainer: Ferrosa Team <ferrosa@ferrosadb.com>
-Homepage: https://ferrosadb.com
+Homepage: https://www.ferrosa.ai
 Description: CQL-compatible distributed database with S3-backed storage
  Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed
  storage, pluggable secondary indexes (B-tree, hash, composite, phonetic,
@@ -142,7 +142,7 @@ cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
 Description=Ferrosa Database Server
 After=network-online.target
 Wants=network-online.target
-Documentation=https://ferrosadb.com
+Documentation=https://www.ferrosa.ai
 
 [Service]
 Type=simple
