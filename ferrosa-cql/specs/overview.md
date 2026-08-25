@@ -79,6 +79,8 @@ KEYED index consult: `WritePath::index_read_in_partition` routes to the
 partition's replicas, each consults its secondary index restricted to that
 partition, and only the matching rows are point-read — O(matching rows), never
 O(partition rows), with an EXPLAIN plan of `PartitionIndexLookup`. The router
+passes the client's consistency level through to the coordinator (t_2f174c97),
+preventing a slow non-required replica from imposing the Bulk timeout. The router
 trusts an empty keyed consult only when the local write path can treat the
 storage `IndexStateTracker` as authoritative and that tracker reports the index
 current with no pending SSTable backfill; clustered reads keep the bounded

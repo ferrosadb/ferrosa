@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-08-09
+last_updated: 2026-08-24
 ---
 
 # ferrosa-cql — Roadmap
@@ -9,6 +9,13 @@ last_updated: 2026-08-09
 Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code "not yet implemented"
 markers, and the dependency/usage review. In-code TODO density is very low; the
 real backlog is structural and security-shaped.
+
+## Recently addressed
+
+- **Keyed secondary-index latency floor (t_2f174c97 / CQL-15).** SELECT now
+  carries the client's consistency level into the partition-scoped index
+  coordinator, allowing CL ONE to finish after one successful replica while
+  retaining quorum requirements at stronger levels.
 
 ## Now (highest value)
 

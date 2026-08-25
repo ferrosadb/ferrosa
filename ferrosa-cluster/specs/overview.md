@@ -81,9 +81,11 @@ partition's replicas from the ring under the keyspace strategy and sends each an
 `IndexReadInPartitionRequest` (`0x66`/`0x67`); the replica consults its
 secondary index restricted to that partition and point-reads only the matching
 rows (O(matching rows), never O(partition rows)). Results merge per token;
-partial replica failures degrade to a partial union (logged); all-replicas-failed
-errors. Exposed as `WritePath::index_read_in_partition` (Direct/Pair resolve
-locally). Unlike `coordinate_index_read`, this never fans out to the whole ring.
+the coordinator returns once the requested consistency level has received enough
+successful replica responses (t_2f174c97). Failures never count toward that
+threshold, and an unmet threshold returns `ReadTimeout`. Exposed as
+`WritePath::index_read_in_partition` (Direct/Pair resolve locally). Unlike
+`coordinate_index_read`, this never fans out to the whole ring.
 
 **Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
 index lookup out to every node — its hits span all token ranges (there is no

@@ -4857,6 +4857,7 @@ async fn route_select_user_table(
                     &decorated_key,
                     &index_name,
                     &index_key,
+                    ctx.consistency,
                     &read_strategy,
                 )
                 .await?;
