@@ -109,7 +109,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   plus the KEYED index read `coordinate_index_read_in_partition` (t_430c4188):
   `WHERE <full pk> AND <indexed_col> = ?` contacts ONLY the partition's replicas
   (ring placement under the keyspace strategy), each running
-  `read_by_index_in_partition` locally — never a global scatter-gather —
+  `read_by_index_in_partition` locally — never a global scatter-gather. The
+  coordinator stops after the requested consistency level has enough successful
+  responses (t_2f174c97), so CL ONE does not inherit a slow peer's three-second
+  Bulk timeout; quorum levels still wait for their required successes.
   (`fts_match` — fans out to every node's local FTI and unions/de-dupes the
   matching keys, since full-text hits span all token ranges; BUG-F-007). FTI
   scatter-gather is partial-failure tolerant: if at least one node completes, the

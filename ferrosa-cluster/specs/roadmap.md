@@ -18,6 +18,12 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   timeout. A native three-node replay of the 69K-row incident remains the live
   closure gate.
 
+- **Keyed secondary-index fixed latency floor (t_2f174c97 / CL-17).** The
+  partition-scoped coordinator previously waited for every replica even at CL
+  ONE, so one slow peer imposed the three-second Bulk timeout. It now returns
+  after the requested consistency threshold succeeds and fails loudly when that
+  threshold cannot be met.
+
 - **Same-host cluster reverse-address collapse (CL-16).** Live launchd evidence
   showed node3 recovering a three-member ring whose three addresses all pointed
   at node3's `:17002`; node1/node2 consequently stayed in pair mode. Inbound

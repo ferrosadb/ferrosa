@@ -1037,6 +1037,7 @@ impl WritePath {
         key: &DecoratedKey,
         index_name: &str,
         index_key: &ferrosa_index::IndexKey,
+        cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
         match self {
@@ -1050,7 +1051,7 @@ impl WritePath {
             Self::Cluster(coordinator) => {
                 coordinator
                     .coordinate_index_read_in_partition(
-                        table_id, key, index_name, index_key, strategy,
+                        table_id, key, index_name, index_key, cl, strategy,
                     )
                     .await
             }

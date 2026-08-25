@@ -73,7 +73,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
   indexed residual `=` predicate — t_430c4188: keyed secondary-index consult
   restricted to the partition, O(matching rows) instead of O(partition rows),
-  routed to the partition's replicas, no ALLOW FILTERING needed). Empty keyed
+  routed to the partition's replicas, no ALLOW FILTERING needed). The request's
+  consistency level is propagated to that consult (t_2f174c97), so CL ONE
+  returns after one successful replica instead of waiting for all replicas.
+  Empty keyed
   consults rescan the one partition only while storage reports the index is not
   current; once `IndexStateTracker` is `Current`, an empty consult is accepted as
   a real miss. Ordinary equality plans admit only scalar indexes (B-tree, hash,

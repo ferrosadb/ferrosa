@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: fmea
-last_updated: 2026-08-07
+last_updated: 2026-08-24
 ---
 
 # ferrosa-cluster — FMEA / Known Issues
@@ -13,6 +13,7 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+| CL-17 | **Keyed secondary-index reads waited for every replica regardless of requested consistency.** One slow or disconnected replica imposed the three-second Bulk timeout even at CL ONE, producing the observed ~4 s fixed floor for small indexed results. | Small indexed lookups are slower than partition reads; a single unhealthy replica amplifies latency cluster-wide. | 6 | 6 | 3 | 108 → 12 | **Fixed (t_2f174c97):** the keyed coordinator filters eligible replicas, computes the CL/DC response threshold, counts only successes, and returns as soon as the threshold is met. Regression: `keyed_index_read_at_one_does_not_wait_for_slow_replica` proves QUORUM still waits for two successes while CL ONE returns after one. |
 | CL-1 | **No external/public Jepsen validation of Accord + Raft.** All consensus/transaction tests are in-crate, deterministic harnesses (`TestCluster`, simulated nemesis). Real partitions, clock skew, fsync faults, and Byzantine timing are not exercised end-to-end. | A linearizability/strict-serializability violation that only manifests under real-world faults would ship undetected | 10 | 4 | 8 | 320 | **Open evidence gap.** `ferrosa-jepsen` harness designed + approved (`specs/todo/jepsen-e2e-test-plan.md`) but **not built**. Strong in-crate property/recovery tests reduce occurrence but cannot close detection. Treat correctness as *tested, not proven*. |
 | CL-2 | **Raft election storm on log divergence.** A follower whose log falls behind bumps its term unboundedly (no pre-vote in upstream openraft 0.9), burning CPU and inflating terms while the cluster is stable (observed T18,348 vs leader T8). | Hot node, term inflation, replication backoff; can block snapshot delivery | 8 | 5 | 4 | 160 | **Mitigated.** Pinned openraft fork adds CheckQuorum (ADR-012, default 0.75). Its PreVote gate — the intended primary defense against this storm — is **disabled by default** because its network transport is unimplemented (see CL-15), so the actual mitigation today is the `election_guard` watchdog (P0-17/P0-19) suppresses storms (`elect(false)` 60 s) and exposes `ELECTION_STORM_TERM_JUMPS_TOTAL`; `snapshot_pusher` (P0-20) pushes snapshots to lagging followers. Guard/pusher slated for removal (W4.11/W4.12) only after a clean Jepsen window — which depends on CL-1. |
 | CL-3 | **Write backpressure exhaustion starves the data path.** `WRITE_CONCURRENCY_LIMIT = 128` semaphore protects Raft from bulk-insert runtime saturation, but a saturated cluster returns `Unavailable` once all 128 permits are held. | Bulk writers see `Unavailable`/`WriteTimeout` under load; client must retry/throttle | 6 | 5 | 3 | 90 | **By design, fail-loud.** Limit prevents the worse failure (Raft heartbeat starvation → election storms). Constant is fixed, not tunable; batch path has a separate `DEFAULT_BATCH_CONCURRENCY = 32`. Tuning guidance + per-tenant limits are roadmap items. |
