@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ferrosa-memory installer — fetches a release tarball, installs to ~/.ferrosa/,
 # offers system-service registration. Assumes Ferrosa is already running at
-# localhost:9042 (install via https://ferrosadb.com/install.sh first).
+# localhost:9042 (install via https://www.ferrosa.ai/install.sh first).
 #
 # SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory : docs/install-memory.sh).
 # It is mirrored into ferrosadb/ferrosa install/install-memory.sh, which is what
-# GitHub Pages serves at https://ferrosadb.com/install-memory.sh. Edit it HERE;
+# GitHub Pages serves at https://www.ferrosa.ai/install-memory.sh. Edit it HERE;
 # the ferrosa copy is a published mirror.
 #
 # It is idempotent: re-running upgrades an existing install in place. When the
@@ -19,9 +19,9 @@
 #                       cut automatically each night. Resolves via /releases.
 #
 # Usage:
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --channel nightly
-#   curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --version v0.16.0 --no-service
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --channel nightly
+#   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
 REPO="ferrosadb/ferrosa-memory"
@@ -288,9 +288,9 @@ cat <<EOF >&2
   templates: $EXAMPLES_DIR
 
 This MCP server connects to a running Ferrosa instance at localhost:9042
-(default from https://ferrosadb.com/install.sh). Ensure Ferrosa is up:
+(default from https://www.ferrosa.ai/install.sh). Ensure Ferrosa is up:
 
-  curl -fsSL https://ferrosadb.com/install.sh | bash
+  curl -fsSL https://www.ferrosa.ai/install.sh | bash
 
 To register with Claude Code, add to your MCP config:
 
@@ -304,7 +304,7 @@ To register with Claude Code, add to your MCP config:
   }
 
 Upgrade later by re-running this installer (idempotent):
-  curl -fsSL https://ferrosadb.com/install-memory.sh | bash -s -- --channel ${CHANNEL}
+  curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --channel ${CHANNEL}
 
 Docs: https://github.com/ferrosadb/ferrosa-memory
 EOF

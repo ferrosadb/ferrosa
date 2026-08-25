@@ -16,7 +16,7 @@
 
 [Unit]
 Description=Ferrosa Database
-Documentation=https://ferrosadb.com
+Documentation=https://www.ferrosa.ai
 After=network-online.target
 Wants=network-online.target
 

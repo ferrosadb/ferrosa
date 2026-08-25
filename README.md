@@ -24,7 +24,7 @@ ask questions, and report issues with the community and maintainers.
 ## Quick Install
 
 ```bash
-curl -fsSL https://ferrosadb.com/install.sh | bash
+curl -fsSL https://www.ferrosa.ai/install.sh | bash
 ```
 
 The installer detects your platform (macOS arm64/x86_64, Linux x86_64/aarch64),
