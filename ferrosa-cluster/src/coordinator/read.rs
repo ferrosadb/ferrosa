@@ -1,4 +1,10 @@
-//! Read coordination -- fans out reads to replicas with CL enforcement.
+//! Module: Coordinate replica reads with consistency-level enforcement.
+//! Correctness: Correct when replica selection satisfies the requested CL,
+//!   latency-sensitive reads and writes retain Data-lane capacity, and
+//!   unbounded scan traffic is isolated on the Bulk lane.
+//! Last revised: 2026-08-24
+//! Last changed: Route unbounded multi-page partition reads through the Bulk
+//!   internode lane so they cannot monopolize the Data lane used by writes.
 //!
 //! # Two-Phase Digest Read Protocol
 //!
@@ -348,7 +354,7 @@ async fn digest_read_attempt(
         match remote {
             None => ReplicaRead::Failed,
             Some((hid, addr)) => match coordinator
-                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body))
+                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body), Lane::Data)
                 .await
             {
                 Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -379,6 +385,20 @@ fn should_retry_missing_peer_error(err: &str) -> bool {
         || err.contains("lane permanently failed")
 }
 
+/// Select the internode lane for a single-partition read.
+///
+/// A clustering-row lookup or a row-bounded request is latency-sensitive and
+/// bounded, so it stays on `Data`. An unbounded partition read can require many
+/// remote pages (70K-row partitions are observed in production); it belongs on
+/// `Bulk` so those pages cannot queue ahead of small writes on `Data`.
+fn partition_read_lane(row_limit: usize, clustering: Option<&[u8]>) -> Lane {
+    if row_limit == 0 && clustering.is_none() {
+        Lane::Bulk
+    } else {
+        Lane::Data
+    }
+}
+
 // ---------------------------------------------------------------------------
 // coordinate_read
 // ---------------------------------------------------------------------------
@@ -389,17 +409,14 @@ impl ClusterCoordinator {
         host_id: uuid::Uuid,
         addr: &str,
         message: Message,
+        lane: Lane,
     ) -> crate::error::Result<Message> {
-        match self
-            .peer_manager
-            .send(host_id, message.clone(), Lane::Data)
-            .await
-        {
+        match self.peer_manager.send(host_id, message.clone(), lane).await {
             Ok(resp) => Ok(resp),
             Err(e) if should_retry_missing_peer_error(&e.to_string()) => {
                 self.peer_manager.ensure_peer(host_id, addr).await?;
                 self.peer_manager
-                    .send(host_id, message, Lane::Data)
+                    .send(host_id, message, lane)
                     .await
                     .map_err(Into::into)
             }
@@ -474,7 +491,7 @@ impl ClusterCoordinator {
         };
         let body = encode_read_request(&payload);
         match self
-            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
+            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), Lane::Data)
             .await
         {
             Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -673,6 +690,7 @@ impl ClusterCoordinator {
                                         hid,
                                         &addr,
                                         Message::ReadRequest(body),
+                                        Lane::Data,
                                     )
                                     .await
                                 {
@@ -1067,8 +1085,9 @@ impl ClusterCoordinator {
                     clustering: clustering.unwrap_or_default().to_vec(),
                 };
                 let body = encode_read_request(&payload);
+                let lane = partition_read_lane(row_limit, clustering);
                 match self
-                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
+                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), lane)
                     .await
                 {
                     Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -2077,6 +2096,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unbounded_partition_scan_uses_bulk_lane() {
+        // Given an unbounded partition read that may require many remote pages,
+        // when the coordinator selects its internode lane, then it must not
+        // share the latency-sensitive Data lane used by writes.
+        assert_eq!(partition_read_lane(0, None), Lane::Bulk);
+    }
+
+    #[test]
+    fn bounded_partition_read_keeps_data_lane() {
+        assert_eq!(partition_read_lane(20, None), Lane::Data);
+    }
+
+    #[test]
+    fn exact_clustering_read_keeps_data_lane() {
+        assert_eq!(partition_read_lane(0, Some(b"row-key")), Lane::Data);
+    }
+
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -2211,6 +2248,34 @@ mod tests {
     struct DelayedRangeReadHandler {
         partition: Partition,
         delay: std::time::Duration,
+    }
+
+    struct DelayedPartitionReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedPartitionReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(body) = msg else {
+                return None;
+            };
+            let request: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+            tokio::time::sleep(self.delay).await;
+            let payload = ReadResponsePayload {
+                found: true,
+                partition: Some(crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )),
+                digest: None,
+                timestamp: i64::MIN,
+                has_more: false,
+                next_page_state: Vec::new(),
+            };
+            (!request.digest_only)
+                .then(|| Message::ReadResponse(Bytes::from(bincode::serialize(&payload).unwrap())))
+        }
     }
 
     #[async_trait::async_trait]
@@ -4709,6 +4774,63 @@ mod tests {
             "coordinator should cache the reconnected peer"
         );
 
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_remote_partition_read_isolated_from_data_lane_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(4321)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(DelayedPartitionReadHandler {
+                partition,
+                delay: std::time::Duration::from_millis(250),
+            }),
+        )
+        .await;
+
+        let config = NetConfig {
+            data_lane_timeout: std::time::Duration::from_millis(100),
+            bulk_lane_timeout: std::time::Duration::from_secs(2),
+            ..NetConfig::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(
+            Arc::new(config),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2, remote);
+        ring.assign_tokens(2, &[key.token.0]);
+        let coordinator =
+            make_coordinator(ring, peer_manager, 1, storage, 1, ConsistencyLevel::One);
+
+        let rows = coordinator
+            .coordinate_read_with_limited_rows(
+                &TableId::new("test_ks", "test_tbl"),
+                &key,
+                ConsistencyLevel::One,
+                1,
+                0,
+            )
+            .await
+            .expect("unbounded scan should use the longer Bulk-lane timeout")
+            .expect("remote partition should be found");
+
+        assert_eq!(rows.len(), 1);
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
