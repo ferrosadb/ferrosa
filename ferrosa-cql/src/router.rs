@@ -442,6 +442,31 @@ fn projection_storage_ordinals_for_select_scan(
     projection_storage_ordinals(&needed, table_meta)
 }
 
+/// True when DISTINCT projects every partition-key component and nothing else.
+/// Such a query has exactly one logical result per physical partition and can
+/// therefore page on partition boundaries without carrying a cross-page seen set.
+fn distinct_full_partition_key_projection(
+    select: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> bool {
+    if !select.distinct || select.columns.len() != table_meta.partition_key.len() {
+        return false;
+    }
+    let selected: Vec<&str> = select
+        .columns
+        .iter()
+        .filter_map(|column| match column {
+            SelectColumn::Column(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    selected.len() == table_meta.partition_key.len()
+        && table_meta
+            .partition_key
+            .iter()
+            .all(|key| selected.iter().filter(|name| **name == key).count() == 1)
+}
+
 fn is_count_only_select(columns: &[SelectColumn]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|c| {
@@ -1239,6 +1264,84 @@ async fn collect_page_from_partition_stream(
         None
     };
 
+    Ok(StreamedPage {
+        rows,
+        next_paging_state,
+    })
+}
+
+/// Collect one projected row per partition, paging only at partition
+/// boundaries. This is the exact execution shape for `SELECT DISTINCT` over
+/// the complete partition key: clustering rows inside a partition must never
+/// consume page capacity or move the continuation past an unseen partition.
+async fn collect_distinct_partition_page_from_stream(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    page_size: usize,
+    resume: Option<StreamResumeCursor>,
+    row_context: PartitionRowContext<'_>,
+) -> Result<StreamedPage, CqlError> {
+    debug_assert!(page_size > 0, "page_size must be positive");
+
+    let mut rows = Vec::with_capacity(page_size);
+    let mut last_pk = Vec::new();
+    let mut last_stream_pk: Option<Vec<u8>> = None;
+    let mut more_partitions_remain = false;
+    let mut processed_partitions = 0usize;
+
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        let mut first_row = None;
+        let partition_key = bridge::consume_partition_rows_with_clustering(
+            partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+            |_, _, output_row| {
+                first_row = Some(output_row);
+                ControlFlow::Break(())
+            },
+        );
+
+        let Some(row) = first_row else {
+            continue;
+        };
+        if last_stream_pk.as_deref() == Some(partition_key.as_slice()) {
+            continue;
+        }
+        last_stream_pk = Some(partition_key.clone());
+
+        if resume
+            .as_ref()
+            .is_some_and(|cursor| cursor.partition_key == partition_key)
+        {
+            continue;
+        }
+        if rows.len() == page_size {
+            more_partitions_remain = true;
+            break;
+        }
+        rows.push(row);
+        last_pk = partition_key;
+
+        processed_partitions += 1;
+        if should_yield_during_partition_scan(
+            processed_partitions,
+            cooperative_scan_yield_every_partitions(),
+        ) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let next_paging_state = more_partitions_remain.then(|| {
+        crate::paging::PagingState {
+            partition_key: last_pk,
+            clustering_key: Vec::new(),
+            remaining_in_partition: false,
+        }
+        .encode()
+    });
     Ok(StreamedPage {
         rows,
         next_paging_state,
@@ -5450,6 +5553,12 @@ async fn route_select_user_table(
                         .columns
                         .iter()
                         .any(|c| matches!(c, SelectColumn::FunctionCall { .. }));
+                    let distinct_partition_page_shape = s.where_clauses.is_empty()
+                        && s.order_by.is_empty()
+                        && s.ann_of.is_none()
+                        && s.limit.is_none()
+                        && ctx.paging.page_size.is_some_and(|size| size > 0)
+                        && distinct_full_partition_key_projection(s, table_meta);
                     let unbounded_scan_shape = s.where_clauses.is_empty()
                         && s.order_by.is_empty()
                         && s.ann_of.is_none()
@@ -5457,7 +5566,51 @@ async fn route_select_user_table(
                         && s.limit.is_none()
                         && !count_only_select
                         && !has_function_projection;
-                    if unbounded_scan_shape {
+                    if distinct_partition_page_shape {
+                        let page_size = ctx.paging.page_size.unwrap() as usize;
+                        let resume = StreamResumeCursor::from_paging_state(
+                            ctx.paging.paging_state.as_deref(),
+                        )?;
+                        let start_key =
+                            resume
+                                .as_ref()
+                                .map(|cursor| ferrosa_cluster::write_path::ScanResume {
+                                    key: ferrosa_common::key::DecoratedKey::new(
+                                        ferrosa_common::key::PartitionKey::from(
+                                            cursor.partition_key.as_slice(),
+                                        ),
+                                    ),
+                                    clustering: None,
+                                });
+                        let wanted = projection_storage_ordinals_for_select_scan(s, table_meta)
+                            .expect("full partition-key projection is always projectable");
+                        let stream = state
+                            .write_path
+                            .load()
+                            .range_read_projected_stream_all_from(
+                                &table_id,
+                                wanted,
+                                start_key.as_ref(),
+                                ctx.consistency,
+                                &table_strategy,
+                            )
+                            .await?;
+                        let page = collect_distinct_partition_page_from_stream(
+                            stream,
+                            page_size,
+                            resume,
+                            PartitionRowContext {
+                                all_col_names: &all_col_names,
+                                all_col_types: &all_col_types,
+                                pk_indices: &pk_indices,
+                                ck_indices: &ck_indices,
+                                storage_to_table: &storage_to_table,
+                            },
+                        )
+                        .await?;
+                        streamed_paging_state = Some(page.next_paging_state);
+                        page.rows
+                    } else if unbounded_scan_shape {
                         let page_size = ctx
                             .paging
                             .page_size
@@ -18873,6 +19026,172 @@ mod tests {
             row_count, 2,
             "SELECT DISTINCT tenant_id must deduplicate repeated tenant partition-key components"
         );
+    }
+
+    #[tokio::test]
+    async fn select_distinct_composite_partition_key_enumerates_partitions() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, Some(2), None);
+
+        for cql in [
+            "CREATE KEYSPACE distinct_composite WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE distinct_composite.entity_source_by_root (\
+             tenant_id text, source_root text, entity_id text, \
+             PRIMARY KEY ((tenant_id, source_root), entity_id))",
+            "INSERT INTO distinct_composite.entity_source_by_root \
+             (tenant_id, source_root, entity_id) VALUES ('tenant-a', 'root-1', 'entity-1')",
+            "INSERT INTO distinct_composite.entity_source_by_root \
+             (tenant_id, source_root, entity_id) VALUES ('tenant-a', 'root-1', 'entity-2')",
+            "INSERT INTO distinct_composite.entity_source_by_root \
+             (tenant_id, source_root, entity_id) VALUES ('tenant-a', 'root-2', 'entity-3')",
+            "INSERT INTO distinct_composite.entity_source_by_root \
+             (tenant_id, source_root, entity_id) VALUES ('tenant-b', 'root-1', 'entity-4')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let query = "SELECT DISTINCT tenant_id, source_root \
+                     FROM distinct_composite.entity_source_by_root";
+        let result = route(&state, &ctx, crate::parser::parse(query).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(result, RouteResult::Result(_)));
+
+        let Statement::Select(select) = crate::parser::parse(query).unwrap() else {
+            panic!("expected SELECT");
+        };
+        let first_page = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(first_page.rows.len(), 2);
+        assert!(first_page.paging_state.is_some());
+
+        let prepared_id = crate::prepared::PreparedCache::compute_id(query);
+        state.prepared_cache.insert(crate::prepared::PreparedPlan {
+            id: prepared_id,
+            query: query.into(),
+            statement: Statement::Select(select.clone()),
+            keyspace: None,
+            result_columns: Vec::new(),
+            bound_columns: Vec::new(),
+            pk_indexes: Vec::new(),
+            table_keyspace: "distinct_composite".into(),
+            table_name: "entity_source_by_root".into(),
+        });
+        let cached_plan = state
+            .prepared_cache
+            .get(&prepared_id)
+            .expect("prepared plan must survive cache insertion");
+        let prepared_statement = crate::connection::substitute_bound_terms(&cached_plan, None);
+        assert!(matches!(
+            route(&state, &ctx, prepared_statement).await.unwrap(),
+            RouteResult::Result(_)
+        ));
+
+        let (all_rows, pages) = collect_all_pages(&state, &auth, &None, query, Some(2)).await;
+        assert_eq!(all_rows.len(), 3);
+        assert_eq!(pages, 2);
+
+        let (single_rows, single_pages) =
+            collect_all_pages(&state, &auth, &None, query, Some(1)).await;
+        assert_eq!(single_rows.len(), 3);
+        assert_eq!(single_pages, 3);
+
+        let reordered = "SELECT DISTINCT source_root, tenant_id \
+                         FROM distinct_composite.entity_source_by_root";
+        let (reordered_rows, reordered_pages) =
+            collect_all_pages(&state, &auth, &None, reordered, Some(2)).await;
+        assert_eq!(reordered_rows.len(), 3);
+        assert_eq!(reordered_pages, 2);
+
+        let exact_ctx = paging_ctx(&auth, &no_ks, Some(3), None);
+        let exact_page = route_select_raw(&state, &exact_ctx, &select).await.unwrap();
+        assert_eq!(exact_page.rows.len(), 3);
+        assert!(exact_page.paging_state.is_none());
+
+        let Statement::Select(filtered_prefix) = crate::parser::parse(
+            "SELECT DISTINCT tenant_id, source_root \
+             FROM distinct_composite.entity_source_by_root \
+             WHERE tenant_id = 'tenant-a'",
+        )
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let err = match route_select_raw(&state, &ctx, &filtered_prefix).await {
+            Ok(_) => panic!("partial partition-key filter unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, CqlError::Invalid(message) if message.contains("requires filtering")),
+            "the existing partial partition-key filtering refusal must remain explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_partition_collector_dedupes_stream_fragments() {
+        fn fragment(key: &[u8], clustering: i32) -> ferrosa_sstable::types::Partition {
+            ferrosa_sstable::types::Partition {
+                key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                    key.to_vec(),
+                )),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![ferrosa_sstable::types::Row {
+                    clustering: bridge::encode_clustering(&[CqlValue::Int(clustering)]),
+                    cells: Vec::new(),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                }],
+            }
+        }
+
+        let stream = || -> ferrosa_cluster::write_path::PartitionResultStream {
+            Box::pin(futures::stream::iter(vec![
+                Ok::<_, ferrosa_cluster::error::ClusterError>(fragment(b"a", 1)),
+                Ok(fragment(b"a", 2)),
+                Ok(fragment(b"b", 1)),
+            ]))
+        };
+        let names = vec!["pk".to_string(), "ck".to_string()];
+        let types = vec![CqlType::Varchar, CqlType::Int];
+        let pk_indices = vec![0];
+        let ck_indices = vec![1];
+        let storage_to_table = Vec::new();
+        let context = || PartitionRowContext {
+            all_col_names: &names,
+            all_col_types: &types,
+            pk_indices: &pk_indices,
+            ck_indices: &ck_indices,
+            storage_to_table: &storage_to_table,
+        };
+
+        let page = collect_distinct_partition_page_from_stream(stream(), 2, None, context())
+            .await
+            .unwrap();
+        assert_eq!(
+            page.rows,
+            vec![
+                vec![Some(CqlValue::Text("a".into())), Some(CqlValue::Int(1))],
+                vec![Some(CqlValue::Text("b".into())), Some(CqlValue::Int(1))],
+            ]
+        );
+        assert!(page.next_paging_state.is_none());
+
+        let first = collect_distinct_partition_page_from_stream(stream(), 1, None, context())
+            .await
+            .unwrap();
+        let resume = StreamResumeCursor::from_paging_state(first.next_paging_state.as_deref())
+            .unwrap()
+            .expect("one more logical partition remains");
+        let second =
+            collect_distinct_partition_page_from_stream(stream(), 1, Some(resume), context())
+                .await
+                .unwrap();
+        assert_eq!(second.rows[0][0], Some(CqlValue::Text("b".into())));
+        assert!(second.next_paging_state.is_none());
     }
 
     /// Regression: a projected full-scan (here `SELECT DISTINCT` over a
