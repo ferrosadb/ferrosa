@@ -79,6 +79,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   a real miss. Ordinary equality plans admit only scalar indexes (B-tree, hash,
   composite, phonetic, and filtered); full-text, vector, and geo indexes have
   dedicated operators and cannot be selected for `column = value`,
+  compound clustering cursors such as `(recorded_at, entity_id) > (?, ?)` are
+  parsed as ordered row-value restrictions and evaluated lexicographically
+  (t_4d8925f4), so ties in the leading component neither skip nor duplicate rows,
   `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` (global index
   scatter-gathers), `VectorAnn` / `GeoIndex` / `FullTextIndex` (dedicated
   branches), `FullScan`. `EXPLAIN SELECT …` renders the same plan the router

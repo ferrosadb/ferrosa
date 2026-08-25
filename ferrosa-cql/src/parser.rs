@@ -7,6 +7,11 @@
 //! - **M2**: Nesting depth capped at `MAX_NESTING_DEPTH` (32).
 //! - **M4**: No `unwrap()` on user-derived data — all fallible paths return `Result`.
 //! - **M6**: Collection element count capped at `MAX_COLLECTION_ELEMENTS` (65,536).
+//!
+//! Correctness: WHERE tuple restrictions require matching column/value arity
+//! and preserve clustering-column order for keyset cursors.
+//! Last revised: 2026-08-24.
+//! Last changed: accepted compound clustering tuple slices (t_4d8925f4).
 
 use std::time::Duration;
 
@@ -2433,10 +2438,26 @@ impl<'input> Parser<'input> {
         let mut clauses = vec![];
         let mut geo_predicates = vec![];
         loop {
-            let column = self.parse_ident()?;
+            let tuple_columns = if self.lexer.eat(&TokenKind::LParen)? {
+                let columns = self.parse_ident_list()?;
+                self.lexer.expect(&TokenKind::RParen)?;
+                if columns.len() < 2 {
+                    return Err(CqlError::SyntaxError(
+                        "a tuple WHERE restriction requires at least two columns".to_string(),
+                    ));
+                }
+                Some(columns)
+            } else {
+                None
+            };
+            let column = if tuple_columns.is_some() {
+                String::new()
+            } else {
+                self.parse_ident()?
+            };
 
             // Check for token(column) pattern: `token` followed by `(`.
-            let has_lparen = self.lexer.eat(&TokenKind::LParen)?;
+            let has_lparen = tuple_columns.is_none() && self.lexer.eat(&TokenKind::LParen)?;
             let is_token_fn = column.eq_ignore_ascii_case("token") && has_lparen;
             // Geospatial function predicates: GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX.
             // They appear in predicate position as a function call over a geo
@@ -2476,7 +2497,7 @@ impl<'input> Parser<'input> {
             };
 
             let op = self.parse_comparison_op()?;
-            let value = if op == ComparisonOp::In {
+            let mut value = if op == ComparisonOp::In {
                 // IN (term, term, ...)
                 self.lexer.expect(&TokenKind::LParen)?;
                 let terms = self.parse_term_list()?;
@@ -2485,6 +2506,36 @@ impl<'input> Parser<'input> {
             } else {
                 self.parse_where_value()?
             };
+            if let Some(columns) = tuple_columns.as_ref() {
+                if !matches!(
+                    op,
+                    ComparisonOp::Eq
+                        | ComparisonOp::Lt
+                        | ComparisonOp::Le
+                        | ComparisonOp::Gt
+                        | ComparisonOp::Ge
+                ) {
+                    return Err(CqlError::SyntaxError(
+                        "tuple WHERE restrictions support only =, <, <=, >, and >=".to_string(),
+                    ));
+                }
+                let Term::TupleLiteral(values) = &value else {
+                    return Err(CqlError::SyntaxError(
+                        "a tuple WHERE restriction requires a tuple value".to_string(),
+                    ));
+                };
+                if values.len() != columns.len() {
+                    return Err(CqlError::SyntaxError(format!(
+                        "tuple WHERE restriction has {} columns but {} values",
+                        columns.len(),
+                        values.len()
+                    )));
+                }
+                value = Term::TupleRestriction {
+                    columns: columns.clone(),
+                    values: values.clone(),
+                };
+            }
             clauses.push(WhereClause {
                 column: actual_column,
                 op,
@@ -2508,6 +2559,14 @@ impl<'input> Parser<'input> {
                 "geospatial WHERE predicates (GEO_WITHIN_RADIUS / GEO_WITHIN_BBOX / ST_WITHIN) \
                  are only supported in SELECT statements"
                     .to_string(),
+            ));
+        }
+        if clauses
+            .iter()
+            .any(|clause| clause.tuple_column_names().is_some())
+        {
+            return Err(CqlError::SyntaxError(
+                "tuple WHERE restrictions are supported only in SELECT statements".to_string(),
             ));
         }
         Ok(clauses)
@@ -5976,6 +6035,55 @@ mod tests {
             matches!(stmt, Statement::Select(_)),
             "WHERE ... IN (...) stays a plain SELECT, got {stmt:?}"
         );
+    }
+
+    #[test]
+    fn parse_compound_clustering_tuple_slice() {
+        let stmt = parse(
+            "SELECT * FROM ks.events WHERE tenant_id = ? \
+             AND (recorded_at, entity_id) < (?, ?)",
+        )
+        .unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let tuple = &select.where_clauses[1];
+        assert_eq!(
+            tuple.tuple_column_names(),
+            Some(["recorded_at".to_string(), "entity_id".to_string()].as_slice())
+        );
+        assert_eq!(tuple.op, ComparisonOp::Lt);
+        assert!(matches!(
+            &tuple.value,
+            Term::TupleRestriction { values, .. }
+                if values.len() == 2
+                    && values.iter().all(|value| matches!(value, Term::BindMarker(_)))
+        ));
+    }
+
+    #[test]
+    fn compound_clustering_tuple_arity_mismatch_fails_loud() {
+        let err = parse(
+            "SELECT * FROM ks.events WHERE tenant_id = ? \
+             AND (recorded_at, entity_id) < (?)",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("2 columns but 1 values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn quoted_scalar_identifier_is_not_a_tuple_restriction() {
+        let stmt =
+            parse("SELECT * FROM ks.events WHERE \"(recorded_at,entity_id)\" = 'scalar'").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected SELECT");
+        };
+        let scalar = &select.where_clauses[0];
+        assert_eq!(scalar.column, "(recorded_at,entity_id)");
+        assert!(scalar.tuple_column_names().is_none());
     }
 }
 

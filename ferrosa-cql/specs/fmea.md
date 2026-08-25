@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-08-09
+last_updated: 2026-08-24
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -12,6 +12,7 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+| CQL-16 | Compound clustering-key tuple slices were rejected at the left parenthesis. | Applications could not express a unique keyset cursor over tied leading clustering values and had to synthesize a packed cursor column. | 5 | 7 | 2 | 70 → 10 | **Fixed (t_4d8925f4):** parser arity checks, ordered PREPARE markers, declared clustering-order validation, and lexicographic execution. End-to-end regression retains `(10, 'b')` after cursor `(10, 'a')`. |
 | CQL-1 | LWT routed to Accord in standalone/pair mode where `peer_manager`/`accord_clock` are absent | `INSERT ... IF NOT EXISTS` / `IF <cond>` return `ServerError` ("not yet implemented") instead of executing | 8 | 5 | 2 | 80 | **Designed fail-loud** (p0-03): `route()` returns a clear error rather than a silent non-linearizable local path. Full coordinator driver tracked on `fix/p0-03b-accord-network`. Real functional gap, but observable. |
 | CQL-2 | `paging_state` cursor is opaque but **unsigned** — `PagingState::encode/decode` is a plain length-prefixed pk+ck+flag with no HMAC | A client can forge/tamper a paging token to resume at an arbitrary key, bypassing the original query's partition scope (cross-partition read / IDOR-style) | 7 | 4 | 7 | 196 → 24 | **Implemented.** `encode` appends `HMAC-SHA256(process_key, payload)`; `decode` verifies it constant-time (`Mac::verify_slice`) before parsing, rejecting any forged/tampered cursor. Key from `FERROSA_PAGING_HMAC_KEY` (64 hex) or a random per-process key (multi-node clusters must share it). Tests: `tampered_paging_state_is_rejected`, `unsigned_forged_paging_state_is_rejected`. |
 | CQL-3 | Encoder divergence vs `ferrosa-postgres` if the re-exported row codec were ever forked into this crate | Rows written via one front-end read back wrong/invisible via the other (silent corruption) | 10 | 1 | 6 | 60 | **Structural**: codec is the single re-export from `ferrosa-row-bridge` (D10); no second encoder exists here. Reinforced by the PG differential oracle. |

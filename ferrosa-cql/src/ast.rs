@@ -2,6 +2,11 @@
 //!
 //! These types represent parsed CQL statements. The parser produces
 //! `Statement` values; the router dispatches them to schema/storage.
+//!
+//! Correctness: compound WHERE tuples retain declared column order so prepared
+//! metadata and lexicographic execution interpret every component identically.
+//! Last revised: 2026-08-24.
+//! Last changed: added compatible compound-restriction column decoding (t_4d8925f4).
 
 use std::time::Duration;
 use uuid::Uuid;
@@ -243,6 +248,14 @@ pub enum Term {
     MapLiteral(Vec<(Term, Term)>),
     SetLiteral(Vec<Term>),
     TupleLiteral(Vec<Term>),
+    /// A row-value WHERE restriction such as `(ts, id) > (?, ?)`.
+    ///
+    /// Keeping the left-hand columns in the AST avoids conflating tuple syntax
+    /// with a quoted scalar identifier whose text contains parentheses/commas.
+    TupleRestriction {
+        columns: Vec<String>,
+        values: Vec<Term>,
+    },
     FunctionCall {
         keyspace: Option<String>,
         name: String,
@@ -288,6 +301,17 @@ pub struct WhereClause {
     /// When true, this clause represents `token(column) op token(value)`
     /// and should be evaluated as a token-range predicate.
     pub token_fn: bool,
+}
+
+impl WhereClause {
+    /// Return the ordered column names of a row-value restriction, or `None`
+    /// for an ordinary scalar restriction.
+    pub fn tuple_column_names(&self) -> Option<&[String]> {
+        match &self.value {
+            Term::TupleRestriction { columns, .. } => Some(columns),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
