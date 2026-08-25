@@ -1,8 +1,8 @@
 //! Module: Per-connection CQL native-protocol handler.
 //! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
 //! substitution preserve the CQL wire contract for every accepted opcode.
-//! Last revised: 2026-07-30
-//! Last changed: Added the synthetic `int` variable specification for `SELECT ... LIMIT ?`.
+//! Last revised: 2026-08-24
+//! Last changed: Expanded compound WHERE tuple bind markers in clustering-column order.
 //!
 //! Per-connection CQL protocol handler.
 //!
@@ -2188,7 +2188,7 @@ type ColumnSpec = Vec<(String, CqlType)>;
 /// Returns `(bound_columns, result_columns)` as ordered lists of
 /// `(column_name, CqlType)`. Falls back to empty vectors if schema
 /// lookup fails (the statement might target a table that doesn't exist yet).
-fn analyze_prepared_columns(
+pub(crate) fn analyze_prepared_columns(
     stmt: &Statement,
     table_ks: &str,
     table_name: &str,
@@ -2345,7 +2345,17 @@ fn select_bind_marker_columns(s: &SelectStatement) -> Vec<&str> {
     let mut columns = Vec::new();
 
     for wc in &s.where_clauses {
-        if matches!(wc.value, Term::BindMarker(_)) {
+        if let Term::TupleRestriction {
+            columns: tuple_columns,
+            values,
+        } = &wc.value
+        {
+            for (column, value) in tuple_columns.iter().zip(values) {
+                if matches!(value, Term::BindMarker(_)) {
+                    columns.push(column.as_str());
+                }
+            }
+        } else if matches!(wc.value, Term::BindMarker(_)) {
             columns.push(wc.column.as_str());
         }
     }
@@ -2532,19 +2542,23 @@ fn system_schema_column_specs(table_ks: &str, table_name: &str) -> Vec<(String, 
 /// the driver retries on a different node where the schema is current.
 fn count_bind_markers(stmt: &Statement) -> usize {
     let is_bind = |t: &Term| matches!(t, Term::BindMarker(_));
-
     match stmt {
         Statement::Select(s) => {
             let where_count = s
                 .where_clauses
                 .iter()
-                .filter(|wc| is_bind(&wc.value))
-                .count();
+                .map(|wc| match &wc.value {
+                    Term::BindMarker(_) => 1,
+                    Term::TupleRestriction { values, .. } => {
+                        values.iter().filter(|value| is_bind(value)).count()
+                    }
+                    _ => 0,
+                })
+                .sum::<usize>();
             let ann_count = s
                 .ann_of
                 .as_ref()
-                .filter(|(_, t)| is_bind(t))
-                .map_or(0, |_| 1);
+                .map_or(0, |(_, term)| usize::from(is_bind(term)));
             let limit_count = match &s.limit {
                 Some(crate::ast::Limit::BindMarker)
                 | Some(crate::ast::Limit::NamedBindMarker(_)) => 1,
@@ -3058,7 +3072,11 @@ fn substitute_batch_values(plan: &PreparedPlan, cursor: &mut &[u8]) -> Result<St
 }
 
 /// Recursively walk a statement and replace `Term::BindMarker` with bound terms.
-fn substitute_in_statement(stmt: &Statement, terms: &[Term], idx: &mut usize) -> Statement {
+pub(crate) fn substitute_in_statement(
+    stmt: &Statement,
+    terms: &[Term],
+    idx: &mut usize,
+) -> Statement {
     match stmt {
         Statement::Select(s) => {
             let mut s = s.clone();
@@ -3143,6 +3161,11 @@ fn substitute_in_term(term: &mut Term, terms: &[Term], idx: &mut usize) {
         | Term::TupleLiteral(items) => {
             for item in items.iter_mut() {
                 substitute_in_term(item, terms, idx);
+            }
+        }
+        Term::TupleRestriction { values, .. } => {
+            for value in values.iter_mut() {
+                substitute_in_term(value, terms, idx);
             }
         }
         Term::MapLiteral(entries) => {
@@ -4641,6 +4664,25 @@ mod tests {
             vec!["session_id", "tenant_id", "fold_embedding"],
             "PREPARE metadata must include the ANN OF bind marker column after WHERE bind markers"
         );
+    }
+
+    #[test]
+    fn select_bind_marker_columns_expands_compound_tuple_in_order() {
+        let stmt = crate::parser::parse(
+            "SELECT * FROM ks.events WHERE tenant_id = ? \
+             AND (recorded_at, entity_id) < (?, ?)",
+        )
+        .unwrap();
+        let Statement::Select(select) = &stmt else {
+            panic!("expected SELECT statement");
+        };
+
+        assert_eq!(
+            select_bind_marker_columns(select),
+            vec!["tenant_id", "recorded_at", "entity_id"],
+            "PREPARE metadata must expose one typed marker per tuple component"
+        );
+        assert_eq!(count_bind_markers(&stmt), 3);
     }
 
     #[test]

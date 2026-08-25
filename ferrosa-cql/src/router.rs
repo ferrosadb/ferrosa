@@ -7,6 +7,11 @@
 //! Security mitigations:
 //! - **M8**: Every `route_*` function checks permissions via `Schema::check_permission`.
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
+//!
+//! Correctness: compound clustering restrictions validate declared key order
+//! and compare row values lexicographically, including tied leading values.
+//! Last revised: 2026-08-24.
+//! Last changed: executed compound clustering tuple slices (t_4d8925f4).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -419,7 +424,17 @@ fn projection_storage_ordinals_for_count_predicates(
 ) -> Option<Vec<u16>> {
     let names: Vec<SelectColumn> = where_clauses
         .iter()
-        .map(|wc| SelectColumn::Column(wc.column.clone()))
+        .flat_map(|wc| {
+            wc.tuple_column_names().map_or_else(
+                || vec![SelectColumn::Column(wc.column.clone())],
+                |columns| {
+                    columns
+                        .iter()
+                        .map(|column| SelectColumn::Column(column.to_string()))
+                        .collect()
+                },
+            )
+        })
         .collect();
     projection_storage_ordinals(&names, table_meta)
 }
@@ -4524,6 +4539,7 @@ async fn route_select_user_table(
         .tables
         .get(&(ks.to_string(), s.table.clone()))
         .ok_or_else(|| CqlError::Invalid(format!("table {}.{} not found", ks, s.table)))?;
+    validate_tuple_where_clauses(&s.where_clauses, table_meta)?;
     let table_strategy = keyspace_strategy(&state.schema, ks);
 
     // ALLOW FILTERING: permit full-table scans with post-filter when the
@@ -6943,6 +6959,7 @@ fn term_has_bind_marker(term: &Term) -> bool {
         | Term::ListLiteral(items)
         | Term::SetLiteral(items)
         | Term::TupleLiteral(items) => items.iter().any(term_has_bind_marker),
+        Term::TupleRestriction { values, .. } => values.iter().any(term_has_bind_marker),
         Term::MapLiteral(entries) => entries
             .iter()
             .any(|(key, value)| term_has_bind_marker(key) || term_has_bind_marker(value)),
@@ -11343,6 +11360,14 @@ fn evaluate_where_predicates(
         if is_fts_match_term(&wc.value) {
             continue;
         }
+        if let Some(matches) =
+            tuple_where_clause_matches(wc, row, all_col_names, all_col_types, ks, state)?
+        {
+            if matches {
+                continue;
+            }
+            return Ok(false);
+        }
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
             None => return Ok(false),
@@ -11483,6 +11508,124 @@ fn evaluate_where_predicates(
         }
     }
     Ok(true)
+}
+
+/// Validate row-value restrictions before reading any rows so invalid tuple
+/// shapes fail consistently even when the target partition is empty.
+fn validate_tuple_where_clauses(
+    where_clauses: &[WhereClause],
+    table_meta: &TableMetadata,
+) -> Result<(), CqlError> {
+    let clustering_columns: Vec<&str> = table_meta
+        .clustering_key
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    for wc in where_clauses {
+        let Term::TupleRestriction { columns, values } = &wc.value else {
+            continue;
+        };
+        if columns.len() != values.len() {
+            return Err(CqlError::Invalid(format!(
+                "tuple WHERE restriction has {} columns but {} values",
+                columns.len(),
+                values.len()
+            )));
+        }
+        let Some(start) = clustering_columns
+            .iter()
+            .position(|column| *column == columns[0])
+        else {
+            return Err(CqlError::Invalid(
+                "tuple WHERE restrictions require clustering columns".into(),
+            ));
+        };
+        let ordered = columns
+            .iter()
+            .map(String::as_str)
+            .eq(clustering_columns[start..]
+                .iter()
+                .copied()
+                .take(columns.len()));
+        if !ordered {
+            return Err(CqlError::Invalid(
+                "tuple WHERE columns must follow declared clustering-key order".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a compound clustering tuple restriction using lexicographic CQL
+/// value ordering. Returns `None` for an ordinary scalar WHERE clause.
+fn tuple_where_clause_matches(
+    wc: &WhereClause,
+    row: &[Option<CqlValue>],
+    all_col_names: &[String],
+    all_col_types: &[CqlType],
+    ks: &str,
+    state: &SharedState,
+) -> Result<Option<bool>, CqlError> {
+    let Term::TupleRestriction {
+        columns,
+        values: expected_terms,
+    } = &wc.value
+    else {
+        return Ok(None);
+    };
+    if columns.len() != expected_terms.len() {
+        return Err(CqlError::Invalid(format!(
+            "tuple WHERE restriction has {} columns but {} values",
+            columns.len(),
+            expected_terms.len()
+        )));
+    }
+
+    let mut actual_values = Vec::with_capacity(columns.len());
+    let mut expected_values = Vec::with_capacity(columns.len());
+    for (column, expected_term) in columns.iter().zip(expected_terms) {
+        let col_idx = all_col_names
+            .iter()
+            .position(|name| name == column)
+            .ok_or_else(|| CqlError::Invalid(format!("unknown column: {column}")))?;
+        let cql_type = all_col_types
+            .get(col_idx)
+            .ok_or_else(|| CqlError::Invalid(format!("missing type for column: {column}")))?;
+        let actual = row
+            .get(col_idx)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| CqlError::Invalid(format!("null tuple column: {column}")))?;
+        actual_values.push(actual.clone());
+        expected_values.push(evaluate_where_rhs_term(
+            expected_term,
+            cql_type,
+            row,
+            all_col_names,
+            all_col_types,
+            ks,
+            state,
+        )?);
+    }
+
+    let matches = compare_tuple_values(&wc.op, &actual_values, &expected_values)
+        .ok_or_else(|| CqlError::Invalid("unsupported tuple WHERE comparison operator".into()))?;
+    Ok(Some(matches))
+}
+
+fn compare_tuple_values(
+    op: &ComparisonOp,
+    actual: &[CqlValue],
+    expected: &[CqlValue],
+) -> Option<bool> {
+    match op {
+        ComparisonOp::Eq => Some(actual == expected),
+        ComparisonOp::Lt => Some(actual < expected),
+        ComparisonOp::Le => Some(actual <= expected),
+        ComparisonOp::Gt => Some(actual > expected),
+        ComparisonOp::Ge => Some(actual >= expected),
+        _ => None,
+    }
 }
 
 /// Cassandra `LIKE` pattern matching. `%` matches any (possibly empty) sequence
@@ -13500,6 +13643,7 @@ fn term_has_udf_call(term: &Term) -> bool {
             items.iter().any(term_has_udf_call)
         }
         Term::TupleLiteral(items) => items.iter().any(term_has_udf_call),
+        Term::TupleRestriction { values, .. } => values.iter().any(term_has_udf_call),
         Term::MapLiteral(pairs) => pairs
             .iter()
             .any(|(k, v)| term_has_udf_call(k) || term_has_udf_call(v)),
@@ -27997,6 +28141,138 @@ mod tests {
         assert_eq!(
             balance_cell.timestamp, 777,
             "persisted cell timestamp must be the Accord-agreed t, not the coordinator wall clock"
+        );
+    }
+
+    #[test]
+    fn compound_clustering_tuple_comparison_is_lexicographic() {
+        let earlier_leading = vec![CqlValue::Int(9), CqlValue::Text("z".into())];
+        let cursor = vec![CqlValue::Int(10), CqlValue::Text("b".into())];
+        let tied_earlier = vec![CqlValue::Int(10), CqlValue::Text("a".into())];
+        let tied_later = vec![CqlValue::Int(10), CqlValue::Text("c".into())];
+
+        assert_eq!(
+            compare_tuple_values(&ComparisonOp::Lt, &earlier_leading, &cursor),
+            Some(true)
+        );
+        assert_eq!(
+            compare_tuple_values(&ComparisonOp::Lt, &tied_earlier, &cursor),
+            Some(true),
+            "the second clustering component must break a tie in the first"
+        );
+        assert_eq!(
+            compare_tuple_values(&ComparisonOp::Gt, &tied_later, &cursor),
+            Some(true)
+        );
+        assert_eq!(
+            compare_tuple_values(&ComparisonOp::Ge, &cursor, &cursor),
+            Some(true)
+        );
+        assert_eq!(
+            compare_tuple_values(&ComparisonOp::Le, &cursor, &cursor),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_clustering_tuple_cursor_preserves_tied_leading_values() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        for cql in [
+            "CREATE KEYSPACE tuple_cursor WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE tuple_cursor.events (tenant text, recorded_at int, entity_id text, \
+             PRIMARY KEY (tenant, recorded_at, entity_id))",
+            "INSERT INTO tuple_cursor.events (tenant, recorded_at, entity_id) VALUES ('t', 10, 'a')",
+            "INSERT INTO tuple_cursor.events (tenant, recorded_at, entity_id) VALUES ('t', 10, 'b')",
+            "INSERT INTO tuple_cursor.events (tenant, recorded_at, entity_id) VALUES ('t', 11, 'a')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let prepared = crate::parser::parse(
+            "SELECT recorded_at, entity_id FROM tuple_cursor.events \
+             WHERE tenant = ? AND (recorded_at, entity_id) > (?, ?)",
+        )
+        .unwrap();
+        let (bound_columns, _) = crate::connection::analyze_prepared_columns(
+            &prepared,
+            "tuple_cursor",
+            "events",
+            &state,
+        );
+        assert_eq!(
+            bound_columns,
+            vec![
+                ("tenant".into(), CqlType::Varchar),
+                ("recorded_at".into(), CqlType::Int),
+                ("entity_id".into(), CqlType::Varchar),
+            ],
+            "PREPARE metadata must preserve tuple marker order and types"
+        );
+        let mut bind_idx = 0;
+        let bound = crate::connection::substitute_in_statement(
+            &prepared,
+            &[
+                Term::StringLiteral("t".into()),
+                Term::IntegerLiteral(10),
+                Term::StringLiteral("a".into()),
+            ],
+            &mut bind_idx,
+        );
+        assert_eq!(bind_idx, 3);
+        let Statement::Select(select) = bound else {
+            panic!("expected SELECT");
+        };
+        let result = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some(CqlValue::Int(10)), Some(CqlValue::Text("b".into()))],
+                vec![Some(CqlValue::Int(11)), Some(CqlValue::Text("a".into()))],
+            ],
+            "the tuple cursor must retain a row tied on the leading clustering value"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_compound_tuple_is_rejected_for_empty_partition() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        for cql in [
+            "CREATE KEYSPACE tuple_empty WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE tuple_empty.events (tenant text, recorded_at int, entity_id text, \
+             PRIMARY KEY (tenant, recorded_at, entity_id))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let Statement::Select(select) = crate::parser::parse(
+            "SELECT * FROM tuple_empty.events WHERE tenant = 'missing' \
+             AND (entity_id, recorded_at) > ('a', 10)",
+        )
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let err = match route_select_raw(&state, &ctx, &select).await {
+            Ok(_) => panic!("invalid tuple order unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, CqlError::Invalid(message) if message.contains("declared clustering-key order")),
+            "invalid tuple order must fail before reading an empty partition: {err}"
         );
     }
 }

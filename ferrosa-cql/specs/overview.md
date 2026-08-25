@@ -74,7 +74,11 @@ and applies through `SessionCore`'s write path / `StorageEngine`. LWT statements
 
 **Read (SELECT).** Same front half; `router::route_select` resolves the table,
 plans the scan (`planner`, ORDER BY classification), reads `Partition`s from
-storage. `WHERE <full partition key> AND <indexed_col> = ?` (t_430c4188) is a
+storage. Compound clustering slices such as
+`(recorded_at, entity_id) > (?, ?)` (t_4d8925f4) retain tuple order through
+PREPARE metadata and use lexicographic row-value comparison after validating
+declared clustering-key order. `WHERE <full partition key> AND <indexed_col> = ?`
+(t_430c4188) is a
 KEYED index consult: `WritePath::index_read_in_partition` routes to the
 partition's replicas, each consults its secondary index restricted to that
 partition, and only the matching rows are point-read — O(matching rows), never

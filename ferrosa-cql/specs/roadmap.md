@@ -12,6 +12,9 @@ real backlog is structural and security-shaped.
 
 ## Recently addressed
 
+- **Compound clustering-key tuple slices (t_4d8925f4 / CQL-16).** Standard
+  row-value keyset cursors now parse, bind each component in order, validate
+  clustering-key order, and compare lexicographically without skipping ties.
 - **Keyed secondary-index latency floor (t_2f174c97 / CQL-15).** SELECT now
   carries the client's consistency level into the partition-scoped index
   coordinator, allowing CL ONE to finish after one successful replica while

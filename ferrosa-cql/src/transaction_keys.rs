@@ -155,6 +155,18 @@ fn serialize_term_into(term: &Term, buf: &mut Vec<u8>) {
                 serialize_term_into(t, buf);
             }
         }
+        Term::TupleRestriction { columns, values } => {
+            buf.push(0x11);
+            buf.extend_from_slice(&(columns.len() as u32).to_be_bytes());
+            for column in columns {
+                buf.extend_from_slice(&(column.len() as u32).to_be_bytes());
+                buf.extend_from_slice(column.as_bytes());
+            }
+            buf.extend_from_slice(&(values.len() as u32).to_be_bytes());
+            for value in values {
+                serialize_term_into(value, buf);
+            }
+        }
         Term::FunctionCall {
             keyspace,
             name,
@@ -228,7 +240,7 @@ fn build_composite_key(clauses: &[(String, KeyBytes)]) -> KeyBytes {
 fn extract_where_keys(where_clauses: &[WhereClause]) -> Option<KeyBytes> {
     let eq_clauses: Vec<(String, KeyBytes)> = where_clauses
         .iter()
-        .filter(|wc| wc.op == ComparisonOp::Eq && !wc.token_fn)
+        .filter(|wc| wc.op == ComparisonOp::Eq && !wc.token_fn && wc.tuple_column_names().is_none())
         .map(|wc| (wc.column.clone(), serialize_term(&wc.value)))
         .collect();
 

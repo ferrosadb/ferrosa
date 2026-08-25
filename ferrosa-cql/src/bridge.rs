@@ -429,6 +429,10 @@ pub fn term_to_cql_value(term: &Term, target: &CqlType) -> Result<CqlValue, CqlE
             ))),
         },
 
+        Term::TupleRestriction { .. } => Err(CqlError::Invalid(
+            "tuple WHERE restriction is not a scalar value".into(),
+        )),
+
         Term::BindMarker(_) => Err(CqlError::Invalid(
             "bind markers not supported in non-prepared queries".into(),
         )),
