@@ -57,6 +57,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   O(1)-streamable full-scan shapes, which are bounded only by the query's own
   `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
   <partition-key column>`) stream through `range_read_projected_stream_all_with`;
+  paged `SELECT DISTINCT` over the complete partition key emits exactly one row
+  per physical partition and resumes at partition boundaries, so clustering-row
+  multiplicity cannot consume page capacity or skip a partition;
   scalar aggregates (`SUM`/`MIN`/`MAX`/`AVG`) fold through an O(1) streaming
   accumulator (`stream_builtin_aggregates`) over the uncapped
   `range_read_stream_all_with` (exact over the whole table, no `all_rows`
@@ -73,7 +76,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
   indexed residual `=` predicate — t_430c4188: keyed secondary-index consult
   restricted to the partition, O(matching rows) instead of O(partition rows),
-  routed to the partition's replicas, no ALLOW FILTERING needed). Empty keyed
+  routed to the partition's replicas, no ALLOW FILTERING needed). The request's
+  consistency level is propagated to that consult (t_2f174c97), so CL ONE
+  returns after one successful replica instead of waiting for all replicas.
+  Empty keyed
   consults rescan the one partition only while storage reports the index is not
   current; once `IndexStateTracker` is `Current`, an empty consult is accepted as
   a real miss. Ordinary equality plans admit only scalar indexes (B-tree, hash,

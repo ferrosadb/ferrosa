@@ -83,6 +83,8 @@ KEYED index consult: `WritePath::index_read_in_partition` routes to the
 partition's replicas, each consults its secondary index restricted to that
 partition, and only the matching rows are point-read — O(matching rows), never
 O(partition rows), with an EXPLAIN plan of `PartitionIndexLookup`. The router
+passes the client's consistency level through to the coordinator (t_2f174c97),
+preventing a slow non-required replica from imposing the Bulk timeout. The router
 trusts an empty keyed consult only when the local write path can treat the
 storage `IndexStateTracker` as authoritative and that tracker reports the index
 current with no pending SSTable backfill; clustered reads keep the bounded
@@ -91,6 +93,13 @@ decomposes partitions to rows via the re-exported
 `partition_to_rows_with_storage_mapping` (tombstone/TTL skipping, storage→table
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
+
+Paged `SELECT DISTINCT` over every component of a composite partition key uses
+a partition-granular projected stream. It emits one logical row per partition,
+looks ahead by one partition to decide whether a continuation exists, and stores
+only the last emitted partition key in `paging_state`. This keeps paging exact
+even when a partition contains multiple clustering rows; partial partition-key
+filters continue to require `ALLOW FILTERING`.
 
 `PartitionIndexLookup` and the generic scalar equality plans only consider
 B-tree, hash, composite, phonetic, and filtered indexes. Full-text, vector, and

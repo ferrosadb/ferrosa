@@ -63,7 +63,11 @@ a detached task. See [data-flow.md](data-flow.md).
 **Tunable-CL read.** `coordinate_read*` issues one full read + (block_for − 1)
 digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newest
 copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
-to a healthy replica and enqueues a background anti-entropy refill.
+to a healthy replica and enqueues a background anti-entropy refill. Remote
+single-partition reads that are unbounded (`row_limit = 0`, no exact clustering
+key) page on `Lane::Bulk`; bounded and exact reads remain on `Lane::Data`. This
+isolates long wide-partition scans from write coordination, which also uses the
+Data lane (t_82052066).
 
 **Range read.** The public write-path range-read surface is streaming-first:
 projected scans use `range_read_projected_stream_all_from` /
@@ -77,9 +81,11 @@ partition's replicas from the ring under the keyspace strategy and sends each an
 `IndexReadInPartitionRequest` (`0x66`/`0x67`); the replica consults its
 secondary index restricted to that partition and point-reads only the matching
 rows (O(matching rows), never O(partition rows)). Results merge per token;
-partial replica failures degrade to a partial union (logged); all-replicas-failed
-errors. Exposed as `WritePath::index_read_in_partition` (Direct/Pair resolve
-locally). Unlike `coordinate_index_read`, this never fans out to the whole ring.
+the coordinator returns once the requested consistency level has received enough
+successful replica responses (t_2f174c97). Failures never count toward that
+threshold, and an unmet threshold returns `ReadTimeout`. Exposed as
+`WritePath::index_read_in_partition` (Direct/Pair resolve locally). Unlike
+`coordinate_index_read`, this never fans out to the whole ring.
 
 **Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
 index lookup out to every node — its hits span all token ranges (there is no

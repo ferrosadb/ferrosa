@@ -1,4 +1,10 @@
-//! Read coordination -- fans out reads to replicas with CL enforcement.
+//! Module: Coordinate replica reads with consistency-level enforcement.
+//! Correctness: Correct when replica selection satisfies the requested CL,
+//!   latency-sensitive reads and writes retain Data-lane capacity, and
+//!   unbounded scan traffic is isolated on the Bulk lane.
+//! Last revised: 2026-08-24
+//! Last changed: Route unbounded multi-page partition reads through the Bulk
+//!   internode lane so they cannot monopolize the Data lane used by writes.
 //!
 //! # Two-Phase Digest Read Protocol
 //!
@@ -17,6 +23,16 @@
 //!    by timestamp (last-write-wins).  Spawn async repair writes to stale replicas.
 //!
 //! For CL = ONE: skip digest entirely — read from one replica, prefer local.
+//!
+//! # Correctness
+//!
+//! Keyed secondary-index reads obey the same consistency response threshold as
+//! primary-key reads. A slow or failed replica does not delay CL ONE after one
+//! successful response, while quorum levels still require their configured
+//! number of successful partition replicas.
+//!
+//! Last revised: 2026-08-24.
+//! Last changed: made keyed index collection consistency-aware (t_2f174c97).
 
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -348,7 +364,7 @@ async fn digest_read_attempt(
         match remote {
             None => ReplicaRead::Failed,
             Some((hid, addr)) => match coordinator
-                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body))
+                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body), Lane::Data)
                 .await
             {
                 Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -379,6 +395,20 @@ fn should_retry_missing_peer_error(err: &str) -> bool {
         || err.contains("lane permanently failed")
 }
 
+/// Select the internode lane for a single-partition read.
+///
+/// A clustering-row lookup or a row-bounded request is latency-sensitive and
+/// bounded, so it stays on `Data`. An unbounded partition read can require many
+/// remote pages (70K-row partitions are observed in production); it belongs on
+/// `Bulk` so those pages cannot queue ahead of small writes on `Data`.
+fn partition_read_lane(row_limit: usize, clustering: Option<&[u8]>) -> Lane {
+    if row_limit == 0 && clustering.is_none() {
+        Lane::Bulk
+    } else {
+        Lane::Data
+    }
+}
+
 // ---------------------------------------------------------------------------
 // coordinate_read
 // ---------------------------------------------------------------------------
@@ -389,17 +419,14 @@ impl ClusterCoordinator {
         host_id: uuid::Uuid,
         addr: &str,
         message: Message,
+        lane: Lane,
     ) -> crate::error::Result<Message> {
-        match self
-            .peer_manager
-            .send(host_id, message.clone(), Lane::Data)
-            .await
-        {
+        match self.peer_manager.send(host_id, message.clone(), lane).await {
             Ok(resp) => Ok(resp),
             Err(e) if should_retry_missing_peer_error(&e.to_string()) => {
                 self.peer_manager.ensure_peer(host_id, addr).await?;
                 self.peer_manager
-                    .send(host_id, message, Lane::Data)
+                    .send(host_id, message, lane)
                     .await
                     .map_err(Into::into)
             }
@@ -474,7 +501,7 @@ impl ClusterCoordinator {
         };
         let body = encode_read_request(&payload);
         match self
-            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
+            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), Lane::Data)
             .await
         {
             Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -673,6 +700,7 @@ impl ClusterCoordinator {
                                         hid,
                                         &addr,
                                         Message::ReadRequest(body),
+                                        Lane::Data,
                                     )
                                     .await
                                 {
@@ -1067,8 +1095,9 @@ impl ClusterCoordinator {
                     clustering: clustering.unwrap_or_default().to_vec(),
                 };
                 let body = encode_read_request(&payload);
+                let lane = partition_read_lane(row_limit, clustering);
                 match self
-                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body))
+                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), lane)
                     .await
                 {
                     Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -1618,29 +1647,94 @@ impl ClusterCoordinator {
     /// rows), so per-replica work is O(rows matching the value), never
     /// O(partition rows). Results from the replicas are merged per token, the
     /// same union semantics as `coordinate_index_read` but over the replica
-    /// set instead of the whole ring. Partial replica failures degrade to a
-    /// partial union (logged); an all-replicas-failed result errors.
+    /// set instead of the whole ring. Only successful responses count toward
+    /// the requested consistency level; falling short returns `ReadTimeout`.
     pub async fn coordinate_index_read_in_partition(
         &self,
         table_id: &TableId,
         key: &DecoratedKey,
         index_name: &str,
         index_key: &ferrosa_index::IndexKey,
+        cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
         let ring = self.ring.load();
-        let replica_ids = ring.replicas_for_strategy(key.token.0, strategy);
+        let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
+        let eligible =
+            crate::coordinator::cl_routing::eligible_replicas_for_cl(cl, &all_replicas, &ring);
+        let local_dc = ring
+            .get_node(self.local_node_id)
+            .map(|n| n.data_center.clone())
+            .unwrap_or_default();
+        let mut required_by_dc: Option<std::collections::HashMap<String, usize>> = None;
+        let (replica_ids, required) = match cl {
+            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
+                let local_replicas: Vec<u64> = eligible
+                    .into_iter()
+                    .filter(|&id| {
+                        ring.get_node(id)
+                            .map(|n| n.data_center == local_dc)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                let local_rf = strategy
+                    .dc_replication_factors()
+                    .get(&local_dc)
+                    .copied()
+                    .unwrap_or(1);
+                (local_replicas, cl.block_for_dc(local_rf))
+            }
+            ConsistencyLevel::EachQuorum => match strategy {
+                crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf } => {
+                    let requirements: std::collections::HashMap<String, usize> = dc_rf
+                        .iter()
+                        .map(|(dc, rf)| (dc.clone(), rf / 2 + 1))
+                        .collect();
+                    let required = requirements.values().sum();
+                    required_by_dc = Some(requirements);
+                    (eligible, required)
+                }
+                crate::ring::strategy::ReplicationStrategy::Simple { .. } => {
+                    return Err(ClusterError::NotImplemented {
+                        feature: "EACH_QUORUM keyed index read requires NetworkTopologyStrategy"
+                            .into(),
+                    });
+                }
+            },
+            _ => (eligible, cl.block_for(strategy.replication_factor())),
+        };
+        let replica_dc_by_id: std::collections::HashMap<u64, String> = replica_ids
+            .iter()
+            .filter_map(|&id| ring.get_node(id).map(|node| (id, node.data_center.clone())))
+            .collect();
         let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = replica_ids
             .iter()
             .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
             .collect();
         drop(ring);
 
-        if nodes.is_empty() {
-            return Err(ClusterError::Internal(format!(
-                "keyed index read: no replicas resolved for token {}",
-                key.token.0
-            )));
+        if nodes.len() < required {
+            return Err(ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required,
+                alive: nodes.len(),
+            });
+        }
+        if let Some(requirements) = required_by_dc.as_ref() {
+            let unavailable_dc = requirements.iter().any(|(dc, required_in_dc)| {
+                replica_dc_by_id
+                    .values()
+                    .filter(|candidate| *candidate == dc)
+                    .count()
+                    < *required_in_dc
+            });
+            if unavailable_dc {
+                return Err(ClusterError::Unavailable {
+                    consistency: cl.to_string(),
+                    required,
+                    alive: nodes.len(),
+                });
+            }
         }
 
         let req_payload = IndexReadInPartitionRequestPayload {
@@ -1658,8 +1752,6 @@ impl ClusterCoordinator {
         let index_name_owned = index_name.to_string();
         let index_key_clone = index_key.clone();
         let partition_key_bytes = key.key.as_bytes().to_vec();
-        let total_nodes = nodes.len();
-
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
             .map(|(node_id, remote)| {
@@ -1672,73 +1764,96 @@ impl ClusterCoordinator {
                 let coordinator = self;
 
                 async move {
-                    if node_id == local_id {
-                        storage
-                            .read_by_index_in_partition(
-                                &table_id,
-                                &index_name,
-                                &index_key,
-                                &partition_key,
-                            )
-                            .map_err(ClusterError::Storage)
-                    } else {
-                        let (hid, addr) = remote.ok_or_else(|| {
-                            ClusterError::Internal(format!(
-                                "keyed index read: node {node_id} has no host_id"
-                            ))
-                        })?;
-
-                        let resp = coordinator
-                            .send_remote_with_reconnect_timeout(
-                                hid,
-                                &addr,
-                                Message::IndexReadInPartitionRequest(req_body),
-                                Lane::Bulk,
-                                Self::BULK_READ_TIMEOUT,
-                            )
-                            .await
-                            .map_err(|e| {
+                    let result = async {
+                        if node_id == local_id {
+                            storage
+                                .read_by_index_in_partition(
+                                    &table_id,
+                                    &index_name,
+                                    &index_key,
+                                    &partition_key,
+                                )
+                                .map_err(ClusterError::Storage)
+                        } else {
+                            let (hid, addr) = remote.ok_or_else(|| {
                                 ClusterError::Internal(format!(
-                                    "keyed index read from node {node_id} ({hid}) via {addr}: {e}"
+                                    "keyed index read: node {node_id} has no host_id"
                                 ))
                             })?;
 
-                        match resp {
-                            Message::IndexReadInPartitionResponse(b) => {
-                                let payload = bincode::deserialize::<IndexReadResponsePayload>(&b)
-                                    .map_err(|e| {
-                                        ClusterError::Internal(format!(
-                                            "keyed index read: failed to decode response \
-                                                 from node {node_id} ({hid}): {e}"
-                                        ))
-                                    })?;
-                                Ok(payload
-                                    .partitions
-                                    .into_iter()
-                                    .map(partition_from_wire)
-                                    .collect())
+                            let resp = coordinator
+                                .send_remote_with_reconnect_timeout(
+                                    hid,
+                                    &addr,
+                                    Message::IndexReadInPartitionRequest(req_body),
+                                    Lane::Bulk,
+                                    Self::BULK_READ_TIMEOUT,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    ClusterError::Internal(format!(
+                                        "keyed index read from node {node_id} ({hid}) via {addr}: {e}"
+                                    ))
+                                })?;
+
+                            match resp {
+                                Message::IndexReadInPartitionResponse(b) => {
+                                    let payload =
+                                        bincode::deserialize::<IndexReadResponsePayload>(&b)
+                                            .map_err(|e| {
+                                                ClusterError::Internal(format!(
+                                                    "keyed index read: failed to decode response \
+                                                     from node {node_id} ({hid}): {e}"
+                                                ))
+                                            })?;
+                                    Ok(payload
+                                        .partitions
+                                        .into_iter()
+                                        .map(partition_from_wire)
+                                        .collect())
+                                }
+                                other => Err(ClusterError::Internal(format!(
+                                    "keyed index read: unexpected response {:?} from node \
+                                     {node_id} ({hid})",
+                                    other.msg_type()
+                                ))),
                             }
-                            other => Err(ClusterError::Internal(format!(
-                                "keyed index read: unexpected response {:?} from node \
-                                 {node_id} ({hid})",
-                                other.msg_type()
-                            ))),
                         }
                     }
+                    .await;
+                    (node_id, result)
                 }
             })
             .collect();
 
         let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
         let mut first_error: Option<ClusterError> = None;
-        let mut failed_nodes = 0usize;
+        let mut received = 0usize;
+        let mut received_by_dc: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
-        while let Some(result) = futs.next().await {
+        while let Some((node_id, result)) = futs.next().await {
             match result {
-                Ok(batch) => all_partitions.extend(batch),
+                Ok(batch) => {
+                    all_partitions.extend(batch);
+                    received += 1;
+                    if let Some(dc) = replica_dc_by_id.get(&node_id) {
+                        *received_by_dc.entry(dc.clone()).or_default() += 1;
+                    }
+                    let consistency_met =
+                        required_by_dc
+                            .as_ref()
+                            .map_or(received >= required, |requirements| {
+                                requirements.iter().all(|(dc, required_in_dc)| {
+                                    received_by_dc.get(dc).copied().unwrap_or(0) >= *required_in_dc
+                                })
+                            });
+                    if consistency_met {
+                        break;
+                    }
+                }
                 Err(e) => {
                     tracing::error!("coordinate_index_read_in_partition: {e}");
-                    failed_nodes += 1;
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
@@ -1746,22 +1861,24 @@ impl ClusterCoordinator {
             }
         }
 
-        if let Some(ref err) = first_error {
-            if failed_nodes == total_nodes {
-                tracing::error!(
-                    failed_nodes,
-                    "coordinate_index_read_in_partition: all replicas failed, returning error"
-                );
-                return Err(first_error.unwrap());
+        let consistency_met =
+            required_by_dc
+                .as_ref()
+                .map_or(received >= required, |requirements| {
+                    requirements.iter().all(|(dc, required_in_dc)| {
+                        received_by_dc.get(dc).copied().unwrap_or(0) >= *required_in_dc
+                    })
+                });
+        if !consistency_met {
+            if let Some(err) = first_error {
+                tracing::warn!(%err, "keyed index read did not satisfy consistency");
             }
-            tracing::warn!(
-                failed_nodes,
-                partitions_received = all_partitions.len(),
-                %err,
-                "coordinate_index_read_in_partition: {failed_nodes} replica(s) failed, \
-                 returning partial results from {remaining} replica(s)",
-                remaining = total_nodes - failed_nodes,
-            );
+            return Err(ClusterError::ReadTimeout {
+                consistency: cl.to_string(),
+                received,
+                required,
+                data_present: !all_partitions.is_empty(),
+            });
         }
 
         // Merge per token (all results are the same partition; replicas may
@@ -2077,6 +2194,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unbounded_partition_scan_uses_bulk_lane() {
+        // Given an unbounded partition read that may require many remote pages,
+        // when the coordinator selects its internode lane, then it must not
+        // share the latency-sensitive Data lane used by writes.
+        assert_eq!(partition_read_lane(0, None), Lane::Bulk);
+    }
+
+    #[test]
+    fn bounded_partition_read_keeps_data_lane() {
+        assert_eq!(partition_read_lane(20, None), Lane::Data);
+    }
+
+    #[test]
+    fn exact_clustering_read_keeps_data_lane() {
+        assert_eq!(partition_read_lane(0, Some(b"row-key")), Lane::Data);
+    }
+
     fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -2211,6 +2346,34 @@ mod tests {
     struct DelayedRangeReadHandler {
         partition: Partition,
         delay: std::time::Duration,
+    }
+
+    struct DelayedPartitionReadHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedPartitionReadHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::ReadRequest(body) = msg else {
+                return None;
+            };
+            let request: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+            tokio::time::sleep(self.delay).await;
+            let payload = ReadResponsePayload {
+                found: true,
+                partition: Some(crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )),
+                digest: None,
+                timestamp: i64::MIN,
+                has_more: false,
+                next_page_state: Vec::new(),
+            };
+            (!request.digest_only)
+                .then(|| Message::ReadResponse(Bytes::from(bincode::serialize(&payload).unwrap())))
+        }
     }
 
     #[async_trait::async_trait]
@@ -3249,6 +3412,29 @@ mod tests {
         partition: Partition,
     }
 
+    struct DelayedIndexReadInPartitionHandler {
+        partition: Partition,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for DelayedIndexReadInPartitionHandler {
+        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+            let Message::IndexReadInPartitionRequest(_) = msg else {
+                return None;
+            };
+            tokio::time::sleep(self.delay).await;
+            let payload = IndexReadResponsePayload {
+                partitions: vec![crate::raft::handlers::partition_to_wire(
+                    self.partition.clone(),
+                )],
+            };
+            Some(Message::IndexReadInPartitionResponse(Bytes::from(
+                bincode::serialize(&payload).unwrap(),
+            )))
+        }
+    }
+
     #[async_trait::async_trait]
     impl RpcHandler for StaticIndexReadInPartitionHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
@@ -3343,6 +3529,7 @@ mod tests {
                 &key,
                 "val_idx",
                 &ferrosa_index::IndexKey(b"hello".to_vec()),
+                ConsistencyLevel::One,
                 &strategy,
             )
             .await
@@ -3367,6 +3554,139 @@ mod tests {
             .shutdown(std::time::Duration::from_millis(50))
             .await;
         other_server
+            .shutdown(std::time::Duration::from_millis(50))
+            .await;
+    }
+
+    /// t_2f174c97: a keyed index lookup at CL ONE must complete after one
+    /// successful replica. Waiting for every replica turns one unavailable or
+    /// slow peer into the fixed three-second Bulk timeout seen by callers.
+    #[tokio::test]
+    async fn keyed_index_read_at_one_does_not_wait_for_slow_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        storage
+            .register_table_with_indexes(schema, vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        storage.write(&table_id, &key, test_row(10), 10).unwrap();
+
+        let slow_partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(9)],
+        };
+        let (slow_server, slow_addr, slow_host_id) = start_rpc_server(
+            MsgType::IndexReadInPartitionRequest,
+            Arc::new(DelayedIndexReadInPartitionHandler {
+                partition: slow_partition,
+                delay: std::time::Duration::from_millis(250),
+            }),
+        )
+        .await;
+
+        let pm = Arc::new(PeerManager::new(
+            Arc::new(NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        let mut local = make_node("127.0.0.1:1");
+        let mut slow = make_node(&slow_addr.to_string());
+        let failed = make_node("127.0.0.1:1");
+        slow.host_id = slow_host_id;
+        local.host_id = Uuid::new_v4();
+
+        let mut ring = TokenRing::new();
+        ring.add_node(1u64, local);
+        ring.add_node(2u64, slow);
+        ring.add_node(3u64, failed);
+        ring.assign_tokens(1u64, &[42]);
+        ring.assign_tokens(2u64, &[500_000]);
+        ring.assign_tokens(3u64, &[1_000_000]);
+
+        let coordinator = make_coordinator(ring, pm, 1u64, storage, 3, ConsistencyLevel::One);
+        let strategy = crate::ring::strategy::ReplicationStrategy::Simple {
+            replication_factor: 3,
+        };
+
+        let quorum = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            coordinator.coordinate_index_read_in_partition(
+                &table_id,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                ConsistencyLevel::Quorum,
+                &strategy,
+            ),
+        )
+        .await;
+        assert!(
+            quorum.is_err(),
+            "a failed replica must not satisfy QUORUM before the slow second success"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            coordinator.coordinate_index_read_in_partition(
+                &table_id,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                ConsistencyLevel::Quorum,
+                &strategy,
+            ),
+        )
+        .await
+        .expect("QUORUM did not complete after the second successful replica")
+        .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            coordinator.coordinate_index_read_in_partition(
+                &table_id,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                ConsistencyLevel::One,
+                &strategy,
+            ),
+        )
+        .await
+        .expect("CL ONE keyed index read waited for the slow replica")
+        .unwrap();
+
+        let each_quorum = coordinator
+            .coordinate_index_read_in_partition(
+                &table_id,
+                &key,
+                "val_idx",
+                &ferrosa_index::IndexKey(b"hello".to_vec()),
+                ConsistencyLevel::EachQuorum,
+                &strategy,
+            )
+            .await;
+        assert!(matches!(
+            each_quorum,
+            Err(ClusterError::NotImplemented { .. })
+        ));
+
+        slow_server
             .shutdown(std::time::Duration::from_millis(50))
             .await;
     }
@@ -4709,6 +5029,63 @@ mod tests {
             "coordinator should cache the reconnected peer"
         );
 
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_remote_partition_read_isolated_from_data_lane_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let partition = Partition {
+            key: key.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![test_row(4321)],
+        };
+        let (server, addr, remote_host_id) = start_rpc_server(
+            MsgType::ReadRequest,
+            Arc::new(DelayedPartitionReadHandler {
+                partition,
+                delay: std::time::Duration::from_millis(250),
+            }),
+        )
+        .await;
+
+        let config = NetConfig {
+            data_lane_timeout: std::time::Duration::from_millis(100),
+            bulk_lane_timeout: std::time::Duration::from_secs(2),
+            ..NetConfig::default()
+        };
+        let peer_manager = Arc::new(PeerManager::new(
+            Arc::new(config),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+
+        let mut remote = make_node(&addr.to_string());
+        remote.host_id = remote_host_id;
+        let mut ring = TokenRing::new();
+        ring.add_node(2, remote);
+        ring.assign_tokens(2, &[key.token.0]);
+        let coordinator =
+            make_coordinator(ring, peer_manager, 1, storage, 1, ConsistencyLevel::One);
+
+        let rows = coordinator
+            .coordinate_read_with_limited_rows(
+                &TableId::new("test_ks", "test_tbl"),
+                &key,
+                ConsistencyLevel::One,
+                1,
+                0,
+            )
+            .await
+            .expect("unbounded scan should use the longer Bulk-lane timeout")
+            .expect("remote partition should be found");
+
+        assert_eq!(rows.len(), 1);
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 

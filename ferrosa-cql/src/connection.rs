@@ -2807,7 +2807,10 @@ fn substitute_bound_values(
     Ok(substitute_bound_terms(plan, bound_terms.as_deref()))
 }
 
-fn substitute_bound_terms(plan: &PreparedPlan, bound_terms: Option<&[Term]>) -> Statement {
+pub(crate) fn substitute_bound_terms(
+    plan: &PreparedPlan,
+    bound_terms: Option<&[Term]>,
+) -> Statement {
     let Some(bound_terms) = bound_terms else {
         return plan.statement.clone();
     };

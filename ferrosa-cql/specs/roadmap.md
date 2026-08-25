@@ -15,6 +15,10 @@ real backlog is structural and security-shaped.
 - **Compound clustering-key tuple slices (t_4d8925f4 / CQL-16).** Standard
   row-value keyset cursors now parse, bind each component in order, validate
   clustering-key order, and compare lexicographically without skipping ties.
+- **Keyed secondary-index latency floor (t_2f174c97 / CQL-15).** SELECT now
+  carries the client's consistency level into the partition-scoped index
+  coordinator, allowing CL ONE to finish after one successful replica while
+  retaining quorum requirements at stronger levels.
 
 ## Now (highest value)
 
@@ -47,6 +51,11 @@ real backlog is structural and security-shaped.
     partitions) instead of hitting the Vec-materialization cap. `SELECT DISTINCT
     <partition key>` and simple `WHERE … ALLOW FILTERING` scans were already
     uncapped (step 1 / paged-filter path).
+  - Composite partition-key DISTINCT paging (t_c76913d7, landed): a complete
+    partition-key projection now consumes one page slot per physical partition,
+    not per clustering row, and resumes with a partition-boundary cursor. Native
+    driver pagination therefore enumerates every partition exactly once; prefix
+    filters remain explicit `ALLOW FILTERING` refusals.
   - Step 5 (landed): the unbounded `ORDER BY` (no `LIMIT`) global sort now
     **spills** instead of fail-loud-refusing. The router streams the uncapped
     scan through `sort_rows_from_partition_stream_spilling` →
