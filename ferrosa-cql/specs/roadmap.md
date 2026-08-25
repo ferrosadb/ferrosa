@@ -41,6 +41,11 @@ real backlog is structural and security-shaped.
     partitions) instead of hitting the Vec-materialization cap. `SELECT DISTINCT
     <partition key>` and simple `WHERE … ALLOW FILTERING` scans were already
     uncapped (step 1 / paged-filter path).
+  - Composite partition-key DISTINCT paging (t_c76913d7, landed): a complete
+    partition-key projection now consumes one page slot per physical partition,
+    not per clustering row, and resumes with a partition-boundary cursor. Native
+    driver pagination therefore enumerates every partition exactly once; prefix
+    filters remain explicit `ALLOW FILTERING` refusals.
   - Step 5 (landed): the unbounded `ORDER BY` (no `LIMIT`) global sort now
     **spills** instead of fail-loud-refusing. The router streams the uncapped
     scan through `sort_rows_from_partition_stream_spilling` →

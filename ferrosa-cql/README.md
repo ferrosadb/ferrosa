@@ -57,6 +57,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   O(1)-streamable full-scan shapes, which are bounded only by the query's own
   `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
   <partition-key column>`) stream through `range_read_projected_stream_all_with`;
+  paged `SELECT DISTINCT` over the complete partition key emits exactly one row
+  per physical partition and resumes at partition boundaries, so clustering-row
+  multiplicity cannot consume page capacity or skip a partition;
   scalar aggregates (`SUM`/`MIN`/`MAX`/`AVG`) fold through an O(1) streaming
   accumulator (`stream_builtin_aggregates`) over the uncapped
   `range_read_stream_all_with` (exact over the whole table, no `all_rows`

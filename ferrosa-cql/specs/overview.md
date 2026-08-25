@@ -88,6 +88,13 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+Paged `SELECT DISTINCT` over every component of a composite partition key uses
+a partition-granular projected stream. It emits one logical row per partition,
+looks ahead by one partition to decide whether a continuation exists, and stores
+only the last emitted partition key in `paging_state`. This keeps paging exact
+even when a partition contains multiple clustering rows; partial partition-key
+filters continue to require `ALLOW FILTERING`.
+
 `PartitionIndexLookup` and the generic scalar equality plans only consider
 B-tree, hash, composite, phonetic, and filtered indexes. Full-text, vector, and
 geo indexes use their dedicated operators; allowing them into a scalar `=` plan
