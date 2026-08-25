@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-08-07
+last_updated: 2026-08-24
 ---
 
 # ferrosa-cluster — Roadmap
@@ -10,6 +10,13 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code deprecation markers,
 reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
+
+- **Wide-partition scan / write lane isolation (CL-17, t_82052066).** Remote
+  unbounded partition pages now use `Lane::Bulk`, leaving `Lane::Data` for
+  bounded reads and mutation fan-out. Unit tests pin the classification and a
+  timeout-differential RPC test proves a slow unbounded page receives the Bulk
+  timeout. A native three-node replay of the 69K-row incident remains the live
+  closure gate.
 
 - **Same-host cluster reverse-address collapse (CL-16).** Live launchd evidence
   showed node3 recovering a three-member ring whose three addresses all pointed

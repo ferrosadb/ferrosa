@@ -63,7 +63,11 @@ a detached task. See [data-flow.md](data-flow.md).
 **Tunable-CL read.** `coordinate_read*` issues one full read + (block_for − 1)
 digest reads, then resolves. On digest mismatch it fail-loud re-fetches the newest
 copy and repairs stale replicas inline; on a corrupt local SSTable it fails over
-to a healthy replica and enqueues a background anti-entropy refill.
+to a healthy replica and enqueues a background anti-entropy refill. Remote
+single-partition reads that are unbounded (`row_limit = 0`, no exact clustering
+key) page on `Lane::Bulk`; bounded and exact reads remain on `Lane::Data`. This
+isolates long wide-partition scans from write coordination, which also uses the
+Data lane (t_82052066).
 
 **Range read.** The public write-path range-read surface is streaming-first:
 projected scans use `range_read_projected_stream_all_from` /

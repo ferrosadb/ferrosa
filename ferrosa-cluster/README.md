@@ -100,7 +100,11 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 - `coordinator/read.rs` — two-phase digest reads, inline read repair on digest
   mismatch (fail-loud `ReadTimeout` rather than serve stale), corrupt-SSTable
   failover feeding the bounded `AntiEntropyRepairQueue` (cap 1024) — *serve now,
-  repair in background* (LOCKED DESIGN). Also hosts the index scatter-gathers:
+  repair in background* (LOCKED DESIGN). Unbounded single-partition reads use
+  the `Bulk` internode lane for every remote page, while LIMIT-bounded and exact
+  clustering-row reads retain `Data`; this prevents a wide-partition scan from
+  queuing ahead of small writes on the latency-sensitive lane (t_82052066).
+  Also hosts the index scatter-gathers:
   `coordinate_index_read` (secondary index) and `coordinate_fulltext_search`,
   plus the KEYED index read `coordinate_index_read_in_partition` (t_430c4188):
   `WHERE <full pk> AND <indexed_col> = ?` contacts ONLY the partition's replicas
