@@ -9,6 +9,7 @@ use crate::write_path::WritePath;
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::server::RpcServer;
 use ferrosa_net::rpc::{PeerId, RpcHandler};
+use proptest::prelude::*;
 
 fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
@@ -1812,6 +1813,130 @@ async fn decommission_requires_raft() {
 
 // ---- is_cql_ready tests ------------------------------------------------
 
+/// A transport callback that reports the local host ID is not a peer.
+///
+/// The live RF=3 incident crossed the two-peer formation threshold with one
+/// real connection plus a connection carrying the bootstrapper's own host ID.
+/// Counting self lets a single node enter cluster formation while its two
+/// intended peers remain in independent pair modes.
+#[test]
+fn self_connection_does_not_advance_cluster_formation() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig::default());
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    controller.on_peer_connected((local_id, "127.0.0.1:7000".parse().unwrap()));
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Standalone,
+        "a self-connection must not be counted as a peer or trigger pair mode"
+    );
+    assert!(
+        controller.connected_peers.lock().is_empty(),
+        "self must not enter the connected-peer formation set"
+    );
+
+    use ferrosa_net::rpc::InboundPeerCallback;
+    controller.on_inbound_peer((local_id, "127.0.0.1:47000".parse().unwrap()), None, None);
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    assert!(controller.connected_peers.lock().is_empty());
+
+    let real_peer = Uuid::from_u128(2);
+    controller.on_peer_connected((real_peer, "127.0.0.2:7000".parse().unwrap()));
+    controller.on_peer_connected((local_id, "127.0.0.1:7000".parse().unwrap()));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "one real peer plus self must remain pair, never advance to trio formation"
+    );
+    let peers = controller.connected_peers.lock();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].0, real_peer);
+}
+
+/// Explicit cluster-size intent makes pair mode a formation state, not a
+/// healthy deployment mode.
+#[test]
+fn configured_three_node_pair_primary_is_not_cql_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        expected_cluster_size: 3,
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let peer_id = Uuid::from_u128(2);
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::new(net_config, local_id, controller.clone()));
+    controller.set_peer_manager(pm);
+
+    controller.on_peer_connected((peer_id, "127.0.0.2:7000".parse().unwrap()));
+
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+    assert!(
+        !controller.is_cql_ready(),
+        "a configured three-node deployment must not advertise pair-primary CQL readiness"
+    );
+}
+
+proptest! {
+    #[test]
+    fn configured_cluster_readiness_requires_declared_committed_voters(
+        expected in 3usize..=9,
+        committed_voters in 0usize..=12,
+        has_leader in any::<bool>(),
+        mode_index in 0u8..=5,
+    ) {
+        let mode = match mode_index {
+            0 => DeploymentMode::Standalone,
+            1 => DeploymentMode::Pair,
+            2 => DeploymentMode::Forming,
+            3 => DeploymentMode::Cluster,
+            4 => DeploymentMode::DegradedPair,
+            _ => DeploymentMode::DegradedCluster,
+        };
+        let actual = declared_topology_is_ready(
+            expected,
+            mode,
+            Some(PairRole::Primary),
+            has_leader,
+            committed_voters,
+        );
+        let expected_ready = mode == DeploymentMode::Cluster
+            && has_leader
+            && committed_voters >= expected;
+        prop_assert_eq!(actual, expected_ready);
+    }
+}
+
 /// The pair role must be decided by host_id ordering, lowest wins.
 ///
 /// `docker-compose.yml` pins node1 to the lowest `FERROSA_HOST_ID` precisely so
@@ -2875,12 +3000,12 @@ async fn forming_falls_back_to_pair_on_timeout() {
 async fn ddl_during_forming_queues_and_replays() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let (tx, rx) = tokio::sync::mpsc::channel::<u32>(4);
     let processed = Arc::new(AtomicUsize::new(0));
 
     // Pre-queue two ops (the steady-state "queued during Forming" case).
-    tx.send(1).unwrap();
-    tx.send(2).unwrap();
+    tx.send(1).await.unwrap();
+    tx.send(2).await.unwrap();
 
     // Inject a third op AFTER the drain has seen the queue go empty, so the
     // test still exercises the cool-down path this helper exists for: a
@@ -2888,7 +3013,7 @@ async fn ddl_during_forming_queues_and_replays() {
     let tx_for_late = tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        tx_for_late.send(3).unwrap();
+        tx_for_late.send(3).await.unwrap();
     });
 
     // Drop the original tx so the channel becomes Disconnected once
@@ -2919,7 +3044,7 @@ async fn ddl_during_forming_queues_and_replays() {
 /// Sanity test for the empty-channel case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_ddl_queue_returns_zero_for_empty_channel() {
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    let (_tx, rx) = tokio::sync::mpsc::channel::<u32>(1);
     let replayed = drain_ddl_queue(rx, |_| async { Ok(()) }).await;
     assert_eq!(replayed, 0);
 }
@@ -3363,6 +3488,27 @@ async fn resetting_a_stranded_node_keeps_its_cluster_membership() {
         std::fs::read(backup.join("db")).unwrap(),
         b"stranded log bytes",
         "the stranded log is the only evidence of how the node got stranded"
+    );
+}
+
+#[test]
+fn resetting_a_stranded_node_rejects_an_oversized_membership_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let raft_dir = dir.path().join("raft").join("datacenter1");
+    std::fs::create_dir_all(&raft_dir).unwrap();
+    std::fs::write(
+        raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER),
+        vec![b'x'; 4097],
+    )
+    .unwrap();
+    std::fs::write(raft_dir.join("db"), b"must remain untouched").unwrap();
+
+    let error = ModeController::reset_stranded_raft_state(&raft_dir)
+        .expect_err("oversized marker must fail before resetting durable Raft state");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        raft_dir.join("db").exists(),
+        "validation must happen before the destructive reset"
     );
 }
 

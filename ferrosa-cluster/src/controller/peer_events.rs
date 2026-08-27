@@ -1,4 +1,11 @@
-//! PeerEventListener and InboundPeerCallback trait implementations.
+//! Peer connection event admission and deployment-mode planning.
+//!
+//! Responsibility: validate peer identity, maintain the bounded connected-peer
+//! set, and translate transport callbacks into serialized mode transitions.
+//! Correctness: the local host is never admitted as its own peer, so self-loop
+//! transports cannot satisfy pair/trio formation thresholds or enter Raft maps.
+//! Last revised: 2026-08-26.
+//! Last changed: reject inbound and outbound self-connections before mutation.
 
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
@@ -244,6 +251,14 @@ impl ModeController {
 impl PeerEventListener for ModeController {
     fn on_peer_connected(&self, peer: PeerId) {
         let (host_id, addr) = peer;
+        if host_id == self.local_host_id {
+            tracing::error!(
+                peer = %host_id,
+                %addr,
+                "rejecting outbound self-connection from cluster formation"
+            );
+            return;
+        }
         tracing::info!(peer = %host_id, %addr, "peer connected");
 
         // Track this peer
@@ -386,6 +401,14 @@ impl InboundPeerCallback for ModeController {
         internode_broadcast: Option<String>,
     ) {
         let (host_id, addr) = peer_id;
+        if host_id == self.local_host_id {
+            tracing::error!(
+                peer = %host_id,
+                %addr,
+                "rejecting inbound self-connection from cluster formation"
+            );
+            return;
+        }
         let reverse_addr = resolve_inbound_reverse_addr(
             addr,
             self.net_config.bind_addr.port(),
