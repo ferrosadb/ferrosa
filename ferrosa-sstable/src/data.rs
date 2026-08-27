@@ -520,6 +520,31 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }))
     }
 
+    /// Point-read one partition while retaining only clustered rows strictly
+    /// after `start_clustering`, stopping after `row_limit` retained rows.
+    /// Prefix rows are decoded one at a time and immediately discarded; the
+    /// partition tail is not decoded once the requested suffix is full.
+    pub fn read_partition_suffix_rows(
+        &mut self,
+        start_clustering: &[u8],
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
+        debug_assert!(row_limit > 0, "suffix reads require a positive row limit");
+        let file_len = self.reader.len()?;
+        if self.pos >= file_len {
+            return Ok(None);
+        }
+        let (key_bytes, deletion) = self.read_partition_header()?;
+        let key = DecoratedKey::new(PartitionKey::new(key_bytes));
+        let (static_row, rows) = self.read_rows_suffix_limited(start_clustering, row_limit)?;
+        Ok(Some(Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        }))
+    }
+
     /// Best-effort recovery of a single partition at the current position.
     ///
     /// Reads the partition header (key + deletion), then decodes clustered rows
@@ -1027,6 +1052,51 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
         }
 
+        Ok((static_row, rows))
+    }
+
+    fn read_rows_suffix_limited(
+        &mut self,
+        start_clustering: &[u8],
+        row_limit: usize,
+    ) -> Result<(Option<Row>, Vec<Row>)> {
+        let file_len = self.reader.len()?;
+        let mut static_row = None;
+        let mut rows = Vec::new();
+
+        loop {
+            if self.pos >= file_len {
+                if static_row.is_some() || !rows.is_empty() {
+                    return Err(Self::missing_partition_end_error());
+                }
+                break;
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+            if flags & END_OF_PARTITION != 0 || flags & IS_MARKER != 0 {
+                break;
+            }
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row = self.read_row(flags, is_static)?;
+            if is_static {
+                static_row = Some(row);
+            } else if row.clustering.as_slice() > start_clustering {
+                rows.push(row);
+                if rows.len() >= row_limit {
+                    break;
+                }
+            }
+        }
         Ok((static_row, rows))
     }
 

@@ -180,6 +180,7 @@ mod tests {
             MsgType::MutationAck as u8,
             MsgType::ReadRequest as u8,
             MsgType::ReadResponse as u8,
+            MsgType::PartitionSuffixReadRequest as u8,
             MsgType::RepairWrite as u8,
             MsgType::StreamStart as u8,
             MsgType::StreamChunk as u8,

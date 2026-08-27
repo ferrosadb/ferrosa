@@ -1412,7 +1412,10 @@ impl ModeController {
             .register(MsgType::FulltextSearchRequest, fulltext_search_handler);
 
         let read_handler = Arc::new(ReadRequestHandler::new(self.storage.clone()));
-        self.registry.register(MsgType::ReadRequest, read_handler);
+        self.registry
+            .register(MsgType::ReadRequest, read_handler.clone());
+        self.registry
+            .register(MsgType::PartitionSuffixReadRequest, read_handler);
 
         // Register batchlog handlers — without these, logged batch writes
         // sent to remote nodes are silently dropped.

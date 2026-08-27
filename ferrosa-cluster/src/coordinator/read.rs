@@ -52,7 +52,8 @@ use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
     partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
     IndexReadInPartitionRequestPayload, IndexReadRequestPayload, IndexReadResponsePayload,
-    RangeReadRequestPayload, RangeReadResponsePayload, ReadRequestPayload, ReadResponsePayload,
+    PartitionSuffixReadRequestPayload, RangeReadRequestPayload, RangeReadResponsePayload,
+    ReadRequestPayload, ReadResponsePayload,
 };
 use crate::raft::IndexNodeStatus;
 
@@ -272,6 +273,37 @@ enum ReplicaRead {
     Failed,
 }
 
+#[derive(Clone, Default)]
+struct PartitionReadSlice {
+    row_limit: usize,
+    clustering: Option<Vec<u8>>,
+    start_clustering: Option<Vec<u8>>,
+}
+
+impl PartitionReadSlice {
+    fn prefix(row_limit: usize) -> Self {
+        Self {
+            row_limit,
+            ..Self::default()
+        }
+    }
+
+    fn exact(clustering: &[u8]) -> Self {
+        Self {
+            clustering: Some(clustering.to_vec()),
+            ..Self::default()
+        }
+    }
+
+    fn after(start_clustering: &[u8], row_limit: usize) -> Self {
+        Self {
+            row_limit,
+            start_clustering: Some(start_clustering.to_vec()),
+            ..Self::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire helpers
 // ---------------------------------------------------------------------------
@@ -279,6 +311,27 @@ enum ReplicaRead {
 /// Encode a [`ReadRequestPayload`] as a bincode-prefixed [`Bytes`].
 fn encode_read_request(payload: &ReadRequestPayload) -> Bytes {
     Bytes::from(bincode::serialize(payload).unwrap_or_default())
+}
+
+/// Encode a legacy-compatible partition read, selecting the additive suffix
+/// message only when an exclusive clustering lower bound is present.
+fn encode_partition_read_request(
+    payload: ReadRequestPayload,
+    start_clustering: Option<Vec<u8>>,
+) -> Message {
+    match start_clustering {
+        Some(start_clustering) => {
+            let payload = PartitionSuffixReadRequestPayload {
+                version: 1,
+                request: payload,
+                start_clustering,
+            };
+            Message::PartitionSuffixReadRequest(Bytes::from(
+                bincode::serialize(&payload).unwrap_or_default(),
+            ))
+        }
+        None => Message::ReadRequest(encode_read_request(&payload)),
+    }
 }
 
 /// Read a partition from the local storage engine.
@@ -299,12 +352,16 @@ async fn read_local_partition(
     key: DecoratedKey,
     row_limit: usize,
     clustering: Option<Vec<u8>>,
+    start_clustering: Option<Vec<u8>>,
 ) -> ferrosa_common::Result<Option<Partition>> {
     let storage = std::sync::Arc::clone(storage);
     ferrosa_common::task_pool::TaskPool::current("coordinator-local-read")
-        .spawn_blocking(move || match clustering {
-            Some(clustering) => storage.read_clustering_row(&table_id, &key, &clustering),
-            None => storage.read_limited_rows(&table_id, &key, row_limit),
+        .spawn_blocking(move || match (clustering, start_clustering) {
+            (Some(clustering), _) => storage.read_clustering_row(&table_id, &key, &clustering),
+            (None, Some(start)) => {
+                storage.read_limited_rows_from(&table_id, &key, &start, row_limit)
+            }
+            (None, None) => storage.read_limited_rows(&table_id, &key, row_limit),
         })
         .await
         .map_err(|e| {
@@ -325,9 +382,19 @@ async fn digest_read_attempt(
     remote: Option<(uuid::Uuid, String)>,
     row_limit: usize,
     clustering: Option<Vec<u8>>,
+    start_clustering: Option<Vec<u8>>,
 ) -> ReplicaRead {
     if replica_id == local_node_id {
-        match read_local_partition(&storage, table_id, key, row_limit, clustering).await {
+        match read_local_partition(
+            &storage,
+            table_id,
+            key,
+            row_limit,
+            clustering,
+            start_clustering,
+        )
+        .await
+        {
             Ok(Some(p)) => {
                 use crate::raft::handlers::compute_partition_digest;
                 let ts = p
@@ -360,11 +427,11 @@ async fn digest_read_attempt(
             page_state: vec![],
             clustering: clustering.unwrap_or_default(),
         };
-        let body = encode_read_request(&payload);
+        let message = encode_partition_read_request(payload, start_clustering);
         match remote {
             None => ReplicaRead::Failed,
             Some((hid, addr)) => match coordinator
-                .send_remote_with_reconnect(hid, &addr, Message::ReadRequest(body), Lane::Data)
+                .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
                 .await
             {
                 Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -481,6 +548,7 @@ impl ClusterCoordinator {
         host_id: uuid::Uuid,
         row_limit: usize,
         clustering: Option<&[u8]>,
+        start_clustering: Option<&[u8]>,
     ) -> Option<Partition> {
         let addr = {
             let ring = self.ring.load();
@@ -499,9 +567,9 @@ impl ClusterCoordinator {
             page_state: vec![],
             clustering: clustering.unwrap_or_default().to_vec(),
         };
-        let body = encode_read_request(&payload);
+        let message = encode_partition_read_request(payload, start_clustering.map(<[u8]>::to_vec));
         match self
-            .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), Lane::Data)
+            .send_remote_with_reconnect(host_id, &addr, message, Lane::Data)
             .await
         {
             Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
@@ -519,7 +587,7 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         host_id: uuid::Uuid,
     ) -> Option<Partition> {
-        self.full_refetch_limited_rows(table_id, key, host_id, 0, None)
+        self.full_refetch_limited_rows(table_id, key, host_id, 0, None, None)
             .await
     }
 
@@ -552,8 +620,34 @@ impl ClusterCoordinator {
         rf: usize,
         row_limit: usize,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        self.coordinate_read_with_filter(table_id, key, cl, rf, row_limit, None)
-            .await
+        self.coordinate_read_with_filter(
+            table_id,
+            key,
+            cl,
+            rf,
+            PartitionReadSlice::prefix(row_limit),
+        )
+        .await
+    }
+
+    /// Coordinate a bounded partition read strictly after one clustering key.
+    pub async fn coordinate_read_with_limited_rows_from(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        rf: usize,
+        row_limit: usize,
+        start_clustering: &[u8],
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_with_filter(
+            table_id,
+            key,
+            cl,
+            rf,
+            PartitionReadSlice::after(start_clustering, row_limit),
+        )
+        .await
     }
 
     pub async fn coordinate_read_clustering_row(
@@ -564,8 +658,14 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         rf: usize,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        self.coordinate_read_with_filter(table_id, key, cl, rf, 0, Some(clustering.to_vec()))
-            .await
+        self.coordinate_read_with_filter(
+            table_id,
+            key,
+            cl,
+            rf,
+            PartitionReadSlice::exact(clustering),
+        )
+        .await
     }
 
     async fn coordinate_read_with_filter(
@@ -574,18 +674,39 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         rf: usize,
-        row_limit: usize,
-        clustering: Option<Vec<u8>>,
+        slice: PartitionReadSlice,
     ) -> crate::error::Result<Option<Vec<Row>>> {
+        let raw_replicas = {
+            let ring = self.ring.load();
+            ring.replicas(key.token.0, rf)
+        };
+        self.coordinate_read_from_replicas(table_id, key, cl, raw_replicas, cl.block_for(rf), slice)
+            .await
+    }
+
+    /// Coordinate against the exact replica identities selected by the
+    /// replication strategy. NTS/LOCAL callers must not collapse this list to
+    /// a count and then recompute SimpleStrategy replicas.
+    async fn coordinate_read_from_replicas(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        raw_replicas: Vec<u64>,
+        required: usize,
+        slice: PartitionReadSlice,
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        let PartitionReadSlice {
+            row_limit,
+            clustering,
+            start_clustering,
+        } = slice;
         let ring = self.ring.load();
-        let raw_replicas = ring.replicas(key.token.0, rf);
 
         // W8.4: filter the replica list by the CL's role policy.
         // Voter-quorum CLs drop learners; ONE / LOCAL_ONE keep them.
         let replicas =
             crate::coordinator::cl_routing::eligible_replicas_for_cl(cl, &raw_replicas, &ring);
-
-        let required = cl.block_for(rf);
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::debug_span!(
@@ -615,8 +736,12 @@ impl ClusterCoordinator {
                     key,
                     &replicas,
                     &ring,
-                    row_limit,
-                    clustering.as_deref(),
+                    cl,
+                    PartitionReadSlice {
+                        row_limit,
+                        clustering,
+                        start_clustering,
+                    },
                 )
                 .await;
         }
@@ -670,12 +795,20 @@ impl ClusterCoordinator {
                 let table_name = table_id.table.clone();
                 let key_bytes = key.key.as_bytes().to_vec();
                 let clustering = clustering.clone();
+                let start_clustering = start_clustering.clone();
 
                 async move {
                     if full_replica == local_node_id {
                         // Local full read.
-                        match read_local_partition(&storage, table_id, key, row_limit, clustering)
-                            .await
+                        match read_local_partition(
+                            &storage,
+                            table_id,
+                            key,
+                            row_limit,
+                            clustering,
+                            start_clustering,
+                        )
+                        .await
                         {
                             Ok(opt) => ReplicaRead::Full(opt),
                             Err(_) => ReplicaRead::Failed,
@@ -691,17 +824,12 @@ impl ClusterCoordinator {
                             page_state: vec![],
                             clustering: clustering.unwrap_or_default(),
                         };
-                        let body = encode_read_request(&payload);
+                        let message = encode_partition_read_request(payload, start_clustering);
                         match full_remote {
                             None => ReplicaRead::Failed,
                             Some((hid, addr)) => {
                                 match coordinator
-                                    .send_remote_with_reconnect(
-                                        hid,
-                                        &addr,
-                                        Message::ReadRequest(body),
-                                        Lane::Data,
-                                    )
+                                    .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
                                     .await
                                 {
                                     Ok(Message::ReadResponse(b)) => {
@@ -740,6 +868,7 @@ impl ClusterCoordinator {
                         remote,
                         row_limit,
                         clustering.clone(),
+                        start_clustering.clone(),
                     )));
                 }
             }
@@ -788,6 +917,7 @@ impl ClusterCoordinator {
                             remote,
                             row_limit,
                             clustering.clone(),
+                            start_clustering.clone(),
                         )));
                     }
                 }
@@ -859,7 +989,14 @@ impl ClusterCoordinator {
 
             if let Some(hid) = newest_remote_host_id {
                 if let Some(newer_partition) = self
-                    .full_refetch_limited_rows(table_id, key, hid, row_limit, clustering.as_deref())
+                    .full_refetch_limited_rows(
+                        table_id,
+                        key,
+                        hid,
+                        row_limit,
+                        clustering.as_deref(),
+                        start_clustering.as_deref(),
+                    )
                     .await
                 {
                     // The full-read replica (and any other mismatched digests
@@ -1006,9 +1143,12 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
-        row_limit: usize,
-        clustering: Option<&[u8]>,
+        cl: ConsistencyLevel,
+        slice: PartitionReadSlice,
     ) -> crate::error::Result<Option<Vec<Row>>> {
+        let row_limit = slice.row_limit;
+        let clustering = slice.clustering.as_deref();
+        let start_clustering = slice.start_clustering.as_deref();
         // Build an ordered candidate list: local node first, then remaining replicas.
         let mut candidates: Vec<u64> = Vec::with_capacity(replicas.len());
         if replicas.contains(&self.local_node_id) {
@@ -1027,6 +1167,11 @@ impl ClusterCoordinator {
         // repair to refill that range (never blocking the read). `None` until a
         // local read surfaces a typed `CorruptSstable` error.
         let mut corrupt_range: Option<(i64, i64)> = None;
+        // Distinguish a valid "not found" response from exhausting replicas
+        // through transport/protocol/storage failures. The latter must be a
+        // typed error, especially during a rolling upgrade where an old peer
+        // rejects the additive suffix-read message.
+        let mut received_response = false;
 
         for &target in &candidates {
             if target == self.local_node_id {
@@ -1036,13 +1181,17 @@ impl ClusterCoordinator {
                     key.clone(),
                     row_limit,
                     clustering.map(<[u8]>::to_vec),
+                    start_clustering.map(<[u8]>::to_vec),
                 )
                 .await
                 .map(|opt| opt.map(|p| p.rows))
                 .map_err(ClusterError::Storage)
                 {
                     Ok(Some(rows)) if !rows.is_empty() => return Ok(Some(rows)),
-                    Ok(_) => continue, // no data on this replica, try next
+                    Ok(_) => {
+                        received_response = true;
+                        continue; // no data on this replica, try next
+                    }
                     Err(ClusterError::Storage(ref e)) if e.corrupt_sstable_range().is_some() => {
                         // Genuine local SSTable corruption (storage already
                         // quarantined it). Treat it as a failed replica: record
@@ -1094,14 +1243,19 @@ impl ClusterCoordinator {
                     page_state: page_state.clone(),
                     clustering: clustering.unwrap_or_default().to_vec(),
                 };
-                let body = encode_read_request(&payload);
+                let message =
+                    encode_partition_read_request(payload, start_clustering.map(<[u8]>::to_vec));
                 let lane = partition_read_lane(row_limit, clustering);
                 match self
-                    .send_remote_with_reconnect(host_id, &addr, Message::ReadRequest(body), lane)
+                    .send_remote_with_reconnect(host_id, &addr, message, lane)
                     .await
                 {
                     Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
-                        Some(resp) if resp.found => {
+                        Some(resp) => {
+                            received_response = true;
+                            if !resp.found {
+                                break;
+                            }
                             found_partition = true;
                             if let Some(p) = resp.partition.map(partition_from_wire) {
                                 all_rows.extend(p.rows);
@@ -1115,7 +1269,7 @@ impl ClusterCoordinator {
                             }
                             break; // no more pages
                         }
-                        _ => break, // not found or decode failure
+                        None => break,
                     },
                     _ => {
                         tracing::debug!(target, "read_one_replica: remote send failed");
@@ -1147,8 +1301,18 @@ impl ClusterCoordinator {
             ));
         }
 
-        // All replicas exhausted — data genuinely not found.
-        Ok(None)
+        if received_response {
+            // At least one replica explicitly answered that the key/slice was
+            // absent. CL ONE may return that valid response.
+            Ok(None)
+        } else {
+            Err(ClusterError::ReadTimeout {
+                consistency: cl.to_string(),
+                received: 0,
+                required: 1,
+                data_present: false,
+            })
+        }
     }
 
     #[cfg(test)]
@@ -1159,8 +1323,15 @@ impl ClusterCoordinator {
         replicas: &[u64],
         ring: &crate::ring::TokenRing,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        self.read_one_replica_limited_rows(table_id, key, replicas, ring, 0, None)
-            .await
+        self.read_one_replica_limited_rows(
+            table_id,
+            key,
+            replicas,
+            ring,
+            ConsistencyLevel::One,
+            PartitionReadSlice::default(),
+        )
+        .await
     }
 
     /// Coordinate a read using NetworkTopologyStrategy with DC-aware consistency.
@@ -1188,8 +1359,34 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
         row_limit: usize,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        self.coordinate_read_nts_filtered(table_id, key, cl, strategy, row_limit, None)
-            .await
+        self.coordinate_read_nts_filtered(
+            table_id,
+            key,
+            cl,
+            strategy,
+            PartitionReadSlice::prefix(row_limit),
+        )
+        .await
+    }
+
+    /// NTS counterpart of [`Self::coordinate_read_with_limited_rows_from`].
+    pub async fn coordinate_read_nts_limited_rows_from(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        row_limit: usize,
+        start_clustering: &[u8],
+    ) -> crate::error::Result<Option<Vec<Row>>> {
+        self.coordinate_read_nts_filtered(
+            table_id,
+            key,
+            cl,
+            strategy,
+            PartitionReadSlice::after(start_clustering, row_limit),
+        )
+        .await
     }
 
     pub async fn coordinate_read_nts_clustering_row(
@@ -1200,8 +1397,14 @@ impl ClusterCoordinator {
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<Option<Vec<Row>>> {
-        self.coordinate_read_nts_filtered(table_id, key, cl, strategy, 0, Some(clustering.to_vec()))
-            .await
+        self.coordinate_read_nts_filtered(
+            table_id,
+            key,
+            cl,
+            strategy,
+            PartitionReadSlice::exact(clustering),
+        )
+        .await
     }
 
     async fn coordinate_read_nts_filtered(
@@ -1210,9 +1413,13 @@ impl ClusterCoordinator {
         key: &DecoratedKey,
         cl: ConsistencyLevel,
         strategy: &crate::ring::strategy::ReplicationStrategy,
-        row_limit: usize,
-        clustering: Option<Vec<u8>>,
+        slice: PartitionReadSlice,
     ) -> crate::error::Result<Option<Vec<Row>>> {
+        let PartitionReadSlice {
+            row_limit,
+            clustering,
+            start_clustering,
+        } = slice;
         let ring = self.ring.load();
         let all_replicas = ring.replicas_for_strategy(key.token.0, strategy);
 
@@ -1266,15 +1473,19 @@ impl ClusterCoordinator {
             });
         }
 
-        // Delegate to the existing coordinate_read_with logic using
-        // the effective replica set and required count.
-        self.coordinate_read_with_filter(
+        // Preserve the exact NTS/DC-selected replica identities through the
+        // shared digest/read path.
+        self.coordinate_read_from_replicas(
             table_id,
             key,
             cl,
-            effective_replicas.len(),
-            row_limit,
-            clustering,
+            effective_replicas,
+            required,
+            PartitionReadSlice {
+                row_limit,
+                clustering,
+                start_clustering,
+            },
         )
         .await
     }
@@ -2297,9 +2508,12 @@ mod tests {
     #[async_trait::async_trait]
     impl RpcHandler for StaticReadHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-            let Message::ReadRequest(_) = msg else {
+            if !matches!(
+                msg,
+                Message::ReadRequest(_) | Message::PartitionSuffixReadRequest(_)
+            ) {
                 return None;
-            };
+            }
             let payload = ReadResponsePayload {
                 found: true,
                 partition: Some(crate::raft::handlers::partition_to_wire(
@@ -2425,10 +2639,18 @@ mod tests {
     #[async_trait::async_trait]
     impl RpcHandler for StaticDigestReadHandler {
         async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-            let Message::ReadRequest(body) = msg else {
-                return None;
+            let digest_only = match msg {
+                Message::ReadRequest(body) => {
+                    let req: ReadRequestPayload = bincode::deserialize(&body).ok()?;
+                    req.digest_only
+                }
+                Message::PartitionSuffixReadRequest(body) => {
+                    let req: PartitionSuffixReadRequestPayload =
+                        bincode::deserialize(&body).ok()?;
+                    req.request.digest_only
+                }
+                _ => return None,
             };
-            let req: ReadRequestPayload = bincode::deserialize(&body).ok()?;
             let digest = crate::raft::handlers::compute_partition_digest(&self.partition).ok();
             let timestamp = self
                 .partition
@@ -2439,7 +2661,7 @@ mod tests {
                 .unwrap_or(i64::MIN);
             let payload = ReadResponsePayload {
                 found: true,
-                partition: if req.digest_only {
+                partition: if digest_only {
                     None
                 } else {
                     Some(crate::raft::handlers::partition_to_wire(
@@ -2756,9 +2978,10 @@ mod tests {
 
         let (worker_thread, result_rows) = rt.block_on(async move {
             let worker = std::thread::current().id();
-            let result = read_local_partition(&storage, table_id.clone(), key.clone(), 0, None)
-                .await
-                .unwrap();
+            let result =
+                read_local_partition(&storage, table_id.clone(), key.clone(), 0, None, None)
+                    .await
+                    .unwrap();
             (worker, result.map(|p| p.rows.len()).unwrap_or(0))
         });
 
@@ -4222,9 +4445,11 @@ mod tests {
 
     #[tokio::test]
     async fn coordinate_read_nts_local_quorum_reads_from_local_dc() {
-        // Setup: dc1 has local node with data, dc2 has unreachable node.
+        // Setup: the first SimpleStrategy replica is an unreachable dc2 node,
+        // while NTS selects the local dc1 node that owns the data.
         // CL=LOCAL_QUORUM with dc1_rf=1 => block_for_dc(1) = 1.
-        // Local node has data => should succeed.
+        // Losing the selected node IDs and recomputing by replica count would
+        // contact dc2 and fail this read.
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -4232,10 +4457,14 @@ mod tests {
         let local_node_id = 1u64;
         let mut local_info = make_node("10.0.0.1:7000");
         local_info.data_center = "dc1".to_string();
+        let mut remote_dc2 = make_node("127.0.0.1:1");
+        remote_dc2.data_center = "dc2".to_string();
 
         let mut ring = TokenRing::new();
         ring.add_node(local_node_id, local_info);
-        ring.assign_tokens(local_node_id, &[0, 100, 200]);
+        ring.add_node(2, remote_dc2);
+        ring.assign_tokens(2, &[42]);
+        ring.assign_tokens(local_node_id, &[100]);
 
         let coordinator = ClusterCoordinator::new(
             Arc::new(ArcSwap::from_pointee(ring)),
@@ -4256,7 +4485,10 @@ mod tests {
         let row = test_row(1000);
         storage.write(&table_id, &key, row, 1000).unwrap();
 
-        let dc_rf = std::collections::HashMap::from([("dc1".to_string(), 1usize)]);
+        let dc_rf = std::collections::HashMap::from([
+            ("dc1".to_string(), 1usize),
+            ("dc2".to_string(), 1usize),
+        ]);
         let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology { dc_rf };
 
         let result = coordinator
@@ -4265,6 +4497,151 @@ mod tests {
             .unwrap();
 
         assert!(result.is_some(), "should read back written data");
+
+        for clustering in [vec![1], vec![2], vec![3]] {
+            let mut row = test_row(2000 + i64::from(clustering[0]));
+            row.clustering = clustering;
+            storage.write(&table_id, &key, row, 2000).unwrap();
+        }
+        let suffix = coordinator
+            .coordinate_read_nts_limited_rows_from(
+                &table_id,
+                &key,
+                ConsistencyLevel::LocalQuorum,
+                &strategy,
+                1,
+                &[1],
+            )
+            .await
+            .unwrap()
+            .expect("local-DC suffix read returns data");
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].clustering, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn partition_suffix_read_fails_when_no_replica_accepts_the_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let mut remote = make_node("127.0.0.1:1");
+        remote.data_center = "dc1".to_string();
+        let mut ring = TokenRing::new();
+        ring.add_node(2, remote);
+        ring.assign_tokens(2, &[key.token.0]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            1,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+        let result = coordinator
+            .coordinate_read_with_limited_rows_from(
+                &TableId::new("test_ks", "test_tbl"),
+                &key,
+                ConsistencyLevel::One,
+                1,
+                3,
+                &[1],
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ClusterError::ReadTimeout { received: 0, .. })),
+            "an unsupported suffix operation must fail loudly, not masquerade as an empty key: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_suffix_read_preserves_valid_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let local_node_id = 1;
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, make_node("127.0.0.1:7000"));
+        ring.assign_tokens(local_node_id, &[key.token.0]);
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage,
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let result = coordinator
+            .coordinate_read_with_limited_rows_from(
+                &TableId::new("test_ks", "test_tbl"),
+                &key,
+                ConsistencyLevel::One,
+                1,
+                3,
+                &[1],
+            )
+            .await
+            .expect("a valid local not-found response is not a transport failure");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_one_suffix_failure_preserves_consistency_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let key = test_key();
+        let local_node_id = 1;
+        let mut local = make_node("127.0.0.1:7000");
+        local.data_center = "dc1".to_string();
+        let mut rejected_remote = make_node("127.0.0.1:1");
+        rejected_remote.data_center = "dc1".to_string();
+        let mut ring = TokenRing::new();
+        ring.add_node(local_node_id, local);
+        ring.add_node(2, rejected_remote);
+        ring.assign_tokens(2, &[key.token.0]);
+        ring.assign_tokens(local_node_id, &[100]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            local_node_id,
+            storage,
+            1,
+            ConsistencyLevel::LocalOne,
+        );
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+            dc_rf: std::collections::HashMap::from([("dc1".to_string(), 1)]),
+        };
+        let result = coordinator
+            .coordinate_read_nts_limited_rows_from(
+                &TableId::new("test_ks", "test_tbl"),
+                &key,
+                ConsistencyLevel::LocalOne,
+                &strategy,
+                3,
+                &[1],
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClusterError::ReadTimeout {
+                    ref consistency,
+                    received: 0,
+                    ..
+                }) if consistency == "LOCAL_ONE"
+            ),
+            "LOCAL_ONE failure must retain its consistency metadata: {result:?}"
+        );
     }
 
     #[tokio::test]

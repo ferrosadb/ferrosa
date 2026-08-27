@@ -151,6 +151,10 @@ pub enum Message {
     MutationAck(Bytes),
     ReadRequest(Bytes),
     ReadResponse(Bytes),
+    /// Additive request type for an exclusive clustering-key suffix read.
+    /// Older peers reject the unknown message type and cannot accidentally
+    /// reinterpret it as a legacy prefix read.
+    PartitionSuffixReadRequest(Bytes),
     RepairWrite(Bytes),
     RangeReadRequest(Bytes),
     RangeReadResponse(Bytes),
@@ -350,6 +354,7 @@ impl Message {
             Self::MutationAck(_) => MsgType::MutationAck,
             Self::ReadRequest(_) => MsgType::ReadRequest,
             Self::ReadResponse(_) => MsgType::ReadResponse,
+            Self::PartitionSuffixReadRequest(_) => MsgType::PartitionSuffixReadRequest,
             Self::RepairWrite(_) => MsgType::RepairWrite,
             Self::RangeReadRequest(_) => MsgType::RangeReadRequest,
             Self::RangeReadResponse(_) => MsgType::RangeReadResponse,
@@ -514,6 +519,7 @@ impl Message {
             | Self::MutationAck(b)
             | Self::ReadRequest(b)
             | Self::ReadResponse(b)
+            | Self::PartitionSuffixReadRequest(b)
             | Self::RepairWrite(b)
             | Self::RangeReadRequest(b)
             | Self::RangeReadResponse(b)
@@ -715,6 +721,9 @@ impl Message {
             MsgType::MutationAck => Self::MutationAck(body.split_to(body.remaining())),
             MsgType::ReadRequest => Self::ReadRequest(body.split_to(body.remaining())),
             MsgType::ReadResponse => Self::ReadResponse(body.split_to(body.remaining())),
+            MsgType::PartitionSuffixReadRequest => {
+                Self::PartitionSuffixReadRequest(body.split_to(body.remaining()))
+            }
             MsgType::RepairWrite => Self::RepairWrite(body.split_to(body.remaining())),
             MsgType::RangeReadRequest => Self::RangeReadRequest(body.split_to(body.remaining())),
             MsgType::RangeReadResponse => Self::RangeReadResponse(body.split_to(body.remaining())),
@@ -1048,6 +1057,37 @@ mod tests {
         assert!(matches!(decoded[1], Message::PairDdlForward(_)));
         assert!(matches!(decoded[2], Message::MutationForward(_)));
         assert!(matches!(decoded[3], Message::ReadRequest(_)));
+    }
+
+    #[test]
+    fn partition_suffix_read_uses_additive_message_type() {
+        let payload = Bytes::from_static(b"suffix-v1");
+        let message = Message::PartitionSuffixReadRequest(payload.clone());
+        assert_eq!(message.msg_type(), MsgType::PartitionSuffixReadRequest);
+        assert_eq!(MsgType::PartitionSuffixReadRequest as u8, 0x2F);
+
+        let mut body = BytesMut::new();
+        message.encode(&mut body).unwrap();
+        let decoded =
+            Message::decode(MsgType::PartitionSuffixReadRequest, &mut body.freeze()).unwrap();
+        assert_eq!(decoded, Message::PartitionSuffixReadRequest(payload));
+
+        // 0x2F was not part of the legacy message set. A rolling old peer
+        // rejects the operation at the frame boundary instead of handing its
+        // payload to the legacy prefix-read handler.
+        let legacy_knows = matches!(
+            MsgType::PartitionSuffixReadRequest as u8,
+            0x01..=0x06
+                | 0x10..=0x14
+                | 0x20..=0x2E
+                | 0x30..=0x3F
+                | 0x40..=0x49
+                | 0x50..=0x52
+                | 0x60..=0x67
+                | 0x70..=0x7C
+                | 0x80..=0x83
+        );
+        assert!(!legacy_knows);
     }
 
     #[test]

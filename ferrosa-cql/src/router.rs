@@ -8,10 +8,11 @@
 //! - **M8**: Every `route_*` function checks permissions via `Schema::check_permission`.
 //! - **M12**: Batch size is capped at `MAX_BATCH_STATEMENTS` (500).
 //!
-//! Correctness: compound clustering restrictions validate declared key order
-//! and compare row values lexicographically, including tied leading values.
-//! Last revised: 2026-08-24.
-//! Last changed: executed compound clustering tuple slices (t_4d8925f4).
+//! Correctness: compound clustering restrictions validate declared key order,
+//! and bounded single-column clustering resumes stop before materializing a
+//! wide partition tail.
+//! Last revised: 2026-08-27.
+//! Last changed: stream full-PK `ck > value LIMIT n` reads from the clustering bound.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -519,6 +520,226 @@ fn safe_partition_key_filter_row_limit(
             !wc.token_fn && wc.op == ComparisonOp::Eq && partition_keys.contains(wc.column.as_str())
         })
         .then_some(limit)
+}
+
+/// Return the exclusive clustering resume and row bound for the streaming
+/// single-partition slice shape used by cursor/event-log consumers.
+///
+/// This intentionally accepts only one ascending clustering column, exact
+/// partition-key equality, and one `ck > value` predicate. Broader predicates
+/// continue through the general post-filter path because stopping after LIMIT
+/// source rows could underfill the result. Keeping this recognition narrow is
+/// the safety proof that lets storage stop without materializing the partition.
+fn bounded_partition_clustering_resume(
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+    ks: &str,
+    schema: &Schema,
+) -> Result<Option<(Vec<u8>, usize)>, CqlError> {
+    let table_has_static_columns = table_meta
+        .columns
+        .values()
+        .any(|column| column.kind == ColumnKind::Static);
+    let row_preserving_projection = s.columns.iter().all(|column| match column {
+        SelectColumn::Star => !table_has_static_columns,
+        SelectColumn::Column(name) => table_meta
+            .columns
+            .get(name)
+            .is_some_and(|column| column.kind != ColumnKind::Static),
+        SelectColumn::FunctionCall { .. } => false,
+    });
+    if !row_preserving_projection
+        || s.distinct
+        || s.ann_of.is_some()
+        || s.geo_nearest.is_some()
+        || !s.geo_predicates.is_empty()
+        || !s.order_by.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(limit) = s.limit.as_ref().and_then(Limit::as_literal) else {
+        return Ok(None);
+    };
+    if limit <= 0 || table_meta.clustering_key.len() != 1 {
+        return Ok(None);
+    }
+    let (clustering_name, clustering_order) = &table_meta.clustering_key[0];
+    if *clustering_order != SchemaClusteringOrder::Asc {
+        return Ok(None);
+    }
+
+    let mut clustering_clause = None;
+    for clause in &s.where_clauses {
+        if clause.token_fn {
+            return Ok(None);
+        }
+        if table_meta
+            .partition_key
+            .iter()
+            .any(|name| name == &clause.column)
+        {
+            if clause.op != ComparisonOp::Eq {
+                return Ok(None);
+            }
+        } else if clause.column == *clustering_name && clause.op == ComparisonOp::Gt {
+            if clustering_clause.replace(clause).is_some() {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    let Some(clause) = clustering_clause else {
+        return Ok(None);
+    };
+
+    let column = &table_meta.columns[clustering_name];
+    let cql_type = resolve_col_type(&column.column_type, ks, schema)?;
+    let value = bridge::term_to_cql_value(&clause.value, &cql_type)?;
+    Ok(Some((
+        bridge::build_clustering_key(&[value]),
+        limit as usize,
+    )))
+}
+
+const BOUNDED_PARTITION_CURSOR_MAGIC: &[u8; 4] = b"BPC1";
+
+fn decode_bounded_partition_cursor(
+    bytes: &[u8],
+    expected_partition_key: &[u8],
+    expected_limit: usize,
+) -> Result<(usize, Vec<u8>), CqlError> {
+    let state = crate::paging::PagingState::decode(bytes)?;
+    if !state.remaining_in_partition || state.partition_key != expected_partition_key {
+        return Err(CqlError::Protocol(
+            "paging_state does not belong to this bounded partition query".into(),
+        ));
+    }
+    let payload = state.clustering_key;
+    if payload.len() < 20 || &payload[..4] != BOUNDED_PARTITION_CURSOR_MAGIC {
+        return Err(CqlError::Protocol(
+            "paging_state is not a bounded partition cursor".into(),
+        ));
+    }
+    let encoded_limit = u64::from_be_bytes(payload[4..12].try_into().unwrap());
+    if encoded_limit != expected_limit as u64 {
+        return Err(CqlError::Protocol(
+            "paging_state LIMIT does not match the current query".into(),
+        ));
+    }
+    let returned_u64 = u64::from_be_bytes(payload[12..20].try_into().unwrap());
+    let returned = usize::try_from(returned_u64)
+        .map_err(|_| CqlError::Protocol("paging_state row count is out of range".into()))?;
+    if returned >= expected_limit || payload.len() == 20 {
+        return Err(CqlError::Protocol(
+            "paging_state has an invalid bounded partition position".into(),
+        ));
+    }
+    Ok((returned, payload[20..].to_vec()))
+}
+
+fn encode_bounded_partition_cursor(
+    partition_key: &[u8],
+    clustering_key: &[u8],
+    query_limit: usize,
+    returned: usize,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20 + clustering_key.len());
+    payload.extend_from_slice(BOUNDED_PARTITION_CURSOR_MAGIC);
+    payload.extend_from_slice(&(query_limit as u64).to_be_bytes());
+    payload.extend_from_slice(&(returned as u64).to_be_bytes());
+    payload.extend_from_slice(clustering_key);
+    crate::paging::PagingState {
+        partition_key: partition_key.to_vec(),
+        clustering_key: payload,
+        remaining_in_partition: true,
+    }
+    .encode()
+}
+
+struct BoundedPartitionReadContext<'a> {
+    write_path: &'a WritePath,
+    table_id: &'a TableId,
+    key: &'a ferrosa_common::key::DecoratedKey,
+    paging: &'a crate::paging::PagingParams,
+    consistency: ConsistencyLevel,
+    strategy: &'a ferrosa_cluster::ring::strategy::ReplicationStrategy,
+}
+
+/// Read one page from a single partition using its token replica set and an
+/// exclusive clustering cursor. The replica returns at most the page target plus
+/// one lookahead row; that extra row is discarded after proving continuation.
+async fn read_bounded_partition_clustering_suffix(
+    context: BoundedPartitionReadContext<'_>,
+    where_start_exclusive: Vec<u8>,
+    query_limit: usize,
+) -> Result<(Option<ferrosa_sstable::types::Partition>, Option<Vec<u8>>), CqlError> {
+    let (already_returned, start_exclusive) = match context.paging.paging_state.as_deref() {
+        Some(bytes) => {
+            decode_bounded_partition_cursor(bytes, context.key.key.as_bytes(), query_limit)?
+        }
+        None => (0, where_start_exclusive),
+    };
+    let remaining = query_limit.saturating_sub(already_returned);
+    if remaining == 0 {
+        return Ok((None, None));
+    }
+    let page_target = context
+        .paging
+        .page_size
+        .filter(|size| *size > 0)
+        .map_or(remaining, |size| remaining.min(size as usize));
+    let probe_limit = page_target.saturating_add(usize::from(page_target < remaining));
+    let mut partition = context
+        .write_path
+        .pk_read_limited_rows_from(
+            context.table_id,
+            context.key,
+            &start_exclusive,
+            context.consistency,
+            context.strategy,
+            probe_limit,
+        )
+        .await?;
+
+    #[cfg(test)]
+    BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|count| {
+        count.set(
+            partition
+                .as_ref()
+                .map_or(0, |partition| partition.rows.len()),
+        );
+    });
+
+    let has_more = partition
+        .as_ref()
+        .is_some_and(|partition| partition.rows.len() > page_target);
+    if let Some(partition) = &mut partition {
+        partition.rows.truncate(page_target);
+    }
+    let delivered = partition
+        .as_ref()
+        .map_or(0, |partition| partition.rows.len());
+    let returned = already_returned.saturating_add(delivered);
+    let next = if has_more && returned < query_limit {
+        let last_clustering = partition
+            .as_ref()
+            .and_then(|partition| partition.rows.last())
+            .map(|row| row.clustering.as_slice())
+            .ok_or_else(|| {
+                CqlError::ServerError("bounded partition page lost its cursor row".into())
+            })?;
+        Some(encode_bounded_partition_cursor(
+            context.key.key.as_bytes(),
+            last_clustering,
+            query_limit,
+            returned,
+        ))
+    } else {
+        None
+    };
+
+    Ok((partition, next))
 }
 
 /// Resolve the keyed secondary-index consult for a full-partition-key SELECT
@@ -3960,17 +4181,26 @@ fn prepared_select_limit(
     bound_terms: &[Term],
     bind_idx: &mut usize,
 ) -> Option<Result<Option<i32>, CqlError>> {
+    let validate = |value: i32| {
+        if value > 0 {
+            Ok(Some(value))
+        } else {
+            Err(CqlError::Invalid(format!(
+                "prepared SELECT LIMIT must be positive, got {value}"
+            )))
+        }
+    };
     match limit {
         None => Some(Ok(None)),
-        Some(Limit::Literal(n)) => Some(Ok(Some(*n))),
+        Some(Limit::Literal(n)) => Some(validate(*n)),
         Some(Limit::BindMarker | Limit::NamedBindMarker(_)) => {
             let term = bound_terms.get(*bind_idx)?;
             *bind_idx += 1;
             match term {
                 Term::IntegerLiteral(n) => Some(
                     i32::try_from(*n)
-                        .map(Some)
-                        .map_err(|_| CqlError::Invalid(format!("LIMIT value {n} out of range"))),
+                        .map_err(|_| CqlError::Invalid(format!("LIMIT value {n} out of range")))
+                        .and_then(validate),
                 ),
                 other => Some(Err(CqlError::Invalid(format!(
                     "LIMIT bind marker must be an integer, got {other:?}"
@@ -4534,6 +4764,10 @@ thread_local! {
     /// wall-clock. `#[tokio::test]` uses a current-thread runtime, so the
     /// increments land on the test thread.
     static PK_LOOKUP_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Rows retained by the bounded partition suffix read before its one-row
+    /// continuation probe is discarded.
+    static BOUNDED_PARTITION_ROWS_MATERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 async fn route_select_user_table(
@@ -4946,6 +5180,8 @@ async fn route_select_user_table(
         let decorated_key = bridge::build_decorated_key(&pk_values, &pk_types)?;
         let row_limit =
             safe_partition_key_filter_row_limit(s, table_meta, count_only_select).unwrap_or(0);
+        let bounded_clustering_resume =
+            bounded_partition_clustering_resume(s, table_meta, ks, &state.schema)?;
         let exact_clustering = if clustering_key_equality_has_phonetic_index(
             &s.where_clauses,
             table_meta,
@@ -4972,6 +5208,23 @@ async fn route_select_user_table(
                 .await?
                 .into_iter()
                 .collect()
+        } else if let Some((start_exclusive, query_limit)) = bounded_clustering_resume {
+            let write_path = state.write_path.load();
+            let (partition, next_paging_state) = read_bounded_partition_clustering_suffix(
+                BoundedPartitionReadContext {
+                    write_path: &write_path,
+                    table_id: &table_id,
+                    key: &decorated_key,
+                    paging: &ctx.paging,
+                    consistency: ctx.consistency,
+                    strategy: &read_strategy,
+                },
+                start_exclusive,
+                query_limit,
+            )
+            .await?;
+            streamed_paging_state = Some(next_paging_state);
+            partition.into_iter().collect()
         } else if let Some((index_name, index_key)) =
             keyed_index_consult(state, &snap, ks, s, table_meta)
         {
@@ -14258,6 +14511,213 @@ mod tests {
         assert_eq!(state.query_tracker.total_executed(), executed_before + 1);
     }
 
+    #[tokio::test]
+    async fn prepared_select_bound_limit_storage_scan_is_bounded_after_clustering_cursor() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        for cql in [
+            "CREATE KEYSPACE cursor_bound WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            "CREATE TABLE cursor_bound.events (tenant text, cursor bigint, payload text, PRIMARY KEY (tenant, cursor))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        for cursor in 1..=100 {
+            let insert = format!(
+                "INSERT INTO cursor_bound.events (tenant, cursor, payload) \
+                 VALUES ('tenant-a', {cursor}, 'event-{cursor}')"
+            );
+            route(&state, &ctx, crate::parser::parse(&insert).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let base_select = match crate::parser::parse(
+            "SELECT cursor, payload FROM cursor_bound.events \
+             WHERE tenant = 'tenant-a' AND cursor > 0 LIMIT 2",
+        )
+        .unwrap()
+        {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let snapshot = state.schema.snapshot();
+        let table_meta = snapshot
+            .tables
+            .get(&("cursor_bound".to_string(), "events".to_string()))
+            .unwrap();
+        let mut distinct = base_select.clone();
+        distinct.distinct = true;
+        assert!(
+            bounded_partition_clustering_resume(
+                &distinct,
+                table_meta,
+                "cursor_bound",
+                &state.schema,
+            )
+            .unwrap()
+            .is_none(),
+            "DISTINCT is not row-preserving and must bypass source LIMIT pushdown"
+        );
+        let mut ann = base_select.clone();
+        ann.ann_of = Some(("payload".into(), Term::IntegerLiteral(1)));
+        assert!(
+            bounded_partition_clustering_resume(&ann, table_meta, "cursor_bound", &state.schema,)
+                .unwrap()
+                .is_none(),
+            "ANN ordering must see the complete candidate set"
+        );
+        let mut function = base_select.clone();
+        function.columns = vec![SelectColumn::FunctionCall {
+            keyspace: None,
+            name: "sum".into(),
+            args: Vec::new(),
+            alias: None,
+        }];
+        assert!(
+            bounded_partition_clustering_resume(
+                &function,
+                table_meta,
+                "cursor_bound",
+                &state.schema,
+            )
+            .unwrap()
+            .is_none(),
+            "aggregate and scalar function projections must bypass source LIMIT pushdown"
+        );
+        BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|visited| visited.set(0));
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "SELECT cursor, payload FROM cursor_bound.events \
+                 WHERE tenant = 'tenant-a' AND cursor > 90 LIMIT 2",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let RouteResult::Result(body) = result else {
+            panic!("expected rows result");
+        };
+        assert_eq!(extract_row_count(&body), 2);
+        let visited = BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|count| count.get());
+        assert_eq!(
+            visited, 2,
+            "the cursor suffix reader must materialize only LIMIT rows, not the 100-row partition"
+        );
+
+        BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|visited| visited.set(0));
+        let page_ctx = paging_ctx(&auth, &current_keyspace, Some(2), None);
+        let page_select = match crate::parser::parse(
+            "SELECT cursor, payload FROM cursor_bound.events \
+             WHERE tenant = 'tenant-a' AND cursor > 0 LIMIT 50",
+        )
+        .unwrap()
+        {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let first_page = route_select_raw(&state, &page_ctx, &page_select)
+            .await
+            .unwrap();
+        assert_eq!(first_page.rows.len(), 2);
+        assert!(first_page.paging_state.is_some());
+        let first_page_visited = BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|count| count.get());
+        assert_eq!(
+            first_page_visited, 3,
+            "page size 2 needs exactly two output rows plus one continuation lookahead, \
+             not all 50 rows allowed by LIMIT"
+        );
+
+        let mut wrong_partition =
+            crate::paging::PagingState::decode(first_page.paging_state.as_deref().unwrap())
+                .unwrap();
+        wrong_partition.partition_key.push(0xff);
+        let wrong_partition_ctx = paging_ctx(
+            &auth,
+            &current_keyspace,
+            Some(2),
+            Some(wrong_partition.encode()),
+        );
+        assert!(matches!(
+            route_select_raw(&state, &wrong_partition_ctx, &page_select).await,
+            Err(CqlError::Protocol(message))
+                if message.contains("does not belong to this bounded partition query")
+        ));
+
+        let wrong_limit_select = match crate::parser::parse(
+            "SELECT cursor, payload FROM cursor_bound.events \
+             WHERE tenant = 'tenant-a' AND cursor > 0 LIMIT 49",
+        )
+        .unwrap()
+        {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let wrong_limit_ctx = paging_ctx(
+            &auth,
+            &current_keyspace,
+            Some(2),
+            first_page.paging_state.clone(),
+        );
+        assert!(matches!(
+            route_select_raw(&state, &wrong_limit_ctx, &wrong_limit_select).await,
+            Err(CqlError::Protocol(message))
+                if message.contains("LIMIT does not match")
+        ));
+
+        let total_limit_select = match crate::parser::parse(
+            "SELECT cursor, payload FROM cursor_bound.events \
+             WHERE tenant = 'tenant-a' AND cursor > 90 LIMIT 5",
+        )
+        .unwrap()
+        {
+            Statement::Select(select) => select,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let mut pages = Vec::new();
+        let mut paging_state = None;
+        for page_number in 0..4 {
+            BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|visited| visited.set(0));
+            let page_ctx = paging_ctx(&auth, &current_keyspace, Some(2), paging_state);
+            let page = route_select_raw(&state, &page_ctx, &total_limit_select)
+                .await
+                .unwrap();
+            let visited = BOUNDED_PARTITION_ROWS_MATERIALIZED.with(|count| count.get());
+            assert!(
+                visited <= 3,
+                "page {page_number} materialized {visited} rows; every page must stay bounded by \
+                 page_size plus one lookahead, independent of paging progress"
+            );
+            paging_state = page.paging_state;
+            if !page.rows.is_empty() {
+                pages.push(page.rows);
+            }
+            if paging_state.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            pages.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 2, 1],
+            "LIMIT is a total query bound, not a fresh allowance per page"
+        );
+        let cursors: Vec<i64> = pages
+            .iter()
+            .flatten()
+            .map(|row| match &row[0] {
+                Some(CqlValue::Bigint(value)) => *value,
+                other => panic!("expected bigint cursor, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(cursors, vec![91, 92, 93, 94, 95]);
+    }
+
     #[test]
     fn keyspace_rf_returns_1_when_keyspace_not_found() {
         let (state, _dir) = setup();
@@ -19246,7 +19706,8 @@ mod tests {
             .prepared_cache
             .get(&prepared_id)
             .expect("prepared plan must survive cache insertion");
-        let prepared_statement = crate::connection::substitute_bound_terms(&cached_plan, None);
+        let prepared_statement = crate::connection::substitute_bound_terms(&cached_plan, None)
+            .expect("DISTINCT plan has no unresolved LIMIT marker");
         assert!(matches!(
             route(&state, &ctx, prepared_statement).await.unwrap(),
             RouteResult::Result(_)

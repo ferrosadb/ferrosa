@@ -1220,6 +1220,12 @@ async fn raft_init_registers_handlers() {
         controller.registry.has_handler(MsgType::ReadRequest),
         "ReadRequest handler should be registered"
     );
+    assert!(
+        controller
+            .registry
+            .has_handler(MsgType::PartitionSuffixReadRequest),
+        "PartitionSuffixReadRequest handler should be registered"
+    );
 }
 
 #[test]

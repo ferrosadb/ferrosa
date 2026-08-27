@@ -2481,6 +2481,76 @@ async fn prepare_select_with_where_and_limit_bind_markers_reports_col_count_two(
     );
 }
 
+/// Regression for ferrosa-memory PR #245: a clustering-range SELECT declines
+/// the exact-partition prepared fast path, so the generic EXECUTE path must
+/// still substitute and enforce `LIMIT ?` before routing the storage read.
+#[tokio::test]
+async fn prepared_select_bound_limit_constrains_clustering_range() {
+    let (state, _dir) = setup_state();
+    let server = ferrosa_cql::server::CqlServer::new(test_config(true), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_auth_disabled(addr).await;
+
+    let body = encode_query_body(
+        "CREATE KEYSPACE mobile_control WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    let body = encode_query_body(
+        "CREATE TABLE mobile_control.mobile_control_events (\
+         tenant_id text, server_fingerprint text, cursor_bucket int, cursor bigint, \
+         event_id uuid, command_id uuid, event_type text, payload blob, created_at timestamp, \
+         PRIMARY KEY ((tenant_id, server_fingerprint, cursor_bucket), cursor))",
+    );
+    send_raw_frame(&mut stream, Opcode::Query, &body).await;
+    assert_result(&read_frame(&mut stream).await);
+
+    for cursor in 1..=5 {
+        let body = encode_query_body(&format!(
+            "INSERT INTO mobile_control.mobile_control_events \
+             (tenant_id, server_fingerprint, cursor_bucket, cursor, event_id) \
+             VALUES ('tenant-a', 'server-a', 7, {cursor}, \
+             00000000-0000-0000-0000-{cursor:012})"
+        ));
+        send_raw_frame(&mut stream, Opcode::Query, &body).await;
+        assert_result(&read_frame(&mut stream).await);
+    }
+
+    let query = "SELECT cursor, event_id, command_id, event_type, payload, created_at \
+                 FROM mobile_control.mobile_control_events \
+                 WHERE tenant_id = ? AND server_fingerprint = ? AND cursor_bucket = ? \
+                 AND cursor > ? LIMIT ?";
+    let prep_body = encode_prepare_body(query);
+    send_raw_frame(&mut stream, Opcode::Prepare, &prep_body).await;
+    let prepared = read_frame(&mut stream).await;
+    assert_result(&prepared);
+    assert_eq!(
+        extract_bind_col_count_from_prepared_response(&prepared.body),
+        5,
+        "the four WHERE markers and synthetic [limit] marker must all be declared"
+    );
+
+    let mut prepared_id = [0u8; 16];
+    prepared_id.copy_from_slice(&prepared.body[6..22]);
+    let bucket = 7i32.to_be_bytes();
+    let after_cursor = 0i64.to_be_bytes();
+    let limit = 2i32.to_be_bytes();
+    let exec_body = encode_execute_body_with_values(
+        &prepared_id,
+        &[b"tenant-a", b"server-a", &bucket, &after_cursor, &limit],
+    );
+    send_raw_frame(&mut stream, Opcode::Execute, &exec_body).await;
+    let response = read_frame(&mut stream).await;
+    assert_result(&response);
+    assert_eq!(
+        extract_row_count_from_result(&response.body),
+        2,
+        "LIMIT ? must constrain the generic prepared range read, not return the full partition"
+    );
+}
+
 /// FRSA-BUG-025 regression: SELECT with WHERE bind markers plus `ANN OF ?`
 /// must report all bind marker columns in PREPARE metadata. The ANN query
 /// vector is bound against the vector column (`fold_embedding`) and strict

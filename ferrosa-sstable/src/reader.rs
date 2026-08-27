@@ -432,6 +432,35 @@ impl<R: ReadAt> SSTableReader<R> {
         }
     }
 
+    /// Point-read a bounded clustering suffix without retaining the prefix or
+    /// decoding the tail after the requested rows are found.
+    pub fn get_partition_limited_rows_from(
+        &self,
+        key: &DecoratedKey,
+        start_clustering: &[u8],
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
+        let (h1, h2) = key.filter_hash();
+        if !self.bloom_filter.is_present(h1, h2) {
+            return Ok(None);
+        }
+        let data_position = match self.partition_index.lookup(key)? {
+            PartitionLookup::RowIndex { position } => {
+                RowIndex::read_entry(&self.rows, position)?.data_position
+            }
+            PartitionLookup::DataDirect { position } => position,
+            PartitionLookup::NotFound => return Ok(None),
+        };
+        if let Some(ref ci) = self.compression_info {
+            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
+            DataReader::new(&chunked, &self.header, data_position)
+                .read_partition_suffix_rows(start_clustering, row_limit)
+        } else {
+            DataReader::new(&self.data, &self.header, data_position)
+                .read_partition_suffix_rows(start_clustering, row_limit)
+        }
+    }
+
     /// Return whether a point read should probe this SSTable for `key`.
     ///
     /// Bloom filters reject definitely-absent keys. New Ferrosa SSTables also
@@ -1684,6 +1713,33 @@ mod tests {
         assert_eq!(partition.rows.len(), 2);
         assert_eq!(partition.rows[0].clustering, 1_i32.to_be_bytes());
         assert_eq!(partition.rows[1].clustering, 2_i32.to_be_bytes());
+    }
+
+    #[test]
+    fn get_partition_limited_rows_from_returns_exclusive_bounded_suffix() {
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"wide".as_slice()));
+        let components = SSTableComponents {
+            data: build_data_blob_with_rows(b"wide", 10),
+            partitions: build_partition_index(&[(&dk, 0)]),
+            rows: Vec::new(),
+            filter: build_bloom_filter(&[&dk]),
+            compression_info: None,
+            statistics: build_statistics(header),
+        };
+        let partition = SSTableReader::open(components)
+            .unwrap()
+            .get_partition_limited_rows_from(&dk, &5_i32.to_be_bytes(), 2)
+            .unwrap()
+            .expect("wide partition should exist");
+        assert_eq!(
+            partition
+                .rows
+                .iter()
+                .map(|row| row.clustering.clone())
+                .collect::<Vec<_>>(),
+            vec![6_i32.to_be_bytes().to_vec(), 7_i32.to_be_bytes().to_vec()]
+        );
     }
 
     #[derive(Clone)]
