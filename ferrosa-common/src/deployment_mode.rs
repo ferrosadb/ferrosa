@@ -77,9 +77,9 @@ impl DeploymentMode {
     /// Filename of the durable "this node has been a cluster member" marker.
     ///
     /// A separate file rather than a field in an existing one, deliberately.
-    /// `schema.json` in this tree already has two writers with two formats and
-    /// loses data when they disagree; adding a third consumer to a contested
-    /// file to fix a correctness bug would be trading one for another.
+    /// `schema.json` is owned by the schema snapshot store and has a versioned
+    /// schema-registry format. Coupling cluster-membership recovery to that
+    /// document would give unrelated durability state a shared failure domain.
     pub const CLUSTER_MEMBER_MARKER: &str = "cluster-member";
 
     /// Has this node been a Raft cluster member, according to `raft_dir`?

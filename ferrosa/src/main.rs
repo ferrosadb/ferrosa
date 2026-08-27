@@ -756,39 +756,22 @@ async fn bootstrap_from_s3(
 ///
 /// This ensures user-created keyspaces/tables survive binary upgrades where the
 /// data directory is preserved but the in-memory schema starts fresh.
-fn persist_schema_locally(data_dir: &Path, schema: &ferrosa_schema::Schema) {
+fn persist_schema_locally(
+    data_dir: &Path,
+    schema: &ferrosa_schema::Schema,
+) -> ferrosa_common::Result<()> {
     let snap = schema.snapshot();
-    match serde_json::to_vec_pretty(&*snap) {
-        Ok(json) => {
-            let schema_path = data_dir.join("schema.json");
-            if let Err(e) = std::fs::write(&schema_path, &json) {
-                tracing::warn!(%e, "failed to persist schema to local disk");
-            }
-        }
-        Err(e) => tracing::warn!(%e, "failed to serialize schema snapshot for local persist"),
-    }
+    ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(data_dir).persist(&snap)
 }
 
 /// Load a schema snapshot from `{data_dir}/schema.json`, if it exists.
 ///
-/// Returns `None` if the file doesn't exist or can't be parsed.
-fn load_local_schema(data_dir: &Path) -> Option<ferrosa_schema::SchemaSnapshot> {
-    let schema_path = data_dir.join("schema.json");
-    let data = match std::fs::read(&schema_path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(%e, "failed to read local schema.json");
-            return None;
-        }
-    };
-    match serde_json::from_slice(&data) {
-        Ok(snap) => Some(snap),
-        Err(e) => {
-            tracing::warn!(%e, "failed to parse local schema.json");
-            None
-        }
-    }
+/// Returns `Ok(None)` only when the file does not exist. Invalid input is
+/// quarantined and returned as an error so startup cannot silently lose schema.
+fn load_local_schema(
+    data_dir: &Path,
+) -> ferrosa_common::Result<Option<ferrosa_schema::SchemaSnapshot>> {
+    ferrosa_storage::schema_snapshot::SchemaSnapshotStore::new(data_dir).load()
 }
 
 /// Persist the current schema snapshot to S3 for cold restart recovery.
@@ -951,6 +934,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "data_dir",
         "/var/lib/ferrosa",
     ));
+    // Parse and validate the authoritative registry snapshot before opening
+    // storage or serving any protocol. Corrupt or storage-only legacy input is
+    // quarantined and aborts startup instead of becoming an empty live schema.
+    let local_schema_snapshot = load_local_schema(Path::new(&data_dir))?;
     std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
@@ -1276,37 +1263,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_path = Path::new(&data_dir);
     let mut schema_restored = false;
 
-    if let Some(snapshot) = load_local_schema(data_path) {
+    if let Some(snapshot) = local_schema_snapshot {
         let ks_count = snapshot.keyspaces.len();
         let table_count = snapshot.tables.len();
-        match schema.apply_snapshot(snapshot) {
-            Ok(()) => {
-                tracing::info!(
-                    ks_count,
-                    table_count,
-                    "restored schema from local schema.json"
-                );
-                schema_restored = true;
+        schema.apply_snapshot(snapshot)?;
+        tracing::info!(
+            ks_count,
+            table_count,
+            "restored schema from local schema.json"
+        );
+        schema_restored = true;
 
-                // Register existing tables with the storage engine so reads work.
-                let snap = schema.snapshot();
-                for ((_ks, _tbl), table_meta) in &snap.tables {
-                    if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
-                        continue;
-                    }
-                    let storage_schema = table_meta.to_storage_schema();
-                    if let Err(e) = storage.register_table(storage_schema) {
-                        tracing::warn!(
-                            table = %table_meta.name,
-                            ks = %table_meta.keyspace,
-                            "failed to register table from local schema: {e}"
-                        );
-                    }
-                }
+        // Register existing tables with the storage engine so reads work.
+        let snap = schema.snapshot();
+        for ((_ks, _tbl), table_meta) in &snap.tables {
+            if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
+                continue;
             }
-            Err(e) => {
-                tracing::warn!(%e, "failed to apply local schema snapshot, trying S3");
-            }
+            storage.register_table(table_meta.to_storage_schema())?;
         }
     }
 
@@ -1316,7 +1290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
         } else {
             // Persist the S3 schema locally so future restarts don't need S3
-            persist_schema_locally(data_path, &schema);
+            persist_schema_locally(data_path, &schema)?;
         }
     }
 
@@ -2511,7 +2485,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Always persist schema locally for restart recovery.
-                        persist_schema_locally(Path::new(&maintenance_data_dir), &maintenance_schema);
+                        if let Err(e) = persist_schema_locally(
+                            Path::new(&maintenance_data_dir),
+                            &maintenance_schema,
+                        ) {
+                            tracing::error!(%e, "failed to persist authoritative local schema snapshot");
+                        }
 
                         // Sync to S3 if configured — on a dedicated thread.
                         if has_s3 {
@@ -2584,7 +2563,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("memtables flushed");
 
         // Persist schema locally for restart recovery.
-        persist_schema_locally(Path::new(&data_dir), &schema);
+        persist_schema_locally(Path::new(&data_dir), &schema)?;
         tracing::info!("shutdown: schema snapshot persisted locally");
 
         // Sync any new SSTables to S3 and persist schema there too.
@@ -3383,7 +3362,7 @@ mod tests {
             })
             .unwrap();
 
-        persist_schema_locally(dir.path(), &schema);
+        persist_schema_locally(dir.path(), &schema).unwrap();
 
         let schema_path = dir.path().join("schema.json");
         assert!(
@@ -3391,8 +3370,7 @@ mod tests {
             "schema.json must be written to data_dir"
         );
 
-        let data = std::fs::read(&schema_path).unwrap();
-        let restored: ferrosa_schema::SchemaSnapshot = serde_json::from_slice(&data).unwrap();
+        let restored = load_local_schema(dir.path()).unwrap().unwrap();
         assert!(
             restored.keyspaces.contains_key("test_ks"),
             "restored snapshot must contain user keyspace"
@@ -3421,7 +3399,7 @@ mod tests {
         let json = serde_json::to_vec_pretty(&snap).unwrap();
         std::fs::write(dir.path().join("schema.json"), &json).unwrap();
 
-        let loaded = load_local_schema(dir.path());
+        let loaded = load_local_schema(dir.path()).unwrap();
         assert!(loaded.is_some(), "must load schema.json from data_dir");
         let loaded = loaded.unwrap();
         assert!(loaded.keyspaces.contains_key("my_ks"));
@@ -3430,7 +3408,7 @@ mod tests {
     #[test]
     fn load_local_schema_returns_none_when_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        let loaded = load_local_schema(dir.path());
+        let loaded = load_local_schema(dir.path()).unwrap();
         assert!(
             loaded.is_none(),
             "must return None when schema.json is absent"
@@ -3754,16 +3732,26 @@ mod tests {
         assert_eq!(id, expected, "host_id must match override");
     }
 
-    /// BT-005k: load_local_schema returns None for corrupt schema.json.
+    /// BT-005k: corrupt schema.json is preserved and startup fails loud.
     #[test]
     fn bt005_load_local_schema_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("schema.json"), "{{invalid json}}").unwrap();
 
-        let loaded = load_local_schema(dir.path());
-        assert!(
-            loaded.is_none(),
-            "corrupt schema.json must return None, not panic"
+        let error = load_local_schema(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("refusing to start"));
+        assert!(!dir.path().join("schema.json").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("schema.json.unparseable-"))
+                .count(),
+            1,
+            "the unreadable input must be retained exactly once"
         );
     }
 

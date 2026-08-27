@@ -67,6 +67,13 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **Crash-safe schema snapshot ownership (ST-17, 2026-08-27).** The engine no
+  longer writes its table array to the registry-owned `schema.json`.
+  `SchemaSnapshotStore` owns the discriminated, size-bounded registry format,
+  cross-process lock, verified stage/fsync/rename publication, quarantine, and
+  three retained generations. Standalone engine recovery uses the separate,
+  atomically published `storage-schema.json`.
+
 - **DROP INDEX live-state cleanup + index build path fixes (2026-07-03).**
   `StorageEngine::drop_index` now unwires declared indexes from the live
   `TableStore` and `IndexStateTracker` in Direct, pair, and Raft DDL paths,

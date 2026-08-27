@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 doc: fmea
-last_updated: 2026-08-07
+last_updated: 2026-08-27
 ---
 
 # ferrosa — FMEA / Known Issues
@@ -23,6 +23,7 @@ own their own internal FMEAs.
 | FE-8 | **S3 bootstrap / index-UDT-UDF replay failures are non-fatal.** On cold start, schema bootstrap and the `system_schema.*` re-registration steps log a WARN and continue on error. | A node can come up "fresh" or missing secondary indexes / UDTs / UDFs that exist in S3, serving incomplete schema without crashing. | 7 | 3 | 6 | 126 | Each step logs the failure with table/keyspace context; designed as best-effort with local→S3→fresh priority. **Gap:** no readiness gate distinguishes "fresh by design" from "bootstrap failed". |
 | FE-9 | **Maintenance-loop sub-task panics swallowed.** Flush/S3-sync run on detached `std::thread`s; the schema-sync path `continue`s on flush failure to avoid persisting schema ahead of data. | A persistently failing flush silently stops schema persistence; a panicked sync thread is logged but the loop continues. | 6 | 3 | 6 | 108 | Failures are logged per tick; the "skip schema persist if flush failed" guard is correct fail-loud-ish behavior. **Gap:** no escalation/metric if a tick keeps failing. |
 | FE-10 | **TOML internode broadcast omitted from peer handshake.** `[internode].broadcast` updated `broadcast_addr` but left `internode_broadcast=None`; same-host nodes using distinct internode ports therefore could not advertise their canonical reverse-dial endpoint. | The cluster seed substitutes its own port for inbound peers, routes multiple host IDs back to itself, and reports successful invites while joiners remain in pair mode. | 9 | 4 | 7 | 252 | **Fixed in code, live re-verification pending (2026-08-07):** `apply_internode_toml_overrides` preserves the exact TOML value after validation. Regression `apply_internode_toml_overrides_sets_other_fields` asserts both resolved and advertised forms. The cluster-side reverse-address selection is tracked as CL-16. |
+| FE-11 | **Two incompatible writers race on `schema.json`.** The composition root wrote a full registry object while storage flush wrote a table-only array; whichever ran last selected the next boot's apparent schema. | A healthy node can restart with an empty/partial CQL registry, hide intact SSTables, and overwrite the only good local evidence. | 10 | 3 | 8 | 240 → 10 | **Fixed:** startup validates the bounded, discriminated registry document before opening storage. `SchemaSnapshotStore` exclusively publishes it with a file lock, verified staging, fsync/rename/directory-fsync, quarantine, and three generations. Storage-only metadata moved to `storage-schema.json`; parse/apply/register errors now return from startup rather than warn-and-continue. |
 
 ## Top risks to act on
 

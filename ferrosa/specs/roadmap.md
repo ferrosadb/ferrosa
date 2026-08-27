@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 doc: roadmap
-last_updated: 2026-08-07
+last_updated: 2026-08-27
 ---
 
 # ferrosa — Roadmap
@@ -10,6 +10,13 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code `TODO`
 (`web/api.rs:475`), and the composition review of `main.rs`.
 
 ## Recently addressed
+
+- **One crash-safe local schema owner (FMEA FE-11).** `schema.json` now has a
+  discriminator and one bounded streaming publication path. Startup validates
+  it before storage opens, quarantines unreadable/legacy-array evidence, and
+  returns an error instead of starting with an empty registry. Three verified
+  generations are retained; storage's table-only recovery file has a different
+  name and cannot win a format race.
 
 - **Preserve TOML internode broadcast advertisements (FMEA FE-10).** A launchd
   three-node cluster used correct, distinct `[internode].broadcast` ports, but

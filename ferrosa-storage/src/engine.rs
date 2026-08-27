@@ -24,6 +24,8 @@ use dashmap::DashMap;
 use ferrosa_common::task_pool::TaskPool;
 use futures::TryStreamExt;
 use parking_lot::RwLock;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 use smallvec::SmallVec;
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
@@ -413,7 +415,7 @@ pub struct StorageEngineConfig {
     /// Maximum number of commit-log replay mutations that may be buffered in
     /// memory when no table schema is available yet.
     ///
-    /// Normal crash recovery preloads local `schema.json` and streams replay
+    /// Normal crash recovery preloads local registry/storage schema metadata and streams replay
     /// directly into registered tables. This cap is only for legacy/no-schema
     /// compatibility paths; exceeding it fails closed instead of rebuilding the
     /// original unbounded pending `Vec<Mutation>` OOM bug.
@@ -953,6 +955,43 @@ struct TableState {
     /// plus an atomic pointer swap, with no mutex contention even when
     /// many threads write to the same table concurrently.
     last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+}
+
+struct StorageSchemaView<'a>(&'a HashMap<TableId, TableState>);
+
+impl Serialize for StorageSchemaView<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for state in self.0.values() {
+            sequence.serialize_element(&state.schema)?;
+        }
+        sequence.end()
+    }
+}
+
+enum LocalTableSchemas {
+    Registry(Box<SchemaSnapshot>),
+    Storage(Vec<TableSchema>),
+}
+
+impl IntoIterator for LocalTableSchemas {
+    type Item = TableSchema;
+    type IntoIter = Box<dyn Iterator<Item = TableSchema>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Registry(snapshot) => Box::new(
+                snapshot
+                    .tables
+                    .into_values()
+                    .map(|metadata| metadata.to_storage_schema()),
+            ),
+            Self::Storage(schemas) => Box::new(schemas.into_iter()),
+        }
+    }
 }
 
 impl TableState {
@@ -2005,7 +2044,7 @@ impl StorageEngine {
             );
         }
 
-        engine.load_local_schema_if_present();
+        engine.load_local_schema_if_present()?;
         Ok(engine)
     }
 
@@ -2238,38 +2277,26 @@ impl StorageEngine {
         let (index_scheduler, index_tracker) = build_index_scheduler(&config);
 
         let tables = RwLock::new(HashMap::new());
-        let schema_path = config.data_dir.join("schema.json");
-        if let Ok(data) = std::fs::read_to_string(&schema_path) {
-            match Self::table_schemas_from_schema_json(&data) {
-                Ok(schemas) => {
-                    for schema in schemas {
-                        let table_id = TableId::new(&schema.keyspace, &schema.table);
-                        match Self::build_table_state(
-                            &config,
-                            schema,
-                            vec![],
-                            Arc::clone(&reader_pool),
-                        ) {
-                            Ok(state) => {
-                                for (index_name, _col_pos) in state.store.indexed_columns() {
-                                    index_tracker.register_index(
-                                        table_id.keyspace(),
-                                        table_id.table(),
-                                        index_name,
-                                    );
-                                }
-                                tables.write().insert(table_id, state);
-                            }
-                            Err(e) => tracing::warn!(
-                                "failed to re-register table from schema.json before replay: {e}"
-                            ),
+        if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
+            for schema in schemas {
+                let table_id = TableId::new(&schema.keyspace, &schema.table);
+                match Self::build_table_state(&config, schema, vec![], Arc::clone(&reader_pool)) {
+                    Ok(state) => {
+                        for (index_name, _col_pos) in state.store.indexed_columns() {
+                            index_tracker.register_index(
+                                table_id.keyspace(),
+                                table_id.table(),
+                                index_name,
+                            );
                         }
+                        tables.write().insert(table_id, state);
+                    }
+                    Err(e) => {
+                        return Err(ferrosa_common::Error::InvalidFormat(format!(
+                            "failed to re-register table from local schema before replay: {e}"
+                        )))
                     }
                 }
-                Err(e) => tracing::warn!(
-                    "failed to parse schema.json at {} before replay: {e}",
-                    schema_path.display()
-                ),
             }
         }
 
@@ -2856,24 +2883,6 @@ impl StorageEngine {
         self.register_table_inner(schema, indexed_columns)
     }
 
-    fn table_schemas_from_schema_json(data: &str) -> Result<Vec<TableSchema>, String> {
-        match serde_json::from_str::<Vec<TableSchema>>(data) {
-            Ok(schemas) => Ok(schemas),
-            Err(legacy_err) => {
-                let snapshot = serde_json::from_str::<SchemaSnapshot>(data).map_err(|snapshot_err| {
-                    format!(
-                        "legacy TableSchema list parse failed: {legacy_err}; SchemaSnapshot parse failed: {snapshot_err}"
-                    )
-                })?;
-                Ok(snapshot
-                    .tables
-                    .into_values()
-                    .map(|metadata| metadata.to_storage_schema())
-                    .collect())
-            }
-        }
-    }
-
     /// Builds per-table state for a schema without requiring a fully constructed
     /// `StorageEngine`. Startup replay uses this to preload schema-backed tables
     /// before streaming commit-log entries, avoiding an eager pending-mutation Vec.
@@ -3138,9 +3147,7 @@ impl StorageEngine {
                 tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
             }
         }
-        if let Err(e) = self.persist_schema_locally() {
-            tracing::warn!("failed to persist schema.json after schema update: {e}");
-        }
+        self.persist_storage_schema_locally()?;
         self.remove_time_series_consolidator(table_id);
         self.install_time_series_consolidator(table_id.clone(), time_series_handle);
         Ok(())
@@ -3220,54 +3227,54 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Persists all registered table schemas to `data_dir/schema.json` so a
-    /// clean restart can recover all table schemas without needing to re-run the
-    /// S3 bootstrap that was gated on `local_empty`.
-    fn persist_schema_locally(&self) -> ferrosa_common::Result<()> {
-        let schema_path = self.config.data_dir.join("schema.json");
+    /// Persists storage-private table registrations separately from the
+    /// registry-owned `schema.json`.
+    fn persist_storage_schema_locally(&self) -> ferrosa_common::Result<()> {
         let tables = self.tables.read();
-        let schemas: Vec<&TableSchema> = tables.values().map(|s| &s.schema).collect();
-        let json = serde_json::to_string_pretty(&schemas).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!("schema serialization failed: {e}"))
-        })?;
-        drop(tables);
-        std::fs::write(&schema_path, json).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to write {}: {e}",
-                schema_path.display()
-            ))
-        })?;
-        Ok(())
+        crate::schema_snapshot::persist_bounded_json(
+            &self.config.data_dir,
+            "storage-schema.json",
+            &StorageSchemaView(&tables),
+        )
     }
 
-    /// Loads table schemas from `data_dir/schema.json` (if it exists) and
-    /// registers any tables not already registered.
+    /// Loads table schemas from the authoritative `schema.json`, or from the
+    /// storage-only `storage-schema.json` when no registry snapshot exists,
+    /// and registers any tables not already registered.
     ///
     /// Called during all `StorageEngine` constructors before any other work.
     /// By running unconditionally (not gated on SSTable presence) this fixes
     /// BUG-022: schema was lost on binary upgrades where the data directory
     /// was non-empty and the S3 bootstrap path was skipped.
-    fn load_local_schema_if_present(&self) {
-        let schema_path = self.config.data_dir.join("schema.json");
-        let data = match std::fs::read_to_string(&schema_path) {
-            Ok(d) => d,
-            Err(_) => return, // No schema.json yet — first run.
-        };
-        let schemas = match Self::table_schemas_from_schema_json(&data) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "failed to parse schema.json at {}: {e}",
-                    schema_path.display()
-                );
-                return;
-            }
+    fn load_local_schema_if_present(&self) -> ferrosa_common::Result<()> {
+        let Some(schemas) = Self::load_local_table_schemas(&self.config.data_dir)? else {
+            return Ok(());
         };
         for schema in schemas {
             if let Err(e) = self.register_table_inner(schema, vec![]) {
-                tracing::warn!("failed to re-register table from schema.json: {e}");
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to re-register table from local schema: {e}"
+                )));
             }
         }
+        Ok(())
+    }
+
+    fn load_local_table_schemas(
+        data_dir: &Path,
+    ) -> ferrosa_common::Result<Option<LocalTableSchemas>> {
+        if data_dir.join("schema.json").exists() {
+            let snapshot = crate::schema_snapshot::SchemaSnapshotStore::new(data_dir)
+                .load()?
+                .ok_or_else(|| {
+                    ferrosa_common::Error::InvalidFormat(
+                        "schema.json disappeared while acquiring its snapshot lock".to_owned(),
+                    )
+                })?;
+            return Ok(Some(LocalTableSchemas::Registry(Box::new(snapshot))));
+        }
+        crate::schema_snapshot::load_bounded_json(data_dir, "storage-schema.json")
+            .map(|schemas| schemas.map(LocalTableSchemas::Storage))
     }
 
     /// Rebuilds live secondary indexes from the persisted `system_schema.indexes`
@@ -7349,9 +7356,7 @@ impl StorageEngine {
 
         // Persist registered table schemas so the next restart can recover without
         // re-running S3 bootstrap (BUG-022).
-        if let Err(e) = self.persist_schema_locally() {
-            tracing::warn!("failed to persist schema.json: {e}");
-        }
+        self.persist_storage_schema_locally()?;
 
         Ok(())
     }
@@ -19107,9 +19112,54 @@ mod tests {
 
     // ── Schema persistence across restarts ──────────────────────────────────
 
+    #[test]
+    fn schema_snapshot_two_writers_do_not_replace_authoritative_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        let authoritative = SchemaSnapshot::new();
+        let authoritative_version = authoritative.version;
+        serde_json::to_writer_pretty(std::fs::File::create(&schema_path).unwrap(), &authoritative)
+            .unwrap();
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+        engine.register_table(test_schema()).unwrap();
+        engine.flush(&tid).unwrap();
+
+        let persisted: SchemaSnapshot =
+            serde_json::from_reader(std::fs::File::open(&schema_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted.version, authoritative_version,
+            "storage flushes must not replace the registry-owned schema.json"
+        );
+    }
+
+    #[test]
+    fn storage_startup_rejects_corrupt_authoritative_schema_before_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.json"), b"{not-json").unwrap();
+
+        let error = match StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None) {
+            Ok(_) => panic!("corrupt authoritative schema must fail storage startup"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("refusing to start"), "{error}");
+        assert!(!dir.path().join("schema.json").exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("schema.json.unparseable-")
+            })
+        }));
+    }
+
     /// Verify that a table schema registered before a flush survives an engine
-    /// restart — `load_local_schema_if_present` reads the `schema.json` written
-    /// by `flush` and re-registers all tables so that the new engine can write
+    /// restart — `load_local_schema_if_present` reads the `storage-schema.json`
+    /// written by `flush` and re-registers all tables so that the new engine can write
     /// and read without calling `register_table` again.
     #[test]
     fn open_reloads_local_schema_before_commitlog_replay() {
@@ -19128,7 +19178,7 @@ mod tests {
 
         assert!(
             engine.is_table_registered_for_test(&tid),
-            "StorageEngine::open must reload schema.json before commit-log replay so recovered nodes do not forward writes for locally unregistered tables"
+            "StorageEngine::open must reload local schema metadata before commit-log replay so recovered nodes do not forward writes for locally unregistered tables"
         );
         assert_eq!(
             engine.deferred_replay_mutation_count_for_test(),
@@ -19178,7 +19228,7 @@ mod tests {
         }
 
         // Reopen: replicate the boot sequence — system tables registered, user
-        // schema reloaded from schema.json, then index reconstruction.
+        // schema reloaded from local registry/storage metadata, then index reconstruction.
         let config = StorageEngineConfig::test_config(dir.path());
         let (engine, _pending) = StorageEngine::open(config, None).unwrap();
         engine.register_system_tables().unwrap();
@@ -20159,9 +20209,11 @@ mod tests {
             engine.commit_log.shutdown().unwrap();
         }
 
-        let schema_path = dir.path().join("schema.json");
-        if schema_path.exists() {
-            std::fs::remove_file(schema_path).unwrap();
+        for filename in ["schema.json", "storage-schema.json"] {
+            let schema_path = dir.path().join(filename);
+            if schema_path.exists() {
+                std::fs::remove_file(schema_path).unwrap();
+            }
         }
 
         let config = StorageEngineConfig {
@@ -20187,7 +20239,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tid = TableId::new("test_ks", "test_table");
 
-        // First engine: register, write, flush (flush writes schema.json).
+        // First engine: register, write, flush (flush writes storage-schema.json).
         {
             let config = StorageEngineConfig::test_config(dir.path());
             let engine = StorageEngine::new(config, None).unwrap();
@@ -20197,20 +20249,20 @@ mod tests {
                 .write(&tid, &key, make_row(b"restart_val", 1000), 1000)
                 .unwrap();
             engine.flush(&tid).unwrap();
-            // engine drops here — schema.json is now on disk
+            // engine drops here — storage-schema.json is now on disk
         }
 
         // Second engine at the SAME directory: must NOT call register_table.
         let config2 = StorageEngineConfig::test_config(dir.path());
         let engine2 = StorageEngine::new(config2, None).unwrap();
 
-        // Write succeeds only if the table was re-registered from schema.json.
+        // Write succeeds only if the table was re-registered from local schema metadata.
         let key2 = make_key("restart_key2");
         let write_result = engine2.write(&tid, &key2, make_row(b"after_restart", 2000), 2000);
         assert!(
             write_result.is_ok(),
             "write after restart must succeed — schema must have been loaded \
-             from schema.json; got: {:?}",
+             from storage-schema.json; got: {:?}",
             write_result.err()
         );
 
