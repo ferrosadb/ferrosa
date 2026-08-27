@@ -2,6 +2,12 @@
 //!
 //! Parallels `WritePath` — the CQL router calls `DdlPath::execute()`
 //! for all DDL operations. Swapped atomically via `ArcSwap`.
+//! Responsibility: route each schema mutation through the authority for the
+//! current deployment mode.
+//! Correctness: formation buffering is explicitly bounded and saturated
+//! producers fail immediately; the queue can never become an unbounded heap.
+//! Last revised: 2026-08-26.
+//! Last changed: replace the unbounded formation queue with bounded admission.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -19,6 +25,13 @@ use crate::error::{ClusterError, Result};
 use crate::pair::ddl::{DdlCoordinator, DdlOperation};
 use crate::raft::{FerrosRaft, RaftCommand, RaftOp};
 use crate::system_table_writer::SystemTableWriter;
+
+/// Maximum schema operations retained while a node is forming a Raft group.
+///
+/// Clients already receive a retriable error in this state. This queue only
+/// bridges operations that raced the path swap, so a small fixed bound is
+/// sufficient and provides deterministic backpressure.
+pub(crate) const FORMING_DDL_QUEUE_CAPACITY: usize = 128;
 
 /// The active DDL path. Swapped atomically via `ArcSwap` when
 /// the deployment mode changes (standalone → pair → cluster).
@@ -52,7 +65,7 @@ pub enum DdlPath {
     /// in `transition_to_cluster`. The client receives a retriable error
     /// so it can retry after formation completes (FMEA F3).
     Forming {
-        queue: tokio::sync::mpsc::UnboundedSender<DdlOperation>,
+        queue: tokio::sync::mpsc::Sender<DdlOperation>,
     },
     /// Degraded: peer lost, DDL rejected until operator promotes.
     Unavailable,
@@ -130,8 +143,21 @@ impl DdlPath {
                 // Still return an error to the client so they know to retry
                 // (the DDL will be applied automatically but the client can't
                 // observe the result until formation completes).
-                if let Err(e) = queue.send(op) {
-                    tracing::error!(%e, "ddl: failed to enqueue DDL operation");
+                match queue.try_send(op) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        return Err(ClusterError::Internal(
+                            "DDL unavailable: cluster formation queue is full — retry shortly"
+                                .into(),
+                        ));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::error!("ddl: formation queue closed before path transition");
+                        return Err(ClusterError::Internal(
+                            "DDL unavailable: cluster formation queue closed — retry shortly"
+                                .into(),
+                        ));
+                    }
                 }
                 Err(ClusterError::Internal(
                     "DDL unavailable: cluster formation in progress, will be applied after leader election — retry shortly".into(),
@@ -161,18 +187,13 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
         }
         DdlOperation::DropKeyspace(name) => {
             let snap = schema.snapshot();
-            let table_ids: Vec<_> = snap
-                .tables
-                .keys()
-                .filter(|(ks, _)| ks == name)
-                .map(|(ks, tbl)| ferrosa_storage::TableId::new(ks, tbl))
-                .collect();
             schema
                 .drop_keyspace_internal(name)
                 .map_err(|e| ClusterError::Internal(format!("drop_keyspace: {e}")))?;
-            for tid in &table_ids {
+            for (keyspace, table) in snap.tables.keys().filter(|(keyspace, _)| keyspace == name) {
+                let tid = ferrosa_storage::TableId::new(keyspace, table);
                 engine
-                    .unregister_table(tid)
+                    .unregister_table(&tid)
                     .map_err(ClusterError::Storage)?;
             }
         }
@@ -620,14 +641,14 @@ async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u6
     loop {
         let metrics = raft.metrics().borrow().clone();
         let local_id = metrics.id;
-        let voters: Vec<u64> = metrics
+        let remote_voter_count = metrics
             .membership_config
             .membership()
             .voter_ids()
             .filter(|id| *id != local_id)
-            .collect();
+            .count();
         // Single-node clusters have no followers to wait on.
-        if voters.is_empty() {
+        if remote_voter_count == 0 {
             break;
         }
         let replication = match &metrics.replication {
@@ -637,32 +658,43 @@ async fn wait_for_replication_to_catch_up(raft: &FerrosRaft, committed_index: u6
             // the caller doesn't immediately race the followers.
             None => break,
         };
-        let everyone_caught_up = voters.iter().all(|voter_id| {
-            replication
-                .get(voter_id)
-                .and_then(|matched| matched.as_ref().map(|lid| lid.index))
-                .is_some_and(|matched_index| matched_index >= committed_index)
-        });
+        let everyone_caught_up = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .filter(|voter_id| *voter_id != local_id)
+            .all(|voter_id| {
+                replication
+                    .get(&voter_id)
+                    .and_then(|matched| matched.as_ref().map(|lid| lid.index))
+                    .is_some_and(|matched_index| matched_index >= committed_index)
+            });
         if everyone_caught_up {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
             // Log so an operator can correlate a downstream "schema still
             // propagating"-style write failure with a slow follower.
-            let lag: Vec<(u64, u64)> = voters
-                .iter()
+            let (lagging_voters, max_lag) = metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .filter(|voter_id| *voter_id != local_id)
                 .map(|voter_id| {
                     let matched = replication
-                        .get(voter_id)
+                        .get(&voter_id)
                         .and_then(|m| m.as_ref().map(|lid| lid.index))
                         .unwrap_or(0);
-                    (*voter_id, committed_index.saturating_sub(matched))
+                    committed_index.saturating_sub(matched)
                 })
-                .filter(|(_, lag)| *lag > 0)
-                .collect();
+                .filter(|lag| *lag > 0)
+                .fold((0usize, 0u64), |(count, max_lag), lag| {
+                    (count + 1, max_lag.max(lag))
+                });
             tracing::warn!(
                 committed_index,
-                ?lag,
+                lagging_voters,
+                max_lag,
                 "ddl_agreement: timed out waiting for all voters to replicate the DDL log entry; \
                  a follower may serve a stale TableSchema for a brief window"
             );
@@ -1574,7 +1606,7 @@ mod tests {
     /// We verify the message-type guard in the handler at the codec level.
     #[tokio::test]
     async fn test_forming_ddl_path_queues_and_returns_error() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let ddl = DdlPath::Forming { queue: tx };
         let op = DdlOperation::CreateKeyspace(simple_keyspace("should_queue"));
         let err = ddl.execute(op).await.unwrap_err();
@@ -1589,6 +1621,30 @@ mod tests {
             DdlOperation::CreateKeyspace(ks) => assert_eq!(ks.name, "should_queue"),
             other => panic!("expected CreateKeyspace, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn forming_ddl_path_fails_fast_when_bounded_queue_is_full() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let ddl = DdlPath::Forming { queue: tx };
+
+        let first = DdlOperation::CreateKeyspace(simple_keyspace("first"));
+        let first_err = ddl.execute(first).await.unwrap_err();
+        assert!(first_err.to_string().contains("formation in progress"));
+
+        let second = DdlOperation::CreateKeyspace(simple_keyspace("second"));
+        let second_err = ddl.execute(second).await.unwrap_err();
+        assert!(
+            second_err.to_string().contains("queue is full"),
+            "a saturated formation queue must fail immediately: {second_err}"
+        );
+
+        let queued = rx.try_recv().expect("first operation remains queued");
+        assert!(matches!(queued, DdlOperation::CreateKeyspace(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "bounded capacity must prevent a second queued operation"
+        );
     }
 
     #[test]

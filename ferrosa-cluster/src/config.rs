@@ -1,3 +1,12 @@
+//! Cluster behavior and consensus timing configuration.
+//!
+//! Responsibility: parse operator intent into bounded, fail-closed cluster
+//! settings shared by formation, replication, and health reporting.
+//! Correctness: explicit topology intent must never silently degrade to a
+//! smaller deployment; invalid expected-size values keep readiness closed.
+//! Last revised: 2026-08-26.
+//! Last changed: add explicit expected cluster size for formation readiness.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -46,6 +55,14 @@ pub struct ClusterConfig {
     /// Maximum seconds to wait in Forming state before falling back to Pair.
     /// `None` uses the default of 60 seconds.
     pub formation_timeout_secs: Option<u64>,
+    /// Operator-declared deployment size used to fail readiness closed while
+    /// formation is incomplete. `0` preserves automatic standalone/pair mode;
+    /// `1`, `2`, and `3+` require standalone, pair, and committed Raft
+    /// membership respectively.
+    ///
+    /// Parsed from `FERROSA_EXPECTED_CLUSTER_SIZE`.
+    #[serde(default)]
+    pub expected_cluster_size: usize,
     /// CQL broadcast address (host:port) for system.peers.
     /// When set, overrides the internode address for native_address.
     /// Parsed from FERROSA_CQL_BROADCAST env var.
@@ -124,6 +141,7 @@ impl Default for ClusterConfig {
             raft_data_dir: None,
             node_role: NodeRole::Both,
             formation_timeout_secs: None,
+            expected_cluster_size: 0,
             cql_broadcast: None,
             raft_heartbeat_ms: 300,
             raft_election_timeout_min_ms: 3000,
@@ -173,6 +191,20 @@ impl ClusterConfig {
         if let Ok(timeout) = std::env::var("FERROSA_FORMATION_TIMEOUT_SECS") {
             if let Ok(n) = timeout.parse() {
                 config.formation_timeout_secs = Some(n);
+            }
+        }
+        if let Ok(value) = std::env::var("FERROSA_EXPECTED_CLUSTER_SIZE") {
+            match value.parse::<usize>() {
+                Ok(size) if size > 0 => config.expected_cluster_size = size,
+                _ => {
+                    // Fail readiness closed instead of silently reverting to
+                    // automatic pair/standalone behavior on bad operator input.
+                    config.expected_cluster_size = usize::MAX;
+                    tracing::error!(
+                        value = %value,
+                        "FERROSA_EXPECTED_CLUSTER_SIZE must be a positive integer; readiness disabled"
+                    );
+                }
             }
         }
         if let Ok(role) = std::env::var("FERROSA_NODE_ROLE") {
@@ -319,6 +351,7 @@ mod tests {
         assert_eq!(config.default_cl, ConsistencyLevel::Quorum);
         assert_eq!(config.hinted_handoff_max_mb, 1024);
         assert!(config.auto_join);
+        assert_eq!(config.expected_cluster_size, 0);
     }
 
     /// W3.12 / ADR-012: CheckQuorum is on by default; PreVote is intentionally
@@ -361,12 +394,14 @@ mod tests {
     fn cluster_config_serde_with_node_role() {
         let config = ClusterConfig {
             node_role: NodeRole::Indexer,
+            expected_cluster_size: 3,
             ..ClusterConfig::default()
         };
 
         let bytes = bincode::serialize(&config).unwrap();
         let decoded: ClusterConfig = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.node_role, NodeRole::Indexer);
+        assert_eq!(decoded.expected_cluster_size, 3);
     }
 
     /// W6.8 RED: per-DC config carries independent raft_data_dir +

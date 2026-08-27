@@ -411,7 +411,7 @@ graph BT
   - `coordinator/read.rs` — Read fan-out with local-replica optimization
   - `consistency.rs` — `ConsistencyLevel` with `blockFor()` + property tests
   - `state.rs` — `RaftClusterState` with `BroadcastResolver` trait for decoupled CQL broadcast resolution (ring → PeerManager → internode fallback), `system.peers` native_address/tokens population
-  - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, `auto_join`, `node_role`, tunable Raft timing (`FERROSA_RAFT_HEARTBEAT_MS`, `FERROSA_RAFT_ELECTION_MIN_MS`, `FERROSA_RAFT_ELECTION_MAX_MS`)
+  - `config.rs` — `ClusterConfig` with `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`), `formation_timeout_secs`, explicit fail-closed topology intent (`FERROSA_EXPECTED_CLUSTER_SIZE`), `auto_join`, `node_role`, tunable Raft timing (`FERROSA_RAFT_HEARTBEAT_MS`, `FERROSA_RAFT_ELECTION_MIN_MS`, `FERROSA_RAFT_ELECTION_MAX_MS`)
   - `error.rs`, `mode.rs`
   - `telemetry/layer.rs` — `FerrosaTelemetryLayer` (`tracing::Layer` impl), head-based coherent sampling, bounded mpsc try_send, drop counter
   - `telemetry/writer.rs` — `TelemetryWriter` background task, batched direct writes to `StorageEngine::write_observability()` (bypasses CQL), cancel-safe via `CancellationToken`

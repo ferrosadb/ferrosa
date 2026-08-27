@@ -3,6 +3,12 @@
 //! The controller implements [`ferrosa_net::peer::PeerEventListener`] and swaps the active
 //! [`WritePath`] and [`ClusterStateHolder`] atomically when the deployment mode
 //! changes (standalone → pair → cluster).
+//! Responsibility: serialize topology transitions and expose health/readiness
+//! that matches the active write and consensus paths.
+//! Correctness: explicit cluster-size intent fails closed until the matching
+//! standalone, pair, or committed Raft membership is observable.
+//! Last revised: 2026-08-26.
+//! Last changed: gate CQL readiness on declared topology and committed voters.
 //!
 //! Failover lifecycle:
 //!   1. Pair mode active, both nodes connected
@@ -242,9 +248,7 @@ pub struct ModeController {
     pub(super) committed_cluster_size: AtomicUsize,
     /// Receiver for DDL operations queued during Forming state.
     pub(super) ddl_queue_rx: Arc<
-        parking_lot::Mutex<
-            Option<tokio::sync::mpsc::UnboundedReceiver<crate::pair::ddl::DdlOperation>>,
-        >,
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<crate::pair::ddl::DdlOperation>>>,
     >,
     /// Contention metrics for the transition guard.
     pub contention_metrics: Arc<ContentionMetrics>,
@@ -280,6 +284,29 @@ pub struct ModeControllerHandles {
     pub write_path: Arc<ArcSwap<WritePath>>,
     pub cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
     pub ddl_path: Arc<ArcSwap<DdlPath>>,
+}
+
+pub(super) fn declared_topology_is_ready(
+    expected_cluster_size: usize,
+    mode: DeploymentMode,
+    role: Option<PairRole>,
+    has_raft_leader: bool,
+    committed_voters: usize,
+) -> bool {
+    match expected_cluster_size {
+        0 => match mode {
+            DeploymentMode::Standalone => true,
+            DeploymentMode::Pair => role == Some(PairRole::Primary),
+            DeploymentMode::Forming => false,
+            DeploymentMode::Cluster => true,
+            DeploymentMode::DegradedPair | DeploymentMode::DegradedCluster => true,
+        },
+        1 => mode == DeploymentMode::Standalone,
+        2 => mode == DeploymentMode::Pair && role == Some(PairRole::Primary),
+        expected => {
+            mode == DeploymentMode::Cluster && has_raft_leader && committed_voters >= expected
+        }
+    }
 }
 
 impl ModeController {
@@ -642,14 +669,28 @@ impl ModeController {
     /// In pair mode only the primary accepts clients; the secondary exists
     /// solely for replication.  Standalone and cluster nodes always accept.
     pub fn is_cql_ready(&self) -> bool {
-        match self.mode() {
-            DeploymentMode::Standalone => true,
-            DeploymentMode::Pair => self.role() == Some(PairRole::Primary),
-            DeploymentMode::Forming => false, // Not ready until Raft leader elected
-            DeploymentMode::Cluster => true,
-            DeploymentMode::DegradedPair => true, // Stale reads available
-            DeploymentMode::DegradedCluster => true, // Stale reads at CL=ONE
-        }
+        let expected = self.config.expected_cluster_size;
+        let (has_raft_leader, committed_voters) = if expected >= 3 {
+            self.raft()
+                .map(|raft| {
+                    let metrics = raft.metrics().borrow().clone();
+                    (
+                        metrics.current_leader.is_some(),
+                        metrics.membership_config.membership().voter_ids().count(),
+                    )
+                })
+                .unwrap_or((false, 0))
+        } else {
+            (false, 0)
+        };
+
+        declared_topology_is_ready(
+            expected,
+            self.mode(),
+            self.role(),
+            has_raft_leader,
+            committed_voters,
+        )
     }
 
     /// Get local host_id.

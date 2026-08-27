@@ -1,8 +1,81 @@
 //! Cluster mode transition logic: forming and full cluster.
+//!
+//! Responsibility: construct the Raft/ring/write-path stack and publish it in
+//! formation order while preserving queued schema mutations.
+//! Correctness: formation work is bounded, cancel-aware, and never advertises
+//! durable topology before the relevant consensus state exists.
+//! Last revised: 2026-08-26.
+//! Last changed: bound the transient DDL replay queue.
 
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+
+const MAX_CLUSTER_MEMBER_MARKER_BYTES: usize = 4096;
+
+struct SavedClusterMemberMarker {
+    bytes: [u8; MAX_CLUSTER_MEMBER_MARKER_BYTES],
+    len: usize,
+}
+
+fn read_cluster_member_marker(
+    marker: &std::path::Path,
+) -> std::io::Result<Option<SavedClusterMemberMarker>> {
+    let mut file = match std::fs::File::open(marker) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let declared_len = file.metadata()?.len();
+    if declared_len > MAX_CLUSTER_MEMBER_MARKER_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cluster membership marker is {declared_len} bytes; maximum is {MAX_CLUSTER_MEMBER_MARKER_BYTES}"
+            ),
+        ));
+    }
+
+    let len = declared_len as usize;
+    let mut bytes = [0u8; MAX_CLUSTER_MEMBER_MARKER_BYTES];
+    file.read_exact(&mut bytes[..len])?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cluster membership marker grew beyond its validated bound",
+        ));
+    }
+    Ok(Some(SavedClusterMemberMarker { bytes, len }))
+}
+
+fn restore_cluster_member_marker_atomic(
+    raft_dir: &std::path::Path,
+    saved: &SavedClusterMemberMarker,
+) -> std::io::Result<()> {
+    let live = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
+    let staging = raft_dir.join(".cluster-member.staging");
+    let result = (|| {
+        let mut file = std::fs::File::create(&staging)?;
+        file.write_all(&saved.bytes[..saved.len])?;
+        file.flush()?;
+        file.sync_all()?;
+        if file.metadata()?.len() != saved.len as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "staged cluster membership marker length mismatch",
+            ));
+        }
+        std::fs::rename(&staging, &live)?;
+        std::fs::File::open(raft_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
 
 /// Process-wide counters for cluster-bootstrap silent-failure detectors.
 /// These fire when previously-swallowed paths now surface errors loudly:
@@ -220,7 +293,7 @@ pub(super) fn resolve_formation_rf(
 /// Generic over the op-processor `F` so unit tests can substitute a
 /// counter without spinning up a Raft.
 pub(super) async fn drain_ddl_queue<Op, F, Fut>(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Op>,
+    mut rx: tokio::sync::mpsc::Receiver<Op>,
     mut process: F,
 ) -> usize
 where
@@ -291,17 +364,13 @@ impl ModeController {
         raft_dir: &std::path::Path,
     ) -> std::io::Result<Option<std::path::PathBuf>> {
         let marker = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
-        let saved_marker = match std::fs::read(&marker) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
+        let saved_marker = read_cluster_member_marker(&marker)?;
 
         let counts = crate::raft::log_store::SledLogStore::reset(raft_dir)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        if let Some(bytes) = saved_marker {
-            std::fs::write(raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER), bytes)?;
+        if let Some(saved) = saved_marker {
+            restore_cluster_member_marker_atomic(raft_dir, &saved)?;
         }
 
         Ok(counts.backup_path)
@@ -616,7 +685,8 @@ impl ModeController {
             .store(peers.len() + 1, std::sync::atomic::Ordering::Relaxed);
         // Queue DDL during formation — operations are replayed after Raft leader
         // election instead of being rejected (FMEA F3).
-        let (ddl_tx, ddl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ddl_tx, ddl_rx) =
+            tokio::sync::mpsc::channel(crate::ddl_path::FORMING_DDL_QUEUE_CAPACITY);
         *self.ddl_queue_rx.lock() = Some(ddl_rx);
         self.ddl_path
             .store(Arc::new(DdlPath::Forming { queue: ddl_tx }));

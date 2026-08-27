@@ -387,7 +387,7 @@ async fn cluster_graph_schema_coordinator_follows_ddl_path_transitions() {
     // Standalone → Forming. The orchestrator swaps the path during
     // cluster formation; in-flight graph DDL gets a retriable error
     // (the operation is queued for replay after election).
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
     ddl_swap.store(Arc::new(DdlPath::Forming { queue: tx }));
     let res = coordinator
         .apply_create_keyspace(KeyspaceMetadata {

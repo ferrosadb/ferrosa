@@ -1,3 +1,12 @@
+//! Bounded internode peer ownership and liveness management.
+//!
+//! Responsibility: own one connection pool per remote host, publish peer
+//! metadata, and notify cluster formation of validated transport events.
+//! Correctness: the local host is rejected before dialing, metadata mutation,
+//! peer-map insertion, or listener callbacks.
+//! Last revised: 2026-08-26.
+//! Last changed: enforce self-peer rejection at the network admission boundary.
+
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -26,7 +35,6 @@ pub trait PeerEventListener: Send + Sync {
 /// Manages all peer connections and runs failure detection.
 pub struct PeerManager {
     config: Arc<NetConfig>,
-    #[allow(dead_code)]
     local_host_id: uuid::Uuid,
     peers: RwLock<HashMap<uuid::Uuid, Arc<PeerState>>>,
     listener: Arc<dyn PeerEventListener>,
@@ -129,6 +137,14 @@ impl PeerManager {
     /// it is stored for system.peers.native_address lookups.
     pub async fn add_peer(&self, peer_id: PeerId, pool: PriorityPool) {
         let (host_id, _addr) = peer_id;
+        if host_id == self.local_host_id {
+            tracing::error!(
+                peer = %host_id,
+                "rejecting self before network peer admission"
+            );
+            pool.shutdown().await;
+            return;
+        }
         // Extract the peer's CQL broadcast from the handshake before wrapping in Arc.
         if let Some(broadcast) = pool.peer_cql_broadcast() {
             self.peer_cql_broadcasts
@@ -192,6 +208,11 @@ impl PeerManager {
     /// Uses the provided address string (IP:port or resolvable hostname:port)
     /// to establish the pool if one is not already present.
     pub async fn ensure_peer(&self, host_id: uuid::Uuid, addr: &str) -> crate::error::Result<()> {
+        if host_id == self.local_host_id {
+            return Err(crate::error::NetError::Protocol(format!(
+                "refusing to connect local host_id {host_id} as a peer"
+            )));
+        }
         let resolved = addr
             .to_socket_addrs()
             .map_err(|e| {
@@ -230,6 +251,13 @@ impl PeerManager {
     /// Add a peer entry without a connection pool (for unit testing).
     pub async fn add_peer_entry(&self, peer_id: PeerId) {
         let (host_id, _addr) = peer_id;
+        if host_id == self.local_host_id {
+            tracing::error!(
+                peer = %host_id,
+                "rejecting self before network peer-entry admission"
+            );
+            return;
+        }
         let state = Arc::new(PeerState::new(peer_id, None, self.now_ms()));
         self.peers.write().await.insert(host_id, state);
         self.listener.on_peer_connected(peer_id);
@@ -565,6 +593,32 @@ mod tests {
         pm.add_peer_entry(peer_id).await;
 
         assert_eq!(listener.connected_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn self_peer_is_rejected_before_network_tracking_or_callback() {
+        let config = Arc::new(NetConfig::default());
+        let listener = Arc::new(TestListener::new());
+        let local_host_id = uuid::Uuid::new_v4();
+        let pm = PeerManager::new(config, local_host_id, listener.clone());
+
+        pm.add_peer_entry((local_host_id, "127.0.0.1:7000".parse().unwrap()))
+            .await;
+
+        assert!(
+            !pm.has_peer(local_host_id),
+            "self must not enter the network peer map"
+        );
+        assert_eq!(
+            listener.connected_count.load(Ordering::Relaxed),
+            0,
+            "self rejection must happen before the formation callback"
+        );
+        assert!(pm.get_peer_cql_broadcast(local_host_id).await.is_none());
+        assert!(pm
+            .get_peer_internode_broadcast(local_host_id)
+            .await
+            .is_none());
     }
 
     #[tokio::test(start_paused = true)]
