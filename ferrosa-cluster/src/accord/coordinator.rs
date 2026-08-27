@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use crate::accord::transport::AccordTransport;
 use bytes::Bytes;
-use ferrosa_common::accord::{BallotNumber, HybridLogicalClock, Timestamp, TxnId};
+use ferrosa_common::accord::{BallotNumber, HybridLogicalClock, Timestamp, TxnId, TxnPhase};
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
@@ -615,6 +615,29 @@ fn agreed_row(reads: &[Vec<u8>], quorum: usize) -> Option<Vec<u8>> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistenceVoteDecision {
+    Apply,
+    ConditionNotMet,
+    QuorumUnavailable,
+}
+
+/// Decide an `INSERT IF NOT EXISTS` read-vote from explicit replica votes.
+///
+fn decide_existence_votes(
+    votes_true: usize,
+    votes_false: usize,
+    quorum: usize,
+) -> ExistenceVoteDecision {
+    if votes_false >= quorum {
+        ExistenceVoteDecision::ConditionNotMet
+    } else if votes_true >= quorum {
+        ExistenceVoteDecision::Apply
+    } else {
+        ExistenceVoteDecision::QuorumUnavailable
+    }
+}
+
 impl AccordCoordinatorDriver {
     /// Build a driver for a new transaction.
     ///
@@ -685,7 +708,8 @@ impl AccordCoordinatorDriver {
     /// Like [`Self::new_multi`] but takes the [`AccordTransport`] seam directly,
     /// so tests can inject a mock that returns controllable per-node responses
     /// (exercising the multi-node Commit/Apply quorum logic without a network).
-    pub(crate) fn new_multi_with_transport(
+    #[doc(hidden)]
+    pub fn new_multi_with_transport(
         node_id: u64,
         replica_ids: Vec<uuid::Uuid>,
         peers: Arc<dyn AccordTransport>,
@@ -1357,6 +1381,32 @@ impl AccordCoordinatorDriver {
         // below.
         let self_is_replica = self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil();
 
+        // A coordinator that is itself a replica must durably process its own
+        // Commit before it may count itself toward the commit quorum or serve
+        // the following read-vote. Treating self as an implicit ack without
+        // updating the local state leaves one replica blind to its own txn; two
+        // concurrent IF NOT EXISTS coordinators can then each see only one false
+        // vote and both apply. An unpublished state is therefore a hard wiring
+        // error, and a local fsync failure is a failed commit vote.
+        if self_is_replica {
+            let local_sm = self.local_accord_state.as_ref().ok_or_else(|| {
+                AccordDriverError::Network(
+                    "coordinator is a replica but its local Accord state is unpublished".into(),
+                )
+            })?;
+            let mut sm = local_sm.lock();
+            sm.handle_commit(txn_id, t0, commit_t, commit_deps.iter().copied().collect());
+            let locally_committed = sm
+                .get_state(&txn_id)
+                .map(|state| matches!(state.phase, TxnPhase::Committed | TxnPhase::Applied))
+                .unwrap_or(false);
+            if !locally_committed {
+                return Err(AccordDriverError::Network(
+                    "coordinator local Accord commit was not durably recorded".into(),
+                ));
+            }
+        }
+
         // Per-shard quorum: every shard the write-set touches must independently
         // reach its slow quorum. A single global counter would let one shard
         // commit while another is a minority — the cross-shard non-atomicity
@@ -1411,6 +1461,7 @@ impl AccordCoordinatorDriver {
                 .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
             let read_msg = Message::AccordRead(Bytes::from(read_bytes));
 
+            let mut votes_true = 0usize;
             let mut votes_false = 0usize;
             let mut dissenting_row: Vec<u8> = Vec::new();
             // For the generic ReadRow predicate: collect each replica's row-at-`t`
@@ -1470,6 +1521,25 @@ impl AccordCoordinatorDriver {
                         }
                     }
                 }
+            } else if let Some(local_sm) = &self.local_accord_state {
+                // The coordinator's own replica casts the same bounded,
+                // dependency-aware existence vote as a remote handler. It was
+                // durably committed above, so this is a real vote rather than an
+                // optimistic implicit ack.
+                if crate::accord::handlers::await_conflicting_deps_applied(local_sm, &key, commit_t)
+                    .await
+                {
+                    if local_sm.lock().read_condition_holds_at(&key, &commit_t) {
+                        votes_true += 1;
+                    } else {
+                        votes_false += 1;
+                    }
+                } else {
+                    tracing::error!(
+                        txn_id = ?txn_id,
+                        "accord: coordinator local existence read-vote dep-wait timed out — abstaining"
+                    );
+                }
             }
 
             let remote_read_futs: Vec<_> = self
@@ -1495,7 +1565,9 @@ impl AccordCoordinatorDriver {
                                     // F+1 agreement; the coordinator evaluates the
                                     // predicate authoritatively below.
                                     read_rows.push(vote.current_row.clone());
-                                } else if !vote.condition_holds {
+                                } else if vote.condition_holds {
+                                    votes_true += 1;
+                                } else {
                                     // INSERT IF NOT EXISTS existence path.
                                     votes_false += 1;
                                     if dissenting_row.is_empty() {
@@ -1577,22 +1649,36 @@ impl AccordCoordinatorDriver {
                     }
                 }
             } else {
-                // F+1 matching votes decide the outcome.
-                // Only return ConditionNotMet if F+1 replicas explicitly voted false.
-                if votes_false >= sq {
-                    tracing::info!(
-                        txn_id = ?txn_id,
-                        votes_false,
-                        sq,
-                        "accord: IF condition not met — [applied]=false"
-                    );
-                    // Finalize this committed-but-not-applied txn as a no-write
-                    // across replicas so it does not linger as a phantom dep that
-                    // would stall later reads' dep-wait on this key.
-                    self.finalize_no_write().await;
-                    return Err(AccordDriverError::ConditionNotMet {
-                        current_row: dissenting_row,
-                    });
+                // F+1 matching votes decide BOTH outcomes. The legacy path only
+                // required a false quorum and treated every other shape — even
+                // zero replies — as permission to apply.
+                match decide_existence_votes(votes_true, votes_false, sq) {
+                    ExistenceVoteDecision::Apply => {}
+                    ExistenceVoteDecision::ConditionNotMet => {
+                        tracing::info!(
+                            txn_id = ?txn_id,
+                            votes_false,
+                            sq,
+                            "accord: IF condition not met — [applied]=false"
+                        );
+                        // Finalize this committed-but-not-applied txn as a no-write
+                        // across replicas so it does not linger as a phantom dep that
+                        // would stall later reads' dep-wait on this key.
+                        self.finalize_no_write().await;
+                        return Err(AccordDriverError::ConditionNotMet {
+                            current_row: dissenting_row,
+                        });
+                    }
+                    ExistenceVoteDecision::QuorumUnavailable => {
+                        tracing::error!(
+                            txn_id = ?txn_id,
+                            votes_true,
+                            votes_false,
+                            required = sq,
+                            "accord: existence read-vote lacked an explicit F+1 decision"
+                        );
+                        return Err(AccordDriverError::QuorumUnavailable);
+                    }
                 }
             }
         } // end read-vote phase (skipped for ReadPredicate::Always)
@@ -1625,18 +1711,16 @@ impl AccordCoordinatorDriver {
             let owned_writes: Vec<Vec<u8>> = self
                 .write_set
                 .iter()
-                .filter(|e| !e.mutation.is_empty())
                 .filter(|e| self.replica_owns_key(self_id, &e.key))
                 .map(|e| e.mutation.clone())
                 .collect();
-            if !owned_writes.is_empty() {
-                if let Some(local_sm) = &self.local_accord_state {
-                    let mut sm = local_sm.lock();
-                    // Commit then apply on this node's own state machine, mirroring
-                    // the `handle_commit` + `handle_apply_writeset` RPC handlers.
-                    sm.handle_commit(txn_id, t0, commit_t, commit_deps.iter().copied().collect());
-                    sm.handle_apply_writeset(txn_id, owned_writes);
-                } else if let Some(applier) = &self.local_applier {
+            if let Some(local_sm) = &self.local_accord_state {
+                local_sm.lock().handle_apply_writeset(txn_id, owned_writes);
+                if !crate::accord::handlers::await_txn_applied(local_sm, txn_id).await {
+                    return Err(AccordDriverError::ApplyQuorumUnavailable);
+                }
+            } else if !owned_writes.is_empty() {
+                if let Some(applier) = &self.local_applier {
                     let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
                     let owned: Vec<crate::accord::apply::ApplyMutation> = self
                         .write_set
@@ -1926,6 +2010,37 @@ mod tests {
             agreed_row(&[Vec::new(), Vec::new(), b"other".to_vec()], 2),
             Some(Vec::new()),
             "two replicas agreeing the row is absent is a decided read"
+        );
+    }
+
+    /// One affirmative vote at RF=3 is not F+1. A timeout or abstention from the
+    /// other replicas must fail closed, never turn "unknown" into permission to
+    /// apply a conditional write.
+    #[test]
+    fn existence_vote_without_true_quorum_is_unavailable() {
+        assert_eq!(
+            decide_existence_votes(1, 0, 2),
+            ExistenceVoteDecision::QuorumUnavailable
+        );
+        assert_eq!(
+            decide_existence_votes(0, 1, 2),
+            ExistenceVoteDecision::QuorumUnavailable
+        );
+        assert_eq!(
+            decide_existence_votes(0, 0, 2),
+            ExistenceVoteDecision::QuorumUnavailable
+        );
+    }
+
+    #[test]
+    fn existence_vote_requires_an_explicit_quorum_decision() {
+        assert_eq!(
+            decide_existence_votes(2, 0, 2),
+            ExistenceVoteDecision::Apply
+        );
+        assert_eq!(
+            decide_existence_votes(1, 2, 2),
+            ExistenceVoteDecision::ConditionNotMet
         );
     }
     use super::*;
@@ -3024,6 +3139,81 @@ mod tests {
         )
     }
 
+    /// All protocol phases succeed, but only one RF=3 replica returns an
+    /// existence read-vote. Network failures and unexpected replies must not be
+    /// promoted into implicit positive votes.
+    struct OneReadVoteTransport {
+        sole_reader: uuid::Uuid,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for OneReadVoteTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{
+                PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
+            };
+
+            match msg {
+                Message::AccordPreAccept(bytes) => {
+                    let request: PreAcceptPayload = bincode::deserialize(&bytes).unwrap();
+                    let response = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t: request.t0,
+                        deps: Vec::new(),
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&response).unwrap(),
+                    )))
+                }
+                Message::AccordCommit(_) => Ok(Message::AccordCommit(Bytes::new())),
+                Message::AccordRead(bytes) if host_id == self.sole_reader => {
+                    let request: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
+                    let response = ReadVoteOkPayload {
+                        txn_id: request.txn_id,
+                        from: node_id_of(host_id),
+                        condition_holds: true,
+                        current_row: Vec::new(),
+                    };
+                    Ok(Message::AccordReadOK(Bytes::from(
+                        bincode::serialize(&response).unwrap(),
+                    )))
+                }
+                Message::AccordRead(_) => Err(ferrosa_net::error::NetError::Timeout(
+                    "read-vote replica unavailable".into(),
+                )),
+                Message::AccordApply(_) | Message::AccordApplyV2(_) => {
+                    Ok(Message::AccordApplyOK(Bytes::new()))
+                }
+                other => panic!("unexpected Accord test message: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_true_existence_vote_plus_two_failures_does_not_apply_rf3() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let transport = Arc::new(OneReadVoteTransport {
+            sole_reader: replicas[0],
+        });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver.run_transaction().await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::QuorumUnavailable)),
+            "one explicit true vote is below F+1 at RF=3; got {result:?}"
+        );
+    }
+
     /// Regression for the deployed-Accord failure: the coordinator is itself the
     /// SOLE replica (RF=1) — the normal production case where the node serving the
     /// request is a replica for the key. It must process its OWN PreAccept locally
@@ -3092,6 +3282,8 @@ mod tests {
         conflict_t: Timestamp,
         conflict_dep: TxnId,
         accept_targets: parking_lot::Mutex<Vec<uuid::Uuid>>,
+        accept_delay: std::time::Duration,
+        accept_delay_hits: std::sync::atomic::AtomicUsize,
     }
 
     fn node_id_of(host: uuid::Uuid) -> u64 {
@@ -3106,7 +3298,10 @@ mod tests {
             msg: Message,
             _lane: ferrosa_net::codec::Lane,
         ) -> ferrosa_net::error::Result<Message> {
-            use crate::accord::wire::{AcceptOkPayload, AcceptPayload, PreAcceptOkPayload};
+            use crate::accord::wire::{
+                AcceptOkPayload, AcceptPayload, PreAcceptOkPayload, ReadVoteOkPayload,
+                ReadVotePayload,
+            };
             match msg {
                 Message::AccordPreAccept(_) | Message::AccordPreAcceptV2(_) => {
                     let (t, deps) = if host_id == self.remote1 {
@@ -3128,6 +3323,9 @@ mod tests {
                 Message::AccordAccept(b) => {
                     self.accept_targets.lock().push(host_id);
                     if host_id == self.remote1 {
+                        self.accept_delay_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::time::sleep(self.accept_delay).await;
                         let ap: AcceptPayload = bincode::deserialize(&b).unwrap();
                         let ok = AcceptOkPayload { txn_id: ap.txn_id };
                         Ok(Message::AccordAcceptOK(Bytes::from(
@@ -3146,6 +3344,18 @@ mod tests {
                             "unexpected Accept target (self must be local)".into(),
                         ))
                     }
+                }
+                Message::AccordRead(bytes) => {
+                    let read: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
+                    let payload = ReadVoteOkPayload {
+                        txn_id: read.txn_id,
+                        from: node_id_of(host_id),
+                        condition_holds: true,
+                        current_row: Vec::new(),
+                    };
+                    Ok(Message::AccordReadOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
                 }
                 // Commit / Apply / anything else: ack so only Accept is stressed.
                 _ => Ok(Message::AccordApplyOK(Bytes::new())),
@@ -3183,6 +3393,8 @@ mod tests {
             conflict_t: make_ts(2000),
             conflict_dep: make_txn_id(7, 500),
             accept_targets: parking_lot::Mutex::new(Vec::new()),
+            accept_delay: std::time::Duration::from_millis(7),
+            accept_delay_hits: std::sync::atomic::AtomicUsize::new(0),
         });
         let clock = HybridLogicalClock::new(self_node, 0);
 
@@ -3214,6 +3426,13 @@ mod tests {
             targets.contains(&remote1) && targets.contains(&remote2),
             "coordinator must fan Accept out to BOTH remote replicas; sent to {targets:?}"
         );
+        assert_eq!(
+            transport
+                .accept_delay_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the deterministic remote Accept response delay must fire exactly once"
+        );
     }
 
     /// A transport whose remote replicas AGREE with the coordinator: each echoes
@@ -3232,7 +3451,9 @@ mod tests {
             msg: Message,
             _lane: ferrosa_net::codec::Lane,
         ) -> ferrosa_net::error::Result<Message> {
-            use crate::accord::wire::{PreAcceptOkPayload, PreAcceptPayload};
+            use crate::accord::wire::{
+                PreAcceptOkPayload, PreAcceptPayload, ReadVoteOkPayload, ReadVotePayload,
+            };
             match msg {
                 Message::AccordPreAccept(b) => {
                     self.preaccept_targets.lock().push(host_id);
@@ -3244,6 +3465,18 @@ mod tests {
                         deps: vec![],
                     };
                     Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&payload).unwrap(),
+                    )))
+                }
+                Message::AccordRead(bytes) => {
+                    let read: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
+                    let payload = ReadVoteOkPayload {
+                        txn_id: read.txn_id,
+                        from: node_id_of(host_id),
+                        condition_holds: true,
+                        current_row: Vec::new(),
+                    };
+                    Ok(Message::AccordReadOK(Bytes::from(
                         bincode::serialize(&payload).unwrap(),
                     )))
                 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrosa_common::accord::Timestamp;
+use ferrosa_common::accord::{Timestamp, TxnId, TxnPhase};
 
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
@@ -140,6 +140,58 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
     }
 }
 
+/// Wait until one exact transaction reaches `Applied` on this replica.
+///
+/// Apply may park behind an ordered dependency, so calling `handle_apply*` is
+/// not itself a durable Apply acknowledgement. This bounded wait is shared by
+/// inbound handlers and the coordinator's local self-apply path.
+pub async fn await_txn_applied(state: &AccordState, txn_id: TxnId) -> bool {
+    let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
+    loop {
+        let notify = {
+            let sm = state.lock();
+            match sm.get_state(&txn_id) {
+                Some(txn) if txn.phase == TxnPhase::Applied => return true,
+                None => {
+                    tracing::error!(
+                        txn_id = ?txn_id,
+                        "accord: Apply target is absent from local state — refusing ApplyOK"
+                    );
+                    return false;
+                }
+                Some(_) => sm.applied_notify(),
+            }
+        };
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            let (phase, dependency_count, result_bytes) = {
+                let sm = state.lock();
+                match sm.get_state(&txn_id) {
+                    Some(txn) => (
+                        Some(txn.phase),
+                        txn.deps.len(),
+                        txn.result.as_ref().map_or(0, Vec::len),
+                    ),
+                    None => (None, 0, 0),
+                }
+            };
+            tracing::error!(
+                txn_id = ?txn_id,
+                ?phase,
+                dependency_count,
+                result_bytes,
+                "accord: Apply timed out after {:?} waiting for ordered dependencies — refusing ApplyOK",
+                READ_DEP_WAIT_TIMEOUT
+            );
+            return false;
+        }
+
+        let wait = READ_DEP_WAIT_POLL.min(deadline - now);
+        let _ = tokio::time::timeout(wait, notify.notified()).await;
+    }
+}
+
 #[async_trait]
 impl RpcHandler for AccordHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
@@ -245,9 +297,13 @@ impl RpcHandler for AccordHandler {
                     .map_err(|e| tracing::error!("AccordApply: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
-                let mut sm = self.state.lock();
-                sm.handle_apply(txn_id, payload.result_data);
-                drop(sm);
+                {
+                    let mut sm = self.state.lock();
+                    sm.handle_apply(txn_id, payload.result_data);
+                }
+                if !await_txn_applied(&self.state, txn_id).await {
+                    return None;
+                }
                 // Gap 5: return a structured ApplyOK so the coordinator can
                 // count F+1 acknowledged applies before returning to the client.
                 let ok = ApplyOkPayload {
@@ -271,9 +327,13 @@ impl RpcHandler for AccordHandler {
                     .ok()?;
                 let txn_id = payload.txn_id;
                 let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
-                let mut sm = self.state.lock();
-                sm.handle_apply_writeset(txn_id, writes);
-                drop(sm);
+                {
+                    let mut sm = self.state.lock();
+                    sm.handle_apply_writeset(txn_id, writes);
+                }
+                if !await_txn_applied(&self.state, txn_id).await {
+                    return None;
+                }
                 let ok = ApplyOkPayload {
                     txn_id,
                     from: self.local_node_id,
@@ -337,17 +397,10 @@ impl RpcHandler for AccordHandler {
                     // holding it across the wait would deadlock.
                     if !await_conflicting_deps_applied(&self.state, &vote_req.key, vote_req.t).await
                     {
-                        // Dep-wait timed out: abstain. No current_row, and
-                        // condition_holds=false so neither the existence path nor
-                        // a generic read fabricates a "row absent" success.
-                        let ok = ReadVoteOkPayload {
-                            txn_id: vote_req.txn_id,
-                            from: self.local_node_id,
-                            condition_holds: false,
-                            current_row: vec![],
-                        };
-                        let resp_bytes = bincode::serialize(&ok).ok()?;
-                        return Some(Message::AccordReadOK(Bytes::from(resp_bytes)));
+                        // Empty ReadOK is the wire-level abstention already
+                        // recognized by the coordinator. A serialized false vote
+                        // would incorrectly turn a timeout into ConditionNotMet.
+                        return Some(Message::AccordReadOK(Bytes::new()));
                     }
 
                     let sm = self.state.lock();

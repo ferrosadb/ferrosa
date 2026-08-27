@@ -40,7 +40,6 @@ SKIPS=(
   --skip compaction_end_to_end_pipeline
   --skip dep_wait_ordering
   --skip disk_fail_no_phantom
-  --skip packet_reorder_linearizability
   --skip lwt_batch_atomicity_all
   --skip clock_skew_large_preaccept
   --skip binary_

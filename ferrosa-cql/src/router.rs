@@ -2279,20 +2279,28 @@ async fn route_accord_read(
     Ok(RouteResult::Result(frame))
 }
 
+/// Fail closed before any LWT routing work if the inbound-handler state machine
+/// has not been published to the CQL session.
+fn require_local_accord_state_for_lwt(
+    state: &SharedState,
+) -> Result<ferrosa_cluster::accord::AccordState, CqlError> {
+    state.accord_state.load_full().ok_or_else(|| {
+        CqlError::ServerError(
+            "LWT requires cluster mode (local Accord state unpublished); refusing an unsafe remote-only quorum"
+                .into(),
+        )
+    })
+}
+
 /// Route a LWT statement through the Accord consensus protocol.
 ///
 /// Constructs an `AccordCoordinatorDriver`, runs the full PreAccept → Commit
 /// protocol over real TCP, and returns a CQL `[applied]` result set.
 ///
-/// The replica set is built dynamically from `PeerManager::live_peer_ids()`
-/// plus the local node's `host_id`. This ensures newly joined peers are
-/// included without requiring a restart.
-///
 /// # Errors
 ///
-/// Returns `CqlError::ServerError` when:
-/// - The replica set has fewer than 1 member (no peers connected).
-/// - The Accord quorum cannot be reached (network failure / too few replicas).
+/// Returns `CqlError::ServerError` when local Accord state is unavailable or
+/// the Accord quorum cannot be reached.
 async fn route_lwt_via_accord(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -2301,6 +2309,10 @@ async fn route_lwt_via_accord(
     clock: Arc<ferrosa_common::accord::HybridLogicalClock>,
 ) -> Result<RouteResult, CqlError> {
     use ferrosa_cluster::accord::AccordCoordinatorDriver;
+
+    // This is a wiring invariant, so check it before mutation construction,
+    // schema lookup, placement, or any peer traffic.
+    let local_accord_state = require_local_accord_state_for_lwt(state)?;
 
     // Fallback replica set: the live peer map plus this node itself. Used when
     // the write path has no ring (standalone/pair/degraded) and as the basis for
@@ -2370,6 +2382,10 @@ async fn route_lwt_via_accord(
         _ => ReadPredicate::NotExists,
     };
 
+    // A replica-coordinator must cast and persist its own protocol votes against
+    // the SAME state machine served by its inbound handlers. A node is absent
+    // from its own peer map, so continuing without this state silently counts a
+    // fictitious self ack and can let concurrent IF NOT EXISTS writes both apply.
     let mut driver = AccordCoordinatorDriver::new(
         node_id,
         replica_ids,
@@ -2379,7 +2395,8 @@ async fn route_lwt_via_accord(
         key,
         mutation,
     )
-    .with_read_predicate(read_predicate);
+    .with_read_predicate(read_predicate)
+    .with_local_accord_state(local_accord_state);
 
     // Give the coordinator a local applier so its OWN replica persists the
     // mutation it coordinates (its self-send Apply RPC is unreachable). Without
@@ -26655,6 +26672,41 @@ mod tests {
                 raft_state,
             )));
         (state, dir)
+    }
+
+    #[test]
+    fn lwt_refuses_an_unpublished_local_accord_state() {
+        let (state, _dir) = setup();
+
+        let error = match require_local_accord_state_for_lwt(&state) {
+            Err(error) => error,
+            Ok(_) => panic!("LWT must fail closed until the local Accord state is published"),
+        };
+
+        match error {
+            CqlError::ServerError(message) => assert!(
+                message.contains("local Accord state unpublished"),
+                "failure must identify the unsafe missing local state: {message:?}"
+            ),
+            other => panic!("expected CqlError::ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lwt_uses_the_exact_published_local_accord_state() {
+        let (state, _dir) = setup();
+        let local_state: ferrosa_cluster::accord::AccordState = Arc::new(parking_lot::Mutex::new(
+            ferrosa_cluster::accord::AccordStateMachine::new(
+                7,
+                Arc::new(ferrosa_storage::accord::sync_writer::MockSyncWriter::new()),
+            ),
+        ));
+        ferrosa_cluster::accord::publish_accord_state(&state.accord_state, local_state.clone());
+
+        let loaded = require_local_accord_state_for_lwt(&state)
+            .expect("published local Accord state must be available to LWT");
+
+        assert!(Arc::ptr_eq(&loaded, &local_state));
     }
 
     /// LWT INSERT IF NOT EXISTS in cluster mode must return ServerError with
