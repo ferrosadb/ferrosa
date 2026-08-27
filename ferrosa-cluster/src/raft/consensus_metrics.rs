@@ -4,13 +4,9 @@
 //!   text-exposition format, and `run_consensus_metrics_poller` publishes the
 //!   term/leadership derived from `raft.current_leader()` (the same source
 //!   `/readyz` trusts), not the raw `metrics().state` snapshot.
-//! Last revised: 2026-07-22
-//! Last changed: Re-added the current-term / is-leader / has-leader gauges,
-//!   now fed by a DEDICATED poller (`run_consensus_metrics_poller`) that derives
-//!   leadership from `current_leader()`. The earlier attempt published from the
-//!   election-guard poll using `state == Leader`, which read 0 even for a ready
-//!   leader (t_310ad227). The poller is its own task — not the guard — so the
-//!   metric surface does not depend on the ADR-012-deprecated guard.
+//! Last revised: 2026-08-27
+//! Last changed: The dedicated poller now watches OpenRaft metrics changes and
+//!   publishes Fatal/channel-closed state before any leader query.
 //!
 //! # Why `current_leader()` not `metrics().state`
 //!
@@ -36,6 +32,16 @@ static RAFT_HAS_LEADER: AtomicU64 = AtomicU64::new(0);
 
 /// How often the poller samples leadership.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn record_fatal_state<E: std::fmt::Display>(
+    health: &crate::consensus_health::ConsensusHealth,
+    running_state: &Result<(), E>,
+) -> Option<bool> {
+    let Err(fatal) = running_state else {
+        return None;
+    };
+    Some(health.fail("openraft-fatal", format_args!("{fatal}")))
+}
 
 /// Publish the latest Raft liveness sample. Cheap; `Relaxed` because each field
 /// is an independent last-writer-wins sample.
@@ -72,19 +78,54 @@ pub fn is_self_leader(current_leader: Option<u64>, my_id: u64) -> bool {
 ///
 /// Leadership comes from `current_leader()` (the reliable `/readyz` source);
 /// the term comes from the metrics snapshot.
-pub async fn run_consensus_metrics_poller<C>(raft: Arc<Raft<C>>, cancel: CancellationToken)
-where
+pub async fn run_consensus_metrics_poller<C>(
+    raft: Arc<Raft<C>>,
+    cancel: CancellationToken,
+    health: Arc<crate::consensus_health::ConsensusHealth>,
+) where
     C: RaftTypeConfig<NodeId = u64>,
 {
+    let mut metrics_rx = raft.metrics();
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        let metrics = metrics_rx.borrow().clone();
+        if let Some(first_failure) = record_fatal_state(&health, &metrics.running_state) {
+            let fatal = metrics
+                .running_state
+                .as_ref()
+                .expect_err("record_fatal_state only succeeds for Err");
+            if first_failure {
+                tracing::error!(
+                    error = %fatal,
+                    "FATAL: OpenRaft stopped; readiness and CQL data operations are disabled"
+                );
+            }
+            return;
         }
         let leader = raft.current_leader().await;
-        let metrics = raft.metrics().borrow().clone();
         let is_leader = is_self_leader(leader, metrics.id);
         record_raft_state(metrics.current_term, is_leader, leader.is_some());
+
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let first_failure = health.fail(
+                        "openraft-metrics-closed",
+                        format_args!("OpenRaft metrics channel closed without a healthy shutdown signal"),
+                    );
+                    if first_failure {
+                        tracing::error!(
+                            "FATAL: OpenRaft metrics channel closed; readiness and CQL data operations are disabled"
+                        );
+                    }
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
     }
 }
 
@@ -131,6 +172,24 @@ fn format_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openraft_fatal_state_closes_health_without_panicking() {
+        let health = crate::consensus_health::ConsensusHealth::new();
+        assert_eq!(
+            record_fatal_state(&health, &Err::<(), _>("storage apply failed")),
+            Some(true)
+        );
+        assert_eq!(
+            record_fatal_state(&health, &Err::<(), _>("second source")),
+            Some(false),
+            "only the first fatal source owns operator output"
+        );
+        assert!(!health.is_healthy());
+        assert_eq!(health.failure().unwrap().kind(), "openraft-fatal");
+        assert_eq!(health.failure().unwrap().detail(), "storage apply failed");
+        assert_eq!(health.failure_count(), 2);
+    }
 
     #[test]
     fn is_self_leader_matches_only_own_id() {

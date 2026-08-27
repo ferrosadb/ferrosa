@@ -1,8 +1,8 @@
 //! Module: Per-connection CQL native-protocol handler.
 //! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
 //! substitution preserve the CQL wire contract for every accepted opcode.
-//! Last revised: 2026-08-24
-//! Last changed: Expanded compound WHERE tuple bind markers in clustering-column order.
+//! Last revised: 2026-08-27
+//! Last changed: Fail data-bearing opcodes immediately after consensus failure.
 //!
 //! Per-connection CQL protocol handler.
 //!
@@ -52,6 +52,21 @@ use futures::SinkExt;
 
 /// Idle timeout: drop connection if no complete frame arrives within this duration (M11).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+const CONSENSUS_UNAVAILABLE_MESSAGE: &str =
+    "node unavailable: consensus runtime failed; retry another node";
+
+fn consensus_gate_error(consensus_healthy: bool, opcode: Opcode) -> Option<CqlError> {
+    if consensus_healthy
+        || !matches!(
+            opcode,
+            Opcode::Query | Opcode::Prepare | Opcode::Execute | Opcode::Batch
+        )
+    {
+        return None;
+    }
+    Some(CqlError::Overloaded(CONSENSUS_UNAVAILABLE_MESSAGE.into()))
+}
 
 fn build_event_frame(event: CqlEvent, response_version: u8) -> CqlFrame {
     let protocol_version = response_version & 0x7F;
@@ -467,6 +482,28 @@ pub(crate) async fn handle_connection<S>(
             }
             FrameOrPush::ClientFrame(maybe_frame) => {
                 let stream_id = maybe_frame.header.stream_id;
+
+                if matches!(phase, ConnectionPhase::Ready) {
+                    if let Some(err) = consensus_gate_error(
+                        state.mode_controller.consensus_is_healthy(),
+                        maybe_frame.header.opcode,
+                    ) {
+                        let frame = CqlFrame {
+                            header: FrameHeader {
+                                version: response_version,
+                                flags: 0,
+                                stream_id,
+                                opcode: Opcode::Error,
+                                length: 0,
+                            },
+                            body: err.encode_body().freeze(),
+                        };
+                        if framed.send(frame).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
 
                 // Check in-flight limit for request opcodes.
                 // The permit lifetime is tied to the request: held inline
@@ -3216,6 +3253,24 @@ fn extract_keyspace_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consensus_failure_gates_data_opcodes_but_keeps_protocol_responsive() {
+        for opcode in [
+            Opcode::Query,
+            Opcode::Prepare,
+            Opcode::Execute,
+            Opcode::Batch,
+        ] {
+            let err = consensus_gate_error(false, opcode)
+                .unwrap_or_else(|| panic!("{opcode:?} must fail after consensus stops"));
+            assert!(matches!(err, CqlError::Overloaded(_)));
+        }
+
+        assert!(consensus_gate_error(false, Opcode::Options).is_none());
+        assert!(consensus_gate_error(false, Opcode::Register).is_none());
+        assert!(consensus_gate_error(true, Opcode::Query).is_none());
+    }
 
     #[test]
     fn ready_prepare_uses_concurrent_request_path() {

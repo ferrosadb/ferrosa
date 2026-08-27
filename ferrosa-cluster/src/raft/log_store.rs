@@ -9,6 +9,11 @@
 //!   ordered iteration yields entries in index order.
 //! - **`meta`** — small metadata values: `vote`, `committed`, and
 //!   `last_purged`.
+//!
+//! Correctness: reversed apply ranges fail before an empty materialization can
+//! reach OpenRaft; valid ranges preserve ordered, bounded-by-request reads.
+//! Last revised: 2026-08-27
+//! Last changed: Rejected reversed Raft log ranges at the storage boundary.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -936,6 +941,23 @@ impl RaftLogReader<FerrosRaftConfig> for SledLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<FerrosRaftConfig>>, StorageError<u64>> {
+        let raw_start = match range.start_bound() {
+            std::ops::Bound::Included(&idx) | std::ops::Bound::Excluded(&idx) => Some(idx),
+            std::ops::Bound::Unbounded => None,
+        };
+        let raw_end = match range.end_bound() {
+            std::ops::Bound::Included(&idx) | std::ops::Bound::Excluded(&idx) => Some(idx),
+            std::ops::Bound::Unbounded => None,
+        };
+        if let (Some(start), Some(end)) = (raw_start, raw_end) {
+            if start > end {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("reversed Raft log range: start={start}, end={end}"),
+                );
+                return Err(StorageIOError::read_logs(to_any_error(error)).into());
+            }
+        }
         let start_bytes = match range.start_bound() {
             std::ops::Bound::Included(&idx) => std::ops::Bound::Included(Self::index_key(idx)),
             std::ops::Bound::Excluded(&idx) => std::ops::Bound::Excluded(Self::index_key(idx)),
@@ -1759,6 +1781,27 @@ mod tests {
         // Range that doesn't match any entries
         let entries = store.try_get_log_entries(10u64..20u64).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// Regression for the live `raft_core.rs:769` panic: openraft asked for a
+    /// reversed apply window, the store returned an empty `Vec`, and openraft
+    /// indexed `entries[len - 1]` (`usize::MAX`). The storage boundary must
+    /// reject a reversed range loudly while preserving ordinary empty ranges.
+    #[tokio::test]
+    #[allow(clippy::reversed_empty_ranges)] // The invalid range is the regression input.
+    async fn try_get_log_entries_reversed_range_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SledLogStore::new(dir.path()).unwrap();
+
+        let err = store
+            .try_get_log_entries(9u64..4u64)
+            .await
+            .expect_err("a reversed apply range must never look like a valid empty read");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("reversed Raft log range"), "{rendered}");
+        assert!(rendered.contains("start=9"), "{rendered}");
+        assert!(rendered.contains("end=4"), "{rendered}");
     }
 
     #[tokio::test]

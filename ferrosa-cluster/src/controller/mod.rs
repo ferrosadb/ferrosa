@@ -6,9 +6,12 @@
 //! Responsibility: serialize topology transitions and expose health/readiness
 //! that matches the active write and consensus paths.
 //! Correctness: explicit cluster-size intent fails closed until the matching
-//! standalone, pair, or committed Raft membership is observable.
-//! Last revised: 2026-08-26.
-//! Last changed: gate CQL readiness on declared topology and committed voters.
+//! standalone, pair, or committed Raft membership is observable; fatal
+//! consensus state additionally closes data readiness without disabling native
+//! protocol diagnostics.
+//! Last revised: 2026-08-27
+//! Last changed: Combined declared-topology readiness with bounded consensus
+//! supervision and protocol-responsive fail-closed admission.
 //!
 //! Failover lifecycle:
 //!   1. Pair mode active, both nodes connected
@@ -69,6 +72,7 @@ use ferrosa_schema::Schema;
 use ferrosa_storage::engine::StorageEngine;
 
 use crate::config::ClusterConfig;
+use crate::consensus_health::ConsensusHealth;
 use crate::ddl_path::DdlPath;
 use crate::hints::{HintConfig, HintStore};
 use crate::mode::DeploymentMode;
@@ -156,6 +160,9 @@ impl Default for ContentionMetrics {
 /// Created at startup with standalone mode. When peers connect/disconnect,
 /// transitions the mode and atomically swaps the write path and cluster state.
 pub struct ModeController {
+    /// Monotonic process-wide consensus health, read synchronously by CQL and
+    /// readiness so neither path waits on a failed Raft runtime.
+    pub(super) consensus_health: Arc<ConsensusHealth>,
     pub(super) mode: Arc<ArcSwap<DeploymentMode>>,
     pub(super) write_path: Arc<ArcSwap<WritePath>>,
     pub(super) cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
@@ -393,6 +400,7 @@ impl ModeController {
         }
 
         let controller = Arc::new(Self {
+            consensus_health: Arc::new(ConsensusHealth::new()),
             mode: Arc::new(ArcSwap::from_pointee(initial_mode)),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
@@ -505,6 +513,7 @@ impl ModeController {
         let hint_store = Arc::new(HintStore::new(hint_config.clone()).expect("test hint store"));
 
         Arc::new(Self {
+            consensus_health: Arc::new(ConsensusHealth::new()),
             mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Standalone)),
             write_path,
             cluster_state,
@@ -568,6 +577,7 @@ impl ModeController {
         };
 
         Arc::new(Self {
+            consensus_health: Arc::new(ConsensusHealth::new()),
             mode: Arc::new(ArcSwap::from_pointee(DeploymentMode::Pair)),
             write_path,
             cluster_state,
@@ -669,6 +679,16 @@ impl ModeController {
     /// In pair mode only the primary accepts clients; the secondary exists
     /// solely for replication.  Standalone and cluster nodes always accept.
     pub fn is_cql_ready(&self) -> bool {
+        if !self.consensus_health.is_healthy() {
+            return false;
+        }
+        self.accepts_cql_connections()
+    }
+
+    /// Whether declared deployment state permits a native-protocol connection.
+    /// Consensus health is intentionally excluded: a failed node must still
+    /// answer OPTIONS/STARTUP and return typed errors for data opcodes.
+    pub fn accepts_cql_connections(&self) -> bool {
         let expected = self.config.expected_cluster_size;
         let (has_raft_leader, committed_voters) = if expected >= 3 {
             self.raft()
@@ -691,6 +711,16 @@ impl ModeController {
             has_raft_leader,
             committed_voters,
         )
+    }
+
+    /// Shared, monotonic health gate for the process's consensus lane.
+    pub fn consensus_health(&self) -> Arc<ConsensusHealth> {
+        self.consensus_health.clone()
+    }
+
+    /// Synchronous fast path used by readiness and CQL dispatch.
+    pub fn consensus_is_healthy(&self) -> bool {
+        self.consensus_health.is_healthy()
     }
 
     /// Get local host_id.

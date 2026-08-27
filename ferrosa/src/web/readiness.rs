@@ -3,19 +3,22 @@
 //! Returns `200 OK` with `{"ready":true}` when the node is ready to serve
 //! traffic. Returns `503 Service Unavailable` with a JSON body explaining
 //! the missing condition otherwise.
+//! A failed consensus runtime overrides every deployment-mode shortcut and
+//! returns 503 without awaiting a Raft handle.
+//! Last revised: 2026-08-27
+//! Last changed: Added the immediate consensus-runtime failure gate.
 //!
 //! ## Readiness criteria
 //!
 //! | Mode       | Condition                                   |
 //! |------------|---------------------------------------------|
-//! | Standalone | Always ready once the web server is up      |
-//! | Pair       | Always ready (mirrors `is_cql_ready()`)     |
+//! | Standalone | Ready unless consensus supervision failed   |
+//! | Pair       | Ready unless consensus supervision failed   |
 //! | Forming    | Ready only once a Raft leader is elected    |
 //! | Cluster    | Ready only once a Raft leader is elected    |
-//! | Degraded*  | Always ready (stale reads available)        |
+//! | Degraded*  | Mode rules apply unless consensus failed    |
 //!
-//! The probe is intentionally additive — no existing endpoint behavior is
-//! changed. It lives outside the `/api/*` auth middleware so external
+//! It lives outside the `/api/*` auth middleware so external
 //! orchestrators (docker-compose, k8s, smoke scripts) can probe it without
 //! credentials.
 //!
@@ -64,6 +67,16 @@ pub fn readiness_route() -> Router<WebAppState> {
 /// Returns `200` only if a Raft leader is currently known to this node.
 /// Otherwise returns `503` with `{"ready":false,"waiting_for":"raft_leader"}`.
 pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+    if !mc.consensus_is_healthy() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "consensus_runtime",
+                "detail": "consensus runtime failed; retry another node"
+            })),
+        );
+    }
     let mode = mc.mode();
 
     match mode {
@@ -295,6 +308,41 @@ mod tests {
         assert_eq!(
             parsed["ready"], true,
             "standalone node must report ready=true"
+        );
+    }
+
+    /// A dead consensus lane overrides deployment mode and returns immediately.
+    /// Standalone is intentional here: the handler must consult the health gate
+    /// before any mode shortcut or Raft-handle await.
+    #[tokio::test]
+    async fn readyz_consensus_failure_is_immediate_503() {
+        let state = make_state();
+        state.mode_controller.consensus_health().fail(
+            "raft-runtime-panic",
+            format_args!("raft_core.rs:769 empty apply window"),
+        );
+        let router = build_router(state);
+        let req = Request::builder()
+            .uri("/readyz")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(100), router.oneshot(req))
+            .await
+            .expect("failed readiness must not wait on a dead Raft handle")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["waiting_for"], "consensus_runtime");
+        assert_eq!(
+            parsed["detail"],
+            "consensus runtime failed; retry another node"
+        );
+        assert!(
+            !String::from_utf8_lossy(&body).contains("raft_core.rs"),
+            "internal panic details belong in bounded server logs, not health responses"
         );
     }
 

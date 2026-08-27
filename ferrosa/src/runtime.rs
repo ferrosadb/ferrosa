@@ -2,6 +2,10 @@
 //!
 //! Each subsystem gets its own tokio runtime so work on one path cannot
 //! starve another.  The main runtime is supervisor-only.
+//! Correctness: a consensus panic is recorded before unwinding continues; the
+//! process remains alive and client-facing gates fail closed.
+//! Last revised: 2026-08-27
+//! Last changed: Replaced process abort with bounded consensus supervision.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,7 +164,7 @@ impl RuntimeManager {
 /// The runtime whose panic means this node can no longer be a cluster member.
 const CONSENSUS_RUNTIME_THREAD: &str = "raft-rt";
 
-/// Must a panic on this thread take the whole process down?
+/// Did a panic originate on the dedicated consensus runtime?
 ///
 /// A Rust panic unwinds one thread. For most of them that is the right scope —
 /// CQL already wraps request handling in `catch_unwind` so a bad request kills
@@ -173,35 +177,80 @@ const CONSENSUS_RUNTIME_THREAD: &str = "raft-rt";
 /// while serving `keyspace 'agent_memory' not found` to every client. launchd's
 /// `KeepAlive { Crashed = true }` never fired because nothing crashed.
 ///
-/// Matching is exact. `raft-log-store` is the sled blocking pool, and a panic
-/// there is a storage fault with its own error path — aborting on a substring
-/// match would turn a contained failure into an outage.
-pub(crate) fn panic_is_fatal(thread_name: Option<&str>) -> bool {
+/// Matching is exact. `raft-log-store` is the sled blocking pool and has its
+/// own error path.
+pub(crate) fn is_consensus_runtime(thread_name: Option<&str>) -> bool {
     thread_name == Some(CONSENSUS_RUNTIME_THREAD)
 }
 
-/// Make a consensus panic kill the process instead of only its thread.
+/// Record a consensus panic in bounded shared state and return to the caller.
 ///
-/// Chains the previous hook so the panic message and backtrace are still
-/// printed before aborting — a silent abort would replace one undiagnosable
-/// failure with another.
+/// Kept separate from the process-global hook so the survival contract can be
+/// tested without racing other tests' panic hooks.
+fn record_consensus_panic(
+    health: &ferrosa_cluster::ConsensusHealth,
+    thread_name: Option<&str>,
+    payload: &str,
+    location: Option<(&str, u32, u32)>,
+) -> bool {
+    if !is_consensus_runtime(thread_name) {
+        return false;
+    }
+    match location {
+        Some((file, line, column)) => health.fail(
+            "raft-runtime-panic",
+            format_args!(
+                "thread={} at {file}:{line}:{column}: {payload}",
+                thread_name.unwrap_or("unnamed")
+            ),
+        ),
+        None => health.fail(
+            "raft-runtime-panic",
+            format_args!(
+                "thread={} at <unknown>: {payload}",
+                thread_name.unwrap_or("unnamed")
+            ),
+        ),
+    }
+}
+
+/// Install bounded supervision for a consensus-runtime panic.
 ///
-/// `abort`, not `exit`: unwinding out of a poisoned consensus runtime can block
-/// on the very locks the panic left held, and a node that hangs on shutdown is
-/// the same "alive but useless" state this exists to end.
-pub fn install_fatal_panic_hook() {
+/// The process deliberately remains alive: readiness closes, new and existing
+/// CQL data operations return typed retriable errors, while protocol health
+/// remains responsive for diagnosis. Consensus output is deliberately capped;
+/// the prior hook is chained only for unrelated panics whose normal handling
+/// this supervisor must not change.
+pub fn install_consensus_panic_hook(health: Arc<ferrosa_cluster::ConsensusHealth>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        previous(info);
-        let name = std::thread::current().name().map(str::to_owned);
-        if panic_is_fatal(name.as_deref()) {
+        let current = std::thread::current();
+        let name = current.name();
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        let location = info
+            .location()
+            .map(|location| (location.file(), location.line(), location.column()));
+        let consensus_thread = is_consensus_runtime(name);
+        let first_failure = record_consensus_panic(&health, name, payload, location);
+        if consensus_thread {
+            if !first_failure {
+                return;
+            }
+            let detail = health
+                .failure()
+                .map(ferrosa_cluster::ConsensusFailure::detail)
+                .unwrap_or("consensus failure detail unavailable");
             eprintln!(
-                "FATAL: panic on the consensus runtime ({}). This node can no \
-longer replicate, so it must not keep serving reads. Aborting so the supervisor \
-restarts it.",
-                name.as_deref().unwrap_or("unnamed")
+                "FATAL: consensus runtime failed; process remains alive in fail-closed mode; \
+readiness=503; CQL data operations=OVERLOADED; detail={detail}"
             );
-            std::process::abort();
+        } else {
+            previous(info);
         }
     }));
 }
@@ -210,7 +259,8 @@ restarts it.",
 mod tests {
     use super::*;
 
-    /// A panic on the consensus runtime must be fatal to the PROCESS.
+    /// A panic on the consensus runtime must fail the consensus health gate
+    /// without terminating the process.
     ///
     /// Observed on node1 of the local three-node cluster, 2026-08-20. The raft
     /// thread panicked inside openraft:
@@ -230,15 +280,86 @@ mod tests {
     /// receive schema. A live endpoint returning a wrong answer is worse than a
     /// dead one: clients cannot fail over from it.
     ///
-    /// launchd is configured `KeepAlive { Crashed = true }`, which would have
-    /// restarted the node — and never fired, because nothing crashed. Making
-    /// the panic fatal is what connects the existing supervision to the actual
-    /// failure.
+    /// The corrected contract keeps the diagnostic surface alive but makes
+    /// readiness and CQL data operations fail closed from shared health state.
     #[test]
-    fn a_panic_on_the_consensus_runtime_is_fatal() {
+    fn a_panic_on_the_consensus_runtime_fails_health_and_returns() {
+        let health = std::sync::Arc::new(ferrosa_cluster::ConsensusHealth::new());
+
+        let first_failure = record_consensus_panic(
+            &health,
+            Some("raft-rt"),
+            "index out of bounds: len is 0",
+            Some(("raft_core.rs", 769, 35)),
+        );
+
         assert!(
-            panic_is_fatal(Some("raft-rt")),
-            "consensus is not optional: a node that cannot replicate must stop serving"
+            first_failure,
+            "the exact consensus runtime must be supervised"
+        );
+        assert!(
+            !record_consensus_panic(&health, Some("raft-rt"), "repeat", None),
+            "repeat panics must not own another FATAL emission"
+        );
+        assert!(!health.is_healthy());
+        let failure = health.failure().expect("bounded diagnostic is retained");
+        assert!(failure.detail().contains("raft_core.rs:769:35"));
+        assert!(failure.detail().contains("len is 0"));
+        assert!(failure.detail().len() <= 1024, "diagnostic must be bounded");
+        // Reaching this assertion is the process-survival contract: the
+        // recorder returns instead of aborting or panicking.
+        assert_eq!(health.failure_count(), 2);
+    }
+
+    /// Exercise the real process-global hook in a child test process. The old
+    /// implementation aborted here; the child now joins the panicked Raft
+    /// worker, observes failed health, and exits successfully.
+    #[test]
+    fn consensus_panic_hook_keeps_child_process_alive() {
+        const CHILD_ENV: &str = "FERROSA_TEST_CONSENSUS_PANIC_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let health = Arc::new(ferrosa_cluster::ConsensusHealth::new());
+            install_consensus_panic_hook(health.clone());
+            for attempt in 0..2 {
+                let result = std::thread::Builder::new()
+                    .name(CONSENSUS_RUNTIME_THREAD.into())
+                    .spawn(move || panic!("synthetic bounded consensus failure {attempt}"))
+                    .expect("spawn named consensus worker")
+                    .join();
+                assert!(
+                    result.is_err(),
+                    "the worker panic must still unwind its thread"
+                );
+            }
+            assert!(!health.is_healthy(), "the hook must close shared health");
+            assert_eq!(health.failure_count(), 2);
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::consensus_panic_hook_keeps_child_process_alive",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("launch isolated panic-hook test process");
+        assert!(
+            output.status.success(),
+            "consensus panic must not abort the process: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("FATAL: consensus runtime failed").count(),
+            1,
+            "only the first failure source may emit the bounded operator diagnostic: {stderr}"
+        );
+        assert!(
+            stderr.len() <= 1_280,
+            "the isolated operator diagnostic must remain bounded: {} bytes",
+            stderr.len()
         );
     }
 
@@ -250,9 +371,9 @@ mod tests {
     /// to make while fixing the first.
     #[test]
     fn a_panic_on_a_request_runtime_is_not_fatal() {
-        assert!(!panic_is_fatal(Some("cql-rt")));
-        assert!(!panic_is_fatal(Some("data-rt")));
-        assert!(!panic_is_fatal(Some("background-rt")));
+        assert!(!is_consensus_runtime(Some("cql-rt")));
+        assert!(!is_consensus_runtime(Some("data-rt")));
+        assert!(!is_consensus_runtime(Some("background-rt")));
     }
 
     /// An unnamed thread is not assumed fatal. Tokio names its workers, so an
@@ -260,8 +381,8 @@ mod tests {
     /// unrelated library panic an outage.
     #[test]
     fn an_unnamed_thread_is_not_fatal() {
-        assert!(!panic_is_fatal(None));
-        assert!(!panic_is_fatal(Some("")));
+        assert!(!is_consensus_runtime(None));
+        assert!(!is_consensus_runtime(Some("")));
     }
 
     /// Matching must be exact. A substring match on "raft" would catch
@@ -270,10 +391,10 @@ mod tests {
     #[test]
     fn matching_is_exact_not_a_substring() {
         assert!(
-            !panic_is_fatal(Some("raft-log-store")),
+            !is_consensus_runtime(Some("raft-log-store")),
             "the sled blocking pool is not the consensus runtime"
         );
-        assert!(!panic_is_fatal(Some("raft-rt-something-else")));
+        assert!(!is_consensus_runtime(Some("raft-rt-something-else")));
     }
 
     /// T0.2 (t_88223ad0): the runtime tunable parser prefers a valid env value
