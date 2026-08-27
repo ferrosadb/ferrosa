@@ -430,7 +430,8 @@ async fn single_coordinator_round_trips_to_remote_replica() {
         &clock,
         b"round-trip-key".to_vec(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(coord_node.accord_state.clone());
 
     let result = driver.run_transaction().await;
     assert!(
@@ -512,7 +513,8 @@ async fn gap4_gap5_read_vote_and_apply_round_trip() {
         &clock1,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(coord_node.accord_state.clone());
 
     let result1 = driver1.run_transaction().await;
     assert!(
@@ -569,7 +571,8 @@ async fn gap4_gap5_read_vote_and_apply_round_trip() {
         &clock2,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(coord_node.accord_state.clone());
 
     let result2 = driver2.run_transaction().await;
     eprintln!(
@@ -682,7 +685,8 @@ async fn generic_if_reads_real_row_at_t_across_cluster() {
         &clock1,
         key.clone(),
         e2e_mutation_bytes(pk, 50, 1),
-    );
+    )
+    .with_local_accord_state(coord.accord_state.clone());
     // Give the coordinator a local applier (so its own replica persists what it
     // coordinates) and a local reader (so its read-at-`t` counts toward F+1).
     let coord_applier = Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
@@ -727,6 +731,7 @@ async fn generic_if_reads_real_row_at_t_across_cluster() {
         key.clone(),
         e2e_mutation_bytes(pk, 99, 2), // the UPDATE's new value (applied regardless)
     )
+    .with_local_accord_state(coord.accord_state.clone())
     .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
         keyspace: E2E_KS.to_string(),
         table: E2E_TABLE.to_string(),
@@ -852,6 +857,7 @@ async fn generic_if_mismatch_does_not_persist_and_match_does() {
         key.clone(),
         e2e_mutation_bytes(pk, 50, 1),
     )
+    .with_local_accord_state(coord.accord_state.clone())
     .with_local_applier(coord_applier.clone())
     .with_local_reader(coord_reader.clone());
     writer
@@ -882,6 +888,7 @@ async fn generic_if_mismatch_does_not_persist_and_match_does() {
         key.clone(),
         e2e_mutation_bytes(pk, 99, 2),
     )
+    .with_local_accord_state(coord.accord_state.clone())
     .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
         keyspace: E2E_KS.to_string(),
         table: E2E_TABLE.to_string(),
@@ -927,6 +934,7 @@ async fn generic_if_mismatch_does_not_persist_and_match_does() {
         key.clone(),
         e2e_mutation_bytes(pk, 77, 3),
     )
+    .with_local_accord_state(coord.accord_state.clone())
     .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
         keyspace: E2E_KS.to_string(),
         table: E2E_TABLE.to_string(),
@@ -1186,6 +1194,7 @@ async fn applied_lwt_value_survives_state_machine_restart() {
         key.clone(),
         e2e_mutation_bytes(pk, 42, 1),
     )
+    .with_local_accord_state(coord.accord_state.clone())
     .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
         keyspace: E2E_KS.to_string(),
         table: E2E_TABLE.to_string(),
