@@ -8,10 +8,10 @@
 //! - **M4**: No `unwrap()` on user-derived data — all fallible paths return `Result`.
 //! - **M6**: Collection element count capped at `MAX_COLLECTION_ELEMENTS` (65,536).
 //!
-//! Correctness: WHERE tuple restrictions require matching column/value arity
-//! and preserve clustering-column order for keyset cursors.
-//! Last revised: 2026-08-24.
-//! Last changed: accepted compound clustering tuple slices (t_4d8925f4).
+//! Correctness: WHERE tuple restrictions preserve clustering order, and LIMIT
+//! literals are strictly positive so zero never aliases the router's unbounded sentinel.
+//! Last revised: 2026-08-27.
+//! Last changed: reject non-positive literal LIMIT values before routing.
 
 use std::time::Duration;
 
@@ -238,6 +238,11 @@ impl<'input> Parser<'input> {
                     let n = i32::try_from(n).map_err(|_| {
                         CqlError::SyntaxError(format!("LIMIT value out of range: {n}"))
                     })?;
+                    if n <= 0 {
+                        return Err(CqlError::SyntaxError(format!(
+                            "LIMIT value must be positive, got {n}"
+                        )));
+                    }
                     Some(crate::ast::Limit::Literal(n))
                 }
                 TokenKind::QuestionMark => Some(crate::ast::Limit::BindMarker),
@@ -3609,6 +3614,15 @@ mod tests {
             }
             other => panic!("expected Select, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_select_rejects_zero_limit_before_unbounded_routing() {
+        let error = parse("SELECT * FROM t WHERE pk = 1 LIMIT 0").unwrap_err();
+        assert!(
+            matches!(error, CqlError::SyntaxError(ref message) if message.contains("must be positive")),
+            "zero LIMIT must fail loudly instead of aliasing the unbounded sentinel: {error:?}"
+        );
     }
 
     #[test]

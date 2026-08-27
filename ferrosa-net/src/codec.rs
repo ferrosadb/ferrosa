@@ -105,6 +105,10 @@ pub enum MsgType {
     // Initiator → peer: apply these partitions (LWW). Peer → initiator: ack.
     RepairApplyRequest = 0x2D,
     RepairApplyResponse = 0x2E,
+    /// Versioned bounded partition-suffix read. Kept distinct from the legacy
+    /// `ReadRequest` so mixed-version peers reject unsupported semantics
+    /// instead of silently executing a prefix read.
+    PartitionSuffixReadRequest = 0x2F,
     // ADR-020 streaming range read — multi-message RPC keyed by
     // request_id, terminated by RangeReadStreamDone, cancellable via
     // RangeReadStreamCancel, kept alive by RangeReadStreamHeartbeat.
@@ -269,6 +273,7 @@ impl TryFrom<u8> for MsgType {
             0x2C => Ok(Self::RepairFetchResponse),
             0x2D => Ok(Self::RepairApplyRequest),
             0x2E => Ok(Self::RepairApplyResponse),
+            0x2F => Ok(Self::PartitionSuffixReadRequest),
             0x30 => Ok(Self::StreamStart),
             0x31 => Ok(Self::StreamChunk),
             0x32 => Ok(Self::StreamEnd),

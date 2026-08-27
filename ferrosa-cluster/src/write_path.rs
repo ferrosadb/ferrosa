@@ -507,6 +507,76 @@ impl WritePath {
         }
     }
 
+    /// Read at most `row_limit` rows from one partition strictly after an
+    /// exclusive clustering cursor. Cluster mode uses the same token replica
+    /// and consistency-level path as an ordinary partition-key read; it never
+    /// widens into a global range scan.
+    pub async fn pk_read_limited_rows_from(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        start_clustering: &[u8],
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        let rows_opt = match self {
+            Self::Direct(engine) => {
+                return engine.read_limited_rows_from(table_id, key, start_clustering, row_limit);
+            }
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                return coordinator.local_storage().read_limited_rows_from(
+                    table_id,
+                    key,
+                    start_clustering,
+                    row_limit,
+                );
+            }
+            Self::Cluster(coordinator) => match strategy {
+                ReplicationStrategy::Simple { replication_factor } => {
+                    coordinator
+                        .coordinate_read_with_limited_rows_from(
+                            table_id,
+                            key,
+                            cl,
+                            *replication_factor,
+                            row_limit,
+                            start_clustering,
+                        )
+                        .await
+                }
+                ReplicationStrategy::NetworkTopology { .. } => {
+                    coordinator
+                        .coordinate_read_nts_limited_rows_from(
+                            table_id,
+                            key,
+                            cl,
+                            strategy,
+                            row_limit,
+                            start_clustering,
+                        )
+                        .await
+                }
+            },
+            Self::Unavailable => {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "pair mode: primary unavailable, reads rejected until operator promotes".into(),
+                ));
+            }
+        };
+
+        match rows_opt {
+            Ok(Some(rows)) if !rows.is_empty() => Ok(Some(Partition {
+                key: key.clone(),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows,
+            })),
+            Ok(_) => Ok(None),
+            Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+        }
+    }
+
     /// Read exactly one clustered row by full primary key with CL enforcement.
     pub async fn pk_read_clustering_row(
         &self,

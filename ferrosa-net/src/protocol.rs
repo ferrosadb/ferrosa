@@ -1533,6 +1533,7 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::MutationAck
             | MsgType::ReadRequest
             | MsgType::ReadResponse
+            | MsgType::PartitionSuffixReadRequest
             | MsgType::RepairWrite
             | MsgType::RangeReadRequest
             | MsgType::RangeReadResponse

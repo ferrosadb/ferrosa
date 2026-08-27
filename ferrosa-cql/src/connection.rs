@@ -2,7 +2,7 @@
 //! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
 //! substitution preserve the CQL wire contract for every accepted opcode.
 //! Last revised: 2026-08-27
-//! Last changed: Fail data-bearing opcodes immediately after consensus failure.
+//! Last changed: Validate and substitute prepared SELECT LIMIT markers before routing.
 //!
 //! Per-connection CQL protocol handler.
 //!
@@ -27,7 +27,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn, Instrument, Level, Span};
 
-use crate::ast::{Assignment, SelectColumn, SelectStatement, Statement, Term};
+use crate::ast::{Assignment, Limit, SelectColumn, SelectStatement, Statement, Term};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
@@ -1672,7 +1672,10 @@ async fn handle_query(
                 }
             };
         paging = parsed_paging;
-        stmt = substitute_bound_terms(&temp_plan, bound_terms.as_deref());
+        stmt = match substitute_bound_terms(&temp_plan, bound_terms.as_deref()) {
+            Ok(stmt) => stmt,
+            Err(error) => return HandleResult::Reply(Opcode::Error, error.encode_body()),
+        };
     }
 
     // Build an auth context for routing (use a default if auth was disabled).
@@ -2000,7 +2003,10 @@ async fn handle_execute(
         }
     }
 
-    let stmt = substitute_bound_terms(&plan, bound_terms.as_deref());
+    let stmt = match substitute_bound_terms(&plan, bound_terms.as_deref()) {
+        Ok(stmt) => stmt,
+        Err(error) => return HandleResult::Reply(Opcode::Error, error.encode_body()),
+    };
 
     match crate::router::route(state, &ctx, stmt).await {
         Ok(RouteResult::Result(body)) => HandleResult::Reply(Opcode::Result, body),
@@ -2841,18 +2847,71 @@ fn substitute_bound_values(
     protocol_version: u8,
 ) -> Result<Statement, CqlError> {
     let bound_terms = decode_bound_values(plan, cursor, protocol_version)?;
-    Ok(substitute_bound_terms(plan, bound_terms.as_deref()))
+    substitute_bound_terms(plan, bound_terms.as_deref())
 }
 
 pub(crate) fn substitute_bound_terms(
     plan: &PreparedPlan,
     bound_terms: Option<&[Term]>,
-) -> Statement {
-    let Some(bound_terms) = bound_terms else {
-        return plan.statement.clone();
-    };
+) -> Result<Statement, CqlError> {
+    let bound_terms = bound_terms.unwrap_or_default();
     let mut substitution_idx = 0usize;
-    substitute_in_statement(&plan.statement, bound_terms, &mut substitution_idx)
+    let mut statement =
+        substitute_in_statement(&plan.statement, bound_terms, &mut substitution_idx);
+
+    if let Statement::Select(select) = &mut statement {
+        // SELECT marker order is WHERE, ANN OF, LIMIT. This must remain aligned
+        // with count_bind_markers() and analyze_prepared_columns(). The generic
+        // path previously stopped after WHERE, so a range predicate declined
+        // the exact-key fast path and left LIMIT ? looking like no limit at all.
+        if let Some((_, ann_term)) = &mut select.ann_of {
+            substitute_in_term(ann_term, bound_terms, &mut substitution_idx);
+        }
+        substitute_select_limit(&mut select.limit, bound_terms, &mut substitution_idx)?;
+    }
+
+    Ok(statement)
+}
+
+/// Resolve a prepared SELECT LIMIT marker to a positive literal.
+///
+/// Invariant: an unresolved, missing, NULL, malformed, zero, or negative LIMIT
+/// never reaches the router, because the router treats a non-literal limit as
+/// absent and absence is an intentionally unbounded query.
+fn substitute_select_limit(
+    limit: &mut Option<Limit>,
+    terms: &[Term],
+    idx: &mut usize,
+) -> Result<(), CqlError> {
+    let Some(Limit::BindMarker | Limit::NamedBindMarker(_)) = limit else {
+        return Ok(());
+    };
+
+    let term = terms
+        .get(*idx)
+        .ok_or_else(|| CqlError::Invalid("missing prepared SELECT LIMIT value".into()))?;
+    *idx += 1;
+
+    let value = match term {
+        Term::IntegerLiteral(value) => i32::try_from(*value).map_err(|_| {
+            CqlError::Invalid(format!(
+                "prepared SELECT LIMIT value {value} is out of range"
+            ))
+        })?,
+        other => {
+            return Err(CqlError::Invalid(format!(
+                "prepared SELECT LIMIT must be an integer, got {other:?}"
+            )))
+        }
+    };
+    if value <= 0 {
+        return Err(CqlError::Invalid(format!(
+            "prepared SELECT LIMIT must be positive, got {value}"
+        )));
+    }
+
+    *limit = Some(Limit::Literal(value));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3973,6 +4032,90 @@ mod tests {
         } else {
             panic!("expected Select statement");
         }
+    }
+
+    #[test]
+    fn prepared_select_bound_limit_is_substituted_after_where() {
+        let plan = make_plan(
+            "SELECT cursor FROM ks.events WHERE tenant = ? AND cursor > ? LIMIT ?",
+            vec![
+                ("tenant", CqlType::Varchar),
+                ("cursor", CqlType::Bigint),
+                ("[limit]", CqlType::Int),
+            ],
+        );
+        let after = 10i64.to_be_bytes();
+        let limit = 2i32.to_be_bytes();
+        let payload = encode_values(&[b"tenant-a", &after, &limit]);
+
+        let result = substitute_bound_values(&plan, &payload, 4).unwrap();
+        let Statement::Select(select) = result else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.limit, Some(crate::ast::Limit::Literal(2)));
+    }
+
+    #[test]
+    fn prepared_select_bound_limit_rejects_missing_value() {
+        let plan = make_plan(
+            "SELECT cursor FROM ks.events WHERE tenant = ? LIMIT ?",
+            vec![("tenant", CqlType::Varchar), ("[limit]", CqlType::Int)],
+        );
+        let payload = encode_values(&[b"tenant-a"]);
+
+        let error = substitute_bound_values(&plan, &payload, 4).unwrap_err();
+        assert!(
+            matches!(error, CqlError::Invalid(ref message) if message.contains("missing prepared SELECT LIMIT")),
+            "missing LIMIT must fail before routing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_select_bound_limit_rejects_null() {
+        let plan = make_plan(
+            "SELECT cursor FROM ks.events WHERE tenant = ? LIMIT ?",
+            vec![("tenant", CqlType::Varchar), ("[limit]", CqlType::Int)],
+        );
+        let mut payload = encode_values(&[b"tenant-a"]);
+        payload[1..3].copy_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&(-1i32).to_be_bytes());
+
+        let error = substitute_bound_values(&plan, &payload, 4).unwrap_err();
+        assert!(
+            matches!(error, CqlError::Invalid(ref message) if message.contains("must be an integer")),
+            "NULL LIMIT must fail before routing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_select_bound_limit_rejects_non_positive_value() {
+        let plan = make_plan(
+            "SELECT cursor FROM ks.events WHERE tenant = ? LIMIT ?",
+            vec![("tenant", CqlType::Varchar), ("[limit]", CqlType::Int)],
+        );
+        let zero = 0i32.to_be_bytes();
+        let payload = encode_values(&[b"tenant-a", &zero]);
+
+        let error = substitute_bound_values(&plan, &payload, 4).unwrap_err();
+        assert!(
+            matches!(error, CqlError::Invalid(ref message) if message.contains("must be positive")),
+            "zero LIMIT must fail before routing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_select_bound_limit_rejects_malformed_int() {
+        let plan = make_plan(
+            "SELECT cursor FROM ks.events WHERE tenant = ? LIMIT ?",
+            vec![("tenant", CqlType::Varchar), ("[limit]", CqlType::Int)],
+        );
+        let payload = encode_values(&[b"tenant-a", b"not-an-int"]);
+
+        let error = substitute_bound_values(&plan, &payload, 4).unwrap_err();
+        assert!(
+            matches!(error, CqlError::Invalid(ref message) if message.contains("must be an integer")),
+            "malformed LIMIT must fail before routing, got {error:?}"
+        );
     }
 
     #[test]

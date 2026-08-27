@@ -6103,6 +6103,29 @@ impl StorageEngine {
         }
     }
 
+    /// Read at most `row_limit` rows strictly after `start_clustering` from one
+    /// partition without retaining the already-delivered prefix or the tail.
+    ///
+    /// Each memtable/SSTable source drops prefix rows before retaining its
+    /// bounded suffix, and SSTable decoding stops once that suffix is full. The
+    /// merge therefore stays O(sources × row_limit) regardless of partition
+    /// width or paging progress.
+    pub fn read_limited_rows_from(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        start_clustering: &[u8],
+        row_limit: usize,
+    ) -> ferrosa_common::Result<Option<Partition>> {
+        let tables = self.tables.read();
+        match tables.get(table_id) {
+            Some(state) => state
+                .store
+                .read_limited_rows_from(key, start_clustering, row_limit),
+            None => Ok(None),
+        }
+    }
+
     /// SSTable generations the read path has quarantined for `table_id` because
     /// a read exhausted the view-retry bound against them (genuine corruption,
     /// not a transient compaction window). A non-empty result is the storage

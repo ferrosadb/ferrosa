@@ -14,6 +14,7 @@
 //! | `RaftVote(bytes)`          | [`RaftVoteHandler`]  | `RaftVoteResponse(bytes)` |
 //! | `RaftInstallSnapshot(bytes)`| [`RaftSnapshotHandler`]| `RaftAppendResponse(bytes)`|
 //! | `ReadRequest(bytes)`       | [`ReadRequestHandler`]| `ReadResponse(bytes)`    |
+//! | `PartitionSuffixReadRequest(bytes)` | [`ReadRequestHandler`] | `ReadResponse(bytes)` |
 //!
 //! # Serialization of Partition Data
 //!
@@ -342,6 +343,23 @@ pub struct ReadRequestPayload {
     /// return partition rows according to page_size/page_state.
     #[serde(default)]
     pub clustering: Vec<u8>,
+}
+
+/// Additive wire payload for a bounded partition suffix read.
+///
+/// This deliberately uses a distinct internode message type rather than
+/// appending a positional bincode field to [`ReadRequestPayload`]. A new node
+/// therefore continues to decode legacy requests byte-for-byte, while an old
+/// node rejects this unknown operation instead of silently dropping the suffix
+/// bound and returning a prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionSuffixReadRequestPayload {
+    /// Wire-schema version. The only supported value is 1.
+    pub version: u8,
+    /// Unchanged legacy request fields used for table, key, digest, and limit.
+    pub request: ReadRequestPayload,
+    /// Exclusive clustering-key lower bound. Must be non-empty.
+    pub start_clustering: Vec<u8>,
 }
 
 /// Payload for a remote read response.
@@ -924,17 +942,40 @@ impl ReadRequestHandler {
 #[async_trait]
 impl RpcHandler for ReadRequestHandler {
     async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-        let bytes = match msg {
-            Message::ReadRequest(b) => b,
+        let (req, start_clustering) = match msg {
+            Message::ReadRequest(bytes) => {
+                let req: ReadRequestPayload = bincode::deserialize(&bytes)
+                    .map_err(|e| {
+                        tracing::warn!("ReadRequestHandler: failed to deserialize request: {e}");
+                        e
+                    })
+                    .ok()?;
+                (req, None)
+            }
+            Message::PartitionSuffixReadRequest(bytes) => {
+                let suffix: PartitionSuffixReadRequestPayload = bincode::deserialize(&bytes)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "ReadRequestHandler: failed to deserialize suffix request: {e}"
+                        );
+                        e
+                    })
+                    .ok()?;
+                if suffix.version != 1
+                    || suffix.start_clustering.is_empty()
+                    || !suffix.request.clustering.is_empty()
+                    || !suffix.request.page_state.is_empty()
+                {
+                    tracing::warn!(
+                        version = suffix.version,
+                        "ReadRequestHandler: rejected malformed suffix read request"
+                    );
+                    return None;
+                }
+                (suffix.request, Some(suffix.start_clustering))
+            }
             _ => return None,
         };
-
-        let req: ReadRequestPayload = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("ReadRequestHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
 
         let table_id = TableId::new(&req.keyspace, &req.table);
         let key = DecoratedKey::new(PartitionKey::new(req.key));
@@ -951,6 +992,9 @@ impl RpcHandler for ReadRequestHandler {
         let storage_read = if !req.clustering.is_empty() {
             self.storage
                 .read_clustering_row(&table_id, &key, &req.clustering)
+        } else if let Some(start_clustering) = start_clustering.as_deref() {
+            self.storage
+                .read_limited_rows_from(&table_id, &key, start_clustering, page_size)
         } else if page_size > 0 && page_offset == 0 {
             // First page: over-read by one row so the paging logic below can
             // tell whether a tail exists past this page.
@@ -1790,6 +1834,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_read_request_payload_decodes_on_new_node() {
+        #[derive(Serialize)]
+        struct LegacyReadRequestPayload {
+            keyspace: String,
+            table: String,
+            key: Vec<u8>,
+            digest_only: bool,
+            page_size: u32,
+            page_state: Vec<u8>,
+            clustering: Vec<u8>,
+        }
+
+        let legacy = LegacyReadRequestPayload {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: b"the_key".to_vec(),
+            digest_only: false,
+            page_size: 17,
+            page_state: vec![],
+            clustering: vec![],
+        };
+        let bytes = bincode::serialize(&legacy).expect("serialize legacy payload");
+        let decoded: ReadRequestPayload = bincode::deserialize(&bytes)
+            .expect("a new node must accept the unchanged legacy ReadRequest payload");
+        assert_eq!(decoded.page_size, 17);
+    }
+
+    #[test]
     fn read_response_payload_serde_roundtrip() {
         let partition = make_partition(b"k", 42);
         let resp = ReadResponsePayload {
@@ -2094,6 +2166,68 @@ mod tests {
             "every row in a partition larger than one page must be paged out; \
              losing the tail is the cluster count(*) data-loss bug"
         );
+    }
+
+    #[tokio::test]
+    async fn read_request_handler_bounds_partition_suffix_from_clustering_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key_bytes = b"cursor_partition".as_slice();
+        let dk = DecoratedKey::new(PartitionKey::new(key_bytes.to_vec()));
+        for i in 0..25u32 {
+            storage
+                .write(
+                    &table_id,
+                    &dk,
+                    Row {
+                        clustering: i.to_be_bytes().to_vec(),
+                        cells: vec![(0, CellValue::live(vec![i as u8], 1000 + i as i64))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
+                    },
+                    1000 + i as i64,
+                )
+                .unwrap();
+        }
+
+        let handler = ReadRequestHandler::new(storage);
+        let req = PartitionSuffixReadRequestPayload {
+            version: 1,
+            request: ReadRequestPayload {
+                keyspace: "test_ks".to_string(),
+                table: "test_tbl".to_string(),
+                key: key_bytes.to_vec(),
+                digest_only: false,
+                page_size: 3,
+                page_state: vec![],
+                clustering: vec![],
+            },
+            start_clustering: 19u32.to_be_bytes().to_vec(),
+        };
+        let response = handler
+            .handle(
+                make_peer_id(),
+                Message::PartitionSuffixReadRequest(Bytes::from(bincode::serialize(&req).unwrap())),
+            )
+            .await
+            .expect("handler responds");
+        let Message::ReadResponse(bytes) = response else {
+            panic!("expected ReadResponse");
+        };
+        let response: ReadResponsePayload = bincode::deserialize(&bytes).unwrap();
+        let partition = partition_from_wire(response.partition.expect("suffix rows"));
+        assert_eq!(
+            partition
+                .rows
+                .iter()
+                .map(|row| u32::from_be_bytes(row.clustering.as_slice().try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![20, 21, 22]
+        );
+        assert!(!response.has_more, "CQL cursor owns suffix continuation");
     }
 
     #[tokio::test]

@@ -833,7 +833,11 @@ fn partition_with_matching_clustering(
     })
 }
 
-fn clone_partition_limited(partition: &Partition, row_limit: usize) -> Partition {
+fn clone_partition_limited(
+    partition: &Partition,
+    start_clustering: Option<&[u8]>,
+    row_limit: usize,
+) -> Partition {
     if row_limit == 0 {
         return partition.clone();
     }
@@ -842,7 +846,13 @@ fn clone_partition_limited(partition: &Partition, row_limit: usize) -> Partition
         key: partition.key.clone(),
         deletion: partition.deletion,
         static_row: partition.static_row.clone(),
-        rows: partition.rows.iter().take(row_limit).cloned().collect(),
+        rows: partition
+            .rows
+            .iter()
+            .filter(|row| start_clustering.is_none_or(|start| row.clustering.as_slice() > start))
+            .take(row_limit)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1527,7 +1537,21 @@ impl<F: FlushTarget> TableStore<F> {
         row_limit: usize,
     ) -> Result<Option<Partition>> {
         self.with_retried_view("read_limited_rows", |view| {
-            self.read_with_view(view, key, row_limit)
+            self.read_with_view(view, key, row_limit, None)
+        })
+    }
+
+    /// Read a bounded clustering suffix from one partition. Every source drops
+    /// rows at or before `start_clustering` before retaining at most
+    /// `row_limit`, so the merge never holds the delivered prefix or tail.
+    pub fn read_limited_rows_from(
+        &self,
+        key: &DecoratedKey,
+        start_clustering: &[u8],
+        row_limit: usize,
+    ) -> Result<Option<Partition>> {
+        self.with_retried_view("read_limited_rows_from", |view| {
+            self.read_with_view(view, key, row_limit, Some(start_clustering))
         })
     }
 
@@ -1670,6 +1694,7 @@ impl<F: FlushTarget> TableStore<F> {
         guard: &StoreView,
         key: &DecoratedKey,
         row_limit: usize,
+        start_clustering: Option<&[u8]>,
     ) -> Result<(Option<Partition>, Option<CorruptSstableId>)> {
         let started = Instant::now();
         let schema = self.schema.load();
@@ -1689,14 +1714,14 @@ impl<F: FlushTarget> TableStore<F> {
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
             memtable_hits += 1;
-            sources.push(clone_partition_limited(&p, row_limit));
+            sources.push(clone_partition_limited(&p, start_clustering, row_limit));
         }
 
         // Flushing memtable
         if let Some(ref flushing) = guard.flushing {
             if let Some(p) = flushing.get(key)? {
                 flushing_hits += 1;
-                sources.push(clone_partition_limited(&p, row_limit));
+                sources.push(clone_partition_limited(&p, start_clustering, row_limit));
             }
         }
 
@@ -1738,7 +1763,11 @@ impl<F: FlushTarget> TableStore<F> {
                 continue;
             }
             sstable_probes += 1;
-            match sstable.get_partition_limited_rows(key, row_limit) {
+            let source_read = match start_clustering {
+                Some(start) => sstable.get_partition_limited_rows_from(key, start, row_limit),
+                None => sstable.get_partition_limited_rows(key, row_limit),
+            };
+            match source_read {
                 Ok(Some(mut p)) => {
                     sstable_hits += 1;
                     ColumnOrdinalMapping::for_header(&schema, sstable.header())
@@ -7471,7 +7500,7 @@ mod tests {
         }));
 
         let view = store.view.load_full();
-        let (result, corrupt) = store.read_with_view(&view, &key, 0).unwrap();
+        let (result, corrupt) = store.read_with_view(&view, &key, 0, None).unwrap();
         assert!(
             result.is_none(),
             "the truncated source yields no rows on this single view snapshot"
