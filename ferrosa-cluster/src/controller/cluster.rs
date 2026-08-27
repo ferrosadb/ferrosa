@@ -3,9 +3,11 @@
 //! Responsibility: construct the Raft/ring/write-path stack and publish it in
 //! formation order while preserving queued schema mutations.
 //! Correctness: formation work is bounded, cancel-aware, and never advertises
-//! durable topology before the relevant consensus state exists.
-//! Last revised: 2026-08-26.
-//! Last changed: bound the transient DDL replay queue.
+//! durable topology before the relevant consensus state exists; Raft fatal
+//! metrics are supervised by the shared fail-closed health gate.
+//! Last revised: 2026-08-27
+//! Last changed: Combined bounded formation/DDL replay with fatal Raft metrics
+//! supervision.
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -1657,6 +1659,7 @@ impl ModeController {
         }
 
         let bootstrap_complete_counter = bootstrap_complete_count;
+        let consensus_health = self.consensus_health();
         self.spawn_tracked(async move {
             // Deliver ClusterInvite to all peers BEFORE starting Raft.
             // This ensures peers transition to cluster mode and register
@@ -1933,9 +1936,15 @@ impl ModeController {
                 use crate::raft::consensus_metrics::run_consensus_metrics_poller;
                 let metrics_raft = raft_arc.clone();
                 let metrics_cancel = election_guard_cancel.clone();
+                let metrics_health = consensus_health.clone();
                 ferrosa_net::task_pool::TaskPool::current("raft-consensus-metrics").spawn(
                     async move {
-                        run_consensus_metrics_poller(metrics_raft, metrics_cancel).await;
+                        run_consensus_metrics_poller(
+                            metrics_raft,
+                            metrics_cancel,
+                            metrics_health,
+                        )
+                        .await;
                     },
                 );
             }

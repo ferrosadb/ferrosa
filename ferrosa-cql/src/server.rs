@@ -1,4 +1,8 @@
 //! CQL TCP server: accepts connections and spawns per-connection tasks.
+//! Correctness: admission is bounded and rejects failed consensus with a typed,
+//! retriable error before authentication or routing work begins.
+//! Last revised: 2026-08-27
+//! Last changed: Added fail-closed admission for consensus runtime failure.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -334,7 +338,7 @@ impl CqlServer {
                         }
                         // In pair mode, only the primary accepts CQL connections.
                         // Secondaries reject with Overloaded so drivers retry on the primary.
-                        if !state.mode_controller.is_cql_ready() {
+                        if !state.mode_controller.accepts_cql_connections() {
                             active.fetch_sub(1, Ordering::Relaxed);
                             tracing::debug!(
                                 "rejecting CQL connection: node is pair-mode secondary"
@@ -953,6 +957,113 @@ mod tests {
         // 0x1001 = Overloaded error code
         let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
         assert_eq!(error_code, 0x1001, "expected Overloaded error code");
+    }
+
+    /// A client connecting after the Raft lane failed can still negotiate the
+    /// protocol, then receives a typed retriable error for data operations.
+    #[tokio::test]
+    async fn consensus_failure_keeps_new_cql_protocol_responsive() {
+        let (state, _dir) = setup_state();
+        state.mode_controller.consensus_health().fail(
+            "raft-runtime-panic",
+            format_args!("raft_core.rs:769 empty apply window"),
+        );
+        let mut config = test_config(10, 64);
+        config.auth_disabled = true;
+        let server = CqlServer::new(config, state);
+        let addr = server.start_background().await.unwrap();
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let (options_header, _) = send_empty_request_and_read_frame(&mut conn, 1, 0x05).await;
+        assert_eq!(options_header.opcode, Opcode::Supported);
+        assert_eq!(
+            startup_and_read_one_frame(&mut conn).await.opcode,
+            Opcode::Ready
+        );
+
+        let (query_header, query_body) =
+            send_empty_request_and_read_frame(&mut conn, 2, 0x07).await;
+        assert_eq!(query_header.opcode, Opcode::Error);
+        assert_eq!(
+            i32::from_be_bytes(query_body[..4].try_into().unwrap()),
+            0x1001,
+            "expected retriable Overloaded"
+        );
+        let message_len = u16::from_be_bytes(query_body[4..6].try_into().unwrap()) as usize;
+        let message = std::str::from_utf8(&query_body[6..6 + message_len]).unwrap();
+        assert_eq!(
+            message,
+            "node unavailable: consensus runtime failed; retry another node"
+        );
+    }
+
+    async fn send_empty_request_and_read_frame(
+        stream: &mut TcpStream,
+        stream_id: i16,
+        opcode: u8,
+    ) -> (FrameHeader, Vec<u8>) {
+        use bytes::BufMut;
+        use tokio::io::AsyncWriteExt;
+
+        let mut request = bytes::BytesMut::with_capacity(HEADER_SIZE);
+        request.put_u8(0x04);
+        request.put_u8(0x00);
+        request.put_i16(stream_id);
+        request.put_u8(opcode);
+        request.put_u32(0);
+        stream.write_all(&request).await.unwrap();
+
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            stream.read_exact(&mut header_bytes),
+        )
+        .await
+        .expect("established connection must remain responsive")
+        .unwrap();
+        let header = FrameHeader::decode(&header_bytes).unwrap();
+        let mut body = vec![0u8; header.length as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        (header, body)
+    }
+
+    /// Connections established before the failure must be fail-closed too.
+    /// OPTIONS remains available to prove the native protocol is alive; QUERY
+    /// fails before its (intentionally empty) body can reach parsing/routing.
+    #[tokio::test]
+    async fn established_cql_connection_fails_data_ops_but_answers_options() {
+        let (state, _dir) = setup_state();
+        let mut config = test_config(10, 64);
+        config.auth_disabled = true;
+        let server = CqlServer::new(config, state.clone());
+        let addr = server.start_background().await.unwrap();
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            startup_and_read_one_frame(&mut conn).await.opcode,
+            Opcode::Ready
+        );
+
+        state.mode_controller.consensus_health().fail(
+            "raft-runtime-panic",
+            format_args!("raft_core.rs:769 empty apply window"),
+        );
+
+        let (options_header, _) = send_empty_request_and_read_frame(&mut conn, 1, 0x05).await;
+        assert_eq!(options_header.opcode, Opcode::Supported);
+
+        let (query_header, query_body) =
+            send_empty_request_and_read_frame(&mut conn, 2, 0x07).await;
+        assert_eq!(query_header.opcode, Opcode::Error);
+        assert_eq!(
+            i32::from_be_bytes(query_body[..4].try_into().unwrap()),
+            0x1001,
+            "existing connections receive retriable Overloaded"
+        );
+        let message_len = u16::from_be_bytes(query_body[4..6].try_into().unwrap()) as usize;
+        assert_eq!(
+            std::str::from_utf8(&query_body[6..6 + message_len]).unwrap(),
+            "node unavailable: consensus runtime failed; retry another node"
+        );
     }
 
     #[test]
