@@ -59,20 +59,21 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 0. **CLI meta flags** — `--version`/`-V` and `--help`/`-h` print one line (`ferrosa <semver>`) and exit *before* tracing or config, so the output is parseable rather than interleaved with startup logs. Any other argument falls through to normal startup, so existing wrappers that pass extra flags are unaffected. Previously these flags were ignored and the **daemon started**, which meant anything probing the binary for its version silently launched a database.
 1. **Tracing** — non-blocking writer (`tracing-appender`); optional OTel layer when `FERROSA_TELEMETRY_ENABLED=true` (`--features otel`).
 2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); file values win over environment values, which win over built-in defaults.
-3. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
-4. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; probe S3 CAS; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables; replay pending S3 uploads.
-5. **Schema** — `Schema::new` (composes audit sinks); seed default roles if auth enabled; restore schema from local `schema.json` → S3 bootstrap → fresh; re-register secondary indexes, UDTs, UDFs, role permissions from `system_schema.*`; replay pending commit-log mutations.
-6. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode.
-7. **PeerManager** — wire as `ModeController`'s `PeerEventListener`; start the heartbeat loop; spawn the self-heal controller with a **live** peer-health probe.
-8. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
-9. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
-10. **Arrow Flight** (`:8815`, `flight` feature) — signing key from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral if unset — warns).
-11. **Web console** (`:9090`).
-12. **Automatic repair** — self-heal controller with verified-replica cluster view + quarantine→refill trigger; periodic anti-entropy scheduler.
-13. **Graph** (HTTP `:7474` + Bolt `:7687`) if enabled; **Postgres** (`:5432`); **SPARQL** (`:8080`) if enabled.
-14. **Seeds** — background connect to `FERROSA_SEED` peers with exponential backoff.
-15. **Maintenance loop** — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3).
-16. **Shutdown** — `SIGINT`/`SIGTERM` → 30 s graceful drain: stop cluster tasks → drain internode → flush memtables → persist schema (local + S3).
+3. **Schema preflight** — load the size-bounded, discriminated local `schema.json` before storage or any listener. Legacy arrays, corrupt/oversized documents, and unknown formats are quarantined and abort startup; they never become an empty registry.
+4. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
+5. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; probe S3 CAS; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables; replay pending S3 uploads. Storage-only recovery metadata lives in `storage-schema.json`, never `schema.json`.
+6. **Schema** — `Schema::new` (composes audit sinks); seed default roles if auth enabled; apply the preflighted local snapshot or use S3 bootstrap/fresh startup; re-register secondary indexes, UDTs, UDFs, role permissions from `system_schema.*`; replay pending commit-log mutations.
+7. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode.
+8. **PeerManager** — wire as `ModeController`'s `PeerEventListener`; start the heartbeat loop; spawn the self-heal controller with a **live** peer-health probe.
+9. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
+10. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
+11. **Arrow Flight** (`:8815`, `flight` feature) — signing key from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral if unset — warns).
+12. **Web console** (`:9090`).
+13. **Automatic repair** — self-heal controller with verified-replica cluster view + quarantine→refill trigger; periodic anti-entropy scheduler.
+14. **Graph** (HTTP `:7474` + Bolt `:7687`) if enabled; **Postgres** (`:5432`); **SPARQL** (`:8080`) if enabled.
+15. **Seeds** — background connect to `FERROSA_SEED` peers with exponential backoff.
+16. **Maintenance loop** — periodic + urgent flush, compaction polling, commit-log GC, schema persist (local + S3).
+17. **Shutdown** — `SIGINT`/`SIGTERM` → 30 s graceful drain: stop cluster tasks → drain internode → flush memtables → persist schema (local + S3).
 
 ## How the subsystems compose
 
@@ -82,7 +83,7 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
   over CQL, and a DDL over CQL replicates over the same `DdlPath` the graph
   engine uses.
 - **CdcBus injection.** The `ferrosa-cdc` bus is attached to the engine's commit
-  log at step 4, *before* any front-end starts, so live CQL `SUBSCRIBE` and the
+  log at step 5, *before* any front-end starts, so live CQL `SUBSCRIBE` and the
   Arrow Flight stream observe the same change events.
 - **SessionCore as the execution hub.** `ferrosa-session::SessionCore` bundles
   engine + schema + write/DDL paths + UDF executor + `ModeController` + peer
@@ -107,7 +108,7 @@ flat under tight cgroups; override with `MALLOC_CONF`).
 | Variable | Purpose |
 |----------|---------|
 | `FERROSA_CONFIG` | TOML config path (default `/etc/ferrosa/ferrosa.toml`) |
-| `FERROSA_DATA_DIR` | data directory (default `/var/lib/ferrosa`) — holds `host_id`, `schema.json`, commit log, hints |
+| `FERROSA_DATA_DIR` | data directory (default `/var/lib/ferrosa`) — holds `host_id`, registry-owned `schema.json`, storage-only `storage-schema.json`, commit log, hints |
 | `FERROSA_HOST_ID` | authoritative host-id override (wins over disk) |
 | `FERROSA_INTERNODE_BROADCAST` | host/port advertised during internode handshakes; file equivalent `[internode].broadcast` is authoritative and preserves the exact endpoint |
 | `FERROSA_AUTH_ENABLED` | single source of truth for CQL role auth; `[cql].auth_enabled` is authoritative when configured |

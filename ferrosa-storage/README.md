@@ -123,8 +123,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   immediately, before restart; tracker cleanup is still idempotent when the
   table is not registered in this engine process. Re-registering an already
   loaded table with index declarations merges any missing declarations into the
-  existing store, keeping disk-loaded sidecars readable after `schema.json`
-  boot preload. Concurrent registration is compare-and-install: a late schema
+  existing store, keeping disk-loaded sidecars readable after local-schema
+  boot preload. The registry-owned `schema.json` is a discriminated, bounded,
+  crash-safe document; the engine's standalone recovery list is written to the
+  separate `storage-schema.json`, so a flush can never replace registry state
+  with an incompatible array. Concurrent registration is compare-and-install: a late schema
   replay merges declarations into the winning store instead of replacing its
   live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable

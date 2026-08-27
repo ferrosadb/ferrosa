@@ -87,9 +87,14 @@ flowchart TD
 - **S3 is authoritative.** Local NVMe is a write-behind cache. Cache eviction
   removes only local copies of remotely-durable objects; manifest-pinned entries
   are never evicted, and `PinMode::NvMe` tables deliberately keep no S3 copy.
-- **Crash recovery.** On `open`, the engine loads `schema.json`, replays
-  commit-log segments into memtables (bounded), and replays the pending-upload
-  log so in-flight S3 uploads complete. Pending-upload replay scans both flat
+- **Crash recovery.** On `open`, the engine first loads the size-bounded,
+  discriminated registry `schema.json`; if no registry snapshot exists, a
+  storage-only consumer can use the separately owned `storage-schema.json`.
+  Both files stream through bounded serde readers, and the storage list is
+  published through stage/fsync/verify/atomic-rename/directory-fsync rather
+  than a whole-file buffer. The engine then replays commit-log segments into
+  memtables (bounded) and the pending-upload log so in-flight S3 uploads
+  complete. Pending-upload replay scans both flat
   SSTable components and generation-directory components produced by S3 restore.
 - **Quarantine.** A row that fails cell/clustering validation at flush or replay
   is written to a durable `quarantine/*.jsonl` sidecar and skipped; the flush
