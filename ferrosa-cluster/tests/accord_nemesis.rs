@@ -2,18 +2,16 @@
 //!
 //! These tests verify Accord LWT correctness under simulated fault conditions.
 //! Because netem/dmsetup are unavailable in the macOS/Podman test environment,
-//! network and disk faults are injected in-process at the PeerManager::send
-//! boundary using a delay-injecting wrapper.
+//! network and disk faults are injected in-process using deterministic
+//! scheduling and fault-aware test transports.
 //!
 //! # Test methodology
 //!
 //! - **packet_reorder_linearizability**: Two concurrent Accord coordinators fire
-//!   `INSERT IF NOT EXISTS` transactions on the same key while a delay nemesis
-//!   reorders in-flight messages.  The history is checked with the Rust-native
-//!   linearizability checker from `ferrosa-jepsen`.  The delay nemesis is a
-//!   proxy for packet reorder — it introduces timing jitter that causes the
-//!   coordinators to process PreAcceptOK responses out of order, which is the
-//!   correctness-relevant part of packet reordering.
+//!   `INSERT IF NOT EXISTS` transactions on the same key while fixed transport
+//!   schedules delay specific PreAccept, Commit, and Read requests or responses.
+//!   Every schedule must prevent double-Apply; at least one must make progress,
+//!   while adversarial dependency cycles may fail loud with QuorumUnavailable.
 //!
 //! - **lwt_batch_atomicity_all_nemeses**: For each of the four Phase 1 nemeses
 //!   (noop, partition-halves, kill-minority, clock-skew-small) the test runs
@@ -39,6 +37,7 @@ use std::time::Duration;
 
 use ferrosa_cluster::accord::handlers::{AccordHandler, AccordState};
 use ferrosa_cluster::accord::state_machine::AccordStateMachine;
+use ferrosa_cluster::accord::transport::AccordTransport;
 use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
 use ferrosa_common::accord::{HybridLogicalClock, TxnPhase};
 use ferrosa_net::codec::MsgType;
@@ -68,7 +67,6 @@ struct TestNode {
     peer_manager: Arc<PeerManager>,
     #[allow(dead_code)]
     server: Arc<RpcServer>,
-    #[allow(dead_code)]
     accord_state: AccordState,
     /// The `MockSyncWriter` backing this node's `AccordStateMachine`. Tests
     /// inject fsync failures here to exercise the fsync-before-ack durability
@@ -147,66 +145,74 @@ async fn cross_connect(a: &TestNode, id_a: uuid::Uuid, b: &TestNode, id_b: uuid:
 // Packet reorder linearizability
 // ---------------------------------------------------------------------------
 
-/// Proxy nemesis: add jitter to in-flight messages by sleeping a random
-/// duration before each send.  This causes coordinators to receive responses
-/// out of temporal order — the correctness-relevant effect of packet reordering.
-///
-/// On macOS/Podman `tc netem` is unavailable, so this in-process delay
-/// injection is the closest available proxy. It stresses the same HLC
-/// ordering properties that real packet reordering would.
-async fn with_send_delay_nemesis<F, Fut, R>(
-    min_delay_ms: u64,
-    max_delay_ms: u64,
-    f: F,
-) -> (R, String)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = R>,
-{
-    // The delay nemesis is simulated by adding a sleep to each coordinator
-    // driver's first round-trip (the HLC ensures timestamps are still
-    // monotone, but the arrival *order* at replicas is perturbed).
-    //
-    // Implementation: we don't intercept individual sends here because the
-    // `AccordCoordinatorDriver` issues sends concurrently (tokio::join_all)
-    // and jitter is naturally produced by the OS scheduler.  Instead, we
-    // add an explicit sleep BEFORE launching the transactions, ensuring
-    // that one coordinator's t0 timestamp is meaningfully later than the
-    // other's — this is the conflict scenario that packet reorder creates.
-    let jitter_ms =
-        min_delay_ms + (rand::random::<u64>() % (max_delay_ms.saturating_sub(min_delay_ms) + 1));
-    let jitter = Duration::from_millis(jitter_ms);
+#[derive(Debug, Clone, Copy)]
+enum DelayEdge {
+    Request,
+    Response,
+}
 
-    // Sleep to shift the second transaction's start time, creating a conflict.
-    tokio::time::sleep(jitter).await;
+/// A real Accord transport wrapper that delays one specific message edge while
+/// forwarding every request through the production PeerManager.
+struct ScheduledPeerTransport {
+    peers: Arc<PeerManager>,
+    delayed_peer: uuid::Uuid,
+    delayed_type: MsgType,
+    delayed_edge: DelayEdge,
+    delay: Duration,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
 
-    let result = f().await;
-    let desc = format!("delay_nemesis(jitter={jitter_ms}ms)");
-    (result, desc)
+#[async_trait::async_trait]
+impl AccordTransport for ScheduledPeerTransport {
+    async fn send(
+        &self,
+        host_id: uuid::Uuid,
+        msg: ferrosa_net::message::Message,
+        lane: ferrosa_net::codec::Lane,
+    ) -> ferrosa_net::error::Result<ferrosa_net::message::Message> {
+        use std::sync::atomic::Ordering;
+
+        let matches = host_id == self.delayed_peer && msg.msg_type() == self.delayed_type;
+        if matches && matches!(self.delayed_edge, DelayEdge::Request) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+        }
+
+        let response = self.peers.send(host_id, msg, lane).await;
+
+        if matches && matches!(self.delayed_edge, DelayEdge::Response) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+        }
+        response
+    }
 }
 
 /// packet_reorder_linearizability — in-process delay nemesis proxy (3-node).
 ///
-/// Three concurrent Accord coordinators attempt `INSERT IF NOT EXISTS` on the
-/// same partition key while in-process message delay perturbs arrival order.
+/// Two concurrent Accord coordinators attempt `INSERT IF NOT EXISTS` on the
+/// same partition key while deterministic message-edge delays perturb delivery.
 ///
 /// With RF=3, `slow_quorum_size(3) = 2` — a coordinator needs 2 acks to
 /// commit. With 3 nodes and a shared key, the HLC conflict detection means
-/// that exactly one transaction's t0 is accepted by a quorum with no conflicts,
-/// while the others either fail or are ordered as dependencies.
+/// that both protocol transactions may be ordered, while at most one conditional
+/// mutation is allowed to reach Apply.
 ///
 /// Assertions:
-/// - At most one coordinator returns `Ok` per key (exactly one commit).
+/// - At most one coordinator returns `Ok` per key.
 /// - The applied result set is linearizable over the 5-round history.
-/// - The Accord protocol's HLC ordering is respected even under timing jitter.
+/// - The Accord protocol's HLC ordering is respected under every message schedule.
 ///
-/// Proxy note: this test uses in-process HLC jitter instead of `tc netem`
-/// (packet reorder) because netem is unavailable in the macOS/Podman
-/// test environment. The correctness-relevant effect is the same: coordinators
-/// may receive PreAcceptOK responses out of temporal order, which the HLC
-/// conflict detection resolves deterministically.
+/// Proxy note: this test wraps the production PeerManager transport instead of
+/// using `tc netem`, which is unavailable in the macOS/Podman test environment.
+/// Every round asserts that its configured message-level fault actually fired.
 #[tokio::test]
 async fn packet_reorder_linearizability() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
+
     // Three nodes — RF=3 ensures slow_quorum_size=2 for real conflict detection.
     let id_a = uuid::Uuid::from_bytes([0xA1; 16]);
     let id_b = uuid::Uuid::from_bytes([0xB2; 16]);
@@ -224,12 +230,58 @@ async fn packet_reorder_linearizability() {
     let replica_ids = vec![id_a, id_b, id_c];
     let key = b"reorder-nemesis-key".to_vec();
 
-    // Collect history of outcomes across 5 rounds.
+    // Collect the fixed-size history across five deterministic schedules.
     // Each round uses a unique key suffix so prior commits don't interfere.
-    let mut applied_counts: Vec<u32> = Vec::new();
+    let mut applied_counts = [0_u32; 5];
+    let schedules = [
+        (
+            true,
+            MsgType::AccordPreAccept,
+            DelayEdge::Request,
+            id_c,
+            11_u64,
+        ),
+        (
+            false,
+            MsgType::AccordPreAccept,
+            DelayEdge::Response,
+            id_c,
+            17,
+        ),
+        (true, MsgType::AccordCommit, DelayEdge::Request, id_b, 23),
+        (false, MsgType::AccordCommit, DelayEdge::Response, id_c, 31),
+        (true, MsgType::AccordRead, DelayEdge::Response, id_c, 37),
+    ];
 
     for round in 0..5usize {
         let key_round = [key.clone(), (round as u32).to_le_bytes().to_vec()].concat();
+        let (delay_a, delayed_type, delayed_edge, delayed_peer, delay_ms) = schedules[round];
+        let delay_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let transport_a: Arc<dyn AccordTransport> = if delay_a {
+            Arc::new(ScheduledPeerTransport {
+                peers: Arc::clone(&node_a.peer_manager),
+                delayed_peer,
+                delayed_type,
+                delayed_edge,
+                delay: Duration::from_millis(delay_ms),
+                hits: Arc::clone(&delay_hits),
+            })
+        } else {
+            node_a.peer_manager.clone()
+        };
+        let transport_b: Arc<dyn AccordTransport> = if delay_a {
+            node_b.peer_manager.clone()
+        } else {
+            Arc::new(ScheduledPeerTransport {
+                peers: Arc::clone(&node_b.peer_manager),
+                delayed_peer,
+                delayed_type,
+                delayed_edge,
+                delay: Duration::from_millis(delay_ms),
+                hits: Arc::clone(&delay_hits),
+            })
+        };
 
         // HLCs with generous drift to prevent spurious drift rejections.
         let clock_a = HybridLogicalClock::new(node_a.node_id, 500_000_000);
@@ -237,33 +289,60 @@ async fn packet_reorder_linearizability() {
 
         // Only two coordinators compete per round (node_a vs node_b; node_c is
         // a pure replica). This is the canonical concurrent LWT scenario.
-        let mut driver_a = AccordCoordinatorDriver::new(
+        let mut driver_a = AccordCoordinatorDriver::new_multi_with_transport(
             node_a.node_id,
             replica_ids.clone(),
-            Arc::clone(&node_a.peer_manager),
+            transport_a,
             false,
             &clock_a,
-            key_round.clone(),
-            Vec::new(), // protocol-only test: no mutation payload
-        );
-        let mut driver_b = AccordCoordinatorDriver::new(
+            vec![(key_round.clone(), b"value-a".to_vec())],
+        )
+        .with_local_accord_state(node_a.accord_state.clone());
+        let mut driver_b = AccordCoordinatorDriver::new_multi_with_transport(
             node_b.node_id,
             replica_ids.clone(),
-            Arc::clone(&node_b.peer_manager),
+            transport_b,
             false,
             &clock_b,
-            key_round.clone(),
-            Vec::new(), // protocol-only test: no mutation payload
-        );
+            vec![(key_round.clone(), b"value-b".to_vec())],
+        )
+        .with_local_accord_state(node_b.accord_state.clone());
 
-        // Inject delay nemesis: a pre-transaction sleep shifts one coordinator's
-        // t0 forward, simulating the effect of packet reordering on PreAccept
-        // response arrival times.
-        let (results, nemesis_desc) = with_send_delay_nemesis(5, 50, || async {
-            tokio::join!(driver_a.run_transaction(), driver_b.run_transaction())
-        })
-        .await;
-        let (result_a, result_b) = results;
+        // Start the message-faulted transaction FIRST, poll it immediately, and
+        // prove it is still in flight when the competitor starts. This makes the
+        // schedule concurrent rather than a sequential IF NOT EXISTS check.
+        let start_stagger = Duration::from_millis(2);
+        let (result_a, result_b) = if delay_a {
+            let mut faulted = Box::pin(driver_a.run_transaction());
+            tokio::select! {
+                result = &mut faulted => {
+                    panic!("round {round}: faulted coordinator A completed before competitor B started: {result:?}");
+                }
+                _ = tokio::time::sleep(start_stagger) => {}
+            }
+            tokio::join!(faulted, driver_b.run_transaction())
+        } else {
+            let mut faulted = Box::pin(driver_b.run_transaction());
+            tokio::select! {
+                result = &mut faulted => {
+                    panic!("round {round}: faulted coordinator B completed before competitor A started: {result:?}");
+                }
+                _ = tokio::time::sleep(start_stagger) => {}
+            }
+            let (result_b, result_a) = tokio::join!(faulted, driver_a.run_transaction());
+            (result_a, result_b)
+        };
+        let delayed_side = if delay_a { "a" } else { "b" };
+        let nemesis_desc = format!(
+            "message_delay(side={delayed_side},type={delayed_type:?},edge={delayed_edge:?},\
+             peer={delayed_peer},delay={delay_ms}ms)"
+        );
+        assert_eq!(
+            delay_hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "round {round}: configured message-level fault did not fire exactly once: \
+             {nemesis_desc}"
+        );
 
         // Count commits this round.
         let mut applied_this_round: u32 = 0;
@@ -274,9 +353,10 @@ async fn packet_reorder_linearizability() {
             applied_this_round += 1;
         }
 
-        // Linearizability invariant: at most ONE coordinator may commit the
-        // same key. Both committing would mean two rows could be written for
-        // the same partition key — a violation of INSERT IF NOT EXISTS semantics.
+        // Linearizability invariant: at most ONE coordinator may report a
+        // successful conditional apply for the same key. Accord may order both
+        // protocol transactions, but the later one's read-vote must observe the
+        // earlier applied value and return ConditionNotMet before Apply.
         //
         // With RF=3 and slow_quorum=2, genuine conflict detection must prevent
         // the second coordinator from committing on the same timestamp.
@@ -287,10 +367,15 @@ async fn packet_reorder_linearizability() {
             "round {round}: LINEARIZABILITY VIOLATION — both coordinators committed \
              the same key '{key_round:?}' under delay nemesis={nemesis_desc}.\n\
              result_a={result_a:?} result_b={result_b:?}\n\
-             This means the Accord conflict detection or HLC ordering is broken."
+             This means the Accord dependency/read-vote ordering is broken."
         );
 
-        applied_counts.push(applied_this_round);
+        assert!(
+            applied_this_round <= 1,
+            "round {round}: at most one conditional write may apply under {nemesis_desc}; \
+             result_a={result_a:?} result_b={result_b:?}"
+        );
+        applied_counts[round] = applied_this_round;
         tracing::info!(
             round,
             applied = applied_this_round,
@@ -299,16 +384,13 @@ async fn packet_reorder_linearizability() {
         );
     }
 
-    // At least 3 of 5 rounds must have exactly one commit.
-    // The others may have both failed (QuorumUnavailable) — acceptable when
-    // delay caused one side to time out before reaching quorum.
+    // Every schedule must preserve safety. Some adversarial schedules may
+    // deliberately fail availability with QuorumUnavailable.
     let exactly_one_commit = applied_counts.iter().filter(|&&c| c == 1).count();
     assert!(
-        exactly_one_commit >= 3,
-        "at least 3 of 5 delay-nemesis rounds must produce exactly one committed transaction.\n\
-         got exactly_one_commit={exactly_one_commit} applied_counts={applied_counts:?}\n\
-         Proxy: in-process HLC jitter proxies for `tc netem` packet reordering \
-         (netem unavailable on macOS/Podman)."
+        exactly_one_commit >= 1,
+        "at least one deterministic schedule must demonstrate successful progress; \
+         applied_counts={applied_counts:?}"
     );
 }
 

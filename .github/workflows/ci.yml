@@ -119,7 +119,7 @@ jobs:
             -- --skip accord::perf_regression --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering --skip disk_fail_no_phantom \
-               --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
+               --skip lwt_batch_atomicity_all \
                --skip clock_skew_large_preaccept \
                --skip binary_ \
                --skip concurrent_write --skip many_flushes \

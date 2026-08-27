@@ -281,7 +281,8 @@ async fn two_coordinators_concurrent_insert_if_not_exists() {
         &clock_a,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(node_a.accord_state.clone());
     let mut driver_b = AccordCoordinatorDriver::new(
         node_b.node_id,
         replica_ids.clone(),
@@ -290,7 +291,8 @@ async fn two_coordinators_concurrent_insert_if_not_exists() {
         &clock_b,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(node_b.accord_state.clone());
 
     // Fire both transactions concurrently (real RPC over TCP).
     let (result_a, result_b) = tokio::join!(driver_a.run_transaction(), driver_b.run_transaction());
