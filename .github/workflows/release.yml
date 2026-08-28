@@ -16,6 +16,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
 
 permissions:
   contents: write
@@ -325,7 +328,7 @@ jobs:
       - name: Inspect published manifest
         run: |
           first_tag=$(echo "${{ steps.tags.outputs.tags }}" | awk '{print $1}')
-          docker buildx imagetools inspect "${first_tag}" || echo "manifest inspect failed (non-fatal; image already pushed)"
+          docker buildx imagetools inspect "${first_tag}"
 
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────
   release:

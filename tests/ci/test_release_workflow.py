@@ -35,6 +35,19 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("\npermissions:\n  actions: read", workflow)
 
+    def test_release_checkout_is_quiet_and_manifest_inspection_fails_loud(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "env:\n"
+            "  CARGO_TERM_COLOR: always\n"
+            "  GIT_CONFIG_COUNT: 1\n"
+            "  GIT_CONFIG_KEY_0: init.defaultBranch\n"
+            "  GIT_CONFIG_VALUE_0: main",
+            workflow,
+        )
+        self.assertNotIn("manifest inspect failed", workflow)
+        self.assertNotIn("docker buildx imagetools inspect \"${first_tag}\" ||", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
