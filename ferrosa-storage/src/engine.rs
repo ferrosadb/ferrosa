@@ -4385,29 +4385,34 @@ impl StorageEngine {
             // a per-partition row index (ferrosa-sstable/src/writer.rs:212).
             // A 0-byte Rows.db is the expected output, not corruption; the
             // reader treats a missing/empty Rows.db as "no row index".
-            // Only Data.db and Partitions.db being zero-byte is unrecoverable.
-            let critical_components = ["Data.db", "Partitions.db"];
-            let mut quarantine = false;
-            for comp in &critical_components {
-                let path = Self::generation_component_path(table_dir, &gen_str, comp)
-                    .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() == 0 => {
-                        quarantine = true;
-                    }
-                    Err(_) => {
-                        // Missing component — will fail in open_sstable_from_dir.
-                    }
-                    _ => {}
-                }
-            }
-            if quarantine {
+            // Only Data.db and Partitions.db are critical.
+            //
+            // A MISSING component counts, not only a zero-byte one. This used
+            // to fall through on the reasoning that it "will fail in
+            // open_sstable_from_dir" -- and it does, as
+            // `storage: I/O error: No such file or directory (os error 2)`
+            // naming no table, no generation and no path, failing every read
+            // of that table rather than the one generation. Missing is
+            // strictly worse than empty and is caught in the same place.
+            let probes: Vec<(&str, crate::sstable_health::ComponentProbe)> =
+                crate::sstable_health::CRITICAL_COMPONENTS
+                    .iter()
+                    .map(|comp| {
+                        let path = Self::generation_component_path(table_dir, &gen_str, comp)
+                            .unwrap_or_else(|| table_dir.join(format!("{gen_str}-{comp}")));
+                        (*comp, crate::sstable_health::probe_component(&path))
+                    })
+                    .collect();
+            let defect = crate::sstable_health::first_unusable_component(&probes);
+            if let Some((component, reason)) = defect {
                 match repair_mode {
                     StartupSstableRepairMode::Quarantine => {
                         tracing::error!(
                             gen,
                             dir = %table_dir.display(),
-                            "storage-engine: startup repair quarantining SSTable with zero-byte critical component"
+                            component,
+                            reason = reason.describe(),
+                            "storage-engine: startup repair quarantining SSTable with an unusable critical component"
                         );
                         let quarantine_dir = table_dir.join("quarantine");
                         let _ = std::fs::create_dir_all(&quarantine_dir);
@@ -4422,7 +4427,9 @@ impl StorageEngine {
                             gen,
                             dir = %table_dir.display(),
                             mode = ?repair_mode,
-                            "storage-engine: startup repair excluded SSTable with zero-byte critical component from active readers; files remain in place for salvage"
+                            component,
+                            reason = reason.describe(),
+                            "storage-engine: startup repair excluded SSTable with an unusable critical component from active readers; files remain in place for salvage"
                         );
                         excluded_count += 1;
                     }

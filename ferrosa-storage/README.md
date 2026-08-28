@@ -202,6 +202,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
+- **Startup SSTable health** (`sstable_health.rs`) — decides whether a
+  generation on disk can serve reads before it is loaded. A critical component
+  (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or
+  **unreadable** withholds the generation; `Rows.db` is excluded because the
+  writer legitimately emits it empty for simple partitions. The judgement is a
+  pure function so it is testable without a disk or a cluster, and the log line
+  names the component and the reason — a manifest entry pointing at a file that
+  is gone used to surface only as `No such file or directory (os error 2)` with
+  no table, generation or path, failing every read of that table.
 - **Accord** (`accord/`) — per-shard conflict index + protocol log for
   strict-serializable transactions. Also defines `TransactionCommitter` (ADR-021):
   the front-end-facing seam CQL/Postgres `BEGIN`/`COMMIT` call to commit a

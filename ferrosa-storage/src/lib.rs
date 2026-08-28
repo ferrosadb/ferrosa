@@ -40,6 +40,7 @@ pub mod schema_snapshot;
 pub mod self_heal;
 pub mod snapshot;
 pub mod spill_budget;
+pub(crate) mod sstable_health;
 pub mod store;
 pub mod subscription_observer;
 #[cfg(feature = "test-generators")]
