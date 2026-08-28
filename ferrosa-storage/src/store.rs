@@ -6068,12 +6068,27 @@ impl<F: FlushTarget> TableStore<F> {
                             sst.total_size()
                         }
                         None => {
+                            // Quarantine, do not merely skip. Skipping removes
+                            // it from THIS compaction plan and nothing else: it
+                            // stays in the read set, so every read keeps
+                            // opening a file that is gone and fails the whole
+                            // table with a bare ENOENT, and planning skips it
+                            // again next cycle, so it is never compacted away
+                            // either. Two ferrosa-memory tables sat in that
+                            // state for days. Quarantining makes reads skip it
+                            // and hands its token range to anti-entropy repair.
+                            self.quarantine_sstable(&CorruptSstableId {
+                                gen: id.clone(),
+                                dir: sstable_path.clone(),
+                                min_token: desc.min_token,
+                                max_token: desc.max_token,
+                            });
                             tracing::warn!(
                                 sstable_id = %id,
                                 table_dir = ?sstable_path,
-                                "compaction planning: skipping SSTable because required on-disk \
-                                 component files are missing or empty and no remote component \
-                                 length hook confirmed object-storage availability"
+                                "compaction planning: quarantining SSTable because required \
+                                 on-disk component files are missing or empty and no remote \
+                                 component length hook confirmed object-storage availability"
                             );
                             return None;
                         }
@@ -7463,6 +7478,58 @@ mod tests {
     /// spurious `Ok(None)` (silent data loss). Before the fix the mid-read `Err`
     /// arm of `read_with_view` left `sstable_open_failed = false`, so no retry
     /// fired and the committed key vanished.
+    /// A phantom SSTable — one the engine still holds a reader for while its
+    /// on-disk components are gone — must be QUARANTINED by compaction
+    /// planning, not merely dropped from the candidate list.
+    ///
+    /// Skipping it from compaction alone is what made this permanent on the
+    /// ferrosa-memory cluster. The generation could never be compacted away
+    /// (planning skips it every cycle) and was never evicted from the read
+    /// set, so every read of the table kept opening a file that was not there
+    /// and failed with a bare `No such file or directory (os error 2)`. Two
+    /// tables sat like that for days.
+    #[test]
+    fn planning_quarantines_an_sstable_whose_components_are_gone() {
+        let store = test_store();
+        let schema = test_schema();
+
+        // The directory exists and holds no component files: exactly the state
+        // left behind when the files go and the reader does not.
+        let table_dir = tempfile::tempdir().expect("temp dir");
+        let phantom_dir = table_dir.path().join("agent_memory.phantom");
+        std::fs::create_dir_all(&phantom_dir).expect("create table dir");
+
+        let reader = Arc::new(sstable_reader_from_partitions(
+            &schema,
+            &[make_partition("k-phantom", b"v", 1000)],
+            None,
+        ));
+        let current = store.view.load_full();
+        let desc =
+            SstableDescriptor::from_reader("phantom-gen".to_string(), phantom_dir.clone(), &reader);
+        store.seed_reader(&desc, reader);
+        store.view.store(Arc::new(StoreView {
+            active: new_memtable(),
+            flushing: None,
+            sstables: Arc::new(vec![desc.clone()]),
+            sstable_ids: Arc::new(vec![("phantom-gen".to_string(), phantom_dir.clone())]),
+            indexes: Arc::clone(&current.indexes),
+            sidecar_indexes: Arc::new(vec![Arc::new(HashMap::new())]),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        }));
+
+        let planned = store.sstable_metadata(&phantom_dir);
+        assert!(
+            planned.is_empty(),
+            "a file-less SSTable must not be offered as a compaction input"
+        );
+        assert!(
+            store.is_sstable_quarantined("phantom-gen"),
+            "planning must also quarantine it — otherwise it can never be \
+             compacted away and every read keeps opening a file that is gone"
+        );
+    }
+
     #[test]
     fn mid_read_fetch_error_signals_view_retry() {
         let store = test_store();

@@ -202,6 +202,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   found at flush/replay are written to a durable `quarantine/*.jsonl` sidecar
   instead of crashing; the self-heal controller detects corrupt SSTables and
   quarantines them under a safety rail.
+- **Phantom-SSTable eviction** (`store.rs`, compaction planning) — when an
+  SSTable's local components cannot be sized and object storage has no copy,
+  planning **quarantines** it rather than only skipping it. Skipping alone left
+  the generation immortal: never selected for compaction, never evicted from
+  the read set, so every read of the table opened a file that was gone.
 - **Startup SSTable health** (`sstable_health.rs`) — decides whether a
   generation on disk can serve reads before it is loaded. A critical component
   (`Data.db`, `Partitions.db`) that is **missing**, **zero-byte**, or
