@@ -1,5 +1,8 @@
-//! Top-level storage engine composing commit log, memtable, flush, compaction,
-//! S3 upload, manifest, and local cache into a single API.
+//! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
+//! Correctness: Correct when admitted writes are durable before visibility and reads,
+//! replay, flush, and maintenance preserve table and cursor invariants.
+//! Last revised: 2026-08-29
+//! Last changed: Added table-scoped count-and-byte bounded durable CDC pages.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -34,6 +37,7 @@ use ferrosa_schema::SchemaSnapshot;
 use ferrosa_sstable::types::{Partition, Row};
 
 use crate::cache::LocalCache;
+use crate::commitlog::cdc::{CdcPageLimit, CdcReader, CdcReplayError, DurableCdcPage};
 use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
@@ -6958,6 +6962,23 @@ impl StorageEngine {
     /// the snapshot covers.
     pub fn commit_log_position(&self) -> CommitLogPosition {
         self.commit_log.current_position()
+    }
+
+    /// Read one table-authorized durable CDC page from an explicit cursor.
+    /// The reader owns only one entry payload plus the count-and-byte bounded
+    /// result page; retained segment metadata is scanned without collection.
+    pub fn durable_cdc_page(
+        &self,
+        position: CommitLogPosition,
+        table: TableId,
+        limit: CdcPageLimit,
+    ) -> Result<DurableCdcPage, CdcReplayError> {
+        let mut reader = CdcReader::from_position(
+            &self.config.commit_log.log_dir,
+            position,
+            Some(HashSet::from([table])),
+        )?;
+        reader.read_page(limit)
     }
 
     /// Open the engine by restoring the snapshot named in `intent`.

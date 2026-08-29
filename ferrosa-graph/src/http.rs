@@ -1,4 +1,8 @@
-//! HTTP/JSON endpoint for graph queries.
+//! Module: Serve authenticated bounded HTTP/JSON graph and durable CDC requests.
+//! Correctness: Correct when authentication and authorization precede storage I/O,
+//! request/page bounds are enforced, and storage failures return sanitized typed responses.
+//! Last revised: 2026-08-29
+//! Last changed: Added authenticated durable cursor-page admission and replay.
 //!
 //! Provides a REST API for executing Cypher queries, explaining query plans,
 //! inspecting graph schema, and health checks. Includes Basic auth middleware (T2),
@@ -33,7 +37,11 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tokio_util::sync::CancellationToken;
 
 use ferrosa_schema::auth::role::AuthContext;
+use ferrosa_schema::auth::{Permission, Resource};
 use ferrosa_schema::Schema;
+use ferrosa_storage::commitlog::cdc::CdcPageLimit;
+use ferrosa_storage::commitlog::cdc::CdcReplayError;
+use ferrosa_storage::{CommitLogPosition, TableId};
 
 use crate::engine::GraphEngine;
 use crate::error::GraphError;
@@ -80,6 +88,77 @@ pub struct QueryRequest {
     pub keyspace: String,
     #[serde(default)]
     pub params: HashMap<String, Value>,
+}
+
+/// Initial durable CDC transport contract. Source-filtered graph projection is
+/// layered on this authenticated, authorized, cursor-bounded transport.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableCdcPageRequest {
+    keyspace: String,
+    table: String,
+    #[serde(default)]
+    after: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DurableCdcMutationEvent {
+    event_id: String,
+    source_cursor: String,
+    /// Versioned Ferrosa mutation bytes. Graph source filtering replaces this
+    /// transport envelope with projected records before Streamer integration.
+    mutation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DurableCdcPageResponse {
+    events: Vec<DurableCdcMutationEvent>,
+    high_water_cursor: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DurableCdcGapResponse {
+    error: &'static str,
+    resync_required: bool,
+    requested_segment: u64,
+    oldest_retained_segment: Option<u64>,
+}
+
+const DURABLE_CDC_CURSOR_VERSION: u8 = 1;
+const DURABLE_CDC_CURSOR_ENCODED_BYTES: usize = 23;
+
+fn decode_durable_cdc_cursor(value: &str) -> Result<CommitLogPosition, &'static str> {
+    if value.len() != DURABLE_CDC_CURSOR_ENCODED_BYTES {
+        return Err("invalid durable CDC cursor");
+    }
+    let mut decoded = [0_u8; 17];
+    let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode_slice(value, &mut decoded)
+        .map_err(|_| "invalid durable CDC cursor")?;
+    if written != decoded.len() || decoded[0] != DURABLE_CDC_CURSOR_VERSION {
+        return Err("invalid durable CDC cursor");
+    }
+    Ok(CommitLogPosition {
+        segment_id: u64::from_be_bytes(
+            decoded[1..9]
+                .try_into()
+                .map_err(|_| "invalid durable CDC cursor")?,
+        ),
+        offset: u64::from_be_bytes(
+            decoded[9..17]
+                .try_into()
+                .map_err(|_| "invalid durable CDC cursor")?,
+        ),
+    })
+}
+
+fn encode_durable_cdc_cursor(position: CommitLogPosition) -> String {
+    let mut bytes = [0_u8; 17];
+    bytes[0] = DURABLE_CDC_CURSOR_VERSION;
+    bytes[1..9].copy_from_slice(&position.segment_id.to_be_bytes());
+    bytes[9..17].copy_from_slice(&position.offset.to_be_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Query parameters for the schema endpoint.
@@ -742,6 +821,172 @@ async fn handle_unsubscribe(State(state): State<AppState>, req: Request<Body>) -
     }
 }
 
+/// POST /graph/cdc/page — authenticated bounded durable replay.
+///
+/// The projection/filter implementation is installed by the durable graph CDC
+/// source. Keeping the route behind the same middleware as graph queries makes
+/// it impossible to open commit-log replay before authentication succeeds.
+async fn handle_durable_cdc_page(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let Some(auth) = req.extensions().get::<AuthContext>().cloned() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "authentication required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorResponse {
+                    error: "durable CDC request exceeds 65536 bytes".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let request: DurableCdcPageRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "invalid durable CDC request".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let limit = match CdcPageLimit::new(request.limit) {
+        Ok(limit) => limit,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let resource = Resource::Table(request.keyspace.clone(), request.table.clone());
+    if state
+        .schema
+        .check_permission(&auth, Permission::Select, &resource)
+        .is_err()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "permission denied".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let position = match request.after.as_deref() {
+        Some(cursor) => match decode_durable_cdc_cursor(cursor) {
+            Ok(cursor) => cursor,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: message.to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => CommitLogPosition {
+            segment_id: 0,
+            offset: 0,
+        },
+    };
+    let storage = state.engine.storage();
+    let table = TableId::new(&request.keyspace, &request.table);
+    let page =
+        match tokio::task::spawn_blocking(move || storage.durable_cdc_page(position, table, limit))
+            .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(CdcReplayError::CursorExpired {
+                requested_segment,
+                oldest_retained_segment,
+            })) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(DurableCdcGapResponse {
+                        error: "cursor_expired",
+                        resync_required: true,
+                        requested_segment,
+                        oldest_retained_segment,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(Err(CdcReplayError::InvalidCursor { .. })) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "invalid durable CDC cursor".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(Err(CdcReplayError::InvalidPageLimit { .. })) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "invalid durable CDC page limit".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(Err(CdcReplayError::EventTooLarge { .. })) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(ErrorResponse {
+                        error: "durable CDC event exceeds page byte budget".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(Err(CdcReplayError::Storage(_))) | Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "durable CDC unavailable".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+
+    let high_water_cursor = encode_durable_cdc_cursor(page.high_water);
+    let events = page
+        .entries
+        .into_iter()
+        .map(|(mutation, position)| {
+            let mut bytes = vec![0_u8; mutation.serialized_size()];
+            mutation.serialize_into(&mut bytes);
+            DurableCdcMutationEvent {
+                event_id: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(mutation.mutation_id),
+                source_cursor: encode_durable_cdc_cursor(position),
+                mutation: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        })
+        .collect();
+    Json(DurableCdcPageResponse {
+        events,
+        high_water_cursor,
+    })
+    .into_response()
+}
+
 /// Build the Axum router with all graph routes.
 ///
 /// Auth middleware is applied to all routes except /graph/health.
@@ -752,6 +997,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/graph/explain", post(handle_explain))
         .route("/graph/schema", get(handle_schema))
         .route("/graph/subscribe", post(handle_subscribe))
+        .route("/graph/cdc/page", post(handle_durable_cdc_page))
         .route("/graph/unsubscribe", post(handle_unsubscribe))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1259,5 +1505,164 @@ mod tests {
 
         // build_router should succeed and include subscribe/unsubscribe routes.
         let _router = build_router(state);
+    }
+
+    #[tokio::test]
+    async fn durable_cdc_page_authenticates_before_opening_replay() {
+        use ferrosa_schema::{
+            AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+            RateLimitConfig, SchemaConfig, TestAuditSink,
+        };
+        use ferrosa_storage::{
+            CommitLogConfig, CompactionConfig, StorageEngineConfig, SyncStrategyConfig,
+        };
+        use tower::ServiceExt;
+
+        let schema = Arc::new(
+            ferrosa_schema::Schema::new(SchemaConfig {
+                hasher: PasswordHasher::default(),
+                password_policy: PasswordPolicy::permissive(),
+                auth_method: AuthMethod::Password,
+                rate_limit: RateLimitConfig::default(),
+                audit_sink: Box::new(TestAuditSink::new()),
+                secrets: Box::new(EnvSecretsProvider),
+                mode: DeploymentMode::Development,
+            })
+            .unwrap(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                StorageEngineConfig {
+                    commit_log: CommitLogConfig {
+                        segment_size: 4096,
+                        max_segment_age: std::time::Duration::from_secs(60),
+                        sync_strategy: SyncStrategyConfig::Batch,
+                        batch: Default::default(),
+                        log_dir: tmp.path().to_path_buf(),
+                        checkpoint_dir: tmp.path().to_path_buf(),
+                        archive: None,
+                    },
+                    compaction: CompactionConfig::from_env(tmp.path().join("compaction")),
+                    object_store: None,
+                    local_cache_max_bytes: 1024 * 1024,
+                    local_disk_free_reserve_bytes: 0,
+                    flush_threshold_bytes: 4096,
+                    memtable_backpressure_bytes: u64::MAX,
+                    flush_max_age_secs: 5,
+                    data_dir: tmp.path().to_path_buf(),
+                    index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+                    write_verify: true,
+                    auth_enabled: true,
+                    auth_warn: false,
+                    max_pending_replay_mutations_without_schema: 1024,
+                    memtable_num_shards: 64,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        let write_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage)),
+        ));
+        let engine = Arc::new(crate::engine::GraphEngine::new(
+            Arc::clone(&schema),
+            storage,
+            write_path,
+            crate::executor::expand::GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        ));
+        let app = build_router(AppState {
+            engine: Arc::clone(&engine),
+            schema: Arc::clone(&schema),
+            auth_disabled: false,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graph/cdc/page")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated_app = build_router(AppState {
+            engine: Arc::clone(&engine),
+            schema: Arc::clone(&schema),
+            auth_disabled: true,
+        });
+        let response = authenticated_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graph/cdc/page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"keyspace":"graph","table":"edges","limit":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = authenticated_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graph/cdc/page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"keyspace":"graph","table":"edges","after":"not-a-cursor","limit":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = authenticated_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/graph/cdc/page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"keyspace":"graph","table":"edges","limit":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut denied_request = Request::builder()
+            .method("POST")
+            .uri("/graph/cdc/page")
+            .body(Body::from(
+                r#"{"keyspace":"graph","table":"edges","limit":1}"#,
+            ))
+            .unwrap();
+        denied_request.extensions_mut().insert(AuthContext {
+            role: "cdc_without_select".to_string(),
+            is_superuser: false,
+            must_change_password: false,
+        });
+        let response = handle_durable_cdc_page(
+            State(AppState {
+                engine,
+                schema,
+                auth_disabled: false,
+            }),
+            denied_request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
