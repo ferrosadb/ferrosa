@@ -141,10 +141,10 @@ impl CdcCheckpoint {
                 }
                 let pos: CdcPosition =
                     serde_json::from_slice(&data[..bytes_read]).map_err(|e| {
-                    ferrosa_common::Error::InvalidFormat(format!(
-                        "cdc checkpoint not valid JSON: {e}"
-                    ))
-                })?;
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "cdc checkpoint not valid JSON: {e}"
+                        ))
+                    })?;
                 Ok(Some(CommitLogPosition {
                     segment_id: pos.segment_id,
                     offset: pos.offset,
