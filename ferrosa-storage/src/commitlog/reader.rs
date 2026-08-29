@@ -1,9 +1,13 @@
-//! Segment reader: reads a commit log segment file and yields mutations.
+//! Module: Incrementally validate and yield mutations from one commit-log segment.
+//! Correctness: Correct when sync markers and CRCs gate every yielded entry, active
+//! segment tails can be refreshed, and payload allocation is caller-bounded.
+//! Last revised: 2026-08-29
+//! Last changed: Replaced whole-segment loading with incremental bounded entry reads.
 //!
-//! [`SegmentReader`] reads a segment file into memory, validates the 17-byte
-//! header, then follows the sync marker chain to extract all valid mutation
-//! entries. On corruption (CRC mismatch), it skips to the next sync marker
-//! if possible, or stops reading.
+//! [`SegmentReader`] keeps an open file, validates the fixed header, and follows
+//! sync markers while allocating at most one caller-bounded entry payload.
+//! On corruption (CRC mismatch), it skips to the next sync marker if possible,
+//! or stops reading.
 //!
 //! This is the read-side counterpart of [`super::segment::Segment`], used
 //! during crash recovery replay.
@@ -12,54 +16,256 @@
 // dead-code warnings until that module exists.
 #![allow(dead_code)]
 
+#[cfg(test)]
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::config::CommitLogPosition;
 use super::descriptor::{SegmentDescriptor, HEADER_SIZE};
 use super::mutation::Mutation;
+
+pub(crate) enum SegmentEntryRead {
+    Mutation(CommitLogPosition, Mutation),
+    PayloadTooLarge {
+        position: CommitLogPosition,
+        bytes: usize,
+    },
+}
 use super::segment::{ENTRY_OVERHEAD, SYNC_MARKER_SIZE};
 
 /// Reads a commit log segment file and yields `(CommitLogPosition, Mutation)` pairs.
 ///
 /// # Reading Algorithm
 ///
-/// 1. Read entire file into memory.
-/// 2. Validate the 17-byte header via [`SegmentDescriptor::read_from()`].
-/// 3. Follow the sync marker chain starting at offset `HEADER_SIZE` (17).
-/// 4. Within each section (between two sync markers), read entries sequentially.
-/// 5. On CRC failure, skip to the next sync marker if available; otherwise stop.
+/// 1. Read and validate only the 17-byte header.
+/// 2. Follow the sync marker chain starting at offset `HEADER_SIZE` (17).
+/// 3. Read and deserialize one entry payload at a time.
+/// 4. On CRC failure, skip to the next sync marker if available; otherwise stop.
 pub struct SegmentReader {
-    /// Raw file contents.
-    data: Vec<u8>,
+    file: File,
+    file_len: u64,
     /// Parsed header descriptor.
     descriptor: SegmentDescriptor,
+    marker_offset: u64,
+    section_end: u64,
+    entry_offset: u64,
+    next_marker_offset: u64,
+    section_active: bool,
+    finished: bool,
 }
 
 impl SegmentReader {
-    /// Opens a segment file, reads it into memory, and validates the header.
+    /// Opens a segment file and validates its fixed-size header.
     ///
     /// Returns an error if the file cannot be read, is too short for a header,
     /// or the header CRC is invalid.
     pub fn open(path: &Path) -> ferrosa_common::Result<Self> {
-        let data = fs::read(path)?;
-
-        if data.len() < HEADER_SIZE {
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < HEADER_SIZE as u64 {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "segment file too short: {} bytes (need at least {})",
-                data.len(),
-                HEADER_SIZE
+                file_len, HEADER_SIZE
             )));
         }
+        let mut header = [0_u8; HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        let descriptor = SegmentDescriptor::read_from(&header)?;
 
-        let descriptor = SegmentDescriptor::read_from(&data[..HEADER_SIZE])?;
+        Ok(Self {
+            file,
+            file_len,
+            descriptor,
+            marker_offset: HEADER_SIZE as u64,
+            section_end: 0,
+            entry_offset: 0,
+            next_marker_offset: 0,
+            section_active: false,
+            finished: false,
+        })
+    }
 
-        Ok(Self { data, descriptor })
+    /// Refresh the durable tail of an already-open active segment. The reader
+    /// keeps its current entry/marker offsets, so this never rescans entries
+    /// that were already yielded.
+    pub(crate) fn refresh(&mut self) -> ferrosa_common::Result<()> {
+        self.file_len = self.file.metadata()?.len();
+        if self.section_active {
+            self.file.seek(SeekFrom::Start(self.marker_offset))?;
+            let mut marker = [0_u8; SYNC_MARKER_SIZE];
+            self.file.read_exact(&mut marker)?;
+            let next = u32::from_be_bytes(marker[..4].try_into().expect("fixed slice"));
+            let stored_crc = u32::from_be_bytes(marker[4..].try_into().expect("fixed slice"));
+            let mut crc_input = [0_u8; 12];
+            crc_input[..8].copy_from_slice(&self.descriptor.segment_id.to_be_bytes());
+            crc_input[8..].copy_from_slice(&next.to_be_bytes());
+            if stored_crc == crc32fast::hash(&crc_input) {
+                let refreshed_end = if next == 0 {
+                    self.file_len
+                } else {
+                    u64::from(next).min(self.file_len)
+                };
+                if refreshed_end >= self.entry_offset {
+                    self.section_end = refreshed_end;
+                    self.next_marker_offset = u64::from(next);
+                }
+            }
+        }
+        self.finished = false;
+        Ok(())
+    }
+
+    pub(crate) fn segment_id(&self) -> u64 {
+        self.descriptor.segment_id
     }
 
     /// Returns the segment descriptor (header info).
     pub fn descriptor(&self) -> &SegmentDescriptor {
         &self.descriptor
+    }
+
+    #[cfg(test)]
+    fn buffered_file_bytes(&self) -> usize {
+        0
+    }
+
+    /// Yield the next valid entry while retaining no segment-sized buffer.
+    pub fn next_entry(&mut self) -> ferrosa_common::Result<Option<(CommitLogPosition, Mutation)>> {
+        match self.next_entry_bounded(usize::MAX)? {
+            Some(SegmentEntryRead::Mutation(position, mutation)) => Ok(Some((position, mutation))),
+            Some(SegmentEntryRead::PayloadTooLarge { .. }) => {
+                unreachable!("usize::MAX cannot reject a u32-sized commit-log entry")
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Yield one entry while rejecting an oversized payload before allocating
+    /// its buffer. The rejected entry is not consumed, so retrying remains
+    /// fail-loud at the same durable position.
+    pub(crate) fn next_entry_bounded(
+        &mut self,
+        maximum_payload_bytes: usize,
+    ) -> ferrosa_common::Result<Option<SegmentEntryRead>> {
+        loop {
+            if self.finished {
+                return Ok(None);
+            }
+            if !self.section_active {
+                self.open_next_section()?;
+                if self.finished {
+                    return Ok(None);
+                }
+            }
+
+            if self.entry_offset.saturating_add(ENTRY_OVERHEAD as u64) > self.section_end {
+                self.advance_section();
+                continue;
+            }
+
+            self.file.seek(SeekFrom::Start(self.entry_offset))?;
+            let mut entry_header = [0_u8; 8];
+            self.file.read_exact(&mut entry_header)?;
+            let entry_size_bytes: [u8; 4] = entry_header[..4].try_into().expect("fixed slice");
+            let entry_size = u32::from_be_bytes(entry_size_bytes) as u64;
+            let stored_size_crc =
+                u32::from_be_bytes(entry_header[4..8].try_into().expect("fixed slice"));
+            if stored_size_crc != crc32fast::hash(&entry_size_bytes) {
+                self.advance_section();
+                continue;
+            }
+
+            let payload_start = self.entry_offset.saturating_add(8);
+            let payload_end = payload_start.saturating_add(entry_size);
+            let entry_end = payload_end.saturating_add(4);
+            if entry_end > self.section_end || entry_end > self.file_len {
+                self.advance_section();
+                continue;
+            }
+
+            let payload_len = usize::try_from(entry_size).map_err(|_| {
+                ferrosa_common::Error::InvalidFormat(
+                    "commit-log entry size does not fit in memory address space".into(),
+                )
+            })?;
+            if payload_len > maximum_payload_bytes {
+                return Ok(Some(SegmentEntryRead::PayloadTooLarge {
+                    position: CommitLogPosition {
+                        segment_id: self.descriptor.segment_id,
+                        offset: self.entry_offset,
+                    },
+                    bytes: payload_len,
+                }));
+            }
+            let mut payload = vec![0_u8; payload_len];
+            self.file.read_exact(&mut payload)?;
+            let mut payload_crc = [0_u8; 4];
+            self.file.read_exact(&mut payload_crc)?;
+            self.entry_offset = entry_end;
+
+            if u32::from_be_bytes(payload_crc) != crc32fast::hash(&payload) {
+                self.advance_section();
+                continue;
+            }
+
+            let mutation = match Mutation::deserialize_from(&payload) {
+                Ok(mutation) => mutation,
+                Err(_) => continue,
+            };
+            return Ok(Some(SegmentEntryRead::Mutation(
+                CommitLogPosition {
+                    segment_id: self.descriptor.segment_id,
+                    offset: payload_start - 8,
+                },
+                mutation,
+            )));
+        }
+    }
+
+    fn open_next_section(&mut self) -> ferrosa_common::Result<()> {
+        if self.marker_offset.saturating_add(SYNC_MARKER_SIZE as u64) > self.file_len {
+            self.finished = true;
+            return Ok(());
+        }
+        self.file.seek(SeekFrom::Start(self.marker_offset))?;
+        let mut marker = [0_u8; SYNC_MARKER_SIZE];
+        self.file.read_exact(&mut marker)?;
+        let next = u32::from_be_bytes(marker[..4].try_into().expect("fixed slice"));
+        let stored_crc = u32::from_be_bytes(marker[4..].try_into().expect("fixed slice"));
+        let mut crc_input = [0_u8; 12];
+        crc_input[..8].copy_from_slice(&self.descriptor.segment_id.to_be_bytes());
+        crc_input[8..].copy_from_slice(&next.to_be_bytes());
+        if stored_crc != crc32fast::hash(&crc_input) {
+            self.finished = true;
+            return Ok(());
+        }
+
+        let section_start = self.marker_offset + SYNC_MARKER_SIZE as u64;
+        let section_end = if next == 0 {
+            self.file_len
+        } else {
+            u64::from(next).min(self.file_len)
+        };
+        if section_end < section_start || (next != 0 && u64::from(next) <= self.marker_offset) {
+            self.finished = true;
+            return Ok(());
+        }
+        self.entry_offset = section_start;
+        self.section_end = section_end;
+        self.next_marker_offset = u64::from(next);
+        self.section_active = true;
+        Ok(())
+    }
+
+    fn advance_section(&mut self) {
+        if self.next_marker_offset == 0 {
+            self.finished = true;
+        } else {
+            self.marker_offset = self.next_marker_offset;
+            self.section_active = false;
+        }
     }
 
     /// Reads all valid entries from the segment.
@@ -69,130 +275,9 @@ impl SegmentReader {
     /// error, returns all entries read so far.
     pub fn read_all(&mut self) -> ferrosa_common::Result<Vec<(CommitLogPosition, Mutation)>> {
         let mut entries = Vec::new();
-        let mut marker_offset = HEADER_SIZE;
-
-        loop {
-            // Check if we have enough bytes for a sync marker at this offset.
-            if marker_offset + SYNC_MARKER_SIZE > self.data.len() {
-                break;
-            }
-
-            // Read sync marker: next_marker_offset (u32) + marker_crc (u32).
-            let next_marker_offset = u32::from_be_bytes([
-                self.data[marker_offset],
-                self.data[marker_offset + 1],
-                self.data[marker_offset + 2],
-                self.data[marker_offset + 3],
-            ]);
-
-            let stored_marker_crc = u32::from_be_bytes([
-                self.data[marker_offset + 4],
-                self.data[marker_offset + 5],
-                self.data[marker_offset + 6],
-                self.data[marker_offset + 7],
-            ]);
-
-            // Validate marker CRC: crc32(segment_id.to_be_bytes() || next_marker_offset.to_be_bytes())
-            let mut crc_input = [0u8; 12];
-            crc_input[..8].copy_from_slice(&self.descriptor.segment_id.to_be_bytes());
-            crc_input[8..12].copy_from_slice(&next_marker_offset.to_be_bytes());
-            let expected_marker_crc = crc32fast::hash(&crc_input);
-
-            if stored_marker_crc != expected_marker_crc {
-                // Marker CRC invalid — cannot trust next_marker_offset, stop reading.
-                break;
-            }
-
-            // Determine the end of this section's entry data.
-            let section_start = marker_offset + SYNC_MARKER_SIZE;
-            let section_end = if next_marker_offset == 0 {
-                // EOF marker: read entries until the end of the data.
-                self.data.len()
-            } else {
-                // Clamp to file length: a torn tail can leave a valid sync
-                // marker pointing past EOF. Treat the missing bytes as
-                // truncated entries so the payload slice below can't panic.
-                (next_marker_offset as usize).min(self.data.len())
-            };
-
-            // Read entries within this section.
-            let mut pos = section_start;
-            while pos + ENTRY_OVERHEAD <= section_end {
-                // Read entry_size (u32).
-                let entry_size_bytes = [
-                    self.data[pos],
-                    self.data[pos + 1],
-                    self.data[pos + 2],
-                    self.data[pos + 3],
-                ];
-                let entry_size = u32::from_be_bytes(entry_size_bytes) as usize;
-
-                // Read size_crc (u32).
-                let stored_size_crc = u32::from_be_bytes([
-                    self.data[pos + 4],
-                    self.data[pos + 5],
-                    self.data[pos + 6],
-                    self.data[pos + 7],
-                ]);
-
-                // Validate size CRC.
-                let expected_size_crc = crc32fast::hash(&entry_size_bytes);
-                if stored_size_crc != expected_size_crc {
-                    // Size CRC mismatch — skip to next sync marker.
-                    break;
-                }
-
-                // Check we have enough data for payload + payload_crc.
-                let payload_start = pos + 8;
-                let payload_end = payload_start + entry_size;
-                let entry_end = payload_end + 4; // + payload_crc
-
-                if entry_end > section_end {
-                    // Truncated entry — stop reading this section.
-                    break;
-                }
-
-                // Read and validate payload CRC.
-                let payload = &self.data[payload_start..payload_end];
-                let stored_payload_crc = u32::from_be_bytes([
-                    self.data[payload_end],
-                    self.data[payload_end + 1],
-                    self.data[payload_end + 2],
-                    self.data[payload_end + 3],
-                ]);
-                let expected_payload_crc = crc32fast::hash(payload);
-
-                if stored_payload_crc != expected_payload_crc {
-                    // Payload CRC mismatch — skip to next sync marker.
-                    break;
-                }
-
-                // Deserialize the mutation.
-                match Mutation::deserialize_from(payload) {
-                    Ok(mutation) => {
-                        let commit_pos = CommitLogPosition {
-                            segment_id: self.descriptor.segment_id,
-                            offset: pos as u64,
-                        };
-                        entries.push((commit_pos, mutation));
-                    }
-                    Err(_) => {
-                        // Deserialization failure — skip this entry, continue to next.
-                        pos = entry_end;
-                        continue;
-                    }
-                }
-
-                pos = entry_end;
-            }
-
-            // Move to next sync marker, or stop if this was the EOF marker.
-            if next_marker_offset == 0 {
-                break;
-            }
-            marker_offset = next_marker_offset as usize;
+        while let Some(entry) = self.next_entry()? {
+            entries.push(entry);
         }
-
         Ok(entries)
     }
 }
@@ -274,6 +359,46 @@ mod tests {
         assert_eq!(entries[1].0.offset, offset2);
         assert_eq!(entries[1].1.keyspace, "test_ks");
         assert_eq!(entries[1].1.timestamp, 99_000);
+    }
+
+    /// RED for t_977ee106: the durable CDC path must not load a segment or all
+    /// of its mutations before yielding the first entry.  Only the current
+    /// mutation payload may be resident.
+    #[test]
+    fn durable_cdc_segment_reader_streams_one_entry_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = Segment::new(7, 512 * 1024, dir.path());
+
+        let mut first = simple_mutation();
+        first.rows[0].cells[0].1 = CellValue::live(vec![0x41; 64 * 1024], 1000);
+        let mut second = another_mutation();
+        second.rows[0].cells[0].1 = CellValue::live(vec![0x42; 64 * 1024], 2000);
+
+        let first_offset = segment.allocate(Segment::entry_total_size(&first)).unwrap();
+        segment.write_entry(first_offset, &first);
+        let second_offset = segment
+            .allocate(Segment::entry_total_size(&second))
+            .unwrap();
+        segment.write_entry(second_offset, &second);
+        segment.flush_to_disk().unwrap();
+
+        let mut reader = SegmentReader::open(segment.path()).unwrap();
+        assert_eq!(
+            reader.buffered_file_bytes(),
+            0,
+            "opening a CDC segment must not materialize the segment"
+        );
+
+        let (position, mutation) = reader.next_entry().unwrap().unwrap();
+        assert_eq!(position.offset, first_offset);
+        assert_eq!(mutation.timestamp, first.timestamp);
+        assert_eq!(reader.buffered_file_bytes(), 0);
+
+        let (position, mutation) = reader.next_entry().unwrap().unwrap();
+        assert_eq!(position.offset, second_offset);
+        assert_eq!(mutation.timestamp, second.timestamp);
+        assert_eq!(reader.buffered_file_bytes(), 0);
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]
