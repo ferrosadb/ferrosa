@@ -39,6 +39,16 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 tracing-appender = "0.2"
+# Diagnostics. rustls, not native-tls: CI builds this for x86_64-unknown-linux-musl
+# and an OpenSSL dependency would break that build. 0.49 rather than an older
+# release because 0.34 pins rustls 0.22, which carries four RUSTSEC advisories
+# in rustls-webpki 0.102 — a diagnostics dependency must not ship known
+# vulnerabilities. default-features off so the SDK installs no panic handler
+# without being asked; `panic` is opted into here.
+sentry = { version = "0.49", default-features = false, features = [
+    "backtrace", "contexts", "panic", "reqwest", "rustls",
+] }
+sentry-tracing = "0.49"
 uuid = { version = "1", features = ["v4"] }
 
 # Replaces glibc malloc to avoid thread-arena retention (27× 64MB arenas ≈ 1.7GB RSS on 3-node cluster).

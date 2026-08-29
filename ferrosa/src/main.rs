@@ -56,6 +56,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 mod cql_broadcast;
 mod repair_wiring;
 mod runtime;
+mod sentry_reporting;
 mod web;
 
 use std::path::Path;
@@ -876,6 +877,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let (non_blocking_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
 
+    // Before the subscriber. The Sentry layer is inert without a client, and
+    // the errors most worth having from a database are the ones raised while
+    // it is still starting. Bound here so it lives until the process exits:
+    // dropping the guard stops sending.
+    let _sentry = sentry_reporting::start();
+
     if std::env::var("FERROSA_TELEMETRY_ENABLED").as_deref() == Ok("true") {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -902,11 +909,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with(env_filter)
             .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
             .with(telemetry_layer)
+            .with(sentry_reporting::layer())
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(non_blocking_writer)
+        // Registry rather than the fmt() builder, so the Sentry layer can sit
+        // beside the writer. The writer and filter are unchanged.
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
+            .with(sentry_reporting::layer())
             .init();
     }
 
