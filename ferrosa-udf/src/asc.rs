@@ -24,7 +24,7 @@
 //! export). A host import publishes its wasmtime `Caller` to a per-instance
 //! active-context cell while it re-enters JS, so the JS-side export/memory/table
 //! wrappers run against the live activation; the owned store's `RefCell` is
-//! borrowed only at the outermost call. See [`with_store_ctx`].
+//! borrowed only at the outermost call. See `with_store_ctx`.
 
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
