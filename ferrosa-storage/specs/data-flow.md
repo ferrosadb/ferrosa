@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: data-flow
-last_updated: 2026-06-30
+last_updated: 2026-09-01
 ---
 
 # ferrosa-storage — Data Flow
@@ -14,8 +14,11 @@ per-table `Mutex`).
 ## Write path
 
 A write is made durable by the commit log first, then applied to the memtable.
-A memtable that crosses the flush / backpressure thresholds is sealed and flushed
-to a BTI SSTable, which is then uploaded to S3 as write-behind.
+A memtable that crosses the flush / backpressure thresholds is sealed and
+flushed to a BTI SSTable, which is then uploaded to S3 as write-behind. The age
+trigger is admitted only above the 16-MiB volume floor (or a smaller configured
+flush threshold). Retained WAL triggers only after eight segment-equivalents of
+actual bytes and only for the table pinning the oldest closed segment.
 
 ```mermaid
 flowchart TD
@@ -33,7 +36,9 @@ flowchart TD
     PUT["ArcSwap::load StoreView<br/>active.put → one memtable shard<br/>(cell-level merge-on-write)"] --> CDC["WriteObserver / CdcBus emit"]
     PUT --> BP{"memtable_size &gt;= backpressure_bytes?"}
     BP -- yes --> FL
-    BP -- no --> DONE["ack write"]
+    BP -- no --> AUTO{"automatic flush:<br/>size/age-volume threshold<br/>or table-owned WAL pressure?"}
+    AUTO -- yes --> FL
+    AUTO -- no --> DONE["ack write<br/>smaller memtable remains WAL-backed"]
 
     subgraph FlushPath["Flush (per-table Mutex; reads/writes continue)"]
       FL["flush_guard.lock<br/>swap in fresh memtable<br/>old → flushing"] --> SER["snapshot + sort<br/>build_serialization_header"]
@@ -50,6 +55,12 @@ flowchart TD
     UP --> PLOG["pending-upload log<br/>(replayed after crash)"]
     UP --> MAN["Manifest: etag CAS update"]
     PUB -. "PinMode::NvMe → skip S3 upload" .-> CACHEPIN["LocalCache pinned set"]
+
+    COMP --> BQ["bounded task queue<br/>1 slot / worker"]
+    BQ --> MERGEC["stream one partition group<br/>per input"]
+    MERGEC --> RESULT["bounded result queue<br/>2 slots / worker"]
+    RESULT --> POLL["maintenance poll: ≤8 results<br/>and ≤8 table admissions"]
+    POLL -. "backlog remains" .-> COMP
 ```
 
 ## Read path
@@ -65,7 +76,10 @@ flowchart TD
     LOAD --> MEM["check active memtable<br/>→ Option&lt;Arc&lt;Partition&gt;&gt;"]
     LOAD --> FLM["check flushing memtable<br/>(if mid-flush)"]
     LOAD --> PRUNE["prune SSTable descriptors<br/>by key / token bounds"]
-    PRUNE --> POOL["ReaderPool::get_or_open<br/>engine-wide LRU, cap 256"]
+    PRUNE --> FANOUT{"descriptor fanout &gt; 32?"}
+    FANOUT -- yes --> OBS["counter + max gauge<br/>rate-limited ERROR"]
+    FANOUT -- no --> POOL["ReaderPool::get_or_open<br/>engine-wide LRU, cap 256"]
+    OBS --> POOL
     POOL --> CACHE{"LocalCache hit?"}
     CACHE -- yes --> RD["SSTableReader::get_partition<br/>(bloom filter internal)"]
     CACHE -- "miss / cold page" --> FETCH["fetch from S3<br/>verify SHA-256"]

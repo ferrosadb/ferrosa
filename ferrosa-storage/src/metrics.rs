@@ -1,3 +1,9 @@
+//! Module: Record and render bounded process-wide storage telemetry.
+//! Correctness: Correct when counters are monotonic, gauges reflect complete
+//! operations, and observation never allocates in storage hot paths.
+//! Last revised: 2026-09-01
+//! Last changed: Added maximum and high-threshold SSTable read-fanout signals.
+
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -328,6 +334,8 @@ static READ_LIMITED_ROWS_SSTABLE_PRUNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static READ_SSTABLE_FANOUT_MAX: AtomicU64 = AtomicU64::new(0);
+static READ_SSTABLE_HIGH_FANOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_SUCCESS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SSTABLE_REHYDRATION_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -566,6 +574,17 @@ pub fn observe_read_limited_rows(
     READ_LIMITED_ROWS_SSTABLE_PROBES_TOTAL.fetch_add(sstable_probes, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_HITS_TOTAL.fetch_add(sstable_hits, Ordering::Relaxed);
     READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.fetch_add(sstable_errors, Ordering::Relaxed);
+}
+
+/// Record the number of immutable SSTable descriptors examined by one read
+/// attempt. The caller classifies the configured operational threshold so this
+/// hot path remains allocation-free and independent of table identity.
+pub fn observe_read_sstable_fanout(fanout: usize, high_fanout: bool) {
+    let fanout = fanout.min(u64::MAX as usize) as u64;
+    update_max_u64(&READ_SSTABLE_FANOUT_MAX, fanout);
+    if high_fanout {
+        READ_SSTABLE_HIGH_FANOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn inc_sstable_rehydration_request() {
@@ -1013,6 +1032,18 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_read_limited_rows_sstable_errors_total {}\n",
         READ_LIMITED_ROWS_SSTABLE_ERRORS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_sstable_fanout_max Maximum SSTable descriptor fanout observed for one partition-read attempt.\n");
+    out.push_str("# TYPE ferrosa_storage_read_sstable_fanout_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_sstable_fanout_max {}\n",
+        READ_SSTABLE_FANOUT_MAX.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_read_sstable_high_fanout_total Partition-read attempts whose SSTable descriptor fanout exceeded the operational threshold.\n");
+    out.push_str("# TYPE ferrosa_storage_read_sstable_high_fanout_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_read_sstable_high_fanout_total {}\n",
+        READ_SSTABLE_HIGH_FANOUT_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_sstable_rehydration_requests_total SSTable read-through rehydration attempts.\n");
     out.push_str("# TYPE ferrosa_storage_sstable_rehydration_requests_total counter\n");
