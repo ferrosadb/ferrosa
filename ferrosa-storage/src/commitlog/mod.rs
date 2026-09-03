@@ -1,3 +1,9 @@
+//! Module: Persist mutations in a bounded, replayable write-ahead log.
+//! Correctness: Correct when acknowledged mutations survive restart and segment
+//! retention advances only after every dirty table is durably flushed.
+//! Last revised: 2026-09-01
+//! Last changed: Added byte-bounded, oldest-segment-scoped flush pressure.
+//!
 //! Commit log (write-ahead log) for durability.
 //!
 //! The commit log records every mutation before it reaches the memtable.
@@ -34,6 +40,15 @@ pub use config::{
     TableId,
 };
 pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
+
+/// Retain at most this many segment-equivalents of dirty closed WAL data
+/// before asking the table that pins the oldest segment to flush.
+///
+/// Pressure is computed from bytes actually written, not segment count. An
+/// age-rotated 4 KiB segment therefore consumes 4 KiB of the budget instead of
+/// its full 32 MiB capacity. This makes forced flush cadence proportional to
+/// durable data volume while bounding retained WAL disk usage.
+const RETAINED_WAL_SEGMENT_EQUIVALENTS: u64 = 8;
 
 use std::collections::HashSet;
 use std::fs;
@@ -963,6 +978,28 @@ impl CommitLog {
     /// is keeping the closed segment count bounded.
     pub fn closed_segment_count(&self) -> usize {
         self.closed_segments.lock().len()
+    }
+
+    /// Returns whether `table_id` pins the oldest closed segment after the
+    /// retained closed-WAL byte budget has been reached.
+    ///
+    /// The scan is allocation-free and bounded by the number of closed WAL
+    /// segments. Concurrent rotations can append closed segments out of ID
+    /// order, so the minimum segment ID identifies the oldest segment that can
+    /// advance reclamation. Unrelated dirty tables are never flushed merely
+    /// because some segment is closed.
+    pub fn table_pins_retained_wal_pressure(&self, table_id: &TableId) -> bool {
+        let closed = self.closed_segments.lock();
+        let budget =
+            (self.config.segment_size as u64).saturating_mul(RETAINED_WAL_SEGMENT_EQUIVALENTS);
+        let retained_bytes = closed.iter().fold(0_u64, |total, segment| {
+            total.saturating_add(segment.current_position())
+        });
+        retained_bytes >= budget
+            && closed
+                .iter()
+                .min_by_key(|segment| segment.id)
+                .is_some_and(|segment| segment.dirty_tables.contains_key(table_id))
     }
 
     /// Returns the total in-memory buffer bytes held by all closed segments.
@@ -2032,6 +2069,43 @@ mod tests {
         );
 
         cl.shutdown().unwrap();
+    }
+
+    #[test]
+    fn retained_wal_pressure_uses_lowest_segment_id_not_vector_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let oldest = TableId::new("test_ks", "oldest");
+        let newer = TableId::new("test_ks", "newer");
+
+        for index in 0..16 {
+            let mut mutation = if index == 0 {
+                mutation_for_table("test_ks", "oldest")
+            } else {
+                mutation_for_table("test_ks", "newer")
+            };
+            mutation.rows[0].cells[0] = (0, CellValue::live(vec![b'x'; 300], index as i64 + 1));
+            cl.append(&mutation).unwrap();
+            cl.force_rotate().unwrap();
+        }
+        assert!(
+            cl.closed_segments.lock().len() >= 8,
+            "fixture must exceed the retained-byte pressure budget"
+        );
+        cl.closed_segments.lock().reverse();
+
+        assert!(
+            cl.table_pins_retained_wal_pressure(&oldest),
+            "the lowest segment ID owns reclamation pressure even when concurrent rotation reordered the vector"
+        );
+        assert!(
+            !cl.table_pins_retained_wal_pressure(&newer),
+            "a newer segment must not steal oldest-segment pressure after vector reordering"
+        );
     }
 
     #[test]

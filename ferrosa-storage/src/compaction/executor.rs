@@ -1,3 +1,9 @@
+//! Module: Execute bounded streaming compaction work on background threads.
+//! Correctness: Correct when input claims prevent overlap, completed outputs are
+//! finalized once, and maintenance result batches remain explicitly bounded.
+//! Last revised: 2026-09-01
+//! Last changed: Added count-bounded result polling for backlog maintenance.
+//!
 //! Background compaction executor.
 //!
 //! Receives [`CompactionTask`]s via a channel, merges input SSTables on a
@@ -16,6 +22,14 @@ use crate::store::SharedReaderPool;
 use crate::upload::manager::SstableComponentBytes;
 
 use super::metadata::{CompactionTask, SSTableMetadata};
+
+/// One queued task per worker is sufficient to keep every worker busy while
+/// preventing a large SSTable backlog from becoming an in-memory task backlog.
+const TASK_QUEUE_CAPACITY_PER_WORKER: usize = 1;
+
+/// Completed outputs waiting for the maintenance thread are bounded to two per
+/// worker. Workers apply backpressure here instead of growing a result vector.
+const RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
 
 /// Reader pool used to obtain compaction input SSTable readers so they count
 /// against the engine-wide resident-reader bound (FMEA #11). Keyed identically
@@ -319,7 +333,7 @@ impl CompactionDirectUpload {
 /// `StorageEngine` submits tasks via `submit()` and polls results via
 /// `poll_results()`. The executor is stopped on `shutdown()`.
 pub struct CompactionExecutor {
-    task_txs: Vec<std::sync::mpsc::Sender<QueuedCompactionTask>>,
+    task_txs: Vec<std::sync::mpsc::SyncSender<QueuedCompactionTask>>,
     next_worker: AtomicUsize,
     result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -362,7 +376,9 @@ impl CompactionExecutor {
             "compaction executor: auto-tuned parallelism (override with \
              FERROSA_COMPACTION_WORKERS / FERROSA_MAX_CONCURRENT_COMPACTIONS)"
         );
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<CompactionResult>();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<CompactionResult>(
+            worker_count.saturating_mul(RESULT_QUEUE_CAPACITY_PER_WORKER),
+        );
         let stop_flag = Arc::new(AtomicBool::new(false));
         let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
@@ -371,7 +387,9 @@ impl CompactionExecutor {
         let mut handles = Vec::with_capacity(worker_count);
 
         for worker_idx in 0..worker_count {
-            let (task_tx, task_rx) = std::sync::mpsc::channel::<QueuedCompactionTask>();
+            let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<QueuedCompactionTask>(
+                TASK_QUEUE_CAPACITY_PER_WORKER,
+            );
             task_txs.push(task_tx);
             let result_tx = result_tx.clone();
             let stop = Arc::clone(&stop_flag);
@@ -415,11 +433,46 @@ impl CompactionExecutor {
                                 drop(permit);
                                 match result {
                                     Ok(output) => {
-                                        let _ = result_tx.send(CompactionResult {
+                                        let mut completed = CompactionResult {
                                             task,
                                             output: output.metadata,
                                             direct_upload: output.direct_upload,
-                                        });
+                                        };
+                                        loop {
+                                            match result_tx.try_send(completed) {
+                                                Ok(()) => break,
+                                                Err(std::sync::mpsc::TrySendError::Full(result)) => {
+                                                    completed = result;
+                                                    if stop.load(Ordering::Acquire) {
+                                                        Self::release_in_flight_inputs(
+                                                            &in_flight_inputs,
+                                                            &completed.task,
+                                                        );
+                                                        tracing::error!(
+                                                            table_id = %completed.task.table_id,
+                                                            "compaction: shutdown while bounded result queue was full; inputs remain live and task will be retried after restart"
+                                                        );
+                                                        break;
+                                                    }
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(10),
+                                                    );
+                                                }
+                                                Err(std::sync::mpsc::TrySendError::Disconnected(
+                                                    result,
+                                                )) => {
+                                                    Self::release_in_flight_inputs(
+                                                        &in_flight_inputs,
+                                                        &result.task,
+                                                    );
+                                                    tracing::error!(
+                                                        table_id = %result.task.table_id,
+                                                        "compaction: result receiver closed; inputs remain live"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         Self::release_in_flight_inputs(&in_flight_inputs, &task);
@@ -475,11 +528,21 @@ impl CompactionExecutor {
             task,
             queued_at: Instant::now(),
         };
-        match self.task_txs[worker_idx].send(queued) {
+        match self.task_txs[worker_idx].try_send(queued) {
             Ok(()) => Ok(true),
-            Err(err) => {
+            Err(std::sync::mpsc::TrySendError::Full(queued)) => {
                 crate::metrics::dec_compaction_queue_depth();
-                Self::release_in_flight_inputs(&self.in_flight_inputs, &err.0.task);
+                Self::release_in_flight_inputs(&self.in_flight_inputs, &queued.task);
+                tracing::debug!(
+                    table_id = %queued.task.table_id,
+                    inputs = queued.task.inputs.len(),
+                    "compaction: bounded worker queue full; deferring task to a later maintenance poll"
+                );
+                Ok(false)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(queued)) => {
+                crate::metrics::dec_compaction_queue_depth();
+                Self::release_in_flight_inputs(&self.in_flight_inputs, &queued.task);
                 Err(ferrosa_common::Error::InvalidFormat(
                     "compaction channel closed".into(),
                 ))
@@ -495,9 +558,21 @@ impl CompactionExecutor {
 
     /// Polls for completed compaction results (non-blocking).
     pub fn poll_results(&self) -> Vec<CompactionResult> {
+        self.poll_results_bounded(usize::MAX)
+    }
+
+    /// Polls at most `max_results` completed tasks without blocking.
+    ///
+    /// Production maintenance uses a small fixed cap so one large backlog can
+    /// neither materialize every completion nor starve later maintenance
+    /// stages. `poll_results()` remains for fixed-size unit-test fixtures.
+    pub fn poll_results_bounded(&self, max_results: usize) -> Vec<CompactionResult> {
         let rx = self.result_rx.lock();
-        let mut results = Vec::new();
-        while let Ok(result) = rx.try_recv() {
+        let mut results = Vec::with_capacity(max_results.min(8));
+        while results.len() < max_results {
+            let Ok(result) = rx.try_recv() else {
+                break;
+            };
             results.push(result);
         }
         results

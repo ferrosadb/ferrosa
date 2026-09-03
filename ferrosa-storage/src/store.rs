@@ -1,3 +1,9 @@
+//! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
+//! Correctness: Correct when every ArcSwap view is internally aligned and read
+//! and compaction planning preserve key bounds without resident-reader fanout.
+//! Last revised: 2026-09-01
+//! Last changed: Added bounded high-SSTable-fanout read diagnostics.
+//!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
 //! [`TableStore`] coordinates the three tiers of the storage engine:
@@ -15,6 +21,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// A partition read touching more immutable files than this is degraded enough
+/// to page operators. The read still completes through the bounded reader pool
+/// while background compaction drains the backlog.
+const READ_FANOUT_ALERT_SSTABLES: usize = 32;
+const READ_FANOUT_ERROR_INTERVAL_SECS: u64 = 60;
+const MAX_COMPACTION_CANDIDATES: usize = 64;
+static LAST_READ_FANOUT_ERROR_UNIX_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -248,6 +263,17 @@ pub(crate) struct SstableDescriptor {
     pub min_token: i64,
     /// Largest partition token covered by this SSTable.
     pub max_token: i64,
+    /// Total component bytes captured from the verified reader.
+    pub size_bytes: u64,
+    /// Minimum cell timestamp from the serialization header.
+    pub min_timestamp: i64,
+    /// Maximum cell timestamp from the serialization header.
+    pub max_timestamp: i64,
+    /// Number of partitions in the SSTable.
+    pub partition_count: u64,
+    /// Whether either persisted key bound uses the legacy non-byte-comparable
+    /// encoding and therefore needs a sorting rewrite.
+    pub legacy_format: bool,
 }
 
 impl SstableDescriptor {
@@ -263,12 +289,16 @@ impl SstableDescriptor {
         use ferrosa_common::Token;
         let min_key = reader.smallest_key_bytes().to_vec();
         let max_key = reader.largest_key_bytes().to_vec();
-        let min_token = ferrosa_sstable::byte_comparable::decode(&min_key)
+        let decoded_min = ferrosa_sstable::byte_comparable::decode(&min_key);
+        let decoded_max = ferrosa_sstable::byte_comparable::decode(&max_key);
+        let legacy_format = decoded_min.is_err() || decoded_max.is_err();
+        let min_token = decoded_min
             .map(|key| key.token.0)
             .unwrap_or_else(|_| Token::from_key(&min_key).0);
-        let max_token = ferrosa_sstable::byte_comparable::decode(&max_key)
+        let max_token = decoded_max
             .map(|key| key.token.0)
             .unwrap_or_else(|_| Token::from_key(&max_key).0);
+        let header = reader.header();
         Self {
             gen,
             dir,
@@ -276,7 +306,69 @@ impl SstableDescriptor {
             max_key,
             min_token,
             max_token,
+            size_bytes: reader.total_size(),
+            min_timestamp: header.min_timestamp,
+            max_timestamp: header.max_timestamp,
+            partition_count: reader.key_count(),
+            legacy_format,
         }
+    }
+
+    fn compaction_metadata(
+        &self,
+        fallback_table_dir: &std::path::Path,
+    ) -> crate::compaction::metadata::SSTableMetadata {
+        crate::compaction::metadata::SSTableMetadata {
+            id: self.gen.clone(),
+            path: if self.dir.as_os_str().is_empty() {
+                fallback_table_dir.to_path_buf()
+            } else {
+                self.dir.clone()
+            },
+            size_bytes: self.size_bytes,
+            min_token: self.min_token,
+            max_token: self.max_token,
+            min_timestamp: self.min_timestamp,
+            max_timestamp: self.max_timestamp,
+            partition_count: self.partition_count,
+            legacy_format: self.legacy_format,
+        }
+    }
+
+    fn validated_compaction_metadata(
+        &self,
+        fallback_table_dir: &std::path::Path,
+    ) -> Option<crate::compaction::metadata::SSTableMetadata> {
+        let mut metadata = self.compaction_metadata(fallback_table_dir);
+        // In-memory flush targets deliberately have no component directory.
+        // Their descriptor was built from an already-verified reader, so its
+        // cached metadata is the only available source of truth. Production
+        // descriptors always carry a directory and retain the fail-loud
+        // component validation below.
+        if self.dir.as_os_str().is_empty() {
+            return Some(metadata);
+        }
+        match sstable_compaction_component_size(&metadata.path, &metadata.id) {
+            Some(size_bytes) => metadata.size_bytes = size_bytes,
+            None if sstable_compaction_remote_component_available(&metadata.path, &metadata.id) => {
+                tracing::warn!(
+                    sstable_id = %metadata.id,
+                    table_dir = ?metadata.path,
+                    size_bytes = metadata.size_bytes,
+                    "compaction planning: SSTable local components are missing or empty; \
+                     using cached verified-reader size and allowing execution to rehydrate inputs"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    sstable_id = %metadata.id,
+                    table_dir = ?metadata.path,
+                    "compaction planning: skipping SSTable because required components are missing or empty and no remote length is registered"
+                );
+                return None;
+            }
+        }
+        Some(metadata)
     }
 
     /// Numeric generation parsed from the stable ID, used as the pool key gen.
@@ -1710,6 +1802,36 @@ impl<F: FlushTarget> TableStore<F> {
         let mut sstable_probes = 0u64;
         let mut sstable_hits = 0u64;
         let mut sstable_errors = 0u64;
+
+        let sstable_fanout = guard.sstables.len();
+        let high_fanout = sstable_fanout > READ_FANOUT_ALERT_SSTABLES;
+        crate::metrics::observe_read_sstable_fanout(sstable_fanout, high_fanout);
+        if high_fanout {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let last = LAST_READ_FANOUT_ERROR_UNIX_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= READ_FANOUT_ERROR_INTERVAL_SECS
+                && LAST_READ_FANOUT_ERROR_UNIX_SECS
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                tracing::error!(
+                    table = %self.pool_table_key,
+                    sstable_fanout,
+                    alert_threshold = READ_FANOUT_ALERT_SSTABLES,
+                    reader_pool_capacity = self.reader_pool.capacity(),
+                    "partition read exceeded the SSTable fanout operational bound; \
+                     continuing through the bounded reader pool while compaction drains backlog"
+                );
+            }
+        }
 
         // Active memtable
         if let Some(p) = guard.active.get(key)? {
@@ -6030,86 +6152,77 @@ impl<F: FlushTarget> TableStore<F> {
             .sstables
             .iter()
             .take(synced_len)
-            .enumerate()
-            .filter_map(|(i, desc)| {
-                // Safe to index: i < synced_len <= sstable_ids.len().
-                let (id, path) = &guard.sstable_ids[i];
-                let sstable_path = if path.as_os_str().is_empty() {
-                    table_dir.to_path_buf()
-                } else {
-                    path.clone()
-                };
-
-                // Open the reader (pooled) for size/header/key_count. One reader
-                // is resident per planning iteration; it becomes evictable when
-                // this closure returns.
-                let sst = match self.open_reader(desc) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(sstable_id = %id, %e, "compaction planning: cannot open SSTable reader; skipping");
-                        return None;
-                    }
-                };
-
-                let size_bytes = if path.as_os_str().is_empty() {
-                    sst.total_size()
-                } else {
-                    match sstable_compaction_component_size(&sstable_path, id) {
-                        Some(size_bytes) => size_bytes,
-                        None if sstable_compaction_remote_component_available(&sstable_path, id) => {
-                            tracing::warn!(
-                                sstable_id = %id,
-                                table_dir = ?sstable_path,
-                                size_bytes = sst.total_size(),
-                                "compaction planning: SSTable local components are missing or empty; \
-                                 using live-reader size and allowing compaction execution to rehydrate \
-                                 inputs from object storage"
-                            );
-                            sst.total_size()
-                        }
-                        None => {
-                            tracing::warn!(
-                                sstable_id = %id,
-                                table_dir = ?sstable_path,
-                                "compaction planning: skipping SSTable because required on-disk \
-                                 component files are missing or empty and no remote component \
-                                 length hook confirmed object-storage availability"
-                            );
-                            return None;
-                        }
-                    }
-                };
-
-                let header = sst.header();
-
-                // Token bounds were captured into the descriptor from the same
-                // index footer at construction time (FMEA #2 — never approximate).
-                let min_token = desc.min_token;
-                let max_token = desc.max_token;
-
-                // Legacy-format detection: a Cassandra-format SSTable whose key
-                // bounds do not decode as byte-comparable stores rows in an order
-                // the streaming read path mis-handles (t_a0f922a3). Flag it so the
-                // strategy schedules a format-rewrite regardless of size tier.
-                let legacy_format = ferrosa_sstable::byte_comparable::decode(
-                    sst.smallest_key_bytes(),
-                )
-                .is_err()
-                    || ferrosa_sstable::byte_comparable::decode(sst.largest_key_bytes()).is_err();
-
-                Some(crate::compaction::metadata::SSTableMetadata {
-                    id: id.clone(),
-                    path: sstable_path,
-                    size_bytes,
-                    min_token,
-                    max_token,
-                    min_timestamp: header.min_timestamp,
-                    max_timestamp: header.max_timestamp,
-                    partition_count: sst.key_count(),
-                    legacy_format,
-                })
-            })
+            .filter_map(|descriptor| descriptor.validated_compaction_metadata(table_dir))
             .collect()
+    }
+
+    /// Select the smallest compaction inputs with memory bounded by
+    /// `max_sstables`, regardless of the table's total SSTable count.
+    ///
+    /// Descriptor metadata was captured when each reader was already open, so
+    /// this scan performs no reader opens, decompression, or component reads.
+    /// The candidate vector never grows beyond `max_sstables`.
+    pub fn smallest_sstable_metadata_batch(
+        &self,
+        table_dir: &std::path::Path,
+        max_sstables: usize,
+        max_input_bytes: u64,
+    ) -> (usize, Vec<crate::compaction::metadata::SSTableMetadata>) {
+        let max_sstables = max_sstables.min(MAX_COMPACTION_CANDIDATES);
+        if max_sstables == 0 || max_input_bytes == 0 {
+            return (self.sstable_count(), Vec::new());
+        }
+
+        let guard = self.view.load();
+        guard.check_invariants("smallest_sstable_metadata_batch");
+        let available = guard.sstables.len().min(guard.sstable_ids.len());
+        let mut selected = Vec::with_capacity(max_sstables);
+
+        for descriptor in guard.sstables.iter().take(available) {
+            let candidate = descriptor.compaction_metadata(table_dir);
+            if candidate.size_bytes > max_input_bytes {
+                continue;
+            }
+            if selected.len() < max_sstables {
+                selected.push(candidate);
+                continue;
+            }
+
+            let largest = selected
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| {
+                    left.size_bytes
+                        .cmp(&right.size_bytes)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|(index, _)| index)
+                .expect("bounded candidate set is non-empty");
+            let replace = candidate.size_bytes < selected[largest].size_bytes
+                || (candidate.size_bytes == selected[largest].size_bytes
+                    && candidate.id < selected[largest].id);
+            if replace {
+                selected[largest] = candidate;
+            }
+        }
+
+        selected.sort_by(|left, right| {
+            left.size_bytes
+                .cmp(&right.size_bytes)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut selected_bytes = 0_u64;
+        let mut keep = 0_usize;
+        for candidate in &selected {
+            let next = selected_bytes.saturating_add(candidate.size_bytes);
+            if next > max_input_bytes {
+                break;
+            }
+            selected_bytes = next;
+            keep += 1;
+        }
+        selected.truncate(keep);
+        (available, selected)
     }
 }
 
@@ -9356,6 +9469,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn smallest_sstable_metadata_batch_has_a_hard_candidate_cap() {
+        const SSTABLES: usize = 80;
+        const HARD_CAP: usize = 64;
+
+        let store = test_store();
+        for index in 0..SSTABLES {
+            store
+                .write(
+                    &make_key(&format!("bounded-{index:03}")),
+                    make_row(b"x", index as i64 + 1),
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+
+        let (available, selected) = store.smallest_sstable_metadata_batch(
+            std::path::Path::new("/tmp/in-memory-sstables"),
+            1_000,
+            u64::MAX,
+        );
+        assert_eq!(available, SSTABLES);
+        assert_eq!(
+            selected.len(),
+            HARD_CAP,
+            "a user-supplied threshold must not turn the candidate Vec into backlog-sized memory"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // WP-002: sstable_metadata reports correct token range
     // -------------------------------------------------------------------------
@@ -10389,6 +10531,51 @@ mod tests {
             store.peak_resident_readers() <= cap,
             "peak resident {} must be <= cap {cap}",
             store.peak_resident_readers()
+        );
+    }
+
+    #[test]
+    fn high_sstable_fanout_is_observable_without_unbounded_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 4usize;
+        let n_sstables = 40usize;
+        let mut store = file_store_with_many_sstables(dir.path(), cap, n_sstables, n_sstables);
+        reset_pool(&mut store, cap);
+
+        let metric = |text: &str, name: &str| -> u64 {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(name)
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        };
+        let before = crate::metrics::render_prometheus();
+        let before_alerts = metric(&before, "ferrosa_storage_read_sstable_high_fanout_total ");
+
+        let row = store.read(&make_key("pk-0")).unwrap();
+        assert!(
+            row.is_some(),
+            "diagnostic must not truncate or fail the read"
+        );
+
+        let after = crate::metrics::render_prometheus();
+        assert!(
+            metric(&after, "ferrosa_storage_read_sstable_high_fanout_total ") > before_alerts,
+            "a 40-SSTable point read must increment the high-fanout counter"
+        );
+        assert!(
+            metric(&after, "ferrosa_storage_read_sstable_fanout_max ") >= n_sstables as u64,
+            "fanout max must expose the complete descriptor scan"
+        );
+        assert!(
+            store.peak_resident_readers() <= cap,
+            "diagnostics must not open or retain more than the reader cap"
+        );
+        assert_eq!(
+            store.reader_pool.soft_cap_breaches(),
+            0,
+            "diagnostics must preserve bounded reader-pool admission"
         );
     }
 

@@ -41,6 +41,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
 
+  **Automatic-flush admission (t_889b0d9a):** maintenance cadence alone never
+  creates a tiny SSTable. The age trigger requires at least 16 MiB (or the
+  configured flush threshold when smaller), while the size/backpressure
+  triggers are unchanged. A table may also flush to release retained WAL, but
+  only after eight segment-equivalents of actual closed-log bytes are pinned
+  and only when that table owns the oldest closed segment. Smaller dirty
+  memtables remain WAL-backed and stream through normal replay after restart.
+  The fixed 64-batch regression produced 63 SSTables before this policy and one
+  afterward; no SSTable or commit-log encoding changed.
+
   The dominant flush cost is **SSTable encoding** (BTI trie build + serialize +
   compress) — ~97% of flush wall time, historically single-threaded per SSTable
   and the real write-throughput floor (fsync was only ~0.3%). For tables with
@@ -66,6 +76,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   of 2 was over-conservative. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
   `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
   startup.
+  Existing backlogs drain without waiting for another flush: every maintenance
+  poll consumes at most eight results and admits at most eight table tasks, then
+  schedules another round when work completes. Descriptor-cached, constant-size
+  metadata selects no more than `min(max_threshold, 64)` of the smallest inputs
+  without opening/decompressing the whole backlog. Per-worker task capacity is one and
+  result capacity is two; saturation releases claims and leaves input files
+  live for the next bounded retry.
   **Legacy-format rewrite (t_a0f922a3):** `SSTableMetadata::legacy_format` flags
   SSTables whose key bounds are not byte-comparable-decodable (older
   Cassandra-shaped files that can store a wide partition's rows out of clustering
@@ -211,6 +228,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   names the component and the reason — a manifest entry pointing at a file that
   is gone used to surface only as `No such file or directory (os error 2)` with
   no table, generation or path, failing every read of that table.
+- **Read fanout detection** — every partition-read attempt exports
+  `ferrosa_storage_read_sstable_fanout_max`; reads above 32 immutable
+  descriptors increment `ferrosa_storage_read_sstable_high_fanout_total` and
+  emit a process-rate-limited ERROR naming the table and reader-pool capacity.
+  The read still streams through the bounded pool; diagnostics never open an
+  extra reader or materialize a table.
 - **Accord** (`accord/`) — per-shard conflict index + protocol log for
   strict-serializable transactions. Also defines `TransactionCommitter` (ADR-021):
   the front-end-facing seam CQL/Postgres `BEGIN`/`COMMIT` call to commit a
