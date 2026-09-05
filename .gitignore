@@ -10,6 +10,14 @@
 # Other developers: run setup.sh from the research repo, then re-link with /warp.
 .worktrees/
 .claude/worktrees/
+# Linked worktrees created as siblings inside the repo root. Without this they
+# stage as mode-160000 gitlinks: a public clone gets broken, empty directories
+# pointing at SHAs it cannot fetch.
+.wt-*/
+# Agent process state and runtime logs. Goal text, acceptance criteria, attempt
+# counts and verifier notes -- internal, and permanent if committed here.
+.forge/
+logs/
 .fastembed_cache/
 rootfs/test_key
 rootfs/test_key.pub
