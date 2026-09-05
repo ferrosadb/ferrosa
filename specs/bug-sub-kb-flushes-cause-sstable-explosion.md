@@ -1,6 +1,6 @@
 ---
 title: Sub-kilobyte flushes produce an sstable per write, and reads pay for it forever
-status: reported
+status: fix landed 2026-09-05, not yet verified against a live cluster
 severity: P1 — sustained ~95% CPU on two of three nodes, indefinitely
 reported: 2026-09-01
 reported-by: observed on the ferrosa-memory dev cluster (~/data/ferrosa-memory)
@@ -8,6 +8,22 @@ component: ferrosa-storage (flush + compaction)
 ---
 
 # Sub-kilobyte flushes produce an sstable per write
+
+> **A fix landed on main the same day this report was filed here.** `1ad286c8`
+> "perf(storage): bound SSTable flush amplification" (PR #382) gates age-based
+> flushes by data volume and retained WAL pressure, drains compaction backlogs
+> through bounded queues, and exposes high read fanout — which is this report's
+> first and third investigation directions respectively. It touches
+> `engine.rs`, `store.rs`, `compaction/executor.rs` and `metrics.rs`.
+>
+> **It has NOT been verified against the cluster this was observed on.** The
+> 20,040 sstable directories and the two nodes at ~95% CPU were measured before
+> the fix existed; nobody has re-measured after. Until someone does, treat the
+> mechanism as addressed and the outcome as unconfirmed — those are different
+> claims, and the second is the one that matters to an operator.
+>
+> Related signal, taken 2026-09-05 on the live dev cluster: a `stats` call
+> costing 4.6 seconds, which is the read-side fanout this describes.
 
 ## The symptom
 
