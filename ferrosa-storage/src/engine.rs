@@ -1,5 +1,8 @@
-//! Top-level storage engine composing commit log, memtable, flush, compaction,
-//! S3 upload, manifest, and local cache into a single API.
+//! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
+//! Correctness: Correct when admitted writes are durable before visibility and reads,
+//! replay, flush, and maintenance preserve table and cursor invariants.
+//! Last revised: 2026-09-01
+//! Last changed: Made automatic flush admission volume- and WAL-pressure-bounded.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -34,6 +37,7 @@ use ferrosa_schema::SchemaSnapshot;
 use ferrosa_sstable::types::{Partition, Row};
 
 use crate::cache::LocalCache;
+use crate::commitlog::cdc::{CdcPageLimit, CdcReader, CdcReplayError, DurableCdcPage};
 use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
@@ -51,6 +55,25 @@ use crate::timeseries::{
     TimeSeriesTimestampUnit,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
+
+/// Maximum minimum size for an age-triggered automatic flush.
+///
+/// With the production 64 MiB flush threshold, data must accumulate to 16 MiB
+/// before age may admit a flush. Smaller configured thresholds retain their
+/// own threshold as the floor, preserving deterministic small-threshold tests.
+const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bound synchronous automatic-flush work per maintenance tick. A later tick
+/// resumes from the still-dirty tables, so this caps allocation/I/O without
+/// sacrificing eventual progress.
+const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
+const MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
+
+fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize) -> (usize, usize) {
+    let max_threshold = max_threshold.clamp(2, MAX_COMPACTION_INPUTS_PER_TASK);
+    let min_threshold = min_threshold.clamp(2, max_threshold);
+    (min_threshold, max_threshold)
+}
 
 /// One operation in an atomic batch (spec URS-QEC-X02).
 ///
@@ -818,9 +841,10 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// Select the next compaction batch without accumulating an unbounded input
-/// set. Sorting by component size keeps early passes cheap and lets repeated
-/// calls progressively consolidate small SSTables before larger outputs.
+/// Test-only reference selector for fixed metadata vectors. Production uses
+/// `TableStore::smallest_sstable_metadata_batch`, whose candidate memory is
+/// bounded by the requested file count while it scans any-size backlogs.
+#[cfg(test)]
 fn select_incremental_compaction_batch(
     mut metadata: Vec<crate::compaction::metadata::SSTableMetadata>,
     max_sstables: usize,
@@ -6960,6 +6984,23 @@ impl StorageEngine {
         self.commit_log.current_position()
     }
 
+    /// Read one table-authorized durable CDC page from an explicit cursor.
+    /// The reader owns only one entry payload plus the count-and-byte bounded
+    /// result page; retained segment metadata is scanned without collection.
+    pub fn durable_cdc_page(
+        &self,
+        position: CommitLogPosition,
+        table: TableId,
+        limit: CdcPageLimit,
+    ) -> Result<DurableCdcPage, CdcReplayError> {
+        let mut reader = CdcReader::from_position(
+            &self.config.commit_log.log_dir,
+            position,
+            Some(HashSet::from([table])),
+        )?;
+        reader.read_page(limit)
+    }
+
     /// Open the engine by restoring the snapshot named in `intent`.
     ///
     /// Convenience over [`Self::open_from_snapshot_with_store`] that builds the
@@ -7435,29 +7476,38 @@ impl StorageEngine {
         state.store.filter_predicate_for(index_name).cloned()
     }
 
-    /// Flushes tables that exceed the size threshold, have unflushed data older
-    /// than `flush_max_age_secs`, or are holding closed commit-log segments
-    /// hostage. The time-based trigger ensures small, infrequently-updated
-    /// tables are durable within a bounded window; the retention-pressure
-    /// trigger prevents one cold dirty memtable from pinning closed segments
-    /// after hotter tables have already flushed.
+    /// Flushes tables that exceed the size threshold, have both sufficient
+    /// volume and unflushed data older than `flush_max_age_secs`, or pin the
+    /// oldest closed commit-log segment after its retained-byte budget is full.
+    ///
+    /// The commit log is the durability boundary for sub-volume data, so age
+    /// alone never creates an SSTable. Retention pressure is table-scoped and
+    /// byte-bounded: an unrelated closed segment cannot flush every dirty
+    /// table, and sparse age-rotated WAL segments consume only bytes written.
     pub fn flush_if_needed(&self) -> ferrosa_common::Result<()> {
         let max_age = std::time::Duration::from_secs(self.config.flush_max_age_secs);
         let max_age_nanos = max_age.as_nanos() as i64;
         let now_nanos = now_nanos_since_reference();
-        let retention_pressure = self.commit_log.closed_segment_count() > 0;
+        let age_flush_floor = self
+            .config
+            .flush_threshold_bytes
+            .clamp(1, MAX_AGE_FLUSH_FLOOR_BYTES);
         let tables = self.tables.read();
         let to_flush: Vec<TableId> = tables
             .iter()
-            .filter(|(_, state)| {
+            .filter(|(table_id, state)| {
                 let memtable_size = state.store.memtable_size();
                 let size_exceeded = memtable_size as u64 >= self.config.flush_threshold_bytes;
                 let first = state
                     .first_unflushed_write_at_nanos
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let age_exceeded = first > 0 && now_nanos.saturating_sub(first) >= max_age_nanos;
-                memtable_size > 0 && (size_exceeded || age_exceeded || retention_pressure)
+                let age_and_volume_exceeded = memtable_size as u64 >= age_flush_floor
+                    && first > 0
+                    && now_nanos.saturating_sub(first) >= max_age_nanos;
+                let pins_retained_wal = self.commit_log.table_pins_retained_wal_pressure(table_id);
+                memtable_size > 0 && (size_exceeded || age_and_volume_exceeded || pins_retained_wal)
             })
+            .take(MAX_AUTOMATIC_FLUSHES_PER_POLL)
             .map(|(id, _)| id.clone())
             .collect();
         drop(tables);
@@ -7493,7 +7543,10 @@ impl StorageEngine {
     /// Crash-safe: pending-log → upload → S3 confirm → manifest update →
     /// enqueue input deletions → evict local input directories.
     pub async fn poll_compactions(&self) {
-        let results = self.compaction_executor.poll_results();
+        const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 8;
+        let results = self
+            .compaction_executor
+            .poll_results_bounded(MAX_RESULTS_PER_MAINTENANCE_POLL);
         for result in results {
             let _input_claim = CompactionResultInputClaim {
                 executor: &self.compaction_executor,
@@ -7984,6 +8037,11 @@ impl StorageEngine {
                 }
             }
         }
+
+        // A restarted node may already own thousands of SSTables but receive no
+        // new writes. Schedule another bounded round after every maintenance
+        // poll so backlog reduction cannot depend on a future flush event.
+        self.schedule_compaction_backlog_round();
     }
 
     /// Opens an SSTable from component files in a directory.
@@ -8201,10 +8259,16 @@ impl StorageEngine {
             let Some(state) = tables.get(table_id) else {
                 return Ok(IncrementalCompactionSchedule::TableNotFound);
             };
-            let metadata = self.collect_sstable_metadata(table_id, state);
-            let available_sstables = metadata.len();
-            let inputs =
-                select_incremental_compaction_batch(metadata, max_sstables, max_input_bytes);
+            let table_dir = self
+                .config
+                .data_dir
+                .join("sstables")
+                .join(table_id.to_string());
+            let (available_sstables, inputs) = state.store.smallest_sstable_metadata_batch(
+                &table_dir,
+                max_sstables,
+                max_input_bytes,
+            );
             (available_sstables, inputs, state.schema.clone())
         };
 
@@ -8262,7 +8326,55 @@ impl StorageEngine {
         }
     }
 
-    fn maybe_compact(&self, table_id: &TableId, state: &TableState) {
+    fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        let sstable_count = state.store.sstable_count();
+        let (min_inputs, max_inputs) = effective_compaction_input_bounds(
+            self.config.compaction.min_threshold,
+            self.config.compaction.max_threshold,
+        );
+        let thresholds_were_normalized = min_inputs != self.config.compaction.min_threshold
+            || max_inputs != self.config.compaction.max_threshold;
+        if sstable_count > max_inputs || thresholds_were_normalized {
+            let table_dir = self
+                .config
+                .data_dir
+                .join("sstables")
+                .join(table_id.to_string());
+            let (_, inputs) = state.store.smallest_sstable_metadata_batch(
+                &table_dir,
+                max_inputs,
+                self.config.compaction.max_compaction_bytes,
+            );
+            if inputs.len() < min_inputs {
+                return false;
+            }
+            let input_bytes = inputs.iter().map(|input| input.size_bytes).sum::<u64>();
+            let task = crate::compaction::metadata::CompactionTask {
+                inputs,
+                output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
+                schema: state.schema.clone(),
+                table_id: table_id.clone(),
+            };
+            return match self.compaction_executor.try_submit(task) {
+                Ok(accepted) => {
+                    if accepted {
+                        tracing::info!(
+                            %table_id,
+                            sstable_count,
+                            input_bytes,
+                            max_inputs,
+                            "compaction: scheduled bounded backlog round"
+                        );
+                    }
+                    accepted
+                }
+                Err(error) => {
+                    tracing::error!(%error, %table_id, "storage-engine: bounded backlog compaction submit failed");
+                    false
+                }
+            };
+        }
+
         let metadata = self.collect_sstable_metadata(table_id, state);
         let strategy = self.strategy_for_table(state);
         let mut tasks = strategy.select(&metadata, &state.schema, table_id);
@@ -8289,7 +8401,7 @@ impl StorageEngine {
             &state.schema,
             table_id,
             &self.config.compaction.output_dir,
-            self.config.compaction.max_threshold,
+            max_inputs,
             self.config.compaction.max_compaction_bytes,
         );
         if !rewrites.is_empty() {
@@ -8302,9 +8414,37 @@ impl StorageEngine {
             );
         }
         tasks.extend(rewrites);
+        let mut accepted_any = false;
         for task in tasks {
-            if let Err(e) = self.compaction_executor.submit(task) {
-                tracing::error!(%e, %table_id, "storage-engine: compaction submit failed");
+            match self.compaction_executor.try_submit(task) {
+                Ok(accepted) => accepted_any |= accepted,
+                Err(error) => {
+                    tracing::error!(%error, %table_id, "storage-engine: compaction submit failed");
+                }
+            }
+        }
+        accepted_any
+    }
+
+    /// Schedule at most eight compaction tasks per maintenance pass, scanning
+    /// the table map in place without collecting IDs or task lists.
+    fn schedule_compaction_backlog_round(&self) {
+        const MAX_SCHEDULED_TABLES_PER_POLL: usize = 8;
+        let (min_inputs, _) = effective_compaction_input_bounds(
+            self.config.compaction.min_threshold,
+            self.config.compaction.max_threshold,
+        );
+        let tables = self.tables.read();
+        let mut accepted = 0_usize;
+        for (table_id, state) in tables.iter() {
+            if state.store.sstable_count() < min_inputs {
+                continue;
+            }
+            if self.maybe_compact(table_id, state) {
+                accepted += 1;
+                if accepted >= MAX_SCHEDULED_TABLES_PER_POLL {
+                    break;
+                }
             }
         }
     }
@@ -9897,6 +10037,13 @@ mod tests {
                 <= 128,
             "a scheduled batch must never exceed its input byte cap"
         );
+    }
+
+    #[test]
+    fn effective_compaction_bounds_reject_unbounded_operator_thresholds() {
+        assert_eq!(effective_compaction_input_bounds(4, 1_000), (4, 64));
+        assert_eq!(effective_compaction_input_bounds(1_000, 1_000), (64, 64));
+        assert_eq!(effective_compaction_input_bounds(0, 0), (2, 2));
     }
 
     #[test]
@@ -13317,8 +13464,116 @@ mod tests {
         );
     }
 
+    /// Regression and fixed-workload performance probe for t_889b0d9a.
+    ///
+    /// The payload stays far below the configured size threshold. Calling the
+    /// maintenance hook once per batch must therefore not turn batch cadence
+    /// into SSTable cadence. The bounded range reads deliberately run only over
+    /// `BATCHES` partitions; their elapsed time is reported for before/after
+    /// comparison, but correctness is asserted on file count and row count.
     #[test]
-    fn flush_if_needed_force_flushes_cold_table_holding_closed_segment() {
+    fn automatic_flush_file_count_tracks_data_volume_not_maintenance_cycles() {
+        const BATCHES: usize = 64;
+        const READ_PASSES: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig {
+            flush_threshold_bytes: 64 * 1024 * 1024,
+            // Exercise the historical time trigger on every maintenance pass
+            // without sleeping. WAL replay keeps these sub-threshold writes
+            // durable until a volume/retention trigger admits a flush.
+            flush_max_age_secs: 0,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        // Isolate flush admission from compaction so this test measures the
+        // number of SSTables CREATED, not the timing of background merging.
+        config.compaction.min_threshold = BATCHES + 1;
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        for batch in 0..BATCHES {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("tiny-{batch:04}")),
+                    make_row(b"x", batch as i64 + 1),
+                    batch as i64 + 1,
+                )
+                .unwrap();
+            engine.flush_if_needed().unwrap();
+        }
+        engine.flush_all().unwrap();
+
+        let sstable_count = engine.sstable_count(&tid);
+        let read_started = std::time::Instant::now();
+        for _ in 0..READ_PASSES {
+            let rows = engine.read_range(&tid, None, None, BATCHES).unwrap();
+            assert_eq!(rows.len(), BATCHES);
+            std::hint::black_box(rows);
+        }
+        let read_elapsed = read_started.elapsed();
+        eprintln!(
+            "t_889b0d9a_perf sstables={sstable_count} batches={BATCHES} read_passes={READ_PASSES} read_elapsed_us={}",
+            read_elapsed.as_micros()
+        );
+
+        assert_eq!(
+            sstable_count, 1,
+            "sub-threshold data must coalesce into one final SSTable instead of one SSTable per maintenance cycle"
+        );
+    }
+
+    #[test]
+    fn automatic_flush_maintenance_batch_is_count_bounded() {
+        const TABLES: usize = 9;
+        const MAX_FLUSHES_PER_POLL: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 1,
+            flush_max_age_secs: 3600,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let engine = StorageEngine::new(config, None).unwrap();
+        let mut table_ids = Vec::with_capacity(TABLES);
+        for index in 0..TABLES {
+            let table = format!("bounded_flush_{index}");
+            let mut schema = test_schema();
+            schema.table.clone_from(&table);
+            let table_id = TableId::new("test_ks", table);
+            engine.register_table(schema).unwrap();
+            engine
+                .write(
+                    &table_id,
+                    &make_key("pk"),
+                    make_row(b"x", index as i64 + 1),
+                    index as i64 + 1,
+                )
+                .unwrap();
+            table_ids.push(table_id);
+        }
+
+        engine.flush_if_needed().unwrap();
+        let flushed = table_ids
+            .iter()
+            .filter(|table_id| engine.sstable_count(table_id) == 1)
+            .count();
+        assert_eq!(
+            flushed, MAX_FLUSHES_PER_POLL,
+            "one maintenance tick must not materialize or flush every dirty table"
+        );
+        engine.flush_if_needed().unwrap();
+        assert!(
+            table_ids
+                .iter()
+                .all(|table_id| engine.sstable_count(table_id) == 1),
+            "a later bounded tick must make progress on the remaining table"
+        );
+    }
+
+    #[test]
+    fn flush_if_needed_only_flushes_oldest_table_after_wal_byte_budget() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -13330,43 +13585,172 @@ mod tests {
             ..StorageEngineConfig::test_config(dir.path())
         };
         let engine = StorageEngine::new(config, None).unwrap();
-        let cold = table_id();
-        let hot = table_id_2();
+        let oldest_owner = table_id();
+        let unrelated = table_id_2();
         engine.register_table(test_schema()).unwrap();
         engine.register_table(test_schema_2()).unwrap();
 
-        engine
-            .write(&cold, &make_key("cold"), make_row(b"cold", 1000), 1000)
-            .unwrap();
-        for i in 0..16 {
+        // Fill and rotate enough closed WAL bytes for one table to cross the
+        // retention budget while its memtable remains far below 1 MiB.
+        let payload = vec![b'x'; 300];
+        for i in 0..12 {
             engine
                 .write(
-                    &hot,
-                    &make_key(&format!("hot-{i}")),
-                    make_row(format!("hot-{i}").as_bytes(), 2000 + i),
-                    2000 + i,
+                    &oldest_owner,
+                    &make_key(&format!("oldest-{i}")),
+                    make_row(&payload, 1000 + i),
+                    1000 + i,
                 )
                 .unwrap();
+            engine.commit_log.force_rotate().unwrap();
         }
-        engine.flush(&hot).unwrap();
+        // This table exists only in the active segment and must not be swept
+        // into the flush because another table owns old WAL.
+        engine
+            .write(
+                &unrelated,
+                &make_key("unrelated"),
+                make_row(b"tiny", 5000),
+                5000,
+            )
+            .unwrap();
 
         assert!(
-            engine.commit_log_closed_segment_count() > 0,
-            "test setup must retain at least one closed segment before retention-pressure flush"
+            engine
+                .commit_log
+                .table_pins_retained_wal_pressure(&oldest_owner),
+            "test setup must exceed the retained-WAL byte budget"
         );
         assert!(
-            engine.memtable_size(&cold) > 0,
-            "cold table must still be unflushed before retention-pressure flush"
+            !engine
+                .commit_log
+                .table_pins_retained_wal_pressure(&unrelated),
+            "active-segment-only table must not inherit another table's WAL pressure"
         );
 
         engine.flush_if_needed().unwrap();
 
         assert_eq!(
-            engine.memtable_size(&cold),
+            engine.memtable_size(&oldest_owner),
             0,
-            "flush_if_needed must force-flush cold memtables when closed commit-log segments are retained"
+            "oldest-segment owner must flush after the retained-WAL byte budget is reached"
         );
+        assert!(
+            engine.memtable_size(&unrelated) > 0,
+            "unrelated sub-volume table must remain in memtable/WAL"
+        );
+        assert_eq!(engine.sstable_count(&oldest_owner), 1);
+        assert_eq!(engine.sstable_count(&unrelated), 0);
         assert_eq!(engine.commit_log_closed_segment_count(), 0);
+    }
+
+    #[test]
+    fn subvolume_automatic_flush_defers_to_wal_and_replays_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+
+        {
+            let config = StorageEngineConfig {
+                flush_threshold_bytes: 64 * 1024 * 1024,
+                flush_max_age_secs: 0,
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            // Persist schema without requiring any user-data SSTable.
+            engine.flush(&tid).unwrap();
+
+            for i in 0..32 {
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&format!("replay-{i:04}")),
+                        make_row(b"durable-in-wal", i + 1),
+                        i + 1,
+                    )
+                    .unwrap();
+                engine.flush_if_needed().unwrap();
+            }
+            assert_eq!(
+                engine.sstable_count(&tid),
+                0,
+                "sub-volume writes must stay in the WAL/memtable before restart"
+            );
+            engine.force_commit_log_sync().unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+
+        let config = StorageEngineConfig {
+            flush_threshold_bytes: 64 * 1024 * 1024,
+            flush_max_age_secs: 0,
+            ..StorageEngineConfig::test_config(dir.path())
+        };
+        let (reopened, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(
+            pending.is_empty(),
+            "schema-backed replay must stream in place"
+        );
+        let rows = reopened.read_range(&tid, None, None, 32).unwrap();
+        assert_eq!(
+            rows.len(),
+            32,
+            "every deferred row must replay exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_poll_drains_existing_sstable_backlog_without_new_writes() {
+        const INPUT_SSTABLES: usize = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tid = table_id();
+        {
+            let mut config = StorageEngineConfig::test_config(dir.path());
+            // Build the backlog without admitting background compaction.
+            config.compaction.min_threshold = INPUT_SSTABLES + 1;
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..INPUT_SSTABLES {
+                engine
+                    .write(
+                        &tid,
+                        &make_key(&format!("backlog-{i:04}")),
+                        make_row(b"x", i as i64 + 1),
+                        i as i64 + 1,
+                    )
+                    .unwrap();
+                engine.flush(&tid).unwrap();
+            }
+            assert_eq!(engine.sstable_count(&tid), INPUT_SSTABLES);
+            engine.shutdown().unwrap();
+        }
+
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 4;
+        config.compaction.max_threshold = 4;
+        let (engine, pending) = StorageEngine::open(config, None).unwrap();
+        assert!(pending.is_empty());
+
+        // Focused runs finish in about three seconds. Allow full-suite CI file
+        // I/O contention without turning the regression into an unbounded wait.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                engine.poll_compactions().await;
+                if engine.sstable_count(&tid) <= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "maintenance must keep scheduling bounded compaction rounds until an existing backlog drains; remaining={}",
+            engine.sstable_count(&tid)
+        );
+        let rows = engine.read_range(&tid, None, None, INPUT_SSTABLES).unwrap();
+        assert_eq!(rows.len(), INPUT_SSTABLES);
     }
 
     /// Regression test: write data, flush to SSTable, read back the exact
@@ -22177,20 +22561,21 @@ mod tests {
         }
 
         let table_compaction_dir = compaction_output_dir.join(tid.to_string());
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if table_compaction_dir.exists()
-                && std::fs::read_dir(&table_compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false)
-            {
-                break;
+        // Wait on the production-visible state transition, not the output file:
+        // the worker necessarily creates files before enqueueing its bounded
+        // result, so file existence races result delivery under CI contention.
+        let swapped = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                engine.poll_compactions().await;
+                if engine.sstable_count(&tid) == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }
+        })
+        .await;
+        assert!(swapped.is_ok(), "first compaction result was never applied");
 
-        // First poll: swap should occur.
-        engine.poll_compactions().await;
         let count_after_first_poll = engine.sstable_count(&tid);
         let dir_entries_after_first_poll = std::fs::read_dir(&table_compaction_dir)
             .map(|rd| rd.count())

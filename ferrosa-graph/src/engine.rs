@@ -1,4 +1,8 @@
 //! GraphEngine: composition root for graph query processing.
+//! Correctness: Correct when planning/execution share the same schema and storage
+//! handles and blocking adapters receive owned handles without locks across await.
+//! Last revised: 2026-08-29
+//! Last changed: Exposed a crate-local storage handle for bounded durable CDC I/O.
 //!
 //! Wires together the parser, planner, executor, adjacency index observer,
 //! and reconciliation loop. Provides the top-level `execute()` and `explain()`
@@ -1163,6 +1167,12 @@ impl GraphEngine {
     /// Get a reference to the subscription registry.
     pub fn subscription_registry(&self) -> &Arc<SubscriptionRegistry> {
         &self.subscription_registry
+    }
+
+    /// Clone the storage handle for bounded blocking adapters such as durable
+    /// graph CDC. Callers must keep disk I/O off async executor threads.
+    pub(crate) fn storage(&self) -> Arc<StorageEngine> {
+        Arc::clone(&self.storage)
     }
 
     /// List vertex and edge tables with their labels in a keyspace.

@@ -4,7 +4,7 @@
 //! [`CellValue`], [`DecoratedKey`], and [`PartitionKey`] values for
 //! property-based testing across crates.
 //!
-//! Generators for [`Row`], [`Partition`], etc. live in consuming crates
+//! Generators for `Row`, `Partition`, etc. live in consuming crates
 //! (e.g., `ferrosa-storage`) because they depend on `ferrosa-sstable` types.
 
 use proptest::prelude::*;

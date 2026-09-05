@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-07-17
+last_updated: 2026-09-01
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -21,6 +21,11 @@ writes into an in-memory memtable, makes them durable through a segmented
 write-ahead commit log, flushes to on-disk BTI SSTables, and asynchronously
 uploads SSTable components to S3 for durability. Reads merge across memtable,
 flushing memtable, and SSTables with cell-level last-write-wins semantics.
+
+Automatic maintenance is volume-driven. Time alone cannot flush a sub-16-MiB
+memtable, and retained-WAL pressure is charged only to the table pinning the
+oldest closed segment after a fixed byte budget. Existing SSTable backlogs are
+drained by bounded maintenance rounds even when no new writes arrive.
 
 Its upstream boundary is the `DataStore` trait: front-ends hold
 `Arc<dyn DataStore>` rather than `Arc<StorageEngine>`, so the same call sites
@@ -72,6 +77,11 @@ reader pool (filling cold pages from `LocalCache`, falling back to S3) →
 `merge_partitions` cell-level LWW newest-first. See [data-flow.md](data-flow.md)
 for the mermaid diagrams.
 
+Point reads publish maximum and above-threshold descriptor fanout. Above 32
+SSTables the engine emits a rate-limited ERROR but continues through the fixed
+reader-pool capacity, making degraded tables visible without multiplying log
+volume or changing query results.
+
 ## Key invariants
 
 1. **S3 is authoritative; local disk is a write-behind cache.** Cache eviction
@@ -110,8 +120,18 @@ for the mermaid diagrams.
    fails cell/clustering validation at flush/replay is written to a durable
    `quarantine/*.jsonl` and the counter `FLUSH_QUARANTINED_ROWS_TOTAL`
    increments — non-zero in steady state is an alert.
-6. **Compaction correctness is gated by a validator.** Oracle + differential
+9. **Compaction correctness is gated by a validator.** Oracle + differential
    checks confirm a compaction output is row-equivalent to its inputs.
+10. **Automatic flushes are volume- or retained-WAL-driven.** A maintenance
+    tick alone cannot create a sub-threshold SSTable. WAL pressure is computed
+    from actual retained bytes and flushes only the table pinning the oldest
+    closed segment; restart replay remains the durability path for smaller
+    memtables.
+11. **Backlog work is bounded and self-rescheduling.** Planning uses cached
+    descriptor scalars with a 64-input hard cap, task/result queues are
+    fixed-capacity, and every poll admits a fixed number of compactions until
+    the strategy threshold is met. Automatic flush ticks handle at most eight
+    tables before yielding to later maintenance.
 
 ## Position in the dependency graph
 
