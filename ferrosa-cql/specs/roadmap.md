@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-08-24
+last_updated: 2026-09-05
 ---
 
 # ferrosa-cql — Roadmap
@@ -12,6 +12,10 @@ real backlog is structural and security-shaped.
 
 ## Recently addressed
 
+- **Full-text index selection with shared columns (t_bf1aa16c / CQL-18).**
+  `fts_match` now selects only a registered full-text index, so an earlier
+  phonetic or scalar index on the same column cannot produce a false empty
+  result.
 - **Compound clustering-key tuple slices (t_4d8925f4 / CQL-16).** Standard
   row-value keyset cursors now parse, bind each component in order, validate
   clustering-key order, and compare lexicographically without skipping ties.

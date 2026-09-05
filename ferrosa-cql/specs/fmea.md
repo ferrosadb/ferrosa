@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-08-24
+last_updated: 2026-09-05
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -30,6 +30,7 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 | CQL-15 | Paged `SELECT DISTINCT` over a composite partition key bounded the upstream scan by physical partitions/rows, then applied DISTINCT and an offset cursor afterward | A driver page could under-fill and advance past an unseen logical partition; three partitions could return only two distinct rows across the traversal | 8 | 3 | 5 | 120 → 16 | **Fixed:** complete partition-key DISTINCT projections use a projected partition stream that emits one row per partition and resumes from the last emitted partition key. Direct, prepared-plan, multi-clustering-row, and partial-prefix-refusal coverage: `select_distinct_composite_partition_key_enumerates_partitions`. |
 | CQL-16 | Keyed secondary-index execution dropped the request consistency level before entering the cluster coordinator. | The coordinator waited for all partition replicas, adding a ~3 s timeout floor when any replica was slow even for CL ONE. | 6 | 6 | 3 | 108 → 12 | **Fixed (t_2f174c97):** `route_select_user_table` propagates `ctx.consistency` through `WritePath::index_read_in_partition`; cluster response collection now stops only after the corresponding success threshold. |
 | CQL-17 | Compound clustering-key tuple slices were rejected at the left parenthesis. | Applications could not express a unique keyset cursor over tied leading clustering values and had to synthesize a packed cursor column. | 5 | 7 | 2 | 70 → 10 | **Fixed (t_4d8925f4):** parser arity checks, ordered PREPARE markers, declared clustering-order validation, and lexicographic execution. End-to-end regression retains `(10, 'b')` after cursor `(10, 'a')`. |
+| CQL-18 | Full-text resolution selected the first index targeting a column without checking its index kind. | When phonetic/scalar and full-text indexes shared a column, `fts_match` consulted the incompatible index and returned an empty result despite successful DDL. | 8 | 3 | 5 | 120 → 16 | **Fixed (t_bf1aa16c):** dedicated full-text resolution now requires `IndexType::FullText`; regression covers a non-full-text-only registration and an end-to-end multi-index column. |
 
 ## Top risks to act on
 

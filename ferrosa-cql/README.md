@@ -90,8 +90,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   (t_4d8925f4), so ties in the leading component neither skip nor duplicate rows,
   `SingleIndex` / `IndexScanWithFilter` / `IndexIntersection` (global index
   scatter-gathers), `VectorAnn` / `GeoIndex` / `FullTextIndex` (dedicated
-  branches), `FullScan`. `EXPLAIN SELECT …` renders the same plan the router
-  executes. `CREATE INDEX` on a CLUSTERING column wires the storage engine's
+  branches). Full-text resolution filters for `FullTextIndex`, so an earlier
+  phonetic or scalar index on the same column cannot hijack `fts_match`.
+  `FullScan`. `EXPLAIN SELECT …` renders the same plan the router executes.
+  `CREATE INDEX` on a CLUSTERING column wires the storage engine's
   clustering-component build path (previously a silent schema-only no-op).
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
