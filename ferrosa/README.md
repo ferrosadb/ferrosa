@@ -57,7 +57,7 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 [specs/data-flow.md](specs/data-flow.md) for the full diagram.
 
 0. **CLI meta flags** — `--version`/`-V` and `--help`/`-h` print one line (`ferrosa <semver>`) and exit *before* tracing or config, so the output is parseable rather than interleaved with startup logs. Any other argument falls through to normal startup, so existing wrappers that pass extra flags are unaffected. Previously these flags were ignored and the **daemon started**, which meant anything probing the binary for its version silently launched a database.
-1. **Tracing** — non-blocking writer (`tracing-appender`); optional OTel layer when `FERROSA_TELEMETRY_ENABLED=true` (`--features otel`).
+1. **Tracing** — the Sentry client starts *first*, before any subscriber, so errors raised during startup are still reported; then the non-blocking writer (`tracing-appender`), the Sentry layer (`ERROR`→event, `WARN`→breadcrumb), and an optional OTel layer when `FERROSA_TELEMETRY_ENABLED=true` (`--features otel`). Because the client starts before the subscriber it cannot log its own outcome, so `Activation::report()` runs immediately after `init()` and states whether errors report to Sentry or **only to the local log** — an unconfigured DSN is a WARN, not silence.
 2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); file values win over environment values, which win over built-in defaults.
 3. **Schema preflight** — load the size-bounded, discriminated local `schema.json` before storage or any listener. Legacy arrays, corrupt/oversized documents, and unknown formats are quarantined and abort startup; they never become an empty registry.
 4. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
@@ -117,6 +117,7 @@ flat under tight cgroups; override with `MALLOC_CONF`).
 | `FERROSA_GRAPH_ENABLED` / `FERROSA_SPARQL_ENABLED` | enable graph (HTTP+Bolt) / SPARQL front-ends |
 | `FERROSA_FLIGHT_BIND` / `FERROSA_FLIGHT_SIGNING_KEY` / `FERROSA_FLIGHT_TOKEN_TTL_SECS` | Flight endpoint (when `flight` feature is built) |
 | `FERROSA_TELEMETRY_ENABLED` | install the OTel tracing layer (when `otel` feature is built) |
+| `FERROSA_SENTRY_DSN` | where node errors go besides the log; an `https://` DSN supplied by the installer, never committed. Unset or unusable is logged at WARN at startup and errors stay local |
 | `FERROSA_SELFHEAL_ENABLED` | self-heal quarantine controller (default on) |
 | `FERROSA_FLUSH_INTERVAL_SECS`, `FERROSA_URGENT_*` | maintenance-loop cadences |
 

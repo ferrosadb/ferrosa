@@ -881,7 +881,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the errors most worth having from a database are the ones raised while
     // it is still starting. Bound here so it lives until the process exits:
     // dropping the guard stops sending.
-    let _sentry = sentry_reporting::start();
+    let (_sentry, sentry_activation) = sentry_reporting::start();
 
     if std::env::var("FERROSA_TELEMETRY_ENABLED").as_deref() == Ok("true") {
         use tracing_subscriber::layer::SubscriberExt;
@@ -925,6 +925,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("ferrosa starting");
+
+    // Now that a subscriber exists to render it. `start()` ran before the
+    // subscriber on purpose, so it could not say this itself.
+    sentry_activation.report();
 
     // 1b. Load TOML config file (env vars override file values)
     let config_path =
