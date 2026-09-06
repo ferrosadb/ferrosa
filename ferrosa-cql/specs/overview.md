@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 status: implemented
-last_updated: 2026-08-09
+last_updated: 2026-09-05
 executive_summary: >
   The CQL native-protocol (v3/v4/v5) server and the largest, most central crate in
   the workspace (~54k LoC). It owns the full client path — TCP accept, frame
@@ -116,7 +116,9 @@ column followed by `[limit] : int`, allowing strict drivers to bind both values
 without treating `limit` as a missing schema column.
 
 Full-text predicates (`WHERE col = fts_match('...')`) take a dedicated branch:
-it resolves the matching row-granular doc keys through the cluster write path
+it resolves the registered `FullText` index for the searched column (ignoring
+phonetic/scalar indexes that target the same column), then resolves matching
+row-granular doc keys through the cluster write path
 (`WritePath::fulltext_search`) — which scatter-gathers across every node's local
 FTI and unions the keys — then point-reads the distinct matched partitions in
 deterministic (partition-key byte) order, retains only the rows whose FULL

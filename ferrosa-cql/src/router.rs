@@ -7177,7 +7177,10 @@ fn resolve_fulltext_index_name(
     snap.indexes
         .iter()
         .find(|((idx_ks, idx_tbl, _), meta)| {
-            idx_ks == ks && idx_tbl == table && meta.target_columns.iter().any(|c| c == column)
+            idx_ks == ks
+                && idx_tbl == table
+                && meta.index_type == IndexType::FullText
+                && meta.target_columns.iter().any(|c| c == column)
         })
         .map(|((_, _, _), meta)| meta.name.clone())
         .unwrap_or_else(|| column.to_string())
@@ -16937,6 +16940,35 @@ mod tests {
     }
 
     #[test]
+    fn fulltext_name_resolution_ignores_non_fulltext_indexes() {
+        // Given: a column with only a non-full-text index.
+        let mut snap = ferrosa_schema::SchemaSnapshot::new();
+        snap.indexes.insert(
+            (
+                "ks".to_string(),
+                "tbl".to_string(),
+                "name_phonetic".to_string(),
+            ),
+            ferrosa_schema::metadata::index::IndexMetadata {
+                keyspace: "ks".to_string(),
+                table: "tbl".to_string(),
+                name: "name_phonetic".to_string(),
+                index_type: IndexType::Phonetic,
+                target_columns: vec!["name".to_string()],
+                filter_predicate: None,
+                options: HashMap::new(),
+            },
+        );
+
+        // When: the full-text resolver is asked for that column.
+        // Then: it must not route fts_match through the phonetic index.
+        assert_eq!(
+            resolve_fulltext_index_name(&snap, "ks", "tbl", "name"),
+            "name"
+        );
+    }
+
+    #[test]
     fn resolve_index_type_unknown_errors() {
         let result = resolve_index_type(Some("nonexistent"), &["col".to_string()], &HashMap::new());
         assert!(result.is_err());
@@ -21578,6 +21610,48 @@ mod tests {
                 let count = extract_row_count(&b);
                 assert_eq!(count, 2, "docs 1 and 2 have both terms; got {count} rows");
             }
+            _ => panic!("expected Result"),
+        }
+    }
+
+    /// When a column has multiple index kinds, fts_match must resolve the
+    /// full-text registration rather than whichever index was declared first
+    /// (t_bf1aa16c).
+    #[tokio::test]
+    async fn fulltext_match_prefers_fulltext_index_for_multi_index_column() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let current_keyspace = None;
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        for cql in [
+            "CREATE KEYSPACE fts_late WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE fts_late.docs (id int PRIMARY KEY, body text)",
+            "CREATE INDEX docs_phonetic ON fts_late.docs (body) USING 'phonetic'",
+            "CREATE INDEX docs_fts ON fts_late.docs (body) USING 'fulltext'",
+            "INSERT INTO fts_late.docs (id, body) VALUES (1, 'valid entity')",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new("fts_late", "docs"))
+            .unwrap();
+
+        // Then: fts_match uses docs_fts, not the earlier phonetic index.
+        let result = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT id FROM fts_late.docs WHERE body = fts_match('valid')")
+                .unwrap(),
+        )
+        .await
+        .expect("fts_match must query the full-text index");
+        match result {
+            RouteResult::Result(body) => assert_eq!(extract_row_count(&body), 1),
             _ => panic!("expected Result"),
         }
     }
