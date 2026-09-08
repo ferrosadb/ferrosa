@@ -1,0 +1,148 @@
+{
+  "name": "pr-fixes-2026-08-24",
+  "created": "2026-08-25T02:57:33.450579Z",
+  "updated": "2026-08-25T06:59:58.226025Z",
+  "items": [
+    {
+      "id": "t-82052066-prevent-partition-scans-from-starving-writes-and-open-pr",
+      "title": "t_82052066: prevent partition scans from starving writes and open PR",
+      "status": "waiting",
+      "notes": "PR merged: https://github.com/ferrosadb/ferrosa/pull/361. [x] Bulk lane for unbounded scans; [x] Data lane for bounded/exact reads; [x] retry lane preservation; [x] independent verifier PASS; [x] post-rebase CI 6,777 passed / 1 skipped. Checklist remains waiting only because Forge recorded a loop_detected verifier-fingerprint gate requiring human resolution.",
+      "gate": {
+        "kind": "loop_detected",
+        "createdAt": "2026-08-25T03:15:52.181689Z",
+        "reason": "a new attempt fingerprint must start with an implementer",
+        "question": "What structurally novel action or human input should resolve this loop?",
+        "attemptIds": [
+          "A-2",
+          "A-3"
+        ]
+      },
+      "attemptState": {
+        "lastFingerprint": "sha256:4df2b9cf99b884bc8c096433d9e81b853a7ef45a166731c379d87a2fb29da89e",
+        "lastExecutionFingerprint": "sha256:a787b84eb98ad1c17c3cb7993d8e29423cfa6dc03f5a56d33463bc120b322138",
+        "sameAttemptCount": 1,
+        "lastProgressAt": "2026-08-25T03:06:44.971662Z",
+        "nextAttemptNumber": 3,
+        "exactAttempts": [
+          {
+            "attemptId": "A-2",
+            "agentId": "codex-root",
+            "role": "implementer"
+          }
+        ],
+        "lastAttempt": {
+          "attemptId": "A-2",
+          "fingerprint": "sha256:4df2b9cf99b884bc8c096433d9e81b853a7ef45a166731c379d87a2fb29da89e",
+          "executionFingerprint": "sha256:a787b84eb98ad1c17c3cb7993d8e29423cfa6dc03f5a56d33463bc120b322138",
+          "agentId": "codex-root",
+          "role": "implementer",
+          "finishedAt": "2026-08-25T03:06:44.971662Z",
+          "resultSignature": "green: unbounded_partition_scan_uses_bulk_lane passed",
+          "progress": "GREEN: unbounded partition pages are routed through Bulk while existing call sites explicitly preserve Data.",
+          "newInformation": "The existing reconnect helper can safely carry an explicit lane, keeping retry behavior identical while isolating scan traffic.",
+          "nextAction": "Triangulate with bounded and exact-row cases, then add integration-level lane isolation coverage."
+        }
+      }
+    },
+    {
+      "id": "t-2f174c97-remove-secondary-index-read-latency-floor-and-open-pr",
+      "title": "t_2f174c97: remove secondary-index read latency floor and open PR",
+      "status": "completed",
+      "completed_at": "2026-08-25T06:00:43.767137Z",
+      "notes": "PR open and refreshed after #361: https://github.com/ferrosadb/ferrosa/pull/362. [x] success-only CL accounting; [x] CL ONE/QUORUM/EACH_QUORUM behavior; [x] partition-only routing; [x] independent verifier PASS; [x] documentation conflict resolved by preserving both roadmap entries; [x] post-conflict CI 6,778 passed / 1 skipped. GitHub checks restarted on refreshed SHA.",
+      "attemptState": {
+        "lastFingerprint": "sha256:517a24a5fbddbb8afaee3bc5d5d4361d06a604e50f272d66d7412753ddda3168",
+        "lastExecutionFingerprint": "sha256:dd89da20407825555633fcab26505eb84f6933ebc5c76890444a7ec342eb83c5",
+        "sameAttemptCount": 1,
+        "lastProgressAt": "2026-08-25T03:37:36.149913Z",
+        "nextAttemptNumber": 3,
+        "exactAttempts": [
+          {
+            "attemptId": "A-3",
+            "agentId": "codex-root",
+            "role": "implementer"
+          }
+        ],
+        "lastAttempt": {
+          "attemptId": "A-3",
+          "fingerprint": "sha256:517a24a5fbddbb8afaee3bc5d5d4361d06a604e50f272d66d7412753ddda3168",
+          "executionFingerprint": "sha256:dd89da20407825555633fcab26505eb84f6933ebc5c76890444a7ec342eb83c5",
+          "agentId": "codex-root",
+          "role": "implementer",
+          "finishedAt": "2026-08-25T03:37:36.149913Z",
+          "resultSignature": "green: corrected keyed index consistency accounting passed",
+          "progress": "GREEN after verifier feedback: a failed replica cannot satisfy QUORUM, QUORUM completes after the second success, CL ONE returns early, and EACH_QUORUM no longer panics.",
+          "newInformation": "EACH_QUORUM needs per-DC response accounting rather than a total success count; SimpleStrategy now fails explicitly and NetworkTopologyStrategy tracks each DC threshold.",
+          "nextAction": "Repeat distinct verification and run lint, documentation, and pre-commit gates."
+        }
+      }
+    },
+    {
+      "id": "t-4d8925f4-support-compound-clustering-key-tuple-slices-and-open-pr",
+      "title": "t_4d8925f4: support compound clustering-key tuple slices and open PR",
+      "status": "completed",
+      "completed_at": "2026-08-25T06:18:39.913428Z",
+      "notes": "PR opened: https://github.com/ferrosadb/ferrosa/pull/363. [x] structural tuple AST; [x] ordered typed prepared markers; [x] lexicographic comparisons; [x] pre-read arity/order validation including empty partitions; [x] tied-leading cursor coverage; [x] independent verifier PASS; [x] post-rebase CI 6,780 passed / 1 skipped.",
+      "attemptState": {
+        "lastFingerprint": "sha256:1305e08f1f9da89916138aa2367ad6a5193ec4d01c53cd5cde6cfd48f87e8d37",
+        "lastExecutionFingerprint": "sha256:dac707b525ea3c1c8dbbd5c03ac87f63b64bf1480e920369b3983e3872505063",
+        "sameAttemptCount": 1,
+        "lastProgressAt": "2026-08-25T04:06:46.383547Z",
+        "nextAttemptNumber": 3,
+        "exactAttempts": [
+          {
+            "attemptId": "A-3",
+            "agentId": "codex-root",
+            "role": "implementer"
+          }
+        ],
+        "lastAttempt": {
+          "attemptId": "A-3",
+          "fingerprint": "sha256:1305e08f1f9da89916138aa2367ad6a5193ec4d01c53cd5cde6cfd48f87e8d37",
+          "executionFingerprint": "sha256:dac707b525ea3c1c8dbbd5c03ac87f63b64bf1480e920369b3983e3872505063",
+          "agentId": "codex-root",
+          "role": "implementer",
+          "finishedAt": "2026-08-25T04:06:46.383547Z",
+          "resultSignature": "green: structural compound tuple restrictions and prepared routing regressions passed",
+          "progress": "GREEN after verifier feedback: tuple syntax has an explicit AST variant, invalid tuple order fails on empty partitions, quoted scalar identifiers remain scalar, and typed markers route after substitution.",
+          "newInformation": "Representing row-value restrictions structurally removes identifier collisions; validating against TableMetadata before reads removes data-dependent correctness; SELECT marker counting must mirror metadata traversal exactly.",
+          "nextAction": "Obtain repeat distinct verification, then run full CQL, lint, documentation, and pre-push gates."
+        }
+      }
+    },
+    {
+      "id": "t-c76913d7-support-distinct-partition-key-prefix-enumeration-and-open-pr",
+      "title": "t_c76913d7: support SELECT DISTINCT partition-key prefix enumeration and open PR",
+      "status": "completed",
+      "completed_at": "2026-08-25T06:37:25.889052Z",
+      "notes": "PR opened: https://github.com/ferrosadb/ferrosa/pull/364. [x] full-PK DISTINCT exact paging; [x] fragment deduplication; [x] page-size 1/reordered/exact-boundary/resume cases; [x] cached PreparedCache path; [x] partial-key filter refusal; [x] independent verifier PASS; [x] post-rebase CI 6,775 passed / 1 skipped.",
+      "attemptState": {
+        "lastFingerprint": "sha256:7643f008b59f66025fb638b9da1860cfab532ac1183e7bfc9cc9cbf8ffe99186",
+        "lastExecutionFingerprint": "sha256:fe2c7c92a00fcf594785b2af3ecbd7e05269d82a173149a6e699cb1a0d07f020",
+        "sameAttemptCount": 1,
+        "lastProgressAt": "2026-08-25T04:51:52.849797Z",
+        "nextAttemptNumber": 3,
+        "exactAttempts": [
+          {
+            "attemptId": "A-3",
+            "agentId": "codex-root",
+            "role": "implementer"
+          }
+        ],
+        "lastAttempt": {
+          "attemptId": "A-3",
+          "fingerprint": "sha256:7643f008b59f66025fb638b9da1860cfab532ac1183e7bfc9cc9cbf8ffe99186",
+          "executionFingerprint": "sha256:fe2c7c92a00fcf594785b2af3ecbd7e05269d82a173149a6e699cb1a0d07f020",
+          "agentId": "codex-root",
+          "role": "implementer",
+          "finishedAt": "2026-08-25T04:51:52.849797Z",
+          "resultSignature": "green: fragmented storage partitions consume one DISTINCT page slot",
+          "progress": "GREEN: the focused fragment-stream unit passes, and the composite DISTINCT integration passes with FERROSA_RANGE_READ_ROWS_PER_FRAGMENT=1 across paging boundaries.",
+          "newInformation": "Projected range streams may emit multiple contiguous Partition items for one physical partition; deduplicating their partition keys before resume and lookahead accounting preserves one-row-per-partition semantics.",
+          "nextAction": "Run the final CQL, lint, documentation, and CI gates and obtain independent re-verification."
+        }
+      }
+    }
+  ]
+}

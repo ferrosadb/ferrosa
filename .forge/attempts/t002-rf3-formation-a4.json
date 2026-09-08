@@ -1,0 +1,18 @@
+{
+  "acceptanceCriterion": "A node must reject its own host ID at the transport boundary before dialing, broadcast-map mutation, peer tracking, or listener callbacks; any supplied pool must be shut down.",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-net/src/peer.rs",
+      "digest": "sha256:7caef7ac29fb676343424686b048c5ca011056c28aa308d17d5e2a30592c6eec"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/peer_events.rs",
+      "digest": "sha256:adc70861789dacdd0d02f1629d260c067b4ae533bb1f606b0f2b19aae178407c"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/tests.rs",
+      "digest": "sha256:66c2390456b74f57688d6cd2ac3573cc0f14e28268cc92a6c157a0aa74ee980b"
+    }
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-net peer::tests::self_peer_is_rejected_before_network_tracking_or_callback; cargo test -p ferrosa-cluster controller::tests::self_connections_do_not_advance_cluster_formation"
+}

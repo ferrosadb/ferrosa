@@ -1,0 +1,6 @@
+{
+  "resultSignature": "red: CL ONE keyed index read exceeded 100ms while a second replica delayed 250ms",
+  "progress": "RED reproduced the fixed latency floor: the coordinator waits for every replica even though CL ONE requires one success.",
+  "newInformation": "The keyed path launches local and remote consults concurrently but drains the entire FuturesUnordered before returning, so a slow or unavailable replica imposes the Bulk timeout.",
+  "nextAction": "Pass consistency into the keyed index coordinator, compute the required successful responses, and stop collecting once the consistency requirement is satisfied."
+}

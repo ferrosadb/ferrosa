@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green:self-peer-rejected-at-transport-boundary",
+  "progress": "GREEN: PeerManager rejects self before address resolution or dial, before broadcast and peer-map mutation, and before listener callbacks; an already-created pool is shut down. The controller retains a defense-in-depth guard.",
+  "newInformation": "Independent review found the first controller-level guard was after PeerManager mutation. A transport-path regression failed before the fix and passes after it; ferrosa-net clippy and the controller regression are clean.",
+  "nextAction": "Run full affected-package suites and obtain independent re-verification before commit and PR."
+}

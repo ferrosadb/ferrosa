@@ -1,0 +1,22 @@
+{
+  "acceptanceCriterion": "Formation and recovery paths must apply bounded backpressure, avoid whole-input materialization, and preserve the cluster membership marker atomically.",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-cluster/src/ddl_path.rs",
+      "digest": "sha256:0cbb6ada80a536f1d80502d81c019ed7073f0fef11d79b4ce79e89735f9b753f"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/cluster.rs",
+      "digest": "sha256:13dcf5f77bb64debf09ce0fd4c76ab530484ef2416c6b557f3a036f65d517032"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/mod.rs",
+      "digest": "sha256:c0ebeda7debe7d1576353f30b390cc1f42c318ea2d1d513258b18e7d45a8b7ab"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/tests.rs",
+      "digest": "sha256:66c2390456b74f57688d6cd2ac3573cc0f14e28268cc92a6c157a0aa74ee980b"
+    }
+  ],
+  "normalizedCommand": "frg materialization-scan ferrosa-cluster/src/controller/cluster.rs ferrosa-cluster/src/ddl_path.rs; cargo test focused formation backpressure and marker cases"
+}

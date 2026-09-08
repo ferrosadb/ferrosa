@@ -1,0 +1,8 @@
+{
+  "acceptanceCriterion": "A paged SELECT DISTINCT over every component of a composite partition key returns every partition exactly once across pages and the prepared-plan path preserves the same behavior.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/router.rs", "digest": "e25912b126403a9430ce73dc565863a9141a62176f5fa311dee7b542654d6749"},
+    {"path": "ferrosa-cql/src/connection.rs", "digest": "7e36371452a4d713690d2c9f4439d19c011881f7ce1599f5ed374ee25625bbfc"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql select_distinct_composite_partition_key_enumerates_partitions"
+}

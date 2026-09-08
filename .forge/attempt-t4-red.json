@@ -1,0 +1,7 @@
+{
+  "acceptanceCriterion": "A paged SELECT DISTINCT over every component of a composite partition key returns every partition exactly once across pages.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/router.rs", "digest": "2ebda54f3fe206dd4e7222cb8cf6d60372f6bf8f3a1ad78aba9f3525ed4cf139"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql select_distinct_composite_partition_key_enumerates_partitions"
+}

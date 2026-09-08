@@ -1,0 +1,10 @@
+{
+  "acceptanceCriterion": "At CL ONE, a keyed secondary-index read returns after one successful partition replica instead of waiting for all replicas or the Bulk timeout.",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-cluster/src/coordinator/read.rs",
+      "digest": "718c6780baadfeb5937018cff1cb51b6ede95f09d00fd5771addcb3175609a23"
+    }
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cluster keyed_index_read_at_one_does_not_wait_for_slow_replica"
+}

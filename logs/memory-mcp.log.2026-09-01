@@ -1,0 +1,2 @@
+2026-09-01T21:50:00.292077Z  WARN ferrosa_memory_mcp: CLAUDE_PROJECT_DIR not set — intentions will require explicit repo param
+2026-09-01T21:50:00.292361Z  WARN ferrosa_memory_mcp: viz server error: Address already in use (os error 48)

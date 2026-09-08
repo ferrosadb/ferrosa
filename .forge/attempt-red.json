@@ -1,0 +1,10 @@
+{
+  "acceptanceCriterion": "unbounded multi-page partition reads use Bulk while bounded and exact reads use Data",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-cluster/src/coordinator/read.rs",
+      "digest": "1aedd0dda7dd5227a81786cbff33862014b994aa7a0f67cb9b45bd46c597851d"
+    }
+  ],
+  "normalizedCommand": "frg run --tee -- cargo test -p ferrosa-cluster partition_read_lane"
+}

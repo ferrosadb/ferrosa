@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green: structural compound tuple restrictions and prepared routing regressions passed",
+  "progress": "GREEN after verifier feedback: tuple syntax has an explicit AST variant, invalid tuple order fails on empty partitions, quoted scalar identifiers remain scalar, and typed markers route after substitution.",
+  "newInformation": "Representing row-value restrictions structurally removes identifier collisions; validating against TableMetadata before reads removes data-dependent correctness; SELECT marker counting must mirror metadata traversal exactly.",
+  "nextAction": "Obtain repeat distinct verification, then run full CQL, lint, documentation, and pre-push gates."
+}

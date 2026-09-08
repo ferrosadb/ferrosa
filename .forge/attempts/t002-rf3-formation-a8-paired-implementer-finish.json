@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green:final-paired-fingerprint",
+  "progress": "GREEN: the final staged fingerprint passes the graph integration, bounded DDL saturation, materialization, whitespace, all-target clippy, and full workspace gates.",
+  "newInformation": "Forge requires implementer and verifier roles to attest the same fingerprint; this event pairs the final changed inputs and exact verification commands before distinct verification.",
+  "nextAction": "Have the independent verifier attest this identical fingerprint."
+}

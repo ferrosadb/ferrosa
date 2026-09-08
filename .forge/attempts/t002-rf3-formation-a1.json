@@ -1,0 +1,22 @@
+{
+  "acceptanceCriterion": "A node must ignore self-connections for formation, must not become a healthy pair when configured for three nodes, and must not serve CQL until the declared formation size is committed.",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-cluster/src/controller/peer_events.rs",
+      "digest": "sha256:8295ab1f00da564243ad6a0dd5c9796627b6c8890ce4bf6de5d94f4e7a25cf90"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/mod.rs",
+      "digest": "sha256:c4b3652149e5e283d03fcb92fe3e4ea9ebf24a82a062bac4183e457f93e085a7"
+    },
+    {
+      "path": "ferrosa-cluster/src/config.rs",
+      "digest": "sha256:4028f1c9530ab10f691db28231d85a6c63204c148ebb1e1a4a50af7e915818c8"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/tests.rs",
+      "digest": "sha256:df48c45b8427e793cc425057ad341a71327a99c4cb5f1778bc6adb8bf6383a36"
+    }
+  ],
+  "normalizedCommand": "frg run --tee -- cargo test -p ferrosa-cluster self_connection_does_not_advance_cluster_formation -- --exact --nocapture"
+}

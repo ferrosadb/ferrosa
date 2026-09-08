@@ -1,0 +1,76 @@
+{
+  "name": "prepared-limit-bind-marker-2026-08-27",
+  "created": "2026-08-27T18:05:00Z",
+  "updated": "2026-08-27T22:39:55.277147Z",
+  "source_skill": "debug,tdd,rust",
+  "schema_version": 3,
+  "source_plan": "forge-task:t_fb3aa9d9",
+  "parallel_policy": "worktree_required",
+  "batch_verification": [
+    {
+      "batch": 1,
+      "command": "frg run --tee -- cargo test -p ferrosa-cql prepared_select_bound_limit -- --nocapture"
+    },
+    {
+      "batch": 2,
+      "command": "frg materialization-scan ferrosa-cql/src/connection.rs && frg cargo -p ferrosa-cql --all-targets -- clippy -- -D warnings"
+    },
+    {
+      "batch": 3,
+      "command": "Deploy the PR build, smoke the real mobile_control_events prepared query, and require a 15-minute clean-log observation window"
+    }
+  ],
+  "items": [
+    {
+      "id": "T-001-prepared-limit-bind-marker",
+      "title": "t_fb3aa9d9: honor LIMIT bind markers in generic prepared SELECTs and open PR",
+      "status": "completed",
+      "completed_at": "2026-08-27T22:39:55.277147Z",
+      "notes": "Ferrosa Memory PR #245 worked around the defect by interpolating a trusted integer literal. Current origin/main leaves LIMIT ? unresolved when cursor > ? disqualifies the exact-partition fast path, so the router treats the limit as absent and returns the full partition.",
+      "batch": 1,
+      "verification": [
+        "frg run --tee -- cargo test -p ferrosa-cql prepared_select_bound_limit -- --nocapture",
+        "Real cached PREPARE/EXECUTE regression matches the mobile_control_events WHERE pk = ? AND cursor > ? LIMIT ? shape",
+        "Missing, null, non-positive, and malformed bound limits fail with typed errors before routing; literal LIMIT remains green",
+        "Bound limit constrains the storage scan and total paged result without collecting the partition",
+        "Independent verifier reviews the full diff and reruns distinct focused commands before PR"
+      ],
+      "source_refs": [
+        "forge-task:t_fb3aa9d9",
+        "https://github.com/ferrosadb/ferrosa-memory/pull/245"
+      ],
+      "goalRef": "prepared-limit-bind-marker",
+      "goalSummary": "Make prepared and literal SELECT LIMIT semantics identical without any unbounded fallback.",
+      "itemContribution": "Prevents cursor replay queries from returning an entire partition when LIMIT is bound.",
+      "basePriority": 95,
+      "effort": "medium",
+      "critical": true,
+      "attemptState": {
+        "lastFingerprint": "sha256:ca4f59d33d66f33e6a5cb0603a5e0546ec0a672473fd9e97245fb5b048b72122",
+        "lastExecutionFingerprint": "sha256:f16812b6ea5d440e584adf2848eefd6991c1578c9b5936177cdf7ea9d409d382",
+        "sameAttemptCount": 1,
+        "lastProgressAt": "2026-08-27T22:36:19.269116Z",
+        "nextAttemptNumber": 15,
+        "exactAttempts": [
+          {
+            "attemptId": "A-15",
+            "agentId": "independent-verifier",
+            "role": "verifier"
+          }
+        ],
+        "lastAttempt": {
+          "attemptId": "A-15",
+          "fingerprint": "sha256:ca4f59d33d66f33e6a5cb0603a5e0546ec0a672473fd9e97245fb5b048b72122",
+          "executionFingerprint": "sha256:f16812b6ea5d440e584adf2848eefd6991c1578c9b5936177cdf7ea9d409d382",
+          "agentId": "independent-verifier",
+          "role": "verifier",
+          "finishedAt": "2026-08-27T22:36:19.269116Z",
+          "resultSignature": "green:prepared-limit-rolling-wire-nts-and-typed-one-local-one",
+          "progress": "Completed the independent full-diff review and exact-repeated every normalized A-14 verifier command once. LOCAL_ONE consistency metadata passed 1/1; partition_suffix_read_ passed 2/2; two-DC NTS, legacy payload, additive 0x2F message, suffix handler, TCP handshake, and SSTable suffix each passed 1/1; prepared LIMIT passed 7/7; ferrosa-net lib passed 155/155; ferrosa-cluster lib passed 1144/1144; five-crate all-target clippy reported zero warnings; cargo fmt and git diff checks were clean.",
+          "newInformation": "The final source preserves the caller's exact ONE versus LOCAL_ONE value in zero-response ReadTimeout metadata while retaining Ok(None) for a valid not-found response. v0.20.1 has no 0x2F decoder arm, legacy ReadRequestPayload remains byte-shape compatible, every remote full/digest/refetch suffix request uses the additive message, and exact NTS/DC-selected replica identities survive into the shared coordinator. Materialization counts remain at the production baseline; the only deltas are two inline-test findings each in router and SSTable reader. No new unbounded channel, retry structure, success-path warning, or payload-sized diagnostic was introduced.",
+          "nextAction": "Release the verifier claim. The candidate is ready for the parent agent's commit and dedicated PR workflow."
+        }
+      }
+    }
+  ]
+}

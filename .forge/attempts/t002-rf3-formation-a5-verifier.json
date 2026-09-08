@@ -1,0 +1,13 @@
+{
+  "acceptanceCriterion": "An independent verifier must confirm RF=3 readiness cannot pass in pair mode, self-peers never enter transport tracking, formation queues and marker recovery are bounded, and the cluster-formation integration suite passes.",
+  "relevantInputs": [
+    { "path": "ferrosa-net/src/peer.rs", "digest": "sha256:7caef7ac29fb676343424686b048c5ca011056c28aa308d17d5e2a30592c6eec" },
+    { "path": "ferrosa-cluster/src/config.rs", "digest": "sha256:4631dac9efd235e65f73b9890ce4c7296a9d2257fc4d2cd45b2f4d3276dab53d" },
+    { "path": "ferrosa-cluster/src/controller/mod.rs", "digest": "sha256:c0ebeda7debe7d1576353f30b390cc1f42c318ea2d1d513258b18e7d45a8b7ab" },
+    { "path": "ferrosa-cluster/src/controller/peer_events.rs", "digest": "sha256:adc70861789dacdd0d02f1629d260c067b4ae533bb1f606b0f2b19aae178407c" },
+    { "path": "ferrosa-cluster/src/controller/cluster.rs", "digest": "sha256:b4d69a0af89518c6f0785901c61e9537fbbfaba32c4bcfb83dd0df5c49f4d61f" },
+    { "path": "ferrosa-cluster/src/ddl_path.rs", "digest": "sha256:021ddb05be3af99b3c3abb83ba0b27f30281504859c05caa079a12b04f6e6ff4" },
+    { "path": "ferrosa-cluster/src/controller/tests.rs", "digest": "sha256:66c2390456b74f57688d6cd2ac3573cc0f14e28268cc92a6c157a0aa74ee980b" }
+  ],
+  "normalizedCommand": "independent verifier: exact readiness, self-peer transport, bounded DDL, marker recovery tests; cargo test -p ferrosa-cluster --test cluster_formation; materialization-scan six production files"
+}

@@ -1,0 +1,7 @@
+{
+  "acceptanceCriterion": "The CQL parser accepts an ordered multi-column clustering tuple on the left side of a slice comparison and a same-arity tuple value on the right.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/parser.rs", "digest": "b6d33ee39d51df3550c998f41be72f1dbdfb8eb4e4a0cb333d5d828efd2f78cd"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql parse_compound_clustering_tuple_slice"
+}

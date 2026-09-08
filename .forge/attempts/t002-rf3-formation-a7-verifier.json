@@ -1,0 +1,10 @@
+{
+  "acceptanceCriterion": "A distinct verifier must review the complete staged RF3 formation diff after the bounded-channel fixture migration and independently rerun the graph integration, saturation, and materialization regressions.",
+  "relevantInputs": [
+    { "path": "ferrosa-graph/tests/adjacency_replication.rs", "digest": "sha256:aa46787e59f2d4556e9071338a41a73d3d817367dc0ca180babe949a899e27f5" },
+    { "path": "ferrosa-cluster/src/ddl_path.rs", "digest": "sha256:021ddb05be3af99b3c3abb83ba0b27f30281504859c05caa079a12b04f6e6ff4" },
+    { "path": "ferrosa-net/src/peer.rs", "digest": "sha256:7caef7ac29fb676343424686b048c5ca011056c28aa308d17d5e2a30592c6eec" },
+    { "path": "ferrosa-cluster/src/controller/mod.rs", "digest": "sha256:c0ebeda7debe7d1576353f30b390cc1f42c318ea2d1d513258b18e7d45a8b7ab" }
+  ],
+  "normalizedCommand": "independent verifier: cargo test -p ferrosa-graph --test adjacency_replication; exact bounded DDL saturation regression; materialization-scan six production files; staged diff check"
+}

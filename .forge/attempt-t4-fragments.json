@@ -1,0 +1,7 @@
+{
+  "acceptanceCriterion": "Paged complete-partition-key DISTINCT treats contiguous stream fragments with the same partition key as one logical partition and resumes after all fragments of the cursor partition.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/router.rs", "digest": "0825f44619df79c1c0928ba972a0b8ececdb355ef2c8771f2f07ff178305152e"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql distinct_partition_collector_dedupes_stream_fragments"
+}

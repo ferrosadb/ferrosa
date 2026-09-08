@@ -1,0 +1,10 @@
+{
+  "acceptanceCriterion": "Compound clustering tuple restrictions are structurally represented, validated before empty reads, and preserve typed prepared marker order through substitution and routing.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/ast.rs", "digest": "e5fd9e654b77740b6fa0bdcc3127f99a63dbd5d4db9afb5819567dc3c160374b"},
+    {"path": "ferrosa-cql/src/parser.rs", "digest": "acb315d33bb5d08ffea9c9cee0718c8fa3d1631ab3806fdea68e2e1258b0b10f"},
+    {"path": "ferrosa-cql/src/router.rs", "digest": "51542a71b8f40653de0802341d72f5ac6b651b109bb36470ab01ff4d04d8803b"},
+    {"path": "ferrosa-cql/src/connection.rs", "digest": "755b19edafe9535294c4e8dcac119c3a69ca249bbf44fe28b53fb0682d933d3a"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql compound_clustering_tuple && cargo test -p ferrosa-cql quoted_scalar_identifier_is_not_a_tuple_restriction && cargo test -p ferrosa-cql select_bind_marker_columns_expands_compound_tuple_in_order && cargo test -p ferrosa-cql parser::tests"
+}

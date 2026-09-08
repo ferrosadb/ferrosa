@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green: unbounded_partition_scan_uses_bulk_lane passed",
+  "progress": "GREEN: unbounded partition pages are routed through Bulk while existing call sites explicitly preserve Data.",
+  "newInformation": "The existing reconnect helper can safely carry an explicit lane, keeping retry behavior identical while isolating scan traffic.",
+  "nextAction": "Triangulate with bounded and exact-row cases, then add integration-level lane isolation coverage."
+}

@@ -1,0 +1,18 @@
+{
+  "acceptanceCriterion": "An explicitly configured three-node deployment in pair mode must fail CQL readiness even when the local node would otherwise be pair primary.",
+  "relevantInputs": [
+    {
+      "path": "ferrosa-cluster/src/config.rs",
+      "digest": "sha256:fe3218a78300b225f7b99f09d41b4f7867769930b2eae0bc4ef1c14f3396cdb1"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/mod.rs",
+      "digest": "sha256:09ef367037e4f5ca5d2fbe65bbd33632a4125d7838dee80965128e15df1b7653"
+    },
+    {
+      "path": "ferrosa-cluster/src/controller/tests.rs",
+      "digest": "sha256:04a9bf3a4bd0835fe5954c9cc2bcfe1c3a5f081870d4b7a2e2dcf3801fbefc72"
+    }
+  ],
+  "normalizedCommand": "frg run --tee -- cargo test -p ferrosa-cluster controller::tests::configured_three_node_pair_primary_is_not_cql_ready -- --exact --nocapture"
+}

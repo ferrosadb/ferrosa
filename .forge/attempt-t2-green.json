@@ -1,0 +1,9 @@
+{
+  "acceptanceCriterion": "Keyed secondary-index reads collect only the successful replica responses required by the client's consistency level.",
+  "relevantInputs": [
+    {"path": "ferrosa-cluster/src/coordinator/read.rs", "digest": "5770498cdbf16c1d29a283b5c63090e3bcc3ae11f87c0f7c26a3f2da38d59562"},
+    {"path": "ferrosa-cluster/src/write_path.rs", "digest": "2e46fa0a7307b60d342145e35ba86df3b43714b64056a45117066d47d18db4eb"},
+    {"path": "ferrosa-cql/src/router.rs", "digest": "fd9822acee55cc1084ef6785e59f9109f0b88f5191b40f353bf9d30af17d5bda"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cluster keyed_index_read_at_one_does_not_wait_for_slow_replica"
+}

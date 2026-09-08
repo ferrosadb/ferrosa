@@ -1,0 +1,6 @@
+{
+  "resultSignature": "red: parser rejects tuple restriction at left parenthesis",
+  "progress": "RED reproduces t_4d8925f4: parse_where_clauses requires an identifier before it considers any parenthesis.",
+  "newInformation": "Tuple values already exist as Term::TupleLiteral and bind substitution is recursive; the missing syntax and semantics are specifically on the WHERE left-hand side and row comparison path.",
+  "nextAction": "Represent tuple column order in WhereClause compatibly, parse and validate tuple restrictions, then evaluate them lexicographically."
+}

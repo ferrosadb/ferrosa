@@ -1,0 +1,10 @@
+{
+  "acceptanceCriterion": "Compound clustering tuple slices parse, bind in column order, fail loudly on arity mismatch, and filter rows lexicographically without skipping tied leading values.",
+  "relevantInputs": [
+    {"path": "ferrosa-cql/src/ast.rs", "digest": "ac76a3de5c44256fabe1ff3390f652b7badd020919b4c18cd094eaf607019804"},
+    {"path": "ferrosa-cql/src/parser.rs", "digest": "6f5c55dd3407b8236c1befb354ec8bbd0414f4243b8a8f57b011db3d2e266bb0"},
+    {"path": "ferrosa-cql/src/router.rs", "digest": "7496e509d7d580ea9ec8b5c863ef29feaf9aa3bf029570446dfeb83595ee9f40"},
+    {"path": "ferrosa-cql/src/connection.rs", "digest": "0d3082c7e70ae824030aba1b3417e39c93bf6583ba4e5871ae9765c413da7c7f"}
+  ],
+  "normalizedCommand": "cargo test -p ferrosa-cql compound_clustering_tuple"
+}

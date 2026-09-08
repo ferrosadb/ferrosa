@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green:bounded-formation-and-atomic-marker",
+  "progress": "GREEN: the Forming DDL queue has fixed capacity 128 and fails immediately when full; DDL and voter scans no longer collect; the membership marker has a 4 KiB hard cap and is restored through fsync, verification, and atomic rename.",
+  "newInformation": "The mandatory materialization scan found an existing unbounded DDL channel plus eager collection and whole-file marker read in the exact touched formation path; all changed production files now scan with zero findings.",
+  "nextAction": "Run controller and cluster-formation suites, add operator documentation/config, then complete CI and independent verification."
+}

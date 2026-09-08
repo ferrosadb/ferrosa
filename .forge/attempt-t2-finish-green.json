@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green: keyed index CL threshold regression passed",
+  "progress": "GREEN: CL ONE returns before a slow second replica, while QUORUM remains blocked until the second success.",
+  "newInformation": "The request consistency level can be propagated through the CQL and WritePath surfaces without changing Direct or Pair behavior; cluster reads now stop at the CL/DC success threshold.",
+  "nextAction": "Run focused cluster and CQL regressions, lint/docs gates, then obtain distinct verification."
+}

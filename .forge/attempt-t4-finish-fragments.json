@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green: fragmented storage partitions consume one DISTINCT page slot",
+  "progress": "GREEN: the focused fragment-stream unit passes, and the composite DISTINCT integration passes with FERROSA_RANGE_READ_ROWS_PER_FRAGMENT=1 across paging boundaries.",
+  "newInformation": "Projected range streams may emit multiple contiguous Partition items for one physical partition; deduplicating their partition keys before resume and lookahead accounting preserves one-row-per-partition semantics.",
+  "nextAction": "Run the final CQL, lint, documentation, and CI gates and obtain independent re-verification."
+}

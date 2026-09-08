@@ -1,0 +1,282 @@
+{
+  "name": "critical-db-correctness-2026-08-26",
+  "schema_version": 3,
+  "created": "2026-08-27T04:52:20Z",
+  "updated": "2026-08-27T04:52:20Z",
+  "source_skill": "tdd,rust",
+  "source_plan": ".forge/plans/critical-db-correctness-2026-08-26.json",
+  "parallel_policy": "worktree_required",
+  "batch_verification": [
+    {
+      "batch": 1,
+      "command": "frg format-fix --check && frg cargo --workspace --all-targets --all-features -- clippy -- -D warnings"
+    },
+    {
+      "batch": 2,
+      "command": "frg materialization-scan . && frg cargo --workspace --all-targets --all-features -- test"
+    },
+    {
+      "batch": 3,
+      "command": "Run the native-cluster deployment and smoke suite, then require the agreed clean-log observation window"
+    }
+  ],
+  "items": [
+    {
+      "id": "T-001-accord-linearizability",
+      "title": "t_1f40005d: prevent conflicting Accord commits under packet reordering and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "frg run --tee -- cargo test -p ferrosa-cluster packet_reorder_linearizability -- --nocapture",
+        "Run the persisted reorder regression across repeated deterministic schedules",
+        "Remove the named CI skip and prove the correctness lane remains green"
+      ],
+      "source_refs": ["forge-task:t_1f40005d", "forge-task:t_9670c71e"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Restores single-outcome linearizability when network packets are reordered.",
+      "basePriority": 98,
+      "effort": "large",
+      "critical": true,
+      "notes": "TDD list: first preserve the deterministic two-conflicting-commits failure as RED; triangulate with reordered duplication, delayed accept/commit, and recovery schedules; GREEN must permit at most one conflicting value to commit. No query-sized collections or unbounded protocol queues; use bounded message channels/backpressure. One isolated worktree and one PR. Distinct verifier must rerun the exact regression once and inspect quorum/ballot invariants."
+    },
+    {
+      "id": "T-002-rf3-cluster-formation",
+      "title": "t_9bd0c95c: forbid silent pair-mode formation for an RF=3 cluster and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "frg run --tee -- cargo test -p ferrosa-cluster cluster_formation -- --nocapture",
+        "Run property tests over node-start permutations, partitions, and stale or empty schema state",
+        "Verify CQL readiness fails loudly until RF=3 formation invariants hold"
+      ],
+      "source_refs": ["forge-task:t_891840e7", "forge-task:t_9bd0c95c", "forge-task:t_05acdc8a"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Prevents a nominal RF=3 deployment from silently operating as a two-node or one-node cluster.",
+      "basePriority": 100,
+      "effort": "large",
+      "critical": true,
+      "notes": "TDD list: RED reproduces a live node reaching one seed and becoming ready in pair mode; add permutation/property cases for rolling starts, stale membership, absent Raft handlers, and missing schema. GREEN must expose an explicit non-ready/degraded state rather than silently reducing RF. Membership/event pipelines must remain bounded and cancel-safe. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-003-backup-consistency",
+      "title": "t_891840e7: prevent backup success below the declared replica durability and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "Add and run RED/GREEN backup tests proving failures below the configured write threshold",
+        "Stream a backup larger than the memory budget while a destination is slow",
+        "frg materialization-scan ."
+      ],
+      "source_refs": ["forge-task:t_891840e7"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Stops LOCAL_ONE-style backup behavior from reporting success without the required durable replicas.",
+      "basePriority": 96,
+      "effort": "medium",
+      "critical": true,
+      "notes": "TDD list: RED covers one-success/two-failure, slow replica, cancellation, and restart; GREEN counts only durable successes and fails loudly below the declared threshold. Backup data must stream end-to-end with bounded channels, no whole-backup Vec/read_to_end/collect, and atomic stage -> verify -> rename at durable sinks. Run materialization scan before and after. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-004-repair-tie-handling",
+      "title": "t_007f5b80: make repair converge instead of no-op on timestamp ties and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "Add and run a RED regression for divergent equal-timestamp replicas",
+        "Run property tests for convergence, idempotence, and replica-order independence",
+        "frg materialization-scan ."
+      ],
+      "source_refs": ["forge-task:t_891840e7", "forge-task:t_007f5b80"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Makes anti-entropy repair deterministic and convergent when timestamps tie.",
+      "basePriority": 95,
+      "effort": "medium",
+      "critical": true,
+      "notes": "TDD list: RED demonstrates current equal-timestamp no-op; triangulate with tombstones, collections, reordered replicas, and repeated repair. GREEN requires deterministic convergence and idempotence. Repair must operate as bounded pages/streams, never a whole-table map or materialized fallback; cancellation cannot publish partial state. Run materialization scan before and after. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-005-openraft-fatal-supervision",
+      "title": "t_fed3ab9b: survive OpenRaft core failure with explicit unhealthy service behavior and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "Add and run a RED regression for the empty-log index underflow",
+        "Kill the Raft core and verify the process stays alive, emits verbose diagnostics, and never hangs requests",
+        "Verify repeated failures are observable without an unbounded logging or retry queue"
+      ],
+      "source_refs": ["forge-task:t_fed3ab9b"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Prevents a hidden Raft panic from leaving a deceptively alive, timing-out CQL service.",
+      "basePriority": 99,
+      "effort": "medium",
+      "critical": true,
+      "notes": "User contract confirmed 2026-08-26: keep process and administrative observability alive; mark readiness failed; keep CQL responsive but return an immediate explicit typed error for every request that depends on the failed Raft core; no hangs or silent degradation; emit verbose bounded diagnostics. TDD list: preserve the usize::MAX underflow as RED; add fatal-core, health/readiness, typed CQL error, retry-storm, and log-observability cases. Diagnostic delivery must be bounded/rate-controlled so verbose failure reporting cannot itself OOM the node. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-006-merkle-hash-v2",
+      "title": "t_094b2d09: replace XOR-cancelling Merkle leaves with a versioned mixed-fleet-safe combiner and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "Add and run RED regressions where equal differences previously cancel under XOR",
+        "Run property tests for order definition, non-cancellation, determinism, and version compatibility",
+        "Stream a large repair tree under a fixed memory budget and run frg materialization-scan ."
+      ],
+      "source_refs": ["forge-task:t_094b2d09"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Ensures anti-entropy detects real divergence without breaking mixed-version clusters.",
+      "basePriority": 97,
+      "effort": "large",
+      "critical": true,
+      "notes": "Default accepted: use a versioned mixed-version-safe algorithm, not a coordinated breaking fleet change. TDD list: RED captures XOR cancellation; triangulate duplicates, permutations, tombstones, version negotiation, persisted v1 trees, and interrupted rebuild. Hash leaves incrementally; no full-partition/full-tree Vec. Migration/rebuild output uses stage -> verify -> atomic rename and safe staging cleanup. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-007-schema-snapshot-owner",
+      "title": "t_cd44f3eb: establish one crash-safe schema snapshot owner and format and open PR",
+      "status": "pending",
+      "depends_on": [],
+      "batch": 1,
+      "verification": [
+        "Add and run a RED concurrent-writer regression for schema.json",
+        "Run crash-point tests for stage, fsync, verify, rename, and startup cleanup",
+        "Run compatibility tests for object, legacy array, corrupt, and retained-generation inputs"
+      ],
+      "source_refs": ["forge-task:t_cd44f3eb"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Removes last-writer-wins corruption between incompatible schema.json producers.",
+      "basePriority": 97,
+      "effort": "large",
+      "critical": true,
+      "notes": "TDD list: RED deterministically races the two current writers; cover legacy/corrupt inputs, non-overwrite on parse failure, quarantine, retained generations, concurrent startup, and crash recovery. Use a single owner plus explicit format discriminator. Parse/migrate incrementally where format permits; never read_to_end an unbounded snapshot. All writes stage alongside live path, flush/fsync, verify, and atomically rename; clean inert staging files on startup. Run materialization scan before and after. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-008-s3-config-wiring",
+      "title": "t_65927c99: honor configured S3 object storage or fail startup loudly and open PR",
+      "status": "pending",
+      "depends_on": ["T-007-schema-snapshot-owner"],
+      "batch": 2,
+      "verification": [
+        "Add and run RED config tests for endpoint, bucket, region, credentials source, and absent manager",
+        "Run an S3-compatible integration test for streaming upload and schema recovery",
+        "Verify configured-but-unavailable object storage prevents false-ready startup"
+      ],
+      "source_refs": ["forge-task:t_65927c99", "forge-task:t_cd44f3eb"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Makes the declared S3 durability configuration real and observable.",
+      "basePriority": 94,
+      "effort": "medium",
+      "critical": true,
+      "notes": "TDD list: RED proves current TOML fields are ignored; cover explicit local mode, partial S3 config, unreachable endpoint, upload failure, restart recovery, and schema restore. Pass ObjectStoreConfig explicitly and fail loud when S3 is configured but no manager exists. Upload/download must stream bounded Bytes chunks with backpressure, no whole-object Vec/body.bytes/read_to_end, and atomic local promotion after verification. Run materialization scan before and after. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-009-accord-log-recovery",
+      "title": "t_6691c002: make Accord log upgrade and startup replay crash-safe and open PR",
+      "status": "pending",
+      "depends_on": ["T-001-accord-linearizability"],
+      "batch": 2,
+      "verification": [
+        "Add and run RED regressions for framed append to a legacy log and missing startup replay",
+        "Run crash/restart tests at every migration and replay boundary",
+        "Stream a large log under a fixed memory budget and run frg materialization-scan ."
+      ],
+      "source_refs": ["forge-task:t_6691c002", "forge-task:t_1f40005d"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Prevents mixed legacy/framed logs and restores durable Accord state on restart.",
+      "basePriority": 96,
+      "effort": "large",
+      "critical": true,
+      "notes": "TDD list: RED captures mixed-format append and startup-without-replay; triangulate empty, legacy, framed, truncated-tail, checksum failure, mid-migration crash, and replay idempotence. Refuse or atomically migrate legacy data before framed appends. Decode/replay record-by-record with bounded buffers, never whole-log read_to_end/Vec; stage -> verify -> fsync -> atomic rename, and clean staging artifacts safely. One isolated worktree and one PR."
+    },
+    {
+      "id": "T-010-replica-recovery",
+      "title": "t_891840e7: recover under-replicated native-cluster rows safely and open PR",
+      "status": "pending",
+      "depends_on": [
+        "T-002-rf3-cluster-formation",
+        "T-003-backup-consistency",
+        "T-004-repair-tie-handling",
+        "T-006-merkle-hash-v2"
+      ],
+      "batch": 2,
+      "verification": [
+        "Reproduce RF=1 and RF=2 rows in a disposable cluster and prove convergence to RF=3",
+        "Interrupt and resume recovery while verifying idempotence and bounded memory",
+        "Verify readiness and repair metrics cannot report healthy before replica counts converge"
+      ],
+      "source_refs": ["forge-task:t_891840e7"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Provides the safe, observable path from corrected formation/repair code to restored live replica durability.",
+      "basePriority": 98,
+      "effort": "large",
+      "critical": true,
+      "notes": "TDD list: disposable-cluster RED fixture with RF=1/RF=2 data; cover resume cursor, node loss, conflicting replicas, tombstones, repeated runs, and honest progress/health reporting. Recovery must page/stream partitions with bounded concurrency and explicit backpressure; no whole-table map/collect or serving-path scan fallback. Persist checkpoints atomically. One isolated worktree and one PR; live execution occurs only in the rollout gate."
+    },
+    {
+      "id": "T-011-live-deploy-smoke",
+      "title": "Deploy merged fixes to the live native cluster and run correctness/durability smoke tests",
+      "status": "pending",
+      "depends_on": [
+        "T-001-accord-linearizability",
+        "T-002-rf3-cluster-formation",
+        "T-003-backup-consistency",
+        "T-004-repair-tie-handling",
+        "T-005-openraft-fatal-supervision",
+        "T-006-merkle-hash-v2",
+        "T-007-schema-snapshot-owner",
+        "T-008-s3-config-wiring",
+        "T-009-accord-log-recovery",
+        "T-010-replica-recovery"
+      ],
+      "batch": 3,
+      "verification": [
+        "Capture a pre-deploy health, replica, schema, backup, process, and log baseline",
+        "Roll nodes safely while continuously probing CQL and readiness behavior",
+        "Smoke Accord conflict handling, RF=3 writes/reads, repair, backup/restore, schema restart, and log replay",
+        "Inspect every node log for the agreed post-deploy clean window"
+      ],
+      "source_refs": ["user-authorized-live-deploy:2026-08-26"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Proves the independently reviewed fixes work together on the authorized live cluster.",
+      "basePriority": 100,
+      "effort": "large",
+      "critical": true,
+      "notes": "User authorized live deployment. Capture a preflight snapshot and use a reversible rolling procedure. Verify RF=3, typed CQL failures, readiness, repair convergence, backup/restore, schema persistence, Accord replay, and bounded resource behavior. User clean-log contract confirmed 2026-08-26: after smoke, require a 15-minute all-node window with zero WARN, ERROR, PANIC, or FATAL events. No warning is normal unless explicitly presented to and accepted by the user. Any such event becomes a failing TDD reproduction and blocks completion."
+    },
+    {
+      "id": "T-012-clean-live-logs",
+      "title": "TDD every deployment-window log error and prove a clean live-cluster observation window",
+      "status": "pending",
+      "depends_on": ["T-011-live-deploy-smoke"],
+      "batch": 3,
+      "verification": [
+        "For each deployment-window error, record a deterministic RED reproduction and land its own bounded fix PR",
+        "Repeat affected smoke tests after each fix",
+        "Require zero disallowed events across all nodes for the agreed observation window"
+      ],
+      "source_refs": ["user-tdd-log-errors:2026-08-26"],
+      "goalRef": "critical-db-correctness",
+      "goalSummary": "Eliminate known correctness, durability, and operability failures before declaring the native cluster healthy.",
+      "itemContribution": "Turns runtime errors into regression coverage and makes clean logs an explicit release criterion.",
+      "basePriority": 100,
+      "effort": "large",
+      "critical": true,
+      "notes": "User clean-log contract confirmed 2026-08-26: every WARN, ERROR, PANIC, or FATAL event is blocking and receives a deterministic RED reproduction plus a bounded fix PR unless the user explicitly approves that exact event. If no events occur, complete with captured evidence. Create one worktree/PR per root cause; do not combine unrelated events. Log capture must be bounded and rotated, never accumulated in an unbounded in-memory buffer."
+    }
+  ]
+}

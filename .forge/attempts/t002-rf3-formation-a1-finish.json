@@ -1,0 +1,6 @@
+{
+  "resultSignature": "red:self-connection-advances-standalone-to-pair",
+  "progress": "RED reproduced deterministically: reporting the local host_id through on_peer_connected changes Standalone to Pair and inserts self into connected_peers.",
+  "newInformation": "The live bootstrapper mechanism exists on current origin/main at the peer-event boundary; self is tracked before any formation plan or transition guard validates identity.",
+  "nextAction": "Reject self before tracking or planning, make the regression GREEN, then triangulate with one real peer plus self and the explicit RF=3 readiness contract."
+}

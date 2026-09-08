@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green: composite partition DISTINCT pages at logical partition boundaries",
+  "progress": "GREEN: three composite partitions, including two clustering rows in one partition, return exactly once across two pages; direct and prepared-plan routes succeed; prefix filtering remains refused.",
+  "newInformation": "The correct bounded shape is one projected row per physical partition with a one-partition lookahead and a last-emitted-partition cursor, avoiding a cross-page DISTINCT seen set.",
+  "nextAction": "Run adjacent DISTINCT regressions, lint/docs/full-suite gates, then obtain distinct verification."
+}

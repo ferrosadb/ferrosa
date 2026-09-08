@@ -1,0 +1,6 @@
+{
+  "resultSignature": "green:declared-rf3-pair-is-not-cql-ready",
+  "progress": "GREEN: explicit expected topology now fails CQL readiness closed in standalone/pair/forming modes and requires a leader plus the declared committed voter count in cluster mode.",
+  "newInformation": "Automatic standalone and pair deployments can remain backward compatible when expected_cluster_size is unset, while FERROSA_EXPECTED_CLUSTER_SIZE gives multi-node operators a precise fail-closed contract.",
+  "nextAction": "Bound the Forming DDL queue, then add property/start-order coverage and run the full formation suite."
+}

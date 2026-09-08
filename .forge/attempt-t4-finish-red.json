@@ -1,0 +1,6 @@
+{
+  "resultSignature": "red: paged composite partition DISTINCT loses a partition",
+  "progress": "RED reproduced on origin/main: three logical composite partitions collapse to only two rows across a page-size-two traversal.",
+  "newInformation": "The unpaged standalone query is correct; the failure is specifically the driver-style paging boundary, where DISTINCT is applied after a row-bounded stream cursor advances.",
+  "nextAction": "Move DISTINCT partition enumeration to a partition-granular paging path so the cursor and page bound count logical partitions, then add prepared coverage."
+}
