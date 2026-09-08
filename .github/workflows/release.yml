@@ -194,7 +194,11 @@ jobs:
   # ── macOS Apple Silicon (aarch64) ─────────────────────────────────────
   build-macos-aarch64:
     name: Build macOS aarch64
-    runs-on: macos-14
+    # The self-hosted Apple Silicon Mac, not GitHub's pool. macOS minutes
+    # bill at 10x Linux. This job builds an unsigned binary and uploads a
+    # tarball -- no codesign, no notarytool, no keychain -- so it has none of
+    # the constraints that keep the Apple SIGNING jobs hosted.
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
