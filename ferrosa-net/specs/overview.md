@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 status: implemented
-last_updated: 2026-07-01
+last_updated: 2026-09-09
 executive_summary: >
   The internode transport for ferrosa: a custom framed TCP wire protocol with a
   44-byte header, a PSK-HMAC handshake, three priority lanes (Raft/Data/Bulk) per
@@ -93,10 +93,14 @@ and rejects frames whose version does not match. `length` is bounded by
 4. **Ordered streaming responses dispatch in wire order.** Chunk/heartbeat/done
    frames for one stream are processed in order; out-of-order dispatch trips the
    coordinator's contiguous-`seq` check (`MsgType::is_ordered_stream_response`).
-5. **Reconnect targets a re-resolvable hostname, not a frozen IP.** Lanes prefer
+5. **A dead client is never treated as connected.** The alive watcher transitions
+   the lane to `Reconnecting` before starting backoff, so new RPCs fail
+   transiently instead of being dispatched to a closed TCP writer; a successful
+   handshake swaps the client back to `Connected`.
+6. **Reconnect targets a re-resolvable hostname, not a frozen IP.** Lanes prefer
    the peer's advertised internode-broadcast hostname so a peer that restarts on
    a new container IP is reconnected (P3 fix in `pool::pick_reconnect_host`).
-6. **Fail loud on bad auth / require_tls.** PSK mismatch rejects the handshake;
+7. **Fail loud on bad auth / require_tls.** PSK mismatch rejects the handshake;
    `require_tls` with no cert errors at startup rather than silently running
    plaintext.
 
