@@ -303,10 +303,14 @@ impl RpcClient {
             header: FrameHeader::new(msg.msg_type(), lane, stream_id, body_len),
             body: body.freeze(),
         };
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|_| NetError::Protocol("connection closed".into()))?;
+        if self.tx.send(frame).await.is_err() {
+            // The writer task has already exited. Remove the slot before
+            // notifying the lane watcher so a dead connection cannot retain
+            // a phantom in-flight request or keep dispatching new work.
+            self.pending.remove(&stream_id);
+            let _ = self.alive_tx.send(false);
+            return Err(NetError::Protocol("connection closed".into()));
+        }
 
         // Increment in-flight gauge now that the request is on the wire.
         self.in_flight
@@ -350,10 +354,11 @@ impl RpcClient {
             header,
             body: body.freeze(),
         };
-        self.tx
-            .send(frame)
-            .await
-            .map_err(|_| NetError::Protocol("connection closed".into()))
+        if self.tx.send(frame).await.is_err() {
+            let _ = self.alive_tx.send(false);
+            return Err(NetError::Protocol("connection closed".into()));
+        }
+        Ok(())
     }
 }
 

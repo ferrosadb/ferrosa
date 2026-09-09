@@ -458,6 +458,167 @@ mod tests {
         server.shutdown(Duration::from_millis(50)).await;
     }
 
+    /// A dropped TCP connection must stop dispatching work to the dead client
+    /// while the lane's reconnect task is running (Fly/OpenRaft recovery path).
+    #[tokio::test]
+    async fn dropped_peer_transitions_lane_to_reconnecting() {
+        use crate::codec::InternodeCodec;
+        use crate::handshake::accept_handshake;
+        use tokio::net::TcpListener;
+        use tokio_util::codec::Framed;
+
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_config = config.clone();
+        let server_task = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(
+                    stream,
+                    InternodeCodec::new(server_config.max_frame_body_size),
+                );
+                accept_handshake(&mut framed, &server_config, uuid::Uuid::new_v4())
+                    .await
+                    .unwrap();
+                connections.push(framed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(connections);
+        });
+
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Given: the peer disappears after the lane is connected.
+        server_task.await.unwrap();
+
+        // Then: the lane leaves Connected before reconnect backoff elapses.
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = pool.raft.query_status().await.unwrap();
+                if status == LaneStatusReport::Reconnecting {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lane must enter Reconnecting after the peer connection drops");
+        assert_eq!(status, LaneStatusReport::Reconnecting);
+
+        let result = pool
+            .send(
+                Message::Ping {
+                    nonce: 7,
+                    sent_at: 0,
+                },
+                Lane::Raft,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(NetError::Reconnecting)),
+            "new Raft work must fail transiently while reconnecting, got {result:?}"
+        );
+
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_peer_reconnects_all_lanes() {
+        use crate::codec::InternodeCodec;
+        use crate::handshake::accept_handshake;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+        use tokio_util::codec::Framed;
+
+        let config = NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_config = config.clone();
+        let (reconnected_tx, reconnected_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut initial_connections = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(
+                    stream,
+                    InternodeCodec::new(server_config.max_frame_body_size),
+                );
+                accept_handshake(&mut framed, &server_config, uuid::Uuid::new_v4())
+                    .await
+                    .unwrap();
+                initial_connections.push(framed);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(initial_connections);
+
+            let mut replacement_connections = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(
+                    stream,
+                    InternodeCodec::new(server_config.max_frame_body_size),
+                );
+                accept_handshake(&mut framed, &server_config, uuid::Uuid::new_v4())
+                    .await
+                    .unwrap();
+                replacement_connections.push(framed);
+            }
+            let _ = reconnected_tx.send(());
+            let _ = release_rx.await;
+            drop(replacement_connections);
+        });
+
+        let pool = PriorityPool::connect(
+            Arc::new(config),
+            uuid::Uuid::new_v4(),
+            &addr.to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(4), reconnected_rx)
+            .await
+            .expect("peer should accept all reconnect handshakes")
+            .expect("reconnect notification sender should remain alive");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.all_lanes_resolved().await == LaneOutcome::AllConnected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "all lanes should return to Connected after reconnect"
+        );
+
+        let _ = release_tx.send(());
+        server_task.await.unwrap();
+        pool.shutdown().await;
+    }
+
     /// Connect to a test server, send Ping on each lane, verify Pong response.
     /// Validates the actor-based pool works end-to-end with real TCP connections.
     #[tokio::test]
