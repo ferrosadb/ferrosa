@@ -72,6 +72,11 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
   keep their `range_read_limited_rows_checked` fail-loud cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
+  Global secondary-index scans use the analogous bounded-per-hop
+  `WritePath::index_read_stream` path, so high-cardinality edge indexes are
+  delivered incrementally. Multi-index intersections retain `O(result)`
+  partition-key membership sets, and cross-replica deduplication retains
+  `O(result)` row identities.
 - **Scan planner** (`planner.rs`) — rule-based `ScanPlan` selection for SELECT:
   `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
   indexed residual `=` predicate — t_430c4188: keyed secondary-index consult
@@ -95,6 +100,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `FullScan`. `EXPLAIN SELECT …` renders the same plan the router executes.
   `CREATE INDEX` on a CLUSTERING column wires the storage engine's
   clustering-component build path (previously a silent schema-only no-op).
+  Scalar indexes created after writes synchronously stream pre-existing active
+  and flushing memtable rows into the index before indexed SELECTs can use it;
+  an empty global lookup remains a real miss and never falls back to a scan.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from

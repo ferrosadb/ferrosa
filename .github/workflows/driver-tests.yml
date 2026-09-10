@@ -10,7 +10,9 @@ name: Driver Smoke Tests
 on:
   push:
     branches: [main]
-  pull_request:
+  # Runs from the trusted default-branch workflow. The author gate below is
+  # therefore not editable by the pull request whose code will be tested.
+  pull_request_target:
     # Path filter keeps cheap PRs (docs-only, specs-only) from spending
     # ~15 min of CI on the multi-language driver matrix.
     paths:
@@ -33,7 +35,9 @@ env:
 jobs:
   driver-smoke:
     name: Driver Smoke (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Only the runner owner's PRs may execute code on organization runners.
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.user.login == 'bkearns'
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
       packages: read
@@ -45,6 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
           submodules: true
 
       - name: Reuse prebuilt node image from GHCR if available

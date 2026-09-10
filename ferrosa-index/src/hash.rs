@@ -15,7 +15,7 @@ use crate::{
 };
 use ferrosa_common::CellValue;
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
 
 // ── Factory ──────────────────────────────────────────────────────────────────
@@ -121,6 +121,21 @@ pub struct HashReader {
 impl IndexReader for HashReader {
     fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>> {
         Ok(self.entries.get(&key.0).cloned().unwrap_or_default())
+    }
+
+    fn visit(
+        &self,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) -> IndexResult<()> {
+        if let Some(positions) = self.entries.get(&key.0) {
+            for position in positions {
+                if visitor(position.clone()).is_break() {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn range(

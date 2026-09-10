@@ -1221,6 +1221,15 @@ pub struct RangeReadStreamRequestPayload {
     pub request_id: u32,
     pub keyspace: String,
     pub table: String,
+    /// Optional secondary-index source. When both fields are present the
+    /// stream walks matching index postings instead of the full table range.
+    /// The same bounded framing/back-pressure contract is used for both
+    /// sources, so a high-cardinality edge lookup never falls back to a
+    /// materialized `Vec` response.
+    #[serde(default)]
+    pub index_name: Option<String>,
+    #[serde(default)]
+    pub index_key: Option<Vec<u8>>,
     /// Optional current-schema regular-column ordinals to decode. `None`
     /// streams full partitions; `Some` uses the projected SSTable reader so
     /// wide cells not needed by the query are byte-skipped on remote replicas.
@@ -1407,85 +1416,6 @@ pub struct FulltextSearchStreamCancelPayload {
     pub request_id: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Index read handler
-// ---------------------------------------------------------------------------
-
-/// Payload for a remote index-read request (secondary index lookup on one node).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexReadRequestPayload {
-    pub keyspace: String,
-    pub table: String,
-    pub index_name: String,
-    pub index_key: Vec<u8>,
-}
-
-/// Payload for a remote index-read response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexReadResponsePayload {
-    pub partitions: Vec<PartitionWire>,
-}
-
-/// Handles inbound `IndexReadRequest` RPCs from remote coordinators.
-///
-/// Runs `read_by_index` on local storage and returns matching partitions.
-pub struct IndexReadHandler {
-    storage: Arc<StorageEngine>,
-}
-
-impl IndexReadHandler {
-    pub fn new(storage: Arc<StorageEngine>) -> Self {
-        Self { storage }
-    }
-}
-
-#[async_trait]
-impl RpcHandler for IndexReadHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-        let bytes = match msg {
-            Message::IndexReadRequest(b) => b,
-            _ => return None,
-        };
-
-        let req: IndexReadRequestPayload = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("IndexReadHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
-
-        let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
-        let index_key = IndexKey(req.index_key);
-
-        let partitions = match self
-            .storage
-            .read_by_index(&table_id, &req.index_name, &index_key)
-        {
-            Ok(ps) => ps,
-            Err(e) => {
-                tracing::warn!("IndexReadHandler: read_by_index failed: {e}");
-                vec![]
-            }
-        };
-
-        let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
-        let payload = IndexReadResponsePayload {
-            partitions: wire_partitions,
-        };
-
-        let resp_bytes = match bincode::serialize(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("IndexReadHandler: failed to serialize response: {e}");
-                bincode::serialize(&IndexReadResponsePayload { partitions: vec![] })
-                    .unwrap_or_default()
-            }
-        };
-
-        Some(Message::IndexReadResponse(Bytes::from(resp_bytes)))
-    }
-}
-
 /// Payload for a remote KEYED index-read request (t_430c4188): a secondary
 /// index lookup restricted to one partition, sent only to that partition's
 /// replicas — never a global scatter-gather.
@@ -1497,6 +1427,12 @@ pub struct IndexReadInPartitionRequestPayload {
     pub index_key: Vec<u8>,
     /// Raw partition key bytes the postings are restricted to.
     pub partition_key: Vec<u8>,
+}
+
+/// Response shared by keyed index-read replicas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexReadResponsePayload {
+    pub partitions: Vec<PartitionWire>,
 }
 
 /// Handles inbound `IndexReadInPartitionRequest` RPCs from remote coordinators.
@@ -2427,6 +2363,8 @@ mod tests {
             request_id: 7,
             keyspace: "agent_memory".into(),
             table: "entity_store".into(),
+            index_name: None,
+            index_key: None,
             projected_regular_ordinals: None,
             start_key: Some(b"resume-here".to_vec()),
             start_clustering: Some(b"resume-ck".to_vec()),

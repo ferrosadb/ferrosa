@@ -1058,33 +1058,34 @@ impl WritePath {
         Ok((partitions, truncated))
     }
 
-    /// Read by secondary index, scattering to all nodes in cluster mode.
-    ///
-    /// - `Direct` / `Pair`: reads from local storage only.
-    /// - `Cluster`: fans out to every ring node, each runs a local
-    ///   `read_by_index`, and results are merged and deduplicated.
-    /// - `Unavailable`: returns error.
-    pub async fn index_read(
+    /// Stream a global secondary-index lookup without materializing all
+    /// matching partitions. The cluster path deduplicates row identities
+    /// across replicas while every storage/RPC hop remains bounded.
+    pub async fn index_read_stream(
         &self,
         table_id: &TableId,
         index_name: &str,
         index_key: &ferrosa_index::IndexKey,
-    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
+    ) -> crate::error::Result<PartitionResultStream> {
         match self {
-            Self::Direct(engine) => engine
-                .read_by_index(table_id, index_name, index_key)
-                .map_err(crate::error::ClusterError::Storage),
-            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
-                .local_storage()
-                .read_by_index(table_id, index_name, index_key)
-                .map_err(crate::error::ClusterError::Storage),
+            Self::Direct(engine) => Ok(Box::pin(
+                engine
+                    .read_by_index_stream(table_id, index_name, index_key)
+                    .map(|item| item.map_err(ClusterError::Storage)),
+            )),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => Ok(Box::pin(
+                coordinator
+                    .local_storage()
+                    .read_by_index_stream(table_id, index_name, index_key)
+                    .map(|item| item.map_err(ClusterError::Storage)),
+            )),
             Self::Cluster(coordinator) => {
                 coordinator
-                    .coordinate_index_read(table_id, index_name, index_key)
+                    .coordinate_index_read_stream(table_id, index_name, index_key)
                     .await
             }
-            Self::Unavailable => Err(crate::error::ClusterError::Internal(
-                "index read unavailable: write path is in degraded mode".into(),
+            Self::Unavailable => Err(ClusterError::Internal(
+                "index read stream unavailable: write path is in degraded mode".into(),
             )),
         }
     }
@@ -1095,7 +1096,7 @@ impl WritePath {
     /// - `Direct` / `Pair`: local `read_by_index_in_partition`.
     /// - `Cluster`: routes to the PARTITION'S replicas under `strategy` (normal
     ///   keyed routing) — never the global scatter-gather of
-    ///   [`index_read`](Self::index_read).
+    ///   [`index_read_stream`](Self::index_read_stream).
     /// - `Unavailable`: returns error.
     ///
     /// Per-node work is O(rows matching the indexed value), never O(partition
@@ -1569,22 +1570,30 @@ mod tests {
         let base = storage.read(&table_id, &key0).unwrap();
         assert!(base.is_some(), "base partition should be readable for key0");
 
-        // Verify index read returns all rows.
+        // Verify the streaming index read returns all rows.
         let index_key = ferrosa_index::IndexKey(b"shared".to_vec());
-        let direct = storage
-            .read_by_index(&table_id, "label_idx", &index_key)
+        let mut direct = Vec::new();
+        storage
+            .read_by_index_each(&table_id, "label_idx", &index_key, &mut |partition| {
+                direct.push(partition);
+                std::ops::ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(
             direct.len(),
             4,
-            "engine.read_by_index must return all 4 rows (direct check)"
+            "engine.read_by_index_each must return all 4 rows (direct check)"
         );
 
         let wp = WritePath::direct(storage);
-        let partitions = wp
-            .index_read(&table_id, "label_idx", &index_key)
+        let mut stream = wp
+            .index_read_stream(&table_id, "label_idx", &index_key)
             .await
             .unwrap();
+        let mut partitions = Vec::new();
+        while let Some(partition) = stream.next().await {
+            partitions.push(partition.unwrap());
+        }
         assert_eq!(
             partitions.len(),
             4,

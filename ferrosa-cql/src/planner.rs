@@ -36,7 +36,8 @@ pub enum ScanPlan {
     },
 
     /// One WHERE column matches a secondary index, but other WHERE columns
-    /// are not indexed. Use read_by_index() + post-filter remaining predicates.
+    /// are not indexed. Use the streaming index-read path and post-filter
+    /// remaining predicates.
     IndexScanWithFilter {
         index_name: String,
         index_column: String,

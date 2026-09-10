@@ -36,7 +36,7 @@ pub use phonetic::PhoneticAlgorithm;
 use ferrosa_common::CellValue;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::ops::Bound;
+use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
 
 // ── Error types ──────────────────────────────────────────────────────────────
@@ -236,6 +236,22 @@ pub trait IndexBuilder: Send {
 pub trait IndexReader: Send + Sync {
     /// Look up all rows whose indexed column(s) exactly match `key`.
     fn lookup(&self, key: &IndexKey) -> IndexResult<Vec<RowPosition>>;
+
+    /// Visit matching rows one at a time, stopping when the visitor returns
+    /// [`ControlFlow::Break`]. Implementations should override this method so
+    /// high-cardinality postings are not first copied into a result `Vec`.
+    fn visit(
+        &self,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) -> IndexResult<()> {
+        for position in self.lookup(key)? {
+            if visitor(position).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Return all rows whose indexed column(s) fall within `[start, end)`.
     fn range(

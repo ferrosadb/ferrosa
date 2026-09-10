@@ -17,7 +17,7 @@ use crate::{
     IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
 };
 use ferrosa_common::CellValue;
-use std::ops::Bound;
+use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
 
 /// Entry stored in the B-tree index: a key and its corresponding row position.
@@ -140,6 +140,25 @@ impl IndexReader for BTreeReader {
             }
         }
         Ok(results)
+    }
+
+    fn visit(
+        &self,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) -> IndexResult<()> {
+        let start = self
+            .entries
+            .partition_point(|e| e.key.as_slice() < key.0.as_slice());
+        for entry in &self.entries[start..] {
+            if entry.key != key.0 {
+                break;
+            }
+            if visitor(entry.position.clone()).is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn range(

@@ -175,6 +175,8 @@ mod tests {
             request_id: id,
             keyspace: "ks".into(),
             table: "tbl".into(),
+            index_name: None,
+            index_key: None,
             projected_regular_ordinals: None,
             start_key: None,
             start_clustering: None,

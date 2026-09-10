@@ -87,6 +87,12 @@ threshold, and an unmet threshold returns `ReadTimeout`. Exposed as
 `WritePath::index_read_in_partition` (Direct/Pair resolve locally). Unlike
 `coordinate_index_read`, this never fans out to the whole ring.
 
+**Global index stream.** `coordinate_index_read_stream` reuses the bounded Bulk
+stream framing for high-cardinality secondary-index lookups. Each replica
+visits postings incrementally and the coordinator forwards bounded partitions;
+the coordinator retains `O(result)` row identities for cross-replica
+deduplication without a full `Vec<Partition>` response.
+
 **Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
 index lookup out to every node — its hits span all token ranges (there is no
 partition key) — running each node's local FTI via a `FulltextSearchRequest` RPC
@@ -132,6 +138,10 @@ transactions before applying to storage at the agreed HLC timestamp. See
    host/port, `peer_events` resolves and uses it for the reverse pool and
    `connected_peers`; only legacy peers without a usable advertisement fall back
    to the observed IP plus the local internode port.
+8. **Replica read failures are not successful partial results.** Legacy range,
+   secondary-index, and full-text scatter-gathers fail the request when a
+   required replica errors; streaming paths propagate the replica error through
+   their bounded result stream.
 
 ## Correctness evidence (be honest)
 

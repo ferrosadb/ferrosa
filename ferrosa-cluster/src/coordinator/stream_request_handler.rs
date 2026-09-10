@@ -90,6 +90,20 @@ pub trait StreamRangeReader: Send + Sync {
         projected_regular_ordinals: Option<&'a [u16]>,
         start: Option<&'a ferrosa_common::key::DecoratedKey>,
     ) -> ferrosa_common::Result<PartitionStream<'a>>;
+
+    /// Open a lazy stream over one secondary-index key. Implementations must
+    /// visit postings incrementally; returning a materialized result vector
+    /// defeats the purpose of the stream protocol.
+    fn index_iter<'a>(
+        &'a self,
+        _table_id: &TableId,
+        _index_name: &str,
+        _index_key: &[u8],
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        Err(ferrosa_common::Error::InvalidData(
+            "streaming index reads are not supported by this reader".into(),
+        ))
+    }
 }
 
 impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
@@ -128,6 +142,16 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
                 None,
             ))
         }
+    }
+
+    fn index_iter<'a>(
+        &'a self,
+        table_id: &TableId,
+        index_name: &str,
+        index_key: &[u8],
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        let key = ferrosa_index::IndexKey(index_key.to_vec());
+        Ok(self.read_by_index_stream(table_id, index_name, &key))
     }
 }
 
@@ -177,11 +201,18 @@ pub async fn handle_stream_request_with_cancel<R, S>(
 
     // Open the lazy partition stream. Errors here are open-time
     // (table not found, etc.) — emit a truncated Done and bail.
-    let mut stream = match reader.range_iter(
-        &table_id,
-        req.projected_regular_ordinals.as_deref(),
-        start_key.as_ref(),
-    ) {
+    let stream_result = match (&req.index_name, &req.index_key) {
+        (Some(index_name), Some(index_key)) => reader.index_iter(&table_id, index_name, index_key),
+        (None, None) => reader.range_iter(
+            &table_id,
+            req.projected_regular_ordinals.as_deref(),
+            start_key.as_ref(),
+        ),
+        _ => Err(ferrosa_common::Error::InvalidData(
+            "streaming index request must include both index_name and index_key".into(),
+        )),
+    };
+    let mut stream = match stream_result {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -547,6 +578,7 @@ mod tests {
     use ferrosa_common::key::DecoratedKey;
     use ferrosa_common::PartitionKey;
     use ferrosa_sstable::types::{DeletionTime, Partition};
+    use futures::StreamExt;
     use uuid::Uuid;
 
     use crate::raft::handlers::{RangeReadStreamChunkPayload, RangeReadStreamDonePayload};
@@ -566,6 +598,8 @@ mod tests {
             request_id: id,
             keyspace: "ks".into(),
             table: "tbl".into(),
+            index_name: None,
+            index_key: None,
             projected_regular_ordinals: None,
             start_key: None,
             start_clustering: None,
@@ -589,6 +623,65 @@ mod tests {
                 self.partitions.iter().cloned().map(Ok).collect();
             Ok(Box::pin(futures::stream::iter(items)))
         }
+    }
+
+    struct SyntheticIndexReader {
+        rows: usize,
+    }
+
+    impl StreamRangeReader for SyntheticIndexReader {
+        fn range_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _projected_regular_ordinals: Option<&'a [u16]>,
+            _start: Option<&'a ferrosa_common::key::DecoratedKey>,
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn index_iter<'a>(
+            &'a self,
+            _table_id: &TableId,
+            _index_name: &str,
+            _index_key: &[u8],
+        ) -> ferrosa_common::Result<PartitionStream<'a>> {
+            Ok(Box::pin(
+                futures::stream::iter(0..self.rows).map(|i| Ok(make_partition((i % 251) as u8))),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn index_request_streams_large_result_in_bounded_chunks() {
+        let mut request = req(123);
+        request.index_name = Some("tenant_idx".into());
+        request.index_key = Some(b"tenant-a".to_vec());
+        let sink = VecSink::new();
+
+        handle_stream_request(
+            request,
+            Arc::new(SyntheticIndexReader { rows: 10_001 }),
+            &sink,
+            128,
+        )
+        .await;
+
+        let frames = sink.take();
+        let mut rows = 0;
+        let mut chunks = 0;
+        for frame in &frames {
+            if let Message::RangeReadStreamChunk(bytes) = frame {
+                let chunk: RangeReadStreamChunkPayload = bincode::deserialize(bytes).unwrap();
+                assert!(chunk.partitions.len() <= 128);
+                rows += chunk.partitions.len();
+                chunks += 1;
+            }
+        }
+        assert_eq!(rows, 10_001);
+        assert!(chunks > 1, "large index results must be chunked");
+        assert!(frames
+            .iter()
+            .any(|frame| matches!(frame, Message::RangeReadStreamDone(_))));
     }
 
     /// Test reader that records the `start` key passed to `range_iter`, so the

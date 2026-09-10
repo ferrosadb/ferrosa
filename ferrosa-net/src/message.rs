@@ -270,10 +270,6 @@ pub enum Message {
     IndexBuildRequest(Bytes),
     IndexBuildComplete(Bytes),
 
-    // Secondary index scatter-gather
-    IndexReadRequest(Bytes),
-    IndexReadResponse(Bytes),
-
     // Full-text index scatter-gather (fts_match across every node's local FTI)
     FulltextSearchRequest(Bytes),
     FulltextSearchResponse(Bytes),
@@ -397,8 +393,6 @@ impl Message {
             Self::BatchlogReplay(_) => MsgType::BatchlogReplay,
             Self::IndexBuildRequest(_) => MsgType::IndexBuildRequest,
             Self::IndexBuildComplete(_) => MsgType::IndexBuildComplete,
-            Self::IndexReadRequest(_) => MsgType::IndexReadRequest,
-            Self::IndexReadResponse(_) => MsgType::IndexReadResponse,
             Self::FulltextSearchRequest(_) => MsgType::FulltextSearchRequest,
             Self::FulltextSearchResponse(_) => MsgType::FulltextSearchResponse,
             Self::IndexReadInPartitionRequest(_) => MsgType::IndexReadInPartitionRequest,
@@ -560,8 +554,6 @@ impl Message {
             | Self::BatchlogReplay(b)
             | Self::IndexBuildRequest(b)
             | Self::IndexBuildComplete(b)
-            | Self::IndexReadRequest(b)
-            | Self::IndexReadResponse(b)
             | Self::FulltextSearchRequest(b)
             | Self::FulltextSearchResponse(b)
             | Self::IndexReadInPartitionRequest(b)
@@ -804,8 +796,6 @@ impl Message {
             MsgType::IndexBuildComplete => {
                 Self::IndexBuildComplete(body.split_to(body.remaining()))
             }
-            MsgType::IndexReadRequest => Self::IndexReadRequest(body.split_to(body.remaining())),
-            MsgType::IndexReadResponse => Self::IndexReadResponse(body.split_to(body.remaining())),
             MsgType::FulltextSearchRequest => {
                 Self::FulltextSearchRequest(body.split_to(body.remaining()))
             }

@@ -38,7 +38,7 @@ about CQL/SQL protocol framing or query planning — those belong to the front-e
 | Module | Responsibility |
 |--------|----------------|
 | `engine` (`src/engine.rs`, ~18.8k LoC) | `StorageEngine` + `StorageEngineConfig`: composition root; write/read/range/batch API, registration, snapshot/PITR orchestration, maintenance |
-| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush; secondary indexes on regular cells AND clustering-key components (`add_clustering_index`), live index removal (`remove_index`), incl. the partition-keyed consult `read_by_index_in_partition` (t_430c4188) |
+| `store` (`src/store.rs`, ~9.2k LoC) | `TableStore`: lock-free `ArcSwap<StoreView>` per table; flush serialization; reader-pool wiring; index/FTI sidecar flush; callback/async streaming global secondary-index reads; fail-loud bounded partition-keyed and geo index consults; secondary indexes on regular cells AND clustering-key components (`add_clustering_index`), live index removal (`remove_index`), incl. the partition-keyed consult `read_by_index_in_partition` (t_430c4188) |
 | `memtable/` | `Memtable` trait; `SkipListMemtable` (default), `ShardedBTreeMemtable`; eager-index + vector-index hooks |
 | `commitlog/` | Segmented WAL: `segment` (CAS alloc), `sync` (Batch/Periodic/Group), `reader` (replay), `archiver` (S3/PITR), `cdc`, `checkpoint`, `manifest` |
 | `flush` | `FlushTarget` trait + `FileFlushTarget`/`InMemoryFlushTarget`; serialization-header construction |
@@ -103,9 +103,13 @@ volume or changing query results.
    tombstones (partition/row/cell) suppress older data by `marked_for_delete_at`.
 4. **Durability is governed by the sync strategy.** Only `Batch` fsyncs every
    write; the **default `Periodic`** has a bounded loss window (`sync_interval`).
-5. **Index registration is replay-safe.** Repeating the same index declaration
-   preserves the active memtable index and its unflushed postings; a conflicting
-   column position or index type fails loud instead of silently replacing it.
+5. **Index registration is replay-safe and complete for live rows.** Repeating
+   the same index declaration preserves the active memtable index and its
+   unflushed postings; a conflicting column position or index type fails loud
+   instead of silently replacing it. A new scalar declaration streams the
+   active and flushing memtables into the index before publication, so rows
+   written before CREATE INDEX are visible without materializing a fallback
+   table scan.
 6. **Table registration is compare-and-install.** A schema replay that loses
    the table-map install race merges declarations into the already-live store;
    it cannot replace active memtable rows or index postings.

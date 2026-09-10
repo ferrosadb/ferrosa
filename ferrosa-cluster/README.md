@@ -114,10 +114,9 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   responses (t_2f174c97), so CL ONE does not inherit a slow peer's three-second
   Bulk timeout; quorum levels still wait for their required successes.
   (`fts_match` — fans out to every node's local FTI and unions/de-dupes the
-  matching keys, since full-text hits span all token ranges; BUG-F-007). FTI
-  scatter-gather is partial-failure tolerant: if at least one node completes, the
-  union is returned even when it is empty, so a transient remote stream failure
-  does not turn a valid no-hit search into a user-visible error. The
+  matching keys, since full-text hits span all token ranges; BUG-F-007). Legacy
+  scatter-gathers fail when any required node fails; returning a local-only union
+  as a successful no-hit search would hide missing data. The
   query-derived `LIMIT k` is pushed down to every replica
   (`FulltextSearchRequestPayload.limit`, t_ee98faa0 layer 2) so each holds a
   bounded top-k working set and the union is at most `replicas x k` keys;
@@ -150,6 +149,11 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
   still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
   degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
+  The same bounded Bulk frames now carry global secondary-index walks: each
+  replica visits postings incrementally, and the coordinator forwards bounded
+  partitions. The coordinator retains `O(result)` row identities for
+  cross-replica deduplication; CQL global index scans use
+  `WritePath::index_read_stream`.
   The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
   `consume_range_stream_into` MOVE each decoded partition into a sink one at a
   time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`

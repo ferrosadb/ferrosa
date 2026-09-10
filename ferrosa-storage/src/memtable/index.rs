@@ -7,6 +7,7 @@
 //! Based on Okasaki's persistent red-black tree (Purely Functional Data
 //! Structures, 1998), adapted for Rust with `Arc` for structural sharing.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -75,6 +76,14 @@ impl MemtableIndex {
     pub fn lookup(&self, key: &IndexKey) -> Vec<RowPosition> {
         let guard = self.root.load();
         Self::lookup_in((**guard).as_ref(), key)
+    }
+
+    /// Visit exact-key postings without cloning the entire posting list.
+    /// Returning `Break` stops the traversal immediately, which lets a
+    /// downstream page or stream apply back-pressure at the index boundary.
+    pub fn visit(&self, key: &IndexKey, visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>) {
+        let guard = self.root.load();
+        Self::visit_in((**guard).as_ref(), key, visitor);
     }
 
     /// Range query: returns all RowPositions for keys in [start, end] inclusive.
@@ -292,6 +301,27 @@ impl MemtableIndex {
                 std::cmp::Ordering::Less => Self::lookup_in(n.left.as_ref(), key),
                 std::cmp::Ordering::Greater => Self::lookup_in(n.right.as_ref(), key),
                 std::cmp::Ordering::Equal => n.values.clone(),
+            },
+        }
+    }
+
+    fn visit_in(
+        node: Option<&Arc<Node>>,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) {
+        match node {
+            None => {}
+            Some(n) => match key.cmp(&n.key) {
+                std::cmp::Ordering::Less => Self::visit_in(n.left.as_ref(), key, visitor),
+                std::cmp::Ordering::Greater => Self::visit_in(n.right.as_ref(), key, visitor),
+                std::cmp::Ordering::Equal => {
+                    for position in &n.values {
+                        if visitor(position.clone()).is_break() {
+                            break;
+                        }
+                    }
+                }
             },
         }
     }

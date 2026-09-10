@@ -624,24 +624,28 @@ where
             }
         }
         TripleOp::ObjectScan { object, .. } => {
-            // Keyed index read first: bounded by the number of index matches.
+            // Keyed index read first. The stream keeps transport bounded and
+            // lets the scan stop as soon as its sink is satisfied.
             let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
-            let indexed = write_path
-                .index_read(&table_id, OBJECT_INDEX_NAME, &index_key)
+            let mut indexed = write_path
+                .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key)
                 .await?;
-            if indexed.is_empty() {
+            let mut found = false;
+            let mut stopped = false;
+            while let Some(partition) = indexed.next().await {
+                found = true;
+                if scan.feed(&partition?)?.is_break() {
+                    stopped = true;
+                    break;
+                }
+            }
+            if !found && !stopped {
                 tracing::warn!(
                     object,
                     "ObjectScan: no secondary index hit; falling back to a streaming \
                      full scan with filtering"
                 );
                 stream_scan(&table_id, write_path, &mut scan).await?;
-            } else {
-                for partition in &indexed {
-                    if scan.feed(partition)?.is_break() {
-                        break;
-                    }
-                }
             }
         }
         TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {

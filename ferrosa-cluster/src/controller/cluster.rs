@@ -132,8 +132,8 @@ use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
 use crate::raft::handlers::{
-    FulltextSearchHandler, IndexReadHandler, IndexReadInPartitionHandler, RaftAppendHandler,
-    RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
+    FulltextSearchHandler, IndexReadInPartitionHandler, RaftAppendHandler, RaftSnapshotHandler,
+    RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -1392,10 +1392,6 @@ impl ModeController {
             .register(MsgType::FulltextSearchStreamHeartbeat, frame_router.clone());
         self.registry
             .register(MsgType::FulltextSearchStreamDone, frame_router);
-
-        let index_read_handler = Arc::new(IndexReadHandler::new(self.storage.clone()));
-        self.registry
-            .register(MsgType::IndexReadRequest, index_read_handler);
 
         // Keyed (partition-restricted) secondary-index reads (t_430c4188) —
         // without this, a remote coordinator's keyed index consult would time

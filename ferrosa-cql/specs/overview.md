@@ -94,6 +94,16 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+Global scalar secondary-index plans use `WritePath::index_read_stream`.
+COUNT folds directly over the bounded-per-hop stream, and a plain `LIMIT` stops
+the consumer at the requested row count. Multi-index AND plans retain only
+`O(result)` partition-key membership sets for non-primary streams and keep the
+primary partitions lazy; coordinator cross-replica deduplication retains
+`O(result)` row identities. An empty index result is a real empty result; it
+does not trigger a full-table fallback. CREATE INDEX populates its scalar
+memtable index from pre-existing active and flushing rows before publication,
+so removing that fallback does not create a visibility gap for unflushed data.
+
 Paged `SELECT DISTINCT` over every component of a composite partition key uses
 a partition-granular projected stream. It emits one logical row per partition,
 looks ahead by one partition to decide whether a continuation exists, and stores

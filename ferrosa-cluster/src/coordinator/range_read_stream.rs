@@ -1189,6 +1189,8 @@ struct WindowedReplicaForwarder {
     keyspace: String,
     table: String,
     wanted: Option<Vec<u16>>,
+    index_name: Option<String>,
+    index_key: Option<Vec<u8>>,
     window_chunks: u32,
     /// Set true ONLY when this replica's logical stream ends for a reason that
     /// makes a silent `remote_tx` close SAFE for the merge to read as "this
@@ -1212,6 +1214,8 @@ impl WindowedReplicaForwarder {
             request_id,
             keyspace: self.keyspace.clone(),
             table: self.table.clone(),
+            index_name: self.index_name.clone(),
+            index_key: self.index_key.clone(),
             projected_regular_ordinals: self.wanted.clone(),
             start_key,
             start_clustering,
@@ -1379,6 +1383,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         host_id: uuid::Uuid,
         projected_regular_ordinals: Option<&[u16]>,
+        index: Option<(&str, &[u8])>,
         resume: Option<&ScanResume>,
         window_chunks: u32,
     ) -> crate::error::Result<ClusterPartitionStream> {
@@ -1396,6 +1401,8 @@ impl ClusterCoordinator {
             keyspace: table_id.keyspace.clone(),
             table: table_id.table.clone(),
             wanted: projected_regular_ordinals.map(|w| w.to_vec()),
+            index_name: index.map(|(name, _)| name.to_string()),
+            index_key: index.map(|(_, key)| key.to_vec()),
             window_chunks,
             clean_end: clean_end.clone(),
         };
@@ -1446,6 +1453,7 @@ impl ClusterCoordinator {
                     table_id,
                     *host_id,
                     projected_regular_ordinals,
+                    None,
                     resume,
                     STREAM_WINDOW_CHUNKS,
                 )
@@ -1751,6 +1759,90 @@ impl ClusterCoordinator {
             .await
     }
 
+    /// Stream a global secondary-index lookup through the same bounded Bulk
+    /// protocol as range reads. Each node visits its local memtable/sidecar
+    /// postings incrementally; the coordinator forwards bounded partitions
+    /// through a bounded channel and deduplicates only row identities across
+    /// replicas. No node or RPC hop constructs the full hit set.
+    pub async fn coordinate_index_read_stream(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        index_key: &ferrosa_index::IndexKey,
+    ) -> crate::error::Result<ClusterPartitionStream> {
+        let ring = self.ring.load();
+        let remotes: Vec<(uuid::Uuid, String)> = ring
+            .node_ids()
+            .iter()
+            .filter(|&&id| id != self.local_node_id)
+            .filter_map(|&id| {
+                ring.get_node(id)
+                    .map(|node| (node.host_id, node.addr.clone()))
+            })
+            .collect();
+        drop(ring);
+
+        let mut sources: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len() + 1);
+        sources.push(Box::pin(
+            self.storage
+                .read_by_index_stream(table_id, index_name, index_key)
+                .map(|item| item.map_err(ClusterError::Storage)),
+        ));
+
+        let index_key_bytes = index_key.0.as_slice();
+        for (host_id, _addr) in remotes {
+            match self
+                .spawn_replica_fragment_stream(
+                    table_id,
+                    host_id,
+                    None,
+                    Some((index_name, index_key_bytes)),
+                    None,
+                    // Index postings do not have a token/clustering cursor
+                    // that can safely resume the logical walk. Keep the wire
+                    // chunks bounded, but use one request so a window resume
+                    // cannot restart the posting list and duplicate rows.
+                    0,
+                )
+                .await
+            {
+                Ok(stream) => sources.push(stream),
+                Err(error) => {
+                    return Err(ClusterError::Internal(format!(
+                        "streaming index read: failed to fire request to {host_id}: {error}"
+                    )))
+                }
+            }
+        }
+
+        let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
+        TaskPool::current("index-read-stream-dedup").spawn(async move {
+            let mut input = futures::stream::select_all(sources);
+            let mut seen = std::collections::HashSet::<(Vec<u8>, Vec<u8>)>::new();
+            while let Some(item) = input.next().await {
+                let mut partition = match item {
+                    Ok(partition) => partition,
+                    Err(error) => {
+                        let _ = out_tx.send(Err(error)).await;
+                        return;
+                    }
+                };
+                let partition_key = partition.key.key.as_bytes().to_vec();
+                partition
+                    .rows
+                    .retain(|row| seen.insert((partition_key.clone(), row.clustering.clone())));
+                if !partition.rows.is_empty() && out_tx.send(Ok(partition)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Ok(Box::pin(stream))
+    }
+
     async fn coordinate_range_read_stream_all_with_projection(
         &self,
         table_id: &TableId,
@@ -1909,6 +2001,7 @@ impl ClusterCoordinator {
                 table_id,
                 *host_id,
                 projected_regular_ordinals.as_deref(),
+                None,
                 None,
                 window_chunks,
             )
@@ -2105,6 +2198,57 @@ mod tests {
             result.is_err(),
             "truncated Done must fail the remote stream instead of being accepted as success"
         );
+    }
+
+    /// A replica that fails after yielding a valid prefix must make the
+    /// coordinator stream fail; the prefix must never be mistaken for a
+    /// complete successful result.
+    #[tokio::test]
+    async fn nway_merge_surfaces_replica_failure_after_prefix() {
+        let prefix = Partition {
+            key: dk(b"alpha"),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(1, b"prefix", 1000)],
+        };
+        let replica_prefix = Partition {
+            key: dk(b"bravo"),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![trow(1, b"replica-prefix", 1000)],
+        };
+        let failing: BoxedFragmentStream = Box::pin(futures::stream::iter(vec![
+            Ok(replica_prefix),
+            Err(ClusterError::ReadTimeout {
+                consistency: "QUORUM".into(),
+                received: 0,
+                required: 1,
+                data_present: true,
+            }),
+        ]));
+        let cursors = vec![
+            FragmentCursor::new(Box::pin(stream_of(vec![prefix])) as BoxedFragmentStream),
+            FragmentCursor::new(failing),
+        ];
+        let (tx, mut rx) = mpsc::channel(8);
+        let driver = tokio::spawn(async move { run_fragment_merge_nway(cursors, 1, tx).await });
+
+        let first = rx.recv().await.expect("prefix must be delivered");
+        assert!(first.is_ok());
+        let mut failure = None;
+        while let Some(item) = rx.recv().await {
+            if item.is_err() {
+                failure = Some(item);
+                break;
+            }
+        }
+        let failure = failure.expect("replica failure must be delivered");
+        assert!(
+            matches!(failure, Err(ClusterError::ReadTimeout { .. })),
+            "a failed replica must not become silent exhaustion: {failure:?}"
+        );
+        drop(rx);
+        driver.await.unwrap();
     }
 
     /// t_a0f922a3 bug #2 (fail-loud guarantee): a per-replica source stream

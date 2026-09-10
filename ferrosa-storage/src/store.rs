@@ -164,8 +164,10 @@ impl PartitionSource {
     }
 }
 
-/// Maximum number of row positions collected from secondary index before
-/// returning an error. Prevents OOM from high-cardinality queries.
+/// Maximum number of row positions retained by partition-scoped and geo index
+/// reads. Global index reads are consumed by the CQL layer, which owns the
+/// inbound LIMIT/paging contract and must not turn a large, valid edge lookup
+/// into an empty result.
 const INDEX_RESULT_CAP: usize = 10_000;
 const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
@@ -948,6 +950,54 @@ fn clone_partition_limited(
     }
 }
 
+/// Add one live row to a scalar memtable index using the same predicate and
+/// key-encoding semantics for write-time maintenance and CREATE INDEX backfill.
+fn insert_scalar_memtable_index_row(
+    index: &MemtableIndex,
+    index_name: &str,
+    column_position: usize,
+    index_type: IndexType,
+    filter_predicate: Option<&FilterPredicate>,
+    partition_key: &[u8],
+    row: &Row,
+) {
+    if let Some(predicate) = filter_predicate {
+        let matches = ferrosa_index::evaluate_predicate_row(predicate, |predicate_col_pos| {
+            row.cells
+                .iter()
+                .find(|(idx, _)| *idx as usize == predicate_col_pos)
+                .and_then(|(_, cell)| cell.value.as_deref())
+        });
+        if !matches {
+            return;
+        }
+    }
+
+    let Some(value) = row
+        .cells
+        .iter()
+        .find(|(idx, _)| *idx as usize == column_position)
+        .and_then(|(_, cell)| cell.value.as_deref())
+    else {
+        return;
+    };
+    match crate::index::scheduler::encode_index_key(index_type, value) {
+        Ok(Some(index_key)) => index.insert(
+            index_key,
+            RowPosition {
+                partition_key: partition_key.to_vec(),
+                clustering_key: row.clustering.clone(),
+            },
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            %e,
+            %index_name,
+            "store: skipping memtable index entry; key encoding failed"
+        ),
+    }
+}
+
 /// Filters sidecar entries to remove references to deleted partitions.
 ///
 /// After compaction merges partitions, some entries in the collected
@@ -1460,60 +1510,16 @@ impl<F: FlushTarget> TableStore<F> {
         // before the memtable put (which consumes the row reference via move).
         if !self.indexed_columns.is_empty() {
             for (index_name, col_pos) in &self.indexed_columns {
-                // Partial (filtered) index gating: a Filtered index has a
-                // predicate on a *filter* column. Only writes whose filter-column
-                // cell satisfies the predicate belong in the index, matching the
-                // SSTable sidecar build. A row missing/tombstoning the filter
-                // column does not match. `evaluate_predicate` is shared with the
-                // build path so memtable and sidecar never disagree.
-                if let Some(predicate) = self.index_filter_predicates.get(index_name) {
-                    // Conjunction gating: a row belongs in the partial index only
-                    // when EVERY clause's column is present (live) and satisfies
-                    // its comparison. `evaluate_predicate_row` resolves each
-                    // clause's own column; it is the shared source of truth with
-                    // the sidecar build path, so memtable and sidecar never
-                    // disagree on which rows belong.
-                    let matches = ferrosa_index::evaluate_predicate_row(predicate, |col_pos| {
-                        row.cells
-                            .iter()
-                            .find(|(idx, _)| *idx as usize == col_pos)
-                            .and_then(|(_, c)| c.value.as_deref())
-                    });
-                    if !matches {
-                        continue;
-                    }
-                }
-
-                if let Some(cell) = row.cells.iter().find(|(idx, _)| *idx as usize == *col_pos) {
-                    if let Some(ref value) = cell.1.value {
-                        // Per-type key encoding: a phonetic index stores the
-                        // phonetic *code* (not the raw text) so it can be
-                        // point-looked-up by the query term's code at read time.
-                        // BTree/Hash/Composite use the raw bytes verbatim. A
-                        // value that encodes to nothing (e.g. non-UTF-8 text on a
-                        // phonetic index) yields no index entry.
-                        let index_type = self.index_type_for(index_name);
-                        match crate::index::scheduler::encode_index_key(index_type, value) {
-                            Ok(Some(index_key)) => {
-                                let row_pos = RowPosition {
-                                    partition_key: key.key.as_bytes().to_vec(),
-                                    clustering_key: row.clustering.clone(),
-                                };
-                                if let Some(idx) = guard.indexes.get(index_name) {
-                                    idx.insert(index_key, row_pos);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    index_name,
-                                    %e,
-                                    "store: skipping memtable index entry; key encoding failed"
-                                );
-                            }
-                        }
-                    }
-                    // If value is None (tombstone), skip — no index entry for deletions
+                if let Some(index) = guard.indexes.get(index_name) {
+                    insert_scalar_memtable_index_row(
+                        index,
+                        index_name,
+                        *col_pos,
+                        self.index_type_for(index_name),
+                        self.index_filter_predicates.get(index_name),
+                        key.key.as_bytes(),
+                        &row,
+                    );
                 }
             }
         }
@@ -4784,20 +4790,21 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(filtered)
     }
 
-    /// Query by secondary index: looks up the index key in the memtable
-    /// index (and, in future, all SSTable sidecar indexes), fetches the
-    /// matching partitions, and returns merged results.
+    /// Visit rows matching a secondary-index key without materializing the
+    /// posting list or result partitions. The visitor owns back-pressure: it
+    /// can return [`std::ops::ControlFlow::Break`] after a page is full.
     ///
-    /// Returns an error if the number of matching row positions exceeds
-    /// `INDEX_RESULT_CAP` (10,000) to prevent OOM on high-cardinality
-    /// index values. The error message suggests `ALLOW FILTERING` for
-    /// unbounded scans.
-    ///
-    /// Deduplicates by `(partition_key, clustering_key)` so that the same
-    /// row appearing in both memtable and sidecar indexes is returned once.
-    pub fn read_by_index(&self, index_name: &str, key: &IndexKey) -> Result<Vec<Partition>> {
+    /// Index readers are visited one at a time and point reads are delivered
+    /// immediately. Only deduplication keys remain resident, because a row
+    /// can be present in both the active memtable and an SSTable sidecar.
+    pub fn read_by_index_each(
+        &self,
+        index_name: &str,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
         if !self.secondary_index_declared(index_name) {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let guard = self.view.load();
@@ -4813,7 +4820,7 @@ impl<F: FlushTarget> TableStore<F> {
         let index_type = self.index_type_for(index_name);
         let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
             Ok(Some(encoded)) => encoded,
-            Ok(None) => return Ok(Vec::new()),
+            Ok(None) => return Ok(()),
             Err(e) => {
                 return Err(ferrosa_common::Error::InvalidFormat(format!(
                     "secondary index '{index_name}' read key encoding failed: {e}"
@@ -4821,57 +4828,69 @@ impl<F: FlushTarget> TableStore<F> {
             }
         };
         let key = &lookup_key;
-
-        let mut positions: Vec<RowPosition> = Vec::new();
-        let mut append_positions = |batch: Vec<RowPosition>| -> Result<()> {
-            if positions.len().saturating_add(batch.len()) > INDEX_RESULT_CAP {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "secondary index query exceeded {} row limit; \
-                     use ALLOW FILTERING for unbounded scans",
-                    INDEX_RESULT_CAP
-                )));
+        let mut seen = std::collections::HashSet::new();
+        let stopped = std::cell::Cell::new(false);
+        let read_error = std::cell::RefCell::new(None);
+        let mut visit_position = |pos: RowPosition| {
+            if stopped.get()
+                || !seen.insert((pos.partition_key.clone(), pos.clustering_key.clone()))
+            {
+                return std::ops::ControlFlow::Continue(());
             }
-            positions.extend(batch);
-            Ok(())
+            let clustering_key = pos.clustering_key;
+            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(pos.partition_key));
+            let read = if clustering_key.is_empty() {
+                self.read(&dk)
+            } else {
+                self.read_clustering_row(&dk, &clustering_key)
+            };
+            match read {
+                Ok(Some(partition)) => {
+                    if visitor(partition).is_break() {
+                        stopped.set(true);
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *read_error.borrow_mut() = Some(error);
+                    stopped.set(true);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
         };
 
-        // 1. Query memtable index
+        // Query the active memtable index without cloning its posting list.
         if let Some(idx) = guard.indexes.get(index_name) {
-            append_positions(idx.lookup(key))?;
+            idx.visit(key, &mut visit_position);
         }
 
-        // 2. Query SSTable sidecar indexes
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                if let Ok(results) = reader.lookup(key) {
-                    append_positions(results)?;
+        if let Some(error) = read_error.borrow_mut().take() {
+            return Err(error);
+        }
+
+        // Query SSTable sidecar indexes without constructing a Vec of hits.
+        if !stopped.get() {
+            for sidecar in guard.sidecar_indexes.iter() {
+                if stopped.get() {
+                    break;
+                }
+                if let Some(reader) = sidecar.get(index_name) {
+                    reader.visit(key, &mut visit_position).map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "secondary index '{index_name}' read failed: {e}"
+                        ))
+                    })?;
                 }
             }
         }
 
-        // 4. Deduplicate by (partition_key, clustering_key)
-        let mut seen = std::collections::HashSet::new();
-        positions.retain(|p| seen.insert((p.partition_key.clone(), p.clustering_key.clone())));
-
-        // 5. Fetch actual rows by base-table key. Secondary-index entries carry
-        // the clustering key, so wide clustered tables must not materialize the
-        // whole partition for every index hit.
-        let mut partitions = Vec::new();
-        for pos in &positions {
-            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-                pos.partition_key.clone(),
-            ));
-            let read = if pos.clustering_key.is_empty() {
-                self.read(&dk)
-            } else {
-                self.read_clustering_row(&dk, &pos.clustering_key)
-            };
-            if let Ok(Some(partition)) = read {
-                partitions.push(partition);
-            }
+        if let Some(error) = read_error.borrow_mut().take() {
+            return Err(error);
         }
 
-        Ok(partitions)
+        Ok(())
     }
 
     /// Query by secondary index restricted to ONE partition (t_430c4188):
@@ -4886,13 +4905,12 @@ impl<F: FlushTarget> TableStore<F> {
     /// cannot blow the `INDEX_RESULT_CAP` bound (or memory) for a keyed query
     /// that matches only a few rows in its partition. Postings retained after
     /// keying are still capped by `INDEX_RESULT_CAP` — the same fail-loud
-    /// bound as [`read_by_index`](Self::read_by_index), never a silent
-    /// truncation.
+    /// bound as the geo candidate consult, never a silent truncation.
     ///
     /// The secondary index is keyed globally by value (not by `(partition,
     /// value)`), so this consult still walks the per-node postings list for
     /// the value; only the retained set is partition-scoped. Staleness
-    /// semantics are identical to `read_by_index` — both read the same
+    /// semantics match the global streaming consult — both read the same
     /// memtable index + sidecar layers.
     pub fn read_by_index_in_partition(
         &self,
@@ -4947,9 +4965,12 @@ impl<F: FlushTarget> TableStore<F> {
         // as `read_by_index`: a missing/failed sidecar contributes nothing).
         for sidecar in guard.sidecar_indexes.iter() {
             if let Some(reader) = sidecar.get(index_name) {
-                if let Ok(results) = reader.lookup(key) {
-                    append_in_partition(results)?;
-                }
+                let results = reader.lookup(key).map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "secondary index '{index_name}' read failed: {e}"
+                    ))
+                })?;
+                append_in_partition(results)?;
             }
         }
 
@@ -4968,7 +4989,8 @@ impl<F: FlushTarget> TableStore<F> {
             } else {
                 self.read_clustering_row(&dk, &pos.clustering_key)
             };
-            if let Ok(Some(partition)) = read {
+            let partition = read?;
+            if let Some(partition) = partition {
                 partitions.push(partition);
             }
         }
@@ -4979,8 +5001,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
     /// ranges, returning the matching base-table partitions.
     ///
-    /// Unlike [`read_by_index`](Self::read_by_index) — which does a point lookup
-    /// on an exact key — a geo index is keyed by an 8-byte big-endian
+    /// Unlike a keyed secondary-index lookup — which does a point lookup on an
+    /// exact key — a geo index is keyed by an 8-byte big-endian
     /// space-filling-curve cell id, so a spatial query maps to a small bounded
     /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
     /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this
@@ -4988,7 +5010,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// whose big-endian key falls inside any range, deduplicates by
     /// `(partition_key, clustering_key)`, and fetches the rows.
     ///
-    /// The same fail-loud `INDEX_RESULT_CAP` bound as `read_by_index` applies:
+    /// The same fail-loud `INDEX_RESULT_CAP` bound as the keyed consult applies:
     /// the candidate set is never silently truncated — exceeding the cap returns
     /// an error suggesting `ALLOW FILTERING`. The geo cover ranges are already
     /// bounded (<= a few thousand cells), so the candidate count is bounded by
@@ -5065,7 +5087,8 @@ impl<F: FlushTarget> TableStore<F> {
             } else {
                 self.read_clustering_row(&dk, &pos.clustering_key)
             };
-            if let Ok(Some(partition)) = read {
+            let partition = read?;
+            if let Some(partition) = partition {
                 partitions.push(partition);
             }
         }
@@ -5075,15 +5098,16 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Retrieve a named memtable-level secondary index.
     ///
-    /// Returns `None` if no index with the given name was declared at
-    /// Dynamically adds a secondary index. Future writes will be indexed.
+    /// Dynamically adds a secondary index. Existing live memtable rows are
+    /// backfilled before publication and future writes are indexed.
     pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
         self.add_index_with_predicate(index_name, column_position, index_type, None);
     }
 
     /// Dynamically adds a secondary index carrying an optional partial-index
-    /// [`FilterPredicate`]. Future writes will be indexed; for a Filtered index
-    /// the predicate gates which writes enter the memtable index.
+    /// [`FilterPredicate`]. Existing active/flushing memtable rows are streamed
+    /// into the new index before it is published, and future writes update it;
+    /// for a Filtered index the predicate gates both paths identically.
     pub fn add_index_with_predicate(
         &mut self,
         index_name: String,
@@ -5094,13 +5118,34 @@ impl<F: FlushTarget> TableStore<F> {
         self.indexed_columns
             .push((index_name.clone(), column_position));
         self.index_types.insert(index_name.clone(), index_type);
-        if let Some(pred) = filter_predicate {
+        if let Some(ref pred) = filter_predicate {
             self.index_filter_predicates
-                .insert(index_name.clone(), pred);
+                .insert(index_name.clone(), pred.clone());
         }
         let current = self.view.load();
+        let memtable_index = Arc::new(MemtableIndex::new());
+        let backfill = |memtable: &Arc<dyn Memtable>| {
+            for partition in memtable.range_iter(None, None) {
+                for row in partition.static_row.iter().chain(partition.rows.iter()) {
+                    insert_scalar_memtable_index_row(
+                        &memtable_index,
+                        &index_name,
+                        column_position,
+                        index_type,
+                        filter_predicate.as_ref(),
+                        partition.key.key.as_bytes(),
+                        row,
+                    );
+                }
+            }
+        };
+        backfill(&current.active);
+        if let Some(flushing) = current.flushing.as_ref() {
+            backfill(flushing);
+        }
+
         let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        new_indexes.insert(index_name, memtable_index);
         let new_view = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
@@ -6327,6 +6372,19 @@ mod tests {
         }
     }
 
+    fn collect_index_results(
+        store: &TableStore<InMemoryFlushTarget>,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        store.read_by_index_each(index_name, key, &mut |partition| {
+            results.push(partition);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(results)
+    }
+
     fn data_bytes_for_single_partition(
         schema: &TableSchema,
         header_partitions: &[Partition],
@@ -6471,15 +6529,30 @@ mod tests {
         );
     }
 
+    /// CREATE INDEX must cover rows that are still in the active memtable.
+    /// Otherwise an index created after writes is registered but remains empty
+    /// until those rows are flushed and rebuilt into a sidecar.
+    #[test]
+    fn add_index_backfills_existing_active_memtable_rows() {
+        let mut store = test_store();
+        store
+            .write(&make_key("before-index"), make_row(b"match", 1000))
+            .unwrap();
+
+        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+
+        let rows = collect_index_results(&store, "val_idx", &IndexKey(b"match".to_vec())).unwrap();
+        assert_eq!(rows.len(), 1, "pre-existing memtable row must be indexed");
+    }
+
     #[test]
     fn remove_index_unwires_future_index_reads() {
         let mut store = test_store();
         store.add_index("val_idx".to_string(), 0, IndexType::BTree);
         store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
 
-        let before_drop = store
-            .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
-            .unwrap();
+        let before_drop =
+            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).unwrap();
         assert_eq!(before_drop.len(), 1);
 
         assert!(
@@ -6488,9 +6561,8 @@ mod tests {
         );
         assert!(store.indexed_columns().is_empty());
 
-        let after_drop = store
-            .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
-            .unwrap();
+        let after_drop =
+            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).unwrap();
         assert!(
             after_drop.is_empty(),
             "dropped index must not consult stale memtable index state"
@@ -6516,8 +6588,7 @@ mod tests {
         store.flush().unwrap();
 
         assert_eq!(
-            store
-                .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec()))
                 .unwrap()
                 .len(),
             1,
@@ -6526,8 +6597,7 @@ mod tests {
 
         assert!(store.remove_index("val_idx"));
         assert!(
-            store
-                .read_by_index("val_idx", &IndexKey(b"v".to_vec()))
+            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec()))
                 .unwrap()
                 .is_empty(),
             "dropped index must not consult stale sidecar readers"
@@ -8701,11 +8771,81 @@ mod tests {
             )
             .unwrap();
 
-        let results = store
-            .read_by_index("email_idx", &IndexKey(b"alice@test.com".to_vec()))
+        let mut visited = 0;
+        store
+            .read_by_index_each(
+                "email_idx",
+                &IndexKey(b"alice@test.com".to_vec()),
+                &mut |partition| {
+                    visited += 1;
+                    assert_eq!(partition.key.key.as_bytes(), b"user1");
+                    std::ops::ControlFlow::Break(())
+                },
+            )
             .unwrap();
+        assert_eq!(visited, 1, "index iteration must stop at the consumer");
+
+        let results =
+            collect_index_results(&store, "email_idx", &IndexKey(b"alice@test.com".to_vec()))
+                .unwrap();
         assert_eq!(results.len(), 1, "expected exactly one matching partition");
         assert_eq!(results[0].key.key.as_bytes(), b"user1");
+    }
+
+    /// Streaming index reads must return every high-cardinality match without
+    /// constructing a result vector at the storage boundary.
+    #[test]
+    fn read_by_index_each_returns_every_row_above_ten_thousand() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "tenant".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("tenant_idx".to_string(), 0_usize)],
+        );
+
+        let n = 10_001;
+        for i in 0..n {
+            store
+                .write(
+                    &make_key(&format!("edge-{i:06}")),
+                    Row {
+                        clustering: vec![0x00, 0x00, 0x00, 0x01],
+                        cells: vec![(0, CellValue::live(b"t-1".to_vec(), 1000))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut visited = 0;
+        store
+            .read_by_index_each("tenant_idx", &IndexKey(b"t-1".to_vec()), &mut |_| {
+                visited += 1;
+                std::ops::ControlFlow::Continue(())
+            })
+            .expect("a large global index stream must remain valid");
+        assert_eq!(visited, n);
     }
 
     #[test]
@@ -8762,9 +8902,8 @@ mod tests {
             )
             .unwrap();
 
-        let results = store
-            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "city_idx", &IndexKey(b"NYC".to_vec())).unwrap();
         assert_eq!(results.len(), 2, "expected both users from index");
         let pks: Vec<&[u8]> = results.iter().map(|p| p.key.key.as_bytes()).collect();
         assert!(pks.contains(&b"user1".as_slice()));
@@ -8776,113 +8915,10 @@ mod tests {
         use ferrosa_index::IndexKey;
         let store = test_store();
         store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
-        let results = store
-            .read_by_index("nonexistent_idx", &IndexKey(b"anything".to_vec()))
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    // =========================================================================
-    // Task 6: Result cap (10K RowPositions)
-    // =========================================================================
-
-    #[test]
-    fn read_by_index_returns_all_rows_under_cap() {
-        use ferrosa_index::IndexKey;
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![ColumnDefinition {
-                name: "ck".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
-            }],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "status".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-            extensions: Default::default(),
-        };
-
-        let store = TableStore::new_with_indexes(
-            schema,
-            InMemoryFlushTarget::new(),
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-            vec![("status_idx".to_string(), 0_usize)],
-        );
-
-        for i in 0..100 {
-            let key = make_key(&format!("user{i}"));
-            store
-                .write(
-                    &key,
-                    Row {
-                        clustering: vec![0x00, 0x00, 0x00, i as u8],
-                        cells: vec![(0, CellValue::live(b"active".to_vec(), 1000 + i as i64))],
-                        deletion: DeletionTime::LIVE,
-                        primary_key_liveness: LivenessInfo::with_timestamp(1000 + i as i64),
-                    },
-                )
+        let results =
+            collect_index_results(&store, "nonexistent_idx", &IndexKey(b"anything".to_vec()))
                 .unwrap();
-        }
-
-        let results = store
-            .read_by_index("status_idx", &IndexKey(b"active".to_vec()))
-            .unwrap();
-        assert_eq!(results.len(), 100, "all 100 rows should be returned");
-    }
-
-    #[test]
-    fn read_by_index_exceeds_cap_returns_error() {
-        use ferrosa_index::IndexKey;
-
-        let schema = TableSchema {
-            keyspace: "test_ks".to_string(),
-            table: "test_table".to_string(),
-            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            clustering_columns: vec![],
-            static_columns: vec![],
-            regular_columns: vec![ColumnDefinition {
-                name: "tag".to_string(),
-                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
-            }],
-            extensions: Default::default(),
-        };
-
-        let store = TableStore::new_with_indexes(
-            schema,
-            InMemoryFlushTarget::new(),
-            WriteOptions {
-                compression: None,
-                ..WriteOptions::default()
-            },
-            vec![("tag_idx".to_string(), 0_usize)],
-        );
-
-        // Inject >10K entries directly into index to avoid slow row writes
-        let idx = store.get_memtable_index("tag_idx").unwrap();
-        for i in 0..10_001 {
-            idx.insert(
-                IndexKey(b"popular".to_vec()),
-                RowPosition {
-                    partition_key: format!("pk{i}").into_bytes(),
-                    clustering_key: vec![],
-                },
-            );
-        }
-
-        let result = store.read_by_index("tag_idx", &IndexKey(b"popular".to_vec()));
-        assert!(result.is_err(), "should return error when cap exceeded");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("10000") || err_msg.contains("ALLOW FILTERING"),
-            "error should mention cap or ALLOW FILTERING, got: {err_msg}"
-        );
+        assert!(results.is_empty());
     }
 
     // =========================================================================
@@ -9180,9 +9216,8 @@ mod tests {
         );
 
         // But read_by_index should still find it via the sidecar
-        let results = store
-            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "city_idx", &IndexKey(b"NYC".to_vec())).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -9249,9 +9284,8 @@ mod tests {
             .unwrap();
 
         // Query should find BOTH: user1 from sidecar, user2 from memtable
-        let results = store
-            .read_by_index("city_idx", &IndexKey(b"NYC".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "city_idx", &IndexKey(b"NYC".to_vec())).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -9311,9 +9345,8 @@ mod tests {
 
         // Query with the phonetically equivalent "Jon" — the index path must
         // encode the term and find the row, even though the raw bytes differ.
-        let results = store
-            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "name_idx", &IndexKey(b"Jon".to_vec())).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -9379,9 +9412,8 @@ mod tests {
             )
             .unwrap();
 
-        let results = store
-            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "name_idx", &IndexKey(b"Jon".to_vec())).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -9437,9 +9469,8 @@ mod tests {
             .unwrap();
         store.flush().unwrap();
 
-        let results = store
-            .read_by_index("name_idx", &IndexKey(b"Jon".to_vec()))
-            .unwrap();
+        let results =
+            collect_index_results(&store, "name_idx", &IndexKey(b"Jon".to_vec())).unwrap();
         assert_eq!(
             results.len(),
             1,
