@@ -5060,12 +5060,23 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // 2. SSTable sidecar indexes: ordered range scan per range.
+        //
+        // A failing range read is REPORTED, not skipped. This used to be
+        // `if let Ok(results) = ...` with no else, so an unreadable sidecar —
+        // a short read, a truncated file, a decode failure — contributed no
+        // positions and the query returned the rows it could find as though
+        // they were all of them. A caller cannot tell that from a genuinely
+        // smaller result, which is how unreadable data gets reported as absent
+        // data.
         for sidecar in guard.sidecar_indexes.iter() {
             if let Some(reader) = sidecar.get(index_name) {
                 for (start_key, end_key) in &key_ranges {
-                    if let Ok(results) = reader.range(start_key, end_key) {
-                        append_positions(results)?;
-                    }
+                    let results = reader.range(start_key, end_key).map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "geo index '{index_name}' range read failed: {e}"
+                        ))
+                    })?;
+                    append_positions(results)?;
                 }
             }
         }
