@@ -24965,8 +24965,7 @@ mod tests {
                         ),
                     )],
                     deletion: ferrosa_sstable::types::DeletionTime::LIVE,
-                    primary_key_liveness:
-                        ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
                 }
             })
             .collect();

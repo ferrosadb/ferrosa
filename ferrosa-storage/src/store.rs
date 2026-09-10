@@ -4997,8 +4997,8 @@ impl<F: FlushTarget> TableStore<F> {
     /// Query a geo (cell-id) secondary index by a set of `[start, end]` cell-id
     /// ranges, returning the matching base-table partitions.
     ///
-    /// Unlike [`read_by_index`](Self::read_by_index) — which does a point lookup
-    /// on an exact key — a geo index is keyed by an 8-byte big-endian
+    /// Unlike a keyed secondary-index lookup — which does a point lookup on an
+    /// exact key — a geo index is keyed by an 8-byte big-endian
     /// space-filling-curve cell id, so a spatial query maps to a small bounded
     /// set of contiguous cell-id ranges (produced by `ferrosa_index::geo::cover_*`).
     /// Each `(start, end)` is an **inclusive** range of `u64` cell ids; this

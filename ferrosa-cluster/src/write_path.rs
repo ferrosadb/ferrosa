@@ -1096,7 +1096,7 @@ impl WritePath {
     /// - `Direct` / `Pair`: local `read_by_index_in_partition`.
     /// - `Cluster`: routes to the PARTITION'S replicas under `strategy` (normal
     ///   keyed routing) — never the global scatter-gather of
-    ///   [`index_read`](Self::index_read).
+    ///   [`index_read_stream`](Self::index_read_stream).
     /// - `Unavailable`: returns error.
     ///
     /// Per-node work is O(rows matching the indexed value), never O(partition
