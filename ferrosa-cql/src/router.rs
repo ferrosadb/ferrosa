@@ -1011,6 +1011,51 @@ async fn extend_rows_from_partition_stream(
     Ok(())
 }
 
+/// Collect matching rows from an index stream while keeping the producer
+/// consumer-paced. `limit` is the query's own row limit; reaching it drops the
+/// stream immediately so the storage worker and remote replica can cancel
+/// instead of scanning the remaining postings.
+async fn collect_rows_from_partition_stream_with_limit(
+    mut stream: ferrosa_cluster::write_path::PartitionResultStream,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    while let Some(partition) = stream.next().await {
+        let partition = partition?;
+        for row in bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            row_context.all_col_names,
+            row_context.all_col_types,
+            row_context.pk_indices,
+            row_context.ck_indices,
+            row_context.storage_to_table,
+        ) {
+            if row_matches_select_predicates(
+                &row,
+                predicate_context.statement,
+                row_context.all_col_names,
+                row_context.all_col_types,
+                predicate_context.table_meta,
+                predicate_context.keyspace,
+                predicate_context.state,
+            )? {
+                rows.push(row);
+                #[cfg(test)]
+                INDEX_ROWS_VISITED.with(|count| count.set(count.get() + 1));
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    return Ok(rows);
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
 /// Stream an uncapped full scan through a **spilling external merge sort** and
 /// return the fully, correctly ordered rows.
 ///
@@ -4555,7 +4600,8 @@ async fn route_geo_select(
         .ok_or_else(|| CqlError::Invalid(format!("geo column {geo_column} not found")))?;
 
     // Fetch candidate partitions for a set of covering cell ranges, convert to
-    // rows. Bounded by the storage layer's INDEX_RESULT_CAP (fail-loud).
+    // rows. Geo candidate reads remain fail-loud and bounded by the storage
+    // layer's keyed/geo candidate guard.
     let fetch_rows = |ranges: Vec<(u64, u64)>| -> Result<Vec<Vec<Option<CqlValue>>>, CqlError> {
         let partitions = state
             .engine
@@ -4764,6 +4810,11 @@ thread_local! {
     /// wall-clock. `#[tokio::test]` uses a current-thread runtime, so the
     /// increments land on the test thread.
     static PK_LOOKUP_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test-only observability: rows accepted by the scalar secondary-index
+    /// stream. A LIMIT query must stop this consumer at its own limit instead
+    /// of draining the complete posting list first.
+    static INDEX_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// Rows retained by the bounded partition suffix read before its one-row
     /// continuation probe is discarded.
@@ -5616,43 +5667,32 @@ async fn route_select_user_table(
                         &state.schema,
                     )?;
 
-                    // Scatter-gather index read: in cluster mode this fans out
-                    // to all ring nodes so results include rows on every node.
-                    let partitions = state
+                    // Stream the global index result through bounded-per-hop
+                    // storage/RPC channels; no materializing compatibility
+                    // API is involved.
+                    let index_stream = state
                         .write_path
                         .load()
-                        .index_read(&table_id, index_name, &index_key)
+                        .index_read_stream(&table_id, index_name, &index_key)
                         .await?;
-
-                    // Fallback: if the index read returns empty, the memtable index
-                    // may not be wired yet (Sprint I-3). Fall back to full scan so
-                    // queries still return correct results.
-                    let partitions = if partitions.is_empty() {
-                        state
-                            .write_path
-                            .load()
-                            .range_read_with(&table_id, ctx.consistency, &table_strategy)
-                            .await?
-                    } else {
-                        partitions
+                    let row_context = PartitionRowContext {
+                        all_col_names: &all_col_names,
+                        all_col_types: &all_col_types,
+                        pk_indices: &pk_indices,
+                        ck_indices: &ck_indices,
+                        storage_to_table: &storage_to_table,
                     };
-
+                    let predicate_context = SelectPredicateContext {
+                        statement: s,
+                        table_meta,
+                        keyspace: ks,
+                        state,
+                    };
                     if count_only_select {
-                        let count = count_rows_from_partitions(
-                            &partitions,
-                            PartitionRowContext {
-                                all_col_names: &all_col_names,
-                                all_col_types: &all_col_types,
-                                pk_indices: &pk_indices,
-                                ck_indices: &ck_indices,
-                                storage_to_table: &storage_to_table,
-                            },
-                            SelectPredicateContext {
-                                statement: s,
-                                table_meta,
-                                keyspace: ks,
-                                state,
-                            },
+                        let count = count_rows_from_partition_stream(
+                            index_stream,
+                            row_context,
+                            predicate_context,
                         )
                         .await?;
                         return Ok(SelectRawResult {
@@ -5664,32 +5704,26 @@ async fn route_select_user_table(
                             paging_state: None,
                         });
                     }
-
-                    let mut all_rows = Vec::new();
-                    extend_rows_from_partitions(
-                        &partitions,
-                        &mut all_rows,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
+                    let can_stop_at_limit = s.order_by.is_empty()
+                        && !s.distinct
+                        && !s
+                            .columns
+                            .iter()
+                            .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
+                    collect_rows_from_partition_stream_with_limit(
+                        index_stream,
+                        row_context,
+                        predicate_context,
+                        can_stop_at_limit
+                            .then(|| {
+                                s.limit
+                                    .as_ref()
+                                    .and_then(|limit| limit.as_literal())
+                                    .map(|limit| limit.max(0) as usize)
+                            })
+                            .flatten(),
                     )
-                    .await;
-
-                    // Always apply post-filter as defensive measure.
-                    // SingleIndex: redundant but safe; IndexScanWithFilter: necessary.
-                    filter_rows_by_select_predicates(
-                        &mut all_rows,
-                        s,
-                        &all_col_names,
-                        &all_col_types,
-                        table_meta,
-                        ks,
-                        state,
-                    )?;
-
-                    all_rows
+                    .await?
                 }
 
                 ScanPlan::IndexIntersection { ref indexes } => {
@@ -5702,39 +5736,32 @@ async fn route_select_user_table(
                             "IndexIntersection",
                         );
                     }
-                    // Consult ALL matched single-column indexes and intersect their
-                    // result sets on partition-key identity, so we fetch only the
-                    // partitions present in every index rather than the full result
-                    // of indexes[0] alone. The post-filter below still enforces
-                    // per-row predicate precision on clustered tables.
-                    let partitions = read_index_intersection(
-                        state,
-                        &table_id,
-                        indexes,
-                        s,
-                        table_meta,
-                        ks,
-                        ctx.consistency,
-                        &table_strategy,
+                    // Consult all matched indexes through bounded streams. The
+                    // intersection helper retains only membership keys for the
+                    // non-primary indexes; the primary result remains lazy.
+                    let index_stream = read_index_intersection_stream(
+                        state, &table_id, indexes, s, table_meta, ks,
                     )
                     .await?;
 
+                    let row_context = PartitionRowContext {
+                        all_col_names: &all_col_names,
+                        all_col_types: &all_col_types,
+                        pk_indices: &pk_indices,
+                        ck_indices: &ck_indices,
+                        storage_to_table: &storage_to_table,
+                    };
+                    let predicate_context = SelectPredicateContext {
+                        statement: s,
+                        table_meta,
+                        keyspace: ks,
+                        state,
+                    };
                     if count_only_select {
-                        let count = count_rows_from_partitions(
-                            &partitions,
-                            PartitionRowContext {
-                                all_col_names: &all_col_names,
-                                all_col_types: &all_col_types,
-                                pk_indices: &pk_indices,
-                                ck_indices: &ck_indices,
-                                storage_to_table: &storage_to_table,
-                            },
-                            SelectPredicateContext {
-                                statement: s,
-                                table_meta,
-                                keyspace: ks,
-                                state,
-                            },
+                        let count = count_rows_from_partition_stream(
+                            index_stream,
+                            row_context,
+                            predicate_context,
                         )
                         .await?;
                         return Ok(SelectRawResult {
@@ -5747,28 +5774,26 @@ async fn route_select_user_table(
                         });
                     }
 
-                    let mut all_rows = Vec::new();
-                    extend_rows_from_partitions(
-                        &partitions,
-                        &mut all_rows,
-                        &all_col_names,
-                        &all_col_types,
-                        &pk_indices,
-                        &ck_indices,
-                        &storage_to_table,
+                    let can_stop_at_limit = s.order_by.is_empty()
+                        && !s.distinct
+                        && !s
+                            .columns
+                            .iter()
+                            .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
+                    collect_rows_from_partition_stream_with_limit(
+                        index_stream,
+                        row_context,
+                        predicate_context,
+                        can_stop_at_limit
+                            .then(|| {
+                                s.limit
+                                    .as_ref()
+                                    .and_then(|limit| limit.as_literal())
+                                    .map(|limit| limit.max(0) as usize)
+                            })
+                            .flatten(),
                     )
-                    .await;
-                    filter_rows_by_select_predicates(
-                        &mut all_rows,
-                        s,
-                        &all_col_names,
-                        &all_col_types,
-                        table_meta,
-                        ks,
-                        state,
-                    )?;
-
-                    all_rows
+                    .await?
                 }
 
                 ScanPlan::FullScan => {
@@ -11362,28 +11387,42 @@ fn try_pk_in_lookup(
 
 /// Convert a WHERE clause `Term` for a given column into an `IndexKey` for
 /// secondary index lookup.
-/// Read and intersect the result sets of every matched single-column index.
+/// Stream the intersection of every matched single-column index.
 ///
-/// Each index is point-looked-up for its `Eq` predicate; the returned
-/// partitions are intersected on partition-key identity, so the fetched set is
-/// the partitions present in *every* index rather than the (larger) result of a
-/// single index. Per-row precision on clustered tables is enforced by the
-/// caller's post-filter. Falls back to a full scan only if every index read is
-/// empty (the memtable-index-not-yet-wired fallback), preserving correctness.
+/// Non-primary index streams contribute only partition-key membership sets;
+/// the primary stream carries partitions through to the caller. No capped
+/// `index_read` call or empty-index full-scan fallback is involved. Per-row
+/// precision on clustered tables is enforced by the caller's post-filter.
 #[allow(clippy::too_many_arguments)]
-async fn read_index_intersection(
+async fn read_index_intersection_stream(
     state: &SharedState,
     table_id: &TableId,
     indexes: &[(String, String)],
     s: &SelectStatement,
     table_meta: &TableMetadata,
     ks: &str,
-    consistency: ConsistencyLevel,
-    table_strategy: &ferrosa_cluster::ring::strategy::ReplicationStrategy,
-) -> Result<Vec<ferrosa_sstable::types::Partition>, CqlError> {
-    let mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>> =
-        Vec::with_capacity(indexes.len());
-    for (index_name, index_column) in indexes {
+) -> Result<ferrosa_cluster::write_path::PartitionResultStream, CqlError> {
+    let (primary_name, primary_column) = indexes.first().ok_or_else(|| {
+        CqlError::ServerError("index intersection requires at least one index".into())
+    })?;
+    let primary_wc = s
+        .where_clauses
+        .iter()
+        .find(|wc| wc.column == *primary_column && wc.op == ComparisonOp::Eq)
+        .ok_or_else(|| {
+            CqlError::Invalid("planner selected index but no matching WHERE clause found".into())
+        })?;
+    let primary_key = term_to_index_key(
+        &primary_wc.value,
+        primary_column,
+        table_meta,
+        ks,
+        &state.schema,
+    )?;
+
+    let write_path = state.write_path.load();
+    let mut membership = Vec::with_capacity(indexes.len().saturating_sub(1));
+    for (index_name, index_column) in indexes.iter().skip(1) {
         let index_wc = s
             .where_clauses
             .iter()
@@ -11395,48 +11434,37 @@ async fn read_index_intersection(
             })?;
         let index_key =
             term_to_index_key(&index_wc.value, index_column, table_meta, ks, &state.schema)?;
-        let partitions = state
-            .write_path
-            .load()
-            .index_read(table_id, index_name, &index_key)
+        let mut stream = write_path
+            .index_read_stream(table_id, index_name, &index_key)
             .await?;
-        per_index.push(partitions);
+        let mut keys = HashSet::new();
+        while let Some(partition) = stream.next().await {
+            keys.insert(partition?.key.key.as_bytes().to_vec());
+        }
+        membership.push(keys);
     }
 
-    // Memtable-index-not-yet-wired fallback: if every index read came back
-    // empty, fall back to a full scan so results stay correct.
-    if per_index.iter().all(|p| p.is_empty()) {
-        return Ok(state
-            .write_path
-            .load()
-            .range_read_with(table_id, consistency, table_strategy)
-            .await?);
-    }
-
-    Ok(intersect_partitions_by_key(per_index))
-}
-
-/// Intersect partition lists on partition-key bytes, keeping each surviving
-/// partition once. A partition survives only if its key appears in every list.
-fn intersect_partitions_by_key(
-    mut per_index: Vec<Vec<ferrosa_sstable::types::Partition>>,
-) -> Vec<ferrosa_sstable::types::Partition> {
-    // Order lists smallest-first so the retained set starts as tight as
-    // possible, then intersect each subsequent list's key set against it.
-    per_index.sort_by_key(|p| p.len());
-    let mut iter = per_index.into_iter();
-    let mut result = match iter.next() {
-        Some(first) => first,
-        None => return Vec::new(),
-    };
-    for partitions in iter {
-        let keys: std::collections::HashSet<Vec<u8>> = partitions
-            .iter()
-            .map(|p| p.key.key.as_bytes().to_vec())
-            .collect();
-        result.retain(|p| keys.contains(p.key.key.as_bytes()));
-    }
-    result
+    let primary = write_path
+        .index_read_stream(table_id, primary_name, &primary_key)
+        .await?;
+    let membership = Arc::new(membership);
+    let filtered = primary.filter_map(move |item| {
+        let membership = Arc::clone(&membership);
+        async move {
+            match item {
+                Ok(partition)
+                    if membership
+                        .iter()
+                        .all(|keys| keys.contains(partition.key.key.as_bytes())) =>
+                {
+                    Some(Ok(partition))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        }
+    });
+    Ok(Box::pin(filtered))
 }
 
 fn term_to_index_key(
@@ -24886,6 +24914,111 @@ mod tests {
         assert_eq!(
             b_count, 5,
             "secondary index query for category='b' should return 5 rows, got {b_count}"
+        );
+    }
+
+    /// Indexed COUNT must consume the stream into an O(1) counter, while an
+    /// indexed LIMIT must stop the consumer at the requested row count. This
+    /// catches both regressions where the CQL layer rebuilt `all_rows` and
+    /// where it drained the producer before applying LIMIT.
+    #[tokio::test]
+    async fn indexed_count_is_streaming_and_limit_stops_the_consumer() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE idx_stream WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_stream.edges (id int, seq int, tenant text, PRIMARY KEY (id, seq))",
+            "CREATE INDEX edges_tenant ON idx_stream.edges (tenant)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Seed the large indexed result directly through storage. The router
+        // is the subject under test below; routing 10,001 individual INSERTs
+        // would make this regression test measure CQL write overhead instead
+        // of COUNT/LIMIT consumption. A single partition with clustered rows
+        // still exercises one index posting per result, and point reads return
+        // one row at a time so LIMIT can stop the producer after ten rows.
+        let n = 10_001_i32;
+        let table_id = TableId::new("idx_stream", "edges");
+        let rows: Vec<ferrosa_sstable::types::Row> = (0..n)
+            .map(|seq| {
+                let ts = seq as i64 + 1;
+                ferrosa_sstable::types::Row {
+                    clustering: encode_value(&CqlValue::Int(seq)),
+                    cells: vec![(
+                        0,
+                        ferrosa_common::CellValue::live(
+                            encode_value(&CqlValue::Text("tenant-a".to_string())),
+                            ts,
+                        ),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness:
+                        ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+                }
+            })
+            .collect();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            encode_value(&CqlValue::Int(1)),
+        ));
+        // Keep each mutation below the small test commit-log segment size,
+        // while still applying the seed through one storage batch call.
+        let mutations: Vec<ferrosa_storage::Mutation> = rows
+            .chunks(40)
+            .map(|chunk| {
+                ferrosa_storage::Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
+                    key.clone(),
+                    chunk.to_vec(),
+                    n as i64,
+                )
+            })
+            .collect();
+        state.engine.write_atomic_batch(mutations).unwrap();
+
+        let count_stmt = match crate::parser::parse(
+            "SELECT COUNT(*) FROM idx_stream.edges WHERE tenant = 'tenant-a'",
+        )
+        .unwrap()
+        {
+            Statement::Select(statement) => statement,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let count = route_select_raw(&state, &ctx, &count_stmt).await.unwrap();
+        assert_eq!(
+            count.rows,
+            vec![vec![Some(CqlValue::Bigint(n as i64))]],
+            "indexed COUNT must see every matching row without the legacy cap"
+        );
+
+        INDEX_ROWS_VISITED.with(|count| count.set(0));
+        let limit_stmt = match crate::parser::parse(
+            "SELECT id FROM idx_stream.edges WHERE tenant = 'tenant-a' LIMIT 10",
+        )
+        .unwrap()
+        {
+            Statement::Select(statement) => statement,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        let limited = route_select_raw(&state, &ctx, &limit_stmt).await.unwrap();
+        assert_eq!(limited.rows.len(), 10);
+        assert_eq!(
+            INDEX_ROWS_VISITED.with(|count| count.get()),
+            10,
+            "indexed LIMIT must stop the CQL consumer at the requested row count"
         );
     }
 

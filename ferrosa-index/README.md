@@ -26,6 +26,11 @@ they are not one uniform trait):
 
 ### 1. Secondary indexes — the root `IndexFactory` / `IndexReader` traits
 
+`IndexReader::visit` is the consumer-paced point-lookup surface. It walks
+matching postings one at a time and supports early termination, so storage and
+cluster callers do not clone a high-cardinality posting list into a `Vec`.
+The existing `lookup` method remains for bounded compatibility callers.
+
 Mature. Each implements `IndexBuilder` (`add_row` → `finish`) and `IndexReader`
 (`lookup` / `range` / `nearest` / `capabilities`):
 

@@ -189,6 +189,8 @@ fn stream_request(request_id: u32) -> RangeReadStreamRequestPayload {
         request_id,
         keyspace: KS.to_string(),
         table: TBL.to_string(),
+        index_name: None,
+        index_key: None,
         projected_regular_ordinals: None,
         start_key: None,
         start_clustering: None,

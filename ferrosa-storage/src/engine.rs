@@ -6441,22 +6441,57 @@ impl StorageEngine {
         }
     }
 
-    /// Query by secondary index across memtable and SSTable sidecar indexes.
-    ///
-    /// Delegates to [`TableStore::read_by_index`] which merges results from
-    /// the memtable index and (future) sidecar indexes. Returns an empty vec
-    /// if the table is not registered.
-    pub fn read_by_index(
+    /// Visit a secondary-index result one partition at a time. The callback
+    /// may stop the scan, allowing paging and cancellation to reach the index
+    /// reader without first building a `Vec` of all postings or partitions.
+    pub fn read_by_index_each(
         &self,
         table_id: &TableId,
         index_name: &str,
         key: &ferrosa_index::IndexKey,
-    ) -> ferrosa_common::Result<Vec<Partition>> {
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
         let tables = self.tables.read();
-        match tables.get(table_id) {
-            Some(state) => state.store.read_by_index(index_name, key),
-            None => Ok(vec![]),
-        }
+        let state = tables.get(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.read_by_index_each(index_name, key, visitor)
+    }
+
+    /// Open a bounded asynchronous stream over a secondary-index result.
+    /// The index walk runs on a blocking worker and hands partitions through
+    /// a bounded channel; the full global result is never materialized.
+    pub fn read_by_index_stream(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
+        const STREAM_BUFFER: usize = 4;
+        let table_id = table_id.clone();
+        let index_name = index_name.to_string();
+        let key = key.clone();
+        let engine = Arc::clone(self);
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
+
+        tokio::task::spawn_blocking(move || {
+            let result =
+                engine.read_by_index_each(&table_id, &index_name, &key, &mut |partition| match tx
+                    .blocking_send(Ok(partition))
+                {
+                    Ok(()) => std::ops::ControlFlow::Continue(()),
+                    Err(_) => std::ops::ControlFlow::Break(()),
+                });
+            if let Err(error) = result {
+                let _ = tx.blocking_send(Err(error));
+            }
+        });
+
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
     }
 
     /// Query by secondary index restricted to ONE partition (t_430c4188).
@@ -6465,10 +6500,9 @@ impl StorageEngine {
     /// only the postings for `partition_key` and point-reads exactly those
     /// rows — O(matching rows in the partition), never O(partition rows).
     ///
-    /// Unlike [`read_by_index`](Self::read_by_index) this fails loud on an
-    /// unregistered table: the keyed CQL path only reaches here after schema
-    /// validation, so a missing table is an internal inconsistency, not an
-    /// empty result.
+    /// This fails loud on an unregistered table: the keyed CQL path only
+    /// reaches here after schema validation, so a missing table is an internal
+    /// inconsistency, not an empty result.
     pub fn read_by_index_in_partition(
         &self,
         table_id: &TableId,
@@ -6491,7 +6525,7 @@ impl StorageEngine {
     /// ranges across the memtable index and SSTable sidecars.
     ///
     /// Delegates to [`TableStore::read_by_index_cell_ranges`]. Returns an empty
-    /// vec if the table is not registered. The same fail-loud `INDEX_RESULT_CAP`
+    /// vec if the table is not registered. The fail-loud `INDEX_RESULT_CAP`
     /// bound applies — an unbounded candidate set returns an error rather than
     /// silently truncating.
     pub fn read_by_index_cell_ranges(
@@ -10486,6 +10520,20 @@ mod tests {
 
     fn table_id() -> TableId {
         TableId::new("test_ks", "test_table")
+    }
+
+    fn collect_index_results(
+        engine: &StorageEngine,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+    ) -> ferrosa_common::Result<Vec<Partition>> {
+        let mut results = Vec::new();
+        engine.read_by_index_each(table_id, index_name, key, &mut |partition| {
+            results.push(partition);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(results)
     }
 
     #[test]
@@ -16791,9 +16839,9 @@ mod tests {
             engine.flush(&tid).unwrap();
 
             // Verify readable before drop.
-            let results = engine
-                .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
-                .unwrap();
+            let results =
+                collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"alice".to_vec()))
+                    .unwrap();
             assert_eq!(results.len(), 1, "pre-reregistration: should find user1");
 
             engine.shutdown().unwrap();
@@ -16809,9 +16857,9 @@ mod tests {
                 .unwrap();
             engine.replay_mutations(pending).unwrap();
 
-            let results = engine
-                .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
-                .unwrap();
+            let results =
+                collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"alice".to_vec()))
+                    .unwrap();
             assert_eq!(
                 results.len(),
                 1,
@@ -16888,9 +16936,8 @@ mod tests {
 
         // Sanity: the GLOBAL consult still sees p2, proving the keyed variant
         // actually restricted the postings rather than the data being absent.
-        let global = engine
-            .read_by_index(&tid, "val_idx", &IndexKey(b"alice".to_vec()))
-            .unwrap();
+        let global =
+            collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"alice".to_vec())).unwrap();
         assert!(
             global.iter().any(|p| p.key.key.as_bytes() == b"p2"),
             "global consult should see the p2 match"
@@ -16923,6 +16970,18 @@ mod tests {
             .read_by_index_in_partition(&tid, "val_idx", &IndexKey(b"nobody".to_vec()), b"p1")
             .unwrap();
         assert!(hits.is_empty(), "absent value → empty result");
+
+        let mut visitor = |_partition| std::ops::ControlFlow::Continue(());
+        let err = engine.read_by_index_each(
+            &TableId::new("nope", "nope"),
+            "val_idx",
+            &IndexKey(b"alice".to_vec()),
+            &mut visitor,
+        );
+        assert!(
+            err.is_err(),
+            "unknown table stream must fail loud, not be empty"
+        );
 
         // Unknown table fails loud (mirrors read_by_index).
         let err = engine.read_by_index_in_partition(
@@ -16967,7 +17026,7 @@ mod tests {
         let key7 = IndexKey(7_i32.to_be_bytes().to_vec());
 
         // Global consult sees both partitions (sidecar layer).
-        let global = engine.read_by_index(&tid, "ck_idx", &key7).unwrap();
+        let global = collect_index_results(&engine, &tid, "ck_idx", &key7).unwrap();
         let mut pks: Vec<Vec<u8>> = global
             .iter()
             .map(|p| p.key.key.as_bytes().to_vec())
@@ -19714,10 +19773,14 @@ mod tests {
             .write(&table_id, &key, make_row(b"indexed", 1000), 1000)
             .unwrap();
         assert_eq!(
-            engine
-                .read_by_index(&table_id, "val_idx", &IndexKey(b"indexed".to_vec()))
-                .unwrap()
-                .len(),
+            collect_index_results(
+                &engine,
+                &table_id,
+                "val_idx",
+                &IndexKey(b"indexed".to_vec()),
+            )
+            .unwrap()
+            .len(),
             1,
             "sanity check: index serves the live row before DROP INDEX"
         );
@@ -19738,10 +19801,14 @@ mod tests {
             "tracker state must be removed immediately"
         );
         assert!(
-            engine
-                .read_by_index(&table_id, "val_idx", &IndexKey(b"indexed".to_vec()))
-                .unwrap()
-                .is_empty(),
+            collect_index_results(
+                &engine,
+                &table_id,
+                "val_idx",
+                &IndexKey(b"indexed".to_vec()),
+            )
+            .unwrap()
+            .is_empty(),
             "dropped index must not serve stale live index state before restart"
         );
         assert!(
@@ -19776,8 +19843,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            engine
-                .read_by_index(&table_id, "name_idx", &IndexKey(b"Jon".to_vec()))
+            collect_index_results(&engine, &table_id, "name_idx", &IndexKey(b"Jon".to_vec()),)
                 .unwrap()
                 .len(),
             1,
@@ -19830,8 +19896,7 @@ mod tests {
         );
 
         assert_eq!(
-            engine
-                .read_by_index(&table_id, "name_idx", &IndexKey(b"Jon".to_vec()))
+            collect_index_results(&engine, &table_id, "name_idx", &IndexKey(b"Jon".to_vec()),)
                 .unwrap()
                 .len(),
             1,
@@ -20340,13 +20405,13 @@ mod tests {
             )
             .unwrap();
 
-        let hits = engine
-            .read_by_index(
-                &user_tid,
-                "name_active_idx",
-                &ferrosa_index::IndexKey(b"alice".to_vec()),
-            )
-            .unwrap();
+        let hits = collect_index_results(
+            &engine,
+            &user_tid,
+            "name_active_idx",
+            &ferrosa_index::IndexKey(b"alice".to_vec()),
+        )
+        .unwrap();
         let pks: Vec<Vec<u8>> = hits.iter().map(|p| p.key.key.as_bytes().to_vec()).collect();
         assert_eq!(
             pks,

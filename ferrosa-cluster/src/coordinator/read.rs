@@ -51,7 +51,7 @@ use crate::error::ClusterError;
 use crate::pair::coordinator::encode_mutation;
 use crate::raft::handlers::{
     partition_from_wire, FulltextSearchRequestPayload, FulltextSearchResponsePayload,
-    IndexReadInPartitionRequestPayload, IndexReadRequestPayload, IndexReadResponsePayload,
+    IndexReadInPartitionRequestPayload, IndexReadResponsePayload,
     PartitionSuffixReadRequestPayload, RangeReadRequestPayload, RangeReadResponsePayload,
     ReadRequestPayload, ReadResponsePayload,
 };
@@ -1563,7 +1563,6 @@ impl ClusterCoordinator {
         let local_id = self.local_node_id;
         let storage = self.storage.clone();
         let table_id_clone = table_id.clone();
-        let total_nodes = nodes.len();
 
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
@@ -1654,182 +1653,17 @@ impl ClusterCoordinator {
             }
         }
 
-        if let Some(ref err) = first_error {
-            if all_partitions.is_empty() {
-                // ALL nodes failed — return error (no data at all).
-                tracing::error!(
-                    failed_nodes,
-                    "coordinate_range_read: all nodes failed, returning error"
-                );
-                return Err(first_error.unwrap());
-            }
-            // Some nodes failed but we have partial data (e.g., local node
-            // succeeded, remote nodes not yet connected during startup).
-            // Return what we have — better than hanging the client.
-            tracing::warn!(
+        if let Some(err) = first_error {
+            tracing::error!(
                 failed_nodes,
                 partitions_received = all_partitions.len(),
                 %err,
-                "coordinate_range_read: {failed_nodes} node(s) failed, \
-                 returning partial results from {remaining} node(s)",
-                remaining = total_nodes - failed_nodes,
+                "coordinate_range_read: replica failure makes the scan incomplete"
             );
+            return Err(err);
         }
 
         // Deduplicate: group by token, merge replicas with the same partition key.
-        let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
-        for p in all_partitions {
-            by_token.entry(p.key.token.0).or_default().push(p);
-        }
-
-        let deduped: Vec<ferrosa_sstable::types::Partition> = by_token
-            .into_values()
-            .map(|group| {
-                if group.len() == 1 {
-                    group.into_iter().next().unwrap()
-                } else {
-                    ferrosa_storage::merge::merge_partitions(group)
-                }
-            })
-            .collect();
-
-        Ok(deduped)
-    }
-
-    /// Scatter-gather index read across all ring nodes.
-    ///
-    /// Each node runs `StorageEngine::read_by_index()` locally and returns
-    /// matching partitions. The coordinator merges and deduplicates results
-    /// so that all rows matching the indexed value are returned regardless
-    /// of which node they reside on.
-    pub async fn coordinate_index_read(
-        &self,
-        table_id: &TableId,
-        index_name: &str,
-        index_key: &ferrosa_index::IndexKey,
-    ) -> crate::error::Result<Vec<ferrosa_sstable::types::Partition>> {
-        let ring = self.ring.load();
-        let node_ids = ring.node_ids();
-
-        let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
-            .iter()
-            .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
-            .collect();
-        drop(ring);
-
-        let req_payload = IndexReadRequestPayload {
-            keyspace: table_id.keyspace.clone(),
-            table: table_id.table.clone(),
-            index_name: index_name.to_string(),
-            index_key: index_key.0.clone(),
-        };
-        let req_body = Bytes::from(bincode::serialize(&req_payload).unwrap_or_default());
-
-        let local_id = self.local_node_id;
-        let storage = self.storage.clone();
-        let table_id_clone = table_id.clone();
-        let index_name_owned = index_name.to_string();
-        let index_key_clone = index_key.clone();
-        let total_nodes = nodes.len();
-
-        let mut futs: FuturesUnordered<_> = nodes
-            .into_iter()
-            .map(|(node_id, remote)| {
-                let storage = storage.clone();
-                let table_id = table_id_clone.clone();
-                let index_name = index_name_owned.clone();
-                let index_key = index_key_clone.clone();
-                let req_body = req_body.clone();
-                let coordinator = self;
-
-                async move {
-                    if node_id == local_id {
-                        storage
-                            .read_by_index(&table_id, &index_name, &index_key)
-                            .map_err(ClusterError::Storage)
-                    } else {
-                        let (hid, addr) = remote.ok_or_else(|| {
-                            ClusterError::Internal(format!(
-                                "index read: node {node_id} has no host_id"
-                            ))
-                        })?;
-
-                        let resp = coordinator
-                            .send_remote_with_reconnect_timeout(
-                                hid,
-                                &addr,
-                                Message::IndexReadRequest(req_body),
-                                Lane::Bulk,
-                                Self::BULK_READ_TIMEOUT,
-                            )
-                            .await
-                            .map_err(|e| {
-                                ClusterError::Internal(format!(
-                                    "index read from node {node_id} ({hid}) via {addr}: {e}"
-                                ))
-                            })?;
-
-                        match resp {
-                            Message::IndexReadResponse(b) => {
-                                let payload = bincode::deserialize::<IndexReadResponsePayload>(&b)
-                                    .map_err(|e| {
-                                        ClusterError::Internal(format!(
-                                            "index read: failed to decode response \
-                                                 from node {node_id} ({hid}): {e}"
-                                        ))
-                                    })?;
-                                Ok(payload
-                                    .partitions
-                                    .into_iter()
-                                    .map(partition_from_wire)
-                                    .collect())
-                            }
-                            other => Err(ClusterError::Internal(format!(
-                                "index read: unexpected response {:?} from node {node_id} ({hid})",
-                                other.msg_type()
-                            ))),
-                        }
-                    }
-                }
-            })
-            .collect();
-
-        let mut all_partitions: Vec<ferrosa_sstable::types::Partition> = Vec::new();
-        let mut first_error: Option<ClusterError> = None;
-        let mut failed_nodes = 0usize;
-
-        while let Some(result) = futs.next().await {
-            match result {
-                Ok(batch) => all_partitions.extend(batch),
-                Err(e) => {
-                    tracing::error!("coordinate_index_read: {e}");
-                    failed_nodes += 1;
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-
-        if let Some(ref err) = first_error {
-            if all_partitions.is_empty() {
-                tracing::error!(
-                    failed_nodes,
-                    "coordinate_index_read: all nodes failed, returning error"
-                );
-                return Err(first_error.unwrap());
-            }
-            tracing::warn!(
-                failed_nodes,
-                partitions_received = all_partitions.len(),
-                %err,
-                "coordinate_index_read: {failed_nodes} node(s) failed, \
-                 returning partial results from {remaining} node(s)",
-                remaining = total_nodes - failed_nodes,
-            );
-        }
-
-        // Deduplicate by token.
         let mut by_token: BTreeMap<i64, Vec<ferrosa_sstable::types::Partition>> = BTreeMap::new();
         for p in all_partitions {
             by_token.entry(p.key.token.0).or_default().push(p);
@@ -2156,7 +1990,6 @@ impl ClusterCoordinator {
         let table_id_clone = table_id.clone();
         let index_name_owned = index_name.to_string();
         let query_owned = query.to_string();
-        let total_nodes = nodes.len();
 
         let mut futs: FuturesUnordered<_> = nodes
             .into_iter()
@@ -2250,20 +2083,13 @@ impl ClusterCoordinator {
         }
 
         if let Some(err) = first_error {
-            if failed_nodes == total_nodes {
-                tracing::error!(
-                    failed_nodes,
-                    "coordinate_fulltext_search: all nodes failed, returning error"
-                );
-                return Err(err);
-            }
-            tracing::warn!(
+            tracing::error!(
                 failed_nodes,
                 keys_received = all_keys.len(),
                 %err,
-                "coordinate_fulltext_search: {failed_nodes}/{total_nodes} node(s) failed, \
-                 returning partial union",
+                "coordinate_fulltext_search: replica failure makes the result incomplete"
             );
+            return Err(err);
         }
 
         Ok(all_keys)
@@ -2536,27 +2362,6 @@ mod tests {
         }
     }
 
-    struct StaticIndexReadHandler {
-        partition: Partition,
-    }
-
-    #[async_trait::async_trait]
-    impl RpcHandler for StaticIndexReadHandler {
-        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-            let Message::IndexReadRequest(_) = msg else {
-                return None;
-            };
-            let payload = IndexReadResponsePayload {
-                partitions: vec![crate::raft::handlers::partition_to_wire(
-                    self.partition.clone(),
-                )],
-            };
-            Some(Message::IndexReadResponse(Bytes::from(
-                bincode::serialize(&payload).unwrap(),
-            )))
-        }
-    }
-
     struct DelayedRangeReadHandler {
         partition: Partition,
         delay: std::time::Duration,
@@ -2604,29 +2409,6 @@ mod tests {
                 truncated: false,
             };
             Some(Message::RangeReadResponse(Bytes::from(
-                bincode::serialize(&payload).unwrap(),
-            )))
-        }
-    }
-
-    struct DelayedIndexReadHandler {
-        partition: Partition,
-        delay: std::time::Duration,
-    }
-
-    #[async_trait::async_trait]
-    impl RpcHandler for DelayedIndexReadHandler {
-        async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
-            let Message::IndexReadRequest(_) = msg else {
-                return None;
-            };
-            tokio::time::sleep(self.delay).await;
-            let payload = IndexReadResponsePayload {
-                partitions: vec![crate::raft::handlers::partition_to_wire(
-                    self.partition.clone(),
-                )],
-            };
-            Some(Message::IndexReadResponse(Bytes::from(
                 bincode::serialize(&payload).unwrap(),
             )))
         }
@@ -2821,14 +2603,11 @@ mod tests {
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
-    /// A remote FTI failure must not turn a legitimate empty local result into
-    /// a user-visible query failure. The fmem hybrid_search path fans out
-    /// `fts_match` and can hit transient remote stream failures such as
-    /// `ChannelClosedBeforeDone`; if at least one node completed, the result is
-    /// a partial union, even when that union is empty. Only all nodes failing is
-    /// fatal.
+    /// A remote FTI failure must not be hidden by a legitimate empty local
+    /// result. Returning the local-only union would make a replica outage look
+    /// like a valid no-match query.
     #[tokio::test]
-    async fn coordinate_fulltext_search_degrades_to_empty_when_some_nodes_fail() {
+    async fn coordinate_fulltext_search_errors_when_some_nodes_fail() {
         let dir = tempfile::tempdir().unwrap();
         let storage = test_storage(dir.path());
         register_test_table(&storage);
@@ -2862,14 +2641,16 @@ mod tests {
             ConsistencyLevel::Quorum,
         );
 
-        let keys = coordinator
+        let error = coordinator
             .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token", None)
             .await
-            .expect("one successful empty FTI shard should degrade remote failure to empty union");
-
+            .expect_err("a remote FTI failure must not return a partial union");
         assert!(
-            keys.is_empty(),
-            "expected an empty partial union when local FTI succeeds and remote FTI fails"
+            matches!(
+                error,
+                ClusterError::Internal(_) | ClusterError::ReadTimeout { .. }
+            ),
+            "expected a loud replica error, got {error:?}"
         );
     }
 
@@ -3564,64 +3345,6 @@ mod tests {
         assert!(
             result.is_some(),
             "remote read should succeed after reconnect"
-        );
-        assert!(
-            pm.has_peer(remote_host_id),
-            "coordinator should cache the reconnected peer"
-        );
-
-        server.shutdown(std::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn coordinate_index_read_reconnects_missing_remote_peer_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = test_storage(dir.path());
-        register_test_table(&storage);
-
-        let key = test_key();
-        let partition = Partition {
-            key,
-            deletion: DeletionTime::LIVE,
-            static_row: None,
-            rows: vec![test_row(888)],
-        };
-        let (server, addr, remote_host_id) = start_rpc_server(
-            MsgType::IndexReadRequest,
-            Arc::new(StaticIndexReadHandler {
-                partition: partition.clone(),
-            }),
-        )
-        .await;
-
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
-
-        let mut remote = make_node(&addr.to_string());
-        remote.host_id = remote_host_id;
-        let mut ring = TokenRing::new();
-        ring.add_node(2u64, remote);
-        ring.assign_tokens(2u64, &[42]);
-
-        let coordinator =
-            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
-
-        let table_id = TableId::new("test_ks", "test_tbl");
-        let partitions = coordinator
-            .coordinate_index_read(
-                &table_id,
-                "val_idx",
-                &ferrosa_index::IndexKey(b"hello".to_vec()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            partitions.len(),
-            1,
-            "index read should succeed after reconnect"
         );
         assert!(
             pm.has_peer(remote_host_id),
@@ -5490,65 +5213,6 @@ mod tests {
         // Empty ring means no nodes to contact at all, should return Ok([])
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn coordinate_index_read_uses_bulk_lane_timeout_for_slow_remote_scan() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = test_storage(dir.path());
-        register_test_table(&storage);
-
-        let key = test_key();
-        let partition = Partition {
-            key,
-            deletion: DeletionTime::LIVE,
-            static_row: None,
-            rows: vec![test_row(9876)],
-        };
-        let (server, addr, remote_host_id) = start_rpc_server(
-            MsgType::IndexReadRequest,
-            Arc::new(DelayedIndexReadHandler {
-                partition: partition.clone(),
-                delay: std::time::Duration::from_secs(1),
-            }),
-        )
-        .await;
-
-        let pm = Arc::new(PeerManager::new(
-            Arc::new(NetConfig::default()),
-            Uuid::new_v4(),
-            Arc::new(NoopListener),
-        ));
-
-        let mut remote = make_node(&addr.to_string());
-        remote.host_id = remote_host_id;
-        let mut ring = TokenRing::new();
-        ring.add_node(2u64, remote);
-        ring.assign_tokens(2u64, &[42]);
-
-        let coordinator =
-            make_coordinator(ring, pm.clone(), 1u64, storage, 1, ConsistencyLevel::One);
-
-        let table_id = TableId::new("test_ks", "test_tbl");
-        let partitions = coordinator
-            .coordinate_index_read(
-                &table_id,
-                "val_idx",
-                &ferrosa_index::IndexKey(b"slow".to_vec()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            partitions.len(),
-            1,
-            "slow remote index scans should complete on the bulk lane"
-        );
-        assert!(
-            pm.has_peer(remote_host_id),
-            "coordinator should cache the reconnected peer"
-        );
-
-        server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
     // -----------------------------------------------------------------------

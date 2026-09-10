@@ -153,9 +153,6 @@ pub enum MsgType {
     // Index build coordination
     IndexBuildRequest = 0x60,
     IndexBuildComplete = 0x61,
-    // Secondary index scatter-gather
-    IndexReadRequest = 0x62,
-    IndexReadResponse = 0x63,
     // Full-text index scatter-gather (fts_match across every node's local FTI)
     FulltextSearchRequest = 0x64,
     FulltextSearchResponse = 0x65,
@@ -295,8 +292,6 @@ impl TryFrom<u8> for MsgType {
             0x52 => Ok(Self::BatchlogReplay),
             0x60 => Ok(Self::IndexBuildRequest),
             0x61 => Ok(Self::IndexBuildComplete),
-            0x62 => Ok(Self::IndexReadRequest),
-            0x63 => Ok(Self::IndexReadResponse),
             0x64 => Ok(Self::FulltextSearchRequest),
             0x65 => Ok(Self::FulltextSearchResponse),
             0x66 => Ok(Self::IndexReadInPartitionRequest),

@@ -20,6 +20,7 @@
 //! +----------------------------------+
 //! ```
 
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use ferrosa_index::{IndexError, IndexKey, IndexResult, RowPosition};
@@ -191,6 +192,27 @@ impl SidecarReader {
             }
         }
         Ok(results)
+    }
+
+    /// Visit exact-key postings in place without allocating a result vector.
+    /// The visitor may stop the scan after a page has been filled.
+    pub fn visit(
+        &self,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) -> IndexResult<()> {
+        let start = self
+            .entries
+            .partition_point(|e| e.key.as_slice() < key.0.as_slice());
+        for entry in &self.entries[start..] {
+            if entry.key != key.0 {
+                break;
+            }
+            if visitor(entry.position.clone()).is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Range query: returns all `RowPosition`s for keys in `[start, end]`

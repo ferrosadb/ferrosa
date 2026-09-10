@@ -10,7 +10,7 @@ pub mod metaphone;
 pub mod soundex;
 
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
 
 use ferrosa_common::CellValue;
@@ -184,6 +184,24 @@ impl IndexReader for PhoneticReader {
             .map_err(|e| IndexError::Corrupt(format!("invalid UTF-8 in lookup key: {e}")))?;
         let code = self.encoder.encode(text);
         Ok(self.entries.get(&code).cloned().unwrap_or_default())
+    }
+
+    fn visit(
+        &self,
+        key: &IndexKey,
+        visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>,
+    ) -> IndexResult<()> {
+        let text = std::str::from_utf8(&key.0)
+            .map_err(|e| IndexError::Corrupt(format!("invalid UTF-8 in lookup key: {e}")))?;
+        let code = self.encoder.encode(text);
+        if let Some(positions) = self.entries.get(&code) {
+            for position in positions {
+                if visitor(position.clone()).is_break() {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn range(

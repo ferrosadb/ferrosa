@@ -51,7 +51,7 @@ bincode tag order is asserted stable (`lib.rs::bincode_index_type_variant_tag_st
 | Module | Responsibility |
 |--------|----------------|
 | `lib` (~611 LoC) | Root traits, `IndexType`/`IndexConfig`/`IndexFiles`/`IndexKey`/`RowPosition`, `IndexError`, the `FilterPredicate`/`FilterClause`/`FilterOp` model with dual-shape back-compat serde, and the big-endian vector codec |
-| `btree` (~466) | Sorted length-prefixed secondary index; point + range |
+| `btree` (~466) | Sorted length-prefixed secondary index; point + range, including visitor-based point reads |
 | `hash` (~344) | `HashMap`-backed point-lookup index |
 | `composite` (~737) | Multi-column key; full-key + prefix scan |
 | `phonetic/*` (~431 + algos) | Soundex / Metaphone / Double Metaphone / Caverphone fuzzy-match index |
