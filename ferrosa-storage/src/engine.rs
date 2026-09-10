@@ -12053,6 +12053,7 @@ mod tests {
     /// size. Keep this below the bounded-read/materialization cap; full
     /// production-volume verification belongs on streaming/paged paths.
     #[test]
+    #[ignore = "slow (high-volume ingest driving repeated auto-flush); runs in the nightly --ignored job"]
     fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
@@ -12104,6 +12105,7 @@ mod tests {
 
     /// Concurrent writes + flush from separate thread.
     #[test]
+    #[ignore = "slow (many threads writing while flushes run); runs in the nightly --ignored job"]
     fn concurrent_write_and_flush_threads_preserve_all_rows() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
@@ -16975,6 +16977,7 @@ mod tests {
     /// Uses the identical code path as the fast 100-row variant; only the row
     /// count differs.
     #[test]
+    #[ignore = "slow (2k-mutation commit-log replay with a 256-byte segment size); runs in the nightly --ignored job"]
     fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

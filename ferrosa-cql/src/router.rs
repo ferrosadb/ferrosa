@@ -20187,6 +20187,7 @@ mod tests {
     /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
     /// large user LIMIT below what the client asked for.
     #[tokio::test]
+    #[ignore = "slow (materializes more than 10k rows); runs in the nightly --ignored job"]
     async fn user_limit_above_10k_returns_all_requested_rows() {
         let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
@@ -28335,6 +28336,7 @@ mod tests {
     /// 3 strictly-advancing pages whose union is the exact row set, and
     /// has_more must go false.
     #[tokio::test]
+    #[ignore = "slow (wide partition paged to exhaustion); runs in the nightly --ignored job"]
     async fn wide_partition_spanning_pages_terminates_exactly() {
         let rows_per: i64 = 15_000;
         let page_size: i32 = 5_000;
@@ -28486,6 +28488,7 @@ mod tests {
     /// backed then SSTable-backed then MIXED (flushed base + memtable
     /// updates), asserting the exact union each time.
     #[tokio::test]
+    #[ignore = "slow (wide partition paged to exhaustion after a flush); runs in the nightly --ignored job"]
     async fn wide_partition_multi_text_clustering_pages_exactly_after_flush() {
         let (state, _dir) = setup();
         let auth = dev_auth();

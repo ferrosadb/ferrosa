@@ -1,0 +1,76 @@
+name: Nightly Slow Tests
+
+# The tests that PR CI skips.
+#
+# A handful of tests take 60-90 seconds each — randomized external-sort spills,
+# a compaction soak over many seeds, high-volume ingest, a 2k-mutation
+# commit-log replay, wide-partition paging. They are worth having and they are
+# not worth paying for on every push, so they carry
+# `#[ignore = "slow (...); runs in the nightly --ignored job"]` and run here.
+#
+# This job is the other half of that bargain. Gating a slow test without a
+# nightly that runs it does not make it cheap, it deletes it: the test still
+# exists, still looks like coverage in the file, and never executes again.
+# If this workflow is removed or left red, re-run those tests some other way
+# or drop the `#[ignore]`s.
+#
+# Run one locally with:
+#   cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # 4 AM UTC daily, before the 5 AM sim sweep
+  workflow_dispatch: # so a change to a slow test can be checked without waiting a day
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  slow-tests:
+    name: Ignored (slow) tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install capnproto
+        run: |
+          set -euo pipefail
+          if command -v capnp >/dev/null 2>&1; then
+            echo "capnp already present: $(capnp --version)"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      # `--ignored` runs ONLY the ignored tests, which is exactly the set PR CI
+      # skipped. Nothing here re-runs the fast suite; that already ran on the
+      # commit that produced this tree.
+      - name: Run the ignored (slow) tests
+        run: cargo test --workspace --all-targets -- --ignored
+
+      # A nightly that silently stops selecting anything is the failure mode
+      # this whole arrangement is exposed to: rename a test, drop an
+      # `#[ignore]`, and the job goes green having run nothing at all.
+      - name: Fail if no ignored tests were selected
+        if: always()
+        run: |
+          set -euo pipefail
+          count=$(cargo test --workspace --all-targets -- --ignored --list 2>/dev/null \
+                  | grep -c ': test$' || true)
+          echo "ignored tests selected: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No ignored tests were found. Either the #[ignore] gates were"
+            echo "::error::removed (so PR CI is paying for them again) or this job is"
+            echo "::error::selecting nothing and reporting success for doing no work."
+            exit 1
+          fi

@@ -620,6 +620,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow (randomized spill/merge over many runs); runs in the nightly --ignored job"]
     fn spilled_result_equals_in_memory_reference_randomized() {
         let mut rng = Lcg(0xF355_0A5A);
         let order = RowOrder::new(vec![(0, true)]);
@@ -651,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow (cascading merge over many spilled runs); runs in the nightly --ignored job"]
     fn cascade_merge_over_many_runs_stays_correct() {
         // Force FAR more than MERGE_FANIN runs (threshold=1 → ~1 run per row) so
         // finish() must cascade-merge across multiple passes. The result must
