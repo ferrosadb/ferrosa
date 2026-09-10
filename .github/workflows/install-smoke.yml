@@ -13,7 +13,9 @@ name: Install Smoke
 # gate that was missing when issue #172 shipped.
 
 on:
-  pull_request:
+  # Runs from the trusted default-branch workflow. The author gate below is
+  # therefore not editable by the pull request whose code will be tested.
+  pull_request_target:
   push:
     branches: [main]
   workflow_call: {}   # so release.yml can gate publish on this
@@ -22,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: install-smoke-${{ github.ref }}
+  group: install-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -39,7 +41,7 @@ jobs:
   build:
     name: Build ferrosa tarball (${{ matrix.os }})
     # Only the runner owner's PRs may execute code on organization runners.
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'bkearns'
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.user.login == 'bkearns'
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +54,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto (Linux)
         if: runner.os == 'Linux'
@@ -97,6 +101,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
       - name: Download the prebuilt ferrosa tarball
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
@@ -130,6 +136,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
       - name: Checkout ferrosa-memory
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
