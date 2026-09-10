@@ -149,6 +149,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable
   postings (including phonetic postings) instead of replacing the live index.
+  A newly registered scalar index streams rows already present in the active
+  or flushing memtable into its `MemtableIndex` before publication; CREATE
+  INDEX therefore covers pre-existing unflushed rows without a query-time
+  full-scan fallback or a temporary row collection.
   `update_schema` (the ALTER TABLE apply) remaps every positional index
   declaration through the old schema's column name, because adding a column
   that sorts before an indexed column shifts the indexed column's cell

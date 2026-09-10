@@ -100,6 +100,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `FullScan`. `EXPLAIN SELECT …` renders the same plan the router executes.
   `CREATE INDEX` on a CLUSTERING column wires the storage engine's
   clustering-component build path (previously a silent schema-only no-op).
+  Scalar indexes created after writes synchronously stream pre-existing active
+  and flushing memtable rows into the index before indexed SELECTs can use it;
+  an empty global lookup remains a real miss and never falls back to a scan.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from

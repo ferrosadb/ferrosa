@@ -23758,12 +23758,12 @@ mod tests {
         );
     }
 
-    /// `CREATE INDEX` followed by `INSERT` then `SELECT WHERE indexed_col = ?`
-    /// must return the inserted row via the memtable index.  This verifies the
-    /// full wire-up: router calls engine.add_index(), the TableStore's
-    /// indexed_columns is updated, and the next write is indexed.
+    /// `INSERT` followed by `CREATE INDEX` then `SELECT WHERE indexed_col = ?`
+    /// must return the pre-existing row via the memtable index. This verifies
+    /// the full wire-up: router calls engine.add_index(), and the TableStore
+    /// backfills rows that have not yet reached an SSTable.
     #[tokio::test]
-    async fn create_index_wires_memtable_indexing_end_to_end() {
+    async fn create_index_backfills_memtable_rows_end_to_end() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
             auth: &dev_auth(),
@@ -23786,16 +23786,16 @@ mod tests {
                 .unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
-        // Create index on `email` — this must wire engine.add_index()
-        let stmt =
-            crate::parser::parse("CREATE INDEX wire_email_idx ON idx_wire.users (email)").unwrap();
-        route(&state, &ctx, stmt).await.unwrap();
-
-        // Insert a row AFTER the index was created
+        // Insert before CREATE INDEX, matching the driver smoke regression.
         let stmt = crate::parser::parse(
             "INSERT INTO idx_wire.users (id, email) VALUES (42, 'bob@example.com')",
         )
         .unwrap();
+        route(&state, &ctx, stmt).await.unwrap();
+
+        // Create index on `email` — this must backfill the active memtable.
+        let stmt =
+            crate::parser::parse("CREATE INDEX wire_email_idx ON idx_wire.users (email)").unwrap();
         route(&state, &ctx, stmt).await.unwrap();
 
         // Query by indexed column — must find the row
@@ -23814,7 +23814,7 @@ mod tests {
                 let count = extract_row_count(&b);
                 assert_eq!(
                     count, 1,
-                    "should find exactly 1 row via memtable index, got {count}"
+                    "should find exactly 1 pre-existing row via memtable index, got {count}"
                 );
             }
             _ => panic!("expected Result"),

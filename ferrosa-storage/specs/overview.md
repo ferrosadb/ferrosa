@@ -103,9 +103,13 @@ volume or changing query results.
    tombstones (partition/row/cell) suppress older data by `marked_for_delete_at`.
 4. **Durability is governed by the sync strategy.** Only `Batch` fsyncs every
    write; the **default `Periodic`** has a bounded loss window (`sync_interval`).
-5. **Index registration is replay-safe.** Repeating the same index declaration
-   preserves the active memtable index and its unflushed postings; a conflicting
-   column position or index type fails loud instead of silently replacing it.
+5. **Index registration is replay-safe and complete for live rows.** Repeating
+   the same index declaration preserves the active memtable index and its
+   unflushed postings; a conflicting column position or index type fails loud
+   instead of silently replacing it. A new scalar declaration streams the
+   active and flushing memtables into the index before publication, so rows
+   written before CREATE INDEX are visible without materializing a fallback
+   table scan.
 6. **Table registration is compare-and-install.** A schema replay that loses
    the table-map install race merges declarations into the already-live store;
    it cannot replace active memtable rows or index postings.

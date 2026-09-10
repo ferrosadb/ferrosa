@@ -950,6 +950,54 @@ fn clone_partition_limited(
     }
 }
 
+/// Add one live row to a scalar memtable index using the same predicate and
+/// key-encoding semantics for write-time maintenance and CREATE INDEX backfill.
+fn insert_scalar_memtable_index_row(
+    index: &MemtableIndex,
+    index_name: &str,
+    column_position: usize,
+    index_type: IndexType,
+    filter_predicate: Option<&FilterPredicate>,
+    partition_key: &[u8],
+    row: &Row,
+) {
+    if let Some(predicate) = filter_predicate {
+        let matches = ferrosa_index::evaluate_predicate_row(predicate, |predicate_col_pos| {
+            row.cells
+                .iter()
+                .find(|(idx, _)| *idx as usize == predicate_col_pos)
+                .and_then(|(_, cell)| cell.value.as_deref())
+        });
+        if !matches {
+            return;
+        }
+    }
+
+    let Some(value) = row
+        .cells
+        .iter()
+        .find(|(idx, _)| *idx as usize == column_position)
+        .and_then(|(_, cell)| cell.value.as_deref())
+    else {
+        return;
+    };
+    match crate::index::scheduler::encode_index_key(index_type, value) {
+        Ok(Some(index_key)) => index.insert(
+            index_key,
+            RowPosition {
+                partition_key: partition_key.to_vec(),
+                clustering_key: row.clustering.clone(),
+            },
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            %e,
+            %index_name,
+            "store: skipping memtable index entry; key encoding failed"
+        ),
+    }
+}
+
 /// Filters sidecar entries to remove references to deleted partitions.
 ///
 /// After compaction merges partitions, some entries in the collected
@@ -1462,60 +1510,16 @@ impl<F: FlushTarget> TableStore<F> {
         // before the memtable put (which consumes the row reference via move).
         if !self.indexed_columns.is_empty() {
             for (index_name, col_pos) in &self.indexed_columns {
-                // Partial (filtered) index gating: a Filtered index has a
-                // predicate on a *filter* column. Only writes whose filter-column
-                // cell satisfies the predicate belong in the index, matching the
-                // SSTable sidecar build. A row missing/tombstoning the filter
-                // column does not match. `evaluate_predicate` is shared with the
-                // build path so memtable and sidecar never disagree.
-                if let Some(predicate) = self.index_filter_predicates.get(index_name) {
-                    // Conjunction gating: a row belongs in the partial index only
-                    // when EVERY clause's column is present (live) and satisfies
-                    // its comparison. `evaluate_predicate_row` resolves each
-                    // clause's own column; it is the shared source of truth with
-                    // the sidecar build path, so memtable and sidecar never
-                    // disagree on which rows belong.
-                    let matches = ferrosa_index::evaluate_predicate_row(predicate, |col_pos| {
-                        row.cells
-                            .iter()
-                            .find(|(idx, _)| *idx as usize == col_pos)
-                            .and_then(|(_, c)| c.value.as_deref())
-                    });
-                    if !matches {
-                        continue;
-                    }
-                }
-
-                if let Some(cell) = row.cells.iter().find(|(idx, _)| *idx as usize == *col_pos) {
-                    if let Some(ref value) = cell.1.value {
-                        // Per-type key encoding: a phonetic index stores the
-                        // phonetic *code* (not the raw text) so it can be
-                        // point-looked-up by the query term's code at read time.
-                        // BTree/Hash/Composite use the raw bytes verbatim. A
-                        // value that encodes to nothing (e.g. non-UTF-8 text on a
-                        // phonetic index) yields no index entry.
-                        let index_type = self.index_type_for(index_name);
-                        match crate::index::scheduler::encode_index_key(index_type, value) {
-                            Ok(Some(index_key)) => {
-                                let row_pos = RowPosition {
-                                    partition_key: key.key.as_bytes().to_vec(),
-                                    clustering_key: row.clustering.clone(),
-                                };
-                                if let Some(idx) = guard.indexes.get(index_name) {
-                                    idx.insert(index_key, row_pos);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    index_name,
-                                    %e,
-                                    "store: skipping memtable index entry; key encoding failed"
-                                );
-                            }
-                        }
-                    }
-                    // If value is None (tombstone), skip — no index entry for deletions
+                if let Some(index) = guard.indexes.get(index_name) {
+                    insert_scalar_memtable_index_row(
+                        index,
+                        index_name,
+                        *col_pos,
+                        self.index_type_for(index_name),
+                        self.index_filter_predicates.get(index_name),
+                        key.key.as_bytes(),
+                        &row,
+                    );
                 }
             }
         }
@@ -5094,15 +5098,16 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Retrieve a named memtable-level secondary index.
     ///
-    /// Returns `None` if no index with the given name was declared at
-    /// Dynamically adds a secondary index. Future writes will be indexed.
+    /// Dynamically adds a secondary index. Existing live memtable rows are
+    /// backfilled before publication and future writes are indexed.
     pub fn add_index(&mut self, index_name: String, column_position: usize, index_type: IndexType) {
         self.add_index_with_predicate(index_name, column_position, index_type, None);
     }
 
     /// Dynamically adds a secondary index carrying an optional partial-index
-    /// [`FilterPredicate`]. Future writes will be indexed; for a Filtered index
-    /// the predicate gates which writes enter the memtable index.
+    /// [`FilterPredicate`]. Existing active/flushing memtable rows are streamed
+    /// into the new index before it is published, and future writes update it;
+    /// for a Filtered index the predicate gates both paths identically.
     pub fn add_index_with_predicate(
         &mut self,
         index_name: String,
@@ -5113,13 +5118,34 @@ impl<F: FlushTarget> TableStore<F> {
         self.indexed_columns
             .push((index_name.clone(), column_position));
         self.index_types.insert(index_name.clone(), index_type);
-        if let Some(pred) = filter_predicate {
+        if let Some(ref pred) = filter_predicate {
             self.index_filter_predicates
-                .insert(index_name.clone(), pred);
+                .insert(index_name.clone(), pred.clone());
         }
         let current = self.view.load();
+        let memtable_index = Arc::new(MemtableIndex::new());
+        let backfill = |memtable: &Arc<dyn Memtable>| {
+            for partition in memtable.range_iter(None, None) {
+                for row in partition.static_row.iter().chain(partition.rows.iter()) {
+                    insert_scalar_memtable_index_row(
+                        &memtable_index,
+                        &index_name,
+                        column_position,
+                        index_type,
+                        filter_predicate.as_ref(),
+                        partition.key.key.as_bytes(),
+                        row,
+                    );
+                }
+            }
+        };
+        backfill(&current.active);
+        if let Some(flushing) = current.flushing.as_ref() {
+            backfill(flushing);
+        }
+
         let mut new_indexes = (*current.indexes).clone();
-        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        new_indexes.insert(index_name, memtable_index);
         let new_view = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
@@ -6501,6 +6527,22 @@ mod tests {
             IndexType::Vector,
             "a vector index is no longer mis-stamped as BTree"
         );
+    }
+
+    /// CREATE INDEX must cover rows that are still in the active memtable.
+    /// Otherwise an index created after writes is registered but remains empty
+    /// until those rows are flushed and rebuilt into a sidecar.
+    #[test]
+    fn add_index_backfills_existing_active_memtable_rows() {
+        let mut store = test_store();
+        store
+            .write(&make_key("before-index"), make_row(b"match", 1000))
+            .unwrap();
+
+        store.add_index("val_idx".to_string(), 0, IndexType::BTree);
+
+        let rows = collect_index_results(&store, "val_idx", &IndexKey(b"match".to_vec())).unwrap();
+        assert_eq!(rows.len(), 1, "pre-existing memtable row must be indexed");
     }
 
     #[test]
