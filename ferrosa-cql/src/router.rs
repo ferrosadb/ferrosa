@@ -869,7 +869,10 @@ fn index_targets_a_materialized_column(
     // no family at all is left.
     let is_built = |col: &String| -> bool {
         table_meta.storage_column_index(col).is_some()
-            || table_meta.clustering_key.iter().any(|(name, _)| name == col)
+            || table_meta
+                .clustering_key
+                .iter()
+                .any(|(name, _)| name == col)
             || table_meta.partition_key.iter().any(|name| name == col)
     };
     let unmaterialized: Vec<&str> = meta
@@ -10303,9 +10306,7 @@ async fn route_create_index(
                         .tables
                         .get(&(ks.to_string(), s.table.clone()))
                         .and_then(|tbl| {
-                            tbl.partition_key
-                                .iter()
-                                .position(|name| name == target_col)
+                            tbl.partition_key.iter().position(|name| name == target_col)
                         });
                     match partition_component {
                         Some(component)
@@ -30038,7 +30039,6 @@ mod tests {
              graph.\n--- captured warnings ---\n{captured}"
         );
     }
-
 
     /// Belt: a `CREATE INDEX` that cannot be built must not report success.
     ///

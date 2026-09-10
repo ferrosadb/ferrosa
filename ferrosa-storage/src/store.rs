@@ -6208,7 +6208,11 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(&self.indexed_columns, &self.indexed_clustering_columns, &self.indexed_partition_key_columns),
+            indexes: new_indexes(
+                &self.indexed_columns,
+                &self.indexed_clustering_columns,
+                &self.indexed_partition_key_columns,
+            ),
             sidecar_indexes: Arc::new(vec![]),
             vector_indexes: new_vector_indexes(&self.vector_index_configs),
         };
@@ -11590,10 +11594,14 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(schema, InMemoryFlushTarget::new(), WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        });
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
 
         // Component 0 of the partition key is the tenant.
         store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
@@ -11622,14 +11630,17 @@ mod tests {
 
         let mut found = 0usize;
         store
-            .read_by_index_each("idx_by_tenant", &IndexKey(b"tenant-a".to_vec()), &mut |_| {
-                found += 1;
-                std::ops::ControlFlow::Continue(())
-            })
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
             .expect("a partition-key index must answer");
         assert_eq!(
-            found,
-            mine,
+            found, mine,
             "an index on a partition-key component must return every row for that \
              component; wrote {mine} for tenant-a and the index returned {found}"
         );
@@ -11660,10 +11671,14 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(schema, InMemoryFlushTarget::new(), WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        });
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
         store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
 
         let mut mine = 0usize;
@@ -11713,10 +11728,14 @@ mod tests {
 
         let mut found = 0usize;
         store
-            .read_by_index_each("idx_by_tenant", &IndexKey(b"tenant-a".to_vec()), &mut |_| {
-                found += 1;
-                std::ops::ControlFlow::Continue(())
-            })
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
             .expect("a partition-key index must answer after a flush");
         assert_eq!(
             found, mine,
@@ -11754,10 +11773,14 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(schema, InMemoryFlushTarget::new(), WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        });
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
         store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
 
         // Comfortably past 2 * MIN_PARTITIONS_PER_FLUSH_SHARD (512).
@@ -11785,10 +11808,14 @@ mod tests {
 
         let mut found = 0usize;
         store
-            .read_by_index_each("idx_by_tenant", &IndexKey(b"tenant-a".to_vec()), &mut |_| {
-                found += 1;
-                std::ops::ControlFlow::Continue(())
-            })
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
             .expect("a partition-key index must answer after a sharded-size flush");
         assert_eq!(
             found, mine,
@@ -11827,10 +11854,14 @@ mod tests {
             }],
             extensions: Default::default(),
         };
-        let mut store = TableStore::new(schema, InMemoryFlushTarget::new(), WriteOptions {
-            compression: None,
-            ..WriteOptions::default()
-        });
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
 
         // One index of each family that exists today.
         store.add_index("idx_regular".to_string(), 0, IndexType::BTree);
@@ -11844,7 +11875,11 @@ mod tests {
             .chain(store.indexed_partition_key_columns.iter())
             .map(|(name, _)| name.clone())
             .collect();
-        assert_eq!(declared.len(), 3, "the test must declare one of each family");
+        assert_eq!(
+            declared.len(),
+            3,
+            "the test must declare one of each family"
+        );
 
         store.flush().expect("flush must succeed");
 
@@ -11861,5 +11896,4 @@ mod tests {
              error on either path."
         );
     }
-
 }

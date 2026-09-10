@@ -4000,9 +4000,11 @@ impl StorageEngine {
         let state = tables.get_mut(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
-        state
-            .store
-            .add_partition_key_index(index_name.to_string(), partition_key_component, index_type);
+        state.store.add_partition_key_index(
+            index_name.to_string(),
+            partition_key_component,
+            index_type,
+        );
 
         // Backfill every SSTable that already exists, so an index created on a
         // table that already holds data covers that data.
@@ -4067,8 +4069,7 @@ impl StorageEngine {
                             &job,
                         )
                         .join(format!("{sst_id}-{built_index}.sidecar"));
-                        if let Err(e) =
-                            crate::index::sidecar::SidecarWriter::write(&path, entries)
+                        if let Err(e) = crate::index::sidecar::SidecarWriter::write(&path, entries)
                         {
                             tracing::error!(
                                 %e,

@@ -50,6 +50,7 @@ fn index_build_lifecycle() {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         })
         .expect("submit should succeed");
@@ -116,6 +117,7 @@ fn multiple_indexes_with_independent_staleness() {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         })
         .unwrap();

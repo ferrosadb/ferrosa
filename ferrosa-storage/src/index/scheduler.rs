@@ -401,28 +401,26 @@ impl IndexBuildBackend for LocalBackend {
                 // its component out of the composite clustering-key bytes
                 // (t_430c4188); a regular/static index reads the cell at the
                 // declared column position.
-                let value_owned: Option<Vec<u8>> = match (
-                    job.clustering_source,
-                    job.partition_key_source,
-                ) {
-                    (Some(src), _) => {
-                        ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
-                            .into_iter()
-                            .nth(src.component)
-                    }
-                    // A partition-key index: every row in this partition shares
-                    // the same value, decoded once from the key.
-                    (None, Some(src)) => {
-                        ferrosa_row_bridge::decode_pk(&partition.key, src.total)
-                            .into_iter()
-                            .nth(src.component)
-                    }
-                    (None, None) => row
-                        .cells
-                        .iter()
-                        .find(|(pos, _)| *pos == job.column_position as u16)
-                        .and_then(|(_, cell)| cell.value.clone()),
-                };
+                let value_owned: Option<Vec<u8>> =
+                    match (job.clustering_source, job.partition_key_source) {
+                        (Some(src), _) => {
+                            ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
+                                .into_iter()
+                                .nth(src.component)
+                        }
+                        // A partition-key index: every row in this partition shares
+                        // the same value, decoded once from the key.
+                        (None, Some(src)) => {
+                            ferrosa_row_bridge::decode_pk(&partition.key, src.total)
+                                .into_iter()
+                                .nth(src.component)
+                        }
+                        (None, None) => row
+                            .cells
+                            .iter()
+                            .find(|(pos, _)| *pos == job.column_position as u16)
+                            .and_then(|(_, cell)| cell.value.clone()),
+                    };
                 if let Some(ref value) = value_owned {
                     if let Some(key) = encode_index_key(job.index_type, value)? {
                         entries.push((
