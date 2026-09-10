@@ -33,7 +33,9 @@ env:
 jobs:
   driver-smoke:
     name: Driver Smoke (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Only the runner owner's PRs may execute code on organization runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'bkearns'
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
       packages: read

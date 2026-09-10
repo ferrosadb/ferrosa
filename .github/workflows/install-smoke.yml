@@ -38,11 +38,17 @@ jobs:
   # ── Compile ferrosa + stage the release tarball ONCE per OS ──────────────
   build:
     name: Build ferrosa tarball (${{ matrix.os }})
+    # Only the runner owner's PRs may execute code on organization runners.
+    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'bkearns'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]   # macos-14 == arm64, the platform #172 was reported on
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, Linux, X64]
+          - os: macos-14
+            runner: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -82,8 +88,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, Linux, X64]
+          - os: macos-14
+            runner: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -111,8 +121,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: [self-hosted, Linux, X64]
+          - os: macos-14
+            runner: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
