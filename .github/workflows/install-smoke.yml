@@ -108,7 +108,13 @@ jobs:
             *) echo "unsupported $(uname -s)/$(uname -m)"; exit 1 ;;
           esac
           cargo build --release --bin ferrosa --bin ferrosa-ctl
-          GITHUB_REF_NAME="$SMOKE_VERSION" bash .github/scripts/stage-release-tarball.sh "$TARGET" target/release
+          # Ask where cargo actually wrote them rather than assuming
+          # `target/release`: a `build.target` or `build.target-dir` in any
+          # cargo config on the runner moves the output, and hardcoding the
+          # path turns a successful build into "missing ferrosa binary".
+          BIN_DIR="$(bash .github/scripts/resolve-release-bin-dir.sh "$TARGET")"
+          echo "staging release binaries from $BIN_DIR"
+          GITHUB_REF_NAME="$SMOKE_VERSION" bash .github/scripts/stage-release-tarball.sh "$TARGET" "$BIN_DIR"
       - name: Upload ferrosa tarball
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
