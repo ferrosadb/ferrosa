@@ -1015,7 +1015,7 @@ async fn extend_rows_from_partition_stream(
 /// consumer-paced. `limit` is the query's own row limit; reaching it drops the
 /// stream immediately so the storage worker and remote replica can cancel
 /// instead of scanning the remaining postings.
-async fn collect_rows_from_partition_stream_with_limit(
+async fn collect_index_rows_with_limit(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
     row_context: PartitionRowContext<'_>,
     predicate_context: SelectPredicateContext<'_>,
@@ -5710,7 +5710,7 @@ async fn route_select_user_table(
                             .columns
                             .iter()
                             .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
-                    collect_rows_from_partition_stream_with_limit(
+                    collect_index_rows_with_limit(
                         index_stream,
                         row_context,
                         predicate_context,
@@ -5780,7 +5780,7 @@ async fn route_select_user_table(
                             .columns
                             .iter()
                             .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
-                    collect_rows_from_partition_stream_with_limit(
+                    collect_index_rows_with_limit(
                         index_stream,
                         row_context,
                         predicate_context,
