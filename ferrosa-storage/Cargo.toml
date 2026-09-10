@@ -112,3 +112,6 @@ hex = "0.4"
 proptest = "1"
 serial_test = "3"
 tempfile = "3"
+# Tests that assert on what WAS or WAS NOT logged: a degraded index and a
+# working one return the same rows, so the log line is the only difference.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
