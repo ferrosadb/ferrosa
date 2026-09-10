@@ -45,6 +45,21 @@ pub struct ClusteringComponentRef {
     pub total: usize,
 }
 
+/// Where a PARTITION-KEY column's value lives, for the index builder.
+///
+/// The partition-key twin of [`ClusteringComponentRef`], and it exists for the
+/// same reason: an index on a partition-key column cannot be built from
+/// `row.cells`, because the value is encoded in the partition key rather than
+/// stored as a cell. The builder needs the component's index and the table's
+/// total partition-key column count to split the composite encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PartitionKeyComponentRef {
+    /// Zero-based index of the component within the partition key.
+    pub component: usize,
+    /// Total number of partition-key columns in the table.
+    pub total: usize,
+}
+
 /// A job to build an index for a single SSTable.
 #[derive(Debug, Clone)]
 pub struct IndexBuildJob {
@@ -67,6 +82,11 @@ pub struct IndexBuildJob {
     /// of from the cell at `column_position` (which is ignored). `None` for
     /// regular/static-column indexes (t_430c4188).
     pub clustering_source: Option<ClusteringComponentRef>,
+    /// `Some` when the indexed column is a PARTITION-KEY column: the value is
+    /// extracted from the partition key at this component instead of from the
+    /// cell at `column_position` (which is ignored). Mutually exclusive with
+    /// `clustering_source` — a column cannot be in both halves of the key.
+    pub partition_key_source: Option<PartitionKeyComponentRef>,
     /// Partial-index predicate. `Some` only for [`IndexType::Filtered`] jobs:
     /// the build skips any row whose filter-column cell does not satisfy this
     /// predicate, so the sidecar holds only matching rows. `None` for every
@@ -175,7 +195,7 @@ fn sstable_component_path(data_dir: &Path, job: &IndexBuildJob, component: &str)
     table_flat
 }
 
-fn sidecar_output_dir(data_dir: &Path, job: &IndexBuildJob) -> PathBuf {
+pub(crate) fn sidecar_output_dir(data_dir: &Path, job: &IndexBuildJob) -> PathBuf {
     let gen = &job.sstable_id;
     let flat_data = data_dir.join(format!("{gen}-Data.db"));
     if flat_data.exists() {
@@ -381,16 +401,26 @@ impl IndexBuildBackend for LocalBackend {
                 // its component out of the composite clustering-key bytes
                 // (t_430c4188); a regular/static index reads the cell at the
                 // declared column position.
-                let value_owned: Option<Vec<u8>> = match job.clustering_source {
-                    Some(src) => ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
-                        .into_iter()
-                        .nth(src.component),
-                    None => row
-                        .cells
-                        .iter()
-                        .find(|(pos, _)| *pos == job.column_position as u16)
-                        .and_then(|(_, cell)| cell.value.clone()),
-                };
+                let value_owned: Option<Vec<u8>> =
+                    match (job.clustering_source, job.partition_key_source) {
+                        (Some(src), _) => {
+                            ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
+                                .into_iter()
+                                .nth(src.component)
+                        }
+                        // A partition-key index: every row in this partition shares
+                        // the same value, decoded once from the key.
+                        (None, Some(src)) => {
+                            ferrosa_row_bridge::decode_pk(&partition.key, src.total)
+                                .into_iter()
+                                .nth(src.component)
+                        }
+                        (None, None) => row
+                            .cells
+                            .iter()
+                            .find(|(pos, _)| *pos == job.column_position as u16)
+                            .and_then(|(_, cell)| cell.value.clone()),
+                    };
                 if let Some(ref value) = value_owned {
                     if let Some(key) = encode_index_key(job.index_type, value)? {
                         entries.push((
@@ -818,6 +848,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -873,6 +904,7 @@ mod tests {
                     enqueued_at: Instant::now(),
                     column_position: 0,
                     clustering_source: None,
+                    partition_key_source: None,
                     filter_predicate: None,
                 })
                 .unwrap();
@@ -945,6 +977,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
@@ -965,6 +998,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job);
@@ -1054,6 +1088,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job).unwrap();
@@ -1183,6 +1218,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: Some(FilterPredicate::single(1, FilterOp::Eq, b"active".to_vec())),
         };
         let result = backend.build(&job).unwrap();
@@ -1217,6 +1253,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 2,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         assert_eq!(job.column_position, 2);
@@ -1235,6 +1272,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         let result = backend.build(&job);
@@ -1285,6 +1323,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1324,6 +1363,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1381,6 +1421,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1425,6 +1466,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1495,6 +1537,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1549,6 +1592,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1667,6 +1711,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1738,6 +1783,7 @@ mod tests {
                 enqueued_at: Instant::now(),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             })
             .unwrap();
@@ -1775,6 +1821,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1819,6 +1866,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1844,6 +1892,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1870,6 +1919,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1913,6 +1963,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -1967,6 +2018,7 @@ mod tests {
                     enqueued_at: Instant::now(),
                     column_position: 0,
                     clustering_source: None,
+                    partition_key_source: None,
                     filter_predicate: None,
                 })
                 .unwrap();

@@ -1,0 +1,25 @@
+# The test-node image CI builds, for this machine's architecture.
+#
+# CI publishes ghcr.io/ferrosadb/ferrosa-test-node for linux/amd64 only. On an
+# arm64 Mac that image runs under QEMU and the engine segfaults on startup,
+# which silently invalidated every local reproduction attempted against it.
+# Same recipe as CI's "Package into a thin runtime image" step — Debian plus the
+# release binaries — built natively instead.
+FROM rust:1.98 AS builder
+# ferrosa-net compiles Cap'n Proto schemas in its build script and fails loudly
+# without the compiler, which is the right behaviour and worth not papering over.
+RUN apt-get update && apt-get install -y --no-install-recommends capnproto \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p ferrosa -p ferrosa-ctl
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates gdb procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/ferrosa /usr/local/bin/ferrosa
+COPY --from=builder /build/target/release/ferrosa-ctl /usr/local/bin/ferrosa-ctl
+EXPOSE 9042 7000 9090 7474 7687
+ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+CMD ["ferrosa"]

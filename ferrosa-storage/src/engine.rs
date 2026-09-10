@@ -796,6 +796,7 @@ fn eager_index_build_job(
     index_name: &str,
     column_position: usize,
     clustering_source: Option<crate::index::ClusteringComponentRef>,
+    partition_key_source: Option<crate::index::PartitionKeyComponentRef>,
 ) -> ferrosa_common::Result<crate::index::IndexBuildJob> {
     // A just-written SSTable's header matches the current schema, so the remap
     // is normally identity — but it must be RESOLVED, not assumed: an
@@ -804,9 +805,11 @@ fn eager_index_build_job(
     // index. Fail closed; the caller logs and leaves the SSTable
     // tracker-pending (queries then treat it as unindexed rather than
     // trusting a wrong index).
-    let source_column_position = match clustering_source {
-        Some(_) => column_position,
-        None => store
+    // A key-sourced index does not read a cell at all, so there is no ordinal
+    // to resolve and nothing to remap.
+    let source_column_position = match (clustering_source, partition_key_source) {
+        (Some(_), _) | (_, Some(_)) => column_position,
+        (None, None) => store
             .source_regular_ordinal_for_sstable(&sstable_id, column_position)?
             .ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!(
@@ -827,6 +830,7 @@ fn eager_index_build_job(
         enqueued_at: std::time::Instant::now(),
         column_position: source_column_position,
         clustering_source,
+        partition_key_source,
         filter_predicate: None,
     })
 }
@@ -3686,6 +3690,7 @@ impl StorageEngine {
                             enqueued_at: std::time::Instant::now(),
                             column_position,
                             clustering_source: None,
+                            partition_key_source: None,
                             filter_predicate: None,
                         };
                         if let Err(e) = scheduler.submit(job) {
@@ -3894,6 +3899,7 @@ impl StorageEngine {
                     enqueued_at: std::time::Instant::now(),
                     column_position: source_column_position,
                     clustering_source: None,
+                    partition_key_source: None,
                     filter_predicate: source_filter_predicate,
                 };
                 if let Err(e) = scheduler.submit(job) {
@@ -3961,10 +3967,160 @@ impl StorageEngine {
                         component: clustering_component,
                         total: ck_total,
                     }),
+                    partition_key_source: None,
                     filter_predicate: None,
                 };
                 if let Err(e) = scheduler.submit(job) {
                     tracing::error!(%e, "engine: failed to submit clustering index backfill");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Adds a secondary index on a PARTITION-KEY column.
+    ///
+    /// A partition-key value is encoded in the key rather than stored as a
+    /// cell, so the cell-based [`add_index`](Self::add_index) cannot see it —
+    /// the same reason [`add_clustering_index`](Self::add_clustering_index)
+    /// exists for the other half of the primary key. Writes extract the value
+    /// from the composite partition key at `partition_key_component`.
+    pub fn add_partition_key_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        partition_key_component: usize,
+        index_type: ferrosa_index::IndexType,
+    ) -> ferrosa_common::Result<()> {
+        self.index_tracker
+            .register_index(table_id.keyspace(), table_id.table(), index_name);
+
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+        state.store.add_partition_key_index(
+            index_name.to_string(),
+            partition_key_component,
+            index_type,
+        );
+
+        // Backfill every SSTable that already exists, so an index created on a
+        // table that already holds data covers that data.
+        //
+        // Without this, `CREATE INDEX` on a populated table produces an index
+        // over only the rows written after it — and because the planner selects
+        // this index, those reads would return a subset and report it as the
+        // whole answer. That is the exact silent-short-answer failure this line
+        // of work exists to remove, so the backfill is part of the fix rather
+        // than a follow-up to it.
+        //
+        // Mark each SSTable pending BEFORE submitting, so a consult that finds
+        // the index empty can only trust it once the backfill has completed.
+        let pk_total = state.store.partition_key_column_count();
+        let sstable_ids = state.store.sstable_generation_ids();
+        for sst_id in sstable_ids {
+            self.index_tracker.mark_pending(
+                table_id.keyspace(),
+                table_id.table(),
+                index_name,
+                &sst_id,
+                0,
+            );
+            let job = crate::index::IndexBuildJob {
+                sstable_id: sst_id.clone(),
+                index_name: index_name.to_string(),
+                index_type,
+                table: (
+                    table_id.keyspace().to_string(),
+                    table_id.table().to_string(),
+                ),
+                priority: crate::index::BuildPriority::Initial,
+                enqueued_at: std::time::Instant::now(),
+                column_position: partition_key_component,
+                clustering_source: None,
+                partition_key_source: Some(crate::index::PartitionKeyComponentRef {
+                    component: partition_key_component,
+                    total: pk_total,
+                }),
+                filter_predicate: None,
+            };
+
+            // Build it HERE rather than handing it to the scheduler.
+            //
+            // The scheduler's worker writes the sidecar file and marks the
+            // SSTable indexed, but nothing installs the result into the live
+            // view — so an asynchronous backfill becomes visible only after a
+            // restart, and until then reads consult an index that is complete
+            // on disk and empty in memory. Building synchronously means
+            // `CREATE INDEX` returns when the index is actually usable, which
+            // is also what a caller reasonably expects it to mean.
+            let backend = crate::index::LocalBackend::new(self.config.data_dir.clone());
+            match crate::index::IndexBuildBackend::build(&backend, &job) {
+                Ok(result) => {
+                    for (built_index, entries) in &result.sidecar_entries {
+                        if entries.is_empty() {
+                            continue;
+                        }
+                        // Persist, so the backfill survives a restart.
+                        let path = crate::index::scheduler::sidecar_output_dir(
+                            &self.config.data_dir,
+                            &job,
+                        )
+                        .join(format!("{sst_id}-{built_index}.sidecar"));
+                        if let Err(e) = crate::index::sidecar::SidecarWriter::write(&path, entries)
+                        {
+                            tracing::error!(
+                                %e,
+                                path = %path.display(),
+                                "engine: partition-key index backfill built but could NOT be \
+                                 written; it will be lost on restart"
+                            );
+                        }
+                        // And install, so it is usable now.
+                        match crate::index::sidecar::SidecarReader::open(&path) {
+                            Ok(reader) => {
+                                if !state.store.install_sidecar(&sst_id, built_index, reader) {
+                                    tracing::warn!(
+                                        index_name,
+                                        sstable = %sst_id,
+                                        "engine: backfilled sidecar not installed — the SSTable \
+                                         left the view while the build ran (likely compacted)"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::error!(
+                                %e,
+                                path = %path.display(),
+                                "engine: partition-key index backfill wrote a sidecar that \
+                                 cannot be reopened; this index is INCOMPLETE for that SSTable"
+                            ),
+                        }
+                    }
+                    self.index_tracker.mark_indexed(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        index_name,
+                        &sst_id,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        index_name,
+                        table = %table_id,
+                        sstable = %sst_id,
+                        "engine: partition-key index backfill FAILED; rows in this SSTable \
+                         are not in the index and reads through it will be incomplete"
+                    );
+                    self.index_tracker.mark_failed(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        index_name,
+                        e,
+                        std::time::Duration::from_secs(60),
+                    );
                 }
             }
         }
@@ -4634,8 +4790,14 @@ impl StorageEngine {
     /// Scans a table directory for sidecar files belonging to a given generation.
     ///
     /// Looks for files matching `{gen}-*.sidecar`. Each successfully opened
-    /// sidecar is added to the returned map keyed by index name. Files that
-    /// fail to open are silently skipped (degraded to full-scan on that index).
+    /// sidecar is added to the returned map keyed by index name.
+    ///
+    /// A sidecar that fails to open is EXCLUDED from the returned map and
+    /// logged. Excluding it is the correct outcome — reads then degrade to a
+    /// full scan and still return every row, which is slow and right rather
+    /// than fast and wrong — but it must never be quiet: an index that
+    /// silently stops existing looks exactly like a table that has no matching
+    /// rows. Every path out of this function that drops an index says so.
     fn load_sidecars_for_generation(
         table_dir: &std::path::Path,
         gen: u64,
@@ -4651,7 +4813,25 @@ impl StorageEngine {
             Self::generation_dir_path(table_dir, gen).unwrap_or_else(|| table_dir.to_path_buf());
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => return sidecars,
+            // Not "no sidecars" — "could not look". A table whose directory is
+            // unreadable (permissions, a racing rename, a failing disk) has
+            // every one of its indexes disappear here, and returning an empty
+            // map with no word turns that into reads that quietly scan, or
+            // report nothing, for as long as the condition lasts. A missing
+            // directory is the one ordinary case: a generation that has no
+            // sidecars never created one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return sidecars,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    gen,
+                    dir = %dir.display(),
+                    "storage-engine: cannot read table directory to load secondary \
+                     index sidecars; EVERY index on this generation is unavailable \
+                     and its reads will degrade to full scans"
+                );
+                return sidecars;
+            }
         };
 
         for entry in entries.flatten() {
@@ -7354,11 +7534,12 @@ impl StorageEngine {
             if let Some(ref scheduler) = self.index_scheduler {
                 let gen = state.store.last_flush_generation();
                 let ck_total = state.store.clustering_column_count();
+                let pk_total = state.store.partition_key_column_count();
                 let index_sources = state
                     .store
                     .indexed_columns()
                     .iter()
-                    .map(|(name, pos)| (name.clone(), *pos, None))
+                    .map(|(name, pos)| (name.clone(), *pos, None, None))
                     .chain(state.store.indexed_clustering_columns().iter().map(
                         |(name, component)| {
                             (
@@ -7368,11 +7549,26 @@ impl StorageEngine {
                                     component: *component,
                                     total: ck_total,
                                 }),
+                                None,
+                            )
+                        },
+                    ))
+                    .chain(state.store.indexed_partition_key_columns().iter().map(
+                        |(name, component)| {
+                            (
+                                name.clone(),
+                                *component,
+                                None,
+                                Some(crate::index::PartitionKeyComponentRef {
+                                    component: *component,
+                                    total: pk_total,
+                                }),
                             )
                         },
                     ))
                     .collect::<Vec<_>>();
-                for (index_name, col_pos, clustering_source) in index_sources {
+                for (index_name, col_pos, clustering_source, partition_key_source) in index_sources
+                {
                     let tracker_state = self.index_tracker.get_state(
                         table_id.keyspace(),
                         table_id.table(),
@@ -7396,6 +7592,7 @@ impl StorageEngine {
                                 &index_name,
                                 col_pos,
                                 clustering_source,
+                                partition_key_source,
                             ) {
                                 Ok(job) => {
                                     if let Err(e) = scheduler.submit(job) {
@@ -7668,6 +7865,7 @@ impl StorageEngine {
                                 index_name,
                                 *col_pos,
                                 None,
+                                None,
                             ) {
                                 Ok(job) => {
                                     if let Err(e) = scheduler.submit(job) {
@@ -7696,6 +7894,7 @@ impl StorageEngine {
                                     component: *component,
                                     total: ck_total,
                                 }),
+                                None,
                             ) {
                                 Ok(job) => {
                                     if let Err(e) = scheduler.submit(job) {
@@ -7705,6 +7904,35 @@ impl StorageEngine {
                                 Err(e) => tracing::error!(
                                     %e, %index_name,
                                     "compaction: cannot resolve clustering ordinal layout; output left tracker-pending"
+                                ),
+                            }
+                        }
+                        // Partition-key indexes, for the same reason: the
+                        // compacted output's sidecar is rebuilt from the
+                        // partition keys, or the index loses every entry
+                        // belonging to the data that was just compacted.
+                        let pk_total = state.store.partition_key_column_count();
+                        for (index_name, component) in state.store.indexed_partition_key_columns() {
+                            match eager_index_build_job(
+                                &state.store,
+                                table_id,
+                                output.id.clone(),
+                                index_name,
+                                *component,
+                                None,
+                                Some(crate::index::PartitionKeyComponentRef {
+                                    component: *component,
+                                    total: pk_total,
+                                }),
+                            ) {
+                                Ok(job) => {
+                                    if let Err(e) = scheduler.submit(job) {
+                                        tracing::error!(%e, %index_name, "compaction: failed to submit partition-key index rebuild");
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    %e, %index_name,
+                                    "compaction: cannot resolve partition-key layout; output left tracker-pending"
                                 ),
                             }
                         }
@@ -11825,6 +12053,7 @@ mod tests {
     /// size. Keep this below the bounded-read/materialization cap; full
     /// production-volume verification belongs on streaming/paged paths.
     #[test]
+    #[ignore = "slow (high-volume ingest driving repeated auto-flush); runs in the nightly --ignored job"]
     fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
@@ -11876,6 +12105,7 @@ mod tests {
 
     /// Concurrent writes + flush from separate thread.
     #[test]
+    #[ignore = "slow (many threads writing while flushes run); runs in the nightly --ignored job"]
     fn concurrent_write_and_flush_threads_preserve_all_rows() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig {
@@ -12816,6 +13046,182 @@ mod tests {
             "a resumed scan after reopen must return exactly the suffix from \
              the resume key (inclusive), in the same token order"
         );
+    }
+
+    /// Captures WARN-and-above tracing so a test can assert on what was logged.
+    ///
+    /// A degraded index and a working one return the same rows. The log line
+    /// is the only observable difference, so it is the only thing a test can
+    /// assert on to tell them apart.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A corrupt index must cost speed, not rows, and must never be quiet.
+    ///
+    /// This is the "or other issue" half of the contract: the clean path is
+    /// tested elsewhere by asserting NO "index NOT used" warning fires. That
+    /// assertion is only worth something if the warning can actually fire, so
+    /// this drives the failure for real — it writes NUL bytes over a flushed
+    /// sidecar and reloads the table from disk.
+    ///
+    /// Note that deleting the file would NOT test this. On Unix an unlinked
+    /// file stays readable through any descriptor already open on it, and the
+    /// sidecar is held in memory after a flush besides, so a live process
+    /// notices nothing either way. Corruption is only observable across the
+    /// reload, which is what this test does.
+    ///
+    /// Three things must all hold:
+    ///   1. the SSTable still loads — the DATA is intact, only the index died;
+    ///   2. the index is absent from the loaded map, so no read consults a
+    ///      corrupt structure and reports its garbage as an answer;
+    ///   3. something said so.
+    #[test]
+    fn a_corrupt_sidecar_drops_the_index_loudly_and_keeps_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "entity_store");
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "entity_store".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "body".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+            extensions: Default::default(),
+        };
+
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+            engine
+                .add_partition_key_index(&tid, "idx_by_tenant", 0, ferrosa_index::IndexType::BTree)
+                .expect("declaring a partition-key index must succeed");
+
+            for i in 0..8u8 {
+                let mut tenant = [0u8; 16];
+                tenant[0] = if i % 2 == 0 { 1 } else { 2 };
+                let mut session = [0u8; 16];
+                session[0] = i;
+                let pk = make_entity_store_pk(tenant, session);
+                let row = Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                };
+                engine.write(&tid, &pk, row, 1000).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+        }
+
+        // Find the sidecar the flush wrote. Its absence would mean the index
+        // was never built, which is a different bug and must not be reported
+        // as this one.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let sidecar = walk_files(&table_dir)
+            .into_iter()
+            .find(|p| p.to_string_lossy().ends_with(".sidecar"))
+            .expect(
+                "the flush must write a sidecar for the partition-key index; \
+                 without one there is no index to corrupt and this test proves nothing",
+            );
+
+        // Write NULs over it, in place. In-place is what matters: it is the
+        // bytes that must change, not the directory entry.
+        let len = std::fs::metadata(&sidecar).unwrap().len() as usize;
+        assert!(len > 0, "a zero-length sidecar is not a corruption test");
+        std::fs::write(&sidecar, vec![0u8; len]).unwrap();
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let (descriptors, sidecars, ids) = tracing::subscriber::with_default(subscriber, || {
+            let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+                Arc::new(crate::reader_pool::ReaderPool::new(8));
+            StorageEngine::load_existing_sstables_and_sidecars(&table_dir, &pool, "corrupt-sidecar")
+        });
+
+        assert!(
+            !ids.is_empty() && !descriptors.is_empty(),
+            "the DATA must survive: a corrupt index is not a corrupt table, and \
+             dropping the rows because their index broke would turn a slow read \
+             into a wrong one"
+        );
+
+        let still_loaded: Vec<&String> = sidecars
+            .iter()
+            .flat_map(|m| m.keys())
+            .filter(|name| name.as_str() == "idx_by_tenant")
+            .collect();
+        assert!(
+            still_loaded.is_empty(),
+            "a sidecar of NUL bytes must not be admitted as an index. Admitting \
+             it means reads consult a structure whose contents are garbage and \
+             report what it returns as a complete answer."
+        );
+
+        let captured = logs.text();
+        assert!(
+            captured.contains("corrupt sidecar"),
+            "dropping an index must be logged. An index that silently stops \
+             existing is indistinguishable from a table with no matching rows — \
+             which is exactly how this class of bug stays invisible.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// Recursively list every file under `root`.
+    fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![];
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// Helper: build CompositeType PK for entity_store.
@@ -16571,6 +16977,7 @@ mod tests {
     /// Uses the identical code path as the fast 100-row variant; only the row
     /// count differs.
     #[test]
+    #[ignore = "slow (2k-mutation commit-log replay with a 256-byte segment size); runs in the nightly --ignored job"]
     fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17053,6 +17460,102 @@ mod tests {
             .unwrap();
         assert_eq!(keyed9.len(), 1, "memtable-resident clustering entry found");
         assert_eq!(keyed9[0].rows[0].clustering, 9_i32.to_be_bytes().to_vec());
+    }
+
+    /// An index created on a table that ALREADY holds data must cover that
+    /// data.
+    ///
+    /// This is the order that matters operationally: a table has been running
+    /// for weeks, reads are slow, somebody adds an index. If the index only
+    /// covers rows written after it was declared, the reads through it return
+    /// a subset — and because the planner selects the index, that subset is
+    /// reported as the complete answer. Silent, and worse than no index.
+    ///
+    /// So the data is written and FLUSHED to an SSTable before the index
+    /// exists. Nothing in the memtable can satisfy this test.
+    #[test]
+    fn a_partition_key_index_backfills_data_that_predates_it() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = TableId::new("test_ks", "entity_store");
+
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "entity_store".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "body".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+            extensions: Default::default(),
+        };
+        engine.register_table(schema).unwrap();
+
+        // Phase 1: data first, index later. The flush is what makes this a
+        // backfill test rather than a memtable test.
+        let mut tenant_a_rows = 0usize;
+        for i in 0..8u8 {
+            let mut tenant = [0u8; 16];
+            tenant[0] = if i % 2 == 0 { 1 } else { 2 };
+            if i % 2 == 0 {
+                tenant_a_rows += 1;
+            }
+            let mut session = [0u8; 16];
+            session[0] = i;
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine
+                .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        // Phase 2: NOW declare the index.
+        engine
+            .add_partition_key_index(&tid, "idx_by_tenant", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        let mut tenant_a = [0u8; 16];
+        tenant_a[0] = 1;
+        let key = IndexKey(tenant_a.to_vec());
+
+        // The backfill runs on the scheduler's worker threads. Poll for it,
+        // bounded — a backfill that never completes must fail this test rather
+        // than hang it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut found = 0usize;
+        while std::time::Instant::now() < deadline {
+            found = collect_index_results(&engine, &tid, "idx_by_tenant", &key)
+                .unwrap()
+                .iter()
+                .map(|p| p.rows.len())
+                .sum();
+            if found >= tenant_a_rows {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert_eq!(
+            found, tenant_a_rows,
+            "an index declared on a table that already holds flushed data must \
+             backfill it: {tenant_a_rows} rows for this tenant were written and \
+             flushed BEFORE the index existed, and the index returned {found}. \
+             Zero means no backfill was submitted; a partial count means it was \
+             submitted and did not finish."
+        );
     }
 
     /// Geo schema: a `places` table whose `location` column is a
@@ -20251,6 +20754,7 @@ mod tests {
             "val_phonetic_idx",
             0,
             None,
+            None,
         )
         .expect("eager job must resolve for a readable in-view SSTable");
         assert_eq!(
@@ -20270,6 +20774,7 @@ mod tests {
             sstable_id.clone(),
             "unknown_idx",
             0,
+            None,
             None,
         )
         .expect("eager job must resolve for a readable in-view SSTable");

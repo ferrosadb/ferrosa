@@ -88,6 +88,6 @@ pub use artifact_manifest::{
 pub use remote_backend::{IndexBackendConfig, RemoteBackend, S3PathResolver};
 pub use scheduler::{
     BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob, IndexBuildResult,
-    IndexBuildScheduler, LocalBackend,
+    IndexBuildScheduler, LocalBackend, PartitionKeyComponentRef,
 };
 pub use tracker::{IndexState, IndexStateTracker, IndexStatus};

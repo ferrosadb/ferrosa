@@ -75,6 +75,7 @@ impl EagerIndexBuilder {
                 enqueued_at: std::time::Instant::now(),
                 column_position: *col_pos,
                 clustering_source: None,
+                partition_key_source: None,
                 filter_predicate: None,
             };
             if self.scheduler.submit(job).is_ok() {

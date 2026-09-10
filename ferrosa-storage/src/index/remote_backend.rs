@@ -372,6 +372,13 @@ fn build_request_body(job: &IndexBuildJob, resolver: &S3PathResolver) -> serde_j
         body["clustering_source"] = serde_json::to_value(src)
             .expect("ClusteringComponentRef serializes to JSON (usize fields)");
     }
+    // Without this the remote worker receives a partition-key job with no
+    // source, looks for the value in a cell that does not exist, and returns a
+    // successfully-built empty index.
+    if let Some(src) = &job.partition_key_source {
+        body["partition_key_source"] = serde_json::to_value(src)
+            .expect("PartitionKeyComponentRef serializes to JSON (usize fields)");
+    }
 
     body
 }
@@ -546,6 +553,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         }
     }
@@ -613,6 +621,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: Some(predicate.clone()),
         };
 
@@ -645,6 +654,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 1,
             clustering_source: Some(source),
+            partition_key_source: None,
             filter_predicate: None,
         };
 
@@ -674,6 +684,7 @@ mod tests {
             enqueued_at: Instant::now(),
             column_position: 0,
             clustering_source: None,
+            partition_key_source: None,
             filter_predicate: None,
         };
         let body = build_request_body(&job, &resolver);

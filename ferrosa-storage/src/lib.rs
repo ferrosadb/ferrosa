@@ -40,6 +40,7 @@ pub mod schema_snapshot;
 pub mod self_heal;
 pub mod snapshot;
 pub mod spill_budget;
+pub mod spilling_dedup;
 pub(crate) mod sstable_health;
 pub mod store;
 pub mod subscription_observer;

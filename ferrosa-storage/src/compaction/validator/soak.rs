@@ -96,6 +96,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "slow (compaction soak across many seeds); runs in the nightly --ignored job"]
     fn soak_stays_clean_across_many_seeds() {
         let tmp = tempfile::tempdir().unwrap();
         let report = run(tmp.path(), 1, 48).expect("soak must stay clean");

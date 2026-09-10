@@ -832,6 +832,75 @@ fn keyed_index_consult(
     }
 }
 
+/// Can this index actually answer a query, or does it only exist in schema?
+///
+/// Secondary indexes are addressed by a STORAGE COLUMN INDEX, and that index
+/// space covers static and regular cells only — `storage_column_index` returns
+/// `None` for a partition-key or clustering column, because those values live
+/// in the encoded key rather than in a cell. `CREATE INDEX` on such a column
+/// is accepted, records schema, and builds nothing: no sidecar is ever written.
+///
+/// A planner that then SELECTS that index sends the read to something empty,
+/// and an empty index is reported as an empty table. That is how
+/// `agent_memory.entity_store`, which is
+/// `PRIMARY KEY ((tenant_id, session_id), entity_id)` with
+/// `CREATE INDEX idx_entity_by_tenant ON entity_store (tenant_id)`, returned
+/// zero entities for a tenant whose rows were all readable by primary key
+/// (2026-09-10).
+///
+/// Until such indexes are genuinely built, they must not be chosen. The query
+/// falls back to the scan its `ALLOW FILTERING` already licenses, which is
+/// slower and correct rather than fast and wrong.
+fn index_targets_a_materialized_column(
+    meta: &IndexMetadata,
+    table_meta: &ferrosa_schema::metadata::TableMetadata,
+) -> bool {
+    // Three families of index are genuinely built today, and a column served
+    // by any of them is safe to select:
+    //
+    //   * a regular or static column, indexed by its storage cell position;
+    //   * a CLUSTERING column, decoded from the clustering-key bytes;
+    //   * a PARTITION-KEY column, decoded from the partition-key bytes.
+    //
+    // The last two are not cells, so `storage_column_index` has no ordinal for
+    // them and this check used to reject both. Rejecting them was right while
+    // nothing built them. Both are built now, so a column that names a
+    // component of either key is materialized, and only a column belonging to
+    // no family at all is left.
+    let is_built = |col: &String| -> bool {
+        table_meta.storage_column_index(col).is_some()
+            || table_meta
+                .clustering_key
+                .iter()
+                .any(|(name, _)| name == col)
+            || table_meta.partition_key.iter().any(|name| name == col)
+    };
+    let unmaterialized: Vec<&str> = meta
+        .target_columns
+        .iter()
+        .filter(|col| !is_built(col))
+        .map(String::as_str)
+        .collect();
+    if unmaterialized.is_empty() {
+        return true;
+    }
+    // Say it. Skipping the index silently trades a wrong answer for a slow one
+    // and tells nobody: the query still works, it just scans the table, and the
+    // first sign is a latency graph rather than a log line. An operator who
+    // created an index is entitled to know it is not being used and why.
+    tracing::warn!(
+        index = %meta.name,
+        table = %table_meta.name,
+        columns = ?unmaterialized,
+        "index NOT used: it targets columns that belong to no index family this \
+         table builds — not a stored cell, not a clustering component, and not a \
+         partition-key component — so no index was ever built for it. The query \
+         falls back to a full scan. Drop the index or restructure the query — it is \
+         costing schema noise and no speed."
+    );
+    false
+}
+
 /// Whether an index can serve an ordinary scalar `column = value` lookup.
 ///
 /// Full-text, vector, and geo indexes have dedicated query operators and do
@@ -4844,16 +4913,15 @@ async fn route_select_user_table(
     validate_tuple_where_clauses(&s.where_clauses, table_meta)?;
     let table_strategy = keyspace_strategy(&state.schema, ks);
 
-    // ALLOW FILTERING: permit full-table scans with post-filter when the
-    // client explicitly opts in.  Log a warning so operators can identify
-    // expensive queries, but do not reject.
-    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
-        tracing::warn!(
-            keyspace = ks,
-            table = %s.table,
-            "executing query with ALLOW FILTERING — full table scan with post-filter"
-        );
-    }
+    // ALLOW FILTERING is permitted, never rejected. The warning that used to
+    // live here fired on the FLAG, before the planner had chosen anything, so
+    // it appeared identically whether the query was served by an index or by
+    // scanning the table. Every read the memory server issues carries the
+    // flag, so the line was on every read and distinguished nothing — the one
+    // question an operator asks of it ("is my index being used?") could not be
+    // answered, and a warning that is always present is one people learn to
+    // ignore. It now fires where the access path is actually known: see the
+    // `ScanPlan::FullScan` arm below.
 
     // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
     if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
@@ -5418,6 +5486,7 @@ async fn route_select_user_table(
             .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
             .map(|(_, meta)| meta)
             .filter(|meta| scalar_equality_index_is_usable(meta))
+            .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
             .filter(|meta| {
                 filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
             })
@@ -5442,6 +5511,27 @@ async fn route_select_user_table(
             &planner_indexes,
             &filtered_covered_columns,
         );
+
+        // Report the access path once, now that it is decided.
+        //
+        // A scan is the expensive case and the one worth a WARN; every other
+        // plan names the index serving it, at DEBUG, so "is my index being
+        // used?" has an affirmative answer in the log rather than only the
+        // absence of a complaint.
+        if matches!(scan_plan, ScanPlan::FullScan) {
+            tracing::warn!(
+                keyspace = ks,
+                table = %s.table,
+                "executing query with ALLOW FILTERING — full table scan with post-filter"
+            );
+        } else {
+            tracing::debug!(
+                keyspace = ks,
+                table = %s.table,
+                plan = %scan_plan,
+                "read served without a full scan"
+            );
+        }
 
         // ── Vector ANN index consult ──────────────────────────────────────
         //
@@ -7085,6 +7175,12 @@ fn route_explain(
         // executed query would never choose (e.g. PartitionIndexLookup on a
         // full-text index when a phonetic index shares the column).
         .filter(|(_, meta)| scalar_equality_index_is_usable(meta))
+        // And the same materialization gating. Without it EXPLAIN offers the
+        // planner an index the SELECT path refuses, and reports an index plan
+        // for a query the executor would scan — which is precisely backwards
+        // for the tool an operator reaches for to answer "is my index being
+        // used?".
+        .filter(|(_, meta)| index_targets_a_materialized_column(meta, table_meta))
         .filter(|(_, meta)| {
             filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
         })
@@ -10198,14 +10294,68 @@ async fn route_create_index(
                     );
                 }
                 None => {
-                    tracing::warn!(
-                        index_name,
-                        target_col,
-                        table = %format!("{ks}.{}", s.table),
-                        "router: CREATE INDEX target is a partition-key or unknown \
-                         column — index registered in schema but NOT wired to storage \
-                         (reads on it will scan)"
-                    );
+                    // Not a cell and not a clustering component: the last
+                    // possibility is a PARTITION-KEY column, whose value lives
+                    // in the partition key bytes. This is the case that
+                    // produced the bug this path exists to close — a
+                    // `CREATE INDEX` on a partition-key column was accepted,
+                    // recorded in schema, and wired to nothing, so the planner
+                    // offered an index that was permanently empty and reported
+                    // its zero rows as a complete answer.
+                    let partition_component = snap
+                        .tables
+                        .get(&(ks.to_string(), s.table.clone()))
+                        .and_then(|tbl| {
+                            tbl.partition_key.iter().position(|name| name == target_col)
+                        });
+                    match partition_component {
+                        Some(component)
+                            if matches!(
+                                index_type,
+                                IndexType::BTree
+                                    | IndexType::Hash
+                                    | IndexType::Composite
+                                    | IndexType::Phonetic
+                            ) =>
+                        {
+                            if let Err(e) = state.engine.add_partition_key_index(
+                                &table_id,
+                                &index_name,
+                                component,
+                                index_type,
+                            ) {
+                                tracing::warn!(
+                                    %e,
+                                    index_name,
+                                    table = %format!("{ks}.{}", s.table),
+                                    "router: CREATE INDEX failed to wire \
+                                     partition-key index to storage engine"
+                                );
+                            }
+                        }
+                        Some(_) => {
+                            tracing::warn!(
+                                index_name,
+                                target_col,
+                                ?index_type,
+                                table = %format!("{ks}.{}", s.table),
+                                "router: CREATE INDEX on a partition-key column \
+                                 supports scalar index kinds only — index registered \
+                                 in schema but NOT wired to storage (reads on it \
+                                 will scan)"
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                index_name,
+                                target_col,
+                                table = %format!("{ks}.{}", s.table),
+                                "router: CREATE INDEX target is an unknown column — \
+                                 index registered in schema but NOT wired to storage \
+                                 (reads on it will scan)"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -11669,18 +11819,48 @@ fn evaluate_where_predicates(
             }
             return Ok(false);
         }
+        // "I cannot evaluate this predicate" is NOT "this row does not match".
+        //
+        // All four of these used to return `Ok(false)`, so a row was silently
+        // dropped whenever the filter could not be applied to it — and a query
+        // whose predicate column was absent from the projected row returned
+        // ZERO rows over a table full of matching data, with nothing logged and
+        // no error raised. That is `WHERE tenant_id = ? ALLOW FILTERING`
+        // returning nothing while every row is readable by primary key.
+        //
+        // A genuine SQL NULL still does not match, which is the one case below
+        // that legitimately answers `false`.
         let col_idx = match all_col_names.iter().position(|n| n == &wc.column) {
             Some(i) => i,
-            None => return Ok(false),
+            None => {
+                return Err(CqlError::ServerError(format!(
+                    "cannot filter on '{}': the read did not materialise that column, so \
+                     the predicate cannot be evaluated. Returning no rows here would \
+                     report unfiltered data as absent data.",
+                    wc.column
+                )));
+            }
         };
         let col_meta = match table_meta.columns.get(&wc.column) {
             Some(m) => m,
-            None => return Ok(false),
+            None => {
+                return Err(CqlError::Invalid(format!(
+                    "unknown column '{}' in WHERE clause",
+                    wc.column
+                )));
+            }
         };
         let cql_type = match resolve_col_type(&col_meta.column_type, ks, &state.schema) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => {
+                return Err(CqlError::ServerError(format!(
+                    "cannot filter on '{}': its type {:?} did not resolve: {e}",
+                    wc.column, col_meta.column_type
+                )));
+            }
         };
+        // A NULL value genuinely does not match a comparison. This one is a
+        // real answer, not a swallowed failure.
         let actual = match &row[col_idx] {
             Some(v) => v,
             None => return Ok(false),
@@ -20007,6 +20187,7 @@ mod tests {
     /// `range_read_limited_rows` clamped the scan to 10_000, silently capping a
     /// large user LIMIT below what the client asked for.
     #[tokio::test]
+    #[ignore = "slow (materializes more than 10k rows); runs in the nightly --ignored job"]
     async fn user_limit_above_10k_returns_all_requested_rows() {
         let n = (ferrosa_cluster::write_path::DEFAULT_RANGE_READ_LIMIT as i64) + 500;
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
@@ -28155,6 +28336,7 @@ mod tests {
     /// 3 strictly-advancing pages whose union is the exact row set, and
     /// has_more must go false.
     #[tokio::test]
+    #[ignore = "slow (wide partition paged to exhaustion); runs in the nightly --ignored job"]
     async fn wide_partition_spanning_pages_terminates_exactly() {
         let rows_per: i64 = 15_000;
         let page_size: i32 = 5_000;
@@ -28306,6 +28488,7 @@ mod tests {
     /// backed then SSTable-backed then MIXED (flushed base + memtable
     /// updates), asserting the exact union each time.
     #[tokio::test]
+    #[ignore = "slow (wide partition paged to exhaustion after a flush); runs in the nightly --ignored job"]
     async fn wide_partition_multi_text_clustering_pages_exactly_after_flush() {
         let (state, _dir) = setup();
         let auth = dev_auth();
@@ -28992,6 +29175,1123 @@ mod tests {
         assert!(
             matches!(&err, CqlError::Invalid(message) if message.contains("declared clustering-key order")),
             "invalid tuple order must fail before reading an empty partition: {err}"
+        );
+    }
+
+    /// A secondary-index read must return EVERY matching row, however many
+    /// there are.
+    ///
+    /// This is the shape ferrosa-memory reads its entities with:
+    ///
+    /// ```sql
+    /// SELECT ... FROM agent_memory.entity_store WHERE tenant_id = ? ALLOW FILTERING
+    /// ```
+    ///
+    /// `entity_store` carries `CREATE INDEX idx_entity_by_tenant ON
+    /// entity_store (tenant_id)`, so despite the `ALLOW FILTERING` this goes
+    /// through the global secondary-index path, not a full scan.
+    ///
+    /// On 2026-09-10 four ferrosa-memory live tests began failing the moment
+    /// this engine changed, each of them writing entities and reading back
+    /// none: `viz entity stream must yield the seeded entities ...; saw 0 ids`.
+    /// They pass against a nearly empty table and fail against a cluster with a
+    /// hundred tests' worth of accumulated rows, which is what a streaming
+    /// index read that loses rows past a chunk boundary would look like.
+    ///
+    /// So the row count here is deliberately over `DEFAULT_STREAM_CHUNK_ROW_CAP`
+    /// (4096) and the two tenants interleave, so the index's posting list is
+    /// mixed rather than one contiguous run.
+    #[tokio::test]
+    async fn an_indexed_read_returns_every_row_past_the_stream_chunk_boundary() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE idx_scale WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_scale.entity_store (entity_id uuid PRIMARY KEY, tenant_id uuid, body text)",
+            "CREATE INDEX idx_entity_by_tenant ON idx_scale.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Comfortably past one chunk, and not a round multiple of it: an
+        // off-by-one at the boundary should show as a short count, not a
+        // clean division.
+        const MINE: usize = 5_000;
+        const THEIRS: usize = 1_500;
+        let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+        let tenant_b = "bbbb0000-0000-4000-8000-0000000000b2";
+
+        let mut written = 0usize;
+        for i in 0..(MINE + THEIRS) {
+            // Interleaved, so neither tenant's postings are one contiguous run.
+            let (tenant, mine) = if i % 4 == 3 {
+                (tenant_b, false)
+            } else {
+                (tenant_a, true)
+            };
+            if mine {
+                written += 1;
+            }
+            let entity = format!("20000000-0000-4000-8000-{i:012}");
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO idx_scale.entity_store (entity_id, tenant_id, body) \
+                     VALUES ({entity}, {tenant}, 'row-{i}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let scan = crate::parser::parse(&format!(
+            "SELECT entity_id, tenant_id FROM idx_scale.entity_store \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let rows = match route(&state, &ctx, scan).await.unwrap() {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected a row result from the indexed scan"),
+        };
+        assert_eq!(
+            rows as usize, written,
+            "an indexed read must return every matching row; wrote {written} for this \
+             tenant and read back {rows}"
+        );
+
+        // And the count must agree with the rows. A COUNT that streams and a
+        // SELECT that streams disagreeing is the same defect wearing a
+        // different hat.
+        let count = crate::parser::parse(&format!(
+            "SELECT COUNT(*) FROM idx_scale.entity_store \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+        let counted = match route(&state, &ctx, count).await.unwrap() {
+            RouteResult::Result(b) => extract_first_bigint_value(&b),
+            _ => panic!("expected a count result from the indexed read"),
+        };
+        assert_eq!(
+            counted as usize, written,
+            "COUNT over an indexed read must agree with the rows it returns"
+        );
+    }
+
+    /// An index on a partition-key column must actually index.
+    ///
+    /// `agent_memory.entity_store` is `PRIMARY KEY ((tenant_id, session_id),
+    /// entity_id)` and carries `CREATE INDEX idx_entity_by_tenant ON
+    /// entity_store (tenant_id)`. Every memory read is
+    /// `WHERE tenant_id = ? ALLOW FILTERING`, which restricts only the FIRST
+    /// component of a composite partition key — the case that needs either an
+    /// index or a scan.
+    ///
+    /// Today the index is accepted and never built: `storage_column_index`
+    /// returns `None` for a partition-key column because the index space covers
+    /// only static and regular CELLS, and a partition-key value is encoded in
+    /// the key rather than stored as a cell. `CREATE INDEX` then returns
+    /// success, the schema records an index, no sidecar is ever written, and
+    /// the read consults an empty index and reports zero rows as an answer.
+    ///
+    /// That is how a live tenant's entities became invisible on 2026-09-10
+    /// while every row remained readable by primary key.
+    ///
+    /// The value IS available — it is in every partition key — so this is a
+    /// build the indexer can do by decoding keys instead of reading cells.
+    #[tokio::test]
+    async fn an_index_on_a_partition_key_column_returns_its_rows() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE pk_idx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            // The real shape: tenant_id is the FIRST of two partition-key
+            // components, so a query on it alone restricts a prefix.
+            "CREATE TABLE pk_idx.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX idx_entity_by_tenant ON pk_idx.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+        let tenant_b = "bbbb0000-0000-4000-8000-0000000000b2";
+        let mut mine = 0usize;
+        for i in 0..12 {
+            // Distinct sessions, as the memory server writes them: the rows
+            // land in different partitions under the same tenant.
+            let tenant = if i % 3 == 2 { tenant_b } else { tenant_a };
+            if tenant == tenant_a {
+                mine += 1;
+            }
+            let session = format!("10000000-0000-4000-8000-{i:012}");
+            let entity = format!("20000000-0000-4000-8000-{i:012}");
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO pk_idx.entity_store (tenant_id, session_id, entity_id, body) \
+                     VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = match route(
+            &state,
+            &ctx,
+            crate::parser::parse(&format!(
+                "SELECT entity_id FROM pk_idx.entity_store \
+                 WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected rows from the indexed read"),
+        };
+
+        assert_eq!(
+            rows as usize, mine,
+            "a query restricting the first component of a composite partition key must \
+             return every matching row; wrote {mine} and read back {rows}"
+        );
+    }
+
+    /// Captures WARN-and-above tracing output so a test can assert on what was
+    /// NOT logged.
+    ///
+    /// Asserting the absence of a log line is the only way to tell a read that
+    /// used an index from one that quietly fell back to a scan: both return
+    /// the same rows, and only the warning distinguishes them. A test that
+    /// checks rows alone passes just as happily on the slow, wrong-for-the-
+    /// wrong-reason path.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// End to end, on the clean path: create the index, insert, read it back.
+    ///
+    /// This is the whole chain the outage ran through —
+    /// `CREATE INDEX ... ON entity_store (tenant_id)` where `tenant_id` is a
+    /// component of `PRIMARY KEY ((tenant_id, session_id), entity_id)` — and
+    /// it asserts BOTH halves of what "working" means:
+    ///
+    ///   1. every written row comes back, and
+    ///   2. nothing logged "index NOT used".
+    ///
+    /// The second is the half that matters. Before the partition-key index was
+    /// built, the planner skipped the index and the query fell back to a scan
+    /// that returned exactly the same rows. Row counts alone cannot tell a
+    /// working index from a fallback, so a test asserting only rows would have
+    /// gone green over the bug. This one goes red unless the read is genuinely
+    /// served by the index.
+    ///
+    /// Deliberately NOT tokio::test: the runtime is built inside the
+    /// subscriber scope so every task polls under the capturing subscriber. A
+    /// thread-local default set outside an already-running runtime would miss
+    /// anything logged from another thread.
+    #[test]
+    fn a_partition_key_index_serves_reads_without_reporting_a_missing_index() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let (rows, mine) = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE pk_e2e WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    "CREATE TABLE pk_e2e.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                    "CREATE INDEX idx_entity_by_tenant ON pk_e2e.entity_store (tenant_id)",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                let tenant_b = "bbbb0000-0000-4000-8000-0000000000b2";
+                let mut mine = 0usize;
+                for i in 0..12 {
+                    let tenant = if i % 3 == 2 { tenant_b } else { tenant_a };
+                    if tenant == tenant_a {
+                        mine += 1;
+                    }
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO pk_e2e.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let rows = match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(&format!(
+                        "SELECT entity_id FROM pk_e2e.entity_store \
+                         WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the indexed read"),
+                };
+                (rows as usize, mine)
+            })
+        });
+
+        assert_eq!(
+            rows, mine,
+            "the indexed read must return every row written for the tenant; \
+             wrote {mine} and read back {rows}"
+        );
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("index NOT used"),
+            "the read must be served by the index on the clean path, with no \
+             \"index NOT used\" warning. A fallback scan returns the same rows, so \
+             this warning is the only thing that distinguishes a working index \
+             from a silent scan.\n--- captured warnings ---\n{captured}"
+        );
+        assert!(
+            !captured.contains("NOT wired to storage"),
+            "CREATE INDEX on a partition-key column must wire the index to the \
+             storage engine, not merely record it in schema.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// `CREATE INDEX` on a table that already has rows must find those rows.
+    ///
+    /// The other end-to-end test creates the index before inserting, which is
+    /// the order a fresh schema uses. This is the order an operator uses: the
+    /// table has been running, reads are slow, someone adds an index. If the
+    /// index covered only rows written after it, this query would return a
+    /// subset of the tenant's rows and report it as the whole answer — and
+    /// because the planner selects the index, nothing would say otherwise.
+    #[test]
+    fn an_index_created_after_the_data_still_returns_all_of_it() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let (rows, mine) = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE pk_after WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    "CREATE TABLE pk_after.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                let tenant_b = "bbbb0000-0000-4000-8000-0000000000b2";
+                let mut mine = 0usize;
+                for i in 0..12 {
+                    let tenant = if i % 3 == 2 { tenant_b } else { tenant_a };
+                    if tenant == tenant_a {
+                        mine += 1;
+                    }
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO pk_after.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                // Flush first: rows sitting in the memtable would be found by
+                // any index, so they cannot demonstrate a backfill. These have
+                // to be in an SSTable before the index is declared.
+                let table_id = TableId::new("pk_after", "entity_store");
+                state.engine.flush(&table_id).expect("flush");
+
+                // NOW create the index, over data that already exists.
+                route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(
+                        "CREATE INDEX idx_entity_by_tenant ON pk_after.entity_store (tenant_id)",
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+                let rows = match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(&format!(
+                        "SELECT entity_id FROM pk_after.entity_store \
+                         WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the indexed read"),
+                };
+                (rows as usize, mine)
+            })
+        });
+
+        assert_eq!(
+            rows, mine,
+            "an index created over existing data must return all {mine} of the \
+             tenant's rows, not {rows}. A short count here means CREATE INDEX \
+             backfilled nothing and the planner is serving reads from an index \
+             that covers only part of the table."
+        );
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("index NOT used"),
+            "the read must be served by the index.\n--- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// An indexed read must NOT be reported as a full table scan.
+    ///
+    /// Every read the memory server issues carries `ALLOW FILTERING`, and the
+    /// warning used to fire on the flag alone — before the planner had chosen
+    /// anything — so it appeared identically whether the query was served by
+    /// an index or by scanning the table. That makes the one question an
+    /// operator actually asks ("is my index being used?") unanswerable from
+    /// the logs, and it trains people to ignore the line, which is worse than
+    /// not logging it.
+    #[test]
+    fn an_indexed_read_is_not_reported_as_a_full_scan() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let rows = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE pk_log WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    "CREATE TABLE pk_log.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                    "CREATE INDEX idx_entity_by_tenant ON pk_log.entity_store (tenant_id)",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                for i in 0..6 {
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO pk_log.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant_a}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(&format!(
+                        "SELECT entity_id FROM pk_log.entity_store \
+                         WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the indexed read"),
+                }
+            })
+        });
+
+        assert_eq!(rows, 6, "the indexed read must return every row");
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("full table scan"),
+            "a read served by an index must not warn that it is scanning the \
+             table. Firing on the ALLOW FILTERING flag alone makes an indexed \
+             read and a scan look identical in the logs.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// The other half: a read that genuinely scans must still say so.
+    ///
+    /// Conditioning the warning on the access path is only correct if the
+    /// warning still fires when the path IS a scan. Otherwise the fix silences
+    /// the expensive-query signal entirely, which is a worse outcome than the
+    /// noise it replaced.
+    #[test]
+    fn an_unindexed_read_still_warns_that_it_is_scanning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let rows = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE scan_log WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    // No index on `body`, so a predicate on it can only scan.
+                    "CREATE TABLE scan_log.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                for i in 0..6 {
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO scan_log.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant_a}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                // A bare unrestricted scan is the other shape that must warn:
+                // no WHERE at all, so nothing could index it.
+                let bare = match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse("SELECT entity_id FROM scan_log.entity_store")
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the unrestricted scan"),
+                };
+                assert_eq!(bare, 6, "the unrestricted scan must see every row");
+
+                match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(
+                        "SELECT entity_id FROM scan_log.entity_store \
+                         WHERE body = 'row-3' ALLOW FILTERING",
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the scanning read"),
+                }
+            })
+        });
+
+        assert_eq!(rows, 1, "the scan must still find the matching row");
+
+        let captured = logs.text();
+        assert!(
+            captured.contains("full table scan"),
+            "a read with no index to serve it must warn that it is scanning — \
+             this is the expensive-query signal, and silencing it would be a \
+             worse regression than the noise it replaced.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// EXPLAIN must agree with what the executor actually does.
+    ///
+    /// EXPLAIN is the tool an operator reaches for to answer "is my index
+    /// being used?", so an EXPLAIN that reports an index for a query the
+    /// executor scans is worse than no EXPLAIN — it ends the investigation at
+    /// the wrong answer. The two build their plans from separate index lists,
+    /// which is exactly how they drift.
+    #[tokio::test]
+    async fn explain_reports_the_partition_key_index_the_read_actually_uses() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE pk_explain WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE pk_explain.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX idx_entity_by_tenant ON pk_explain.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+        let stmt = crate::parser::parse(&format!(
+            "EXPLAIN SELECT entity_id FROM pk_explain.entity_store \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let plan = String::from_utf8_lossy(&b);
+                assert!(
+                    plan.contains("idx_entity_by_tenant"),
+                    "EXPLAIN must name the partition-key index the read is served \
+                     by, got: {plan}"
+                );
+                assert!(
+                    !plan.contains("FullScan"),
+                    "EXPLAIN must not report a full scan for a query an index \
+                     serves, got: {plan}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
+    }
+
+    /// The positive control for the test above.
+    ///
+    /// A test that asserts a warning is ABSENT proves nothing on its own: it
+    /// passes just as well if the warning can never fire, if the capture is
+    /// misconfigured, or if the message text drifted. So this runs the same
+    /// sequence, drops the index, and asserts the two things that must then be
+    /// true — the rows still come back, and the read says out loud that it is
+    /// scanning.
+    ///
+    /// Dropping the index is the one way to reach the degraded path at runtime
+    /// without editing code, which is what makes this a durable guard rather
+    /// than a one-off manual check.
+    #[test]
+    fn dropping_the_index_still_returns_the_rows_and_says_it_is_scanning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let (before, after, mine) = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE pk_drop WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    "CREATE TABLE pk_drop.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                    "CREATE INDEX idx_entity_by_tenant ON pk_drop.entity_store (tenant_id)",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                let tenant_b = "bbbb0000-0000-4000-8000-0000000000b2";
+                let mut mine = 0usize;
+                for i in 0..12 {
+                    let tenant = if i % 3 == 2 { tenant_b } else { tenant_a };
+                    if tenant == tenant_a {
+                        mine += 1;
+                    }
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO pk_drop.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let query = format!(
+                    "SELECT entity_id FROM pk_drop.entity_store \
+                     WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+                );
+
+                let before = match route(&state, &ctx, crate::parser::parse(&query).unwrap())
+                    .await
+                    .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the indexed read"),
+                };
+
+                route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse("DROP INDEX pk_drop.idx_entity_by_tenant").unwrap(),
+                )
+                .await
+                .unwrap();
+
+                let after = match route(&state, &ctx, crate::parser::parse(&query).unwrap())
+                    .await
+                    .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the unindexed read"),
+                };
+
+                (before as usize, after as usize, mine)
+            })
+        });
+
+        let captured = logs.text();
+
+        assert_eq!(
+            before, mine,
+            "with the index in place the read must return every row; wrote {mine}, \
+             read {before}"
+        );
+        assert_eq!(
+            after, mine,
+            "dropping the index must cost SPEED, not rows: the query is still \
+             licensed by ALLOW FILTERING and must return the same {mine} rows, \
+             not {after}. Returning fewer would mean the drop left the planner \
+             consulting an index that no longer exists."
+        );
+        assert!(
+            captured.contains("ALLOW FILTERING"),
+            "a read that scans must say so — an unindexed scan that logs nothing \
+             is indistinguishable from an indexed read except on a latency \
+             graph.\n--- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// Belt: a `CREATE INDEX` that cannot be built must not report success.
+    ///
+    /// The build is skipped by an `if let Some(..)` with no `else`, so the
+    /// statement returns OK, the schema records an index, and nothing exists.
+    /// Every read afterwards consults it and finds nothing. Whatever the engine
+    /// decides to do about partition-key columns, silently accepting and not
+    /// building is the one option that must not remain.
+    #[tokio::test]
+    async fn create_index_never_reports_success_without_building() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE idx_guard WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_guard.t (pk uuid, ck uuid, v text, PRIMARY KEY ((pk), ck))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // On a partition-key column and on a clustering column: neither has a
+        // storage cell, so both take the same skipped path today.
+        for (col, kind) in [("pk", "partition key"), ("ck", "clustering")] {
+            let created = route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!("CREATE INDEX idx_on_{col} ON idx_guard.t ({col})"))
+                    .unwrap(),
+            )
+            .await;
+
+            eprintln!(
+                "PKIDX CREATE INDEX on {kind} column '{col}' -> {}",
+                if created.is_ok() { "Ok" } else { "Err" }
+            );
+            // Either it built the index, or it refused. What it must not do is
+            // return OK having built nothing.
+            if created.is_ok() {
+                route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(
+                        "INSERT INTO idx_guard.t (pk, ck, v) VALUES \
+                         (11111111-1111-4111-8111-111111111111, \
+                          22222222-2222-4222-8222-222222222222, 'x')",
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                let value = if col == "pk" {
+                    "11111111-1111-4111-8111-111111111111"
+                } else {
+                    "22222222-2222-4222-8222-222222222222"
+                };
+                let rows = match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(&format!(
+                        "SELECT v FROM idx_guard.t WHERE {col} = {value} ALLOW FILTERING"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows"),
+                };
+                assert_eq!(
+                    rows, 1,
+                    "CREATE INDEX on a {kind} column returned success, so the index it \
+                     claims to have built must answer: got {rows} rows for a row that exists"
+                );
+            }
+        }
+    }
+
+    /// Suspenders: a read must never treat "the index has no entries" as "there
+    /// are no rows".
+    ///
+    /// `ALLOW FILTERING` is the caller saying a scan is acceptable. When the
+    /// chosen index cannot answer, the scan is what must happen — an empty
+    /// index is not evidence of an empty table.
+    #[tokio::test]
+    async fn a_read_does_not_report_an_unbuilt_index_as_an_empty_table() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE idx_fallback WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_fallback.t (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        // The index exists in schema and was never built, which is the whole
+        // point: the read must still be correct.
+        let _ = route(
+            &state,
+            &ctx,
+            crate::parser::parse("CREATE INDEX idx_fb_pk ON idx_fallback.t (tenant_id)").unwrap(),
+        )
+        .await;
+
+        for i in 0..5 {
+            route(
+                &state,
+                &ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO idx_fallback.t (tenant_id, session_id, entity_id, body) VALUES \
+                     (00000000-0000-0000-0000-000000000001, \
+                      10000000-0000-0000-0000-{i:012}, \
+                      20000000-0000-0000-0000-{i:012}, 'row-{i}')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = match route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "SELECT body FROM idx_fallback.t \
+                 WHERE tenant_id = 00000000-0000-0000-0000-000000000001 ALLOW FILTERING",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(
+            rows, 5,
+            "the rows exist and ALLOW FILTERING permits a scan; an index with no \
+             entries must not be reported as an empty table (got {rows} of 5)"
+        );
+    }
+
+    /// If an index exists, the planner must either USE it or say why it did not.
+    ///
+    /// Falling back to a scan is the right answer when the index was never
+    /// built, but doing it silently swaps a wrong answer for a slow one and
+    /// tells nobody. The first symptom is then a latency graph, and the cause —
+    /// an index that exists in schema and nowhere else — is invisible.
+    ///
+    /// This asserts the planner's decision is observable: an index on a regular
+    /// column IS selected, and an index that cannot be built is refused with a
+    /// warning naming it.
+    #[tokio::test]
+    async fn the_planner_either_uses_an_index_or_says_why_not() {
+        use ferrosa_schema::metadata::{
+            ClusteringOrder, ColumnKind, ColumnMetadata, TableMetadata, TableParams,
+        };
+        use indexmap::IndexMap;
+
+        let mut columns: IndexMap<String, ColumnMetadata> = IndexMap::new();
+        for (name, kind) in [
+            ("pk", ColumnKind::PartitionKey),
+            ("pk2", ColumnKind::PartitionKey),
+            ("ck", ColumnKind::Clustering),
+            ("body", ColumnKind::Regular),
+        ] {
+            columns.insert(
+                name.to_string(),
+                ColumnMetadata {
+                    name: name.to_string(),
+                    column_type: "uuid".to_string(),
+                    kind,
+                    position: 0,
+                    clustering_order: ClusteringOrder::Asc,
+                    mask: None,
+                },
+            );
+        }
+        let table_meta = TableMetadata {
+            keyspace: "ks".into(),
+            name: "t".into(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["pk".into(), "pk2".into()],
+            clustering_key: vec![("ck".into(), ClusteringOrder::Asc)],
+            params: TableParams::default(),
+            flags: Default::default(),
+            extensions: Default::default(),
+            is_system: false,
+        };
+
+        let usable = |cols: &[&str]| IndexMetadata {
+            name: format!("idx_on_{}", cols.join("_")),
+            keyspace: "ks".into(),
+            table: "t".into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: cols.iter().map(|c| (*c).to_string()).collect(),
+            filter_predicate: None,
+            options: Default::default(),
+        };
+
+        assert!(
+            index_targets_a_materialized_column(&usable(&["body"]), &table_meta),
+            "an index on a regular column is real and must be selectable"
+        );
+        // These two assertions were inverted when this test was written, and
+        // both are now wrong for the same reason: they encoded "nothing builds
+        // an index on a key column", which was true of partition keys until
+        // `add_partition_key_index` landed and was ALREADY untrue of clustering
+        // columns, which `add_clustering_index` has built since t_430c4188.
+        // A key column is a column whose value the indexer can decode from the
+        // key, not a column it cannot see.
+        assert!(
+            index_targets_a_materialized_column(&usable(&["pk"]), &table_meta),
+            "an index on a partition-key column is built by decoding the partition \
+             key, so it must be selectable — skipping it sends the query to a scan"
+        );
+        assert!(
+            index_targets_a_materialized_column(&usable(&["ck"]), &table_meta),
+            "an index on a clustering column is built by decoding the clustering \
+             key, so it must be selectable"
+        );
+
+        // The other half of the contract still has to hold, or this test only
+        // proves the planner says yes to everything. A column the table does
+        // not have belongs to no index family and must be refused, loudly.
+        assert!(
+            !index_targets_a_materialized_column(&usable(&["nonexistent"]), &table_meta),
+            "an index naming a column the table does not have cannot be built, so it \
+             must be refused rather than silently chosen and read as empty"
         );
     }
 }

@@ -17,6 +17,7 @@ use ferrosa_index::IndexType;
 use ferrosa_storage::index::sidecar::SidecarWriter;
 use ferrosa_storage::index::{
     BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob, LocalBackend,
+    PartitionKeyComponentRef,
 };
 
 /// Request sent to the worker pool from the HTTP handler.
@@ -38,6 +39,12 @@ pub struct BuildRequest {
     /// Omitted for regular/static-column indexes.
     #[serde(default)]
     pub clustering_source: Option<ClusteringComponentRef>,
+    /// Partition-key component metadata for indexes on PARTITION-KEY columns.
+    /// Omitted for every other index. Without this the remote builder would
+    /// look for the value in a cell that does not exist and build an empty
+    /// index while reporting success.
+    #[serde(default)]
+    pub partition_key_source: Option<PartitionKeyComponentRef>,
     pub priority: String,
     /// Partial-index predicate. `Some` only for a `filtered` index build: the
     /// fully-encoded [`ferrosa_index::FilterPredicate`] (value bytes already in
@@ -320,6 +327,7 @@ fn build_job(req: &BuildRequest) -> Result<IndexBuildJob, String> {
         enqueued_at: Instant::now(),
         column_position: req.column_position,
         clustering_source: req.clustering_source,
+        partition_key_source: req.partition_key_source,
         filter_predicate: req.filter_predicate.clone(),
     })
 }
@@ -451,6 +459,46 @@ mod tests {
         assert!(matches!(job.priority, BuildPriority::Initial));
     }
 
+    /// The partition-key source must survive the wire, for the same reason the
+    /// clustering one must: a remote worker that receives the job without it
+    /// looks for the value in a cell that does not exist, finds nothing, and
+    /// returns a successfully-built EMPTY index. Nothing errors, and the index
+    /// then answers every query with no rows.
+    #[test]
+    fn build_request_threads_partition_key_source_into_job() {
+        let json = serde_json::json!({
+            "sstable_id": "gen-9",
+            "index_name": "idx_by_tenant",
+            "index_type": "btree",
+            "s3_endpoint": "memory://",
+            "s3_bucket": "b",
+            "s3_prefix": "p/ks.tbl/gen-9",
+            "table": ["ks", "tbl"],
+            "column_position": 0,
+            "partition_key_source": {
+                "component": 0,
+                "total": 2
+            },
+            "priority": "initial",
+        });
+        let req: BuildRequest = serde_json::from_value(json).unwrap();
+        let job = build_job(&req).unwrap();
+
+        assert_eq!(
+            job.partition_key_source,
+            Some(PartitionKeyComponentRef {
+                component: 0,
+                total: 2
+            }),
+            "a partition-key job that arrives without its source builds an empty \
+             index and reports success"
+        );
+        assert!(
+            job.clustering_source.is_none(),
+            "a column cannot be in both halves of the primary key"
+        );
+    }
+
     #[test]
     fn parse_priorities() {
         assert!(matches!(parse_priority("high"), BuildPriority::High));
@@ -476,6 +524,7 @@ mod tests {
                 table: ("ks".into(), "tbl".into()),
                 column_position: 0,
                 clustering_source: None,
+                partition_key_source: None,
                 priority: "normal".into(),
                 filter_predicate: None,
             })

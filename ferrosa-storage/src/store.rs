@@ -589,6 +589,14 @@ pub struct TableStore<F: FlushTarget> {
     /// is not a cell — the write path extracts it from the row's composite
     /// clustering-key bytes at the given component index.
     indexed_clustering_columns: Vec<(String, usize)>,
+    /// Partition-key secondary index declarations:
+    /// `(index_name, partition_key_component)`.
+    ///
+    /// A partition-key value is encoded in the key, not stored as a cell, so
+    /// the cell-based `indexed_columns` path cannot see it — the same reason
+    /// `indexed_clustering_columns` exists for the other half of the primary
+    /// key.
+    indexed_partition_key_columns: Vec<(String, usize)>,
     /// Per-index type, keyed by index name. Threaded from the schema so eager /
     /// backfill / compaction index-build jobs carry the correct `IndexType`
     /// instead of a hardcoded `BTree`. Missing entries default to `BTree`.
@@ -650,10 +658,16 @@ fn new_memtable() -> Arc<dyn Memtable> {
 fn new_indexes(
     indexed_columns: &[(String, usize)],
     clustering_indexed_columns: &[(String, usize)],
+    partition_key_indexed_columns: &[(String, usize)],
 ) -> Arc<HashMap<String, Arc<MemtableIndex>>> {
+    // EVERY declared index must appear here. A flush installs this map
+    // wholesale, so a family of indexes omitted from it exists in the
+    // declaration and nowhere else: `guard.indexes.get(name)` then returns
+    // None for the rest of the table's life and each write silently skips it.
     let map: HashMap<String, Arc<MemtableIndex>> = indexed_columns
         .iter()
         .chain(clustering_indexed_columns.iter())
+        .chain(partition_key_indexed_columns.iter())
         .map(|(name, _)| (name.clone(), Arc::new(MemtableIndex::new())))
         .collect();
     Arc::new(map)
@@ -1089,7 +1103,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[]);
+        let indexes = new_indexes(&indexed_columns, &[], &[]);
         let initial_view = StoreView {
             active,
             flushing: None,
@@ -1110,6 +1124,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_filter_predicates: HashMap::new(),
             indexed_columns,
             indexed_clustering_columns: Vec::new(),
+            indexed_partition_key_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1243,7 +1258,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[]);
+        let indexes = new_indexes(&indexed_columns, &[], &[]);
         let sidecar_count = initial_sstables.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1305,6 +1320,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_filter_predicates: HashMap::new(),
             indexed_columns,
             indexed_clustering_columns: Vec::new(),
+            indexed_partition_key_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1339,7 +1355,7 @@ impl<F: FlushTarget> TableStore<F> {
         indexed_columns: Vec<(String, usize)>,
     ) -> Self {
         let active: Arc<dyn Memtable> = new_memtable();
-        let indexes = new_indexes(&indexed_columns, &[]);
+        let indexes = new_indexes(&indexed_columns, &[], &[]);
         let sstable_count = descriptors.len();
 
         // Pad sidecar list with empty maps if shorter than the SSTable list.
@@ -1384,6 +1400,7 @@ impl<F: FlushTarget> TableStore<F> {
             index_filter_predicates: HashMap::new(),
             indexed_columns,
             indexed_clustering_columns: Vec::new(),
+            indexed_partition_key_columns: Vec::new(),
             fulltext_indexes: vec![],
             vector_index_configs: vec![],
             vector_index_methods: HashMap::new(),
@@ -1524,6 +1541,54 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
+        // Partition-key index maintenance: a partition-key column's value is
+        // not a cell either, so it is extracted from the row's composite
+        // partition-key bytes at the declared component.
+        if !self.indexed_partition_key_columns.is_empty() {
+            let total = self.partition_key_column_count();
+            let components = ferrosa_row_bridge::decode_pk(key, total);
+            for (index_name, component) in &self.indexed_partition_key_columns {
+                let Some(value) = components.get(*component) else {
+                    tracing::warn!(
+                        index_name,
+                        component,
+                        total,
+                        "store: partition-key index component missing from key bytes"
+                    );
+                    continue;
+                };
+                let index_type = self.index_type_for(index_name);
+                match crate::index::scheduler::encode_index_key(index_type, value) {
+                    Ok(Some(index_key)) => {
+                        let row_pos = RowPosition {
+                            partition_key: key.key.as_bytes().to_vec(),
+                            clustering_key: row.clustering.clone(),
+                        };
+                        match guard.indexes.get(index_name) {
+                            Some(idx) => idx.insert(index_key, row_pos),
+                            // Declared but absent from the live map: the write
+                            // is not indexed and a later read of this index
+                            // would report a short answer as a complete one.
+                            None => tracing::error!(
+                                index_name,
+                                "store: declared partition-key index is missing from the live index \
+                                 map; this write is NOT indexed and reads of this index \
+                                 will be incomplete"
+                            ),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            index_name,
+                            %e,
+                            "store: skipping partition-key index entry; key encoding failed"
+                        );
+                    }
+                }
+            }
+        }
+
         // Clustering-column index maintenance (t_430c4188): a clustering
         // column's value is not a cell, so it is extracted from the row's
         // composite clustering-key bytes at the declared component.
@@ -1547,8 +1612,17 @@ impl<F: FlushTarget> TableStore<F> {
                             partition_key: key.key.as_bytes().to_vec(),
                             clustering_key: row.clustering.clone(),
                         };
-                        if let Some(idx) = guard.indexes.get(index_name) {
-                            idx.insert(index_key, row_pos);
+                        match guard.indexes.get(index_name) {
+                            Some(idx) => idx.insert(index_key, row_pos),
+                            // Declared but absent from the live map: the write
+                            // is not indexed and a later read of this index
+                            // would report a short answer as a complete one.
+                            None => tracing::error!(
+                                index_name,
+                                "store: declared clustering index is missing from the live index \
+                                 map; this write is NOT indexed and reads of this index \
+                                 will be incomplete"
+                            ),
                         }
                     }
                     Ok(None) => {}
@@ -2309,7 +2383,11 @@ impl<F: FlushTarget> TableStore<F> {
         // new writes go to the new active memtable, and the old memtable
         // contains a complete snapshot.
         let new_active: Arc<dyn Memtable> = new_memtable();
-        let fresh_indexes = new_indexes(&self.indexed_columns, &self.indexed_clustering_columns);
+        let fresh_indexes = new_indexes(
+            &self.indexed_columns,
+            &self.indexed_clustering_columns,
+            &self.indexed_partition_key_columns,
+        );
         let fresh_vector_indexes = new_vector_indexes(&self.vector_index_configs);
         let phase_start = Instant::now();
         let (old_active, old_view_flushing, old_indexes, old_vector_indexes) = {
@@ -2514,6 +2592,7 @@ impl<F: FlushTarget> TableStore<F> {
         // fulltext/vector steps stay exactly as-is.
         let can_shard = self.indexed_columns.is_empty()
             && self.indexed_clustering_columns.is_empty()
+            && self.indexed_partition_key_columns.is_empty()
             && self.fulltext_indexes.is_empty()
             && self.vector_index_configs.is_empty();
         let num_shards = flush::desired_flush_shards(
@@ -5060,12 +5139,23 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // 2. SSTable sidecar indexes: ordered range scan per range.
+        //
+        // A failing range read is REPORTED, not skipped. This used to be
+        // `if let Ok(results) = ...` with no else, so an unreadable sidecar —
+        // a short read, a truncated file, a decode failure — contributed no
+        // positions and the query returned the rows it could find as though
+        // they were all of them. A caller cannot tell that from a genuinely
+        // smaller result, which is how unreadable data gets reported as absent
+        // data.
         for sidecar in guard.sidecar_indexes.iter() {
             if let Some(reader) = sidecar.get(index_name) {
                 for (start_key, end_key) in &key_ranges {
-                    if let Ok(results) = reader.range(start_key, end_key) {
-                        append_positions(results)?;
-                    }
+                    let results = reader.range(start_key, end_key).map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "geo index '{index_name}' range read failed: {e}"
+                        ))
+                    })?;
+                    append_positions(results)?;
                 }
             }
         }
@@ -5173,8 +5263,12 @@ impl<F: FlushTarget> TableStore<F> {
         let before_clustering = self.indexed_clustering_columns.len();
         self.indexed_clustering_columns
             .retain(|(name, _)| name != index_name);
+        let before_pk = self.indexed_partition_key_columns.len();
+        self.indexed_partition_key_columns
+            .retain(|(name, _)| name != index_name);
         let mut removed = before_regular != self.indexed_columns.len()
-            || before_clustering != self.indexed_clustering_columns.len();
+            || before_clustering != self.indexed_clustering_columns.len()
+            || before_pk != self.indexed_partition_key_columns.len();
 
         removed |= self.index_types.remove(index_name).is_some();
         removed |= self.index_filter_predicates.remove(index_name).is_some();
@@ -5241,6 +5335,63 @@ impl<F: FlushTarget> TableStore<F> {
     /// `(index_name, clustering_component)` pairs.
     pub fn indexed_clustering_columns(&self) -> &[(String, usize)] {
         &self.indexed_clustering_columns
+    }
+
+    /// Dynamically adds a secondary index on a PARTITION-KEY column.
+    ///
+    /// Future writes extract the indexed value from the row's composite
+    /// partition-key bytes at `partition_key_component`. A partition-key
+    /// value is not a cell, so the cell-based [`add_index`](Self::add_index)
+    /// path cannot see it at all — the same reason
+    /// [`add_clustering_index`](Self::add_clustering_index) exists.
+    ///
+    /// Without this, `CREATE INDEX ... (tenant_id)` on
+    /// `PRIMARY KEY ((tenant_id, session_id), entity_id)` was accepted and
+    /// built nothing, and every read through it returned no rows over a table
+    /// full of data.
+    pub fn add_partition_key_index(
+        &mut self,
+        index_name: String,
+        partition_key_component: usize,
+        index_type: IndexType,
+    ) {
+        self.indexed_partition_key_columns
+            .push((index_name.clone(), partition_key_component));
+        self.index_types.insert(index_name.clone(), index_type);
+        let current = self.view.load();
+        let mut new_indexes = (*current.indexes).clone();
+        new_indexes.insert(index_name, Arc::new(MemtableIndex::new()));
+        let new_view = StoreView {
+            active: Arc::clone(&current.active),
+            flushing: current.flushing.clone(),
+            sstables: Arc::clone(&current.sstables),
+            sstable_ids: Arc::clone(&current.sstable_ids),
+            indexes: Arc::new(new_indexes),
+            sidecar_indexes: Arc::clone(&current.sidecar_indexes),
+            vector_indexes: Arc::clone(&current.vector_indexes),
+        };
+        new_view.check_invariants("add_partition_key_index");
+        self.view.store(Arc::new(new_view));
+    }
+
+    /// Partition-key secondary index declarations:
+    /// `(index_name, partition_key_component)` pairs.
+    pub fn indexed_partition_key_columns(&self) -> &[(String, usize)] {
+        &self.indexed_partition_key_columns
+    }
+
+    /// Number of partition-key columns in this table's schema — the component
+    /// count needed to split composite partition-key bytes.
+    pub fn partition_key_column_count(&self) -> usize {
+        let schema = self.schema.load();
+        let kt = &schema.key_type;
+        if !kt.contains("CompositeType") {
+            return 1;
+        }
+        // CompositeType(A,B,...) — count the comma-separated inner types.
+        kt.split_once('(')
+            .map(|(_, rest)| rest.trim_end_matches(')').split(',').count())
+            .unwrap_or(1)
     }
 
     /// Number of clustering columns in this table's schema (the component
@@ -6057,7 +6208,11 @@ impl<F: FlushTarget> TableStore<F> {
             flushing: None,
             sstables: Arc::new(vec![]),
             sstable_ids: Arc::new(vec![]),
-            indexes: new_indexes(&self.indexed_columns, &self.indexed_clustering_columns),
+            indexes: new_indexes(
+                &self.indexed_columns,
+                &self.indexed_clustering_columns,
+                &self.indexed_partition_key_columns,
+            ),
             sidecar_indexes: Arc::new(vec![]),
             vector_indexes: new_vector_indexes(&self.vector_index_configs),
         };
@@ -6156,6 +6311,61 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
         merged
+    }
+
+    /// Install a freshly-built sidecar index for an SSTable already in the
+    /// view, making it visible to reads in THIS process immediately.
+    ///
+    /// The index build scheduler writes sidecar files to disk and marks the
+    /// SSTable indexed, but nothing installs the result into the live view —
+    /// so before this existed, a backfill became visible only after a restart
+    /// reloaded the directory. A read in between consulted an index that was
+    /// complete on disk and empty in memory, and reported the empty answer as
+    /// the whole one.
+    ///
+    /// Returns whether the generation was found. A `false` means the SSTable
+    /// was compacted away while the build ran, which is benign — the compacted
+    /// output gets its own build — but the caller must not treat it as
+    /// "installed".
+    pub fn install_sidecar(
+        &self,
+        generation_id: &str,
+        index_name: &str,
+        reader: crate::index::sidecar::SidecarReader,
+    ) -> bool {
+        let guard = self.view.load();
+        let Some(position) = guard
+            .sstable_ids
+            .iter()
+            .position(|(gen, _)| gen == generation_id)
+        else {
+            return false;
+        };
+
+        let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+            Vec::with_capacity(guard.sidecar_indexes.len());
+        for (i, existing) in guard.sidecar_indexes.iter().enumerate() {
+            if i == position {
+                let mut map: HashMap<String, SidecarReader> = existing.as_ref().clone();
+                map.insert(index_name.to_string(), reader.clone());
+                sidecars.push(Arc::new(map));
+            } else {
+                sidecars.push(Arc::clone(existing));
+            }
+        }
+
+        let new_view = StoreView {
+            active: Arc::clone(&guard.active),
+            flushing: guard.flushing.clone(),
+            sstables: Arc::clone(&guard.sstables),
+            sstable_ids: Arc::clone(&guard.sstable_ids),
+            indexes: Arc::clone(&guard.indexes),
+            sidecar_indexes: Arc::new(sidecars),
+            vector_indexes: Arc::clone(&guard.vector_indexes),
+        };
+        new_view.check_invariants("install_sidecar");
+        self.view.store(Arc::new(new_view));
+        true
     }
 
     /// Collect metadata for all current SSTables.
@@ -6344,6 +6554,19 @@ mod tests {
             }],
             extensions: Default::default(),
         }
+    }
+
+    /// Encode a composite partition key the way `decode_pk` reads it:
+    /// `[2-byte len][value][0x00]` per component.
+    fn make_composite_key(parts: &[&str]) -> DecoratedKey {
+        let mut bytes = Vec::new();
+        for part in parts {
+            let b = part.as_bytes();
+            bytes.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(b);
+            bytes.push(0x00);
+        }
+        DecoratedKey::new(ferrosa_common::key::PartitionKey::new(bytes))
     }
 
     fn make_key(s: &str) -> DecoratedKey {
@@ -11335,6 +11558,342 @@ mod tests {
         assert_eq!(
             reopened.rows, before,
             "reopened reader (post-eviction) returns the same complete partition"
+        );
+    }
+
+    /// An index on a PARTITION-KEY component must be built and answer reads.
+    ///
+    /// A partition-key value is not a cell — it is encoded in the key — so the
+    /// cell-based `add_index` path cannot see it, exactly as it cannot see a
+    /// clustering column. Clustering columns already have their own path
+    /// (`add_clustering_index`, t_430c4188) which decodes the composite
+    /// clustering bytes at a declared component. This is the same thing for
+    /// the other half of the primary key.
+    ///
+    /// Without it, `CREATE INDEX ... (tenant_id)` on
+    /// `PRIMARY KEY ((tenant_id, session_id), entity_id)` is accepted, builds
+    /// nothing, and every read through it returns zero rows over a table full
+    /// of data (2026-09-10).
+    #[test]
+    fn an_index_on_a_partition_key_component_is_built_and_answers() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            // Composite partition key: (tenant_id, session_id).
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        // Component 0 of the partition key is the tenant.
+        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+
+        // Two tenants, several sessions each: the rows land in different
+        // partitions under the same tenant, which is the shape that matters.
+        let mut mine = 0usize;
+        for i in 0..6 {
+            let tenant = if i % 3 == 2 { "tenant-b" } else { "tenant-a" };
+            if tenant == "tenant-a" {
+                mine += 1;
+            }
+            let key = make_composite_key(&[tenant, &format!("session-{i}")]);
+            store
+                .write(
+                    &key,
+                    Row {
+                        clustering: vec![],
+                        cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut found = 0usize;
+        store
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .expect("a partition-key index must answer");
+        assert_eq!(
+            found, mine,
+            "an index on a partition-key component must return every row for that \
+             component; wrote {mine} for tenant-a and the index returned {found}"
+        );
+    }
+
+    /// The gate that decides whether the PLANNER may select such an index.
+    ///
+    /// A memtable index that loses its entries at the first flush is worse
+    /// than no index: the planner would choose it, read nothing, and report an
+    /// empty result as success — which is the exact bug this whole line of work
+    /// exists to kill. So this asserts across a flush, not before one.
+    #[test]
+    fn a_partition_key_index_still_answers_after_the_memtable_is_flushed() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+
+        let mut mine = 0usize;
+        for i in 0..6 {
+            let tenant = if i % 3 == 2 { "tenant-b" } else { "tenant-a" };
+            if tenant == "tenant-a" {
+                mine += 1;
+            }
+            let key = make_composite_key(&[tenant, &format!("session-{i}")]);
+            store
+                .write(
+                    &key,
+                    Row {
+                        clustering: vec![],
+                        cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                    },
+                )
+                .unwrap();
+        }
+
+        store.flush().expect("flush must succeed");
+
+        // Writes AFTER the flush must be indexed too. The flush installs a
+        // freshly-built index map; a family of indexes left out of it is
+        // declared and never written to again, and every write below would be
+        // dropped on the floor without a word.
+        for i in 6..10 {
+            let tenant = if i % 3 == 2 { "tenant-b" } else { "tenant-a" };
+            if tenant == "tenant-a" {
+                mine += 1;
+            }
+            let key = make_composite_key(&[tenant, &format!("session-{i}")]);
+            store
+                .write(
+                    &key,
+                    Row {
+                        clustering: vec![],
+                        cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut found = 0usize;
+        store
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .expect("a partition-key index must answer after a flush");
+        assert_eq!(
+            found, mine,
+            "a partition-key index must survive a flush; wrote {mine} rows for \
+             tenant-a and the index returned {found} after flushing. A memtable-only \
+             index that empties on flush must NOT be selectable by the planner."
+        );
+    }
+
+    /// Regression guard for the SHARDED flush path.
+    ///
+    /// `can_shard` lists the index families that force the single-SSTable
+    /// path, because the sharded path does not write sidecars. A family
+    /// missing from that list flushes to an index containing nothing, and
+    /// nothing says so — the table simply answers every indexed read with
+    /// zero rows. The threshold is 2 * 512 partitions, so this test has to be
+    /// big enough to cross it; a smaller one passes no matter what `can_shard`
+    /// says and proves nothing.
+    #[test]
+    fn a_partition_key_index_survives_a_flush_large_enough_to_shard() {
+        use ferrosa_index::IndexKey;
+
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+
+        // Comfortably past 2 * MIN_PARTITIONS_PER_FLUSH_SHARD (512).
+        let rows = 1200usize;
+        let mut mine = 0usize;
+        for i in 0..rows {
+            let tenant = if i % 4 == 3 { "tenant-b" } else { "tenant-a" };
+            if tenant == "tenant-a" {
+                mine += 1;
+            }
+            let key = make_composite_key(&[tenant, &format!("session-{i}")]);
+            store
+                .write(
+                    &key,
+                    Row {
+                        clustering: vec![],
+                        cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                        deletion: DeletionTime::LIVE,
+                        primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                    },
+                )
+                .unwrap();
+        }
+        store.flush().expect("flush must succeed");
+
+        let mut found = 0usize;
+        store
+            .read_by_index_each(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                &mut |_| {
+                    found += 1;
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .expect("a partition-key index must answer after a sharded-size flush");
+        assert_eq!(
+            found, mine,
+            "a partition-key index must survive a flush large enough to shard; \
+             wrote {mine} rows for tenant-a across {rows} partitions and the index \
+             returned {found}. If this is 0, `can_shard` took the sharded path and \
+             skipped sidecar construction."
+        );
+    }
+
+    /// The structural guard: EVERY declared index family must appear in the
+    /// live index map a flush installs.
+    ///
+    /// The two tests above catch the partition-key family specifically. This
+    /// one catches the next family somebody adds, because the failure mode is
+    /// silent by construction: `new_indexes` builds the map from an explicit
+    /// list of families, and a family left off that list is declared, accepted,
+    /// never written to, and reads back empty.
+    #[test]
+    fn every_declared_index_family_is_present_in_the_live_map_after_a_flush() {
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+
+        // One index of each family that exists today.
+        store.add_index("idx_regular".to_string(), 0, IndexType::BTree);
+        store.add_clustering_index("idx_clustering".to_string(), 0, IndexType::BTree);
+        store.add_partition_key_index("idx_partition_key".to_string(), 0, IndexType::BTree);
+
+        let declared: Vec<String> = store
+            .indexed_columns
+            .iter()
+            .chain(store.indexed_clustering_columns.iter())
+            .chain(store.indexed_partition_key_columns.iter())
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            3,
+            "the test must declare one of each family"
+        );
+
+        store.flush().expect("flush must succeed");
+
+        let live = store.view.load();
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|name| !live.indexes.contains_key(*name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every declared index must exist in the live map a flush installs; \
+             missing {missing:?}. An index in this list is declared and never \
+             maintained: writes skip it and reads of it return nothing, with no \
+             error on either path."
         );
     }
 }

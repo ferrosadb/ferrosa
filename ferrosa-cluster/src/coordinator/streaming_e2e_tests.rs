@@ -102,6 +102,20 @@ impl StreamRangeReader for StaticReader {
             self.partitions.iter().cloned().map(Ok).collect();
         Ok(Box::pin(futures::stream::iter(items)))
     }
+
+    /// This replica's slice of an indexed read. A real node consults its own
+    /// local index; a static one hands back everything it holds, which is what
+    /// makes it usable for asserting the fan-out rather than the index.
+    fn index_iter<'a>(
+        &'a self,
+        _table_id: &TableId,
+        _index_name: &str,
+        _index_key: &[u8],
+    ) -> ferrosa_common::Result<PartitionStream<'a>> {
+        let items: Vec<ferrosa_common::Result<Partition>> =
+            self.partitions.iter().cloned().map(Ok).collect();
+        Ok(Box::pin(futures::stream::iter(items)))
+    }
 }
 
 /// Single replica, 10 partitions, chunk_size=3 → 4 chunks (3+3+3+1)
@@ -235,4 +249,78 @@ async fn end_to_end_no_producer_trips_idle_watchdog() {
 
     let err = consume_range_stream(rx, IDLE, 1, REQ_ID).await.unwrap_err();
     assert!(matches!(err, StreamConsumeError::IdleTimeout { .. }));
+}
+
+/// Scatter-gather is the invariant for a cluster-wide indexed read: a
+/// secondary index is LOCAL to each node, so the coordinator must ask EVERY
+/// node and union what comes back. A read that consults one node returns a
+/// subset and reports it as the whole answer, which is indistinguishable from
+/// the rows not existing.
+///
+/// This had a test while the read was `coordinate_index_read`. That function
+/// was deleted when the read became streaming, and its tests went with it —
+/// including the ones for a missing peer pool and a slow replica — leaving the
+/// replacement with no multi-node coverage at all. This is the invariant put
+/// back.
+#[tokio::test]
+async fn an_indexed_read_unions_every_replicas_rows() {
+    let router = Arc::new(StreamRouter::new());
+    const REQ_ID: u32 = 0x3333_3333;
+    let rx = router.register(REQ_ID, 16);
+    let frame_router = Arc::new(StreamFrameRouter::new(router.clone()));
+
+    // The shape the coordinator sends for an indexed read: same framing as a
+    // range read, with the index named. Both fields must be set; one without
+    // the other is refused by the handler.
+    let req = RangeReadStreamRequestPayload {
+        request_id: REQ_ID,
+        keyspace: "ks".into(),
+        table: "tbl".into(),
+        index_name: Some("tenant_idx".into()),
+        index_key: Some(b"tenant-a".to_vec()),
+        projected_regular_ordinals: None,
+        start_key: None,
+        start_clustering: None,
+        max_chunks: 0,
+    };
+
+    let from_a: PeerId = (Uuid::from_u128(1), "127.0.0.1:7001".parse().unwrap());
+    let from_b: PeerId = (Uuid::from_u128(2), "127.0.0.1:7002".parse().unwrap());
+    let sink_a = FakeWireSinkShared {
+        frame_router: frame_router.clone(),
+        from: from_a,
+    };
+    let sink_b = FakeWireSinkShared {
+        frame_router: frame_router.clone(),
+        from: from_b,
+    };
+
+    // Disjoint rows: every partition exists on exactly one replica, so a
+    // union that drops a replica is a short count rather than a duplicate.
+    let reader_a = StaticReader {
+        partitions: (1u8..=5).map(make_partition).collect(),
+    };
+    let reader_b = StaticReader {
+        partitions: (6u8..=10).map(make_partition).collect(),
+    };
+
+    let req_a = req.clone();
+    let req_b = req.clone();
+    let p_a = tokio::spawn(async move {
+        handle_stream_request(req_a, Arc::new(reader_a), &sink_a, 2).await;
+    });
+    let p_b = tokio::spawn(async move {
+        handle_stream_request(req_b, Arc::new(reader_b), &sink_b, 2).await;
+    });
+
+    let outcome = consume_range_stream(rx, IDLE, 2, REQ_ID).await.unwrap();
+    p_a.await.unwrap();
+    p_b.await.unwrap();
+
+    assert_eq!(
+        outcome.partitions.len(),
+        10,
+        "an indexed read must union every replica's rows; a subset reported as \
+         the whole answer looks exactly like the rows not existing"
+    );
 }

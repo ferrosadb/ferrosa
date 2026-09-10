@@ -86,7 +86,7 @@ impl SidecarWriter {
 // ── Reader ───────────────────────────────────────────────────────────────────
 
 /// Reads a sidecar index file, validating the CRC32 header on open.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SidecarReader {
     entry_count: u64,
     entries: Vec<SidecarEntry>,
