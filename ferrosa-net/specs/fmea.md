@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-09-09
 ---
 
 # ferrosa-net — FMEA / Known Issues
@@ -24,6 +24,7 @@ not are flagged as open gaps.
 | NET-8 | `require_tls=false` (default) → internode traffic is plaintext | Eavesdrop / MITM on the internode network if operator forgets to enable TLS | 8 | 4 | 6 | 192 | **Fail-loud only when opted in.** `require_tls` errors at startup when set with no cert, but TLS is **off by default** and there is no mutual-TLS client-auth (`with_no_client_auth`). Operators must explicitly enable + provide a CA. Document as a deployment gap. |
 | NET-9 | PSK unset (default `psk: None`) → handshake authenticates cluster-name only | Any host knowing the cluster name can join the internode mesh | 8 | 3 | 6 | 144 | **Optional auth.** HMAC-SHA256 token verification is constant-time and correct *when a PSK is set*, but PSK is `None` by default. Pair with NET-8: secure internode requires both PSK and TLS configured. |
 | NET-10 | Streaming chunk frames dispatched out of wire order | Coordinator's contiguous-`seq` check trips → `ChannelClosedBeforeDone` mid-stream | 7 | 2 | 5 | 70 | **Mitigated.** `is_ordered_stream_response` keeps chunk/heartbeat/done on the ordered lane path; documented at length in `codec.rs`. Surfaced only for multi-chunk responses (wide partitions). |
+| NET-11 | A lane remained `Connected` after its TCP client died while background reconnect was already running. | New Raft traffic was dispatched to the closed writer, producing repeated `connection closed` errors and `Raft lane timeout` backoff during Fly/OpenRaft peer disruptions. | 8 | 4 | 4 | 128 → 16 | **Fixed (2026-09-09):** the alive watcher transitions the lane to `Reconnecting` before reconnect backoff; closed-writer sends remove pending slots and signal the watcher. Regression covers drop, transient rejection, and recovery of all three lanes. |
 
 ## Top risks to act on
 

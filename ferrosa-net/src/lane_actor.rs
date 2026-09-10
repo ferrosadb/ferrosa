@@ -109,6 +109,8 @@ pub(crate) enum LaneCommand {
     DispatchPending,
     /// Replace the current RPC client (used after successful reconnect).
     SwapClient(RpcClient),
+    /// Mark the current connection unusable and stop dispatching new work to it.
+    ConnectionLost,
     /// Signal that one full `connect_with_retry` cycle was exhausted.
     ///
     /// Carries the `exhaustion_count` value at the time of spawning so the
@@ -252,6 +254,13 @@ impl LaneHandle {
     /// Attempt to swap in a new RPC client (best-effort, non-blocking).
     pub(crate) fn try_swap_client(&self, client: RpcClient) {
         if let Err(e) = self.tx.try_send(LaneCommand::SwapClient(client)) {
+            tracing::error!(%e, "net: lane command send failed");
+        }
+    }
+
+    /// Transition a connected lane to reconnecting after its TCP client dies.
+    pub(crate) fn mark_reconnecting(&self) {
+        if let Err(e) = self.tx.try_send(LaneCommand::ConnectionLost) {
             tracing::error!(%e, "net: lane command send failed");
         }
     }
@@ -495,6 +504,7 @@ async fn lane_actor_loop(
         spawn_alive_watcher(
             alive_rx,
             move || {
+                watcher_ctx.handle.mark_reconnecting();
                 watcher_ctx.spawn_reconnect(0);
             },
             ctx.task_pool.clone(),
@@ -623,6 +633,7 @@ async fn lane_actor_loop(
                 spawn_alive_watcher(
                     alive_rx,
                     move || {
+                        watcher_ctx.handle.mark_reconnecting();
                         watcher_ctx.spawn_reconnect(0);
                     },
                     ctx.task_pool.clone(),
@@ -636,6 +647,20 @@ async fn lane_actor_loop(
                     &mut pending_streams,
                     dispatch_retry_scheduled,
                 );
+            }
+            LaneCommand::ConnectionLost => {
+                if matches!(state, LaneState::Connected(_)) {
+                    tracing::warn!(
+                        ?lane,
+                        peer = %ctx.peer_host,
+                        "lane connection lost; entering reconnecting state"
+                    );
+                    state = LaneState::Reconnecting {
+                        attempt: 0,
+                        exhaustion_count: 0,
+                    };
+                    fail_pending_streams_reconnecting(&mut pending_streams);
+                }
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
                 let current_exhaustion = match &state {

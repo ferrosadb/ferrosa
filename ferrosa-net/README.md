@@ -57,8 +57,9 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   holding a `tokio::Mutex` across network `await`s. The Raft lane can run on its
   own OS thread/runtime so heartbeats are never starved by data-path saturation.
 - **Reconnect / dormancy lifecycle** (`reconnect`, `lane_actor`) — on disconnect
-  a lane retries with exponential backoff (`connect_with_retry_cancelable`); after
-  `MAX_RECONNECT_ATTEMPTS` it counts an exhaustion, and after
+  a lane immediately enters `Reconnecting` so new work is not dispatched to the
+  dead RPC client, then retries with exponential backoff
+  (`connect_with_retry_cancelable`); after `MAX_RECONNECT_ATTEMPTS` it counts an exhaustion, and after
   `DORMANT_AFTER_EXHAUSTIONS` it goes `Dormant`, probing once per
   `DORMANT_PROBE_INTERVAL`. Reconnects re-resolve the peer's advertised hostname
   so container IP churn is handled automatically.
@@ -128,7 +129,7 @@ External: `tokio`, `tokio-util`, `bytes`, `capnp`/`capnpc`, `rustls` +
 
 ## Tests
 
-~138 in-crate unit tests across the modules, plus ~27 integration tests in
+~157 in-crate unit tests across the modules, plus ~27 integration tests in
 `tests/` (Cap'n Proto adapters/conformance/envelope framing/protocol,
 end-to-end `integration.rs`, and `reconnect_backoff.rs`). No `#[ignore]`, no
 `TODO`/`FIXME`/`unimplemented!` in `src/`.

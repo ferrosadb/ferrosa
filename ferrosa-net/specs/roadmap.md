@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-09-09
 ---
 
 # ferrosa-net — Roadmap
@@ -9,6 +9,14 @@ last_updated: 2026-06-19
 Sourced from the FMEA gaps ([fmea.md](fmea.md)), the in-code design notes, and
 the dependency/usage review. There are no `TODO`/`FIXME` markers in `src/`, so
 this roadmap is gap- and risk-driven rather than scraped from the code.
+
+## Recently addressed
+
+- **Dead-client dispatch during reconnect (NET-11).** A dropped TCP connection
+  now moves the lane to `Reconnecting` immediately, rejects new work
+  transiently, and resumes `Connected` after a successful handshake. This is
+  covered by the Fly/OpenRaft-style three-lane drop/reconnect regression in
+  `pool.rs`.
 
 ## Now (highest value)
 
