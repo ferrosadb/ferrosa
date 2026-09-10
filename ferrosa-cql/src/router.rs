@@ -4910,16 +4910,15 @@ async fn route_select_user_table(
     validate_tuple_where_clauses(&s.where_clauses, table_meta)?;
     let table_strategy = keyspace_strategy(&state.schema, ks);
 
-    // ALLOW FILTERING: permit full-table scans with post-filter when the
-    // client explicitly opts in.  Log a warning so operators can identify
-    // expensive queries, but do not reject.
-    if s.allow_filtering && !where_has_udf_calls(&s.where_clauses) {
-        tracing::warn!(
-            keyspace = ks,
-            table = %s.table,
-            "executing query with ALLOW FILTERING — full table scan with post-filter"
-        );
-    }
+    // ALLOW FILTERING is permitted, never rejected. The warning that used to
+    // live here fired on the FLAG, before the planner had chosen anything, so
+    // it appeared identically whether the query was served by an index or by
+    // scanning the table. Every read the memory server issues carries the
+    // flag, so the line was on every read and distinguished nothing — the one
+    // question an operator asks of it ("is my index being used?") could not be
+    // answered, and a warning that is always present is one people learn to
+    // ignore. It now fires where the access path is actually known: see the
+    // `ScanPlan::FullScan` arm below.
 
     // If WHERE contains UDF calls but ALLOW FILTERING is not set, reject.
     if where_has_udf_calls(&s.where_clauses) && !s.allow_filtering {
@@ -5509,6 +5508,27 @@ async fn route_select_user_table(
             &planner_indexes,
             &filtered_covered_columns,
         );
+
+        // Report the access path once, now that it is decided.
+        //
+        // A scan is the expensive case and the one worth a WARN; every other
+        // plan names the index serving it, at DEBUG, so "is my index being
+        // used?" has an affirmative answer in the log rather than only the
+        // absence of a complaint.
+        if matches!(scan_plan, ScanPlan::FullScan) {
+            tracing::warn!(
+                keyspace = ks,
+                table = %s.table,
+                "executing query with ALLOW FILTERING — full table scan with post-filter"
+            );
+        } else {
+            tracing::debug!(
+                keyspace = ks,
+                table = %s.table,
+                plan = %scan_plan,
+                "read served without a full scan"
+            );
+        }
 
         // ── Vector ANN index consult ──────────────────────────────────────
         //
@@ -7152,6 +7172,12 @@ fn route_explain(
         // executed query would never choose (e.g. PartitionIndexLookup on a
         // full-text index when a phonetic index shares the column).
         .filter(|(_, meta)| scalar_equality_index_is_usable(meta))
+        // And the same materialization gating. Without it EXPLAIN offers the
+        // planner an index the SELECT path refuses, and reports an index plan
+        // for a query the executor would scan — which is precisely backwards
+        // for the tool an operator reaches for to answer "is my index being
+        // used?".
+        .filter(|(_, meta)| index_targets_a_materialized_column(meta, table_meta))
         .filter(|(_, meta)| {
             filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
         })
@@ -29629,6 +29655,261 @@ mod tests {
             !captured.contains("index NOT used"),
             "the read must be served by the index.\n--- captured warnings ---\n{captured}"
         );
+    }
+
+    /// An indexed read must NOT be reported as a full table scan.
+    ///
+    /// Every read the memory server issues carries `ALLOW FILTERING`, and the
+    /// warning used to fire on the flag alone — before the planner had chosen
+    /// anything — so it appeared identically whether the query was served by
+    /// an index or by scanning the table. That makes the one question an
+    /// operator actually asks ("is my index being used?") unanswerable from
+    /// the logs, and it trains people to ignore the line, which is worse than
+    /// not logging it.
+    #[test]
+    fn an_indexed_read_is_not_reported_as_a_full_scan() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let rows = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE pk_log WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    "CREATE TABLE pk_log.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                    "CREATE INDEX idx_entity_by_tenant ON pk_log.entity_store (tenant_id)",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                for i in 0..6 {
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO pk_log.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant_a}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(&format!(
+                        "SELECT entity_id FROM pk_log.entity_store \
+                         WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the indexed read"),
+                }
+            })
+        });
+
+        assert_eq!(rows, 6, "the indexed read must return every row");
+
+        let captured = logs.text();
+        assert!(
+            !captured.contains("full table scan"),
+            "a read served by an index must not warn that it is scanning the \
+             table. Firing on the ALLOW FILTERING flag alone makes an indexed \
+             read and a scan look identical in the logs.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// The other half: a read that genuinely scans must still say so.
+    ///
+    /// Conditioning the warning on the access path is only correct if the
+    /// warning still fires when the path IS a scan. Otherwise the fix silences
+    /// the expensive-query signal entirely, which is a worse outcome than the
+    /// noise it replaced.
+    #[test]
+    fn an_unindexed_read_still_warns_that_it_is_scanning() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let rows = tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (state, _dir) = setup();
+                let auth = dev_auth();
+                let ctx = RequestContext {
+                    auth: &auth,
+                    current_keyspace: &None,
+                    consistency: ConsistencyLevel::One,
+                    serial_consistency: None,
+                    paging: crate::paging::PagingParams::default(),
+                    client_address: String::new(),
+                    protocol_version: 4,
+                };
+
+                for cql in [
+                    "CREATE KEYSPACE scan_log WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+                    // No index on `body`, so a predicate on it can only scan.
+                    "CREATE TABLE scan_log.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+                ] {
+                    route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                        .await
+                        .unwrap();
+                }
+
+                let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+                for i in 0..6 {
+                    let session = format!("10000000-0000-4000-8000-{i:012}");
+                    let entity = format!("20000000-0000-4000-8000-{i:012}");
+                    route(
+                        &state,
+                        &ctx,
+                        crate::parser::parse(&format!(
+                            "INSERT INTO scan_log.entity_store (tenant_id, session_id, entity_id, body) \
+                             VALUES ({tenant_a}, {session}, {entity}, 'row-{i}')"
+                        ))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                // A bare unrestricted scan is the other shape that must warn:
+                // no WHERE at all, so nothing could index it.
+                let bare = match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse("SELECT entity_id FROM scan_log.entity_store")
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the unrestricted scan"),
+                };
+                assert_eq!(bare, 6, "the unrestricted scan must see every row");
+
+                match route(
+                    &state,
+                    &ctx,
+                    crate::parser::parse(
+                        "SELECT entity_id FROM scan_log.entity_store \
+                         WHERE body = 'row-3' ALLOW FILTERING",
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                {
+                    RouteResult::Result(b) => extract_row_count(&b),
+                    _ => panic!("expected rows from the scanning read"),
+                }
+            })
+        });
+
+        assert_eq!(rows, 1, "the scan must still find the matching row");
+
+        let captured = logs.text();
+        assert!(
+            captured.contains("full table scan"),
+            "a read with no index to serve it must warn that it is scanning — \
+             this is the expensive-query signal, and silencing it would be a \
+             worse regression than the noise it replaced.\n\
+             --- captured warnings ---\n{captured}"
+        );
+    }
+
+    /// EXPLAIN must agree with what the executor actually does.
+    ///
+    /// EXPLAIN is the tool an operator reaches for to answer "is my index
+    /// being used?", so an EXPLAIN that reports an index for a query the
+    /// executor scans is worse than no EXPLAIN — it ends the investigation at
+    /// the wrong answer. The two build their plans from separate index lists,
+    /// which is exactly how they drift.
+    #[tokio::test]
+    async fn explain_reports_the_partition_key_index_the_read_actually_uses() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE pk_explain WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE pk_explain.entity_store (tenant_id uuid, session_id uuid, entity_id uuid, body text, PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX idx_entity_by_tenant ON pk_explain.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let tenant_a = "aaaa0000-0000-4000-8000-0000000000a1";
+        let stmt = crate::parser::parse(&format!(
+            "EXPLAIN SELECT entity_id FROM pk_explain.entity_store \
+             WHERE tenant_id = {tenant_a} ALLOW FILTERING"
+        ))
+        .unwrap();
+
+        match route(&state, &ctx, stmt).await.unwrap() {
+            RouteResult::Result(b) => {
+                let plan = String::from_utf8_lossy(&b);
+                assert!(
+                    plan.contains("idx_entity_by_tenant"),
+                    "EXPLAIN must name the partition-key index the read is served \
+                     by, got: {plan}"
+                );
+                assert!(
+                    !plan.contains("FullScan"),
+                    "EXPLAIN must not report a full scan for a query an index \
+                     serves, got: {plan}"
+                );
+            }
+            _ => panic!("expected Result from EXPLAIN"),
+        }
     }
 
     /// The positive control for the test above.
