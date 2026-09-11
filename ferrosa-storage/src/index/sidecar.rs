@@ -58,6 +58,7 @@ impl SidecarWriter {
     pub fn write(path: &Path, entries: &[(IndexKey, RowPosition)]) -> IndexResult<()> {
         let mut sorted: Vec<_> = entries.to_vec();
         sorted.sort_by(posting_order);
+        sorted.dedup();
 
         let entry_count = sorted.len() as u64;
 
@@ -108,6 +109,7 @@ impl SidecarReader {
     pub fn from_entries(entries: Vec<(IndexKey, RowPosition)>) -> Self {
         let mut sorted = entries;
         sorted.sort_by(posting_order);
+        sorted.dedup();
         let entry_count = sorted.len() as u64;
         let sidecar_entries: Vec<SidecarEntry> = sorted
             .into_iter()
@@ -209,19 +211,19 @@ impl SidecarReader {
         Ok(results)
     }
 
-    /// The key's postings strictly after `after` (all of them when `None`),
-    /// in row order, borrowed in place — a binary search to the start, then
-    /// a walk that ends at the first entry of another key.
-    pub fn postings_after<'a>(
+    /// The key's postings at or after `from` (all of them when `None`), in
+    /// row order, borrowed in place — a binary search to the start, then a
+    /// walk that ends at the first entry of another key.
+    pub fn postings_from<'a>(
         &'a self,
         key: &'a IndexKey,
-        after: Option<&RowPosition>,
+        from: Option<&RowPosition>,
     ) -> impl Iterator<Item = &'a RowPosition> + 'a {
         let start =
             self.entries
                 .partition_point(|e| match e.key.as_slice().cmp(key.0.as_slice()) {
                     std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => after.is_some_and(|cursor| e.position <= *cursor),
+                    std::cmp::Ordering::Equal => from.is_some_and(|start| e.position < *start),
                     std::cmp::Ordering::Greater => false,
                 });
         self.entries[start..]

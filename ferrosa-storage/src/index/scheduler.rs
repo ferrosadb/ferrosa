@@ -423,14 +423,26 @@ impl IndexBuildBackend for LocalBackend {
                     };
                 if let Some(ref value) = value_owned {
                     if let Some(key) = encode_index_key(job.index_type, value)? {
+                        // A partition-key index names the PARTITION: every row
+                        // shares the value, so one (pk, []) posting covers them
+                        // and the read streams the partition instead of
+                        // point-reading each row (t_c5bccc65).
+                        let clustering_key = if job.partition_key_source.is_some() {
+                            Vec::new()
+                        } else {
+                            row.clustering.clone()
+                        };
                         entries.push((
                             key,
                             RowPosition {
                                 partition_key: pk_bytes.clone(),
-                                clustering_key: row.clustering.clone(),
+                                clustering_key,
                             },
                         ));
                     }
+                }
+                if job.partition_key_source.is_some() {
+                    break;
                 }
             }
         }

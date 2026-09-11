@@ -23008,6 +23008,81 @@ mod tests {
         }
     }
 
+    /// t_c5bccc65: a tenant-wide read through the partition-key index streams
+    /// each session partition and pages through it, including pages that end
+    /// inside a partition, delivering every entity exactly once.
+    #[tokio::test]
+    async fn a_tenant_read_pages_through_partitions_split_across_pages() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, None, None);
+        for cql in [
+            "CREATE KEYSPACE tenant_pages WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE tenant_pages.entity_store (
+                tenant_id uuid, session_id uuid, entity_id int, name text,
+                PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX tenant_pages_by_tenant ON tenant_pages.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let tenant = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8";
+        let other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let mut expected = std::collections::BTreeSet::new();
+        for (owner, session) in [(tenant, 1), (tenant, 2), (tenant, 3), (other, 4)] {
+            for entity in 0..5 {
+                if owner == tenant {
+                    expected.insert((session, entity));
+                }
+                let cql = format!(
+                    "INSERT INTO tenant_pages.entity_store (tenant_id, session_id, entity_id, name) \
+                     VALUES ({owner}, 00000000-0000-0000-0000-00000000000{session}, {entity}, 'e')"
+                );
+                route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let Statement::Select(select) = crate::parser::parse(&format!(
+            "SELECT session_id, entity_id FROM tenant_pages.entity_store WHERE tenant_id = {tenant}"
+        ))
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            // A page of 4 over partitions of 5 rows ends inside partitions.
+            let page_ctx = paging_ctx(&auth, &no_ks, Some(4), cursor.clone());
+            let page = route_select_raw(&state, &page_ctx, &select).await.unwrap();
+            assert!(page.rows.len() <= 4, "a page never exceeds its size");
+            for row in &page.rows {
+                let (Some(CqlValue::Uuid(session)), Some(CqlValue::Int(entity))) =
+                    (&row[0], &row[1])
+                else {
+                    panic!("expected (session_id, entity_id), got {row:?}");
+                };
+                let session = session.as_bytes()[15] as i32;
+                assert!(
+                    seen.insert((session, *entity)),
+                    "session {session} entity {entity} was delivered twice"
+                );
+            }
+            cursor = page.paging_state;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the walk must reach the end");
+        assert_eq!(
+            seen, expected,
+            "every entity of the tenant, each once, none of another tenant"
+        );
+    }
+
     /// t_50c8bc7d: an aggregate over an index read folds each row as it
     /// streams — O(1) state per aggregate — instead of collecting the match
     /// set and aggregating the collection.

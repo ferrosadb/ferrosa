@@ -185,6 +185,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   (`OrderedPostings`), drops a row two sources hold by comparing it with the
   previous row, and resumes strictly after a cursor: memory is O(posting
   sources), never O(result); `read_by_index_stream_after` is its async form.
+  A partition-key-column index is partition-granular (t_c5bccc65): every row
+  of a partition shares the value, so the write path, the backfill and the
+  eager builder post `(pk, [])` once per partition, and the walk streams that
+  partition's rows in `rows_per_fragment` chunks through the retried
+  `read_limited_rows[_from]` instead of one point read per row — one
+  tenant's 101,848 entities were ~101k single-row reads. A cursor reopens its
+  partition (the seek is inclusive at `(pk, [])`), and row postings left by
+  sidecars written before this change are skipped once their partition has
+  streamed whole.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
   **falls back to scanning any live SSTable whose sidecar is transiently

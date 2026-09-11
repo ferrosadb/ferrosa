@@ -1085,9 +1085,41 @@ pub(crate) mod read_race_test_hook {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: rows an index read fetched by single-row point read.
+    static INDEX_POINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only: bounded chunks an index read streamed whole partitions in.
+    static INDEX_PARTITION_CHUNKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One row-ordered source of index postings: the memtable's pinned list or
 /// an SSTable sidecar's slice for the key.
 type PostingSource<'a> = Box<dyn Iterator<Item = &'a RowPosition> + 'a>;
+
+/// The row-ordered posting sources for one index key, each positioned at
+/// `from` (inclusive): the active memtable's pinned list, then every SSTable
+/// sidecar that holds the index.
+fn index_posting_sources<'a>(
+    view: &'a StoreView,
+    memtable: Option<&'a crate::memtable::index::PostingList>,
+    index_name: &str,
+    key: &'a IndexKey,
+    from: Option<&RowPosition>,
+) -> Vec<PostingSource<'a>> {
+    let mut sources: Vec<PostingSource<'a>> = Vec::with_capacity(view.sidecar_indexes.len() + 1);
+    if let Some(list) = memtable {
+        let postings = list.as_slice();
+        let start = postings.partition_point(|p| from.is_some_and(|start| p < start));
+        sources.push(Box::new(postings[start..].iter()));
+    }
+    for sidecar in view.sidecar_indexes.iter() {
+        if let Some(reader) = sidecar.get(index_name) {
+            sources.push(Box::new(reader.postings_from(key, from)));
+        }
+    }
+    sources
+}
 
 /// K-way merge of row-ordered posting sources, yielding each row once.
 ///
@@ -1615,9 +1647,14 @@ impl<F: FlushTarget> TableStore<F> {
                 let index_type = self.index_type_for(index_name);
                 match crate::index::scheduler::encode_index_key(index_type, value) {
                     Ok(Some(index_key)) => {
+                        // One posting per PARTITION (t_c5bccc65): every row of
+                        // the partition shares this value, so the posting names
+                        // the partition and the read streams its rows. A later
+                        // write to the same partition posts the same position,
+                        // which the index ignores.
                         let row_pos = RowPosition {
                             partition_key: key.key.as_bytes().to_vec(),
-                            clustering_key: row.clustering.clone(),
+                            clustering_key: Vec::new(),
                         };
                         match guard.indexes.get(index_name) {
                             Some(idx) => idx.insert(index_key, row_pos),
@@ -4945,8 +4982,10 @@ impl<F: FlushTarget> TableStore<F> {
     /// active memtable index and each SSTable sidecar) holds its postings in
     /// row order, so one `OrderedPostings` merge yields them in order, and a
     /// row held by two sources is dropped by comparing it with the previous
-    /// row rather than by remembering every row seen (t_50c8bc7d). Each
-    /// posting is point-read as it is reached and handed straight on.
+    /// row rather than by remembering every row seen (t_50c8bc7d). A row
+    /// posting is point-read as it is reached; a partition posting (pk, []),
+    /// which a partition-key index writes, streams the partition's rows in
+    /// bounded chunks instead of one point read per row (t_c5bccc65).
     pub fn read_by_index_each_after(
         &self,
         index_name: &str,
@@ -4978,37 +5017,129 @@ impl<F: FlushTarget> TableStore<F> {
             .indexes
             .get(index_name)
             .and_then(|index| index.posting_list(&lookup_key));
-        let mut sources: Vec<PostingSource<'_>> =
-            Vec::with_capacity(guard.sidecar_indexes.len() + 1);
-        if let Some(list) = &memtable {
-            let postings = list.as_slice();
-            let start = postings.partition_point(|p| after.is_some_and(|cursor| p <= cursor));
-            sources.push(Box::new(postings[start..].iter()));
-        }
-        for sidecar in guard.sidecar_indexes.iter() {
-            if let Some(reader) = sidecar.get(index_name) {
-                sources.push(Box::new(reader.postings_after(&lookup_key, after)));
-            }
-        }
+        // Seek to the cursor's PARTITION, inclusive: a partition posting
+        // (pk, []) sorts before every row of pk, and a page that stopped
+        // inside pk must reopen it. Rows at or before the cursor are dropped
+        // as they are reached.
+        let from = after.map(|cursor| RowPosition {
+            partition_key: cursor.partition_key.clone(),
+            clustering_key: Vec::new(),
+        });
+        let sources = index_posting_sources(
+            &guard,
+            memtable.as_ref(),
+            index_name,
+            &lookup_key,
+            from.as_ref(),
+        );
 
+        // The partition last streamed whole: a row posting for it (a sidecar
+        // written before partition postings) names a row already delivered.
+        let mut streamed_partition: Option<&[u8]> = None;
         for position in OrderedPostings::new(sources) {
-            let partition_key =
-                ferrosa_common::key::PartitionKey::new(position.partition_key.clone());
-            let decorated = DecoratedKey::new(partition_key);
-            let row = if position.clustering_key.is_empty() {
-                self.read(&decorated)?
-            } else {
-                self.read_clustering_row(&decorated, &position.clustering_key)?
-            };
-            let Some(partition) = row else {
-                // The posting outlived its row (deleted since it was indexed).
+            if streamed_partition == Some(position.partition_key.as_slice()) {
                 continue;
+            }
+            let resume = after
+                .filter(|cursor| cursor.partition_key == position.partition_key)
+                .map(|cursor| cursor.clustering_key.as_slice());
+            let flow = if position.clustering_key.is_empty() {
+                streamed_partition = Some(position.partition_key.as_slice());
+                self.stream_partition_rows(&position.partition_key, resume, visitor)?
+            } else if resume.is_some_and(|cursor| position.clustering_key.as_slice() <= cursor) {
+                continue;
+            } else {
+                self.visit_indexed_row(position, visitor)?
             };
-            if visitor(partition).is_break() {
+            if flow.is_break() {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// Point-read the one row a row posting names and hand it to `visitor`.
+    /// A posting that outlived its row (deleted since it was indexed) yields
+    /// nothing.
+    fn visit_indexed_row(
+        &self,
+        position: &RowPosition,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<std::ops::ControlFlow<()>> {
+        #[cfg(test)]
+        INDEX_POINT_READS.with(|count| count.set(count.get() + 1));
+        let decorated = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+            position.partition_key.clone(),
+        ));
+        let row = self.read_clustering_row(&decorated, &position.clustering_key)?;
+        Ok(match row {
+            Some(partition) => visitor(partition),
+            None => std::ops::ControlFlow::Continue(()),
+        })
+    }
+
+    /// Stream one partition's rows to `visitor` — a partition posting means
+    /// every row of the partition matches (t_c5bccc65). Rows go out one
+    /// single-row `Partition` at a time, the same shape a row posting yields,
+    /// strictly after `resume` when given. They are read in chunks of
+    /// `rows_per_fragment` under the store-view retry policy, so memory is one
+    /// chunk however wide the partition. Each full chunk advances past at
+    /// least one row, and a short chunk ends the partition, so the loop is
+    /// bounded by the partition's rows.
+    fn stream_partition_rows(
+        &self,
+        partition_key: &[u8],
+        resume: Option<&[u8]>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<std::ops::ControlFlow<()>> {
+        let key = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+            partition_key.to_vec(),
+        ));
+        let chunk_rows = crate::range_merger::rows_per_fragment().max(1);
+        let mut start: Option<Vec<u8>> = resume.map(<[u8]>::to_vec);
+        loop {
+            #[cfg(test)]
+            INDEX_PARTITION_CHUNKS.with(|count| count.set(count.get() + 1));
+            let chunk = match &start {
+                Some(after) => self.read_limited_rows_from(&key, after, chunk_rows)?,
+                None => self.read_limited_rows(&key, chunk_rows)?,
+            };
+            let Some(Partition {
+                key: chunk_key,
+                deletion,
+                static_row,
+                rows,
+            }) = chunk
+            else {
+                return Ok(std::ops::ControlFlow::Continue(()));
+            };
+            if rows.is_empty() && start.is_none() && static_row.is_some() {
+                // A partition holding only static cells still matches.
+                return Ok(visitor(Partition {
+                    key: chunk_key,
+                    deletion,
+                    static_row,
+                    rows,
+                }));
+            }
+            let more = rows.len() >= chunk_rows;
+            let last = rows.last().map(|row| row.clustering.clone());
+            for row in rows {
+                let single = Partition {
+                    key: chunk_key.clone(),
+                    deletion,
+                    static_row: static_row.clone(),
+                    rows: vec![row],
+                };
+                if visitor(single).is_break() {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            match (more, last) {
+                (true, Some(last)) => start = Some(last),
+                _ => return Ok(std::ops::ControlFlow::Continue(())),
+            }
+        }
     }
 
     /// Encode a raw query term into the index's native key space. A phonetic
@@ -11789,6 +11920,183 @@ mod tests {
             "an index on a partition-key component must return every row for that \
              component; wrote {mine} for tenant-a and the index returned {found}"
         );
+    }
+
+    // ── t_c5bccc65: a partition-key index is partition-granular ─────────────
+    //
+    // Every row of a partition shares its partition-key value, so the index
+    // has nothing to say per row. It used to post (pk, clustering) for every
+    // row and point-read each one: ~101k single-row reads for one tenant of
+    // agent_memory.entity_store. It now posts (pk, []) once per partition and
+    // streams the partition's rows in bounded chunks.
+
+    fn clustered_entity_store() -> TableStore<InMemoryFlushTarget> {
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "entity_store".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "entity_id".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "body".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let mut store = TableStore::new(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store.add_partition_key_index("idx_by_tenant".to_string(), 0, IndexType::BTree);
+        store
+    }
+
+    fn write_session(
+        store: &TableStore<InMemoryFlushTarget>,
+        tenant: &str,
+        session: &str,
+        rows: i32,
+    ) {
+        let key = make_composite_key(&[tenant, session]);
+        for entity in 1..=rows {
+            store
+                .write(&key, make_row_with_ck(entity, b"entity", 1000))
+                .unwrap();
+        }
+    }
+
+    /// The row positions an index read delivers, in delivery order.
+    fn tenant_rows(
+        store: &TableStore<InMemoryFlushTarget>,
+        after: Option<&RowPosition>,
+    ) -> Vec<RowPosition> {
+        let mut delivered = Vec::new();
+        store
+            .read_by_index_each_after(
+                "idx_by_tenant",
+                &IndexKey(b"tenant-a".to_vec()),
+                after,
+                &mut |partition| {
+                    delivered.extend(partition.rows.iter().map(|row| RowPosition {
+                        partition_key: partition.key.key.as_bytes().to_vec(),
+                        clustering_key: row.clustering.clone(),
+                    }));
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        delivered
+    }
+
+    #[test]
+    fn a_partition_key_index_posts_once_per_partition() {
+        let store = clustered_entity_store();
+        for session in ["s1", "s2", "s3"] {
+            write_session(&store, "tenant-a", session, 4);
+        }
+        write_session(&store, "tenant-b", "s9", 4);
+
+        let postings = store
+            .get_memtable_index("idx_by_tenant")
+            .expect("declared index")
+            .lookup(&IndexKey(b"tenant-a".to_vec()));
+        assert_eq!(
+            postings.len(),
+            3,
+            "one posting per tenant-a partition, not one per row: {postings:?}"
+        );
+        assert!(
+            postings.iter().all(|p| p.clustering_key.is_empty()),
+            "a partition posting names the partition, not a row: {postings:?}"
+        );
+    }
+
+    #[test]
+    fn a_partition_key_index_read_streams_partitions_instead_of_point_reading_rows() {
+        let store = clustered_entity_store();
+        write_session(&store, "tenant-a", "s1", 4);
+        write_session(&store, "tenant-a", "s2", 4);
+        store.flush().unwrap();
+        write_session(&store, "tenant-a", "s3", 4);
+        write_session(&store, "tenant-b", "s9", 4);
+
+        INDEX_POINT_READS.with(|count| count.set(0));
+        INDEX_PARTITION_CHUNKS.with(|count| count.set(0));
+        let delivered = tenant_rows(&store, None);
+
+        let mut expected = Vec::new();
+        for session in ["s1", "s2", "s3"] {
+            for entity in 1..=4_i32 {
+                expected.push(RowPosition {
+                    partition_key: make_composite_key(&["tenant-a", session])
+                        .key
+                        .as_bytes()
+                        .to_vec(),
+                    clustering_key: entity.to_be_bytes().to_vec(),
+                });
+            }
+        }
+        expected.sort();
+        assert_eq!(delivered, expected, "every tenant row, in row order, once");
+        assert_eq!(
+            INDEX_POINT_READS.with(|count| count.get()),
+            0,
+            "a partition-key index read must not point-read rows one at a time"
+        );
+        assert_eq!(
+            INDEX_PARTITION_CHUNKS.with(|count| count.get()),
+            3,
+            "one bounded chunk per (narrow) partition"
+        );
+    }
+
+    #[test]
+    fn a_partition_key_index_read_resumes_inside_a_partition() {
+        let store = clustered_entity_store();
+        for session in ["s1", "s2", "s3"] {
+            write_session(&store, "tenant-a", session, 4);
+        }
+        let all = tenant_rows(&store, None);
+        assert_eq!(all.len(), 12);
+
+        // Resume after the second row of the second partition.
+        let resumed = tenant_rows(&store, Some(&all[5]));
+        assert_eq!(
+            resumed,
+            all[6..].to_vec(),
+            "a page resumed mid-partition continues that partition, then the rest"
+        );
+    }
+
+    /// A sidecar written before this change posts every row. Beside the
+    /// partition posting, those rows must still come back once each.
+    #[test]
+    fn legacy_row_postings_beside_a_partition_posting_yield_each_row_once() {
+        let store = clustered_entity_store();
+        write_session(&store, "tenant-a", "s1", 3);
+        let key = make_composite_key(&["tenant-a", "s1"]);
+        let index = store.get_memtable_index("idx_by_tenant").unwrap();
+        for entity in 1..=3_i32 {
+            index.insert(
+                IndexKey(b"tenant-a".to_vec()),
+                RowPosition {
+                    partition_key: key.key.as_bytes().to_vec(),
+                    clustering_key: entity.to_be_bytes().to_vec(),
+                },
+            );
+        }
+
+        assert_eq!(tenant_rows(&store, None).len(), 3, "each row once");
     }
 
     /// The gate that decides whether the PLANNER may select such an index.
