@@ -45,6 +45,16 @@ jobs:
       - name: Check release binary path resolution
         run: python3 -m unittest tests.ci.test_resolve_release_bin_dir
 
+  no-memory-public:
+    name: memory-public is NOT TO BE USED
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: No reference to memory-public
+        run: bash scripts/guard-no-memory-public.sh
+      - name: Guard tests
+        run: bash tests/test_guard_no_memory_public.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
