@@ -1058,6 +1058,24 @@ impl WritePath {
         Ok((partitions, truncated))
     }
 
+    /// Whether THIS node's engine declares `index_name` on `table_id`.
+    ///
+    /// [`index_read_stream`](Self::index_read_stream) refuses an index a node
+    /// does not declare instead of answering it with zero rows, so a caller
+    /// that can fall back to a scan asks here first. In cluster mode the local
+    /// declaration stands in for the cluster's (schema is replicated); a
+    /// remote node that disagrees still fails the read loudly.
+    pub fn declares_index_locally(&self, table_id: &TableId, index_name: &str) -> bool {
+        match self {
+            Self::Direct(engine) => engine.declares_index(table_id, index_name),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .declares_index(table_id, index_name),
+            Self::Cluster(coordinator) => coordinator.storage.declares_index(table_id, index_name),
+            Self::Unavailable => false,
+        }
+    }
+
     /// Stream a global secondary-index lookup without materializing all
     /// matching partitions. The cluster path deduplicates row identities
     /// across replicas while every storage/RPC hop remains bounded.

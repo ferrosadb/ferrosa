@@ -175,6 +175,38 @@ async fn a_bound_subject_alone_finds_its_triples() {
     );
 }
 
+/// A bound object is an `ObjectScan`, which consults `rdf_triples_object_idx`
+/// when this node has it and otherwise scans. Nothing creates that index, so
+/// the scan is the path every such query takes. It used to get there by
+/// reading the missing index as "no hits"; since an undeclared index is now
+/// refused rather than answered empty (t_50c8bc7d), the executor must choose
+/// the scan up front instead of leaning on that silent answer. Both before
+/// and after a flush.
+#[tokio::test]
+async fn a_bound_object_finds_its_triples_without_an_object_index() {
+    let (storage, wp, _dir) = setup();
+    let eng = engine(Arc::clone(&storage), wp);
+
+    eng.execute_update(
+        "INSERT DATA { \
+            <urn:qa:probe> <urn:qa:says> \"hello\" . \
+            <urn:qa:other> <urn:qa:says> \"elsewhere\" }",
+        KS,
+    )
+    .await
+    .expect("insert data");
+
+    let before_flush = select_count(&eng, "SELECT ?s WHERE { ?s ?p \"hello\" }").await;
+    storage.flush_all().expect("flush to sstables");
+    let after_flush = select_count(&eng, "SELECT ?s WHERE { ?s ?p \"hello\" }").await;
+    assert_eq!(
+        (before_flush, after_flush),
+        (1, 1),
+        "a bound object must find exactly its own triple whether or not an \
+         object index exists"
+    );
+}
+
 /// A subject that genuinely has no triples must return zero -- otherwise a fix
 /// for the above could be "return everything", which would pass the tests above
 /// while being just as wrong in the other direction.

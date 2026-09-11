@@ -153,7 +153,11 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   replica visits postings incrementally, and the coordinator forwards bounded
   partitions. The coordinator retains `O(result)` row identities for
   cross-replica deduplication; CQL global index scans use
-  `WritePath::index_read_stream`.
+  `WritePath::index_read_stream`. A replica that does not declare the index
+  refuses the walk (truncated `Done` → `TruncatedReplica`) instead of
+  contributing zero rows, so a tenant-wide read through a partition-key index
+  either unions every node's slice or fails (t_50c8bc7d); callers with a scan
+  alternative check `WritePath::declares_index_locally` first.
   The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
   `consume_range_stream_into` MOVE each decoded partition into a sink one at a
   time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`

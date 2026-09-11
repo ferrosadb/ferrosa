@@ -1313,7 +1313,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // table schemas with no indexes, so without this every secondary index is
     // silently dropped on restart. This runs after system tables (step 3) and
     // user tables (above) are registered so `add_index` can resolve targets.
-    match storage.reload_indexes_from_system_schema() {
+    // The storage schema has no partition-key column names, so they come from
+    // the CQL schema — without them an index on a partition-key column (the
+    // tenant index of a `((tenant_id, session_id), ..)` table) is dropped here
+    // while the planner keeps selecting it (t_50c8bc7d).
+    let partition_keys: ferrosa_storage::engine::PartitionKeyColumns = schema
+        .snapshot()
+        .tables
+        .values()
+        .map(|table| {
+            (
+                ferrosa_storage::TableId::new(&table.keyspace, &table.name),
+                table.partition_key.clone(),
+            )
+        })
+        .collect();
+    match storage.reload_indexes_from_system_schema(&partition_keys) {
         // A non-zero `skipped` (dangling registrations) is already warned
         // about — with a count — inside the reload, and surfaces in the
         // `ferrosa_storage_index_reload_skipped_rows_total` metric.

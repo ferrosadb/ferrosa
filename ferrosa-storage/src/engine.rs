@@ -1122,6 +1122,15 @@ pub struct IndexReloadOutcome {
     pub skipped: usize,
 }
 
+/// Partition-key column NAMES per table, in key order, for
+/// [`StorageEngine::reload_indexes_from_system_schema`].
+///
+/// The storage [`TableSchema`] records only the
+/// composite partition-key TYPE, not the column names, so the engine cannot
+/// resolve an index target like `tenant_id` to a partition-key component on
+/// its own. The boot path holds the CQL schema and supplies them.
+pub type PartitionKeyColumns = HashMap<TableId, Vec<String>>;
+
 /// A decoded row of the persisted `system_schema.types` table.
 ///
 /// Returned by [`StorageEngine::read_persisted_types`] so both the CQL router
@@ -3322,7 +3331,15 @@ impl StorageEngine {
     /// one summary warn plus the
     /// `ferrosa_storage_index_reload_skipped_rows_total` metric — per-row
     /// detail stays at debug level — rather than aborting the whole reload.
-    pub fn reload_indexes_from_system_schema(&self) -> ferrosa_common::Result<IndexReloadOutcome> {
+    ///
+    /// `partition_keys` names each table's partition-key columns so an index
+    /// on one of them (e.g. `tenant_id` of `((tenant_id, session_id), ..)`) is
+    /// restored — and backfilled — rather than dropped. A table missing from
+    /// the map has no resolvable partition-key indexes.
+    pub fn reload_indexes_from_system_schema(
+        &self,
+        partition_keys: &PartitionKeyColumns,
+    ) -> ferrosa_common::Result<IndexReloadOutcome> {
         let indexes_tid = TableId::new("system_schema", "indexes");
         if !self.tables.read().contains_key(&indexes_tid) {
             // Table not registered (no dogfooded schema yet) — nothing to do.
@@ -3352,7 +3369,7 @@ impl StorageEngine {
                 if row.cells.is_empty() && !row.deletion.is_live() {
                     continue;
                 }
-                if self.reload_one_index(&keyspace, row)? {
+                if self.reload_one_index(&keyspace, row, partition_keys)? {
                     restored += 1;
                 } else {
                     skipped += 1;
@@ -3545,7 +3562,12 @@ impl StorageEngine {
     ///
     /// Returns `Ok(true)` when the index was re-registered, `Ok(false)` when the
     /// row was skipped (tombstone, unknown kind, unresolvable column/table).
-    fn reload_one_index(&self, keyspace: &str, row: &Row) -> ferrosa_common::Result<bool> {
+    fn reload_one_index(
+        &self,
+        keyspace: &str,
+        row: &Row,
+        partition_keys: &PartitionKeyColumns,
+    ) -> ferrosa_common::Result<bool> {
         let Some((table, index_name)) = decode_index_clustering(&row.clustering) else {
             tracing::warn!(
                 keyspace,
@@ -3625,6 +3647,41 @@ impl StorageEngine {
                     index_name,
                     kind,
                     "re-registered persisted clustering-column index after restart"
+                );
+                return Ok(true);
+            }
+            // Or a PARTITION-KEY column index (t_50c8bc7d). Dropping this one
+            // is not a lost optimisation: the CQL schema still lists the index,
+            // the planner still selects it, and a consult of an index the
+            // engine no longer has answers with zero rows.
+            if let Some(component) = partition_keys
+                .get(&table_id)
+                .and_then(|names| names.iter().position(|name| name == target_col))
+            {
+                if !matches!(
+                    index_type,
+                    ferrosa_index::IndexType::BTree
+                        | ferrosa_index::IndexType::Hash
+                        | ferrosa_index::IndexType::Composite
+                        | ferrosa_index::IndexType::Phonetic
+                ) {
+                    tracing::warn!(
+                        keyspace,
+                        table,
+                        index_name,
+                        target_col,
+                        kind,
+                        "partition-key-column index reload supports scalar index kinds only — skipping"
+                    );
+                    return Ok(false);
+                }
+                self.add_partition_key_index(&table_id, &index_name, component, index_type)?;
+                tracing::info!(
+                    keyspace,
+                    table,
+                    index_name,
+                    kind,
+                    "re-registered persisted partition-key-column index after restart"
                 );
                 return Ok(true);
             }
@@ -8958,6 +9015,17 @@ impl StorageEngine {
     /// Returns the shared index state tracker.
     pub fn index_tracker(&self) -> &Arc<crate::index::IndexStateTracker> {
         &self.index_tracker
+    }
+
+    /// Whether `table_id` declares the secondary index `index_name` in this
+    /// engine. A global index read of an undeclared index is refused rather
+    /// than answered empty (t_50c8bc7d), so a caller with another access path
+    /// checks this first instead of mistaking the refusal for a miss.
+    pub fn declares_index(&self, table_id: &TableId, index_name: &str) -> bool {
+        self.tables
+            .read()
+            .get(table_id)
+            .is_some_and(|state| state.store.secondary_index_declared(index_name))
     }
 
     /// Returns true when the named index is registered and its build tracker
@@ -17558,6 +17626,122 @@ mod tests {
         );
     }
 
+    /// An index on a PARTITION-KEY column must survive a restart (t_50c8bc7d).
+    ///
+    /// The live failure: `agent_memory.entity_store` is keyed
+    /// `((tenant_id, session_id), entity_id)` and carries
+    /// `idx_entity_by_tenant ON entity_store (tenant_id)`. After a restart the
+    /// reload re-registered regular and clustering indexes but not this one,
+    /// so it was counted as a "dangling registration" and dropped. The CQL
+    /// schema still listed it, the planner still chose it, and the engine
+    /// answered a consult of an index it did not have with zero rows —
+    /// 101,848 entities read as an empty database.
+    ///
+    /// The storage schema carries no partition-key column NAMES (only the
+    /// composite key type), so the reload is told them by the caller, which
+    /// holds the CQL schema.
+    #[test]
+    fn a_partition_key_index_survives_restart_and_answers() {
+        use ferrosa_index::IndexKey;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "entity_store");
+        let indexes_tid = TableId::new("system_schema", "indexes");
+        let schema = ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "entity_store".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UUIDType,\
+                       org.apache.cassandra.db.marshal.UUIDType)"
+                .into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "body".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+            extensions: Default::default(),
+        };
+        let idx_meta = ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "test_ks".into(),
+            table: "entity_store".into(),
+            name: "idx_by_tenant".into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["tenant_id".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let mut tenant_a = [0u8; 16];
+        tenant_a[0] = 1;
+
+        let mut tenant_a_rows = 0usize;
+        {
+            let config = StorageEngineConfig::test_config(dir.path());
+            let engine = StorageEngine::new(config, None).unwrap();
+            engine.register_table(schema.clone()).unwrap();
+            engine.register_system_tables().unwrap();
+            engine
+                .add_partition_key_index(&tid, "idx_by_tenant", 0, ferrosa_index::IndexType::BTree)
+                .unwrap();
+            let row = persistence::index_to_rows(&idx_meta);
+            engine
+                .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
+                .unwrap();
+
+            for i in 0..8u8 {
+                let mut tenant = [0u8; 16];
+                tenant[0] = if i % 2 == 0 { 1 } else { 2 };
+                if i % 2 == 0 {
+                    tenant_a_rows += 1;
+                }
+                let mut session = [0u8; 16];
+                session[0] = i;
+                let row = Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                };
+                engine
+                    .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                    .unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            engine.flush(&indexes_tid).unwrap();
+        }
+
+        let config = StorageEngineConfig::test_config(dir.path());
+        let (engine, _pending) = StorageEngine::open(config, None).unwrap();
+        engine.register_system_tables().unwrap();
+
+        let partition_keys = PartitionKeyColumns::from([(
+            tid.clone(),
+            vec!["tenant_id".to_string(), "session_id".to_string()],
+        )]);
+        let outcome = engine
+            .reload_indexes_from_system_schema(&partition_keys)
+            .unwrap();
+        assert_eq!(
+            (outcome.restored, outcome.skipped),
+            (1, 0),
+            "the partition-key index must be RESTORED after a restart, not \
+             skipped as a dangling registration"
+        );
+
+        let found: usize =
+            collect_index_results(&engine, &tid, "idx_by_tenant", &IndexKey(tenant_a.to_vec()))
+                .unwrap()
+                .iter()
+                .map(|p| p.rows.len())
+                .sum();
+        assert_eq!(
+            found, tenant_a_rows,
+            "after a restart the tenant index must still answer for every \
+             flushed row of the tenant"
+        );
+    }
+
     /// Geo schema: a `places` table whose `location` column is a
     /// `frozen<tuple<double,double>>` indexed with `IndexType::Geo`.
     fn geo_schema() -> TableSchema {
@@ -20216,7 +20400,9 @@ mod tests {
             "index must be absent before reconstruction — proves the test exercises the fix"
         );
 
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(
             outcome.restored, 1,
             "exactly one persisted index should be restored"
@@ -20310,9 +20496,9 @@ mod tests {
                 "val_idx",
                 &IndexKey(b"indexed".to_vec()),
             )
-            .unwrap()
-            .is_empty(),
-            "dropped index must not serve stale live index state before restart"
+            .is_err(),
+            "dropped index must not serve stale live index state before restart, \
+             and must not report its absence as zero rows"
         );
         assert!(
             !engine.drop_index(&table_id, "val_idx").unwrap(),
@@ -20557,7 +20743,9 @@ mod tests {
         );
 
         let metric_before = crate::metrics::index_reload_skipped_rows_total();
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(outcome.restored, 1, "the resolvable index is restored");
         assert_eq!(
             outcome.skipped, 2,
@@ -20575,7 +20763,9 @@ mod tests {
                 .unwrap(),
             2
         );
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(outcome.skipped, 0, "no orphans remain after the cascade");
         assert_eq!(outcome.restored, 1);
     }
@@ -20637,7 +20827,9 @@ mod tests {
         );
         engine.replay_mutations(pending).unwrap();
 
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(
             outcome.skipped, 0,
             "no orphaned registrations may survive DROP TABLE + restart"
@@ -20868,7 +21060,9 @@ mod tests {
         let (engine, _pending) = StorageEngine::open(config, None).unwrap();
         engine.register_system_tables().unwrap();
 
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(outcome.restored, 1, "the filtered index should be restored");
 
         assert_eq!(
@@ -22041,7 +22235,9 @@ mod tests {
         engine
             .write(&indexes_tid, &row.key, row.row, now_micros_for_test())
             .unwrap();
-        let outcome = engine.reload_indexes_from_system_schema().unwrap();
+        let outcome = engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
         assert_eq!(
             outcome.restored, 0,
             "the dangling registration must be skipped, not restored"
@@ -22176,7 +22372,9 @@ mod tests {
         let config = StorageEngineConfig::test_config(dir.path());
         let (engine, _pending) = StorageEngine::open(config, None).unwrap();
         engine.register_system_tables().unwrap();
-        engine.reload_indexes_from_system_schema().unwrap();
+        engine
+            .reload_indexes_from_system_schema(&PartitionKeyColumns::new())
+            .unwrap();
 
         // The bug: fts_match must still return the row after restart.
         let hits = engine

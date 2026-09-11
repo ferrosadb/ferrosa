@@ -19795,6 +19795,108 @@ mod tests {
         );
     }
 
+    /// The live t_50c8bc7d shape: `entity_store` keyed `((tenant_id,
+    /// session_id), entity_id)` with `idx_entity_by_tenant ON (tenant_id)`.
+    ///
+    /// A tenant-wide read is served by the tenant index. When the engine has
+    /// lost that index while the schema still lists it — what a restart did
+    /// before partition-key indexes were reloaded — the planner still selects
+    /// it, and both live queries returned 0 over 101,848 rows. Either answer
+    /// correctly or refuse; never zero.
+    #[tokio::test]
+    async fn a_tenant_index_the_engine_lost_is_refused_not_answered_empty() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE agent_memory WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE agent_memory.entity_store (
+                tenant_id uuid,
+                session_id uuid,
+                entity_id uuid,
+                entity_name text,
+                PRIMARY KEY ((tenant_id, session_id), entity_id)
+            )",
+            "CREATE INDEX idx_entity_by_tenant ON agent_memory.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let tenant = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8";
+        let other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        for (owner, session) in [(tenant, 1), (tenant, 2), (tenant, 3), (other, 4)] {
+            let cql = format!(
+                "INSERT INTO agent_memory.entity_store \
+                 (tenant_id, session_id, entity_id, entity_name) \
+                 VALUES ({owner}, 00000000-0000-0000-0000-00000000000{session}, \
+                         10000000-0000-0000-0000-00000000000{session}, 'e{session}')"
+            );
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let rows_cql = format!(
+            "SELECT tenant_id FROM agent_memory.entity_store \
+             WHERE tenant_id = {tenant} ALLOW FILTERING"
+        );
+        let count_cql = format!(
+            "SELECT count(*) FROM agent_memory.entity_store \
+             WHERE tenant_id = {tenant} ALLOW FILTERING"
+        );
+
+        // Served by the tenant index: every one of the tenant's sessions.
+        let rows = route(&state, &ctx, crate::parser::parse(&rows_cql).unwrap())
+            .await
+            .unwrap();
+        let RouteResult::Result(rows) = rows else {
+            panic!("expected rows");
+        };
+        assert_eq!(extract_row_count(&rows), 3, "tenant rows via the index");
+        let count = route(&state, &ctx, crate::parser::parse(&count_cql).unwrap())
+            .await
+            .unwrap();
+        let RouteResult::Result(count) = count else {
+            panic!("expected a count");
+        };
+        assert_eq!(
+            extract_first_bigint_value(&count),
+            3,
+            "tenant count via the index"
+        );
+
+        // The engine loses the index; the schema keeps it.
+        let table_id = TableId::new("agent_memory", "entity_store");
+        assert!(state
+            .engine
+            .drop_index(&table_id, "idx_entity_by_tenant")
+            .unwrap());
+
+        for cql in [&rows_cql, &count_cql] {
+            match route(&state, &ctx, crate::parser::parse(cql).unwrap()).await {
+                Err(err) => assert!(
+                    err.to_string().contains("idx_entity_by_tenant"),
+                    "the refusal must name the index: {err}"
+                ),
+                Ok(RouteResult::Result(buf)) => panic!(
+                    "`{cql}` answered from an index the engine does not have \
+                     ({} result rows) instead of refusing",
+                    extract_row_count(&buf),
+                ),
+                Ok(_) => panic!("`{cql}` returned a non-result"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn select_distinct_tenant_id_returns_unique_partition_key_components() {
         let (state, _dir) = setup();
