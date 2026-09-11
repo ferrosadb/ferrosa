@@ -309,7 +309,7 @@ jobs:
       - name: Pre-pull the Jepsen compose images
         run: |
           docker pull rustfs/rustfs:latest
-          docker pull minio/mc
+          docker pull quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run Jepsen smoke tier
         env:
@@ -387,7 +387,7 @@ jobs:
                 retries: 10
                 start_period: 10s
             rustfs-init:
-              image: minio/mc
+              image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
               depends_on:
                 rustfs:
                   condition: service_healthy
