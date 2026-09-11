@@ -8,11 +8,22 @@ WORKFLOW = ROOT / ".github" / "workflows" / "install-smoke.yml"
 
 
 def jobs_routed_to_self_hosted(workflow: str) -> list[str]:
-    """Names of the jobs in this workflow whose matrix routes to self-hosted runners."""
+    """Names of the jobs whose ROUTING — not prose — names a self-hosted runner.
+
+    Reads `runs-on:` and `runner:` values only. An earlier version searched the
+    whole job block for the string "self-hosted", and when this workflow moved
+    to hosted runners it kept passing on the strength of a COMMENT that still
+    mentioned them: a test written to notice that nothing routes to self-hosted
+    any more, satisfied by prose about self-hosted. Match on the routing lines,
+    so the answer cannot come from a comment.
+    """
     names = []
     for block in re.split(r"\n  (?=[a-z][a-z0-9_-]*:\n)", workflow):
         header = block.split(":", 1)[0].strip()
-        if "self-hosted" in block and header:
+        if not header:
+            continue
+        routes = re.findall(r"^\s*(?:runs-on|runner):\s*(.+)$", block, re.M)
+        if any("self-hosted" in r for r in routes):
             names.append(header)
     return names
 
@@ -38,10 +49,18 @@ class InstallSmokeWorkflowTest(unittest.TestCase):
     def test_dependency_install_does_not_assume_passwordless_sudo(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertTrue(
+        # No precondition on self-hosted routing any more: ferrosa is public,
+        # and GitHub does not offer self-hosted runners to a public repo's
+        # workflows at an arbitrary ref, so these jobs were moved to hosted
+        # runners. The guard below is kept regardless — it costs nothing on a
+        # hosted runner, where `sudo -n` simply succeeds, and it is what makes
+        # this workflow safe to point back at a self-hosted box later.
+        self.assertEqual(
             jobs_routed_to_self_hosted(workflow),
-            "this test is meaningless if nothing here routes to a self-hosted "
-            "runner any more — delete it, or re-point it at wherever they went",
+            [],
+            "these jobs are expected to run on HOSTED runners while ferrosa is "
+            "public; if they have been pointed back at self-hosted, confirm the "
+            "ref constraint no longer bites before trusting this workflow",
         )
 
         bare_sudo = re.findall(r"^\s*run: sudo apt-get .*$", workflow, re.MULTILINE)
