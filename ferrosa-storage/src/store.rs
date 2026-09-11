@@ -1122,6 +1122,57 @@ fn index_posting_sources<'a>(
     sources
 }
 
+/// K-way merge of whole sidecars in `(key, row)` order, yielding each entry
+/// once: one head per sidecar, duplicates dropped by comparison with the
+/// previous entry.
+struct MergedSidecarEntries<'a> {
+    sources: Vec<Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>>,
+    heads: std::collections::BinaryHeap<std::cmp::Reverse<((&'a [u8], RowPositionRef<'a>), usize)>>,
+    previous: Option<(&'a [u8], RowPositionRef<'a>)>,
+}
+
+impl<'a> MergedSidecarEntries<'a> {
+    fn new(readers: &[&'a SidecarReader]) -> Self {
+        let mut sources: Vec<Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>> =
+            readers
+                .iter()
+                .map(|reader| {
+                    Box::new(reader.entries_in_order())
+                        as Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>
+                })
+                .collect();
+        let mut heads = std::collections::BinaryHeap::with_capacity(sources.len());
+        for (index, source) in sources.iter_mut().enumerate() {
+            if let Some(first) = source.next() {
+                heads.push(std::cmp::Reverse((first, index)));
+            }
+        }
+        Self {
+            sources,
+            heads,
+            previous: None,
+        }
+    }
+}
+
+impl<'a> Iterator for MergedSidecarEntries<'a> {
+    type Item = (&'a [u8], RowPositionRef<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let std::cmp::Reverse((entry, index)) = self.heads.pop()?;
+            if let Some(following) = self.sources[index].next() {
+                self.heads.push(std::cmp::Reverse((following, index)));
+            }
+            if self.previous == Some(entry) {
+                continue;
+            }
+            self.previous = Some(entry);
+            return Some(entry);
+        }
+    }
+}
+
 /// K-way merge of row-ordered posting sources, yielding each row once.
 ///
 /// Holds one head per source and the previous row: a row present in two
@@ -6447,6 +6498,63 @@ impl<F: FlushTarget> TableStore<F> {
     /// because different directories (flush vs compaction) can produce the same
     /// generation number. Matching on both fields prevents accidental removal
     /// of an SSTable that happens to share a gen with an input in a different dir.
+    /// Build the compaction output's sidecars by merging the inputs' (t_7ac6b0e3).
+    ///
+    /// A posting names a row by `(partition key, clustering)` — a key, not a
+    /// file offset — so every input posting stays valid for the merged
+    /// output. Per index, the inputs' sidecars are k-way merged in `(key, row)`
+    /// order, adjacent duplicates dropped, streamed through the atomic writer
+    /// to `{output_gen}-{index}.sidecar` in `output_dir`, and mapped: memory is
+    /// one head per input, and no SSTable is rescanned. A posting whose row
+    /// the compaction dropped is harmless — the read finds no row, or a row the
+    /// query's predicate rejects.
+    ///
+    /// Returns an error rather than a partial map: a compaction swapped in
+    /// without an input's postings would leave that index short.
+    pub(crate) fn merge_sidecars_for_compaction(
+        &self,
+        input_ids: &[(String, std::path::PathBuf)],
+        output_dir: &std::path::Path,
+        output_gen: &str,
+    ) -> Result<HashMap<String, SidecarReader>> {
+        let guard = self.view.load();
+        let mut inputs_by_index: HashMap<&str, Vec<&SidecarReader>> = HashMap::new();
+        for (position, (id, _)) in guard.sstable_ids.iter().enumerate() {
+            if !input_ids.iter().any(|(input_id, _)| input_id == id) {
+                continue;
+            }
+            let Some(sidecars) = guard.sidecar_indexes.get(position) else {
+                continue;
+            };
+            for (index_name, reader) in sidecars.iter() {
+                inputs_by_index
+                    .entry(index_name.as_str())
+                    .or_default()
+                    .push(reader);
+            }
+        }
+        let mut merged = HashMap::with_capacity(inputs_by_index.len());
+        for (index_name, readers) in inputs_by_index {
+            let path = output_dir.join(format!("{output_gen}-{index_name}.sidecar"));
+            let written = crate::index::sidecar::SidecarWriter::write_sorted(
+                &path,
+                MergedSidecarEntries::new(&readers).map(|(key, position)| {
+                    Ok((IndexKey(key.to_vec()), position.to_owned_position()))
+                }),
+            )
+            .and_then(|_| SidecarReader::open(&path))
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "compaction: could not build the output sidecar for index '{index_name}' \
+                     at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            merged.insert(index_name.to_string(), written);
+        }
+        Ok(merged)
+    }
+
     pub fn swap_compacted_sstables(
         &self,
         input_ids: &[(String, std::path::PathBuf)],

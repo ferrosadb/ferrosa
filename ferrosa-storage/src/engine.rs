@@ -714,6 +714,37 @@ pub fn log_auth_warn_state(auth_enabled: bool, auth_warn: bool) {
     }
 }
 
+/// The scheduler's sidecar installer: map the sidecar it just wrote and put it
+/// into the owning table's live view (t_7ac6b0e3).
+fn sidecar_installer(
+    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+) -> crate::index::scheduler::SidecarInstaller {
+    let tables = Arc::clone(tables);
+    Arc::new(move |job, index_name, path| {
+        let reader = crate::index::sidecar::SidecarReader::open(path)
+            .map_err(|e| format!("map {}: {e}", path.display()))?;
+        let table_id = TableId::new(&job.table.0, &job.table.1);
+        let tables = tables.read();
+        let state = tables
+            .get(&table_id)
+            .ok_or_else(|| format!("table {table_id} is not registered"))?;
+        if !state
+            .store
+            .install_sidecar(&job.sstable_id, index_name, reader)
+        {
+            // Not a loss: the SSTable was compacted away while this built, and
+            // the compaction output carries its postings (merged at the swap).
+            tracing::info!(
+                %table_id,
+                index_name,
+                sstable = %job.sstable_id,
+                "index-build: SSTable left the view before its sidecar was installed"
+            );
+        }
+        Ok(())
+    })
+}
+
 /// Build the index scheduler and tracker based on the engine configuration.
 ///
 /// Returns `(Option<IndexBuildScheduler>, Arc<IndexStateTracker>)`.
@@ -721,11 +752,13 @@ pub fn log_auth_warn_state(auth_enabled: bool, auth_warn: bool) {
 /// threads are spawned.
 fn build_index_scheduler(
     config: &StorageEngineConfig,
+    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
 ) -> (
     Option<crate::index::IndexBuildScheduler>,
     Arc<crate::index::IndexStateTracker>,
 ) {
     let tracker = Arc::new(crate::index::IndexStateTracker::new());
+    let installer = sidecar_installer(tables);
 
     let scheduler = match &config.index_backend {
         crate::index::IndexBackendConfig::Off => None,
@@ -737,6 +770,7 @@ fn build_index_scheduler(
                     Arc::clone(&tracker),
                     backend,
                     config.data_dir.clone(),
+                    Some(Arc::clone(&installer)),
                 ),
             )
         }
@@ -773,6 +807,7 @@ fn build_index_scheduler(
                     Arc::clone(&tracker),
                     backend,
                     config.data_dir.clone(),
+                    Some(Arc::clone(&installer)),
                 ),
             )
         }
@@ -891,7 +926,8 @@ fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes:
 /// `TableStore`. The commit log is shared across all tables.
 pub struct StorageEngine {
     config: StorageEngineConfig,
-    tables: RwLock<HashMap<TableId, TableState>>,
+    /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
+    tables: Arc<RwLock<HashMap<TableId, TableState>>>,
     pub(crate) commit_log: CommitLog,
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
@@ -2030,11 +2066,12 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
 
         let engine = Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -2214,11 +2251,12 @@ impl StorageEngine {
             _ => None,
         };
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
 
         Ok(Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -2311,9 +2349,8 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
-
-        let tables = RwLock::new(HashMap::new());
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
         if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
             for schema in schemas {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -7928,12 +7965,27 @@ impl StorageEngine {
                         state.store.advance_gen_past(gen_num);
                     }
                     let pre_swap_count = state.store.sstable_count();
+                    // The output carries its inputs' index postings (t_7ac6b0e3):
+                    // swapping it in with no sidecars left every scalar index
+                    // short of the compacted rows until a restart. A merge that
+                    // fails leaves the inputs live rather than the index short.
+                    let output_sidecars = match state.store.merge_sidecars_for_compaction(
+                        &input_id_paths,
+                        dir,
+                        gen,
+                    ) {
+                        Ok(sidecars) => sidecars,
+                        Err(e) => {
+                            tracing::error!(%e, %table_id, "compaction: output sidecars could not be built; keeping the inputs");
+                            continue;
+                        }
+                    };
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
                         output.path.clone(),
                         reader,
-                        std::collections::HashMap::new(),
+                        output_sidecars,
                     ) {
                         tracing::error!(%e, "compaction: swap failed");
                         continue;
@@ -10083,11 +10135,12 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
 
         Ok(Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -17690,6 +17743,154 @@ mod tests {
     /// The storage schema carries no partition-key column NAMES (only the
     /// composite key type), so the reload is told them by the caller, which
     /// holds the CQL schema.
+    /// t_7ac6b0e3: an index created over data already flushed answers for
+    /// that data as soon as its backfill completes. The scheduler wrote the
+    /// backfilled sidecar to disk and marked the SSTable indexed, but never
+    /// installed it: the index read nothing for pre-existing SSTables until a
+    /// restart loaded the file.
+    #[test]
+    fn a_backfilled_sidecar_is_served_without_a_restart() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        (0..15).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        // Hang guard, not a timing assertion: the backfill always completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill must complete"
+        );
+
+        let found = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .unwrap()
+            .len();
+        assert_eq!(
+            found, 15,
+            "once its backfill is current, the index answers for data that predates it"
+        );
+        assert!(
+            engine
+                .sidecar_backings_for_test(&tid, "val_idx")
+                .iter()
+                .all(|mapped| *mapped),
+            "the backfilled sidecar is mapped"
+        );
+    }
+
+    /// t_7ac6b0e3: an index still answers for rows a compaction merged. The
+    /// swap used to install the output SSTable with NO sidecars (and the
+    /// rebuilt file was written to disk but never installed), so every scalar
+    /// index silently lost the compacted rows until the next restart.
+    #[tokio::test]
+    async fn an_index_answers_for_rows_a_compaction_merged() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        (0..10).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("a{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        (0..10).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("b{i}")),
+                    make_row(b"shared", 2000),
+                    2000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+        let key = IndexKey(b"shared".to_vec());
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &key)
+                .unwrap()
+                .len(),
+            20,
+            "precondition: both SSTables' sidecars answer"
+        );
+
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            engine
+                .compaction_executor
+                .submit(crate::compaction::metadata::CompactionTask {
+                    inputs: metadata,
+                    output_dir: dir.path().join("compaction"),
+                    schema: test_schema(),
+                    table_id: tid.clone(),
+                })
+                .unwrap();
+        }
+        // Hang guard (~30s), not a timing assertion.
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(swapped, "the compaction must merge the two SSTables");
+
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &key)
+                .unwrap()
+                .len(),
+            20,
+            "after the compaction, without a restart, the index must still answer \
+             for every row the compaction merged"
+        );
+        assert!(
+            engine
+                .sidecar_backings_for_test(&tid, "val_idx")
+                .iter()
+                .all(|mapped| *mapped),
+            "the compaction output's sidecar is mapped"
+        );
+    }
+
     /// t_7ac6b0e3: a flushed sidecar is served from its file through a
     /// memory map. Flush used to keep a heap copy of every flushed sidecar in
     /// the view for the life of the SSTable, beside the file it had written.

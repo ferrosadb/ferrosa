@@ -466,6 +466,13 @@ impl IndexBuildBackend for LocalBackend {
 /// Callback invoked after each index build job completes successfully.
 pub type BuildCompleteCallback = Box<dyn Fn(&IndexBuildJob) + Send + Sync>;
 
+/// Installs a sidecar the scheduler just wrote into the owning table's live
+/// view: `(job, index_name, path)`. The scheduler calls it BEFORE marking the
+/// SSTable indexed, so an index the tracker reports current is one the read
+/// path already serves (t_7ac6b0e3). An `Err` marks the build failed.
+pub type SidecarInstaller =
+    Arc<dyn Fn(&IndexBuildJob, &str, &Path) -> std::result::Result<(), String> + Send + Sync>;
+
 /// Background scheduler that dispatches index build jobs to worker threads.
 ///
 /// Follows the `CompactionExecutor` pattern: an mpsc channel feeds N worker
@@ -585,11 +592,14 @@ impl IndexBuildScheduler {
     }
 
     /// Creates a scheduler with backend and data directory for sidecar writes.
+    /// `installer`, when given, puts each written sidecar into the live view
+    /// before its SSTable is marked indexed.
     pub fn with_backend_and_data_dir(
         worker_count: usize,
         tracker: Arc<IndexStateTracker>,
         backend: Arc<dyn IndexBuildBackend>,
         data_dir: PathBuf,
+        installer: Option<SidecarInstaller>,
     ) -> Self {
         let (task_tx, task_rx) = std::sync::mpsc::channel::<IndexBuildJob>();
         let task_rx = Arc::new(Mutex::new(task_rx));
@@ -604,11 +614,19 @@ impl IndexBuildScheduler {
             let tracker = Arc::clone(&tracker);
             let backend = Arc::clone(&backend);
             let data_dir = data_dir.clone();
+            let installer = installer.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("index-builder-{i}"))
                 .spawn(move || {
-                    Self::worker_loop_full(&rx, &stop, &tracker, &*backend, &data_dir);
+                    Self::worker_loop_full(
+                        &rx,
+                        &stop,
+                        &tracker,
+                        &*backend,
+                        &data_dir,
+                        installer.as_ref(),
+                    );
                 })
                 .expect("failed to spawn index builder thread");
 
@@ -741,9 +759,8 @@ impl IndexBuildScheduler {
         tracker: &IndexStateTracker,
         backend: &dyn IndexBuildBackend,
         data_dir: &std::path::Path,
+        installer: Option<&SidecarInstaller>,
     ) {
-        use crate::index::sidecar::SidecarWriter;
-
         while !stop.load(Ordering::Acquire) {
             let job = {
                 let rx_guard = rx.lock();
@@ -756,20 +773,42 @@ impl IndexBuildScheduler {
                     match backend.build(&job) {
                         Ok(result) => {
                             // Write sidecar files locally unless the backend
-                            // already wrote them to S3 (e.g. RemoteBackend).
-                            if !result.sidecar_written_to_s3 {
-                                for (index_name, entries) in &result.sidecar_entries {
-                                    if entries.is_empty() {
-                                        continue;
-                                    }
-                                    let path = sidecar_output_dir(data_dir, &job)
-                                        .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
-                                    if let Err(e) = SidecarWriter::write(&path, entries) {
-                                        tracing::error!(%e, path = %path.display(), "index-build: failed to write sidecar");
-                                    }
+                            // already wrote them to S3 (e.g. RemoteBackend), and
+                            // install each into the live view BEFORE marking the
+                            // SSTable indexed: a sidecar only on disk used to be
+                            // invisible until a restart while the tracker called
+                            // the index current (t_7ac6b0e3).
+                            let published = if result.sidecar_written_to_s3 {
+                                Ok(())
+                            } else {
+                                publish_sidecars(&job, &result, data_dir, installer)
+                            };
+                            match published {
+                                Ok(()) => tracker.mark_indexed(
+                                    keyspace,
+                                    table,
+                                    &job.index_name,
+                                    &job.sstable_id,
+                                ),
+                                Err(err) => {
+                                    tracing::error!(
+                                        %err,
+                                        keyspace,
+                                        table,
+                                        index_name = %job.index_name,
+                                        sstable = %job.sstable_id,
+                                        "index-build: sidecar built but not published; the index \
+                                         is NOT current for this SSTable"
+                                    );
+                                    tracker.mark_failed(
+                                        keyspace,
+                                        table,
+                                        &job.index_name,
+                                        err,
+                                        std::time::Duration::from_secs(60),
+                                    );
                                 }
                             }
-                            tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
                         }
                         Err(err) => {
                             tracker.mark_failed(
@@ -787,6 +826,30 @@ impl IndexBuildScheduler {
             }
         }
     }
+}
+
+/// Write each built sidecar next to its SSTable and install it through
+/// `installer`. The first failure is returned: a sidecar that is not both on
+/// disk and in the view leaves the index incomplete for this SSTable.
+fn publish_sidecars(
+    job: &IndexBuildJob,
+    result: &IndexBuildResult,
+    data_dir: &Path,
+    installer: Option<&SidecarInstaller>,
+) -> std::result::Result<(), String> {
+    for (index_name, entries) in &result.sidecar_entries {
+        if entries.is_empty() {
+            continue;
+        }
+        let path = sidecar_output_dir(data_dir, job)
+            .join(format!("{}-{}.sidecar", job.sstable_id, index_name));
+        crate::index::sidecar::SidecarWriter::write(&path, entries)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        if let Some(install) = installer {
+            install(job, index_name, &path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1537,6 +1600,7 @@ mod tests {
             Arc::clone(&tracker),
             backend,
             sidecar_dir.clone(),
+            None,
         );
 
         scheduler
@@ -1783,6 +1847,7 @@ mod tests {
             Arc::clone(&tracker),
             Arc::new(SidecarBackend),
             root.path().to_path_buf(),
+            None,
         );
 
         scheduler

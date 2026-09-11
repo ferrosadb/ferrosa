@@ -470,6 +470,15 @@ impl SidecarReader {
             .take_while(move |entry| entry.key == key)
     }
 
+    /// Every entry as `(key, position)`, in `(key, row)` order, borrowed from
+    /// the mapping — one entry decoded at a time.
+    pub fn entries_in_order(&self) -> impl Iterator<Item = (&[u8], RowPositionRef<'_>)> + '_ {
+        (0..self.entry_count).map(move |index| {
+            let entry = self.entry(index);
+            (entry.key, entry.position)
+        })
+    }
+
     /// Returns all entries as `(IndexKey, RowPosition)` pairs. Materializes
     /// the file — for tests and offline tools, not the read path.
     pub fn all_entries(&self) -> Vec<(IndexKey, RowPosition)> {
