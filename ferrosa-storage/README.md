@@ -194,6 +194,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   partition (the seek is inclusive at `(pk, [])`), and row postings left by
   sidecars written before this change are skipped once their partition has
   streamed whole.
+  **Sidecars are memory-mapped (t_7ac6b0e3).** A scalar sidecar (format v2:
+  sorted entries, an entry-offset table, a footer with a body CRC) is mapped,
+  validated in one pass at open, and binary-searched in place; entries decode
+  as borrowed `RowPositionRef`s, so a reader's heap does not grow with the
+  file and mapped pages are reclaimable page cache (gauges
+  `ferrosa_storage_index_sidecar_mapped_{bytes,files}`). Writers stream to a
+  temp file, fsync and rename, so a mapped file is never truncated; v1 files
+  are converted at open through the spilling `ExternalSorter`. Flush maps the
+  sidecars it writes; compaction installs its output's sidecars by k-way
+  merging the inputs' (postings are keys, so they stay valid); the index
+  scheduler installs each backfilled sidecar before marking the SSTable
+  indexed. Restore pulls every index artifact of a generation from S3
+  completely before publishing it, and the S3 sync uploads sidecars built
+  after their generation was already in the manifest.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
   **falls back to scanning any live SSTable whose sidecar is transiently

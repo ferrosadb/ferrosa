@@ -1125,22 +1125,24 @@ fn index_posting_sources<'a>(
 /// K-way merge of whole sidecars in `(key, row)` order, yielding each entry
 /// once: one head per sidecar, duplicates dropped by comparison with the
 /// previous entry.
+/// One sidecar entry, borrowed: `(index key, row position)`.
+type SidecarEntryRef<'a> = (&'a [u8], RowPositionRef<'a>);
+
+/// One whole sidecar's entries, in `(key, row)` order.
+type SidecarEntrySource<'a> = Box<dyn Iterator<Item = SidecarEntryRef<'a>> + 'a>;
+
 struct MergedSidecarEntries<'a> {
-    sources: Vec<Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>>,
-    heads: std::collections::BinaryHeap<std::cmp::Reverse<((&'a [u8], RowPositionRef<'a>), usize)>>,
-    previous: Option<(&'a [u8], RowPositionRef<'a>)>,
+    sources: Vec<SidecarEntrySource<'a>>,
+    heads: std::collections::BinaryHeap<std::cmp::Reverse<(SidecarEntryRef<'a>, usize)>>,
+    previous: Option<SidecarEntryRef<'a>>,
 }
 
 impl<'a> MergedSidecarEntries<'a> {
     fn new(readers: &[&'a SidecarReader]) -> Self {
-        let mut sources: Vec<Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>> =
-            readers
-                .iter()
-                .map(|reader| {
-                    Box::new(reader.entries_in_order())
-                        as Box<dyn Iterator<Item = (&'a [u8], RowPositionRef<'a>)> + 'a>
-                })
-                .collect();
+        let mut sources: Vec<SidecarEntrySource<'a>> = readers
+            .iter()
+            .map(|reader| Box::new(reader.entries_in_order()) as SidecarEntrySource<'a>)
+            .collect();
         let mut heads = std::collections::BinaryHeap::with_capacity(sources.len());
         for (index, source) in sources.iter_mut().enumerate() {
             if let Some(first) = source.next() {
@@ -1156,7 +1158,7 @@ impl<'a> MergedSidecarEntries<'a> {
 }
 
 impl<'a> Iterator for MergedSidecarEntries<'a> {
-    type Item = (&'a [u8], RowPositionRef<'a>);
+    type Item = SidecarEntryRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
