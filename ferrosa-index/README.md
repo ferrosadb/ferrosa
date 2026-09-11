@@ -132,7 +132,9 @@ predicate combinations are not yet exact.
 
 `IndexType` (BTree / Hash / Composite / Phonetic / Filtered / Vector / FullText
 / Geo, with stable bincode tags), `IndexConfig`, `IndexFiles`, `IndexKey`,
-`RowPosition`, `IndexCapabilities`, `IndexError` / `IndexResult`, the
+`RowPosition` (totally ordered by `(partition_key, clustering_key)` bytes — the
+order ferrosa-storage keeps index postings in, so index reads can merge sources
+and resume from a cursor), `IndexCapabilities`, `IndexError` / `IndexResult`, the
 `FilterPredicate` / `FilterClause` / `FilterOp` model (with a back-compat custom
 `Serialize`/`Deserialize` accepting both the legacy flat single-clause shape and
 the v2 conjunction shape, in JSON and bincode), and the `vector<float, N>`

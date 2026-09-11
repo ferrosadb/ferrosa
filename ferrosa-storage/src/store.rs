@@ -1085,6 +1085,61 @@ pub(crate) mod read_race_test_hook {
     }
 }
 
+/// One row-ordered source of index postings: the memtable's pinned list or
+/// an SSTable sidecar's slice for the key.
+type PostingSource<'a> = Box<dyn Iterator<Item = &'a RowPosition> + 'a>;
+
+/// K-way merge of row-ordered posting sources, yielding each row once.
+///
+/// Holds one head per source and the previous row: a row present in two
+/// sources surfaces from both consecutively and the second is dropped by
+/// comparison with the previous one, so no set of seen rows is kept. Each
+/// `next` consumes at least one posting, so the walk is bounded by the
+/// postings present.
+struct OrderedPostings<'a> {
+    sources: Vec<PostingSource<'a>>,
+    heads: std::collections::BinaryHeap<std::cmp::Reverse<(&'a RowPosition, usize)>>,
+    previous: Option<&'a RowPosition>,
+}
+
+impl<'a> OrderedPostings<'a> {
+    fn new(mut sources: Vec<PostingSource<'a>>) -> Self {
+        let mut heads = std::collections::BinaryHeap::with_capacity(sources.len());
+        for (index, source) in sources.iter_mut().enumerate() {
+            if let Some(first) = source.next() {
+                heads.push(std::cmp::Reverse((first, index)));
+            }
+        }
+        Self {
+            sources,
+            heads,
+            previous: None,
+        }
+    }
+}
+
+impl<'a> Iterator for OrderedPostings<'a> {
+    type Item = &'a RowPosition;
+
+    fn next(&mut self) -> Option<&'a RowPosition> {
+        loop {
+            let std::cmp::Reverse((position, index)) = self.heads.pop()?;
+            if let Some(following) = self.sources[index].next() {
+                debug_assert!(
+                    following >= position,
+                    "index posting source out of row order"
+                );
+                self.heads.push(std::cmp::Reverse((following, index)));
+            }
+            if self.previous == Some(position) {
+                continue;
+            }
+            self.previous = Some(position);
+            return Some(position);
+        }
+    }
+}
+
 impl<F: FlushTarget> TableStore<F> {
     /// Create a new `TableStore` with an empty memtable and no SSTables.
     pub fn new(schema: TableSchema, flush_target: F, options: WriteOptions) -> Self {
@@ -4869,17 +4924,34 @@ impl<F: FlushTarget> TableStore<F> {
         Ok(filtered)
     }
 
-    /// Visit rows matching a secondary-index key without materializing the
-    /// posting list or result partitions. The visitor owns back-pressure: it
-    /// can return [`std::ops::ControlFlow::Break`] after a page is full.
-    ///
-    /// Index readers are visited one at a time and point reads are delivered
-    /// immediately. Only deduplication keys remain resident, because a row
-    /// can be present in both the active memtable and an SSTable sidecar.
+    /// Visit every row matching a secondary-index key, in row order. See
+    /// [`Self::read_by_index_each_after`].
     pub fn read_by_index_each(
         &self,
         index_name: &str,
         key: &IndexKey,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        self.read_by_index_each_after(index_name, key, None, visitor)
+    }
+
+    /// Visit the rows matching a secondary-index key in row order —
+    /// `(partition key, clustering)` bytes — strictly after `after` when
+    /// given. The visitor owns back-pressure: [`std::ops::ControlFlow::Break`]
+    /// ends the walk once a page is full, and the caller resumes it with the
+    /// last row it kept as `after`.
+    ///
+    /// Memory is O(posting sources), never O(result): every source (the
+    /// active memtable index and each SSTable sidecar) holds its postings in
+    /// row order, so one `OrderedPostings` merge yields them in order, and a
+    /// row held by two sources is dropped by comparing it with the previous
+    /// row rather than by remembering every row seen (t_50c8bc7d). Each
+    /// posting is point-read as it is reached and handed straight on.
+    pub fn read_by_index_each_after(
+        &self,
+        index_name: &str,
+        key: &IndexKey,
+        after: Option<&RowPosition>,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> Result<()> {
         // An index this node does not declare cannot answer, and must not
@@ -4897,91 +4969,66 @@ impl<F: FlushTarget> TableStore<F> {
                  zero matching rows"
             )));
         }
+        let Some(lookup_key) = self.encode_index_lookup_key(index_name, key)? else {
+            return Ok(());
+        };
 
         let guard = self.view.load();
+        let memtable = guard
+            .indexes
+            .get(index_name)
+            .and_then(|index| index.posting_list(&lookup_key));
+        let mut sources: Vec<PostingSource<'_>> =
+            Vec::with_capacity(guard.sidecar_indexes.len() + 1);
+        if let Some(list) = &memtable {
+            let postings = list.as_slice();
+            let start = postings.partition_point(|p| after.is_some_and(|cursor| p <= cursor));
+            sources.push(Box::new(postings[start..].iter()));
+        }
+        for sidecar in guard.sidecar_indexes.iter() {
+            if let Some(reader) = sidecar.get(index_name) {
+                sources.push(Box::new(reader.postings_after(&lookup_key, after)));
+            }
+        }
 
-        // Per-type read dispatch: encode the raw query term into the index's
-        // native key space before probing. A phonetic index is keyed by the
-        // phonetic *code* of the term (both the memtable index and the flushed
-        // sidecar store codes), so a `WHERE name = 'Jon'` lookup must encode
-        // 'Jon' to its code and point-look-up that — not the raw bytes.
-        // BTree/Hash/Composite are identity-encoded. A term that encodes to
-        // nothing (e.g. empty/non-UTF-8 text on a phonetic index) cannot match
-        // any stored entry, so return no rows.
-        let index_type = self.index_type_for(index_name);
-        let lookup_key = match crate::index::scheduler::encode_index_key(index_type, &key.0) {
-            Ok(Some(encoded)) => encoded,
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "secondary index '{index_name}' read key encoding failed: {e}"
-                )));
-            }
-        };
-        let key = &lookup_key;
-        let mut seen = std::collections::HashSet::new();
-        let stopped = std::cell::Cell::new(false);
-        let read_error = std::cell::RefCell::new(None);
-        let mut visit_position = |pos: RowPosition| {
-            if stopped.get()
-                || !seen.insert((pos.partition_key.clone(), pos.clustering_key.clone()))
-            {
-                return std::ops::ControlFlow::Continue(());
-            }
-            let clustering_key = pos.clustering_key;
-            let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(pos.partition_key));
-            let read = if clustering_key.is_empty() {
-                self.read(&dk)
+        for position in OrderedPostings::new(sources) {
+            let partition_key =
+                ferrosa_common::key::PartitionKey::new(position.partition_key.clone());
+            let decorated = DecoratedKey::new(partition_key);
+            let row = if position.clustering_key.is_empty() {
+                self.read(&decorated)?
             } else {
-                self.read_clustering_row(&dk, &clustering_key)
+                self.read_clustering_row(&decorated, &position.clustering_key)?
             };
-            match read {
-                Ok(Some(partition)) => {
-                    if visitor(partition).is_break() {
-                        stopped.set(true);
-                        return std::ops::ControlFlow::Break(());
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    *read_error.borrow_mut() = Some(error);
-                    stopped.set(true);
-                    return std::ops::ControlFlow::Break(());
-                }
-            }
-            std::ops::ControlFlow::Continue(())
-        };
-
-        // Query the active memtable index without cloning its posting list.
-        if let Some(idx) = guard.indexes.get(index_name) {
-            idx.visit(key, &mut visit_position);
-        }
-
-        if let Some(error) = read_error.borrow_mut().take() {
-            return Err(error);
-        }
-
-        // Query SSTable sidecar indexes without constructing a Vec of hits.
-        if !stopped.get() {
-            for sidecar in guard.sidecar_indexes.iter() {
-                if stopped.get() {
-                    break;
-                }
-                if let Some(reader) = sidecar.get(index_name) {
-                    reader.visit(key, &mut visit_position).map_err(|e| {
-                        ferrosa_common::Error::InvalidFormat(format!(
-                            "secondary index '{index_name}' read failed: {e}"
-                        ))
-                    })?;
-                }
+            let Some(partition) = row else {
+                // The posting outlived its row (deleted since it was indexed).
+                continue;
+            };
+            if visitor(partition).is_break() {
+                break;
             }
         }
-
-        if let Some(error) = read_error.borrow_mut().take() {
-            return Err(error);
-        }
-
         Ok(())
+    }
+
+    /// Encode a raw query term into the index's native key space. A phonetic
+    /// index is keyed by the phonetic *code* of the term (both the memtable
+    /// index and the flushed sidecar store codes), so `WHERE name = 'Jon'`
+    /// must look up Jon's code, not its bytes; BTree/Hash/Composite are
+    /// identity-encoded. `None` for a term that encodes to nothing (e.g.
+    /// empty or non-UTF-8 text on a phonetic index): it cannot match any
+    /// stored entry.
+    fn encode_index_lookup_key(
+        &self,
+        index_name: &str,
+        key: &IndexKey,
+    ) -> Result<Option<IndexKey>> {
+        let index_type = self.index_type_for(index_name);
+        crate::index::scheduler::encode_index_key(index_type, &key.0).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "secondary index '{index_name}' read key encoding failed: {e}"
+            ))
+        })
     }
 
     /// Query by secondary index restricted to ONE partition (t_430c4188):
@@ -6810,6 +6857,84 @@ mod tests {
             !store.remove_index("val_idx"),
             "second removal is idempotent and reports no state removed"
         );
+    }
+
+    /// A node's index read is one ordered stream over every posting source —
+    /// the memtable index and each SSTable sidecar — in row order, each row
+    /// once even when two sources hold it, resumable strictly after a row.
+    /// That is what lets a tenant-wide read page through a node holding only
+    /// a cursor per source, never the result (t_50c8bc7d).
+    #[test]
+    fn index_reads_merge_sources_in_row_order_and_resume_after_a_row() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".to_string(), 0_usize)],
+        );
+        // Sidecar: k3, k1. Memtable afterwards: k4, k2, and k1 again.
+        store.write(&make_key("k3"), make_row(b"v", 1000)).unwrap();
+        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
+        store.flush().unwrap();
+        store.write(&make_key("k4"), make_row(b"v", 2000)).unwrap();
+        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
+        store.write(&make_key("k1"), make_row(b"v", 2000)).unwrap();
+        store
+            .write(&make_key("x9"), make_row(b"other", 2000))
+            .unwrap();
+
+        let key = IndexKey(b"v".to_vec());
+        // Each delivered row's own position — the cursor a pager would keep.
+        let read_after = |after: Option<&RowPosition>| -> Vec<RowPosition> {
+            let mut delivered = Vec::new();
+            store
+                .read_by_index_each_after("val_idx", &key, after, &mut |partition| {
+                    delivered.extend(partition.rows.iter().map(|row| RowPosition {
+                        partition_key: partition.key.key.as_bytes().to_vec(),
+                        clustering_key: row.clustering.clone(),
+                    }));
+                    std::ops::ControlFlow::Continue(())
+                })
+                .unwrap();
+            delivered
+        };
+        let pk = |s: &str| make_key(s).key.as_bytes().to_vec();
+        let keys = |rows: &[RowPosition]| -> Vec<Vec<u8>> {
+            rows.iter().map(|row| row.partition_key.clone()).collect()
+        };
+
+        let all = read_after(None);
+        assert_eq!(
+            keys(&all),
+            vec![pk("k1"), pk("k2"), pk("k3"), pk("k4")],
+            "every match in row order, k1 once although both sources hold it"
+        );
+        assert_eq!(
+            keys(&read_after(Some(&all[1]))),
+            vec![pk("k3"), pk("k4")],
+            "a read resumed after the second row yields exactly the rows after it"
+        );
+    }
+
+    /// Tripwire: the node-level index walk may hold a cursor per source and
+    /// the previous row, nothing that grows with the result.
+    #[test]
+    fn the_index_walk_holds_no_result_sized_collection() {
+        let source = include_str!("store.rs");
+        let body = source
+            .split("pub fn read_by_index_each_after(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("read_by_index_each_after must exist");
+        for forbidden in ["HashSet", "HashMap", ".collect::<Vec", "BTreeSet"] {
+            assert!(
+                !body.contains(forbidden),
+                "read_by_index_each_after must not hold a result-sized `{forbidden}`"
+            );
+        }
     }
 
     #[test]

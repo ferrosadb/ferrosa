@@ -149,10 +149,13 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   bounds the truncation-detecting `range_read_limited_rows_checked` probe (for the
   still-accumulating `ORDER BY` shape, until spill-to-disk lands) and the legacy
   degraded RPC (spec: `../ferrosa/specs/proposed/streaming-range-reads-no-cap.md`).
-  The same bounded Bulk frames now carry global secondary-index walks: each
-  replica visits postings incrementally, and the coordinator forwards bounded
-  partitions. The coordinator retains `O(result)` row identities for
-  cross-replica deduplication; CQL global index scans use
+  The same bounded Bulk frames now carry global secondary-index walks, in row
+  order — `(partition key, clustering)` — from an optional cursor carried in
+  the request's `start_key` + `start_clustering` (resume strictly after that
+  row). `coordinate_index_read_stream` merges the node streams in row order
+  (`merge_index_streams_in_row_order`) and drops a row several replicas return
+  by comparing it with the previous row: one head per node, no set of rows
+  seen (t_50c8bc7d). CQL global index scans use
   `WritePath::index_read_stream`. A replica that does not declare the index
   refuses the walk (truncated `Done` → `TruncatedReplica`) instead of
   contributing zero rows, so a tenant-wide read through a partition-key index

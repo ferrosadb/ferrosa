@@ -13,7 +13,8 @@
 //! | entry_count: u64 LE (8 bytes)   |
 //! | header_crc:  u32 LE (4 bytes)   |  <- CRC32 of first 13 bytes
 //! +----------------------------------+
-//! | body: sorted entries             |
+//! | body: entries sorted by          |
+//! |   (key, partition key, clust.)   |
 //! |   key_len(u32) | key_bytes      |
 //! |   pk_len(u32)  | pk_bytes       |
 //! |   ck_len(u32)  | ck_bytes       |
@@ -52,10 +53,11 @@ struct SidecarEntry {
 pub struct SidecarWriter;
 
 impl SidecarWriter {
-    /// Write a sidecar index file. Entries are sorted by key before writing.
+    /// Write a sidecar index file. Entries are sorted by index key, then row
+    /// position, before writing (see `posting_order`).
     pub fn write(path: &Path, entries: &[(IndexKey, RowPosition)]) -> IndexResult<()> {
         let mut sorted: Vec<_> = entries.to_vec();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_by(posting_order);
 
         let entry_count = sorted.len() as u64;
 
@@ -83,6 +85,14 @@ impl SidecarWriter {
     }
 }
 
+/// Sidecar entry order: index key, then row position — `(partition key,
+/// clustering)` bytes. Row-ordered postings let an index read merge the
+/// memtable's and every sidecar's postings, and resume after a row, holding
+/// only one cursor per source (t_50c8bc7d).
+fn posting_order(a: &(IndexKey, RowPosition), b: &(IndexKey, RowPosition)) -> std::cmp::Ordering {
+    a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+}
+
 // ── Reader ───────────────────────────────────────────────────────────────────
 
 /// Reads a sidecar index file, validating the CRC32 header on open.
@@ -97,7 +107,7 @@ impl SidecarReader {
     /// Used during flush to create in-memory sidecar readers.
     pub fn from_entries(entries: Vec<(IndexKey, RowPosition)>) -> Self {
         let mut sorted = entries;
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_by(posting_order);
         let entry_count = sorted.len() as u64;
         let sidecar_entries: Vec<SidecarEntry> = sorted
             .into_iter()
@@ -155,7 +165,12 @@ impl SidecarReader {
 
         let entry_count = u64::from_le_bytes(data[5..13].try_into().expect("8-byte slice"));
 
-        let entries = deserialize_entries(&data[HEADER_SIZE..], entry_count as usize)?;
+        let mut entries = deserialize_entries(&data[HEADER_SIZE..], entry_count as usize)?;
+        // Files from the previous writer are sorted by index key only, with
+        // each key's postings in arrival order. Sort once here, at load, so
+        // every reader holds postings in row order; a current file is already
+        // sorted, and the stable sort passes over it in one linear run.
+        entries.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.position.cmp(&b.position)));
 
         Ok(Self {
             entry_count,
@@ -192,6 +207,27 @@ impl SidecarReader {
             }
         }
         Ok(results)
+    }
+
+    /// The key's postings strictly after `after` (all of them when `None`),
+    /// in row order, borrowed in place — a binary search to the start, then
+    /// a walk that ends at the first entry of another key.
+    pub fn postings_after<'a>(
+        &'a self,
+        key: &'a IndexKey,
+        after: Option<&RowPosition>,
+    ) -> impl Iterator<Item = &'a RowPosition> + 'a {
+        let start =
+            self.entries
+                .partition_point(|e| match e.key.as_slice().cmp(key.0.as_slice()) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => after.is_some_and(|cursor| e.position <= *cursor),
+                    std::cmp::Ordering::Greater => false,
+                });
+        self.entries[start..]
+            .iter()
+            .take_while(move |e| e.key == key.0)
+            .map(|e| &e.position)
     }
 
     /// Visit exact-key postings in place without allocating a result vector.
@@ -305,6 +341,67 @@ mod tests {
     use super::*;
     use ferrosa_index::{IndexKey, RowPosition};
     use tempfile::tempdir;
+
+    fn row(pk: &[u8], ck: &[u8]) -> RowPosition {
+        RowPosition {
+            partition_key: pk.to_vec(),
+            clustering_key: ck.to_vec(),
+        }
+    }
+
+    fn visit_all(reader: &SidecarReader, key: &IndexKey) -> Vec<RowPosition> {
+        let mut visited = Vec::new();
+        reader
+            .visit(key, &mut |position| {
+                visited.push(position);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        visited
+    }
+
+    /// A key's postings are visited in row order — (partition key,
+    /// clustering) — whether the sidecar was written now or by the previous
+    /// writer, which sorted by index key only and left each key's postings in
+    /// arrival order. Ordered postings let an index read merge sources and
+    /// resume from a cursor without holding the result (t_50c8bc7d).
+    #[test]
+    fn a_keys_postings_are_visited_in_row_order_new_and_legacy() {
+        let tenant = IndexKey(b"tenant-a".to_vec());
+        let arrival = vec![
+            (tenant.clone(), row(b"pk3", b"")),
+            (tenant.clone(), row(b"pk1", b"ck2")),
+            (IndexKey(b"other".to_vec()), row(b"pk0", b"")),
+            (tenant.clone(), row(b"pk1", b"ck1")),
+        ];
+        let expected = vec![row(b"pk1", b"ck1"), row(b"pk1", b"ck2"), row(b"pk3", b"")];
+
+        let dir = tempdir().unwrap();
+        let fresh = dir.path().join("fresh.sidecar");
+        SidecarWriter::write(&fresh, &arrival).unwrap();
+        assert_eq!(
+            visit_all(&SidecarReader::open(&fresh).unwrap(), &tenant),
+            expected
+        );
+
+        // The previous writer's layout: sorted by index key only.
+        let mut legacy_order = arrival.clone();
+        legacy_order.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+        header.extend_from_slice(SIDECAR_MAGIC);
+        header.push(SIDECAR_VERSION);
+        header.extend_from_slice(&(legacy_order.len() as u64).to_le_bytes());
+        let crc = crc32fast::hash(&header);
+        header.extend_from_slice(&crc.to_le_bytes());
+        header.extend_from_slice(&serialize_entries(&legacy_order));
+        let legacy = SidecarReader::from_bytes(&header).unwrap();
+        assert_eq!(visit_all(&legacy, &tenant), expected);
+
+        assert_eq!(
+            visit_all(&SidecarReader::from_entries(arrival), &tenant),
+            expected
+        );
+    }
 
     fn sample_entries() -> Vec<(IndexKey, RowPosition)> {
         vec![

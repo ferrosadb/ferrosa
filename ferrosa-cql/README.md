@@ -72,11 +72,18 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
   keep their `range_read_limited_rows_checked` fail-loud cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
-  Global secondary-index scans use the analogous bounded-per-hop
-  `WritePath::index_read_stream` path, so high-cardinality edge indexes are
-  delivered incrementally. Multi-index intersections retain `O(result)`
-  partition-key membership sets, and cross-replica deduplication retains
-  `O(result)` row identities.
+  Global secondary-index reads (`SingleIndex`, `IndexScanWithFilter`,
+  `IndexIntersection`) stream in row order — `(partition key, clustering)` —
+  through `WritePath::index_read_stream(.., after)`, and hold O(sources) at
+  every layer (t_50c8bc7d): each node merges its memtable and sidecar posting
+  lists, the coordinator merges the nodes and drops replica copies by
+  adjacency, and an intersection is a partition-level merge-join with one head
+  per index. A plain projection is served one bounded page at a time — the
+  client's page size, or `default_scan_page_size()` when unpaged — through
+  `collect_filtered_page_from_partition_stream`, and the next page resumes
+  strictly after the `(pk, ck)` cursor. Builtin aggregates over an index fold
+  as rows stream. `ORDER BY`, `DISTINCT` and non-builtin function projections
+  over an index still collect the match set (`collect_index_rows_with_limit`).
 - **Scan planner** (`planner.rs`) — rule-based `ScanPlan` selection for SELECT:
   `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
   indexed residual `=` predicate — t_430c4188: keyed secondary-index consult

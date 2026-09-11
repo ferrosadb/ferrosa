@@ -643,7 +643,7 @@ where
             // lets the scan stop as soon as its sink is satisfied.
             let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
             let mut indexed = write_path
-                .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key)
+                .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key, None)
                 .await?;
             let mut found = false;
             let mut stopped = false;

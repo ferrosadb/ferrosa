@@ -33,6 +33,19 @@ pub(crate) struct Node {
     right: Option<Arc<Node>>,
 }
 
+/// One index key's postings, pinned to the tree snapshot they came from.
+/// Sorted by row position and unique (see [`MemtableIndex::insert`]).
+pub struct PostingList {
+    node: Arc<Node>,
+}
+
+impl PostingList {
+    /// The postings, in row order.
+    pub fn as_slice(&self) -> &[RowPosition] {
+        &self.node.values
+    }
+}
+
 /// Lock-free persistent red-black tree for memtable secondary indexing.
 ///
 /// Writers acquire a `Mutex` (serializes inserts — the memtable write path
@@ -84,6 +97,26 @@ impl MemtableIndex {
     pub fn visit(&self, key: &IndexKey, visitor: &mut dyn FnMut(RowPosition) -> ControlFlow<()>) {
         let guard = self.root.load();
         Self::visit_in((**guard).as_ref(), key, visitor);
+    }
+
+    /// The key's postings in row order, pinned: the returned list holds its
+    /// tree node, so it stays valid and unchanged however many inserts land
+    /// while the caller walks it. `None` when the key has no postings.
+    pub fn posting_list(&self, key: &IndexKey) -> Option<PostingList> {
+        let guard = self.root.load();
+        let mut node = (**guard).as_ref();
+        while let Some(n) = node {
+            node = match key.cmp(&n.key) {
+                std::cmp::Ordering::Less => n.left.as_ref(),
+                std::cmp::Ordering::Greater => n.right.as_ref(),
+                std::cmp::Ordering::Equal => {
+                    return Some(PostingList {
+                        node: Arc::clone(n),
+                    })
+                }
+            };
+        }
+        None
     }
 
     /// Range query: returns all RowPositions for keys in [start, end] inclusive.
@@ -153,9 +186,16 @@ impl MemtableIndex {
                     )
                 }
                 std::cmp::Ordering::Equal => {
-                    // Same key: append the new position to the values list
+                    // Same key: insert the position in row order, once. Ordered
+                    // postings let an index read merge this list with the
+                    // sidecars' and resume from a cursor holding nothing but
+                    // the previous row (t_50c8bc7d). A rewrite of a row posts
+                    // the same position again, which is not a second match.
+                    let Err(at) = n.values.binary_search(&pos) else {
+                        return n;
+                    };
                     let mut new_values = n.values.clone();
-                    new_values.push(pos);
+                    new_values.insert(at, pos);
                     Arc::new(Node {
                         color: n.color,
                         key: n.key.clone(),
@@ -377,6 +417,41 @@ mod tests {
         let results = index.lookup(&key);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], row);
+    }
+
+    /// A key's postings are kept in row order — (partition key, clustering)
+    /// — and each row once, however they were written. Ordered postings are
+    /// what let an index read merge its sources and resume from a cursor
+    /// without holding the result (t_50c8bc7d); a rewrite of the same row
+    /// must not post it twice.
+    #[test]
+    fn a_keys_postings_are_kept_in_row_order_and_unique() {
+        let index = MemtableIndex::new();
+        let key = IndexKey(b"tenant-a".to_vec());
+        for row in [
+            pos(b"pk3", b""),
+            pos(b"pk1", b"ck2"),
+            pos(b"pk2", b"ck1"),
+            pos(b"pk1", b"ck1"),
+            pos(b"pk1", b"ck2"),
+        ] {
+            index.insert(key.clone(), row);
+        }
+
+        let mut visited = Vec::new();
+        index.visit(&key, &mut |row| {
+            visited.push(row);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            visited,
+            vec![
+                pos(b"pk1", b"ck1"),
+                pos(b"pk1", b"ck2"),
+                pos(b"pk2", b"ck1"),
+                pos(b"pk3", b""),
+            ]
+        );
     }
 
     #[test]

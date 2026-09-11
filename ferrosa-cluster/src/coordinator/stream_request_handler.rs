@@ -91,14 +91,17 @@ pub trait StreamRangeReader: Send + Sync {
         start: Option<&'a ferrosa_common::key::DecoratedKey>,
     ) -> ferrosa_common::Result<PartitionStream<'a>>;
 
-    /// Open a lazy stream over one secondary-index key. Implementations must
-    /// visit postings incrementally; returning a materialized result vector
-    /// defeats the purpose of the stream protocol.
+    /// Open a lazy stream over one secondary-index key, in row order —
+    /// `(partition key, clustering)` — strictly after `after` when given (the
+    /// last row the previous page delivered). Implementations must visit
+    /// postings incrementally; returning a materialized result vector defeats
+    /// the purpose of the stream protocol.
     fn index_iter<'a>(
         &'a self,
         _table_id: &TableId,
         _index_name: &str,
         _index_key: &[u8],
+        _after: Option<&ferrosa_index::RowPosition>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         Err(ferrosa_common::Error::InvalidData(
             "streaming index reads are not supported by this reader".into(),
@@ -149,9 +152,10 @@ impl StreamRangeReader for Arc<ferrosa_storage::StorageEngine> {
         table_id: &TableId,
         index_name: &str,
         index_key: &[u8],
+        after: Option<&ferrosa_index::RowPosition>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         let key = ferrosa_index::IndexKey(index_key.to_vec());
-        Ok(self.read_by_index_stream(table_id, index_name, &key))
+        Ok(self.read_by_index_stream_after(table_id, index_name, &key, after.cloned()))
     }
 }
 
@@ -199,10 +203,24 @@ pub async fn handle_stream_request_with_cancel<R, S>(
         ))
     });
 
+    // An index read resumes strictly AFTER the last row the previous page
+    // delivered, carried as its partition key + clustering (empty for a table
+    // without clustering columns). Unlike a range read's inclusive start key,
+    // both halves are the cursor, so an index request with only one is refused.
+    let index_after = match (&req.start_key, &req.start_clustering) {
+        (Some(partition_key), Some(clustering_key)) => Some(ferrosa_index::RowPosition {
+            partition_key: partition_key.clone(),
+            clustering_key: clustering_key.clone(),
+        }),
+        _ => None,
+    };
+
     // Open the lazy partition stream. Errors here are open-time
     // (table not found, etc.) — emit a truncated Done and bail.
     let stream_result = match (&req.index_name, &req.index_key) {
-        (Some(index_name), Some(index_key)) => reader.index_iter(&table_id, index_name, index_key),
+        (Some(index_name), Some(index_key)) => {
+            reader.index_iter(&table_id, index_name, index_key, index_after.as_ref())
+        }
         (None, None) => reader.range_iter(
             &table_id,
             req.projected_regular_ordinals.as_deref(),
@@ -644,6 +662,7 @@ mod tests {
             _table_id: &TableId,
             _index_name: &str,
             _index_key: &[u8],
+            _after: Option<&ferrosa_index::RowPosition>,
         ) -> ferrosa_common::Result<PartitionStream<'a>> {
             Ok(Box::pin(
                 futures::stream::iter(0..self.rows).map(|i| Ok(make_partition((i % 251) as u8))),

@@ -6678,9 +6678,10 @@ impl StorageEngine {
         }
     }
 
-    /// Visit a secondary-index result one partition at a time. The callback
-    /// may stop the scan, allowing paging and cancellation to reach the index
-    /// reader without first building a `Vec` of all postings or partitions.
+    /// Visit a secondary-index result one partition at a time, in row order.
+    /// The callback may stop the scan, allowing paging and cancellation to
+    /// reach the index reader without first building a `Vec` of all postings
+    /// or partitions. See [`Self::read_by_index_each_after`].
     pub fn read_by_index_each(
         &self,
         table_id: &TableId,
@@ -6688,11 +6689,28 @@ impl StorageEngine {
         key: &ferrosa_index::IndexKey,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> ferrosa_common::Result<()> {
+        self.read_by_index_each_after(table_id, index_name, key, None, visitor)
+    }
+
+    /// Visit a secondary-index result in row order — `(partition key,
+    /// clustering)` — strictly after `after` when given, so a page can resume
+    /// where the previous one stopped. O(posting sources) memory; see
+    /// `TableStore::read_by_index_each_after`.
+    pub fn read_by_index_each_after(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        after: Option<&ferrosa_index::RowPosition>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
-        state.store.read_by_index_each(index_name, key, visitor)
+        state
+            .store
+            .read_by_index_each_after(index_name, key, after, visitor)
     }
 
     /// Open a bounded asynchronous stream over a secondary-index result.
@@ -6706,6 +6724,21 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
+        self.read_by_index_stream_after(table_id, index_name, key, None)
+    }
+
+    /// [`Self::read_by_index_stream`] resumed strictly after `after`: the
+    /// stream yields rows in row order, so the next page of an index read is
+    /// the stream opened after the last row the previous page delivered.
+    pub fn read_by_index_stream_after(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        after: Option<ferrosa_index::RowPosition>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
         const STREAM_BUFFER: usize = 4;
         let table_id = table_id.clone();
         let index_name = index_name.to_string();
@@ -6714,13 +6747,16 @@ impl StorageEngine {
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
 
         tokio::task::spawn_blocking(move || {
-            let result =
-                engine.read_by_index_each(&table_id, &index_name, &key, &mut |partition| match tx
-                    .blocking_send(Ok(partition))
-                {
+            let result = engine.read_by_index_each_after(
+                &table_id,
+                &index_name,
+                &key,
+                after.as_ref(),
+                &mut |partition| match tx.blocking_send(Ok(partition)) {
                     Ok(()) => std::ops::ControlFlow::Continue(()),
                     Err(_) => std::ops::ControlFlow::Break(()),
-                });
+                },
+            );
             if let Err(error) = result {
                 let _ = tx.blocking_send(Err(error));
             }

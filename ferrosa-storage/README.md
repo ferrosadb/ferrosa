@@ -177,6 +177,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   chooses indexes from the CQL schema, so a consult of an undeclared index
   means schema and engine disagree, and an empty answer from one node is
   unioned by the coordinator into a short result (ST-20).
+  Index postings are kept in row order — `(partition key, clustering)` — in
+  every source: `MemtableIndex` inserts each key's postings sorted and unique,
+  and sidecars are written in `(key, row)` order and re-sorted once at load,
+  which normalizes files from the previous key-only writer without a format
+  change. `read_by_index_each_after` k-way merges the sources
+  (`OrderedPostings`), drops a row two sources hold by comparing it with the
+  previous row, and resumes strictly after a cursor: memory is O(posting
+  sources), never O(result); `read_by_index_stream_after` is its async form.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
   **falls back to scanning any live SSTable whose sidecar is transiently
