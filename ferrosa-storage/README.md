@@ -163,11 +163,20 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   physical ordinals through the per-SSTable header instead of interpreting old
   rows against the new layout.
   Boot-time
-  `reload_indexes_from_system_schema` returns an `IndexReloadOutcome`
-  (`restored`/`skipped`); unresolvable rows emit one summary warn plus the
-  `ferrosa_storage_index_reload_skipped_rows_total` counter (per-row detail at
-  debug). Pre-existing orphans are never GC'd automatically — clean up with
-  `DROP INDEX IF EXISTS`.
+  `reload_indexes_from_system_schema(&PartitionKeyColumns)` returns an
+  `IndexReloadOutcome` (`restored`/`skipped`); unresolvable rows emit one
+  summary warn plus the `ferrosa_storage_index_reload_skipped_rows_total`
+  counter (per-row detail at debug). Pre-existing orphans are never GC'd
+  automatically — clean up with `DROP INDEX IF EXISTS`. The caller supplies
+  each table's partition-key column names (the storage `TableSchema` records
+  only the composite key type), so an index on a partition-key column — the
+  tenant index of a `((tenant_id, session_id), ..)` table — is restored and
+  backfilled through `add_partition_key_index` rather than skipped (ST-20).
+  A global index read (`read_by_index_each`) of an index the table does not
+  declare returns an error naming the index, never zero rows: the planner
+  chooses indexes from the CQL schema, so a consult of an undeclared index
+  means schema and engine disagree, and an empty answer from one node is
+  unioned by the coordinator into a short result (ST-20).
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
   **falls back to scanning any live SSTable whose sidecar is transiently

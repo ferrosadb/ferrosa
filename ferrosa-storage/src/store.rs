@@ -4882,8 +4882,20 @@ impl<F: FlushTarget> TableStore<F> {
         key: &IndexKey,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> Result<()> {
+        // An index this node does not declare cannot answer, and must not
+        // answer "nothing". The planner selects indexes from the CQL schema,
+        // so a consult arrives here only when schema and engine disagree — a
+        // restart that failed to re-register the index, or a DROP racing the
+        // read. An empty answer from here is unioned by the coordinator into
+        // a short result that reads as the rows not existing (t_50c8bc7d:
+        // 101,848 entities read as an empty database). Refusing is still
+        // never stale: a dropped index's sidecars are not consulted.
         if !self.secondary_index_declared(index_name) {
-            return Ok(());
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "secondary index '{index_name}' is not declared on this node's \
+                 table, so it cannot answer; refusing to report its absence as \
+                 zero matching rows"
+            )));
         }
 
         let guard = self.view.load();
@@ -5410,7 +5422,9 @@ impl<F: FlushTarget> TableStore<F> {
         guard.indexes.get(name).cloned()
     }
 
-    fn secondary_index_declared(&self, index_name: &str) -> bool {
+    /// Whether this table declares the secondary index `index_name`. A global
+    /// read of an undeclared index is refused by [`Self::read_by_index_each`].
+    pub fn secondary_index_declared(&self, index_name: &str) -> bool {
         self.index_types.contains_key(index_name)
             || self
                 .indexed_columns
@@ -6784,11 +6798,13 @@ mod tests {
         );
         assert!(store.indexed_columns().is_empty());
 
-        let after_drop =
-            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).unwrap();
+        // Not consulted, and not answered as "no rows" either: the read is
+        // refused, naming the index (t_50c8bc7d).
+        let after_drop = collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec()))
+            .expect_err("dropped index must not consult stale memtable index state");
         assert!(
-            after_drop.is_empty(),
-            "dropped index must not consult stale memtable index state"
+            after_drop.to_string().contains("val_idx"),
+            "the refusal must name the index: {after_drop}"
         );
         assert!(
             !store.remove_index("val_idx"),
@@ -6820,10 +6836,9 @@ mod tests {
 
         assert!(store.remove_index("val_idx"));
         assert!(
-            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec()))
-                .unwrap()
-                .is_empty(),
-            "dropped index must not consult stale sidecar readers"
+            collect_index_results(&store, "val_idx", &IndexKey(b"v".to_vec())).is_err(),
+            "dropped index must not consult stale sidecar readers, and must not \
+             report its absence as zero rows"
         );
         assert!(
             !store.remove_index("val_idx"),
@@ -9133,15 +9148,20 @@ mod tests {
         assert!(pks.contains(&b"user2".as_slice()));
     }
 
+    /// An index the table does not declare cannot answer. Returning no rows
+    /// here is what let a planner/engine disagreement read as an empty table
+    /// (t_50c8bc7d), so the read is refused and names the index.
     #[test]
-    fn read_by_index_unknown_index_returns_empty() {
+    fn read_by_index_unknown_index_is_refused_not_empty() {
         use ferrosa_index::IndexKey;
         let store = test_store();
         store.write(&make_key("k"), make_row(b"v", 1000)).unwrap();
-        let results =
-            collect_index_results(&store, "nonexistent_idx", &IndexKey(b"anything".to_vec()))
-                .unwrap();
-        assert!(results.is_empty());
+        let err = collect_index_results(&store, "nonexistent_idx", &IndexKey(b"anything".to_vec()))
+            .expect_err("an undeclared index must not answer with zero rows");
+        assert!(
+            err.to_string().contains("nonexistent_idx"),
+            "the refusal must name the index: {err}"
+        );
     }
 
     // =========================================================================

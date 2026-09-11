@@ -324,3 +324,268 @@ async fn an_indexed_read_unions_every_replicas_rows() {
          the whole answer looks exactly like the rows not existing"
     );
 }
+
+// ── Tenant-wide reads through a partition-key index (t_50c8bc7d) ─────────────
+//
+// `agent_memory.entity_store` is keyed `((tenant_id, session_id), entity_id)`
+// and carries `idx_entity_by_tenant ON entity_store (tenant_id)`. A tenant's
+// sessions hash all over the ring, so at RF=1 on three nodes each node holds a
+// disjoint slice of the tenant, indexed only by its own local index. A
+// tenant-wide read is correct only if every node answers from its index and
+// the coordinator unions the answers.
+
+const TENANT_A: u8 = 0xA;
+const TENANT_B: u8 = 0xB;
+const TENANT_INDEX: &str = "idx_by_tenant";
+
+fn tenant_table_id() -> TableId {
+    TableId::new("agent_memory", "entity_store")
+}
+
+fn tenant_table_schema() -> ferrosa_common::TableSchema {
+    ferrosa_common::TableSchema {
+        keyspace: "agent_memory".into(),
+        table: "entity_store".into(),
+        key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                   org.apache.cassandra.db.marshal.UUIDType,\
+                   org.apache.cassandra.db.marshal.UUIDType)"
+            .into(),
+        clustering_columns: vec![],
+        static_columns: vec![],
+        regular_columns: vec![ferrosa_common::ColumnDefinition {
+            name: "body".into(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        }],
+        extensions: Default::default(),
+    }
+}
+
+/// The `(tenant_id, session_id)` composite key, CQL composite encoding.
+fn tenant_session_key(tenant: u8, session: u8) -> DecoratedKey {
+    let mut key = Vec::with_capacity(38);
+    for component in [tenant, session] {
+        let mut uuid = [0u8; 16];
+        uuid[0] = component;
+        key.extend_from_slice(&16u16.to_be_bytes());
+        key.extend_from_slice(&uuid);
+        key.push(0x00);
+    }
+    DecoratedKey::new(PartitionKey::new(key))
+}
+
+fn tenant_index_key(tenant: u8) -> Vec<u8> {
+    let mut uuid = [0u8; 16];
+    uuid[0] = tenant;
+    uuid.to_vec()
+}
+
+/// Writes one row per `(tenant, session)` and flushes, so every answer comes
+/// from an SSTable sidecar rather than the memtable.
+fn write_sessions(engine: &ferrosa_storage::StorageEngine, sessions: &[(u8, u8)]) {
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::types::{LivenessInfo, Row};
+    let table_id = tenant_table_id();
+    for &(tenant, session) in sessions {
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"entity".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        engine
+            .write(&table_id, &tenant_session_key(tenant, session), row, 1000)
+            .unwrap();
+    }
+    engine.flush(&table_id).unwrap();
+}
+
+/// One node of an RF=1 cluster holding `sessions`, with or without the
+/// tenant index declared.
+fn tenant_node(
+    dir: &std::path::Path,
+    sessions: &[(u8, u8)],
+    declare_index: bool,
+) -> Arc<ferrosa_storage::StorageEngine> {
+    let config = ferrosa_storage::StorageEngineConfig::test_config(dir);
+    let engine = ferrosa_storage::StorageEngine::new(config, None).unwrap();
+    engine.register_table(tenant_table_schema()).unwrap();
+    if declare_index {
+        engine
+            .add_partition_key_index(
+                &tenant_table_id(),
+                TENANT_INDEX,
+                0,
+                ferrosa_index::IndexType::BTree,
+            )
+            .unwrap();
+    }
+    write_sessions(&engine, sessions);
+    Arc::new(engine)
+}
+
+/// A node that declared the tenant index, took writes, and was RESTARTED —
+/// the live cluster's state. The index comes back only through the reload.
+fn restarted_tenant_node(
+    dir: &std::path::Path,
+    sessions: &[(u8, u8)],
+) -> Arc<ferrosa_storage::StorageEngine> {
+    use ferrosa_schema::system::persistence;
+    let indexes_tid = TableId::new("system_schema", "indexes");
+    {
+        let config = ferrosa_storage::StorageEngineConfig::test_config(dir);
+        let engine = ferrosa_storage::StorageEngine::new(config, None).unwrap();
+        engine.register_table(tenant_table_schema()).unwrap();
+        engine.register_system_tables().unwrap();
+        engine
+            .add_partition_key_index(
+                &tenant_table_id(),
+                TENANT_INDEX,
+                0,
+                ferrosa_index::IndexType::BTree,
+            )
+            .unwrap();
+        let row = persistence::index_to_rows(&ferrosa_schema::metadata::index::IndexMetadata {
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            name: TENANT_INDEX.into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["tenant_id".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        });
+        engine
+            .write(&indexes_tid, &row.key, row.row, 1_000_000)
+            .unwrap();
+        write_sessions(&engine, sessions);
+        engine.flush(&indexes_tid).unwrap();
+    }
+    let config = ferrosa_storage::StorageEngineConfig::test_config(dir);
+    let (engine, _pending) = ferrosa_storage::StorageEngine::open(config, None).unwrap();
+    engine.register_system_tables().unwrap();
+    let partition_keys = ferrosa_storage::engine::PartitionKeyColumns::from([(
+        tenant_table_id(),
+        vec!["tenant_id".to_string(), "session_id".to_string()],
+    )]);
+    let outcome = engine
+        .reload_indexes_from_system_schema(&partition_keys)
+        .unwrap();
+    assert_eq!(
+        outcome.restored, 1,
+        "the tenant index must be restored on restart"
+    );
+    Arc::new(engine)
+}
+
+/// Drives one tenant-index read against every node through the real request
+/// handler and the real multi-replica consumer.
+async fn scatter_gather_tenant(
+    nodes: Vec<Arc<ferrosa_storage::StorageEngine>>,
+    tenant: u8,
+) -> Result<super::stream_consumer::StreamConsumeOutcome, StreamConsumeError> {
+    const REQ_ID: u32 = 0x7E_7A_17;
+    let router = Arc::new(StreamRouter::new());
+    let rx = router.register(REQ_ID, 64);
+    let frame_router = Arc::new(StreamFrameRouter::new(router.clone()));
+    let req = RangeReadStreamRequestPayload {
+        request_id: REQ_ID,
+        keyspace: "agent_memory".into(),
+        table: "entity_store".into(),
+        index_name: Some(TENANT_INDEX.into()),
+        index_key: Some(tenant_index_key(tenant)),
+        projected_regular_ordinals: None,
+        start_key: None,
+        start_clustering: None,
+        max_chunks: 0,
+    };
+    let expected_done = nodes.len();
+    let producers: Vec<_> = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(i, engine)| {
+            let sink = FakeWireSinkShared {
+                frame_router: frame_router.clone(),
+                from: (
+                    Uuid::from_u128(i as u128 + 1),
+                    format!("127.0.0.1:{}", 7101 + i).parse().unwrap(),
+                ),
+            };
+            let req = req.clone();
+            tokio::spawn(async move {
+                handle_stream_request(req, Arc::new(engine), &sink, 2).await;
+            })
+        })
+        .collect();
+    let outcome = consume_range_stream(rx, IDLE, expected_done, REQ_ID).await;
+    futures::future::join_all(producers)
+        .await
+        .into_iter()
+        .for_each(|joined| joined.expect("producer task must not panic"));
+    outcome
+}
+
+/// The tenant's rows live on three nodes, one of them restarted. A
+/// tenant-wide read must return every one of them and nothing of another
+/// tenant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_read_scatter_gathers_every_nodes_tenant_index() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let nodes = vec![
+        tenant_node(
+            dirs[0].path(),
+            &[(TENANT_A, 1), (TENANT_A, 2), (TENANT_B, 3)],
+            true,
+        ),
+        tenant_node(
+            dirs[1].path(),
+            &[(TENANT_A, 4), (TENANT_B, 5), (TENANT_B, 6)],
+            true,
+        ),
+        restarted_tenant_node(
+            dirs[2].path(),
+            &[(TENANT_A, 7), (TENANT_A, 8), (TENANT_A, 9)],
+        ),
+    ];
+
+    let outcome = scatter_gather_tenant(nodes, TENANT_A)
+        .await
+        .expect("every node declares the tenant index, so the read must succeed");
+
+    // Byte 2 of the composite key is the first byte of the tenant uuid.
+    let mut tenants: Vec<u8> = outcome
+        .partitions
+        .iter()
+        .map(|p| p.key.key.as_bytes()[2])
+        .collect();
+    tenants.sort_unstable();
+    assert_eq!(
+        tenants,
+        vec![TENANT_A; 6],
+        "a tenant-wide read must union all six of the tenant's sessions across \
+         the three nodes — including the restarted one — and none of another \
+         tenant's"
+    );
+}
+
+/// A node that does not have the index cannot answer for its slice of the
+/// tenant. Its silence must fail the read: an empty contribution unions into
+/// a short answer that looks exactly like the rows not existing — the live
+/// failure, where 101,848 entities read as an empty database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_without_the_tenant_index_fails_the_read_rather_than_shortening_it() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let nodes = vec![
+        tenant_node(dirs[0].path(), &[(TENANT_A, 1), (TENANT_A, 2)], true),
+        tenant_node(dirs[1].path(), &[(TENANT_A, 3), (TENANT_A, 4)], false),
+        tenant_node(dirs[2].path(), &[(TENANT_A, 5), (TENANT_A, 6)], true),
+    ];
+
+    match scatter_gather_tenant(nodes, TENANT_A).await {
+        Err(StreamConsumeError::TruncatedReplica { .. }) => {}
+        Err(other) => panic!("expected the missing index to truncate a replica, got {other:?}"),
+        Ok(outcome) => panic!(
+            "a node without the tenant index answered with an empty slice and the \
+             read returned {} of 6 rows as if complete",
+            outcome.partitions.len()
+        ),
+    }
+}
