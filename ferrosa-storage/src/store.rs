@@ -48,7 +48,7 @@ use rayon::prelude::*;
 use ferrosa_index::DistanceMetric;
 
 use crate::flush::{self, FlushTarget};
-use crate::index::sidecar::SidecarReader;
+use crate::index::sidecar::{RowPositionRef, SidecarReader};
 use crate::memtable::index::MemtableIndex;
 #[cfg(not(feature = "skiplist-memtable"))]
 use crate::memtable::sharded::ShardedBTreeMemtable;
@@ -1094,8 +1094,9 @@ thread_local! {
 }
 
 /// One row-ordered source of index postings: the memtable's pinned list or
-/// an SSTable sidecar's slice for the key.
-type PostingSource<'a> = Box<dyn Iterator<Item = &'a RowPosition> + 'a>;
+/// an SSTable sidecar's run for the key, borrowed in place (a sidecar's from
+/// its memory map).
+type PostingSource<'a> = Box<dyn Iterator<Item = RowPositionRef<'a>> + 'a>;
 
 /// The row-ordered posting sources for one index key, each positioned at
 /// `from` (inclusive): the active memtable's pinned list, then every SSTable
@@ -1111,7 +1112,7 @@ fn index_posting_sources<'a>(
     if let Some(list) = memtable {
         let postings = list.as_slice();
         let start = postings.partition_point(|p| from.is_some_and(|start| p < start));
-        sources.push(Box::new(postings[start..].iter()));
+        sources.push(Box::new(postings[start..].iter().map(RowPositionRef::from)));
     }
     for sidecar in view.sidecar_indexes.iter() {
         if let Some(reader) = sidecar.get(index_name) {
@@ -1130,8 +1131,8 @@ fn index_posting_sources<'a>(
 /// postings present.
 struct OrderedPostings<'a> {
     sources: Vec<PostingSource<'a>>,
-    heads: std::collections::BinaryHeap<std::cmp::Reverse<(&'a RowPosition, usize)>>,
-    previous: Option<&'a RowPosition>,
+    heads: std::collections::BinaryHeap<std::cmp::Reverse<(RowPositionRef<'a>, usize)>>,
+    previous: Option<RowPositionRef<'a>>,
 }
 
 impl<'a> OrderedPostings<'a> {
@@ -1151,9 +1152,9 @@ impl<'a> OrderedPostings<'a> {
 }
 
 impl<'a> Iterator for OrderedPostings<'a> {
-    type Item = &'a RowPosition;
+    type Item = RowPositionRef<'a>;
 
-    fn next(&mut self) -> Option<&'a RowPosition> {
+    fn next(&mut self) -> Option<RowPositionRef<'a>> {
         loop {
             let std::cmp::Reverse((position, index)) = self.heads.pop()?;
             if let Some(following) = self.sources[index].next() {
@@ -2773,7 +2774,6 @@ impl<F: FlushTarget> TableStore<F> {
         self.next_gen
             .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
         let mut raw_sidecar_entries: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
-        let mut sidecar_map: HashMap<String, SidecarReader> = HashMap::new();
         for (index_name, memtable_idx) in old_indexes.iter() {
             let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
             // Flatten: each (key, positions) pair becomes multiple (key, pos) entries
@@ -2784,18 +2784,35 @@ impl<F: FlushTarget> TableStore<F> {
                 })
                 .collect();
             if !flat_entries.is_empty() {
-                raw_sidecar_entries.insert(index_name.clone(), flat_entries.clone());
-                sidecar_map.insert(
-                    index_name.clone(),
-                    SidecarReader::from_entries(flat_entries),
-                );
+                raw_sidecar_entries.insert(index_name.clone(), flat_entries);
             }
         }
 
-        // Persist sidecar files to disk (no-op for in-memory flush targets).
-        if let Err(e) = self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
-            tracing::error!(%e, gen, "store: sidecar persist failed");
-        }
+        // Persist the sidecars and take back a reader for each: a file-backed
+        // target maps what it wrote (t_7ac6b0e3); an in-memory target has no
+        // file and returns images. The flat entries are dropped after this.
+        let sidecar_map: HashMap<String, SidecarReader> =
+            match self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
+                Ok(readers) => readers,
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        gen,
+                        "store: sidecar persist failed; serving this generation's indexes from \
+                         in-memory copies"
+                    );
+                    raw_sidecar_entries
+                        .iter()
+                        .map(|(index_name, entries)| {
+                            (
+                                index_name.clone(),
+                                SidecarReader::from_entries(entries.clone()),
+                            )
+                        })
+                        .collect()
+                }
+            };
+        drop(raw_sidecar_entries);
 
         // Step 5c: Build FTI sidecar files for any full-text indexes.
         for (index_name, col_pos) in &self.fulltext_indexes {
@@ -5037,16 +5054,16 @@ impl<F: FlushTarget> TableStore<F> {
         // written before partition postings) names a row already delivered.
         let mut streamed_partition: Option<&[u8]> = None;
         for position in OrderedPostings::new(sources) {
-            if streamed_partition == Some(position.partition_key.as_slice()) {
+            if streamed_partition == Some(position.partition_key) {
                 continue;
             }
             let resume = after
-                .filter(|cursor| cursor.partition_key == position.partition_key)
+                .filter(|cursor| cursor.partition_key.as_slice() == position.partition_key)
                 .map(|cursor| cursor.clustering_key.as_slice());
             let flow = if position.clustering_key.is_empty() {
-                streamed_partition = Some(position.partition_key.as_slice());
-                self.stream_partition_rows(&position.partition_key, resume, visitor)?
-            } else if resume.is_some_and(|cursor| position.clustering_key.as_slice() <= cursor) {
+                streamed_partition = Some(position.partition_key);
+                self.stream_partition_rows(position.partition_key, resume, visitor)?
+            } else if resume.is_some_and(|cursor| position.clustering_key <= cursor) {
                 continue;
             } else {
                 self.visit_indexed_row(position, visitor)?
@@ -5063,15 +5080,15 @@ impl<F: FlushTarget> TableStore<F> {
     /// nothing.
     fn visit_indexed_row(
         &self,
-        position: &RowPosition,
+        position: RowPositionRef<'_>,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> Result<std::ops::ControlFlow<()>> {
         #[cfg(test)]
         INDEX_POINT_READS.with(|count| count.set(count.get() + 1));
         let decorated = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
-            position.partition_key.clone(),
+            position.partition_key.to_vec(),
         ));
-        let row = self.read_clustering_row(&decorated, &position.clustering_key)?;
+        let row = self.read_clustering_row(&decorated, position.clustering_key)?;
         Ok(match row {
             Some(partition) => visitor(partition),
             None => std::ops::ControlFlow::Continue(()),
@@ -5595,6 +5612,18 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns `None` if no index with the given name was declared at
     /// construction time. The returned `Arc` is a snapshot — it remains
     /// valid even after a flush swaps in fresh indexes.
+    /// Test-only: for each SSTable in the view that has a sidecar for
+    /// `index_name`, whether that sidecar is read through a memory map.
+    #[cfg(test)]
+    pub(crate) fn sidecar_backings_for_test(&self, index_name: &str) -> Vec<bool> {
+        let guard = self.view.load();
+        guard
+            .sidecar_indexes
+            .iter()
+            .filter_map(|sidecars| sidecars.get(index_name).map(SidecarReader::is_mapped))
+            .collect()
+    }
+
     pub fn get_memtable_index(&self, name: &str) -> Option<Arc<MemtableIndex>> {
         let guard = self.view.load();
         guard.indexes.get(name).cloned()

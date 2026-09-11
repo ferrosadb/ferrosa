@@ -9066,6 +9066,20 @@ impl StorageEngine {
 
     /// Returns true when the named index is registered and its build tracker
     /// has no known pending or failed work.
+    /// Test-only: see `TableStore::sidecar_backings_for_test`.
+    #[cfg(test)]
+    pub(crate) fn sidecar_backings_for_test(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Vec<bool> {
+        self.tables
+            .read()
+            .get(table_id)
+            .map(|state| state.store.sidecar_backings_for_test(index_name))
+            .unwrap_or_default()
+    }
+
     pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
         self.index_tracker
             .is_current(table_id.keyspace(), table_id.table(), index_name)
@@ -17676,6 +17690,48 @@ mod tests {
     /// The storage schema carries no partition-key column NAMES (only the
     /// composite key type), so the reload is told them by the caller, which
     /// holds the CQL schema.
+    /// t_7ac6b0e3: a flushed sidecar is served from its file through a
+    /// memory map. Flush used to keep a heap copy of every flushed sidecar in
+    /// the view for the life of the SSTable, beside the file it had written.
+    #[test]
+    fn a_flushed_sidecar_is_read_through_a_memory_map() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        (0..20).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+
+        let backings = engine.sidecar_backings_for_test(&tid, "val_idx");
+        assert!(!backings.is_empty(), "the flush produced a sidecar");
+        assert!(
+            backings.iter().all(|mapped| *mapped),
+            "every flushed sidecar must be mapped, not a heap image: {backings:?}"
+        );
+        let found = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .unwrap()
+            .len();
+        assert_eq!(
+            found, 20,
+            "the mapped sidecar answers for every flushed row"
+        );
+    }
+
     #[test]
     fn a_partition_key_index_survives_restart_and_answers() {
         use ferrosa_index::IndexKey;

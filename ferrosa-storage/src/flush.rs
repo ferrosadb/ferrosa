@@ -357,9 +357,18 @@ pub trait FlushTarget {
     fn write_sidecars(
         &self,
         _generation: u64,
-        _sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
-    ) -> Result<()> {
-        Ok(())
+        sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
+    ) -> Result<HashMap<String, crate::index::sidecar::SidecarReader>> {
+        Ok(sidecars
+            .iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .map(|(index_name, entries)| {
+                (
+                    index_name.clone(),
+                    crate::index::sidecar::SidecarReader::from_entries(entries.clone()),
+                )
+            })
+            .collect())
     }
 
     /// Write a full-text index (FTI) sidecar file alongside the SSTable.
@@ -1540,20 +1549,23 @@ impl FlushTarget for FileFlushTarget {
         &self.base_dir
     }
 
-    /// Write per-index sidecar files as `{gen}-{index_name}.sidecar`.
+    /// Write per-index sidecar files as `{gen}-{index_name}.sidecar` and
+    /// return a reader for each that maps the file just written (t_7ac6b0e3):
+    /// the view then holds a mapping, not a heap copy of every posting.
     ///
-    /// Skips empty entry lists (no-ops for indexes with no data).
-    /// Files that fail to write are logged but do not abort the flush —
-    /// a missing sidecar degrades to a full-scan on that index, which is
-    /// recoverable. This matches the `load_existing_sstables` "skip corrupt"
-    /// policy.
+    /// Skips empty entry lists. A sidecar that cannot be written or mapped
+    /// does not abort the flush and must not leave its index short: the error
+    /// is logged and that index is served from an in-memory image of the same
+    /// entries — correct, but heap-resident until the next restart rebuilds
+    /// it, which the log line says.
     fn write_sidecars(
         &self,
         generation: u64,
         sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
-    ) -> Result<()> {
-        use crate::index::sidecar::SidecarWriter;
+    ) -> Result<HashMap<String, crate::index::sidecar::SidecarReader>> {
+        use crate::index::sidecar::{SidecarReader, SidecarWriter};
 
+        let mut readers = HashMap::with_capacity(sidecars.len());
         for (index_name, entries) in sidecars {
             if entries.is_empty() {
                 continue;
@@ -1561,11 +1573,24 @@ impl FlushTarget for FileFlushTarget {
             let path = self
                 .base_dir
                 .join(format!("{generation}-{index_name}.sidecar"));
-            if let Err(e) = SidecarWriter::write(&path, entries) {
-                tracing::error!(%e, path = %path.display(), "flush: failed to write sidecar");
-            }
+            let mapped =
+                SidecarWriter::write(&path, entries).and_then(|()| SidecarReader::open(&path));
+            let reader = match mapped {
+                Ok(reader) => reader,
+                Err(e) => {
+                    tracing::error!(
+                        %e,
+                        path = %path.display(),
+                        index_name,
+                        "flush: sidecar could not be written or mapped; serving this index \
+                         for this generation from an in-memory copy (heap-resident until restart)"
+                    );
+                    SidecarReader::from_entries(entries.clone())
+                }
+            };
+            readers.insert(index_name.clone(), reader);
         }
-        Ok(())
+        Ok(readers)
     }
 
     fn write_fti_sidecar(&self, generation: u64, index_name: &str, fti_bytes: &[u8]) -> Result<()> {
