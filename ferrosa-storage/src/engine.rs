@@ -714,12 +714,25 @@ pub fn log_auth_warn_state(auth_enabled: bool, auth_warn: bool) {
     }
 }
 
+/// A sidecar built after its SSTable may already have been uploaded: the sync
+/// skips generations already in the manifest, so this one is uploaded on its
+/// own. In memory only — lost on a crash, in which case the next boot's index
+/// reload rebuilds the sidecar from the SSTable.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingIndexUpload {
+    table_id: TableId,
+    sstable_id: String,
+    path: std::path::PathBuf,
+}
+
 /// The scheduler's sidecar installer: map the sidecar it just wrote and put it
 /// into the owning table's live view (t_7ac6b0e3).
 fn sidecar_installer(
     tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
 ) -> crate::index::scheduler::SidecarInstaller {
     let tables = Arc::clone(tables);
+    let pending_uploads = Arc::clone(pending_uploads);
     Arc::new(move |job, index_name, path| {
         let reader = crate::index::sidecar::SidecarReader::open(path)
             .map_err(|e| format!("map {}: {e}", path.display()))?;
@@ -740,7 +753,13 @@ fn sidecar_installer(
                 sstable = %job.sstable_id,
                 "index-build: SSTable left the view before its sidecar was installed"
             );
+            return Ok(());
         }
+        pending_uploads.lock().push(PendingIndexUpload {
+            table_id,
+            sstable_id: job.sstable_id.clone(),
+            path: path.to_path_buf(),
+        });
         Ok(())
     })
 }
@@ -753,12 +772,13 @@ fn sidecar_installer(
 fn build_index_scheduler(
     config: &StorageEngineConfig,
     tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
 ) -> (
     Option<crate::index::IndexBuildScheduler>,
     Arc<crate::index::IndexStateTracker>,
 ) {
     let tracker = Arc::new(crate::index::IndexStateTracker::new());
-    let installer = sidecar_installer(tables);
+    let installer = sidecar_installer(tables, pending_uploads);
 
     let scheduler = match &config.index_backend {
         crate::index::IndexBackendConfig::Off => None,
@@ -928,6 +948,9 @@ pub struct StorageEngine {
     config: StorageEngineConfig,
     /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
     tables: Arc<RwLock<HashMap<TableId, TableState>>>,
+    /// Sidecars the scheduler built and installed, whose generation may
+    /// already be in S3 — the next S3 sync uploads them (t_7ac6b0e3).
+    pending_index_uploads: Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
     pub(crate) commit_log: CommitLog,
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
@@ -2067,11 +2090,14 @@ impl StorageEngine {
         );
 
         let tables = Arc::new(RwLock::new(HashMap::new()));
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         let engine = Self {
             config,
             tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -2252,11 +2278,14 @@ impl StorageEngine {
         };
 
         let tables = Arc::new(RwLock::new(HashMap::new()));
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         Ok(Self {
             config,
             tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -2350,7 +2379,9 @@ impl StorageEngine {
         );
 
         let tables = Arc::new(RwLock::new(HashMap::new()));
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
         if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
             for schema in schemas {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -2405,6 +2436,7 @@ impl StorageEngine {
         let engine = Self {
             config,
             tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
             compaction_executor,
@@ -9497,6 +9529,9 @@ impl StorageEngine {
             }
         }
 
+        self.upload_pending_index_sidecars(upload_mgr, &manifest)
+            .await;
+
         if uploaded > 0 {
             // Save updated manifest — use CAS if supported, unconditional otherwise.
             let phase_start = Instant::now();
@@ -9518,6 +9553,64 @@ impl StorageEngine {
         }
 
         Ok(uploaded)
+    }
+
+    /// Upload the sidecars the index scheduler built for generations already
+    /// in the manifest (t_7ac6b0e3). A generation not yet in the manifest
+    /// takes its sidecars along in its own upload, which scans every
+    /// `{gen}-*` file. A sidecar that fails to upload is kept for the next
+    /// sync, and said so.
+    async fn upload_pending_index_sidecars(
+        &self,
+        upload_mgr: &crate::upload::UploadManager,
+        manifest: &crate::manifest::Manifest,
+    ) {
+        let pending = std::mem::take(&mut *self.pending_index_uploads.lock());
+        let mut retry = Vec::new();
+        for item in pending {
+            let table = item.table_id.to_string();
+            let in_manifest = manifest
+                .sstables
+                .get(&table)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.id == item.sstable_id));
+            if !in_manifest || !item.path.exists() {
+                continue;
+            }
+            let Some(name) = item
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let task = crate::upload::UploadTask::SSTable {
+                table_id: table.clone(),
+                sstable_id: item.sstable_id.clone(),
+                files: vec![crate::upload::manager::SstableComponentFile::new(
+                    name, &item.path,
+                )],
+                on_complete: Some(tx),
+            };
+            let outcome = match upload_mgr.submit(task).await {
+                Ok(()) => rx
+                    .await
+                    .unwrap_or_else(|_| Err("upload worker dropped the channel".into())),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(msg) = outcome {
+                tracing::error!(
+                    table,
+                    sstable = item.sstable_id,
+                    path = %item.path.display(),
+                    "s3-sync: index sidecar upload failed; will retry on the next sync: {msg}"
+                );
+                retry.push(item);
+            }
+        }
+        if !retry.is_empty() {
+            self.pending_index_uploads.lock().extend(retry);
+        }
     }
 
     /// Download SSTables from S3 to local disk for a specific table.
@@ -9572,6 +9665,17 @@ impl StorageEngine {
                 Self::generation_component_path(&table_dir, &entry.id, component).is_some()
             });
             if local_complete {
+                if let Some(local_dir) = Self::generation_dir_for(&table_dir, &entry.id) {
+                    Self::pull_index_artifacts(
+                        store.as_ref(),
+                        &prefix,
+                        &hex,
+                        &table_id.to_string(),
+                        &entry.id,
+                        &local_dir,
+                    )
+                    .await?;
+                }
                 downloaded += 1;
                 continue;
             }
@@ -9642,6 +9746,20 @@ impl StorageEngine {
                 }
             }
 
+            if let Err(e) = Self::pull_index_artifacts(
+                store.as_ref(),
+                &prefix,
+                &hex,
+                &table_id.to_string(),
+                &entry.id,
+                &staging_dir,
+            )
+            .await
+            {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(e);
+            }
+
             Self::sync_directory(&staging_dir).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&staging_dir);
                 ferrosa_common::Error::InvalidFormat(format!(
@@ -9685,6 +9803,92 @@ impl StorageEngine {
         }
 
         Ok(downloaded)
+    }
+
+    /// The directory holding generation `gen`'s components: its own
+    /// generation directory, or the flat table directory.
+    fn generation_dir_for(table_dir: &std::path::Path, gen: &str) -> Option<std::path::PathBuf> {
+        Self::generation_component_path(table_dir, gen, "Data.db")
+            .and_then(|data| data.parent().map(std::path::Path::to_path_buf))
+    }
+
+    /// Whether `component` (a file name after `{gen}-`) is an index artifact
+    /// rather than an SSTable component: a scalar `.sidecar`, or a full-text,
+    /// vector or quantized-vector index file.
+    fn is_index_artifact(component: &str) -> bool {
+        component.ends_with(".sidecar")
+            || component.starts_with("FTI-")
+            || component.starts_with("VEC-")
+            || component.starts_with("QVEC-")
+    }
+
+    /// Pull every index artifact S3 holds for generation `gen` into `dest_dir`,
+    /// completely, before anything maps it (t_7ac6b0e3). Artifacts already on
+    /// disk are left alone; each download streams to a temp file and is renamed
+    /// into place, so a partially fetched sidecar is never visible. Without
+    /// this a node restored from S3 had SSTables but no indexes over them.
+    pub(crate) async fn pull_index_artifacts(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        hex: &str,
+        table_id: &str,
+        gen: &str,
+        dest_dir: &std::path::Path,
+    ) -> ferrosa_common::Result<usize> {
+        use futures::StreamExt;
+
+        let generation_prefix =
+            object_store::path::Path::from(format!("{prefix}/{hex}/{table_id}/{gen}"));
+        let name_prefix = format!("{gen}-");
+        let mut listing = store.list(Some(&generation_prefix));
+        let mut pulled = 0usize;
+        while let Some(object) = listing.next().await {
+            let object = object.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "listing index artifacts for generation {gen} of {table_id}: {e}"
+                ))
+            })?;
+            let Some(file_name) = object.location.filename() else {
+                continue;
+            };
+            let Some(component) = file_name.strip_prefix(&name_prefix) else {
+                continue;
+            };
+            if !Self::is_index_artifact(component) {
+                continue;
+            }
+            let final_path = dest_dir.join(file_name);
+            if final_path.exists() {
+                continue;
+            }
+            let temp_path = dest_dir.join(format!(".{file_name}.download.tmp"));
+            match Self::download_sstable_component_to_path(store, &object.location, &temp_path)
+                .await?
+            {
+                Some(_) => {
+                    tokio::fs::rename(&temp_path, &final_path)
+                        .await
+                        .map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "publishing pulled index artifact {}: {e}",
+                                final_path.display()
+                            ))
+                        })?;
+                    pulled += 1;
+                }
+                None => {
+                    // Listed, then gone: deleted between list and get.
+                    tracing::warn!(
+                        path = %object.location,
+                        "index artifact vanished from S3 between listing and download"
+                    );
+                }
+            }
+        }
+        if pulled > 0 {
+            tracing::info!(table_id, gen, pulled, "pulled index artifacts from S3");
+        }
+        Ok(pulled)
     }
 
     fn temp_download_directory(
@@ -10136,11 +10340,14 @@ impl StorageEngine {
         );
 
         let tables = Arc::new(RwLock::new(HashMap::new()));
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config, &tables);
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         Ok(Self {
             config,
             tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
             compaction_executor,
@@ -21901,6 +22108,61 @@ mod tests {
         (dir, engine, store, prefix, tid)
     }
 
+    /// t_7ac6b0e3: a sidecar built after its generation is already in S3 (a
+    /// CREATE INDEX backfill over uploaded data) is uploaded too. The sync
+    /// skips any generation already in the manifest, so such a sidecar was
+    /// never uploaded, and a node restored from S3 had no index over that
+    /// generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sidecar_built_after_its_generation_was_uploaded_reaches_s3() {
+        use futures::StreamExt;
+
+        let (_dir, engine, store, _prefix, tid) = s3_sync_fixture("test-late-sidecar", &[]);
+        (0..5).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        assert!(
+            engine.sync_sstables_to_s3().await.unwrap() >= 1,
+            "the generation is uploaded"
+        );
+
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill completes"
+        );
+
+        engine.sync_sstables_to_s3().await.unwrap();
+
+        let mut listing = store.list(None);
+        let mut sidecar_objects = Vec::new();
+        while let Some(object) = listing.next().await {
+            let object = object.unwrap();
+            if object.location.as_ref().ends_with("-val_idx.sidecar") {
+                sidecar_objects.push(object.location.to_string());
+            }
+        }
+        assert_eq!(
+            sidecar_objects.len(),
+            1,
+            "the backfilled sidecar must be uploaded beside its generation: {sidecar_objects:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sync_s3_rejects_generation_missing_required_rows_component() {
         let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
@@ -23230,6 +23492,106 @@ mod tests {
             let table_dir = dir.path().join("sstables").join(&table_id_str);
             assert!(StorageEngine::generation_component_path(&table_dir, "1", "Data.db").is_some());
             assert!(StorageEngine::generation_component_path(&table_dir, "2", "Data.db").is_none());
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    /// t_7ac6b0e3: restoring a generation from S3 pulls its index sidecars
+    /// down completely, beside its components, so a node rebuilt from its S3
+    /// prefix has its indexes. Restore used to fetch only the SSTable's seven
+    /// components: every generation came back with no sidecar and every
+    /// scalar index read as empty for it.
+    #[test]
+    fn download_sstables_from_s3_pulls_the_generations_index_sidecars() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-sidecar-restore".to_string();
+            let tid = table_id();
+            let table_id_str = tid.to_string();
+
+            let engine = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let mut manifest = crate::manifest::Manifest::new();
+            manifest.add_sstable(
+                &table_id_str,
+                crate::manifest::ManifestEntry {
+                    id: "1".to_string(),
+                    size: 4,
+                    min_token: 0,
+                    max_token: 0,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+
+            // A real v2 sidecar image, uploaded as the generation's object.
+            let staging = tempfile::tempdir().unwrap();
+            let sidecar_path = staging.path().join("1-val_idx.sidecar");
+            crate::index::sidecar::SidecarWriter::write(
+                &sidecar_path,
+                &[(
+                    ferrosa_index::IndexKey(b"shared".to_vec()),
+                    ferrosa_index::RowPosition {
+                        partition_key: b"k1".to_vec(),
+                        clustering_key: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+            let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+
+            let hex = crate::upload::manager::hex_prefix_for("1");
+            for (component, bytes) in [
+                ("Data.db", b"data".to_vec()),
+                ("Partitions.db", b"partitions".to_vec()),
+                ("Rows.db", b"rows".to_vec()),
+                ("val_idx.sidecar", sidecar_bytes.clone()),
+            ] {
+                let path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id_str,
+                    "1",
+                    component,
+                );
+                store
+                    .put(
+                        &path,
+                        object_store::PutPayload::from(bytes::Bytes::from(bytes)),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("restore");
+            assert_eq!(downloaded, 1);
+
+            let table_dir = dir.path().join("sstables").join(&table_id_str);
+            let restored =
+                StorageEngine::generation_component_path(&table_dir, "1", "val_idx.sidecar")
+                    .expect("the generation's sidecar must be restored beside its components");
+            assert_eq!(
+                std::fs::read(&restored).unwrap(),
+                sidecar_bytes,
+                "the sidecar is pulled down completely, byte for byte"
+            );
 
             engine.shutdown().unwrap();
         });

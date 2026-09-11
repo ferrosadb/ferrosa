@@ -324,6 +324,8 @@ static MEMTABLE_BACKPRESSURE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 static RANGE_READ_TRUNCATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INDEX_RELOAD_SKIPPED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INDEX_SIDECAR_MAPPED_BYTES: AtomicI64 = AtomicI64::new(0);
+static INDEX_SIDECAR_MAPPED_FILES: AtomicI64 = AtomicI64::new(0);
 static READ_LIMITED_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_FOUND_TOTAL: AtomicU64 = AtomicU64::new(0);
 static READ_LIMITED_ROWS_SECONDS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -486,6 +488,29 @@ pub fn range_read_truncated_total() -> u64 {
 /// boot).
 pub fn add_index_reload_skipped(n: u64) {
     INDEX_RELOAD_SKIPPED_ROWS_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+/// A scalar index sidecar of `bytes` was memory-mapped (t_7ac6b0e3).
+pub fn index_sidecar_mapped(bytes: u64) {
+    INDEX_SIDECAR_MAPPED_BYTES.fetch_add(bytes as i64, Ordering::Relaxed);
+    INDEX_SIDECAR_MAPPED_FILES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A mapped sidecar of `bytes` was unmapped (its last reader dropped).
+pub fn index_sidecar_unmapped(bytes: u64) {
+    INDEX_SIDECAR_MAPPED_BYTES.fetch_sub(bytes as i64, Ordering::Relaxed);
+    INDEX_SIDECAR_MAPPED_FILES.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Bytes of scalar index sidecars currently memory-mapped. Mapped pages are
+/// file-backed page cache the kernel reclaims under pressure, not heap.
+pub fn index_sidecar_mapped_bytes() -> i64 {
+    INDEX_SIDECAR_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Scalar index sidecar files currently memory-mapped.
+pub fn index_sidecar_mapped_files() -> i64 {
+    INDEX_SIDECAR_MAPPED_FILES.load(Ordering::Relaxed)
 }
 
 /// Total unresolvable `system_schema.indexes` rows skipped by index reloads
@@ -970,6 +995,22 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_index_reload_skipped_rows_total {}\n",
         INDEX_RELOAD_SKIPPED_ROWS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_index_sidecar_mapped_bytes Bytes of scalar index sidecars memory-mapped (reclaimable page cache, not heap).\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_index_sidecar_mapped_bytes gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_index_sidecar_mapped_bytes {}\n",
+        INDEX_SIDECAR_MAPPED_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_index_sidecar_mapped_files Scalar index sidecar files memory-mapped.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_index_sidecar_mapped_files gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_index_sidecar_mapped_files {}\n",
+        INDEX_SIDECAR_MAPPED_FILES.load(Ordering::Relaxed)
     ));
     out.push_str(
         "# HELP ferrosa_storage_read_limited_rows_total Partition read_limited_rows calls.\n",

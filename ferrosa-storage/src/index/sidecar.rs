@@ -307,11 +307,30 @@ fn encode_v2_in_memory(sorted: &[(IndexKey, RowPosition)]) -> Vec<u8> {
 
 // ── Reader ───────────────────────────────────────────────────────────────────
 
+/// A memory-mapped sidecar, counted in the `index_sidecar_mapped_*` gauges
+/// for exactly the life of the mapping.
+struct MappedSidecar {
+    map: memmap2::Mmap,
+}
+
+impl MappedSidecar {
+    fn new(map: memmap2::Mmap) -> Self {
+        crate::metrics::index_sidecar_mapped(map.len() as u64);
+        Self { map }
+    }
+}
+
+impl Drop for MappedSidecar {
+    fn drop(&mut self) {
+        crate::metrics::index_sidecar_unmapped(self.map.len() as u64);
+    }
+}
+
 /// The bytes a reader decodes from.
 #[derive(Clone)]
 enum SidecarBytes {
     /// A published file, memory-mapped: reclaimable page cache, not heap.
-    Mapped(Arc<memmap2::Mmap>),
+    Mapped(Arc<MappedSidecar>),
     /// An in-memory image, for flush targets with no file (in-memory stores).
     Heap(Arc<[u8]>),
     /// A file with no entries.
@@ -321,7 +340,7 @@ enum SidecarBytes {
 impl SidecarBytes {
     fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Mapped(map) => map,
+            Self::Mapped(mapped) => &mapped.map,
             Self::Heap(bytes) => bytes,
             Self::Empty => &[],
         }
@@ -394,7 +413,7 @@ impl SidecarReader {
             // A readahead hint only; lookups are correct without it.
             tracing::debug!(%error, path = %path.display(), "sidecar: madvise(RANDOM) refused");
         }
-        Self::from_bytes(SidecarBytes::Mapped(Arc::new(map)))
+        Self::from_bytes(SidecarBytes::Mapped(Arc::new(MappedSidecar::new(map))))
     }
 
     /// Validate a v2 image and build a reader over it.
@@ -893,6 +912,30 @@ mod tests {
             leftovers.is_empty(),
             "no temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// Mapped sidecars are counted: bytes and files are exported as gauges,
+    /// held for exactly the life of the mapping. Lower bounds only — other
+    /// tests map sidecars concurrently.
+    #[test]
+    fn mapped_sidecars_are_counted_for_the_life_of_the_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("7-idx.sidecar");
+        SidecarWriter::write(&path, &sample_entries()).unwrap();
+        let reader = SidecarReader::open(&path).unwrap();
+        let clone = reader.clone();
+        assert!(crate::metrics::index_sidecar_mapped_files() >= 1);
+        assert!(crate::metrics::index_sidecar_mapped_bytes() >= reader.byte_len() as i64);
+        drop(reader);
+        assert!(
+            crate::metrics::index_sidecar_mapped_files() >= 1,
+            "a clone shares the mapping, so it is still counted"
+        );
+        drop(clone);
+
+        let rendered = crate::metrics::render_prometheus();
+        assert!(rendered.contains("ferrosa_storage_index_sidecar_mapped_bytes"));
+        assert!(rendered.contains("ferrosa_storage_index_sidecar_mapped_files"));
     }
 
     fn sample_entries() -> Vec<(IndexKey, RowPosition)> {
