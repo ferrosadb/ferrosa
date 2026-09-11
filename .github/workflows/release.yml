@@ -194,7 +194,38 @@ jobs:
   # ── macOS Apple Silicon (aarch64) ─────────────────────────────────────
   build-macos-aarch64:
     name: Build macOS aarch64
-    runs-on: [self-hosted, macOS, ARM64]
+    # HOSTED, not the self-hosted Mac, and this job is the reason releases
+    # stopped producing a macOS artifact.
+    #
+    # ferrosa is a PUBLIC repository, and GitHub does not offer self-hosted
+    # runners to a public repo's workflows at an arbitrary ref — only on the
+    # default branch. This workflow is triggered by `push: tags: v*`, so every
+    # release run sits at `refs/tags/...` and the job queued forever with no
+    # runner assigned. Four releases (v2026.09.10.2254 through
+    # v2026.09.11.0545) stalled this way: their Linux jobs finished in minutes
+    # on hosted runners while this one never started, so no release published
+    # and the installer manifest could not be repinned.
+    #
+    # The evidence, gathered 2026-09-11:
+    #
+    #   * ferrosa (public) self-hosted jobs at a MAIN ref — install-smoke,
+    #     driver-tests — dispatch and succeed on macbook-m5max.
+    #   * ferrosa (public) self-hosted jobs at a TAG ref never dispatch, with
+    #     both Mac runners online and idle.
+    #   * ferrosa-memory-private (PRIVATE) dispatches the same label set at a
+    #     tag ref without trouble.
+    #
+    # The runner group's `allows_public_repositories=true` admits the repo; it
+    # does not lift the ref constraint. Removing the group's workflow
+    # restriction changed nothing, and neither did restarting the runner or
+    # moving runners between groups — all three were tried first.
+    #
+    # macOS minutes bill at 10x, which is why the rest of the fleet is
+    # self-hosted. This job is the exception because a release cannot be cut
+    # any other way while the repo is public: it runs only on a tag push, not
+    # per-commit. If ferrosa goes private, or the release moves to a
+    # main-ref trigger, put it back on `[self-hosted, macOS, ARM64]`.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25

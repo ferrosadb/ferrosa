@@ -47,9 +47,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, Linux, X64]
+            runner: ubuntu-latest
           - os: macos-14
-            runner: [self-hosted, macOS, ARM64]
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -57,14 +57,14 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      # These jobs run on SELF-HOSTED runners (see `runner:` in the matrix
-      # above; the `os:` value is only a display name). A self-hosted box is
-      # not a fresh hosted image: it may have no passwordless sudo, and it
-      # already has the toolchain installed from the last build. Running the
-      # hosted-image incantation blindly failed this job in 10 seconds, before
-      # any compilation, on every run since builds were routed here — while
-      # the identical line kept passing in the jobs that really do use
-      # `runs-on: ubuntu-latest`.
+      # Kept defensive even though these jobs now run on HOSTED runners.
+      #
+      # They ran on self-hosted boxes until 2026-09-11, and a bare
+      # `sudo apt-get install` failed there in 10 seconds, before any
+      # compilation, on every run: that machine has no passwordless sudo and
+      # already had the toolchain. On a hosted runner `sudo -n` simply
+      # succeeds and this costs nothing — so the guard stays, and pointing
+      # these jobs back at a self-hosted box cannot reintroduce that failure.
       #
       # So: use capnp if it is there, install it if we are allowed to, and say
       # exactly what is missing and where if neither is true. Never fail with
@@ -131,9 +131,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, Linux, X64]
+            runner: ubuntu-latest
           - os: macos-14
-            runner: [self-hosted, macOS, ARM64]
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -166,9 +166,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runner: [self-hosted, Linux, X64]
+            runner: ubuntu-latest
           - os: macos-14
-            runner: [self-hosted, macOS, ARM64]
+            runner: macos-14
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -181,14 +181,14 @@ jobs:
           repository: ferrosadb/ferrosa-memory
           path: ferrosa-memory
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      # These jobs run on SELF-HOSTED runners (see `runner:` in the matrix
-      # above; the `os:` value is only a display name). A self-hosted box is
-      # not a fresh hosted image: it may have no passwordless sudo, and it
-      # already has the toolchain installed from the last build. Running the
-      # hosted-image incantation blindly failed this job in 10 seconds, before
-      # any compilation, on every run since builds were routed here — while
-      # the identical line kept passing in the jobs that really do use
-      # `runs-on: ubuntu-latest`.
+      # Kept defensive even though these jobs now run on HOSTED runners.
+      #
+      # They ran on self-hosted boxes until 2026-09-11, and a bare
+      # `sudo apt-get install` failed there in 10 seconds, before any
+      # compilation, on every run: that machine has no passwordless sudo and
+      # already had the toolchain. On a hosted runner `sudo -n` simply
+      # succeeds and this costs nothing — so the guard stays, and pointing
+      # these jobs back at a self-hosted box cannot reintroduce that failure.
       #
       # So: use capnp if it is there, install it if we are allowed to, and say
       # exactly what is missing and where if neither is true. Never fail with
