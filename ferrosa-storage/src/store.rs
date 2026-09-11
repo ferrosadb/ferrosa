@@ -7197,7 +7197,10 @@ mod tests {
         let body = source
             .split("pub fn read_by_index_each_after(")
             .nth(1)
-            .and_then(|rest| rest.split("\n    }\n").next())
+            // `\x7d` is a closing brace, spelled as an escape so brace-counting
+            // tools (scripts/check-unbounded-reads.py) do not see the test
+            // module end here.
+            .and_then(|rest| rest.split("\n    \x7d\n").next())
             .expect("read_by_index_each_after must exist");
         for forbidden in ["HashSet", "HashMap", ".collect::<Vec", "BTreeSet"] {
             assert!(
