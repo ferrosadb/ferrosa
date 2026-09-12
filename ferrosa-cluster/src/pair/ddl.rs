@@ -332,6 +332,15 @@ impl DdlCoordinator {
                 self.schema
                     .create_index_internal(idx.clone())
                     .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+                // Build it here too (t_1f2741a0).
+                if let Some(table) = self
+                    .schema
+                    .snapshot()
+                    .tables
+                    .get(&(idx.keyspace.clone(), idx.table.clone()))
+                {
+                    crate::index_wiring::wire_index_into_engine(&self.engine, table, idx);
+                }
                 crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
                     .apply(
                         ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(

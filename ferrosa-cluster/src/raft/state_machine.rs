@@ -1210,8 +1210,20 @@ impl FerrosStateMachine {
                     });
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_index_internal(index) {
+                    if let Err(e) = schema.create_index_internal(index.clone()) {
                         tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
+                    }
+                    // Build it here too: a follower that records the index and
+                    // does not have it refuses reads its schema says it can
+                    // serve, until a restart's reload builds it (t_1f2741a0).
+                    if let Some(engine) = &self.engine {
+                        if let Some(table) = schema
+                            .snapshot()
+                            .tables
+                            .get(&(index.keyspace.clone(), index.table.clone()))
+                        {
+                            crate::index_wiring::wire_index_into_engine(engine, table, &index);
+                        }
                     }
                 }
             }

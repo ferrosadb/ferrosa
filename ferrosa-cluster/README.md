@@ -61,6 +61,22 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   also calls `engine.drop_index`, so live memtable/vector index state, sidecar
   read guards, and `IndexStateTracker` entries are removed on the applying node
   immediately.
+- `index_wiring.rs` — **`CreateIndex` apply builds the index on the node
+  receiving it** (t_1f2741a0), matching what `DropIndex` has always done.
+  Every replicated apply path (Raft state machine, `ddl_path`, pair) calls
+  `wire_index_into_engine`, which picks the same engine call the executing node
+  picks for that column's kind: `add_index`/`add_index_with_predicate` for a
+  stored cell, `add_clustering_index` for a clustering component,
+  `add_partition_key_index` for a partition-key component — a partition-key
+  column has no storage-cell ordinal, so wiring it as a cell index would leave
+  it permanently empty. Previously only the executing node built the index, so
+  every other node had one its schema listed and its table did not have, and a
+  read there refused it (`is not declared on this node's table`) until a
+  restart's `reload_indexes_from_system_schema` built it. That is what took
+  ferrosa-memory's entity streams down across `main` and every open PR of that
+  repo (t_12457d3e). A wiring failure is a WARN, never a failed DDL: the schema
+  keeps the index cluster-wide, and failing it on one node would leave the
+  cluster's schema inconsistent.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
