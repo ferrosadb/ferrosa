@@ -1209,21 +1209,40 @@ impl FerrosStateMachine {
                         context: "Raft apply: system table write failed",
                     });
                 }
+                // Build it here too. The schema half above is what makes the
+                // planner select this index on THIS node; without the engine
+                // half the node holds an index it cannot answer from, and a
+                // global index read fans out to every replica. Mirrors
+                // `RaftOp::DropIndex` below, which has always called
+                // `engine.drop_index` and pushed an `ApplyError` on failure.
+                if let Some(engine) = &self.engine {
+                    let partition_key = self
+                        .state
+                        .tables
+                        .get(&(index.keyspace.clone(), index.table.clone()))
+                        .map(|t| t.partition_key.clone())
+                        .unwrap_or_default();
+                    if let Err(e) = crate::ddl_path::build_replicated_index(
+                        engine,
+                        &index,
+                        &partition_key,
+                        "replicated DDL (raft apply)",
+                    ) {
+                        tracing::error!(
+                            %e,
+                            index = %index.name,
+                            "Raft apply: building the replicated index failed — this node \
+                             will refuse or under-answer reads the planner routes to it"
+                        );
+                        apply_errors.push(ApplyError::Other(format!(
+                            "build_replicated_index({}.{}.{}) failed: {e}",
+                            index.keyspace, index.table, index.name
+                        )));
+                    }
+                }
                 if let Some(schema) = &self.schema {
                     if let Err(e) = schema.create_index_internal(index.clone()) {
                         tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
-                    }
-                    // Build it here too: a follower that records the index and
-                    // does not have it refuses reads its schema says it can
-                    // serve, until a restart's reload builds it (t_1f2741a0).
-                    if let Some(engine) = &self.engine {
-                        if let Some(table) = schema
-                            .snapshot()
-                            .tables
-                            .get(&(index.keyspace.clone(), index.table.clone()))
-                        {
-                            crate::index_wiring::wire_index_into_engine(engine, table, &index);
-                        }
                     }
                 }
             }
@@ -4216,6 +4235,88 @@ mod tests {
             .expect("index entry should exist");
         assert_eq!(entry.get(&1u64), Some(&IndexNodeStatus::Ready));
         assert_eq!(entry.get(&2u64), Some(&IndexNodeStatus::Building));
+    }
+
+    /// A `CREATE INDEX` replicated through Raft must BUILD the index in the
+    /// receiving node's storage engine, not only record it in schema.
+    ///
+    /// Only the CQL router wires an index into storage, and it runs on the one
+    /// node whose session received the DDL. Every other replica applies
+    /// `RaftOp::CreateIndex`, which registers the index in `Schema` and in
+    /// `system_schema.indexes` and marks every member `Building` — and never
+    /// touches the engine. Nothing later builds it either: no node reports
+    /// `Ready` because no build was ever started.
+    ///
+    /// The asymmetry is visible three lines down in the same `match`:
+    /// `RaftOp::DropIndex` calls `engine.drop_index`, and pushes an
+    /// `ApplyError` when it fails. Create unwires nothing and wires nothing.
+    ///
+    /// What it costs: the planner picks the index on every node, because the
+    /// CQL schema lists it everywhere. A global index read fans out to all
+    /// replicas (`coordinate_index_read_stream`), so the replicas that never
+    /// built it answer for their whole slice of the table. Before
+    /// d6645fc7 they answered it with zero rows and the coordinator unioned
+    /// that into a short result reported as the complete one; since d6645fc7
+    /// they refuse, naming the index, and the refusal fails the whole read.
+    /// Both are wrong, and the second is what `agent_memory`'s tenant-wide
+    /// entity reads have been failing on.
+    #[tokio::test]
+    async fn create_index_via_raft_apply_is_built_in_the_local_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+
+        let shared_schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&shared_schema), Arc::clone(&engine));
+
+        // This node never sees the CQL statement; it only replays the log.
+        let ks = simple_keyspace("idx_ks");
+        let table = simple_table("idx_ks", "idx_tbl");
+        let index = IndexMetadata {
+            keyspace: "idx_ks".into(),
+            table: "idx_tbl".into(),
+            name: "idx_by_value".into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["value".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+        let responses = sm
+            .apply(vec![
+                make_entry(1, 1, RaftOp::CreateKeyspace(ks)),
+                make_entry(1, 2, RaftOp::CreateTable(Box::new(table))),
+                make_entry(1, 3, RaftOp::CreateIndex(index)),
+            ])
+            .await
+            .unwrap();
+        for (i, response) in responses.iter().enumerate() {
+            assert!(
+                matches!(response, RaftResponse::Ok),
+                "entry {i} should apply cleanly: {response:?}"
+            );
+        }
+
+        // The schema half already works — that is what makes the missing half
+        // invisible, and what makes the planner keep choosing the index.
+        assert!(
+            shared_schema.snapshot().indexes.contains_key(&(
+                "idx_ks".to_string(),
+                "idx_tbl".to_string(),
+                "idx_by_value".to_string(),
+            )),
+            "the replicated index must be in the shared schema"
+        );
+
+        let table_id = TableId::new("idx_ks", "idx_tbl");
+        assert!(
+            engine.declares_index(&table_id, "idx_by_value"),
+            "a CREATE INDEX replicated through Raft must be built in this \
+             node's storage engine. The schema lists it, so the planner will \
+             select it on this node; an index the engine does not have either \
+             answers for its whole slice with zero rows or refuses the read \
+             outright. Neither is an answer."
+        );
     }
 
     #[test]

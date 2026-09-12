@@ -13,7 +13,6 @@ pub mod ddl_path;
 pub mod error;
 pub mod hints;
 pub mod index_coordination;
-pub mod index_wiring;
 pub mod membership;
 pub mod mode;
 pub mod pair;
