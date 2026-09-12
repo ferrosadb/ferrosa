@@ -113,3 +113,14 @@ repos:
         language: system
         always_run: true
         pass_filenames: false
+
+  # Refuse to add a new spec to this published repository. The private specs
+  # tree lives in the coordination repo; see the script header for why.
+  - repo: local
+    hooks:
+      - id: published-specs-guard
+        name: no new specs in a published repo
+        entry: .github/scripts/check-published-specs.sh
+        language: system
+        pass_filenames: false
+        always_run: true
