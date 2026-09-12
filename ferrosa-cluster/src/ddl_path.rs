@@ -67,6 +67,9 @@ pub(crate) fn build_replicated_index(
                 partition_key_columns: partition_key,
                 filter_predicate: idx.filter_predicate.clone(),
                 options: &idx.options,
+                // Live DDL: a CREATE INDEX can outrun its CREATE TABLE on this
+                // node, and the table is on its way.
+                defer_until_table_exists: true,
                 site,
             },
         )

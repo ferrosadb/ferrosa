@@ -996,6 +996,16 @@ pub struct StorageEngine {
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
+    /// Index registrations that arrived before their table was registered,
+    /// applied when it is — the same lazy shape as
+    /// `deferred_replay_mutations` directly above, for the same reason.
+    ///
+    /// A replicated `CREATE INDEX` can reach a node before that node has
+    /// registered the table. That is ordinary ordering, so it must neither
+    /// fail the DDL apply nor wait for a restart's reload to notice: both
+    /// leave the planner selecting an index this node cannot answer, for as
+    /// long as the node stays up.
+    deferred_index_builds: parking_lot::Mutex<HashMap<TableId, Vec<DeferredIndexBuild>>>,
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     compaction_upload_manager: Option<UploadManager>,
@@ -1247,9 +1257,36 @@ pub struct IndexToRegister<'a> {
     /// the HNSW and quantized artifact paths and declined to build vectors at
     /// all. Pass an empty map when the kind has no options.
     pub options: &'a HashMap<String, String>,
+    /// What an unregistered table means at THIS call site.
+    ///
+    /// `true` for live DDL: a replicated `CREATE INDEX` can outrun the
+    /// `CREATE TABLE` apply on a node, the table is coming, and the
+    /// registration is held until it arrives.
+    ///
+    /// `false` for the restart reload, where every live table is registered
+    /// before indexes are replayed — so an absent table there is an ORPHAN
+    /// (a dangling `system_schema.indexes` row from a pre-cascade
+    /// `DROP TABLE`) whose table will never arrive. Deferring those would
+    /// grow a map keyed by dropped tables for the life of the process.
+    pub defer_until_table_exists: bool,
     /// Where the registration came from, for the log line — e.g.
     /// `"after restart"` or `"replicated DDL (raft apply)"`.
     pub site: &'a str,
+}
+
+/// An index registration held until its table is registered.
+///
+/// The owned twin of [`IndexToRegister`], which borrows so the common case
+/// allocates nothing.
+#[derive(Clone, Debug)]
+struct DeferredIndexBuild {
+    index_name: String,
+    index_type: ferrosa_index::IndexType,
+    target_col: String,
+    partition_key_columns: Vec<String>,
+    filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    options: HashMap<String, String>,
+    site: String,
 }
 
 /// Resolve the `method` index option to a [`VectorIndexMethod`].
@@ -2202,6 +2239,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -2390,6 +2428,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -2541,6 +2580,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -3228,6 +3268,9 @@ impl StorageEngine {
         }
 
         self.replay_deferred_mutations_for_table(&table_id);
+        // An index whose CREATE INDEX outran this CREATE TABLE is built now,
+        // not at the next restart.
+        self.drain_deferred_index_builds(&table_id);
 
         Ok(())
     }
@@ -3813,6 +3856,7 @@ impl StorageEngine {
                     .unwrap_or(&[]),
                 filter_predicate,
                 options: &options,
+                defer_until_table_exists: false,
                 site: "after restart",
             },
         )
@@ -3857,6 +3901,7 @@ impl StorageEngine {
             partition_key_columns,
             filter_predicate,
             options,
+            defer_until_table_exists,
             site,
         } = index;
         // FullText is re-registered after column resolution below (and its
@@ -3938,17 +3983,40 @@ impl StorageEngine {
                 );
                 return Ok(true);
             }
-            // Debug, not warn: this is the per-orphan case (dangling
-            // registration from a pre-cascade DROP TABLE) that used to churn
-            // one warn per orphan on every boot. The caller emits one summary
-            // warn with the skipped count and bumps
+            // The table is not registered HERE yet. That is ordinary ordering
+            // — a replicated CREATE INDEX can outrun the CREATE TABLE apply on
+            // a given node — so hold the registration and complete it when the
+            // table arrives. Failing the DDL would escalate a normal race, and
+            // waiting for a restart's reload would make a restart load-bearing
+            // for correctness.
+            if defer_until_table_exists && !self.tables.read().contains_key(table_id) {
+                self.defer_index_build(
+                    table_id,
+                    DeferredIndexBuild {
+                        index_name: index_name.to_string(),
+                        index_type,
+                        target_col: target_col.to_string(),
+                        partition_key_columns: partition_key_columns.to_vec(),
+                        filter_predicate,
+                        options: options.clone(),
+                        site: site.to_string(),
+                    },
+                );
+                return Ok(false);
+            }
+            // The table IS registered and the column is not in it. Debug, not
+            // warn: this is the per-orphan case (dangling registration from a
+            // pre-cascade DROP TABLE) that used to churn one warn per orphan on
+            // every boot. The caller emits one summary warn with the skipped
+            // count and bumps
             // `ferrosa_storage_index_reload_skipped_rows_total`.
             tracing::debug!(
                 keyspace = table_id.keyspace(),
                 table = table_id.table(),
                 index_name,
                 target_col,
-                "cannot resolve index target column to a position — table unregistered or column missing"
+                "cannot resolve index target column to a position — the table is \
+                 registered and has no such column"
             );
             return Ok(false);
         };
@@ -4075,6 +4143,80 @@ impl StorageEngine {
     /// declared, so nothing reported a problem and reads decoded a different
     /// column's bytes. It went unseen because every schema helper in this
     /// file's tests declares no static columns.
+    /// Hold an index registration until its table is registered.
+    ///
+    /// Loud, because the index is declared in the cluster's schema and this
+    /// node cannot answer it yet: the planner may route a read here in the
+    /// meantime, and the reader's scan fallback is what makes that survivable
+    /// rather than correct.
+    fn defer_index_build(&self, table_id: &TableId, build: DeferredIndexBuild) {
+        let mut deferred = self.deferred_index_builds.lock();
+        let queued = deferred.entry(table_id.clone()).or_default();
+        if queued.iter().any(|b| b.index_name == build.index_name) {
+            return;
+        }
+        tracing::info!(
+            keyspace = table_id.keyspace(),
+            table = table_id.table(),
+            index_name = %build.index_name,
+            site = %build.site,
+            "index build DEFERRED: its table is not registered on this node yet. \
+             It will be built when the table is registered — not at the next restart."
+        );
+        queued.push(build);
+    }
+
+    /// Build every index that was waiting for `table_id` to exist.
+    ///
+    /// Called immediately after a table is registered. A build that fails here
+    /// is reported against the index by name; it is not retried, because a
+    /// registered table with a resolvable column that still cannot take an
+    /// index is a real failure rather than an ordering one.
+    fn drain_deferred_index_builds(&self, table_id: &TableId) {
+        let queued = {
+            let mut deferred = self.deferred_index_builds.lock();
+            deferred.remove(table_id).unwrap_or_default()
+        };
+        for build in queued {
+            let outcome = self.register_index_in_engine(
+                table_id,
+                IndexToRegister {
+                    index_name: &build.index_name,
+                    index_type: build.index_type,
+                    target_col: &build.target_col,
+                    partition_key_columns: &build.partition_key_columns,
+                    filter_predicate: build.filter_predicate.clone(),
+                    options: &build.options,
+                    defer_until_table_exists: false,
+                    site: "deferred until its table was registered",
+                },
+            );
+            match outcome {
+                Ok(true) => tracing::info!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index built once its table was registered"
+                ),
+                Ok(false) => tracing::warn!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index still NOT built after its table was registered \
+                     — this node holds an index its schema declares and its table \
+                     does not have"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index FAILED to build after its table was registered"
+                ),
+            }
+        }
+    }
+
     /// The declared marshal type of a table's column, from any column family.
     ///
     /// A vector's dimension is part of its type, so the only way to rebuild the
@@ -10622,6 +10764,7 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -11477,6 +11620,7 @@ mod tests {
                     partition_key_columns: &[],
                     filter_predicate: None,
                     options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
                     site: "test",
                 },
             )
@@ -11490,6 +11634,109 @@ mod tests {
              write path stores its cell at index 1 + 1 = 2. Registering it at 1 \
              points the index at r1 and every read through it decodes the wrong \
              column's bytes."
+        );
+    }
+
+    fn schema_named(table: &str) -> TableSchema {
+        TableSchema {
+            table: table.to_string(),
+            ..test_schema()
+        }
+    }
+
+    /// A replicated `CREATE INDEX` can reach a node before the node has
+    /// registered the table, and the index must still end up built.
+    ///
+    /// This is ordinary ordering, not a failure, and both existing policies
+    /// get it wrong. #402's Raft arm turns the `Err` into an `ApplyError` and
+    /// fails the apply. #403's wiring logs a WARN and leaves it, explicitly
+    /// waiting for "the next restart's reload" — which makes a restart
+    /// load-bearing for correctness on a path that happens normally.
+    ///
+    /// Neither builds the index. The registration is recorded and completed
+    /// when the table arrives, so no restart is involved and the apply does
+    /// not fail.
+    #[test]
+    fn an_index_registered_before_its_table_is_built_when_the_table_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let table_id = TableId::new("test_ks", "late_table");
+
+        // The table is NOT registered here: the DDL won the race.
+        let options = std::collections::HashMap::new();
+        engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_val",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: true,
+                    site: "test",
+                },
+            )
+            .expect("an unregistered table is an ordering case, never an error");
+
+        assert!(
+            !engine.declares_index(&table_id, "idx_val"),
+            "nothing to build against yet"
+        );
+
+        engine.register_table(schema_named("late_table")).unwrap();
+
+        assert!(
+            engine.declares_index(&table_id, "idx_val"),
+            "the deferred index must be built when its table registers. Waiting \
+             for a restart leaves the planner selecting an index this node \
+             cannot answer, for however long the node stays up."
+        );
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_val"),
+            Some(0),
+            "and it must land at the same cell a non-deferred build would"
+        );
+    }
+
+    /// The restart reload must NOT defer: there, an absent table is an orphan.
+    ///
+    /// Every live table is registered before indexes are replayed at boot, so
+    /// a `system_schema.indexes` row whose table is missing is a dangling
+    /// registration from a pre-cascade `DROP TABLE`. Its table will never
+    /// arrive. Holding those would grow a map keyed by dropped tables for the
+    /// life of the process — a leak that only shows up on a cluster with churn,
+    /// which is the worst place to find it.
+    #[test]
+    fn a_reload_does_not_defer_an_index_whose_table_will_never_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let table_id = TableId::new("test_ks", "dropped_table");
+
+        let options = std::collections::HashMap::new();
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_orphan",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: false,
+                    site: "after restart",
+                },
+            )
+            .unwrap();
+        assert!(!built, "there is no table to build against");
+
+        assert!(
+            engine.deferred_index_builds.lock().is_empty(),
+            "an orphaned index row must be skipped, not held forever"
         );
     }
 
@@ -11547,6 +11794,7 @@ mod tests {
                     partition_key_columns: &[],
                     filter_predicate: None,
                     options: &options,
+                    defer_until_table_exists: false,
                     site: "test",
                 },
             )
@@ -11587,6 +11835,7 @@ mod tests {
                     partition_key_columns: &[],
                     filter_predicate: None,
                     options: &options,
+                    defer_until_table_exists: false,
                     site: "test",
                 },
             )
@@ -11625,6 +11874,7 @@ mod tests {
                     partition_key_columns: &[],
                     filter_predicate: None,
                     options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
                     site: "test",
                 },
             )
@@ -11664,6 +11914,7 @@ mod tests {
                     partition_key_columns: &[],
                     filter_predicate: None,
                     options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
                     site: "test",
                 },
             )
