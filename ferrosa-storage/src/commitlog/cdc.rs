@@ -157,7 +157,10 @@ impl CdcCheckpoint {
 
     /// Saves the CDC checkpoint atomically (tmp + rename).
     pub fn save(dir: &Path, position: &CommitLogPosition) -> ferrosa_common::Result<()> {
-        let tmp = dir.join("cdc_checkpoint.json.tmp");
+        // Staged under a path of this write's own: one shared temp file let
+        // concurrent writers land in the same bytes and steal each other's
+        // rename. See checkpoint::staging_path_for.
+        let tmp = super::checkpoint::staging_path_for(dir, CDC_CHECKPOINT_FILENAME);
         let final_path = dir.join(CDC_CHECKPOINT_FILENAME);
         let data = serde_json::to_vec_pretty(&CdcPosition {
             segment_id: position.segment_id,
@@ -166,8 +169,10 @@ impl CdcCheckpoint {
         .map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to serialize cdc checkpoint: {e}"))
         })?;
-        std::fs::write(&tmp, &data)?;
-        std::fs::rename(&tmp, &final_path)?;
+        if let Err(e) = super::checkpoint::publish_atomically(&tmp, &final_path, &data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -500,6 +505,46 @@ impl CdcReader {
 
 #[cfg(test)]
 mod tests {
+    /// The CDC checkpoint had the same shared-temp-path defect the commit log
+    /// checkpoint did: one fixed `cdc_checkpoint.json.tmp` for every writer, so
+    /// concurrent saves land in one file and steal each other's rename. Same
+    /// fix, same reasoning — see `checkpoint::checkpoint_tmp_path`.
+    #[test]
+    fn concurrent_cdc_saves_all_succeed_and_publish_a_readable_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let failures = std::sync::Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let failures = &failures;
+                let dir = dir.path();
+                scope.spawn(move || {
+                    for i in 0..25 {
+                        let pos = CommitLogPosition {
+                            segment_id: worker,
+                            offset: i,
+                        };
+                        if let Err(e) = CdcCheckpoint::save(dir, &pos) {
+                            failures.lock().unwrap().push(e.to_string());
+                        }
+                    }
+                });
+            }
+        });
+
+        let failures = failures.into_inner().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} of 200 concurrent cdc saves failed, first: {}",
+            failures.len(),
+            failures.first().unwrap(),
+        );
+        assert!(
+            CdcCheckpoint::load(dir.path()).unwrap().is_some(),
+            "the published cdc checkpoint must be readable"
+        );
+    }
+
     use super::*;
     use crate::commitlog::config::CommitLogPosition;
     use crate::commitlog::{CommitLog, CommitLogConfig};
