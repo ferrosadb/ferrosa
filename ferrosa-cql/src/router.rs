@@ -901,6 +901,67 @@ fn index_targets_a_materialized_column(
     false
 }
 
+/// Whether an index's build has finished, so a read may be served from it.
+///
+/// `CREATE INDEX` over data that already exists backfills asynchronously. Until
+/// that finishes the index holds only part of the table, and the engine knows
+/// it: every build is `mark_pending`-ed before it is submitted, so
+/// [`StorageEngine::index_is_current`] is false for exactly as long as the
+/// window lasts.
+///
+/// Serving a read from the index during that window returns the fraction built
+/// so far and reports it as the whole answer — 0 rows of 1, or 2374 of 2500,
+/// with nothing to distinguish it from a genuinely empty result. That is the
+/// same silent short answer that withholding a never-built index removed; this
+/// closes the transient case the permanent one left behind.
+///
+/// The tracker is local, so it can only speak for this node's own SSTables. A
+/// coordinator fanning out to replicas has no such state for them, so the
+/// check applies only where the local engine is the whole picture — mirroring
+/// the keyed-partition consult, which makes the same distinction.
+fn index_build_has_finished(
+    state: &SharedState,
+    table_id: &ferrosa_storage::TableId,
+    meta: &IndexMetadata,
+) -> bool {
+    let write_path = state.write_path.load();
+    let local_tracker_authoritative = matches!(
+        &**write_path,
+        WritePath::Direct(_) | WritePath::Pair(_) | WritePath::DegradedPair(_)
+    );
+    if !local_tracker_authoritative {
+        return true;
+    }
+    // An index the tracker has never heard of is a different failure, and one
+    // that is already handled: the engine refuses to read an index it does not
+    // have, naming it, rather than answering from nothing (t_50c8bc7d). Leaving
+    // it to that path keeps a lost index loud instead of quietly downgrading it
+    // to a scan. Only an index the tracker IS following can be mid-build.
+    if state
+        .engine
+        .index_tracker()
+        .get_state(table_id.keyspace(), table_id.table(), &meta.name)
+        .is_none()
+    {
+        return true;
+    }
+    if state.engine.index_is_current(table_id, &meta.name) {
+        return true;
+    }
+    // Say it, for the same reason the never-built skip says it: the query still
+    // answers, it just scans, and an unexplained latency step is a bad way to
+    // learn that a backfill is in flight.
+    tracing::warn!(
+        index = %meta.name,
+        table = %table_id.table(),
+        "index NOT used: its build has not finished, so it covers only part of \
+         the table. The query falls back to a full scan where one is licensed, \
+         and is refused otherwise — a partial index must never answer as though \
+         it were complete."
+    );
+    false
+}
+
 /// Whether an index can serve an ordinary scalar `column = value` lookup.
 ///
 /// Full-text, vector, and geo indexes have dedicated query operators and do
@@ -5569,17 +5630,22 @@ async fn route_select_user_table(
         // query implies its predicate (see `query_implies_filter_predicate`);
         // otherwise it is withheld so the planner cannot unsoundly serve an
         // incomplete result from it.
-        let usable_indexes: Vec<&IndexMetadata> = snap
-            .indexes
-            .iter()
-            .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-            .map(|(_, meta)| meta)
-            .filter(|meta| scalar_equality_index_is_usable(meta))
-            .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
-            .filter(|meta| {
-                filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
-            })
-            .collect();
+        // An index whose backfill is still in flight is withheld the same way,
+        // and separately, because the two cases end differently: a never-built
+        // index will never answer, so a scan is the only outcome, while a
+        // still-building one becomes usable in a moment — a caller with no scan
+        // license is told to wait rather than told nothing.
+        let (usable_indexes, indexes_still_building): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
+            snap.indexes
+                .iter()
+                .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+                .map(|(_, meta)| meta)
+                .filter(|meta| scalar_equality_index_is_usable(meta))
+                .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
+                .filter(|meta| {
+                    filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+                })
+                .partition(|meta| index_build_has_finished(state, &table_id, meta));
         let planner_indexes: Vec<(String, Vec<String>)> = usable_indexes
             .iter()
             .map(|meta| (meta.name.clone(), meta.target_columns.clone()))
@@ -5600,6 +5666,28 @@ async fn route_select_user_table(
             &planner_indexes,
             &filtered_covered_columns,
         );
+
+        // Withholding a still-building index left nothing to serve this read,
+        // and the query never licensed the scan that would answer it correctly.
+        // Refuse, naming the index: the alternative is the partial answer this
+        // check exists to prevent, and a retry in a moment succeeds.
+        if matches!(scan_plan, ScanPlan::FullScan)
+            && !s.allow_filtering
+            && !indexes_still_building.is_empty()
+        {
+            let names: Vec<&str> = indexes_still_building
+                .iter()
+                .map(|meta| meta.name.as_str())
+                .collect();
+            return Err(CqlError::Invalid(format!(
+                "secondary index {} on {ks}.{} is still building and covers only part of \
+                 the table, so it cannot answer this query yet. Retry once the build \
+                 completes, or add ALLOW FILTERING to read the table by scan in the \
+                 meantime.",
+                names.join(", "),
+                s.table,
+            )));
+        }
 
         // Report the access path once, now that it is decided.
         //
@@ -14409,6 +14497,18 @@ mod tests {
     use tempfile::TempDir;
 
     fn setup() -> (SharedState, TempDir) {
+        setup_with_index_backend(ferrosa_storage::index::IndexBackendConfig::Local)
+    }
+
+    /// `setup`, with the index build backend chosen by the caller.
+    ///
+    /// `IndexBackendConfig::Off` builds no scheduler, so `CREATE INDEX` marks
+    /// every existing SSTable pending and nothing ever indexes them. That is
+    /// the backfill window a real node passes through, held still: the index
+    /// is registered, incomplete, and known-incomplete by the tracker.
+    fn setup_with_index_backend(
+        index_backend: ferrosa_storage::index::IndexBackendConfig,
+    ) -> (SharedState, TempDir) {
         let dir = TempDir::new().unwrap();
 
         let commit_log = CommitLogConfig {
@@ -14431,7 +14531,7 @@ mod tests {
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
             data_dir: dir.path().to_path_buf(),
-            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            index_backend,
             write_verify: true,
             auth_enabled: false,
             auth_warn: false,
@@ -30822,6 +30922,148 @@ mod tests {
             rows, 5,
             "the rows exist and ALLOW FILTERING permits a scan; an index with no \
              entries must not be reported as an empty table (got {rows} of 5)"
+        );
+    }
+
+    /// Seeds a table whose rows are in an SSTable that the index does not cover.
+    ///
+    /// The engine is built with no index build backend, so `CREATE INDEX`
+    /// registers the index, marks the flushed SSTable pending, and nothing
+    /// ever builds it. The tracker therefore reports the index as not current
+    /// while the index itself answers short — the state a real node occupies
+    /// for as long as a backfill takes, held still.
+    async fn seed_a_table_whose_index_is_still_building(
+        state: &SharedState,
+        ctx: &RequestContext<'_>,
+        ks: &str,
+    ) {
+        for cql in [
+            format!(
+                "CREATE KEYSPACE {ks} WITH REPLICATION = \
+                 {{'class': 'SimpleStrategy', 'replication_factor': '1'}}"
+            ),
+            format!("CREATE TABLE {ks}.people (id uuid PRIMARY KEY, email text)"),
+        ] {
+            route(state, ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+        for i in 0..5 {
+            route(
+                state,
+                ctx,
+                crate::parser::parse(&format!(
+                    "INSERT INTO {ks}.people (id, email) VALUES \
+                     (30000000-0000-4000-8000-{i:012}, 'user{i}@example.com')"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        // Flush first: the index is then created over data that already lives
+        // in an SSTable, which is what makes the backfill (and its window)
+        // exist at all.
+        state
+            .engine
+            .flush(&ferrosa_storage::TableId::new(ks, "people"))
+            .unwrap();
+        route(
+            state,
+            ctx,
+            crate::parser::parse(&format!(
+                "CREATE INDEX idx_people_email ON {ks}.people (email)"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !state.engine.index_is_current(
+                &ferrosa_storage::TableId::new(ks, "people"),
+                "idx_people_email"
+            ),
+            "the fixture is only meaningful while the index is known-incomplete"
+        );
+    }
+
+    /// A still-building index must not answer a read that a scan can answer.
+    ///
+    /// `CREATE INDEX` over existing data backfills asynchronously. Until that
+    /// finishes the index holds a fraction of the rows, and the tracker knows
+    /// it (`mark_pending` is called before each build is submitted, precisely
+    /// so a consult can tell an incomplete index from an empty one). The
+    /// global index arm never asked, so a read during the window returned that
+    /// fraction and reported it as the whole answer.
+    ///
+    /// This is the CI-visible failure in `tests/drivers/python/test_2i_demo.py`:
+    /// an indexed lookup returning 0 of 1 rows, or 2374 of 2500, against the
+    /// same data an `ALLOW FILTERING` scan reads correctly.
+    #[tokio::test]
+    async fn a_still_building_index_does_not_answer_a_read_short() {
+        let (state, _dir) =
+            setup_with_index_backend(ferrosa_storage::index::IndexBackendConfig::Off);
+        let auth = dev_auth();
+        let no_keyspace = None;
+        let ctx = test_ctx(&auth, &no_keyspace);
+        seed_a_table_whose_index_is_still_building(&state, &ctx, "idx_building_scan").await;
+
+        let rows = match route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "SELECT email FROM idx_building_scan.people \
+                 WHERE email = 'user3@example.com' ALLOW FILTERING",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        {
+            RouteResult::Result(b) => extract_row_count(&b),
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(
+            rows, 1,
+            "the row exists and ALLOW FILTERING licenses a scan; a backfill \
+             still in flight must not turn it into {rows} rows"
+        );
+    }
+
+    /// Without a scan license, a still-building index fails loud.
+    ///
+    /// The read cannot be served correctly: the index is incomplete and the
+    /// query never licensed the scan that would be correct. Returning the
+    /// index's partial answer would be the silent wrong answer this whole line
+    /// of work exists to remove, so the caller is told, in the terms Cassandra
+    /// uses, that the index is not yet queryable.
+    #[tokio::test]
+    async fn a_still_building_index_refuses_a_read_it_cannot_serve() {
+        let (state, _dir) =
+            setup_with_index_backend(ferrosa_storage::index::IndexBackendConfig::Off);
+        let auth = dev_auth();
+        let no_keyspace = None;
+        let ctx = test_ctx(&auth, &no_keyspace);
+        seed_a_table_whose_index_is_still_building(&state, &ctx, "idx_building_strict").await;
+
+        let err = route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "SELECT email FROM idx_building_strict.people \
+                 WHERE email = 'user3@example.com'",
+            )
+            .unwrap(),
+        )
+        .await;
+        let Err(err) = err else {
+            panic!("a read that can only be served by an incomplete index must not succeed");
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("idx_people_email") && rendered.contains("building"),
+            "the error must name the index and say it is still building, so the \
+             caller can retry rather than believe a short answer; got: {rendered}"
         );
     }
 

@@ -108,8 +108,15 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `CREATE INDEX` on a CLUSTERING column wires the storage engine's
   clustering-component build path (previously a silent schema-only no-op).
   Scalar indexes created after writes synchronously stream pre-existing active
-  and flushing memtable rows into the index before indexed SELECTs can use it;
-  an empty global lookup remains a real miss and never falls back to a scan.
+  and flushing memtable rows into the index before indexed SELECTs can use it.
+  Rows already in SSTables are backfilled asynchronously, and an index is
+  withheld from the planner for as long as `IndexStateTracker` reports that
+  build unfinished: the query takes the scan its `ALLOW FILTERING` licenses, or
+  is refused naming the index when it holds no such licence. A partial index
+  never answers as though it were complete. Once the index is current, an empty
+  global lookup is a real miss and never falls back to a scan. An index the
+  engine does not have at all is a different case and stays refused (t_50c8bc7d)
+  rather than quietly downgrading to a scan.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
