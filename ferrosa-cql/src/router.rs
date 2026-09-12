@@ -901,52 +901,55 @@ fn index_targets_a_materialized_column(
     false
 }
 
-/// Whether an index's build has finished, so a read may be served from it.
+/// Why an index cannot completely answer a read on this node, if it cannot.
 ///
-/// `CREATE INDEX` over data that already exists backfills asynchronously. Until
-/// that finishes the index holds only part of the table, and the engine knows
-/// it: every build is `mark_pending`-ed before it is submitted, so
-/// [`StorageEngine::index_is_current`] is false for exactly as long as the
-/// window lasts.
+/// Two conditions make a chosen index unable to answer in full, and both used
+/// to reach the client as a server error over a query a plain scan would have
+/// answered correctly:
 ///
-/// Serving a read from the index during that window returns the fraction built
-/// so far and reports it as the whole answer — 0 rows of 1, or 2374 of 2500,
-/// with nothing to distinguish it from a genuinely empty result. That is the
-/// same silent short answer that withholding a never-built index removed; this
-/// closes the transient case the permanent one left behind.
+///   * the local engine does not have it. The schema lists it, this node's
+///     table does not (a restart before partition-key indexes were reloaded,
+///     a build that never ran). Reads were refused, and that refusal reached
+///     ferrosa-memory as `Internal server error` on every entity stream, on
+///     `main` and on every open PR (t_12457d3e).
+///   * its backfill has not finished. `CREATE INDEX` over existing rows builds
+///     asynchronously, and until it completes the index covers part of the
+///     table. The engine knows: every build is `mark_pending`-ed before it is
+///     submitted. Reads served from it came back short — 0 rows of 1, or 2374
+///     of 2500 — indistinguishable from a genuinely empty result (t_edd3be70).
 ///
-/// The tracker is local, so it can only speak for this node's own SSTables. A
-/// coordinator fanning out to replicas has no such state for them, so the
-/// check applies only where the local engine is the whole picture — mirroring
-/// the keyed-partition consult, which makes the same distinction.
-fn index_build_has_finished(
+/// Neither is a reason to fail a read that carries its own scan license. The
+/// fail-loud ladder puts a VISIBLE fallback above an error: withhold the index
+/// from the planner, take the scan, say so at WARN. What must never happen is
+/// the third option — answering from a partial index as though it were whole.
+/// A query that licensed no scan has nothing correct to fall back to, and only
+/// that one is refused.
+///
+/// The currency half is judged from the local tracker, which speaks only for
+/// this node's SSTables, so it is consulted only where the local engine is the
+/// whole picture — mirroring the keyed-partition consult. Presence is checked
+/// everywhere: a coordinator that cannot answer from its own index gains
+/// nothing by trying (t_f29318c4 covers a replica whose build is behind).
+fn index_cannot_answer_completely(
     state: &SharedState,
     table_id: &ferrosa_storage::TableId,
     meta: &IndexMetadata,
-) -> bool {
+) -> Option<&'static str> {
     let write_path = state.write_path.load();
+    if !write_path.declares_index_locally(table_id, &meta.name) {
+        tracing::warn!(
+            index = %meta.name,
+            table = %table_id.table(),
+            "index NOT used: this node's table does not have it, though the schema              lists it. The query falls back to a full scan where one is licensed,              and is refused otherwise — an index that is not here cannot report              its absence as zero rows."
+        );
+        return Some("is not present on this node");
+    }
     let local_tracker_authoritative = matches!(
         &**write_path,
         WritePath::Direct(_) | WritePath::Pair(_) | WritePath::DegradedPair(_)
     );
-    if !local_tracker_authoritative {
-        return true;
-    }
-    // An index the tracker has never heard of is a different failure, and one
-    // that is already handled: the engine refuses to read an index it does not
-    // have, naming it, rather than answering from nothing (t_50c8bc7d). Leaving
-    // it to that path keeps a lost index loud instead of quietly downgrading it
-    // to a scan. Only an index the tracker IS following can be mid-build.
-    if state
-        .engine
-        .index_tracker()
-        .get_state(table_id.keyspace(), table_id.table(), &meta.name)
-        .is_none()
-    {
-        return true;
-    }
-    if state.engine.index_is_current(table_id, &meta.name) {
-        return true;
+    if !local_tracker_authoritative || state.engine.index_is_current(table_id, &meta.name) {
+        return None;
     }
     // Say it, for the same reason the never-built skip says it: the query still
     // answers, it just scans, and an unexplained latency step is a bad way to
@@ -959,7 +962,7 @@ fn index_build_has_finished(
          and is refused otherwise — a partial index must never answer as though \
          it were complete."
     );
-    false
+    Some("is still building and covers only part of the table")
 }
 
 /// Whether an index can serve an ordinary scalar `column = value` lookup.
@@ -5630,22 +5633,30 @@ async fn route_select_user_table(
         // query implies its predicate (see `query_implies_filter_predicate`);
         // otherwise it is withheld so the planner cannot unsoundly serve an
         // incomplete result from it.
-        // An index whose backfill is still in flight is withheld the same way,
-        // and separately, because the two cases end differently: a never-built
-        // index will never answer, so a scan is the only outcome, while a
-        // still-building one becomes usable in a moment — a caller with no scan
-        // license is told to wait rather than told nothing.
-        let (usable_indexes, indexes_still_building): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
-            snap.indexes
-                .iter()
-                .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-                .map(|(_, meta)| meta)
-                .filter(|meta| scalar_equality_index_is_usable(meta))
-                .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
-                .filter(|meta| {
-                    filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
-                })
-                .partition(|meta| index_build_has_finished(state, &table_id, meta));
+        // An index this node cannot answer from completely — absent here, or
+        // still building — is withheld the same way, and its reason is kept so
+        // a query with no scan license can be told which it was.
+        let mut withheld_indexes: Vec<(&str, &'static str)> = Vec::new();
+        let usable_indexes: Vec<&IndexMetadata> = snap
+            .indexes
+            .iter()
+            .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+            .map(|(_, meta)| meta)
+            .filter(|meta| scalar_equality_index_is_usable(meta))
+            .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
+            .filter(|meta| {
+                filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+            })
+            .filter(
+                |meta| match index_cannot_answer_completely(state, &table_id, meta) {
+                    Some(reason) => {
+                        withheld_indexes.push((meta.name.as_str(), reason));
+                        false
+                    }
+                    None => true,
+                },
+            )
+            .collect();
         let planner_indexes: Vec<(String, Vec<String>)> = usable_indexes
             .iter()
             .map(|meta| (meta.name.clone(), meta.target_columns.clone()))
@@ -5667,24 +5678,23 @@ async fn route_select_user_table(
             &filtered_covered_columns,
         );
 
-        // Withholding a still-building index left nothing to serve this read,
-        // and the query never licensed the scan that would answer it correctly.
-        // Refuse, naming the index: the alternative is the partial answer this
-        // check exists to prevent, and a retry in a moment succeeds.
+        // Withholding left nothing to serve this read, and the query licensed
+        // no scan to fall back to. Refuse, naming each index and why: the
+        // alternative is the short answer the withholding exists to prevent,
+        // and for a build in flight a retry shortly after succeeds.
         if matches!(scan_plan, ScanPlan::FullScan)
             && !s.allow_filtering
-            && !indexes_still_building.is_empty()
+            && !withheld_indexes.is_empty()
         {
-            let names: Vec<&str> = indexes_still_building
+            let reasons = withheld_indexes
                 .iter()
-                .map(|meta| meta.name.as_str())
-                .collect();
+                .map(|(name, reason)| format!("'{name}' {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(CqlError::Invalid(format!(
-                "secondary index {} on {ks}.{} is still building and covers only part of \
-                 the table, so it cannot answer this query yet. Retry once the build \
-                 completes, or add ALLOW FILTERING to read the table by scan in the \
-                 meantime.",
-                names.join(", "),
+                "no secondary index on {ks}.{} can answer this query: {reasons}. Retry \
+                 once the index is available, or add ALLOW FILTERING to read the table \
+                 by scan in the meantime.",
                 s.table,
             )));
         }
@@ -20106,8 +20116,17 @@ mod tests {
     /// before partition-key indexes were reloaded — the planner still selects
     /// it, and both live queries returned 0 over 101,848 rows. Either answer
     /// correctly or refuse; never zero.
+    ///
+    /// Of those two, answering correctly is the better one, and it is what a
+    /// query carrying ALLOW FILTERING has already licensed. Refusing it
+    /// instead took the outage from "wrong answer" to "no answer": every
+    /// ferrosa-memory PR and `main` went red on
+    /// `secondary index 'idx_entity_by_tenant' is not declared on this node's
+    /// table` reaching a client as a 500 (t_12457d3e). So the index is
+    /// withheld and the licensed scan runs — visibly, at WARN — and the
+    /// refusal is kept for the query that licensed nothing.
     #[tokio::test]
-    async fn a_tenant_index_the_engine_lost_is_refused_not_answered_empty() {
+    async fn a_tenant_index_the_engine_lost_falls_back_to_the_scan_it_licensed() {
         let (state, _dir) = setup();
         let auth = dev_auth();
         let ctx = RequestContext {
@@ -20184,20 +20203,44 @@ mod tests {
             .drop_index(&table_id, "idx_entity_by_tenant")
             .unwrap());
 
-        for cql in [&rows_cql, &count_cql] {
-            match route(&state, &ctx, crate::parser::parse(cql).unwrap()).await {
-                Err(err) => assert!(
-                    err.to_string().contains("idx_entity_by_tenant"),
-                    "the refusal must name the index: {err}"
-                ),
-                Ok(RouteResult::Result(buf)) => panic!(
-                    "`{cql}` answered from an index the engine does not have \
-                     ({} result rows) instead of refusing",
-                    extract_row_count(&buf),
-                ),
-                Ok(_) => panic!("`{cql}` returned a non-result"),
-            }
-        }
+        // Both queries carry ALLOW FILTERING, so the scan they licensed is the
+        // correct answer and the one the caller gets.
+        let rows = route(&state, &ctx, crate::parser::parse(&rows_cql).unwrap())
+            .await
+            .expect("a licensed scan answers a read the lost index cannot");
+        let RouteResult::Result(rows) = rows else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            extract_row_count(&rows),
+            3,
+            "every one of the tenant's rows is readable by scan; losing the index \
+             must cost speed, not rows"
+        );
+        let count = route(&state, &ctx, crate::parser::parse(&count_cql).unwrap())
+            .await
+            .expect("a licensed scan answers the count too");
+        let RouteResult::Result(count) = count else {
+            panic!("expected a count");
+        };
+        assert_eq!(
+            extract_first_bigint_value(&count),
+            3,
+            "tenant count by scan"
+        );
+
+        // Without a scan license there is nothing correct to fall back to, so
+        // the read is refused — naming the index, so the cause is legible.
+        let unlicensed =
+            format!("SELECT tenant_id FROM agent_memory.entity_store WHERE tenant_id = {tenant}");
+        let err = route(&state, &ctx, crate::parser::parse(&unlicensed).unwrap()).await;
+        let Err(err) = err else {
+            panic!("a read only the lost index could serve must not succeed");
+        };
+        assert!(
+            err.to_string().contains("idx_entity_by_tenant"),
+            "the refusal must name the index: {err}"
+        );
     }
 
     #[tokio::test]

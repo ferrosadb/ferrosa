@@ -109,14 +109,17 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   clustering-component build path (previously a silent schema-only no-op).
   Scalar indexes created after writes synchronously stream pre-existing active
   and flushing memtable rows into the index before indexed SELECTs can use it.
-  Rows already in SSTables are backfilled asynchronously, and an index is
-  withheld from the planner for as long as `IndexStateTracker` reports that
-  build unfinished: the query takes the scan its `ALLOW FILTERING` licenses, or
-  is refused naming the index when it holds no such licence. A partial index
-  never answers as though it were complete. Once the index is current, an empty
-  global lookup is a real miss and never falls back to a scan. An index the
-  engine does not have at all is a different case and stays refused (t_50c8bc7d)
-  rather than quietly downgrading to a scan.
+  Rows already in SSTables are backfilled asynchronously. One rule covers every
+  index that cannot completely answer on this node — absent from the local
+  table though the schema lists it (t_50c8bc7d), or with `IndexStateTracker`
+  reporting its build unfinished (t_edd3be70): it is **withheld from the
+  planner**, so the query takes the scan its `ALLOW FILTERING` licenses and says
+  so at WARN, and is refused — naming each index and why — only when it licensed
+  no scan. A partial index never answers as though it were complete, and a
+  correct slow answer beats a server error: refusing the licensed case turned
+  ferrosa-memory's entity streams into 500s across `main` and every open PR
+  (t_12457d3e). Once the index is current, an empty global lookup is a real miss
+  and never falls back to a scan.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
