@@ -1242,9 +1242,36 @@ pub struct IndexToRegister<'a> {
     /// The decoded predicate of a partial (`Filtered`) index. Required for
     /// that kind and ignored by every other.
     pub filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    /// The index's options as `CREATE INDEX` recorded them. Carries `method`
+    /// for a `Vector` index; without it this resolver could not pick between
+    /// the HNSW and quantized artifact paths and declined to build vectors at
+    /// all. Pass an empty map when the kind has no options.
+    pub options: &'a HashMap<String, String>,
     /// Where the registration came from, for the log line — e.g.
     /// `"after restart"` or `"replicated DDL (raft apply)"`.
     pub site: &'a str,
+}
+
+/// Resolve the `method` index option to a [`VectorIndexMethod`].
+///
+/// Absent or `hnsw` selects the full-precision HNSW sidecar (the default);
+/// `hvq` selects the quantized IVF / C-SPANN artifact path. Any other value is
+/// an error rather than a silent fall back to HNSW — the two write different
+/// artifacts, so guessing produces an index that reads nothing.
+///
+/// Lives here, beside [`VectorIndexMethod`], because both the CQL router (on
+/// the node executing the DDL) and [`StorageEngine::register_index_in_engine`]
+/// (on every replica, and on restart) must reach the same answer.
+pub fn resolve_vector_index_method(
+    options: &HashMap<String, String>,
+) -> ferrosa_common::Result<VectorIndexMethod> {
+    match options.get("method").map(String::as_str) {
+        None | Some("hnsw") => Ok(VectorIndexMethod::Hnsw),
+        Some("hvq") => Ok(VectorIndexMethod::QuantizedIvf),
+        Some(other) => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "unknown vector index method '{other}' (expected 'hnsw' or 'hvq')"
+        ))),
+    }
 }
 
 /// Partition-key column NAMES per table, in key order, for
@@ -1434,14 +1461,23 @@ pub const FILTER_PREDICATE_OPTION_KEY: &str = "__filter_predicate";
 /// reserved [`FILTER_PREDICATE_OPTION_KEY`], or the stored predicate JSON does
 /// not deserialize — every one of which is a malformed Filtered index that the
 /// caller must reject rather than reload as an unfiltered index.
-fn decode_filter_predicate_from_options(row: &Row) -> Option<ferrosa_index::FilterPredicate> {
-    let options_json = cell_text(
+/// The index options recorded by `CREATE INDEX`, as stored in the
+/// `system_schema.indexes` row. An absent or unreadable blob is an empty map:
+/// every option this decodes has a documented default.
+fn decode_index_options(row: &Row) -> HashMap<String, String> {
+    cell_text(
         row,
         ferrosa_schema::system::persistence::INDEXES_COL_OPTIONS,
-    )?;
-    let options: HashMap<String, String> = serde_json::from_str(&options_json).ok()?;
-    let predicate_json = options.get(FILTER_PREDICATE_OPTION_KEY)?;
-    ferrosa_index::FilterPredicate::from_option_string(predicate_json)
+    )
+    .and_then(|json| serde_json::from_str(&json).ok())
+    .unwrap_or_default()
+}
+
+fn decode_filter_predicate_from_options(row: &Row) -> Option<ferrosa_index::FilterPredicate> {
+    let predicate_json = decode_index_options(row)
+        .get(FILTER_PREDICATE_OPTION_KEY)
+        .cloned()?;
+    ferrosa_index::FilterPredicate::from_option_string(&predicate_json)
 }
 
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
@@ -3764,6 +3800,7 @@ impl StorageEngine {
             None
         };
 
+        let options = decode_index_options(row);
         self.register_index_in_engine(
             &table_id,
             IndexToRegister {
@@ -3775,6 +3812,7 @@ impl StorageEngine {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 filter_predicate,
+                options: &options,
                 site: "after restart",
             },
         )
@@ -3818,24 +3856,21 @@ impl StorageEngine {
             target_col,
             partition_key_columns,
             filter_predicate,
+            options,
             site,
         } = index;
-        // Vector indexes need their dimension + HNSW params to rebuild and use
-        // a dedicated path; skip them here. FullText is re-registered after
-        // column resolution below (and its sidecars rebuilt) — leaving it
-        // skipped made fts_match return EMPTY after a restart even though the
-        // on-disk FTI sidecars were intact, because the engine's
-        // fulltext_indexes map (column position) was never repopulated.
-        if matches!(index_type, ferrosa_index::IndexType::Vector) {
-            tracing::warn!(
-                keyspace = table_id.keyspace(),
-                table = table_id.table(),
-                index_name,
-                ?index_type,
-                "vector index needs a dedicated rebuild path — not built here {site}"
-            );
-            return Ok(false);
-        }
+        // FullText is re-registered after column resolution below (and its
+        // sidecars rebuilt) — leaving it skipped made fts_match return EMPTY
+        // after a restart even though the on-disk FTI sidecars were intact,
+        // because the engine's fulltext_indexes map (column position) was never
+        // repopulated.
+        //
+        // Vector used to be refused outright here, on the grounds that it
+        // "needs a dedicated rebuild path". That left every replica of a
+        // replicated CREATE INDEX, and every restart, without the index the
+        // planner selects — the same defect the rest of this function exists to
+        // close. It is resolved below with the other kinds, once the target
+        // column is known, because a vector's dimension is part of its type.
 
         let Some(column_position) = self.storage_cell_position(table_id, target_col) else {
             // Not a stored cell: it may be a CLUSTERING column index
@@ -3844,7 +3879,9 @@ impl StorageEngine {
             if let Some(component) = self.clustering_column_position(table_id, target_col) {
                 if matches!(
                     index_type,
-                    ferrosa_index::IndexType::Filtered | ferrosa_index::IndexType::FullText
+                    ferrosa_index::IndexType::Filtered
+                        | ferrosa_index::IndexType::FullText
+                        | ferrosa_index::IndexType::Vector
                 ) {
                     tracing::warn!(
                         keyspace = table_id.keyspace(),
@@ -3915,6 +3952,51 @@ impl StorageEngine {
             );
             return Ok(false);
         };
+
+        // Vector: the artifact is chosen by the `method` option, and the
+        // dimension is carried by the column's own type. The engine spells that
+        // type the marshal way (`VectorType(FloatType,3)`) and the CQL side
+        // spells it `vector<float, 3>`; `vector_dimension` reads both, so this
+        // path and `route_create_index` cannot disagree about the same column.
+        //
+        // A target that carries no dimension is declined, not built: the
+        // artifact would be meaningless, and building it would leave an index
+        // that answers nothing while the planner keeps selecting it.
+        if matches!(index_type, ferrosa_index::IndexType::Vector) {
+            let column_type = self.column_type_name(table_id, target_col);
+            let Some(dimension) = column_type
+                .as_deref()
+                .and_then(ferrosa_common::schema::vector_dimension)
+            else {
+                tracing::warn!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name,
+                    target_col,
+                    column_type = column_type.as_deref().unwrap_or("<unknown>"),
+                    "vector index NOT built {site}: its target column declares no \
+                     vector dimension, so there is no artifact to build"
+                );
+                return Ok(false);
+            };
+            let method = resolve_vector_index_method(options)?;
+            self.add_vector_index_with_method(
+                table_id,
+                index_name,
+                column_position,
+                dimension,
+                method,
+            )?;
+            tracing::info!(
+                keyspace = table_id.keyspace(),
+                table = table_id.table(),
+                index_name,
+                dimension,
+                ?method,
+                "registered vector index {site}"
+            );
+            return Ok(true);
+        }
 
         // FullText: repopulate the engine's fulltext_indexes map (so fts_match
         // can resolve the column and read the on-disk FTI sidecars / scan
@@ -3993,6 +4075,22 @@ impl StorageEngine {
     /// declared, so nothing reported a problem and reads decoded a different
     /// column's bytes. It went unseen because every schema helper in this
     /// file's tests declares no static columns.
+    /// The declared marshal type of a table's column, from any column family.
+    ///
+    /// A vector's dimension is part of its type, so the only way to rebuild the
+    /// artifact is to read the type back out of the registered schema.
+    fn column_type_name(&self, table_id: &TableId, column_name: &str) -> Option<String> {
+        let tables = self.tables.read();
+        let schema = &tables.get(table_id)?.schema;
+        schema
+            .static_columns
+            .iter()
+            .chain(schema.regular_columns.iter())
+            .chain(schema.clustering_columns.iter())
+            .find(|c| c.name == column_name)
+            .map(|c| c.type_name.clone())
+    }
+
     fn storage_cell_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
         let tables = self.tables.read();
         let schema = &tables.get(table_id)?.schema;
@@ -11378,6 +11476,7 @@ mod tests {
                     target_col: "r2",
                     partition_key_columns: &[],
                     filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
                     site: "test",
                 },
             )
@@ -11391,6 +11490,110 @@ mod tests {
              write path stores its cell at index 1 + 1 = 2. Registering it at 1 \
              points the index at r1 and every read through it decodes the wrong \
              column's bytes."
+        );
+    }
+
+    /// A table with a vector column, spelled the way the ENGINE spells it.
+    fn schema_with_a_vector_column() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "vec_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "embedding".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.VectorType(FloatType,3)".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// A replicated `CREATE INDEX` of a VECTOR index must build it here too.
+    ///
+    /// `register_index_in_engine` refused vectors outright — "vector index
+    /// needs a dedicated rebuild path" — so a replica applying the DDL got
+    /// nothing, and so did the restart reload that shares this resolver. Only
+    /// the node whose CQL session ran the statement had the index; the planner
+    /// selects it everywhere, because the schema is replicated.
+    ///
+    /// Two things blocked it and both are now gone: the dimension lives in the
+    /// column's type, which the engine spells `VectorType(FloatType,3)` and
+    /// only a CQL-form parser could read; and the method lives in the index
+    /// options, which `IndexToRegister` did not carry.
+    ///
+    /// `hvq` is asserted rather than the default `hnsw` because
+    /// `vector_index_method` answers `Hnsw` for an index it has never heard
+    /// of — asserting the default would pass against a table with no vector
+    /// index at all.
+    #[test]
+    fn a_replicated_vector_index_is_built_in_the_local_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_vector_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "vec_table");
+
+        let options = std::collections::HashMap::from([("method".to_string(), "hvq".to_string())]);
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_embedding",
+                    index_type: ferrosa_index::IndexType::Vector,
+                    target_col: "embedding",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            built,
+            "a vector index on a vector column must be built on the node applying the DDL"
+        );
+
+        assert_eq!(
+            engine
+                .vector_index_method(&table_id, "idx_embedding")
+                .unwrap(),
+            VectorIndexMethod::QuantizedIvf,
+            "the method from the index options must reach the engine; Hnsw here \
+             means the index was never registered at all"
+        );
+    }
+
+    /// A vector index whose target is not a vector column must not be built,
+    /// and must say so — the dimension is unreadable, so the artifact would be
+    /// meaningless.
+    #[test]
+    fn a_vector_index_on_a_non_vector_column_is_declined_not_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let options = std::collections::HashMap::new();
+        let built = engine
+            .register_index_in_engine(
+                &table_id(),
+                IndexToRegister {
+                    index_name: "idx_not_a_vector",
+                    index_type: ferrosa_index::IndexType::Vector,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            !built,
+            "`val` is UTF8Type and carries no dimension, so there is nothing to build"
         );
     }
 
@@ -11421,6 +11624,7 @@ mod tests {
                     target_col: "s1",
                     partition_key_columns: &[],
                     filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
                     site: "test",
                 },
             )
@@ -11459,6 +11663,7 @@ mod tests {
                     target_col: "val",
                     partition_key_columns: &[],
                     filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
                     site: "test",
                 },
             )

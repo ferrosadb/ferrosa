@@ -10285,21 +10285,14 @@ fn resolve_index_type(
 
 /// Resolve the `method` index option to a storage [`VectorIndexMethod`].
 ///
-/// Absent or `'hnsw'` selects the full-precision HNSW sidecar (the default);
-/// `'hvq'` selects the hybrid vector quantization (quantized IVF / C-SPANN)
-/// artifact path. Any other value fails loudly rather than silently falling
-/// back to HNSW.
+/// Delegates to `ferrosa_storage::engine::resolve_vector_index_method` so the
+/// executing node and every replica (and the restart reload) pick the same
+/// artifact for the same options. Only the error type is ours.
 fn resolve_vector_index_method(
     options: &HashMap<String, String>,
 ) -> Result<ferrosa_storage::VectorIndexMethod, CqlError> {
-    use ferrosa_storage::VectorIndexMethod;
-    match options.get("method").map(String::as_str) {
-        None | Some("hnsw") => Ok(VectorIndexMethod::Hnsw),
-        Some("hvq") => Ok(VectorIndexMethod::QuantizedIvf),
-        Some(other) => Err(CqlError::Invalid(format!(
-            "unknown vector index method '{other}' (expected 'hnsw' or 'hvq')"
-        ))),
-    }
+    ferrosa_storage::engine::resolve_vector_index_method(options)
+        .map_err(|e| CqlError::Invalid(e.to_string()))
 }
 
 async fn route_create_index(

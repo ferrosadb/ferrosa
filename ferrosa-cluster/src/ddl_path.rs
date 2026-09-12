@@ -66,6 +66,7 @@ pub(crate) fn build_replicated_index(
                 target_col,
                 partition_key_columns: partition_key,
                 filter_predicate: idx.filter_predicate.clone(),
+                options: &idx.options,
                 site,
             },
         )
