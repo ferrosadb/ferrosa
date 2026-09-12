@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
+# ── STOP: memory-public is NOT TO BE USED ──────────────────────────────────
+# Build, clone, pin and link ferrosadb/ferrosa-memory-private, never the old
+# public mirror. This end-user script still downloads from memory-public only
+# because anonymous users get a 404 from the private repo. That is a KNOWN
+# VIOLATION, tracked by forge task t_03a95aa5 (move end-user downloads to
+# downloads.ferrosa.ai). Do not copy these URLs anywhere else. Find every
+# such line with:   git grep -n 'KNOWN VIOLATION t_03a95aa5'
+# ───────────────────────────────────────────────────────────────────────────
+#
 # ferrosa-memory installer — fetches a release tarball, installs to ~/.ferrosa/,
 # offers system-service registration. Assumes Ferrosa is already running at
 # localhost:9042 (install via https://www.ferrosa.ai/install.sh first).
 #
-# SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory : docs/install-memory.sh).
+# SOURCE OF TRUTH: this file (ferrosadb/ferrosa-memory-private : docs/install-memory.sh).
 # It is mirrored into ferrosadb/ferrosa install/install-memory.sh, which is what
 # GitHub Pages serves at https://www.ferrosa.ai/install-memory.sh. Edit it HERE;
 # the ferrosa copy is a published mirror.
@@ -24,7 +33,7 @@
 #   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --version v0.16.0 --no-service
 set -euo pipefail
 
-REPO="ferrosadb/ferrosa-memory"
+REPO="ferrosadb/ferrosa-memory"  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
 RELEASE_HOST="https://github.com/${REPO}/releases"
 INSTALL_ROOT="${HOME}/.ferrosa"
 BIN_DIR="${INSTALL_ROOT}/bin"
@@ -87,7 +96,7 @@ detect_target() {
   case "$os/$arch" in
     Darwin/arm64)              echo "aarch64-apple-darwin" ;;
     Darwin/x86_64)
-      die "Intel macOS is not supported. Please build from source: https://github.com/ferrosadb/ferrosa-memory#building" ;;
+      die "Intel macOS is not supported. Please build from source: https://github.com/ferrosadb/ferrosa-memory#building" ;;  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
     Linux/x86_64)              echo "x86_64-unknown-linux-musl" ;;
     Linux/aarch64|Linux/arm64) echo "aarch64-unknown-linux-musl" ;;
     *) die "unsupported platform: $os/$arch" ;;
@@ -306,5 +315,5 @@ To register with Claude Code, add to your MCP config:
 Upgrade later by re-running this installer (idempotent):
   curl -fsSL https://www.ferrosa.ai/install-memory.sh | bash -s -- --channel ${CHANNEL}
 
-Docs: https://github.com/ferrosadb/ferrosa-memory
+Docs: https://github.com/${REPO}
 EOF

@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ── STOP: memory-public is NOT TO BE USED ──────────────────────────────────
+# Build, clone, pin and link ferrosadb/ferrosa-memory-private, never the old
+# public mirror. This end-user script still downloads and clones from
+# memory-public only because anonymous users get a 404 from the private repo.
+# That is a KNOWN VIOLATION, tracked by forge task t_03a95aa5 (move end-user
+# downloads to downloads.ferrosa.ai). Do not copy these URLs anywhere else.
+# Find every such line with:   git grep -n 'KNOWN VIOLATION t_03a95aa5'
+# ───────────────────────────────────────────────────────────────────────────
+#
 # ferrosa-memory fast setup — installs prebuilt binaries via the LATEST file,
 # downloads ONBOARDING.md, optionally clones source repos, optionally pulls
 # the Nomic embedding model, and hands off to a selected LLM harness.
@@ -23,7 +32,7 @@
 set -euo pipefail
 
 FERROSA_REPO="ferrosadb/ferrosa"
-MEMORY_REPO="ferrosadb/ferrosa-memory"
+MEMORY_REPO="ferrosadb/ferrosa-memory"  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
 LATEST_URL="${FERROSA_LATEST_URL:-https://www.ferrosa.ai/LATEST}"
 FERROSA_RELEASE_HOST="${FERROSA_RELEASE_HOST:-https://github.com/${FERROSA_REPO}/releases}"
 MEMORY_RELEASE_HOST="${MEMORY_RELEASE_HOST:-https://github.com/${MEMORY_REPO}/releases}"

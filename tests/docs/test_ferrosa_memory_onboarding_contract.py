@@ -11,10 +11,10 @@ def read(path: Path) -> str:
 
 def test_setup_memory_defaults_use_canonical_ferrosadb_org_and_existing_onboarding_path():
     script = read(SETUP_SCRIPT)
-    assert "https://github.com/ferrosadb/ferrosa-memory.git" in script
+    assert "https://github.com/ferrosadb/ferrosa-memory.git" in script  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
     assert "https://github.com/ferrosadb/ferrosa.git" in script
     assert (
-        "https://raw.githubusercontent.com/ferrosadb/ferrosa-memory/main/ONBOARDING.md"
+        "https://raw.githubusercontent.com/ferrosadb/ferrosa-memory/main/ONBOARDING.md"  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
         in script
     )
     assert "github.com/bkearns/ferrosa" not in script
@@ -25,7 +25,7 @@ def test_getting_started_manual_clone_and_compose_steps_match_public_runtime_con
     guide = read(GETTING_STARTED)
     assert "git clone https://github.com/ferrosadb/ferrosa.git ferrosa" in guide
     assert (
-        "git clone https://github.com/ferrosadb/ferrosa-memory.git ferrosa-memory"
+        "git clone https://github.com/ferrosadb/ferrosa-memory.git ferrosa-memory"  # memory-public-ok: KNOWN VIOLATION t_03a95aa5 — end-user download source pending
         in guide
     )
     assert "scripts/init-runtime.sh" in guide
