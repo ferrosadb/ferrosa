@@ -83,6 +83,49 @@ pub struct TableSchema {
 /// Variable-width types (Inet — 4 or 16 bytes — text, blob, decimal,
 /// varint, list/set/map/tuple/UDT) return `None` and are not validated
 /// at this layer; their lengths are checked at decode time downstream.
+/// The declared dimension of a vector column, from either spelling of its
+/// type, or `None` if it is not a dimensioned vector.
+///
+/// A column reaches this function spelled one of two ways depending on which
+/// side is asking, and both are the same type:
+///
+/// | side | spelling |
+/// |---|---|
+/// | CQL / `TableMetadata::columns` | `vector<float, 3>` |
+/// | storage / `ColumnDefinition::type_name` | `org.apache.cassandra.db.marshal.VectorType(FloatType,3)` |
+///
+/// This existed as a private CQL-form-only parser in `ferrosa-cql`'s router
+/// while the engine held the marshal form. Nothing crossed that line yet, so
+/// nothing was broken — but the two are one `type_name` apart, and the failure
+/// it was set up for is silent: `None` means "not a vector", which is
+/// indistinguishable from "I could not read this spelling", so a vector index
+/// would decline to build without saying why. One parser for both spellings is
+/// what stops that, so the caller's `None` means what it says.
+pub fn vector_dimension(type_name: &str) -> Option<usize> {
+    let trimmed = type_name.trim();
+
+    // Marshal form: `[org.apache.cassandra.db.marshal.]VectorType(<elem>,<dim>)`.
+    // Matched before lowercasing so the element type keeps its own case.
+    let marshal = trimmed
+        .rsplit_once('.')
+        .map(|(_, tail)| tail)
+        .unwrap_or(trimmed);
+    if let Some(args) = marshal
+        .strip_prefix("VectorType(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        return args
+            .rsplit_once(',')
+            .and_then(|(_, dim)| dim.trim().parse::<usize>().ok());
+    }
+
+    // CQL form: `vector<<elem>, <dim>>`.
+    let lower = trimmed.to_ascii_lowercase();
+    let args = lower.strip_prefix("vector<")?.strip_suffix('>')?;
+    args.rsplit_once(',')
+        .and_then(|(_, dim)| dim.trim().parse::<usize>().ok())
+}
+
 pub fn fixed_width_for_marshal_type(type_name: &str) -> Option<usize> {
     match type_name {
         "org.apache.cassandra.db.marshal.TimeUUIDType"
@@ -308,6 +351,53 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same column is spelled two ways depending on which side asks, and
+    /// one parser must answer for both.
+    ///
+    /// `route_create_index` reads the CQL spelling out of `TableMetadata`;
+    /// the storage engine's `TableSchema` carries the marshal spelling
+    /// (`ColumnDefinition::type_name`). A parser that understands only one
+    /// returns `None` for the other — and `None` here means "not a vector",
+    /// which is indistinguishable from "I could not read this", so a vector
+    /// index silently declines to build rather than failing.
+    #[test]
+    fn a_vector_dimension_is_read_from_either_spelling_of_the_type() {
+        for spelling in [
+            "vector<float, 3>",
+            "vector<float,3>",
+            "VECTOR<Float, 3>",
+            "  vector<float, 3>  ",
+            "org.apache.cassandra.db.marshal.VectorType(FloatType,3)",
+            "org.apache.cassandra.db.marshal.VectorType(FloatType, 3)",
+            "VectorType(FloatType,3)",
+        ] {
+            assert_eq!(
+                vector_dimension(spelling),
+                Some(3),
+                "both sides spell this column the same type: {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_vector_type_has_no_vector_dimension() {
+        for spelling in [
+            "org.apache.cassandra.db.marshal.UTF8Type",
+            "text",
+            "list<float>",
+            "vector<float>",
+            "vector<float, notanumber>",
+            "VectorType(FloatType)",
+            "",
+        ] {
+            assert_eq!(
+                vector_dimension(spelling),
+                None,
+                "not a dimensioned vector: {spelling:?}"
+            );
+        }
+    }
 
     #[test]
     fn fixed_width_known_types() {

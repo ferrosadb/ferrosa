@@ -10302,14 +10302,6 @@ fn resolve_vector_index_method(
     }
 }
 
-fn vector_dimension_from_column_type(column_type: &str) -> Option<usize> {
-    let lower = column_type.trim().to_ascii_lowercase();
-    let inner = lower.strip_prefix("vector<")?.strip_suffix('>')?;
-    inner
-        .rsplit_once(',')
-        .and_then(|(_, dim)| dim.trim().parse::<usize>().ok())
-}
-
 async fn route_create_index(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -10436,7 +10428,7 @@ async fn route_create_index(
         if let Some((pos, column_type)) = col_info {
             let wire_result = if index_type == IndexType::Vector {
                 let dimension =
-                    vector_dimension_from_column_type(&column_type).ok_or_else(|| {
+                    ferrosa_common::schema::vector_dimension(&column_type).ok_or_else(|| {
                         CqlError::Invalid(format!(
                             "vector index target column '{}' has non-vector type '{}'",
                             target_col, column_type
