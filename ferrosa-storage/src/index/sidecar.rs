@@ -130,7 +130,7 @@ struct EntryRef<'a> {
 ///
 /// This is the flush path's half of the streaming contract. A memtable index
 /// already holds its postings sorted — in-order traversal yields exactly
-/// [`posting_order`] — so the sidecar can be written straight out of the tree,
+/// `posting_order` — so the sidecar can be written straight out of the tree,
 /// one borrowed entry at a time. Handing the writer a `Vec` instead cost three
 /// full copies of the index: the traversal built one, the flatten cloned the
 /// key once per posting, and the writer took its own `to_vec` to sort.

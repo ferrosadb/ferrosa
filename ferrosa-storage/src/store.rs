@@ -10090,6 +10090,65 @@ mod tests {
         assert_eq!(results[0].key.key.as_bytes(), b"user1");
     }
 
+    /// A row flushed before `ALTER TABLE ADD` must still expose its cells under
+    /// the same column names after the new schema reorders column ordinals.
+    #[test]
+    fn row_flushed_before_alter_still_reads_back_under_its_own_column() {
+        let make_schema = |regulars: &[&str]| TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![],
+            regular_columns: regulars
+                .iter()
+                .map(|name| ColumnDefinition {
+                    name: (*name).to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                })
+                .collect(),
+            extensions: Default::default(),
+        };
+
+        let mut store = TableStore::new(
+            make_schema(&["name"]),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+        );
+        store
+            .write(
+                &make_key("user1"),
+                Row {
+                    clustering: vec![0x00, 0x00, 0x00, 0x01],
+                    cells: vec![(0, CellValue::live(b"John".to_vec(), 1000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                },
+            )
+            .unwrap();
+        store.flush().unwrap();
+
+        // Adding a lexically earlier column moves `name` from ordinal 0 to 1.
+        store.update_schema(make_schema(&["aaa_before", "name"]));
+
+        let partition = store
+            .read(&make_key("user1"))
+            .unwrap()
+            .expect("pre-ALTER row must remain readable after ALTER");
+        let name_cell = partition.rows[0]
+            .cells
+            .iter()
+            .find(|(ordinal, _)| *ordinal == 1)
+            .expect("pre-ALTER value must be remapped to name's post-ALTER ordinal");
+        assert_eq!(name_cell.1.value.as_deref(), Some(b"John".as_slice()));
+    }
+
     /// Phase 2: the same phonetic point-lookup must work through the sidecar
     /// after a flush, since the flushed sidecar inherits the memtable's
     /// phonetic-code keys.

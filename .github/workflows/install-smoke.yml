@@ -175,11 +175,29 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+      # memory-public is NOT TO BE USED: this job compiles ferrosa-memory from
+      # source, so it builds the real repo, ferrosadb/ferrosa-memory-private.
+      # That repo is private and the default github.token cannot read it, so
+      # the checkout needs FERROSA_COMPONENTS_TOKEN. Say so by name when it is
+      # missing, rather than letting checkout fail with "repository not found".
+      - name: Require FERROSA_COMPONENTS_TOKEN
+        env:
+          COMPONENTS_TOKEN: ${{ secrets.FERROSA_COMPONENTS_TOKEN }}
+        run: |
+          if [ -z "$COMPONENTS_TOKEN" ]; then
+            echo "::error::secret FERROSA_COMPONENTS_TOKEN is not set on ferrosadb/ferrosa (or was not passed to this workflow)."
+            echo "::error::It must be a token that can read ferrosadb/ferrosa-memory-private; without it this job cannot check out the memory source."
+            exit 1
+          fi
       - name: Checkout ferrosa-memory
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: ferrosadb/ferrosa-memory
+          repository: ferrosadb/ferrosa-memory-private
           path: ferrosa-memory
+          token: ${{ secrets.FERROSA_COMPONENTS_TOKEN }}
+          # The build steps that follow run PR code; do not leave the token in
+          # ferrosa-memory/.git/config for them to read.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       # Kept defensive even though these jobs now run on HOSTED runners.
       #
