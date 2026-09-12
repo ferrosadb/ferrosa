@@ -125,6 +125,34 @@ struct EntryRef<'a> {
 
 // ── Writer ───────────────────────────────────────────────────────────────────
 
+/// Somewhere postings already live, able to hand them over in `(key, row)`
+/// order without first copying them into a `Vec`.
+///
+/// This is the flush path's half of the streaming contract. A memtable index
+/// already holds its postings sorted — in-order traversal yields exactly
+/// [`posting_order`] — so the sidecar can be written straight out of the tree,
+/// one borrowed entry at a time. Handing the writer a `Vec` instead cost three
+/// full copies of the index: the traversal built one, the flatten cloned the
+/// key once per posting, and the writer took its own `to_vec` to sort.
+///
+/// `visit` stops at the first `Err` the visitor returns, and returns it.
+pub trait SidecarSource {
+    /// Offer every posting, in `(key, row)` order.
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> IndexResult<()>,
+    ) -> IndexResult<()>;
+
+    /// Whether the source holds no postings at all, answered without walking.
+    ///
+    /// An index with nothing in it gets no sidecar file: a directory listing
+    /// feeds both the SSTable manifest and the S3 upload set, so a file that
+    /// exists only to say "empty" is a file every one of those has to carry.
+    /// The flush needs the answer BEFORE it opens anything, which is why this
+    /// is on the source rather than inferred from a write that returned zero.
+    fn is_empty(&self) -> bool;
+}
+
 /// Writes a sidecar index file with CRC32-validated header.
 pub struct SidecarWriter;
 
@@ -152,9 +180,40 @@ impl SidecarWriter {
     where
         I: IntoIterator<Item = IndexResult<(IndexKey, RowPosition)>>,
     {
+        Self::write_streaming(path, |sink| {
+            for entry in entries {
+                let (key, position) = entry?;
+                sink.push(&key.0, RowPositionRef::from(&position))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Stream a [`SidecarSource`]'s postings into a v2 sidecar at `path`,
+    /// returning the number written.
+    ///
+    /// The same guarantees as [`write_sorted`](Self::write_sorted), without
+    /// the source having to own its entries in a `Vec` first: this is what
+    /// lets a flush write a memtable index's sidecar in memory that does not
+    /// grow with the index.
+    pub fn write_from_source(path: &Path, source: &dyn SidecarSource) -> IndexResult<u64> {
+        Self::write_streaming(path, |sink| {
+            source.visit(&mut |key, position| sink.push(&key.0, RowPositionRef::from(position)))
+        })
+    }
+
+    /// The temp-file, fsync and rename dance both streaming writers share.
+    fn write_streaming(
+        path: &Path,
+        fill: impl FnOnce(&mut V2Sink) -> IndexResult<()>,
+    ) -> IndexResult<u64> {
         let body_path = temp_sibling(path, "body");
         let offsets_path = temp_sibling(path, "offsets");
-        let result = write_v2_files(&body_path, &offsets_path, entries);
+        let result = (|| {
+            let mut sink = V2Sink::create(&body_path, &offsets_path)?;
+            fill(&mut sink)?;
+            sink.finish(&offsets_path)
+        })();
         if let Err(error) = std::fs::remove_file(&offsets_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(%error, path = %offsets_path.display(), "sidecar: could not remove the offset-table temp file");
@@ -207,22 +266,49 @@ fn sync_parent_dir(path: &Path) -> IndexResult<()> {
 
 /// Write the body to `body_path` and the offset table to `offsets_path`, then
 /// append the table and footer to the body and fill in the header.
-fn write_v2_files<I>(body_path: &Path, offsets_path: &Path, entries: I) -> IndexResult<u64>
-where
-    I: IntoIterator<Item = IndexResult<(IndexKey, RowPosition)>>,
-{
-    let mut body = BufWriter::new(std::fs::File::create(body_path)?);
-    let mut offsets = BufWriter::new(std::fs::File::create(offsets_path)?);
-    body.write_all(&[0u8; HEADER_SIZE])?;
-    let mut crc = crc32fast::Hasher::new();
-    let mut position = HEADER_SIZE as u64;
-    let mut count = 0u64;
-    let mut previous: Option<(IndexKey, RowPosition)> = None;
-    for entry in entries {
-        let entry = entry?;
-        if let Some(prev) = &previous {
-            match posting_order(prev, &entry) {
-                std::cmp::Ordering::Equal => continue,
+/// The streaming half of the v2 writer: everything that can be done knowing
+/// only the entry in hand.
+///
+/// It exists so a caller that holds its postings somewhere already — a
+/// memtable index, a merge of sidecars — can hand them over one borrowed
+/// entry at a time instead of building a `Vec` for the writer to copy. Its
+/// buffers are reused, so a push allocates nothing after the first few.
+struct V2Sink {
+    body: BufWriter<std::fs::File>,
+    offsets: BufWriter<std::fs::File>,
+    crc: crc32fast::Hasher,
+    position: u64,
+    count: u64,
+    encoded: Vec<u8>,
+    previous: Option<(Vec<u8>, RowPosition)>,
+}
+
+impl V2Sink {
+    fn create(body_path: &Path, offsets_path: &Path) -> IndexResult<Self> {
+        let mut body = BufWriter::new(std::fs::File::create(body_path)?);
+        let offsets = BufWriter::new(std::fs::File::create(offsets_path)?);
+        body.write_all(&[0u8; HEADER_SIZE])?;
+        Ok(Self {
+            body,
+            offsets,
+            crc: crc32fast::Hasher::new(),
+            position: HEADER_SIZE as u64,
+            count: 0,
+            encoded: Vec::new(),
+            previous: None,
+        })
+    }
+
+    /// Append one entry, which must not sort before the last one written.
+    /// An exact repeat is dropped (the reader's binary search and the store's
+    /// ordered merge both assume unique, ascending entries).
+    fn push(&mut self, key: &[u8], position: RowPositionRef<'_>) -> IndexResult<()> {
+        if let Some((prev_key, prev_position)) = &self.previous {
+            match ref_posting_order(
+                (prev_key.as_slice(), RowPositionRef::from(prev_position)),
+                (key, position),
+            ) {
+                std::cmp::Ordering::Equal => return Ok(()),
                 std::cmp::Ordering::Greater => {
                     return Err(IndexError::Corrupt(
                         "sidecar writer: entries out of (key, row) order".into(),
@@ -231,37 +317,65 @@ where
                 std::cmp::Ordering::Less => {}
             }
         }
-        let encoded = encode_entry(&entry.0, &entry.1);
-        body.write_all(&encoded)?;
-        crc.update(&encoded);
-        let slot = position.to_le_bytes();
-        offsets.write_all(&slot)?;
-        position += encoded.len() as u64;
-        count += 1;
-        previous = Some(entry);
-    }
-    offsets.flush()?;
-    drop(offsets);
-
-    let offsets_start = position;
-    let mut table = std::io::BufReader::new(std::fs::File::open(offsets_path)?);
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let read = table.read(&mut chunk)?;
-        if read == 0 {
-            break;
+        self.encoded.clear();
+        encode_entry_into(&mut self.encoded, key, position);
+        self.body.write_all(&self.encoded)?;
+        self.crc.update(&self.encoded);
+        self.offsets.write_all(&self.position.to_le_bytes())?;
+        self.position += self.encoded.len() as u64;
+        self.count += 1;
+        match &mut self.previous {
+            // Reuse the buffers rather than allocating a new owned entry per
+            // push: the writer holds exactly one entry, whatever it is fed.
+            Some((prev_key, prev_position)) => {
+                prev_key.clear();
+                prev_key.extend_from_slice(key);
+                prev_position.partition_key.clear();
+                prev_position
+                    .partition_key
+                    .extend_from_slice(position.partition_key);
+                prev_position.clustering_key.clear();
+                prev_position
+                    .clustering_key
+                    .extend_from_slice(position.clustering_key);
+            }
+            slot @ None => *slot = Some((key.to_vec(), position.to_owned_position())),
         }
-        body.write_all(&chunk[..read])?;
-        crc.update(&chunk[..read]);
+        Ok(())
     }
-    body.write_all(&offsets_start.to_le_bytes())?;
-    body.write_all(&crc.finalize().to_le_bytes())?;
-    body.write_all(FOOTER_MAGIC)?;
-    let mut file = body.into_inner().map_err(|error| error.into_error())?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&header_bytes(SIDECAR_VERSION, count))?;
-    file.sync_all()?;
-    Ok(count)
+
+    fn finish(self, offsets_path: &Path) -> IndexResult<u64> {
+        let Self {
+            mut body,
+            mut offsets,
+            mut crc,
+            position,
+            count,
+            ..
+        } = self;
+        offsets.flush()?;
+        drop(offsets);
+
+        let offsets_start = position;
+        let mut table = std::io::BufReader::new(std::fs::File::open(offsets_path)?);
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let read = table.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            body.write_all(&chunk[..read])?;
+            crc.update(&chunk[..read]);
+        }
+        body.write_all(&offsets_start.to_le_bytes())?;
+        body.write_all(&crc.finalize().to_le_bytes())?;
+        body.write_all(FOOTER_MAGIC)?;
+        let mut file = body.into_inner().map_err(|error| error.into_error())?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header_bytes(SIDECAR_VERSION, count))?;
+        file.sync_all()?;
+        Ok(count)
+    }
 }
 
 /// The 17-byte header for `version` and `count`.
@@ -280,11 +394,27 @@ fn encode_entry(key: &IndexKey, position: &RowPosition) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
         12 + key.0.len() + position.partition_key.len() + position.clustering_key.len(),
     );
-    for field in [&key.0, &position.partition_key, &position.clustering_key] {
+    encode_entry_into(&mut buf, &key.0, RowPositionRef::from(position));
+    buf
+}
+
+/// `encode_entry` into a caller-owned buffer, so a streaming writer can reuse
+/// one buffer for every entry instead of allocating per posting.
+fn encode_entry_into(buf: &mut Vec<u8>, key: &[u8], position: RowPositionRef<'_>) {
+    for field in [key, position.partition_key, position.clustering_key] {
         buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
         buf.extend_from_slice(field);
     }
-    buf
+}
+
+/// [`posting_order`] over borrowed entries.
+fn ref_posting_order(
+    a: (&[u8], RowPositionRef<'_>),
+    b: (&[u8], RowPositionRef<'_>),
+) -> std::cmp::Ordering {
+    a.0.cmp(b.0)
+        .then_with(|| a.1.partition_key.cmp(b.1.partition_key))
+        .then_with(|| a.1.clustering_key.cmp(b.1.clustering_key))
 }
 
 /// Serialize sorted, unique entries into a complete v2 image in memory — for

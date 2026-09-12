@@ -2826,46 +2826,73 @@ impl<F: FlushTarget> TableStore<F> {
         // Keep next_gen at least as high as the flush target gen + 1.
         self.next_gen
             .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
-        let mut raw_sidecar_entries: HashMap<String, Vec<(IndexKey, RowPosition)>> = HashMap::new();
-        for (index_name, memtable_idx) in old_indexes.iter() {
-            let entries: Vec<(IndexKey, Vec<RowPosition>)> = memtable_idx.iter().collect();
-            // Flatten: each (key, positions) pair becomes multiple (key, pos) entries
-            let flat_entries: Vec<(IndexKey, RowPosition)> = entries
-                .into_iter()
-                .flat_map(|(key, positions)| {
-                    positions.into_iter().map(move |pos| (key.clone(), pos))
+        // Hand the memtable indexes to the flush target as SOURCES, not as a
+        // materialised posting set: a tree is already in `(key, row)` order,
+        // so the target streams it to disk one borrowed entry at a time. This
+        // used to copy every posting three times before a byte was written —
+        // the traversal built a `Vec`, the flatten cloned the key once per
+        // posting, and the writer took its own `to_vec` of that to sort it —
+        // which made the flush, not the query, the memory peak on a node with
+        // a large index (see tests/sidecar_memory_bound.rs).
+        //
+        // The pin is taken HERE, beside the memtable that was just swapped out,
+        // so the sidecar describes the rows this SSTable holds however long the
+        // write itself takes. Pinning a persistent tree copies nothing: it is
+        // one `Arc` per index.
+        let pinned_indexes: Vec<(&str, crate::memtable::index::IndexSnapshot)> = old_indexes
+            .iter()
+            .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
+            .collect();
+        let sidecar_sources: Vec<(&str, &dyn crate::index::sidecar::SidecarSource)> =
+            pinned_indexes
+                .iter()
+                .map(|(index_name, pinned)| {
+                    (
+                        *index_name,
+                        pinned as &dyn crate::index::sidecar::SidecarSource,
+                    )
                 })
                 .collect();
-            if !flat_entries.is_empty() {
-                raw_sidecar_entries.insert(index_name.clone(), flat_entries);
-            }
-        }
-
-        // Persist the sidecars and take back a reader for each: a file-backed
-        // target maps what it wrote (t_7ac6b0e3); an in-memory target has no
-        // file and returns images. The flat entries are dropped after this.
         let sidecar_map: HashMap<String, SidecarReader> =
-            match self.flush_target.write_sidecars(gen, &raw_sidecar_entries) {
+            match self.flush_target.write_sidecars(gen, &sidecar_sources) {
                 Ok(readers) => readers,
                 Err(e) => {
+                    // Fail loud and degrade visibly: this generation's indexes
+                    // are served from images so no read answers short, and the
+                    // next restart rebuilds them from the files.
                     tracing::error!(
                         %e,
                         gen,
                         "store: sidecar persist failed; serving this generation's indexes from \
-                         in-memory copies"
+                         in-memory copies (heap-resident until restart)"
                     );
-                    raw_sidecar_entries
+                    sidecar_sources
                         .iter()
-                        .map(|(index_name, entries)| {
-                            (
-                                index_name.clone(),
-                                SidecarReader::from_entries(entries.clone()),
-                            )
+                        .filter(|(_, source)| !source.is_empty())
+                        .filter_map(|(index_name, source)| {
+                            let mut entries: Vec<(IndexKey, RowPosition)> = Vec::new();
+                            let visited = source.visit(&mut |key, position| {
+                                entries.push((key.clone(), position.clone()));
+                                Ok(())
+                            });
+                            if let Err(error) = visited {
+                                tracing::error!(
+                                    %error, index_name,
+                                    "store: could not read a memtable index for its fallback image"
+                                );
+                                return None;
+                            }
+                            (!entries.is_empty()).then(|| {
+                                (
+                                    (*index_name).to_string(),
+                                    SidecarReader::from_entries(entries),
+                                )
+                            })
                         })
                         .collect()
                 }
             };
-        drop(raw_sidecar_entries);
+        drop(sidecar_sources);
 
         // Step 5c: Build FTI sidecar files for any full-text indexes.
         for (index_name, col_pos) in &self.fulltext_indexes {

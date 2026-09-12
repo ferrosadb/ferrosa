@@ -264,6 +264,27 @@ pub(crate) fn desired_flush_shards(
 /// Implementers decide whether the output goes to in-memory buffers or
 /// to the filesystem. After writing, the trait returns an `SSTableReader`
 /// so the flushed data is immediately queryable.
+/// Collect a source's postings into `entries`, for the two targets that have
+/// no file to map and must hold an image.
+///
+/// This is the one copy the streaming path cannot avoid, so it is in one place
+/// and named: everything else writes straight through.
+fn visit_postings(
+    source: &dyn crate::index::sidecar::SidecarSource,
+    entries: &mut Vec<(IndexKey, RowPosition)>,
+) -> Result<()> {
+    source
+        .visit(&mut |key, position| {
+            entries.push((key.clone(), position.clone()));
+            Ok(())
+        })
+        .map_err(|error| {
+            ferrosa_common::Error::InvalidData(format!(
+                "reading a memtable index's postings: {error}"
+            ))
+        })
+}
+
 pub trait FlushTarget {
     /// The reader type used to access component data after flushing.
     type Reader: ReadAt + Send + Sync + 'static;
@@ -357,18 +378,24 @@ pub trait FlushTarget {
     fn write_sidecars(
         &self,
         _generation: u64,
-        sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
+        sidecars: &[(&str, &dyn crate::index::sidecar::SidecarSource)],
     ) -> Result<HashMap<String, crate::index::sidecar::SidecarReader>> {
-        Ok(sidecars
-            .iter()
-            .filter(|(_, entries)| !entries.is_empty())
-            .map(|(index_name, entries)| {
-                (
-                    index_name.clone(),
-                    crate::index::sidecar::SidecarReader::from_entries(entries.clone()),
-                )
-            })
-            .collect())
+        // No file to map, so this target has to hold an image. It collects
+        // once, straight from the source — the caller never builds a `Vec` for
+        // it to copy.
+        let mut readers = HashMap::with_capacity(sidecars.len());
+        for (index_name, source) in sidecars {
+            if source.is_empty() {
+                continue;
+            }
+            let mut entries: Vec<(IndexKey, RowPosition)> = Vec::new();
+            visit_postings(*source, &mut entries)?;
+            readers.insert(
+                (*index_name).to_string(),
+                crate::index::sidecar::SidecarReader::from_entries(entries),
+            );
+        }
+        Ok(readers)
     }
 
     /// Write a full-text index (FTI) sidecar file alongside the SSTable.
@@ -1561,20 +1588,20 @@ impl FlushTarget for FileFlushTarget {
     fn write_sidecars(
         &self,
         generation: u64,
-        sidecars: &HashMap<String, Vec<(IndexKey, RowPosition)>>,
+        sidecars: &[(&str, &dyn crate::index::sidecar::SidecarSource)],
     ) -> Result<HashMap<String, crate::index::sidecar::SidecarReader>> {
         use crate::index::sidecar::{SidecarReader, SidecarWriter};
 
         let mut readers = HashMap::with_capacity(sidecars.len());
-        for (index_name, entries) in sidecars {
-            if entries.is_empty() {
+        for (index_name, source) in sidecars {
+            if source.is_empty() {
                 continue;
             }
             let path = self
                 .base_dir
                 .join(format!("{generation}-{index_name}.sidecar"));
-            let mapped =
-                SidecarWriter::write(&path, entries).and_then(|()| SidecarReader::open(&path));
+            let mapped = SidecarWriter::write_from_source(&path, *source)
+                .and_then(|_written| SidecarReader::open(&path));
             let reader = match mapped {
                 Ok(reader) => reader,
                 Err(e) => {
@@ -1585,10 +1612,18 @@ impl FlushTarget for FileFlushTarget {
                         "flush: sidecar could not be written or mapped; serving this index \
                          for this generation from an in-memory copy (heap-resident until restart)"
                     );
-                    SidecarReader::from_entries(entries.clone())
+                    // The degraded path is the one place an image is built, and
+                    // it is built from the source rather than from a `Vec` the
+                    // caller was holding for the purpose.
+                    let mut entries: Vec<(IndexKey, RowPosition)> = Vec::new();
+                    visit_postings(*source, &mut entries)?;
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    SidecarReader::from_entries(entries)
                 }
             };
-            readers.insert(index_name.clone(), reader);
+            readers.insert((*index_name).to_string(), reader);
         }
         Ok(readers)
     }

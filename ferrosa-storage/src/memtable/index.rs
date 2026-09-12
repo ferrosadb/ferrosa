@@ -128,11 +128,65 @@ impl MemtableIndex {
     }
 
     /// In-order iterator over all (key, positions) pairs.
+    ///
+    /// This COPIES the whole index. Prefer [`visit_all`](Self::visit_all)
+    /// wherever the postings are consumed once, which is every caller on a
+    /// hot path: a flush writing its sidecar reads the tree exactly once and
+    /// has no use for a second copy of it.
     pub fn iter(&self) -> impl Iterator<Item = (IndexKey, Vec<RowPosition>)> {
         let guard = self.root.load();
         let mut entries = Vec::new();
         Self::collect_all((**guard).as_ref(), &mut entries);
         entries.into_iter()
+    }
+
+    /// Visit every posting in `(key, row)` order, copying nothing.
+    ///
+    /// The walk holds an explicit stack of the nodes on the current path —
+    /// O(log n) pointers, no recursion — and lends each entry to the visitor
+    /// in place. In-order traversal yields keys ascending, and a node's
+    /// postings are already sorted and unique (see [`insert`](Self::insert)),
+    /// so the sequence is exactly the order a sidecar wants.
+    ///
+    /// Returning `Break` stops the walk immediately, so a consumer that
+    /// fails part-way (a write error, a full page) does not pay for the rest.
+    pub fn visit_all(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let guard = self.root.load();
+        Self::walk((**guard).as_ref(), visitor)
+    }
+
+    /// Pin the tree as it stands now, for a consumer that will read it later.
+    /// Holding the root is the snapshot: nothing is copied.
+    pub fn pin(&self) -> IndexSnapshot {
+        IndexSnapshot {
+            root: (**self.root.load()).clone(),
+        }
+    }
+
+    /// The in-order walk both [`visit_all`](Self::visit_all) and a pinned
+    /// [`IndexSnapshot`] share.
+    fn walk(
+        root: Option<&Arc<Node>>,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut stack: Vec<&Arc<Node>> = Vec::new();
+        let mut next = root;
+        loop {
+            while let Some(node) = next {
+                stack.push(node);
+                next = node.left.as_ref();
+            }
+            let Some(node) = stack.pop() else {
+                return ControlFlow::Continue(());
+            };
+            for position in &node.values {
+                visitor(&node.key, position)?;
+            }
+            next = node.right.as_ref();
+        }
     }
 
     /// Take a snapshot of the current root for persistence guarantees.
@@ -391,6 +445,66 @@ impl MemtableIndex {
             entries.push((n.key.clone(), n.values.clone()));
             Self::collect_all(n.right.as_ref(), entries);
         }
+    }
+}
+
+/// One index's postings, pinned to the tree as it stood at a chosen instant.
+///
+/// The tree is persistent, so holding its root is the whole snapshot: no
+/// copying, and inserts that land afterwards build new nodes without
+/// disturbing these. That matters for a flush, which must write the sidecar
+/// for the rows it put in the SSTable and no others — pinning at the moment
+/// the memtable is swapped out fixes which rows those are, whatever the write
+/// path does next, and whenever the bytes are actually written.
+pub struct IndexSnapshot {
+    root: Option<Arc<Node>>,
+}
+
+impl IndexSnapshot {
+    /// Visit every pinned posting in `(key, row)` order, copying nothing.
+    pub fn visit_all(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        MemtableIndex::walk(self.root.as_ref(), visitor)
+    }
+
+    /// True when the snapshot holds no postings. Every node carries at least
+    /// one (`insert` is the only way to make one), so an absent root and an
+    /// empty index are the same thing.
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+}
+
+/// A pinned index writes its own sidecar, straight out of the tree.
+///
+/// The first error the writer reports stops the walk and is returned: a
+/// half-written sidecar is never published (the writer renames into place
+/// only on success), so a failure here leaves the previous file untouched.
+impl crate::index::sidecar::SidecarSource for IndexSnapshot {
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ferrosa_index::IndexResult<()>,
+    ) -> ferrosa_index::IndexResult<()> {
+        let mut failure = None;
+        // The walk's own `Break` carries nothing: the error it stopped for is
+        // in `failure`, which is what this returns.
+        let _stopped = self.visit_all(&mut |key, position| match visitor(key, position) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                failure = Some(error);
+                ControlFlow::Break(())
+            }
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        IndexSnapshot::is_empty(self)
     }
 }
 
