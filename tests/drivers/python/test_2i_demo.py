@@ -101,12 +101,20 @@ def wait_for_index_build(session, probe_cql, index_name, timeout_s=30):
 
 
 def seed_unlogged_batch(session, insert_cql, rows):
-    """Seed one demo table without paying one network round trip per row."""
+    """Seed one demo table in protocol-safe batches."""
     prepared = session.prepare(insert_cql)
     batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+    pending = 0
     for row in rows:
         batch.add(prepared, row)
-    session.execute(batch)
+        pending += 1
+        if pending == 500:
+            session.execute(batch)
+            batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+            pending = 0
+
+    if pending:
+        session.execute(batch)
 
 
 def print_comparison(index_type, without_ms, with_ms, rows_without, rows_with):
