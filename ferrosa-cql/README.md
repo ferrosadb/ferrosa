@@ -72,11 +72,18 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   (`FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`). `DISTINCT`/aggregate/function-projection
   keep their `range_read_limited_rows_checked` fail-loud cap
   (spec: `specs/proposed/streaming-range-reads-no-cap.md`).
-  Global secondary-index scans use the analogous bounded-per-hop
-  `WritePath::index_read_stream` path, so high-cardinality edge indexes are
-  delivered incrementally. Multi-index intersections retain `O(result)`
-  partition-key membership sets, and cross-replica deduplication retains
-  `O(result)` row identities.
+  Global secondary-index reads (`SingleIndex`, `IndexScanWithFilter`,
+  `IndexIntersection`) stream in row order — `(partition key, clustering)` —
+  through `WritePath::index_read_stream(.., after)`, and hold O(sources) at
+  every layer (t_50c8bc7d): each node merges its memtable and sidecar posting
+  lists, the coordinator merges the nodes and drops replica copies by
+  adjacency, and an intersection is a partition-level merge-join with one head
+  per index. A plain projection is served one bounded page at a time — the
+  client's page size, or `default_scan_page_size()` when unpaged — through
+  `collect_filtered_page_from_partition_stream`, and the next page resumes
+  strictly after the `(pk, ck)` cursor. Builtin aggregates over an index fold
+  as rows stream. `ORDER BY`, `DISTINCT` and non-builtin function projections
+  over an index still collect the match set (`collect_index_rows_with_limit`).
 - **Scan planner** (`planner.rs`) — rule-based `ScanPlan` selection for SELECT:
   `PartitionKeyLookup` (full PK), `PartitionIndexLookup` (full PK **plus** an
   indexed residual `=` predicate — t_430c4188: keyed secondary-index consult
@@ -102,14 +109,17 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   clustering-component build path (previously a silent schema-only no-op).
   Scalar indexes created after writes synchronously stream pre-existing active
   and flushing memtable rows into the index before indexed SELECTs can use it.
-  Rows already in SSTables are backfilled asynchronously, and an index is
-  withheld from the planner for as long as `IndexStateTracker` reports that
-  build unfinished: the query takes the scan its `ALLOW FILTERING` licenses, or
-  is refused naming the index when it holds no such licence. A partial index
-  never answers as though it were complete. Once the index is current, an empty
-  global lookup is a real miss and never falls back to a scan. An index the
-  engine does not have at all is a different case and stays refused (t_50c8bc7d)
-  rather than quietly downgrading to a scan.
+  Rows already in SSTables are backfilled asynchronously. One rule covers every
+  index that cannot completely answer on this node — absent from the local
+  table though the schema lists it (t_50c8bc7d), or with `IndexStateTracker`
+  reporting its build unfinished (t_edd3be70): it is **withheld from the
+  planner**, so the query takes the scan its `ALLOW FILTERING` licenses and says
+  so at WARN, and is refused — naming each index and why — only when it licensed
+  no scan. A partial index never answers as though it were complete, and a
+  correct slow answer beats a server error: refusing the licensed case turned
+  ferrosa-memory's entity streams into 500s across `main` and every open PR
+  (t_12457d3e). Once the index is current, an empty global lookup is a real miss
+  and never falls back to a scan.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from

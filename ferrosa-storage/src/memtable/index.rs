@@ -33,6 +33,19 @@ pub(crate) struct Node {
     right: Option<Arc<Node>>,
 }
 
+/// One index key's postings, pinned to the tree snapshot they came from.
+/// Sorted by row position and unique (see [`MemtableIndex::insert`]).
+pub struct PostingList {
+    node: Arc<Node>,
+}
+
+impl PostingList {
+    /// The postings, in row order.
+    pub fn as_slice(&self) -> &[RowPosition] {
+        &self.node.values
+    }
+}
+
 /// Lock-free persistent red-black tree for memtable secondary indexing.
 ///
 /// Writers acquire a `Mutex` (serializes inserts — the memtable write path
@@ -86,6 +99,26 @@ impl MemtableIndex {
         Self::visit_in((**guard).as_ref(), key, visitor);
     }
 
+    /// The key's postings in row order, pinned: the returned list holds its
+    /// tree node, so it stays valid and unchanged however many inserts land
+    /// while the caller walks it. `None` when the key has no postings.
+    pub fn posting_list(&self, key: &IndexKey) -> Option<PostingList> {
+        let guard = self.root.load();
+        let mut node = (**guard).as_ref();
+        while let Some(n) = node {
+            node = match key.cmp(&n.key) {
+                std::cmp::Ordering::Less => n.left.as_ref(),
+                std::cmp::Ordering::Greater => n.right.as_ref(),
+                std::cmp::Ordering::Equal => {
+                    return Some(PostingList {
+                        node: Arc::clone(n),
+                    })
+                }
+            };
+        }
+        None
+    }
+
     /// Range query: returns all RowPositions for keys in [start, end] inclusive.
     pub fn range(&self, start: &IndexKey, end: &IndexKey) -> Vec<RowPosition> {
         let guard = self.root.load();
@@ -95,11 +128,65 @@ impl MemtableIndex {
     }
 
     /// In-order iterator over all (key, positions) pairs.
+    ///
+    /// This COPIES the whole index. Prefer [`visit_all`](Self::visit_all)
+    /// wherever the postings are consumed once, which is every caller on a
+    /// hot path: a flush writing its sidecar reads the tree exactly once and
+    /// has no use for a second copy of it.
     pub fn iter(&self) -> impl Iterator<Item = (IndexKey, Vec<RowPosition>)> {
         let guard = self.root.load();
         let mut entries = Vec::new();
         Self::collect_all((**guard).as_ref(), &mut entries);
         entries.into_iter()
+    }
+
+    /// Visit every posting in `(key, row)` order, copying nothing.
+    ///
+    /// The walk holds an explicit stack of the nodes on the current path —
+    /// O(log n) pointers, no recursion — and lends each entry to the visitor
+    /// in place. In-order traversal yields keys ascending, and a node's
+    /// postings are already sorted and unique (see [`insert`](Self::insert)),
+    /// so the sequence is exactly the order a sidecar wants.
+    ///
+    /// Returning `Break` stops the walk immediately, so a consumer that
+    /// fails part-way (a write error, a full page) does not pay for the rest.
+    pub fn visit_all(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let guard = self.root.load();
+        Self::walk((**guard).as_ref(), visitor)
+    }
+
+    /// Pin the tree as it stands now, for a consumer that will read it later.
+    /// Holding the root is the snapshot: nothing is copied.
+    pub fn pin(&self) -> IndexSnapshot {
+        IndexSnapshot {
+            root: (**self.root.load()).clone(),
+        }
+    }
+
+    /// The in-order walk both [`visit_all`](Self::visit_all) and a pinned
+    /// [`IndexSnapshot`] share.
+    fn walk(
+        root: Option<&Arc<Node>>,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut stack: Vec<&Arc<Node>> = Vec::new();
+        let mut next = root;
+        loop {
+            while let Some(node) = next {
+                stack.push(node);
+                next = node.left.as_ref();
+            }
+            let Some(node) = stack.pop() else {
+                return ControlFlow::Continue(());
+            };
+            for position in &node.values {
+                visitor(&node.key, position)?;
+            }
+            next = node.right.as_ref();
+        }
     }
 
     /// Take a snapshot of the current root for persistence guarantees.
@@ -153,9 +240,16 @@ impl MemtableIndex {
                     )
                 }
                 std::cmp::Ordering::Equal => {
-                    // Same key: append the new position to the values list
+                    // Same key: insert the position in row order, once. Ordered
+                    // postings let an index read merge this list with the
+                    // sidecars' and resume from a cursor holding nothing but
+                    // the previous row (t_50c8bc7d). A rewrite of a row posts
+                    // the same position again, which is not a second match.
+                    let Err(at) = n.values.binary_search(&pos) else {
+                        return n;
+                    };
                     let mut new_values = n.values.clone();
-                    new_values.push(pos);
+                    new_values.insert(at, pos);
                     Arc::new(Node {
                         color: n.color,
                         key: n.key.clone(),
@@ -354,6 +448,66 @@ impl MemtableIndex {
     }
 }
 
+/// One index's postings, pinned to the tree as it stood at a chosen instant.
+///
+/// The tree is persistent, so holding its root is the whole snapshot: no
+/// copying, and inserts that land afterwards build new nodes without
+/// disturbing these. That matters for a flush, which must write the sidecar
+/// for the rows it put in the SSTable and no others — pinning at the moment
+/// the memtable is swapped out fixes which rows those are, whatever the write
+/// path does next, and whenever the bytes are actually written.
+pub struct IndexSnapshot {
+    root: Option<Arc<Node>>,
+}
+
+impl IndexSnapshot {
+    /// Visit every pinned posting in `(key, row)` order, copying nothing.
+    pub fn visit_all(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        MemtableIndex::walk(self.root.as_ref(), visitor)
+    }
+
+    /// True when the snapshot holds no postings. Every node carries at least
+    /// one (`insert` is the only way to make one), so an absent root and an
+    /// empty index are the same thing.
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+}
+
+/// A pinned index writes its own sidecar, straight out of the tree.
+///
+/// The first error the writer reports stops the walk and is returned: a
+/// half-written sidecar is never published (the writer renames into place
+/// only on success), so a failure here leaves the previous file untouched.
+impl crate::index::sidecar::SidecarSource for IndexSnapshot {
+    fn visit(
+        &self,
+        visitor: &mut dyn FnMut(&IndexKey, &RowPosition) -> ferrosa_index::IndexResult<()>,
+    ) -> ferrosa_index::IndexResult<()> {
+        let mut failure = None;
+        // The walk's own `Break` carries nothing: the error it stopped for is
+        // in `failure`, which is what this returns.
+        let _stopped = self.visit_all(&mut |key, position| match visitor(key, position) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                failure = Some(error);
+                ControlFlow::Break(())
+            }
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        IndexSnapshot::is_empty(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +531,41 @@ mod tests {
         let results = index.lookup(&key);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], row);
+    }
+
+    /// A key's postings are kept in row order — (partition key, clustering)
+    /// — and each row once, however they were written. Ordered postings are
+    /// what let an index read merge its sources and resume from a cursor
+    /// without holding the result (t_50c8bc7d); a rewrite of the same row
+    /// must not post it twice.
+    #[test]
+    fn a_keys_postings_are_kept_in_row_order_and_unique() {
+        let index = MemtableIndex::new();
+        let key = IndexKey(b"tenant-a".to_vec());
+        for row in [
+            pos(b"pk3", b""),
+            pos(b"pk1", b"ck2"),
+            pos(b"pk2", b"ck1"),
+            pos(b"pk1", b"ck1"),
+            pos(b"pk1", b"ck2"),
+        ] {
+            index.insert(key.clone(), row);
+        }
+
+        let mut visited = Vec::new();
+        index.visit(&key, &mut |row| {
+            visited.push(row);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            visited,
+            vec![
+                pos(b"pk1", b"ck1"),
+                pos(b"pk1", b"ck2"),
+                pos(b"pk2", b"ck1"),
+                pos(b"pk3", b""),
+            ]
+        );
     }
 
     #[test]

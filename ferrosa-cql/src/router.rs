@@ -901,52 +901,55 @@ fn index_targets_a_materialized_column(
     false
 }
 
-/// Whether an index's build has finished, so a read may be served from it.
+/// Why an index cannot completely answer a read on this node, if it cannot.
 ///
-/// `CREATE INDEX` over data that already exists backfills asynchronously. Until
-/// that finishes the index holds only part of the table, and the engine knows
-/// it: every build is `mark_pending`-ed before it is submitted, so
-/// [`StorageEngine::index_is_current`] is false for exactly as long as the
-/// window lasts.
+/// Two conditions make a chosen index unable to answer in full, and both used
+/// to reach the client as a server error over a query a plain scan would have
+/// answered correctly:
 ///
-/// Serving a read from the index during that window returns the fraction built
-/// so far and reports it as the whole answer — 0 rows of 1, or 2374 of 2500,
-/// with nothing to distinguish it from a genuinely empty result. That is the
-/// same silent short answer that withholding a never-built index removed; this
-/// closes the transient case the permanent one left behind.
+///   * the local engine does not have it. The schema lists it, this node's
+///     table does not (a restart before partition-key indexes were reloaded,
+///     a build that never ran). Reads were refused, and that refusal reached
+///     ferrosa-memory as `Internal server error` on every entity stream, on
+///     `main` and on every open PR (t_12457d3e).
+///   * its backfill has not finished. `CREATE INDEX` over existing rows builds
+///     asynchronously, and until it completes the index covers part of the
+///     table. The engine knows: every build is `mark_pending`-ed before it is
+///     submitted. Reads served from it came back short — 0 rows of 1, or 2374
+///     of 2500 — indistinguishable from a genuinely empty result (t_edd3be70).
 ///
-/// The tracker is local, so it can only speak for this node's own SSTables. A
-/// coordinator fanning out to replicas has no such state for them, so the
-/// check applies only where the local engine is the whole picture — mirroring
-/// the keyed-partition consult, which makes the same distinction.
-fn index_build_has_finished(
+/// Neither is a reason to fail a read that carries its own scan license. The
+/// fail-loud ladder puts a VISIBLE fallback above an error: withhold the index
+/// from the planner, take the scan, say so at WARN. What must never happen is
+/// the third option — answering from a partial index as though it were whole.
+/// A query that licensed no scan has nothing correct to fall back to, and only
+/// that one is refused.
+///
+/// The currency half is judged from the local tracker, which speaks only for
+/// this node's SSTables, so it is consulted only where the local engine is the
+/// whole picture — mirroring the keyed-partition consult. Presence is checked
+/// everywhere: a coordinator that cannot answer from its own index gains
+/// nothing by trying (t_f29318c4 covers a replica whose build is behind).
+fn index_cannot_answer_completely(
     state: &SharedState,
     table_id: &ferrosa_storage::TableId,
     meta: &IndexMetadata,
-) -> bool {
+) -> Option<&'static str> {
     let write_path = state.write_path.load();
+    if !write_path.declares_index_locally(table_id, &meta.name) {
+        tracing::warn!(
+            index = %meta.name,
+            table = %table_id.table(),
+            "index NOT used: this node's table does not have it, though the schema              lists it. The query falls back to a full scan where one is licensed,              and is refused otherwise — an index that is not here cannot report              its absence as zero rows."
+        );
+        return Some("is not present on this node");
+    }
     let local_tracker_authoritative = matches!(
         &**write_path,
         WritePath::Direct(_) | WritePath::Pair(_) | WritePath::DegradedPair(_)
     );
-    if !local_tracker_authoritative {
-        return true;
-    }
-    // An index the tracker has never heard of is a different failure, and one
-    // that is already handled: the engine refuses to read an index it does not
-    // have, naming it, rather than answering from nothing (t_50c8bc7d). Leaving
-    // it to that path keeps a lost index loud instead of quietly downgrading it
-    // to a scan. Only an index the tracker IS following can be mid-build.
-    if state
-        .engine
-        .index_tracker()
-        .get_state(table_id.keyspace(), table_id.table(), &meta.name)
-        .is_none()
-    {
-        return true;
-    }
-    if state.engine.index_is_current(table_id, &meta.name) {
-        return true;
+    if !local_tracker_authoritative || state.engine.index_is_current(table_id, &meta.name) {
+        return None;
     }
     // Say it, for the same reason the never-built skip says it: the query still
     // answers, it just scans, and an unexplained latency step is a bad way to
@@ -959,7 +962,7 @@ fn index_build_has_finished(
          and is refused otherwise — a partial index must never answer as though \
          it were complete."
     );
-    false
+    Some("is still building and covers only part of the table")
 }
 
 /// Whether an index can serve an ordinary scalar `column = value` lookup.
@@ -1176,7 +1179,7 @@ async fn collect_index_rows_with_limit(
             )? {
                 rows.push(row);
                 #[cfg(test)]
-                INDEX_ROWS_VISITED.with(|count| count.set(count.get() + 1));
+                INDEX_ROWS_COLLECTED.with(|count| count.set(count.get() + 1));
                 if limit.is_some_and(|limit| rows.len() >= limit) {
                     return Ok(rows);
                 }
@@ -1558,6 +1561,15 @@ struct StreamResumeCursor {
 }
 
 impl StreamResumeCursor {
+    /// The row this cursor stands on — where an index read resumes, strictly
+    /// after it.
+    fn row_position(&self) -> ferrosa_index::RowPosition {
+        ferrosa_index::RowPosition {
+            partition_key: self.partition_key.clone(),
+            clustering_key: self.clustering_key.clone(),
+        }
+    }
+
     fn from_paging_state(paging_state: Option<&[u8]>) -> Result<Option<Self>, CqlError> {
         match paging_state {
             None => Ok(None),
@@ -1570,6 +1582,81 @@ impl StreamResumeCursor {
             }
         }
     }
+}
+
+/// An index read that cannot be served a page at a time.
+enum UnpagedIndexRead {
+    /// A builtin aggregate, folded as rows streamed: the one result row.
+    Aggregated(Vec<Option<CqlValue>>),
+    /// The whole match set, for shapes that still need it (see
+    /// [`read_unpaged_index_rows`]).
+    Rows(Vec<Vec<Option<CqlValue>>>),
+}
+
+/// Answer an index read whose projection is not a plain page
+/// ([`plain_projection_page_shape`]). Builtin aggregates (COUNT/SUM/AVG/MIN/
+/// MAX, no LIMIT) fold each row as it streams — O(1) state per aggregate. ORDER
+/// BY, DISTINCT and other function projections still collect the match set:
+/// an unpaged ORDER BY must return every row sorted in one result, so bounding
+/// it needs a server-side cursor over spilled sort runs (t_d4bb3cc8).
+async fn read_unpaged_index_rows(
+    s: &SelectStatement,
+    stream: ferrosa_cluster::write_path::PartitionResultStream,
+    row_context: PartitionRowContext<'_>,
+    predicate_context: SelectPredicateContext<'_>,
+) -> Result<UnpagedIndexRead, CqlError> {
+    if builtin_scalar_aggregate_stream_shape(s) && s.limit.is_none() {
+        let accs = build_agg_accumulators(s, row_context.all_col_names, row_context.all_col_types)?;
+        let row = fold_builtin_aggregates(stream, accs, row_context, predicate_context).await?;
+        return Ok(UnpagedIndexRead::Aggregated(row));
+    }
+    let rows = collect_index_rows_with_limit(stream, row_context, predicate_context, None).await?;
+    Ok(UnpagedIndexRead::Rows(rows))
+}
+
+/// A projection that can be answered one page at a time from a row-ordered
+/// stream: no ORDER BY (which needs every row to sort), no DISTINCT, no
+/// function projection (aggregates fold the whole result).
+fn plain_projection_page_shape(s: &SelectStatement) -> bool {
+    s.order_by.is_empty()
+        && !s.distinct
+        && !s
+            .columns
+            .iter()
+            .any(|column| matches!(column, SelectColumn::FunctionCall { .. }))
+}
+
+/// The client's page size, or the server default when the request is unpaged
+/// — an unpaged read still gets a bounded page and a cursor.
+fn request_page_size(ctx: &RequestContext<'_>) -> usize {
+    ctx.paging
+        .page_size
+        .and_then(|size| (size > 0).then_some(size as usize))
+        .unwrap_or_else(crate::paging::default_scan_page_size)
+}
+
+/// A literal `LIMIT n`, if the statement has one.
+fn literal_limit(s: &SelectStatement) -> Option<usize> {
+    s.limit
+        .as_ref()
+        .and_then(|limit| limit.as_literal())
+        .map(|limit| limit.max(0) as usize)
+}
+
+/// Test instrumentation: count the index rows a read pulls from its stream,
+/// so a test can prove a page stops pulling once it is full. A no-op outside
+/// tests.
+fn instrument_index_rows(
+    stream: ferrosa_cluster::write_path::PartitionResultStream,
+) -> ferrosa_cluster::write_path::PartitionResultStream {
+    #[cfg(test)]
+    let stream: ferrosa_cluster::write_path::PartitionResultStream =
+        Box::pin(stream.inspect(|item| {
+            if let Ok(partition) = item {
+                INDEX_ROWS_VISITED.with(|count| count.set(count.get() + partition.rows.len()));
+            }
+        }));
+    stream
 }
 
 /// One bounded page collected from a partition stream.
@@ -4941,10 +5028,15 @@ thread_local! {
     /// increments land on the test thread.
     static PK_LOOKUP_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
-    /// Test-only observability: rows accepted by the scalar secondary-index
-    /// stream. A LIMIT query must stop this consumer at its own limit instead
-    /// of draining the complete posting list first.
+    /// Test-only observability: rows pulled from a scalar secondary-index
+    /// stream (see `instrument_index_rows`). A LIMIT query or a full page must
+    /// stop pulling at its own bound instead of draining the posting list.
     static INDEX_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test-only observability: rows `collect_index_rows_with_limit` holds —
+    /// an index read that materializes its match set. Shapes that stream
+    /// (pages, aggregates) must leave it at zero.
+    static INDEX_ROWS_COLLECTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// Rows retained by the bounded partition suffix read before its one-row
     /// continuation probe is discarded.
@@ -5541,22 +5633,30 @@ async fn route_select_user_table(
         // query implies its predicate (see `query_implies_filter_predicate`);
         // otherwise it is withheld so the planner cannot unsoundly serve an
         // incomplete result from it.
-        // An index whose backfill is still in flight is withheld the same way,
-        // and separately, because the two cases end differently: a never-built
-        // index will never answer, so a scan is the only outcome, while a
-        // still-building one becomes usable in a moment — a caller with no scan
-        // license is told to wait rather than told nothing.
-        let (usable_indexes, indexes_still_building): (Vec<&IndexMetadata>, Vec<&IndexMetadata>) =
-            snap.indexes
-                .iter()
-                .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
-                .map(|(_, meta)| meta)
-                .filter(|meta| scalar_equality_index_is_usable(meta))
-                .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
-                .filter(|meta| {
-                    filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
-                })
-                .partition(|meta| index_build_has_finished(state, &table_id, meta));
+        // An index this node cannot answer from completely — absent here, or
+        // still building — is withheld the same way, and its reason is kept so
+        // a query with no scan license can be told which it was.
+        let mut withheld_indexes: Vec<(&str, &'static str)> = Vec::new();
+        let usable_indexes: Vec<&IndexMetadata> = snap
+            .indexes
+            .iter()
+            .filter(|((idx_ks, idx_tbl, _), _)| idx_ks == ks && idx_tbl == &s.table)
+            .map(|(_, meta)| meta)
+            .filter(|meta| scalar_equality_index_is_usable(meta))
+            .filter(|meta| index_targets_a_materialized_column(meta, table_meta))
+            .filter(|meta| {
+                filtered_index_is_usable(meta, &s.where_clauses, table_meta, ks, &state.schema)
+            })
+            .filter(
+                |meta| match index_cannot_answer_completely(state, &table_id, meta) {
+                    Some(reason) => {
+                        withheld_indexes.push((meta.name.as_str(), reason));
+                        false
+                    }
+                    None => true,
+                },
+            )
+            .collect();
         let planner_indexes: Vec<(String, Vec<String>)> = usable_indexes
             .iter()
             .map(|meta| (meta.name.clone(), meta.target_columns.clone()))
@@ -5578,24 +5678,23 @@ async fn route_select_user_table(
             &filtered_covered_columns,
         );
 
-        // Withholding a still-building index left nothing to serve this read,
-        // and the query never licensed the scan that would answer it correctly.
-        // Refuse, naming the index: the alternative is the partial answer this
-        // check exists to prevent, and a retry in a moment succeeds.
+        // Withholding left nothing to serve this read, and the query licensed
+        // no scan to fall back to. Refuse, naming each index and why: the
+        // alternative is the short answer the withholding exists to prevent,
+        // and for a build in flight a retry shortly after succeeds.
         if matches!(scan_plan, ScanPlan::FullScan)
             && !s.allow_filtering
-            && !indexes_still_building.is_empty()
+            && !withheld_indexes.is_empty()
         {
-            let names: Vec<&str> = indexes_still_building
+            let reasons = withheld_indexes
                 .iter()
-                .map(|meta| meta.name.as_str())
-                .collect();
+                .map(|(name, reason)| format!("'{name}' {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(CqlError::Invalid(format!(
-                "secondary index {} on {ks}.{} is still building and covers only part of \
-                 the table, so it cannot answer this query yet. Retry once the build \
-                 completes, or add ALLOW FILTERING to read the table by scan in the \
-                 meantime.",
-                names.join(", "),
+                "no secondary index on {ks}.{} can answer this query: {reasons}. Retry \
+                 once the index is available, or add ALLOW FILTERING to read the table \
+                 by scan in the meantime.",
                 s.table,
             )));
         }
@@ -5845,14 +5944,26 @@ async fn route_select_user_table(
                         &state.schema,
                     )?;
 
-                    // Stream the global index result through bounded-per-hop
-                    // storage/RPC channels; no materializing compatibility
-                    // API is involved.
-                    let index_stream = state
-                        .write_path
-                        .load()
-                        .index_read_stream(&table_id, index_name, &index_key)
-                        .await?;
+                    // The index result streams in row order from a cursor
+                    // (WritePath::index_read_stream), so a plain projection is
+                    // served one bounded page at a time and resumed after the
+                    // last row delivered — never collected whole and sliced by
+                    // offset, which rebuilt the result on every page
+                    // (t_50c8bc7d).
+                    let page_shape = !count_only_select && plain_projection_page_shape(s);
+                    let resume = if page_shape {
+                        StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?
+                    } else {
+                        None
+                    };
+                    let after = resume.as_ref().map(StreamResumeCursor::row_position);
+                    let index_stream = instrument_index_rows(
+                        state
+                            .write_path
+                            .load()
+                            .index_read_stream(&table_id, index_name, &index_key, after.as_ref())
+                            .await?,
+                    );
                     let row_context = PartitionRowContext {
                         all_col_names: &all_col_names,
                         all_col_types: &all_col_types,
@@ -5882,26 +5993,40 @@ async fn route_select_user_table(
                             paging_state: None,
                         });
                     }
-                    let can_stop_at_limit = s.order_by.is_empty()
-                        && !s.distinct
-                        && !s
-                            .columns
-                            .iter()
-                            .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
-                    collect_index_rows_with_limit(
-                        index_stream,
-                        row_context,
-                        predicate_context,
-                        can_stop_at_limit
-                            .then(|| {
-                                s.limit
-                                    .as_ref()
-                                    .and_then(|limit| limit.as_literal())
-                                    .map(|limit| limit.max(0) as usize)
-                            })
-                            .flatten(),
-                    )
-                    .await?
+                    if page_shape {
+                        let page = collect_filtered_page_from_partition_stream(
+                            index_stream,
+                            request_page_size(ctx),
+                            resume,
+                            row_context,
+                            predicate_context,
+                            literal_limit(s),
+                        )
+                        .await?;
+                        streamed_paging_state = Some(page.next_paging_state);
+                        page.rows
+                    } else {
+                        match read_unpaged_index_rows(
+                            s,
+                            index_stream,
+                            row_context,
+                            predicate_context,
+                        )
+                        .await?
+                        {
+                            UnpagedIndexRead::Aggregated(row) => {
+                                return Ok(SelectRawResult {
+                                    column_names: col_names.to_vec(),
+                                    column_types: col_types.to_vec(),
+                                    rows: vec![row],
+                                    keyspace: ks.to_string(),
+                                    table: s.table.clone(),
+                                    paging_state: None,
+                                });
+                            }
+                            UnpagedIndexRead::Rows(rows) => rows,
+                        }
+                    }
                 }
 
                 ScanPlan::IndexIntersection { ref indexes } => {
@@ -5914,11 +6039,24 @@ async fn route_select_user_table(
                             "IndexIntersection",
                         );
                     }
-                    // Consult all matched indexes through bounded streams. The
-                    // intersection helper retains only membership keys for the
-                    // non-primary indexes; the primary result remains lazy.
+                    // Every index stream is in row order, so the intersection
+                    // is a merge-join holding one head per index, paged from a
+                    // cursor like a single index read (t_50c8bc7d).
+                    let page_shape = !count_only_select && plain_projection_page_shape(s);
+                    let resume = if page_shape {
+                        StreamResumeCursor::from_paging_state(ctx.paging.paging_state.as_deref())?
+                    } else {
+                        None
+                    };
+                    let after = resume.as_ref().map(StreamResumeCursor::row_position);
                     let index_stream = read_index_intersection_stream(
-                        state, &table_id, indexes, s, table_meta, ks,
+                        state,
+                        &table_id,
+                        indexes,
+                        s,
+                        table_meta,
+                        ks,
+                        after.as_ref(),
                     )
                     .await?;
 
@@ -5952,26 +6090,40 @@ async fn route_select_user_table(
                         });
                     }
 
-                    let can_stop_at_limit = s.order_by.is_empty()
-                        && !s.distinct
-                        && !s
-                            .columns
-                            .iter()
-                            .any(|column| matches!(column, SelectColumn::FunctionCall { .. }));
-                    collect_index_rows_with_limit(
-                        index_stream,
-                        row_context,
-                        predicate_context,
-                        can_stop_at_limit
-                            .then(|| {
-                                s.limit
-                                    .as_ref()
-                                    .and_then(|limit| limit.as_literal())
-                                    .map(|limit| limit.max(0) as usize)
-                            })
-                            .flatten(),
-                    )
-                    .await?
+                    if page_shape {
+                        let page = collect_filtered_page_from_partition_stream(
+                            index_stream,
+                            request_page_size(ctx),
+                            resume,
+                            row_context,
+                            predicate_context,
+                            literal_limit(s),
+                        )
+                        .await?;
+                        streamed_paging_state = Some(page.next_paging_state);
+                        page.rows
+                    } else {
+                        match read_unpaged_index_rows(
+                            s,
+                            index_stream,
+                            row_context,
+                            predicate_context,
+                        )
+                        .await?
+                        {
+                            UnpagedIndexRead::Aggregated(row) => {
+                                return Ok(SelectRawResult {
+                                    column_names: col_names.to_vec(),
+                                    column_types: col_types.to_vec(),
+                                    rows: vec![row],
+                                    keyspace: ks.to_string(),
+                                    table: s.table.clone(),
+                                    paging_state: None,
+                                });
+                            }
+                            UnpagedIndexRead::Rows(rows) => rows,
+                        }
+                    }
                 }
 
                 ScanPlan::FullScan => {
@@ -10133,29 +10285,14 @@ fn resolve_index_type(
 
 /// Resolve the `method` index option to a storage [`VectorIndexMethod`].
 ///
-/// Absent or `'hnsw'` selects the full-precision HNSW sidecar (the default);
-/// `'hvq'` selects the hybrid vector quantization (quantized IVF / C-SPANN)
-/// artifact path. Any other value fails loudly rather than silently falling
-/// back to HNSW.
+/// Delegates to `ferrosa_storage::engine::resolve_vector_index_method` so the
+/// executing node and every replica (and the restart reload) pick the same
+/// artifact for the same options. Only the error type is ours.
 fn resolve_vector_index_method(
     options: &HashMap<String, String>,
 ) -> Result<ferrosa_storage::VectorIndexMethod, CqlError> {
-    use ferrosa_storage::VectorIndexMethod;
-    match options.get("method").map(String::as_str) {
-        None | Some("hnsw") => Ok(VectorIndexMethod::Hnsw),
-        Some("hvq") => Ok(VectorIndexMethod::QuantizedIvf),
-        Some(other) => Err(CqlError::Invalid(format!(
-            "unknown vector index method '{other}' (expected 'hnsw' or 'hvq')"
-        ))),
-    }
-}
-
-fn vector_dimension_from_column_type(column_type: &str) -> Option<usize> {
-    let lower = column_type.trim().to_ascii_lowercase();
-    let inner = lower.strip_prefix("vector<")?.strip_suffix('>')?;
-    inner
-        .rsplit_once(',')
-        .and_then(|(_, dim)| dim.trim().parse::<usize>().ok())
+    ferrosa_storage::engine::resolve_vector_index_method(options)
+        .map_err(|e| CqlError::Invalid(e.to_string()))
 }
 
 async fn route_create_index(
@@ -10284,7 +10421,7 @@ async fn route_create_index(
         if let Some((pos, column_type)) = col_info {
             let wire_result = if index_type == IndexType::Vector {
                 let dimension =
-                    vector_dimension_from_column_type(&column_type).ok_or_else(|| {
+                    ferrosa_common::schema::vector_dimension(&column_type).ok_or_else(|| {
                         CqlError::Invalid(format!(
                             "vector index target column '{}' has non-vector type '{}'",
                             target_col, column_type
@@ -11639,28 +11776,11 @@ async fn read_index_intersection_stream(
     s: &SelectStatement,
     table_meta: &TableMetadata,
     ks: &str,
+    after: Option<&ferrosa_index::RowPosition>,
 ) -> Result<ferrosa_cluster::write_path::PartitionResultStream, CqlError> {
-    let (primary_name, primary_column) = indexes.first().ok_or_else(|| {
-        CqlError::ServerError("index intersection requires at least one index".into())
-    })?;
-    let primary_wc = s
-        .where_clauses
-        .iter()
-        .find(|wc| wc.column == *primary_column && wc.op == ComparisonOp::Eq)
-        .ok_or_else(|| {
-            CqlError::Invalid("planner selected index but no matching WHERE clause found".into())
-        })?;
-    let primary_key = term_to_index_key(
-        &primary_wc.value,
-        primary_column,
-        table_meta,
-        ks,
-        &state.schema,
-    )?;
-
     let write_path = state.write_path.load();
-    let mut membership = Vec::with_capacity(indexes.len().saturating_sub(1));
-    for (index_name, index_column) in indexes.iter().skip(1) {
+    let mut streams = Vec::with_capacity(indexes.len());
+    for (index_name, index_column) in indexes {
         let index_wc = s
             .where_clauses
             .iter()
@@ -11672,37 +11792,115 @@ async fn read_index_intersection_stream(
             })?;
         let index_key =
             term_to_index_key(&index_wc.value, index_column, table_meta, ks, &state.schema)?;
-        let mut stream = write_path
-            .index_read_stream(table_id, index_name, &index_key)
-            .await?;
-        let mut keys = HashSet::new();
-        while let Some(partition) = stream.next().await {
-            keys.insert(partition?.key.key.as_bytes().to_vec());
-        }
-        membership.push(keys);
+        streams.push(
+            write_path
+                .index_read_stream(table_id, index_name, &index_key, after)
+                .await?,
+        );
     }
+    let mut streams = streams.into_iter();
+    let primary = streams.next().ok_or_else(|| {
+        CqlError::ServerError("index intersection requires at least one index".into())
+    })?;
+    Ok(intersect_index_streams_by_partition(
+        primary,
+        streams.collect(),
+    ))
+}
 
-    let primary = write_path
-        .index_read_stream(table_id, primary_name, &primary_key)
-        .await?;
-    let membership = Arc::new(membership);
-    let filtered = primary.filter_map(move |item| {
-        let membership = Arc::clone(&membership);
-        async move {
-            match item {
-                Ok(partition)
-                    if membership
-                        .iter()
-                        .all(|keys| keys.contains(partition.key.key.as_bytes())) =>
-                {
-                    Some(Ok(partition))
+/// Keep each row of the row-ordered `primary` index stream whose partition
+/// every other index stream also matched — a merge-join over streams in the
+/// same row order, holding one head per index.
+///
+/// Membership is per PARTITION, as before this became a stream: the row
+/// predicates still post-filter every kept row. An exhausted other stream
+/// ends the intersection (no later partition can be in all of them); any
+/// stream's error ends it with that error.
+fn intersect_index_streams_by_partition(
+    primary: ferrosa_cluster::write_path::PartitionResultStream,
+    others: Vec<ferrosa_cluster::write_path::PartitionResultStream>,
+) -> ferrosa_cluster::write_path::PartitionResultStream {
+    struct Join {
+        primary: ferrosa_cluster::write_path::PartitionResultStream,
+        others: Vec<ferrosa_cluster::write_path::PartitionResultStream>,
+        heads: Vec<Option<ferrosa_sstable::types::Partition>>,
+        done: bool,
+    }
+    let heads = others.iter().map(|_| None).collect();
+    let join = Join {
+        primary,
+        others,
+        heads,
+        done: false,
+    };
+    Box::pin(futures::stream::unfold(join, |mut join| async move {
+        while !join.done {
+            let partition = match join.primary.next().await? {
+                Ok(partition) => partition,
+                Err(error) => {
+                    join.done = true;
+                    return Some((Err(error), join));
                 }
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
+            };
+            match advance_heads_to_partition(&mut join.others, &mut join.heads, &partition).await {
+                Ok(PartitionMembership::InAll) => return Some((Ok(partition), join)),
+                Ok(PartitionMembership::Missing) => {}
+                Ok(PartitionMembership::Exhausted) => join.done = true,
+                Err(error) => {
+                    join.done = true;
+                    return Some((Err(error), join));
+                }
             }
         }
-    });
-    Ok(Box::pin(filtered))
+        None
+    }))
+}
+
+/// Whether a partition is matched by every other index of an intersection.
+enum PartitionMembership {
+    InAll,
+    Missing,
+    /// An other index has no rows left, so nothing further can be in all.
+    Exhausted,
+}
+
+/// Advance each other index's head to the first row at or past `partition`
+/// (row order), and report whether every head is IN it. Heads at the
+/// partition are kept, since the primary may hold several rows there.
+async fn advance_heads_to_partition(
+    others: &mut [ferrosa_cluster::write_path::PartitionResultStream],
+    heads: &mut [Option<ferrosa_sstable::types::Partition>],
+    partition: &ferrosa_sstable::types::Partition,
+) -> Result<PartitionMembership, ferrosa_cluster::error::ClusterError> {
+    let target = partition.key.key.as_bytes();
+    let mut in_all = true;
+    for (stream, head) in others.iter_mut().zip(heads.iter_mut()) {
+        loop {
+            if head.is_none() {
+                match stream.next().await {
+                    Some(item) => *head = Some(item?),
+                    None => return Ok(PartitionMembership::Exhausted),
+                }
+            }
+            let current = head
+                .as_ref()
+                .expect("head was just filled")
+                .key
+                .key
+                .as_bytes();
+            if current < target {
+                *head = None;
+                continue;
+            }
+            in_all &= current == target;
+            break;
+        }
+    }
+    Ok(if in_all {
+        PartitionMembership::InAll
+    } else {
+        PartitionMembership::Missing
+    })
 }
 
 fn term_to_index_key(
@@ -19903,8 +20101,17 @@ mod tests {
     /// before partition-key indexes were reloaded — the planner still selects
     /// it, and both live queries returned 0 over 101,848 rows. Either answer
     /// correctly or refuse; never zero.
+    ///
+    /// Of those two, answering correctly is the better one, and it is what a
+    /// query carrying ALLOW FILTERING has already licensed. Refusing it
+    /// instead took the outage from "wrong answer" to "no answer": every
+    /// ferrosa-memory PR and `main` went red on
+    /// `secondary index 'idx_entity_by_tenant' is not declared on this node's
+    /// table` reaching a client as a 500 (t_12457d3e). So the index is
+    /// withheld and the licensed scan runs — visibly, at WARN — and the
+    /// refusal is kept for the query that licensed nothing.
     #[tokio::test]
-    async fn a_tenant_index_the_engine_lost_is_refused_not_answered_empty() {
+    async fn a_tenant_index_the_engine_lost_falls_back_to_the_scan_it_licensed() {
         let (state, _dir) = setup();
         let auth = dev_auth();
         let ctx = RequestContext {
@@ -19981,20 +20188,44 @@ mod tests {
             .drop_index(&table_id, "idx_entity_by_tenant")
             .unwrap());
 
-        for cql in [&rows_cql, &count_cql] {
-            match route(&state, &ctx, crate::parser::parse(cql).unwrap()).await {
-                Err(err) => assert!(
-                    err.to_string().contains("idx_entity_by_tenant"),
-                    "the refusal must name the index: {err}"
-                ),
-                Ok(RouteResult::Result(buf)) => panic!(
-                    "`{cql}` answered from an index the engine does not have \
-                     ({} result rows) instead of refusing",
-                    extract_row_count(&buf),
-                ),
-                Ok(_) => panic!("`{cql}` returned a non-result"),
-            }
-        }
+        // Both queries carry ALLOW FILTERING, so the scan they licensed is the
+        // correct answer and the one the caller gets.
+        let rows = route(&state, &ctx, crate::parser::parse(&rows_cql).unwrap())
+            .await
+            .expect("a licensed scan answers a read the lost index cannot");
+        let RouteResult::Result(rows) = rows else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            extract_row_count(&rows),
+            3,
+            "every one of the tenant's rows is readable by scan; losing the index \
+             must cost speed, not rows"
+        );
+        let count = route(&state, &ctx, crate::parser::parse(&count_cql).unwrap())
+            .await
+            .expect("a licensed scan answers the count too");
+        let RouteResult::Result(count) = count else {
+            panic!("expected a count");
+        };
+        assert_eq!(
+            extract_first_bigint_value(&count),
+            3,
+            "tenant count by scan"
+        );
+
+        // Without a scan license there is nothing correct to fall back to, so
+        // the read is refused — naming the index, so the cause is legible.
+        let unlicensed =
+            format!("SELECT tenant_id FROM agent_memory.entity_store WHERE tenant_id = {tenant}");
+        let err = route(&state, &ctx, crate::parser::parse(&unlicensed).unwrap()).await;
+        let Err(err) = err else {
+            panic!("a read only the lost index could serve must not succeed");
+        };
+        assert!(
+            err.to_string().contains("idx_entity_by_tenant"),
+            "the refusal must name the index: {err}"
+        );
     }
 
     #[tokio::test]
@@ -22905,6 +23136,217 @@ mod tests {
         }
     }
 
+    /// t_c5bccc65: a tenant-wide read through the partition-key index streams
+    /// each session partition and pages through it, including pages that end
+    /// inside a partition, delivering every entity exactly once.
+    #[tokio::test]
+    async fn a_tenant_read_pages_through_partitions_split_across_pages() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, None, None);
+        for cql in [
+            "CREATE KEYSPACE tenant_pages WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE tenant_pages.entity_store (
+                tenant_id uuid, session_id uuid, entity_id int, name text,
+                PRIMARY KEY ((tenant_id, session_id), entity_id))",
+            "CREATE INDEX tenant_pages_by_tenant ON tenant_pages.entity_store (tenant_id)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let tenant = "9a5f8fbf-d842-4d30-8ea5-1aa931e618a8";
+        let other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let mut expected = std::collections::BTreeSet::new();
+        for (owner, session) in [(tenant, 1), (tenant, 2), (tenant, 3), (other, 4)] {
+            for entity in 0..5 {
+                if owner == tenant {
+                    expected.insert((session, entity));
+                }
+                let cql = format!(
+                    "INSERT INTO tenant_pages.entity_store (tenant_id, session_id, entity_id, name) \
+                     VALUES ({owner}, 00000000-0000-0000-0000-00000000000{session}, {entity}, 'e')"
+                );
+                route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let Statement::Select(select) = crate::parser::parse(&format!(
+            "SELECT session_id, entity_id FROM tenant_pages.entity_store WHERE tenant_id = {tenant}"
+        ))
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            // A page of 4 over partitions of 5 rows ends inside partitions.
+            let page_ctx = paging_ctx(&auth, &no_ks, Some(4), cursor.clone());
+            let page = route_select_raw(&state, &page_ctx, &select).await.unwrap();
+            assert!(page.rows.len() <= 4, "a page never exceeds its size");
+            for row in &page.rows {
+                let (Some(CqlValue::Uuid(session)), Some(CqlValue::Int(entity))) =
+                    (&row[0], &row[1])
+                else {
+                    panic!("expected (session_id, entity_id), got {row:?}");
+                };
+                let session = session.as_bytes()[15] as i32;
+                assert!(
+                    seen.insert((session, *entity)),
+                    "session {session} entity {entity} was delivered twice"
+                );
+            }
+            cursor = page.paging_state;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the walk must reach the end");
+        assert_eq!(
+            seen, expected,
+            "every entity of the tenant, each once, none of another tenant"
+        );
+    }
+
+    /// t_50c8bc7d: an aggregate over an index read folds each row as it
+    /// streams — O(1) state per aggregate — instead of collecting the match
+    /// set and aggregating the collection.
+    #[tokio::test]
+    async fn an_aggregate_over_an_index_read_folds_without_collecting_rows() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, None, None);
+        for cql in [
+            "CREATE KEYSPACE idx_agg WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_agg.edges (id int, seq int, tenant text, PRIMARY KEY (id, seq))",
+            "CREATE INDEX idx_agg_tenant ON idx_agg.edges (tenant)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        for seq in 0..25 {
+            let tenant = if seq % 5 == 0 { "tenant-b" } else { "tenant-a" };
+            let cql = format!(
+                "INSERT INTO idx_agg.edges (id, seq, tenant) VALUES (1, {seq}, '{tenant}')"
+            );
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let Statement::Select(select) = crate::parser::parse(
+            "SELECT max(seq), sum(seq) FROM idx_agg.edges WHERE tenant = 'tenant-a'",
+        )
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        INDEX_ROWS_COLLECTED.with(|count| count.set(0));
+        let result = route_select_raw(&state, &ctx, &select).await.unwrap();
+        let (max, sum): (i32, i32) = (0..25)
+            .filter(|seq| seq % 5 != 0)
+            .fold((0, 0), |(m, s), seq| (m.max(seq), s + seq));
+        assert_eq!(
+            result.rows,
+            vec![vec![Some(CqlValue::Int(max)), Some(CqlValue::Int(sum))]],
+            "aggregates over the tenant's rows"
+        );
+        assert_eq!(
+            INDEX_ROWS_COLLECTED.with(|count| count.get()),
+            0,
+            "an aggregate over an index read must fold rows, not collect them"
+        );
+    }
+
+    /// t_50c8bc7d: an index intersection streams too. It used to read every
+    /// non-primary index's matches into a set before the first row; now every
+    /// index stream is in row order, so the intersection is a merge-join
+    /// holding one head per index, and it pages from a cursor like a single
+    /// index read.
+    #[tokio::test]
+    async fn an_index_intersection_pages_every_match_once_from_a_cursor() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, None, None);
+        for cql in [
+            "CREATE KEYSPACE isect_pages WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE isect_pages.people (id int PRIMARY KEY, city text, dept text)",
+            "CREATE INDEX isect_pages_city ON isect_pages.people (city)",
+            "CREATE INDEX isect_pages_dept ON isect_pages.people (dept)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        // Every third row matches both; the rest match one index or neither.
+        let mut expected = std::collections::BTreeSet::new();
+        for id in 0..60 {
+            let city = if id % 3 == 2 { "LA" } else { "NYC" };
+            let dept = if id % 3 == 1 { "sales" } else { "eng" };
+            if city == "NYC" && dept == "eng" {
+                expected.insert(id);
+            }
+            let cql = format!(
+                "INSERT INTO isect_pages.people (id, city, dept) VALUES ({id}, '{city}', '{dept}')"
+            );
+            route(&state, &ctx, crate::parser::parse(&cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let Statement::Select(select) = crate::parser::parse(
+            "SELECT id FROM isect_pages.people WHERE city = 'NYC' AND dept = 'eng'",
+        )
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pages = 0;
+        for _ in 0..40 {
+            let page_ctx = paging_ctx(&auth, &no_ks, Some(3), cursor.clone());
+            let page = route_select_raw(&state, &page_ctx, &select).await.unwrap();
+            assert!(page.rows.len() <= 3, "a page never exceeds its size");
+            pages += 1;
+            for row in &page.rows {
+                let Some(CqlValue::Int(id)) = row[0] else {
+                    panic!("expected id, got {row:?}");
+                };
+                assert!(seen.insert(id), "row {id} was delivered twice");
+            }
+            cursor = page.paging_state;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the walk must reach the end");
+        assert_eq!(seen, expected, "exactly the rows matching both predicates");
+        assert!(pages > 1, "the fixture needs several pages");
+    }
+
+    /// Tripwire: the intersection holds one head per index, never a set of
+    /// matches.
+    #[test]
+    fn the_index_intersection_holds_no_result_sized_collection() {
+        let source = include_str!("router.rs");
+        let body = source
+            .split("async fn read_index_intersection_stream(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("read_index_intersection_stream must exist");
+        for forbidden in ["HashSet", "HashMap", ".collect::<Vec", "BTreeSet"] {
+            assert!(
+                !body.contains(forbidden),
+                "read_index_intersection_stream must not hold a result-sized `{forbidden}`"
+            );
+        }
+    }
+
     // ── Phase 3: per-type index-usage observability ─────────────────────────
     //
     // Each of the following tests proves, for one index type, BOTH that the
@@ -25402,6 +25844,111 @@ mod tests {
             10,
             "indexed LIMIT must stop the CQL consumer at the requested row count"
         );
+    }
+
+    /// t_50c8bc7d: an index read streams one bounded page at a time and
+    /// resumes from a cursor. It used to collect every matching row into a
+    /// `Vec` and slice it by offset, so each page rebuilt the whole result:
+    /// O(result) memory per request and O(result²) work to page through it.
+    #[tokio::test]
+    async fn an_index_read_streams_bounded_pages_and_resumes_from_a_cursor() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks: Option<String> = None;
+        let ctx = paging_ctx(&auth, &no_ks, None, None);
+        for cql in [
+            "CREATE KEYSPACE idx_pages WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE idx_pages.edges (id int, seq int, tenant text, PRIMARY KEY (id, seq))",
+            "CREATE INDEX edges_tenant ON idx_pages.edges (tenant)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+        let n = crate::paging::DEFAULT_SCAN_PAGE_SIZE as i32 + 3;
+        let table_id = TableId::new("idx_pages", "edges");
+        let rows: Vec<ferrosa_sstable::types::Row> = (0..n)
+            .map(|seq| ferrosa_sstable::types::Row {
+                clustering: encode_value(&CqlValue::Int(seq)),
+                cells: vec![(
+                    0,
+                    ferrosa_common::CellValue::live(
+                        encode_value(&CqlValue::Text("tenant-a".to_string())),
+                        1,
+                    ),
+                )],
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+            })
+            .collect();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            encode_value(&CqlValue::Int(1)),
+        ));
+        let mutations: Vec<ferrosa_storage::Mutation> = rows
+            .chunks(40)
+            .map(|chunk| {
+                ferrosa_storage::Mutation::new(
+                    table_id.keyspace.clone(),
+                    table_id.table.clone(),
+                    key.clone(),
+                    chunk.to_vec(),
+                    1,
+                )
+            })
+            .collect();
+        state.engine.write_atomic_batch(mutations).unwrap();
+
+        let query = "SELECT seq FROM idx_pages.edges WHERE tenant = 'tenant-a'";
+        let Statement::Select(select) = crate::parser::parse(query).unwrap() else {
+            panic!("expected SELECT");
+        };
+
+        // Unpaged: one bounded default page and a cursor, like a scan.
+        INDEX_ROWS_VISITED.with(|count| count.set(0));
+        let first = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            first.rows.len(),
+            crate::paging::DEFAULT_SCAN_PAGE_SIZE,
+            "an unpaged index read returns a bounded default page, not every match"
+        );
+        assert!(
+            first.paging_state.is_some(),
+            "more rows remain, so a cursor is required"
+        );
+        // A full page pulls one row past its end to learn a cursor is needed.
+        assert!(
+            INDEX_ROWS_VISITED.with(|count| count.get())
+                <= crate::paging::DEFAULT_SCAN_PAGE_SIZE + 1,
+            "the first page must stop pulling rows once it is full"
+        );
+
+        // Paged walk: each page pulls about a page of rows, and together they
+        // cover every row exactly once.
+        let page_size = 1_000;
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..(n as usize / page_size + 2) {
+            INDEX_ROWS_VISITED.with(|count| count.set(0));
+            let page_ctx = paging_ctx(&auth, &no_ks, Some(page_size as i32), cursor.clone());
+            let page = route_select_raw(&state, &page_ctx, &select).await.unwrap();
+            assert!(
+                INDEX_ROWS_VISITED.with(|count| count.get()) <= page_size + 1,
+                "a page visited {} rows; it must not rebuild the result to find its slice",
+                INDEX_ROWS_VISITED.with(|count| count.get())
+            );
+            for row in &page.rows {
+                let Some(CqlValue::Int(seq)) = row[0] else {
+                    panic!("expected seq, got {row:?}");
+                };
+                assert!(seen.insert(seq), "row {seq} was delivered twice");
+            }
+            cursor = page.paging_state;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the walk must reach the end");
+        assert_eq!(seen.len(), n as usize, "every matching row, each once");
     }
 
     // ── BUG-007: SOUNDS LIKE syntax parses ──────────────────────────────

@@ -111,6 +111,7 @@ impl StreamRangeReader for StaticReader {
         _table_id: &TableId,
         _index_name: &str,
         _index_key: &[u8],
+        _after: Option<&ferrosa_index::RowPosition>,
     ) -> ferrosa_common::Result<PartitionStream<'a>> {
         let items: Vec<ferrosa_common::Result<Partition>> =
             self.partitions.iter().cloned().map(Ok).collect();
@@ -481,6 +482,7 @@ fn restarted_tenant_node(
 async fn scatter_gather_tenant(
     nodes: Vec<Arc<ferrosa_storage::StorageEngine>>,
     tenant: u8,
+    after: Option<(u8, u8)>,
 ) -> Result<super::stream_consumer::StreamConsumeOutcome, StreamConsumeError> {
     const REQ_ID: u32 = 0x7E_7A_17;
     let router = Arc::new(StreamRouter::new());
@@ -493,8 +495,10 @@ async fn scatter_gather_tenant(
         index_name: Some(TENANT_INDEX.into()),
         index_key: Some(tenant_index_key(tenant)),
         projected_regular_ordinals: None,
-        start_key: None,
-        start_clustering: None,
+        // An index read resumes strictly AFTER the last row delivered: its
+        // partition key and clustering (empty here: no clustering columns).
+        start_key: after.map(|(t, s)| tenant_session_key(t, s).key.as_bytes().to_vec()),
+        start_clustering: after.map(|_| Vec::new()),
         max_chunks: 0,
     };
     let expected_done = nodes.len();
@@ -546,7 +550,7 @@ async fn a_tenant_read_scatter_gathers_every_nodes_tenant_index() {
         ),
     ];
 
-    let outcome = scatter_gather_tenant(nodes, TENANT_A)
+    let outcome = scatter_gather_tenant(nodes, TENANT_A, None)
         .await
         .expect("every node declares the tenant index, so the read must succeed");
 
@@ -579,7 +583,7 @@ async fn a_node_without_the_tenant_index_fails_the_read_rather_than_shortening_i
         tenant_node(dirs[2].path(), &[(TENANT_A, 5), (TENANT_A, 6)], true),
     ];
 
-    match scatter_gather_tenant(nodes, TENANT_A).await {
+    match scatter_gather_tenant(nodes, TENANT_A, None).await {
         Err(StreamConsumeError::TruncatedReplica { .. }) => {}
         Err(other) => panic!("expected the missing index to truncate a replica, got {other:?}"),
         Ok(outcome) => panic!(
@@ -588,4 +592,39 @@ async fn a_node_without_the_tenant_index_fails_the_read_rather_than_shortening_i
             outcome.partitions.len()
         ),
     }
+}
+
+/// The next page of a tenant-wide read: every node resumes its own index walk
+/// strictly after the cursor the coordinator hands it — the last row the
+/// previous page delivered — so no node repeats a row or skips one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_tenant_read_returns_only_rows_after_the_cursor_from_every_node() {
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let nodes = vec![
+        tenant_node(
+            dirs[0].path(),
+            &[(TENANT_A, 1), (TENANT_A, 5), (TENANT_B, 3)],
+            true,
+        ),
+        tenant_node(dirs[1].path(), &[(TENANT_A, 4), (TENANT_A, 8)], true),
+        restarted_tenant_node(dirs[2].path(), &[(TENANT_A, 2), (TENANT_A, 9)]),
+    ];
+
+    let outcome = scatter_gather_tenant(nodes, TENANT_A, Some((TENANT_A, 4)))
+        .await
+        .expect("every node declares the tenant index");
+
+    // Byte 21 of the composite key is the first byte of the session uuid.
+    let mut sessions: Vec<u8> = outcome
+        .partitions
+        .iter()
+        .map(|p| p.key.key.as_bytes()[21])
+        .collect();
+    sessions.sort_unstable();
+    assert_eq!(
+        sessions,
+        vec![5, 8, 9],
+        "a page resumed after session 4 must hold exactly the tenant's later \
+         sessions, from whichever node holds them"
+    );
 }

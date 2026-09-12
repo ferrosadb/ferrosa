@@ -184,7 +184,42 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index
   means schema and engine disagree, and an empty answer from one node is
-  unioned by the coordinator into a short result (ST-20).
+  unioned by the coordinator into a short result (ST-20). The same read also
+  refuses an index whose tracker is not `Current`: CREATE INDEX backfill and a
+  failed sidecar publish may leave only a subset of postings available, and
+  that subset must never be reported as a complete result. Callers can retry
+  after the bounded background build finishes.
+  Index postings are kept in row order — `(partition key, clustering)` — in
+  every source: `MemtableIndex` inserts each key's postings sorted and unique,
+  and sidecars are written in `(key, row)` order and re-sorted once at load,
+  which normalizes files from the previous key-only writer without a format
+  change. `read_by_index_each_after` k-way merges the sources
+  (`OrderedPostings`), drops a row two sources hold by comparing it with the
+  previous row, and resumes strictly after a cursor: memory is O(posting
+  sources), never O(result); `read_by_index_stream_after` is its async form.
+  A partition-key-column index is partition-granular (t_c5bccc65): every row
+  of a partition shares the value, so the write path, the backfill and the
+  eager builder post `(pk, [])` once per partition, and the walk streams that
+  partition's rows in `rows_per_fragment` chunks through the retried
+  `read_limited_rows[_from]` instead of one point read per row — one
+  tenant's 101,848 entities were ~101k single-row reads. A cursor reopens its
+  partition (the seek is inclusive at `(pk, [])`), and row postings left by
+  sidecars written before this change are skipped once their partition has
+  streamed whole.
+  **Sidecars are memory-mapped (t_7ac6b0e3).** A scalar sidecar (format v2:
+  sorted entries, an entry-offset table, a footer with a body CRC) is mapped,
+  validated in one pass at open, and binary-searched in place; entries decode
+  as borrowed `RowPositionRef`s, so a reader's heap does not grow with the
+  file and mapped pages are reclaimable page cache (gauges
+  `ferrosa_storage_index_sidecar_mapped_{bytes,files}`). Writers stream to a
+  temp file, fsync and rename, so a mapped file is never truncated; v1 files
+  are converted at open through the spilling `ExternalSorter`. Flush maps the
+  sidecars it writes; compaction installs its output's sidecars by k-way
+  merging the inputs' (postings are keys, so they stay valid); the index
+  scheduler installs each backfilled sidecar before marking the SSTable
+  indexed. Restore pulls every index artifact of a generation from S3
+  completely before publishing it, and the S3 sync uploads sidecars built
+  after their generation was already in the manifest.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
   searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
   **falls back to scanning any live SSTable whose sidecar is transiently

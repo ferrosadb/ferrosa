@@ -127,6 +127,20 @@ impl RestoreManager {
                     Self::generation_component_path(&table_dir, &entry.id, component).is_some()
                 });
                 if local_complete {
+                    let local_dir =
+                        Self::generation_component_path(&table_dir, &entry.id, "Data.db")
+                            .and_then(|data| data.parent().map(std::path::Path::to_path_buf));
+                    if let Some(local_dir) = local_dir {
+                        crate::engine::StorageEngine::pull_index_artifacts(
+                            self.store.as_ref(),
+                            &self.prefix,
+                            &hex,
+                            table_id_str,
+                            &entry.id,
+                            &local_dir,
+                        )
+                        .await?;
+                    }
                     total += 1;
                     continue;
                 }
@@ -188,6 +202,23 @@ impl RestoreManager {
                             "optional snapshot SSTable component absent in object store"
                         );
                     }
+                }
+
+                // The generation's index sidecars come down completely with it
+                // (t_7ac6b0e3): restoring SSTables without them left every
+                // scalar index empty over the restored data.
+                if let Err(e) = crate::engine::StorageEngine::pull_index_artifacts(
+                    self.store.as_ref(),
+                    &self.prefix,
+                    &hex,
+                    table_id_str,
+                    &entry.id,
+                    &staging_dir,
+                )
+                .await
+                {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                    return Err(e);
                 }
 
                 Self::sync_directory(&staging_dir).map_err(|e| {
@@ -563,6 +594,59 @@ mod tests {
         let mgr = RestoreManager::new(Arc::clone(&store), prefix);
         let count = mgr.download_sstables(&manifest, dir.path()).await.unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// t_7ac6b0e3: a snapshot restore pulls each generation's index sidecars
+    /// down with its components; it used to restore SSTables with no indexes.
+    #[tokio::test]
+    async fn download_sstables_pulls_index_sidecars() {
+        let store = make_store();
+        let prefix = "test";
+        let dir = tempfile::tempdir().unwrap();
+        let table_id = "ks.users";
+        let sstable_id = "0001";
+        for (component, bytes) in [
+            ("Data.db", b"data".as_slice()),
+            ("Partitions.db", b"partitions".as_slice()),
+            ("Rows.db", b"rows".as_slice()),
+            ("val_idx.sidecar", b"sidecar-image".as_slice()),
+        ] {
+            let hex = crate::upload::manager::hex_prefix_for(sstable_id);
+            let s3_path = crate::upload::manager::sstable_object_key(
+                prefix, &hex, table_id, sstable_id, component,
+            );
+            store
+                .put(
+                    &s3_path,
+                    PutPayload::from(bytes::Bytes::copy_from_slice(bytes)),
+                )
+                .await
+                .unwrap();
+        }
+        let mut manifest = Manifest::new();
+        manifest.add_sstable(
+            table_id,
+            ManifestEntry {
+                id: sstable_id.to_string(),
+                size: 4,
+                min_token: 0,
+                max_token: 0,
+                min_timestamp: 0,
+                max_timestamp: 0,
+            },
+        );
+
+        let mgr = RestoreManager::new(Arc::clone(&store), prefix);
+        assert_eq!(
+            mgr.download_sstables(&manifest, dir.path()).await.unwrap(),
+            1
+        );
+
+        let table_dir = dir.path().join(table_id);
+        let sidecar =
+            RestoreManager::generation_component_path(&table_dir, sstable_id, "val_idx.sidecar")
+                .expect("the generation's sidecar must be restored");
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"sidecar-image");
     }
 
     // ── Test 4: download_sstables downloads available files ──────────────

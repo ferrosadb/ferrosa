@@ -154,7 +154,11 @@ pub struct IndexKey(pub Vec<u8>);
 
 /// Position of a row within an SSTable, identified by partition key and
 /// optional clustering key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Ordered by `(partition_key, clustering_key)` bytes — the field order is
+/// the sort order. Index postings are kept in this order so an index read
+/// can merge its sources and resume after a row without holding the result.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RowPosition {
     /// Partition key bytes.
     pub partition_key: Vec<u8>,

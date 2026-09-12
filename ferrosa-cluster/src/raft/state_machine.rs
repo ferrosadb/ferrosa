@@ -1241,7 +1241,7 @@ impl FerrosStateMachine {
                     }
                 }
                 if let Some(schema) = &self.schema {
-                    if let Err(e) = schema.create_index_internal(index) {
+                    if let Err(e) = schema.create_index_internal(index.clone()) {
                         tracing::error!(%e, "Raft apply: schema.create_index_internal failed");
                     }
                 }

@@ -66,6 +66,10 @@ pub(crate) fn build_replicated_index(
                 target_col,
                 partition_key_columns: partition_key,
                 filter_predicate: idx.filter_predicate.clone(),
+                options: &idx.options,
+                // Live DDL: a CREATE INDEX can outrun its CREATE TABLE on this
+                // node, and the table is on its way.
+                defer_until_table_exists: true,
                 site,
             },
         )
@@ -1180,6 +1184,25 @@ mod tests {
         }
     }
 
+    /// `simple_table` plus a regular column, so an index has something to
+    /// target that is a stored cell.
+    fn indexable_table(ks: &str, name: &str) -> TableMetadata {
+        use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+        let mut table = simple_table(ks, name);
+        table.columns.insert(
+            "email".to_string(),
+            ColumnMetadata {
+                name: "email".to_string(),
+                kind: ColumnKind::Regular,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        table
+    }
+
     struct NoopListener;
     impl PeerEventListener for NoopListener {
         fn on_peer_connected(&self, _peer: PeerId) {}
@@ -1720,6 +1743,119 @@ mod tests {
     }
 
     // -- apply_direct tests for remaining DDL operation variants -----------
+
+    /// Applying a replicated CREATE INDEX must build the index HERE, not just
+    /// record it in schema.
+    ///
+    /// Only the node that executes the DDL used to call `engine.add_index`.
+    /// Every other node wrote the schema row and the system-table row and
+    /// stopped, so its table did not have the index while its schema said it
+    /// did. Reads on that node then refused the index outright:
+    ///
+    ///   secondary index 'idx_entity_by_tenant' is not declared on this node's
+    ///   table, so it cannot answer
+    ///
+    /// which is what took every ferrosa-memory entity stream down, on `main`
+    /// and on every open PR of that repo (t_12457d3e, t_1f2741a0). It looked
+    /// intermittent because a restart repairs it: `reload_indexes_from_system_schema`
+    /// rebuilds indexes from the system table at startup, so the index becomes
+    /// real at the next boot rather than at CREATE INDEX.
+    ///
+    /// `DropIndex` in this same match has always called `engine.drop_index`.
+    /// Create and drop now agree that the engine is part of applying index DDL.
+    #[tokio::test]
+    async fn direct_create_index_wires_the_index_into_this_nodes_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+        // `system_schema.indexes` must be a registered table before its rows
+        // can be written (bootstrap ordering).
+        engine.register_system_tables().unwrap();
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("idx_ks")))
+            .await
+            .unwrap();
+        ddl.execute(DdlOperation::CreateTable(Box::new(indexable_table(
+            "idx_ks", "people",
+        ))))
+        .await
+        .unwrap();
+
+        ddl.execute(DdlOperation::CreateIndex(ferrosa_schema::IndexMetadata {
+            keyspace: "idx_ks".to_string(),
+            table: "people".to_string(),
+            name: "people_email_idx".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["email".to_string()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        }))
+        .await
+        .unwrap();
+
+        let table_id = ferrosa_storage::TableId::new("idx_ks", "people");
+        assert!(
+            engine.declares_index(&table_id, "people_email_idx"),
+            "the schema records the index on this node, so this node's table must \
+             have it too — otherwise reads here refuse an index the cluster believes \
+             exists, and only a restart repairs it"
+        );
+    }
+
+    /// A partition-key column index must be wired as one.
+    ///
+    /// `storage_column_index` has no ordinal for a partition-key column — the
+    /// value lives in the key bytes — so the generic `add_index` cannot carry
+    /// it. This is the shape that started the whole line of work
+    /// (`entity_store` keyed `((tenant_id, session_id), entity_id)` with an
+    /// index on `tenant_id`), and the replicated path has to pick the same
+    /// variant the executing node picks.
+    #[tokio::test]
+    async fn direct_create_index_on_a_partition_key_column_is_wired_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let engine = test_storage(dir.path());
+        // `system_schema.indexes` must be a registered table before its rows
+        // can be written (bootstrap ordering).
+        engine.register_system_tables().unwrap();
+        let ddl = DdlPath::Direct {
+            schema: schema.clone(),
+            engine: engine.clone(),
+        };
+
+        ddl.execute(DdlOperation::CreateKeyspace(simple_keyspace("pk_idx_ks")))
+            .await
+            .unwrap();
+        ddl.execute(DdlOperation::CreateTable(Box::new(indexable_table(
+            "pk_idx_ks",
+            "entity_store",
+        ))))
+        .await
+        .unwrap();
+
+        ddl.execute(DdlOperation::CreateIndex(ferrosa_schema::IndexMetadata {
+            keyspace: "pk_idx_ks".to_string(),
+            table: "entity_store".to_string(),
+            name: "idx_by_id".to_string(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["id".to_string()],
+            filter_predicate: None,
+            options: HashMap::new(),
+        }))
+        .await
+        .unwrap();
+
+        let table_id = ferrosa_storage::TableId::new("pk_idx_ks", "entity_store");
+        assert!(
+            engine.declares_index(&table_id, "idx_by_id"),
+            "a partition-key column index must be wired through add_partition_key_index; \
+             wiring it as a cell index (or not at all) leaves it permanently empty"
+        );
+    }
 
     #[tokio::test]
     async fn direct_drop_keyspace_removes_from_schema() {

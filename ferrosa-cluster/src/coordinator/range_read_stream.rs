@@ -1760,15 +1760,20 @@ impl ClusterCoordinator {
     }
 
     /// Stream a global secondary-index lookup through the same bounded Bulk
-    /// protocol as range reads. Each node visits its local memtable/sidecar
-    /// postings incrementally; the coordinator forwards bounded partitions
-    /// through a bounded channel and deduplicates only row identities across
-    /// replicas. No node or RPC hop constructs the full hit set.
+    /// protocol as range reads, in row order, strictly after `after` when
+    /// given (the last row the previous page delivered).
+    ///
+    /// Each node walks its local memtable/sidecar postings in row order from
+    /// the cursor; the coordinator merges the node streams in row order and
+    /// drops a row more than one replica returned by comparing it with the
+    /// previous row. Memory is one head per node — no node, RPC hop or merge
+    /// holds the hit set or a set of rows seen (t_50c8bc7d).
     pub async fn coordinate_index_read_stream(
         &self,
         table_id: &TableId,
         index_name: &str,
         index_key: &ferrosa_index::IndexKey,
+        after: Option<&ferrosa_index::RowPosition>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let ring = self.ring.load();
         let remotes: Vec<(uuid::Uuid, String)> = ring
@@ -1782,10 +1787,16 @@ impl ClusterCoordinator {
             .collect();
         drop(ring);
 
+        let resume = after.map(|cursor| ScanResume {
+            key: ferrosa_common::key::DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
+                cursor.partition_key.clone(),
+            )),
+            clustering: Some(cursor.clustering_key.clone()),
+        });
         let mut sources: Vec<ClusterPartitionStream> = Vec::with_capacity(remotes.len() + 1);
         sources.push(Box::pin(
             self.storage
-                .read_by_index_stream(table_id, index_name, index_key)
+                .read_by_index_stream_after(table_id, index_name, index_key, after.cloned())
                 .map(|item| item.map_err(ClusterError::Storage)),
         ));
 
@@ -1797,11 +1808,9 @@ impl ClusterCoordinator {
                     host_id,
                     None,
                     Some((index_name, index_key_bytes)),
-                    None,
-                    // Index postings do not have a token/clustering cursor
-                    // that can safely resume the logical walk. Keep the wire
-                    // chunks bounded, but use one request so a window resume
-                    // cannot restart the posting list and duplicate rows.
+                    resume.as_ref(),
+                    // One request per page: the cursor, not a window resume,
+                    // is how an index walk continues.
                     0,
                 )
                 .await
@@ -1815,32 +1824,7 @@ impl ClusterCoordinator {
             }
         }
 
-        let (out_tx, out_rx) = mpsc::channel(STREAM_RECEIVER_BUFFER);
-        TaskPool::current("index-read-stream-dedup").spawn(async move {
-            let mut input = futures::stream::select_all(sources);
-            let mut seen = std::collections::HashSet::<(Vec<u8>, Vec<u8>)>::new();
-            while let Some(item) = input.next().await {
-                let mut partition = match item {
-                    Ok(partition) => partition,
-                    Err(error) => {
-                        let _ = out_tx.send(Err(error)).await;
-                        return;
-                    }
-                };
-                let partition_key = partition.key.key.as_bytes().to_vec();
-                partition
-                    .rows
-                    .retain(|row| seen.insert((partition_key.clone(), row.clustering.clone())));
-                if !partition.rows.is_empty() && out_tx.send(Ok(partition)).await.is_err() {
-                    return;
-                }
-            }
-        });
-
-        let stream = futures::stream::unfold(out_rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        Ok(Box::pin(stream))
+        Ok(merge_index_streams_in_row_order(sources))
     }
 
     async fn coordinate_range_read_stream_all_with_projection(
@@ -2124,12 +2108,185 @@ impl ClusterCoordinator {
     }
 }
 
+/// Row identity of one index hit: its partition key and first row's
+/// clustering (empty for a partition without clustering rows).
+fn index_hit_position(partition: &Partition) -> (&[u8], &[u8]) {
+    let clustering = partition
+        .rows
+        .first()
+        .map(|row| row.clustering.as_slice())
+        .unwrap_or_default();
+    (partition.key.key.as_bytes(), clustering)
+}
+
+/// Merge per-node index streams — each in row order — into one stream in row
+/// order, yielding each row once.
+///
+/// A row that several replicas return (RF > 1) surfaces from each of them
+/// consecutively and every copy after the first is dropped by comparison with
+/// the previous row, so no set of rows seen is kept: memory is one head per
+/// node plus the previous row's key. A node's error ends the merged stream
+/// with that error — its undelivered rows are never passed off as absent.
+pub(crate) fn merge_index_streams_in_row_order(
+    sources: Vec<ClusterPartitionStream>,
+) -> ClusterPartitionStream {
+    struct Merge {
+        sources: Vec<ClusterPartitionStream>,
+        heads: Vec<Option<Partition>>,
+        exhausted: Vec<bool>,
+        previous: Option<(Vec<u8>, Vec<u8>)>,
+        failed: bool,
+    }
+    let node_count = sources.len();
+    let merge = Merge {
+        sources,
+        heads: (0..node_count).map(|_| None).collect(),
+        exhausted: vec![false; node_count],
+        previous: None,
+        failed: false,
+    };
+    Box::pin(futures::stream::unfold(merge, |mut merge| async move {
+        if merge.failed {
+            return None;
+        }
+        loop {
+            // Every live node must show its next row before the smallest can
+            // be chosen; each fill pulls exactly one item.
+            for node in 0..merge.sources.len() {
+                if merge.heads[node].is_some() || merge.exhausted[node] {
+                    continue;
+                }
+                match merge.sources[node].next().await {
+                    Some(Ok(partition)) => merge.heads[node] = Some(partition),
+                    Some(Err(error)) => {
+                        merge.failed = true;
+                        return Some((Err(error), merge));
+                    }
+                    None => merge.exhausted[node] = true,
+                }
+            }
+            let smallest = merge
+                .heads
+                .iter()
+                .enumerate()
+                .filter_map(|(node, head)| head.as_ref().map(|p| (index_hit_position(p), node)))
+                .min()
+                .map(|(_, node)| node)?;
+            let partition = merge.heads[smallest]
+                .take()
+                .expect("the smallest head was just observed");
+            let (partition_key, clustering) = index_hit_position(&partition);
+            let position = (partition_key.to_vec(), clustering.to_vec());
+            if merge.previous.as_ref() == Some(&position) {
+                continue;
+            }
+            merge.previous = Some(position);
+            return Some((Ok(partition), merge));
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consistency::ConsistencyLevel as CL;
     use ferrosa_common::key::{DecoratedKey, PartitionKey};
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+
+    /// One index hit as a node streams it: a partition carrying one row.
+    fn index_hit(pk: &[u8], ck: &[u8]) -> crate::error::Result<Partition> {
+        Ok(Partition {
+            key: DecoratedKey::new(PartitionKey::new(pk.to_vec())),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: vec![Row {
+                clustering: ck.to_vec(),
+                cells: Vec::new(),
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            }],
+        })
+    }
+
+    fn replica(hits: Vec<crate::error::Result<Partition>>) -> ClusterPartitionStream {
+        Box::pin(futures::stream::iter(hits))
+    }
+
+    /// t_50c8bc7d: each node streams its index hits in row order, so the
+    /// coordinator can merge them in row order and drop an RF>1 replica's copy
+    /// of a row by comparing it with the previous row — holding one head per
+    /// node, not a set of every row seen. Row order is also what lets the next
+    /// page resume after the last row delivered.
+    #[tokio::test]
+    async fn index_streams_merge_in_row_order_and_drop_replica_copies() {
+        let merged = merge_index_streams_in_row_order(vec![
+            replica(vec![index_hit(b"a", b"1"), index_hit(b"c", b"1")]),
+            // A second replica of `a` and `c`, plus `b` of its own.
+            replica(vec![
+                index_hit(b"a", b"1"),
+                index_hit(b"b", b"1"),
+                index_hit(b"c", b"1"),
+            ]),
+            replica(vec![index_hit(b"a", b"2"), index_hit(b"d", b"")]),
+        ]);
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = merged
+            .map(|hit| {
+                let hit = hit.expect("no replica failed");
+                (
+                    hit.key.key.as_bytes().to_vec(),
+                    hit.rows[0].clustering.clone(),
+                )
+            })
+            .collect()
+            .await;
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"a".to_vec(), b"2".to_vec()),
+                (b"b".to_vec(), b"1".to_vec()),
+                (b"c".to_vec(), b"1".to_vec()),
+                (b"d".to_vec(), Vec::new()),
+            ],
+            "row order across nodes, each row once"
+        );
+    }
+
+    /// A node that fails mid-stream fails the merged read; the rows it did
+    /// not deliver must not be passed off as absent.
+    #[tokio::test]
+    async fn a_failing_replica_fails_the_merged_index_stream() {
+        let merged = merge_index_streams_in_row_order(vec![
+            replica(vec![index_hit(b"a", b"1"), index_hit(b"c", b"1")]),
+            replica(vec![
+                index_hit(b"b", b"1"),
+                Err(ClusterError::Internal("replica lost its index".into())),
+            ]),
+        ]);
+        let outcome: Vec<_> = merged.collect().await;
+        assert!(
+            outcome.iter().any(|item| item.is_err()),
+            "the failure must reach the reader: {outcome:?}"
+        );
+    }
+
+    /// Tripwire: the coordinator's index read may hold one head per node and
+    /// the previous row, nothing that grows with the result.
+    #[test]
+    fn the_coordinator_index_read_holds_no_result_sized_collection() {
+        let source = include_str!("range_read_stream.rs");
+        let body = source
+            .split("pub async fn coordinate_index_read_stream(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("coordinate_index_read_stream must exist");
+        for forbidden in ["HashSet", "select_all", ".collect::<Vec"] {
+            assert!(
+                !body.contains(forbidden),
+                "coordinate_index_read_stream must not use `{forbidden}`"
+            );
+        }
+    }
 
     #[test]
     fn channel_closed_before_done_is_retryable_read_timeout() {

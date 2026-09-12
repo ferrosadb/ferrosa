@@ -714,18 +714,112 @@ pub fn log_auth_warn_state(auth_enabled: bool, auth_warn: bool) {
     }
 }
 
+/// A sidecar built after its SSTable may already have been uploaded: the sync
+/// skips generations already in the manifest, so this one is uploaded on its
+/// own. In memory only — lost on a crash, in which case the next boot's index
+/// reload rebuilds the sidecar from the SSTable.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingIndexUpload {
+    table_id: TableId,
+    sstable_id: String,
+    path: std::path::PathBuf,
+}
+
+/// The scheduler's sidecar installer: map the sidecar it just wrote and put it
+/// into the owning table's live view (t_7ac6b0e3).
+fn sidecar_installer(
+    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
+) -> crate::index::scheduler::SidecarInstaller {
+    let tables = Arc::clone(tables);
+    let pending_uploads = Arc::clone(pending_uploads);
+    Arc::new(move |job, index_name, path| {
+        let reader = crate::index::sidecar::SidecarReader::open(path)
+            .map_err(|e| format!("map {}: {e}", path.display()))?;
+        let table_id = TableId::new(&job.table.0, &job.table.1);
+        let tables = tables.read();
+        let state = tables
+            .get(&table_id)
+            .ok_or_else(|| format!("table {table_id} is not registered"))?;
+        if !state
+            .store
+            .install_sidecar(&job.sstable_id, index_name, reader)
+        {
+            // Not a loss: the SSTable was compacted away while this built, and
+            // the compaction output carries its postings (merged at the swap).
+            tracing::info!(
+                %table_id,
+                index_name,
+                sstable = %job.sstable_id,
+                "index-build: SSTable left the view before its sidecar was installed"
+            );
+            return Ok(());
+        }
+        pending_uploads.lock().push(PendingIndexUpload {
+            table_id,
+            sstable_id: job.sstable_id.clone(),
+            path: path.to_path_buf(),
+        });
+        Ok(())
+    })
+}
+
 /// Build the index scheduler and tracker based on the engine configuration.
 ///
 /// Returns `(Option<IndexBuildScheduler>, Arc<IndexStateTracker>)`.
 /// When `index_backend` is `Off`, the scheduler is `None` and no worker
 /// threads are spawned.
+/// What a flush still owes an index for the generation it just wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushIndexAction {
+    /// The generation is already recorded as indexed for this index.
+    Nothing,
+    /// The flush wrote this index's postings for this generation itself, so
+    /// the generation is indexed the moment the flush returns.
+    AlreadyWritten,
+    /// This index had no memtable postings in the flush, so the generation's
+    /// rows are genuinely unindexed until a build reads them off the SSTable.
+    NeedsBuild,
+}
+
+/// Decide it for one index, given what the flush covered.
+///
+/// `TableStore::flush` writes and installs a sidecar for every index it held a
+/// memtable index for, from the postings that went into this very SSTable —
+/// before `flush` returns. Marking those generations pending anyway declares a
+/// complete index incomplete until the rebuild is dequeued, and readers now
+/// act on that: the storage layer refuses an index that is not current, and
+/// the planner withholds it and scans. So every flush opened a window in which
+/// the index it had just written was unusable.
+///
+/// An index the flush had no postings for is a different case and still needs
+/// the build: it exists on the table but nothing put its entries in the
+/// memtable index, so only a pass over the SSTable can fill it.
+fn flush_index_action(
+    covered_by_flush: &[String],
+    index_name: &str,
+    indexed_sstables: &HashSet<String>,
+    sstable_id: &str,
+) -> FlushIndexAction {
+    if indexed_sstables.contains(sstable_id) {
+        return FlushIndexAction::Nothing;
+    }
+    if covered_by_flush.iter().any(|name| name == index_name) {
+        return FlushIndexAction::AlreadyWritten;
+    }
+    FlushIndexAction::NeedsBuild
+}
+
 fn build_index_scheduler(
     config: &StorageEngineConfig,
+    tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
+    pending_uploads: &Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
 ) -> (
     Option<crate::index::IndexBuildScheduler>,
     Arc<crate::index::IndexStateTracker>,
 ) {
     let tracker = Arc::new(crate::index::IndexStateTracker::new());
+    let installer = sidecar_installer(tables, pending_uploads);
 
     let scheduler = match &config.index_backend {
         crate::index::IndexBackendConfig::Off => None,
@@ -737,6 +831,7 @@ fn build_index_scheduler(
                     Arc::clone(&tracker),
                     backend,
                     config.data_dir.clone(),
+                    Some(Arc::clone(&installer)),
                 ),
             )
         }
@@ -773,6 +868,7 @@ fn build_index_scheduler(
                     Arc::clone(&tracker),
                     backend,
                     config.data_dir.clone(),
+                    Some(Arc::clone(&installer)),
                 ),
             )
         }
@@ -891,11 +987,25 @@ fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes:
 /// `TableStore`. The commit log is shared across all tables.
 pub struct StorageEngine {
     config: StorageEngineConfig,
-    tables: RwLock<HashMap<TableId, TableState>>,
+    /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
+    tables: Arc<RwLock<HashMap<TableId, TableState>>>,
+    /// Sidecars the scheduler built and installed, whose generation may
+    /// already be in S3 — the next S3 sync uploads them (t_7ac6b0e3).
+    pending_index_uploads: Arc<parking_lot::Mutex<Vec<PendingIndexUpload>>>,
     pub(crate) commit_log: CommitLog,
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
+    /// Index registrations that arrived before their table was registered,
+    /// applied when it is — the same lazy shape as
+    /// `deferred_replay_mutations` directly above, for the same reason.
+    ///
+    /// A replicated `CREATE INDEX` can reach a node before that node has
+    /// registered the table. That is ordinary ordering, so it must neither
+    /// fail the DDL apply nor wait for a restart's reload to notice: both
+    /// leave the planner selecting an index this node cannot answer, for as
+    /// long as the node stays up.
+    deferred_index_builds: parking_lot::Mutex<HashMap<TableId, Vec<DeferredIndexBuild>>>,
     compaction_executor: CompactionExecutor,
     upload_manager: Option<UploadManager>,
     compaction_upload_manager: Option<UploadManager>,
@@ -1142,9 +1252,63 @@ pub struct IndexToRegister<'a> {
     /// The decoded predicate of a partial (`Filtered`) index. Required for
     /// that kind and ignored by every other.
     pub filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    /// The index's options as `CREATE INDEX` recorded them. Carries `method`
+    /// for a `Vector` index; without it this resolver could not pick between
+    /// the HNSW and quantized artifact paths and declined to build vectors at
+    /// all. Pass an empty map when the kind has no options.
+    pub options: &'a HashMap<String, String>,
+    /// What an unregistered table means at THIS call site.
+    ///
+    /// `true` for live DDL: a replicated `CREATE INDEX` can outrun the
+    /// `CREATE TABLE` apply on a node, the table is coming, and the
+    /// registration is held until it arrives.
+    ///
+    /// `false` for the restart reload, where every live table is registered
+    /// before indexes are replayed — so an absent table there is an ORPHAN
+    /// (a dangling `system_schema.indexes` row from a pre-cascade
+    /// `DROP TABLE`) whose table will never arrive. Deferring those would
+    /// grow a map keyed by dropped tables for the life of the process.
+    pub defer_until_table_exists: bool,
     /// Where the registration came from, for the log line — e.g.
     /// `"after restart"` or `"replicated DDL (raft apply)"`.
     pub site: &'a str,
+}
+
+/// An index registration held until its table is registered.
+///
+/// The owned twin of [`IndexToRegister`], which borrows so the common case
+/// allocates nothing.
+#[derive(Clone, Debug)]
+struct DeferredIndexBuild {
+    index_name: String,
+    index_type: ferrosa_index::IndexType,
+    target_col: String,
+    partition_key_columns: Vec<String>,
+    filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    options: HashMap<String, String>,
+    site: String,
+}
+
+/// Resolve the `method` index option to a [`VectorIndexMethod`].
+///
+/// Absent or `hnsw` selects the full-precision HNSW sidecar (the default);
+/// `hvq` selects the quantized IVF / C-SPANN artifact path. Any other value is
+/// an error rather than a silent fall back to HNSW — the two write different
+/// artifacts, so guessing produces an index that reads nothing.
+///
+/// Lives here, beside [`VectorIndexMethod`], because both the CQL router (on
+/// the node executing the DDL) and [`StorageEngine::register_index_in_engine`]
+/// (on every replica, and on restart) must reach the same answer.
+pub fn resolve_vector_index_method(
+    options: &HashMap<String, String>,
+) -> ferrosa_common::Result<VectorIndexMethod> {
+    match options.get("method").map(String::as_str) {
+        None | Some("hnsw") => Ok(VectorIndexMethod::Hnsw),
+        Some("hvq") => Ok(VectorIndexMethod::QuantizedIvf),
+        Some(other) => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "unknown vector index method '{other}' (expected 'hnsw' or 'hvq')"
+        ))),
+    }
 }
 
 /// Partition-key column NAMES per table, in key order, for
@@ -1334,14 +1498,23 @@ pub const FILTER_PREDICATE_OPTION_KEY: &str = "__filter_predicate";
 /// reserved [`FILTER_PREDICATE_OPTION_KEY`], or the stored predicate JSON does
 /// not deserialize — every one of which is a malformed Filtered index that the
 /// caller must reject rather than reload as an unfiltered index.
-fn decode_filter_predicate_from_options(row: &Row) -> Option<ferrosa_index::FilterPredicate> {
-    let options_json = cell_text(
+/// The index options recorded by `CREATE INDEX`, as stored in the
+/// `system_schema.indexes` row. An absent or unreadable blob is an empty map:
+/// every option this decodes has a documented default.
+fn decode_index_options(row: &Row) -> HashMap<String, String> {
+    cell_text(
         row,
         ferrosa_schema::system::persistence::INDEXES_COL_OPTIONS,
-    )?;
-    let options: HashMap<String, String> = serde_json::from_str(&options_json).ok()?;
-    let predicate_json = options.get(FILTER_PREDICATE_OPTION_KEY)?;
-    ferrosa_index::FilterPredicate::from_option_string(predicate_json)
+    )
+    .and_then(|json| serde_json::from_str(&json).ok())
+    .unwrap_or_default()
+}
+
+fn decode_filter_predicate_from_options(row: &Row) -> Option<ferrosa_index::FilterPredicate> {
+    let predicate_json = decode_index_options(row)
+        .get(FILTER_PREDICATE_OPTION_KEY)
+        .cloned()?;
+    ferrosa_index::FilterPredicate::from_option_string(&predicate_json)
 }
 
 /// Sidecar map type alias: index name -> sidecar reader for one SSTable.
@@ -2055,13 +2228,18 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         let engine = Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -2239,13 +2417,18 @@ impl StorageEngine {
             _ => None,
         };
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         Ok(Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -2336,9 +2519,10 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
-
-        let tables = RwLock::new(HashMap::new());
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
         if let Some(schemas) = Self::load_local_table_schemas(&config.data_dir)? {
             for schema in schemas {
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
@@ -2393,8 +2577,10 @@ impl StorageEngine {
         let engine = Self {
             config,
             tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -3082,6 +3268,9 @@ impl StorageEngine {
         }
 
         self.replay_deferred_mutations_for_table(&table_id);
+        // An index whose CREATE INDEX outran this CREATE TABLE is built now,
+        // not at the next restart.
+        self.drain_deferred_index_builds(&table_id);
 
         Ok(())
     }
@@ -3654,6 +3843,7 @@ impl StorageEngine {
             None
         };
 
+        let options = decode_index_options(row);
         self.register_index_in_engine(
             &table_id,
             IndexToRegister {
@@ -3665,6 +3855,8 @@ impl StorageEngine {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 filter_predicate,
+                options: &options,
+                defer_until_table_exists: false,
                 site: "after restart",
             },
         )
@@ -3708,33 +3900,33 @@ impl StorageEngine {
             target_col,
             partition_key_columns,
             filter_predicate,
+            options,
+            defer_until_table_exists,
             site,
         } = index;
-        // Vector indexes need their dimension + HNSW params to rebuild and use
-        // a dedicated path; skip them here. FullText is re-registered after
-        // column resolution below (and its sidecars rebuilt) — leaving it
-        // skipped made fts_match return EMPTY after a restart even though the
-        // on-disk FTI sidecars were intact, because the engine's
-        // fulltext_indexes map (column position) was never repopulated.
-        if matches!(index_type, ferrosa_index::IndexType::Vector) {
-            tracing::warn!(
-                keyspace = table_id.keyspace(),
-                table = table_id.table(),
-                index_name,
-                ?index_type,
-                "vector index needs a dedicated rebuild path — not built here {site}"
-            );
-            return Ok(false);
-        }
+        // FullText is re-registered after column resolution below (and its
+        // sidecars rebuilt) — leaving it skipped made fts_match return EMPTY
+        // after a restart even though the on-disk FTI sidecars were intact,
+        // because the engine's fulltext_indexes map (column position) was never
+        // repopulated.
+        //
+        // Vector used to be refused outright here, on the grounds that it
+        // "needs a dedicated rebuild path". That left every replica of a
+        // replicated CREATE INDEX, and every restart, without the index the
+        // planner selects — the same defect the rest of this function exists to
+        // close. It is resolved below with the other kinds, once the target
+        // column is known, because a vector's dimension is part of its type.
 
-        let Some(column_position) = self.regular_column_position(table_id, target_col) else {
-            // Not a regular column: it may be a CLUSTERING column index
+        let Some(column_position) = self.storage_cell_position(table_id, target_col) else {
+            // Not a stored cell: it may be a CLUSTERING column index
             // (t_430c4188), re-registered through its own path so restart does
             // not silently drop it.
             if let Some(component) = self.clustering_column_position(table_id, target_col) {
                 if matches!(
                     index_type,
-                    ferrosa_index::IndexType::Filtered | ferrosa_index::IndexType::FullText
+                    ferrosa_index::IndexType::Filtered
+                        | ferrosa_index::IndexType::FullText
+                        | ferrosa_index::IndexType::Vector
                 ) {
                     tracing::warn!(
                         keyspace = table_id.keyspace(),
@@ -3791,20 +3983,88 @@ impl StorageEngine {
                 );
                 return Ok(true);
             }
-            // Debug, not warn: this is the per-orphan case (dangling
-            // registration from a pre-cascade DROP TABLE) that used to churn
-            // one warn per orphan on every boot. The caller emits one summary
-            // warn with the skipped count and bumps
+            // The table is not registered HERE yet. That is ordinary ordering
+            // — a replicated CREATE INDEX can outrun the CREATE TABLE apply on
+            // a given node — so hold the registration and complete it when the
+            // table arrives. Failing the DDL would escalate a normal race, and
+            // waiting for a restart's reload would make a restart load-bearing
+            // for correctness.
+            if defer_until_table_exists && !self.tables.read().contains_key(table_id) {
+                self.defer_index_build(
+                    table_id,
+                    DeferredIndexBuild {
+                        index_name: index_name.to_string(),
+                        index_type,
+                        target_col: target_col.to_string(),
+                        partition_key_columns: partition_key_columns.to_vec(),
+                        filter_predicate,
+                        options: options.clone(),
+                        site: site.to_string(),
+                    },
+                );
+                return Ok(false);
+            }
+            // The table IS registered and the column is not in it. Debug, not
+            // warn: this is the per-orphan case (dangling registration from a
+            // pre-cascade DROP TABLE) that used to churn one warn per orphan on
+            // every boot. The caller emits one summary warn with the skipped
+            // count and bumps
             // `ferrosa_storage_index_reload_skipped_rows_total`.
             tracing::debug!(
                 keyspace = table_id.keyspace(),
                 table = table_id.table(),
                 index_name,
                 target_col,
-                "cannot resolve index target column to a position — table unregistered or column missing"
+                "cannot resolve index target column to a position — the table is \
+                 registered and has no such column"
             );
             return Ok(false);
         };
+
+        // Vector: the artifact is chosen by the `method` option, and the
+        // dimension is carried by the column's own type. The engine spells that
+        // type the marshal way (`VectorType(FloatType,3)`) and the CQL side
+        // spells it `vector<float, 3>`; `vector_dimension` reads both, so this
+        // path and `route_create_index` cannot disagree about the same column.
+        //
+        // A target that carries no dimension is declined, not built: the
+        // artifact would be meaningless, and building it would leave an index
+        // that answers nothing while the planner keeps selecting it.
+        if matches!(index_type, ferrosa_index::IndexType::Vector) {
+            let column_type = self.column_type_name(table_id, target_col);
+            let Some(dimension) = column_type
+                .as_deref()
+                .and_then(ferrosa_common::schema::vector_dimension)
+            else {
+                tracing::warn!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name,
+                    target_col,
+                    column_type = column_type.as_deref().unwrap_or("<unknown>"),
+                    "vector index NOT built {site}: its target column declares no \
+                     vector dimension, so there is no artifact to build"
+                );
+                return Ok(false);
+            };
+            let method = resolve_vector_index_method(options)?;
+            self.add_vector_index_with_method(
+                table_id,
+                index_name,
+                column_position,
+                dimension,
+                method,
+            )?;
+            tracing::info!(
+                keyspace = table_id.keyspace(),
+                table = table_id.table(),
+                index_name,
+                dimension,
+                ?method,
+                "registered vector index {site}"
+            );
+            return Ok(true);
+        }
 
         // FullText: repopulate the engine's fulltext_indexes map (so fts_match
         // can resolve the column and read the on-disk FTI sidecars / scan
@@ -3865,16 +4125,129 @@ impl StorageEngine {
         Ok(true)
     }
 
-    /// Position of `column_name` within a registered table's regular columns,
-    /// matching the ordinal convention used by the CREATE INDEX wire path.
-    fn regular_column_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
+    /// The cell position the WRITE path stores `column_name` at, or `None` if
+    /// it is not a cell (a partition-key or clustering column, which are
+    /// encoded in the key and have their own index families).
+    ///
+    /// This is one index space, defined by [`TableSchema`] and implemented by
+    /// `memtable::validate_row_against_schema`: statics occupy
+    /// `0..static_columns.len()`, regulars follow at `static_columns.len()..`.
+    /// `TableMetadata::storage_column_index` is the same space computed from
+    /// the schema side, and is what `route_create_index` registers on the node
+    /// that executes the DDL.
+    ///
+    /// Its predecessor, `regular_column_position`, returned the ordinal WITHIN
+    /// `regular_columns` and never added the static offset, while its doc
+    /// comment claimed to match the wire path. On a table with statics every
+    /// index it registered pointed at the wrong cell, silently — the index was
+    /// declared, so nothing reported a problem and reads decoded a different
+    /// column's bytes. It went unseen because every schema helper in this
+    /// file's tests declares no static columns.
+    /// Hold an index registration until its table is registered.
+    ///
+    /// Loud, because the index is declared in the cluster's schema and this
+    /// node cannot answer it yet: the planner may route a read here in the
+    /// meantime, and the reader's scan fallback is what makes that survivable
+    /// rather than correct.
+    fn defer_index_build(&self, table_id: &TableId, build: DeferredIndexBuild) {
+        let mut deferred = self.deferred_index_builds.lock();
+        let queued = deferred.entry(table_id.clone()).or_default();
+        if queued.iter().any(|b| b.index_name == build.index_name) {
+            return;
+        }
+        tracing::info!(
+            keyspace = table_id.keyspace(),
+            table = table_id.table(),
+            index_name = %build.index_name,
+            site = %build.site,
+            "index build DEFERRED: its table is not registered on this node yet. \
+             It will be built when the table is registered — not at the next restart."
+        );
+        queued.push(build);
+    }
+
+    /// Build every index that was waiting for `table_id` to exist.
+    ///
+    /// Called immediately after a table is registered. A build that fails here
+    /// is reported against the index by name; it is not retried, because a
+    /// registered table with a resolvable column that still cannot take an
+    /// index is a real failure rather than an ordering one.
+    fn drain_deferred_index_builds(&self, table_id: &TableId) {
+        let queued = {
+            let mut deferred = self.deferred_index_builds.lock();
+            deferred.remove(table_id).unwrap_or_default()
+        };
+        for build in queued {
+            let outcome = self.register_index_in_engine(
+                table_id,
+                IndexToRegister {
+                    index_name: &build.index_name,
+                    index_type: build.index_type,
+                    target_col: &build.target_col,
+                    partition_key_columns: &build.partition_key_columns,
+                    filter_predicate: build.filter_predicate.clone(),
+                    options: &build.options,
+                    defer_until_table_exists: false,
+                    site: "deferred until its table was registered",
+                },
+            );
+            match outcome {
+                Ok(true) => tracing::info!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index built once its table was registered"
+                ),
+                Ok(false) => tracing::warn!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index still NOT built after its table was registered \
+                     — this node holds an index its schema declares and its table \
+                     does not have"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name = %build.index_name,
+                    "deferred index FAILED to build after its table was registered"
+                ),
+            }
+        }
+    }
+
+    /// The declared marshal type of a table's column, from any column family.
+    ///
+    /// A vector's dimension is part of its type, so the only way to rebuild the
+    /// artifact is to read the type back out of the registered schema.
+    fn column_type_name(&self, table_id: &TableId, column_name: &str) -> Option<String> {
         let tables = self.tables.read();
-        let state = tables.get(table_id)?;
-        state
-            .schema
+        let schema = &tables.get(table_id)?.schema;
+        schema
+            .static_columns
+            .iter()
+            .chain(schema.regular_columns.iter())
+            .chain(schema.clustering_columns.iter())
+            .find(|c| c.name == column_name)
+            .map(|c| c.type_name.clone())
+    }
+
+    fn storage_cell_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
+        let tables = self.tables.read();
+        let schema = &tables.get(table_id)?.schema;
+        if let Some(position) = schema
+            .static_columns
+            .iter()
+            .position(|c| c.name == column_name)
+        {
+            return Some(position);
+        }
+        schema
             .regular_columns
             .iter()
             .position(|c| c.name == column_name)
+            .map(|position| position + schema.static_columns.len())
     }
 
     /// Position of `column_name` within a registered table's CLUSTERING
@@ -6760,9 +7133,10 @@ impl StorageEngine {
         }
     }
 
-    /// Visit a secondary-index result one partition at a time. The callback
-    /// may stop the scan, allowing paging and cancellation to reach the index
-    /// reader without first building a `Vec` of all postings or partitions.
+    /// Visit a secondary-index result one partition at a time, in row order.
+    /// The callback may stop the scan, allowing paging and cancellation to
+    /// reach the index reader without first building a `Vec` of all postings
+    /// or partitions. See [`Self::read_by_index_each_after`].
     pub fn read_by_index_each(
         &self,
         table_id: &TableId,
@@ -6770,11 +7144,34 @@ impl StorageEngine {
         key: &ferrosa_index::IndexKey,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> ferrosa_common::Result<()> {
+        self.read_by_index_each_after(table_id, index_name, key, None, visitor)
+    }
+
+    /// Visit a secondary-index result in row order — `(partition key,
+    /// clustering)` — strictly after `after` when given, so a page can resume
+    /// where the previous one stopped. O(posting sources) memory; see
+    /// `TableStore::read_by_index_each_after`.
+    pub fn read_by_index_each_after(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        after: Option<&ferrosa_index::RowPosition>,
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
+        if !self.index_is_current(table_id, index_name) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "secondary index '{index_name}' on {table_id} is not current; refusing to return \
+                 incomplete results while index backfill is pending or failed"
+            )));
+        }
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
-        state.store.read_by_index_each(index_name, key, visitor)
+        state
+            .store
+            .read_by_index_each_after(index_name, key, after, visitor)
     }
 
     /// Open a bounded asynchronous stream over a secondary-index result.
@@ -6788,6 +7185,21 @@ impl StorageEngine {
     ) -> std::pin::Pin<
         Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
     > {
+        self.read_by_index_stream_after(table_id, index_name, key, None)
+    }
+
+    /// [`Self::read_by_index_stream`] resumed strictly after `after`: the
+    /// stream yields rows in row order, so the next page of an index read is
+    /// the stream opened after the last row the previous page delivered.
+    pub fn read_by_index_stream_after(
+        self: &Arc<Self>,
+        table_id: &TableId,
+        index_name: &str,
+        key: &ferrosa_index::IndexKey,
+        after: Option<ferrosa_index::RowPosition>,
+    ) -> std::pin::Pin<
+        Box<dyn futures::stream::Stream<Item = ferrosa_common::Result<Partition>> + Send>,
+    > {
         const STREAM_BUFFER: usize = 4;
         let table_id = table_id.clone();
         let index_name = index_name.to_string();
@@ -6796,13 +7208,16 @@ impl StorageEngine {
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BUFFER);
 
         tokio::task::spawn_blocking(move || {
-            let result =
-                engine.read_by_index_each(&table_id, &index_name, &key, &mut |partition| match tx
-                    .blocking_send(Ok(partition))
-                {
+            let result = engine.read_by_index_each_after(
+                &table_id,
+                &index_name,
+                &key,
+                after.as_ref(),
+                &mut |partition| match tx.blocking_send(Ok(partition)) {
                     Ok(()) => std::ops::ControlFlow::Continue(()),
                     Err(_) => std::ops::ControlFlow::Break(()),
-                });
+                },
+            );
             if let Err(error) = result {
                 let _ = tx.blocking_send(Err(error));
             }
@@ -7706,6 +8121,7 @@ impl StorageEngine {
                         },
                     ))
                     .collect::<Vec<_>>();
+                let written_by_flush = state.store.indexes_written_by_last_flush();
                 for (index_name, col_pos, clustering_source, partition_key_source) in index_sources
                 {
                     let tracker_state = self.index_tracker.get_state(
@@ -7716,32 +8132,53 @@ impl StorageEngine {
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
                         let sstable_id = format!("{gen}");
-                        if !idx_state.indexed_sstables.contains(&sstable_id) {
-                            self.index_tracker.mark_pending(
-                                table_id.keyspace(),
-                                table_id.table(),
-                                &index_name,
-                                &sstable_id,
-                                0,
-                            );
-                            match eager_index_build_job(
-                                &state.store,
-                                table_id,
-                                sstable_id,
-                                &index_name,
-                                col_pos,
-                                clustering_source,
-                                partition_key_source,
-                            ) {
-                                Ok(job) => {
-                                    if let Err(e) = scheduler.submit(job) {
-                                        tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                        match flush_index_action(
+                            &written_by_flush,
+                            &index_name,
+                            &idx_state.indexed_sstables,
+                            &sstable_id,
+                        ) {
+                            FlushIndexAction::Nothing => {}
+                            FlushIndexAction::AlreadyWritten => {
+                                // The flush wrote this index's sidecar for this
+                                // generation from the memtable index that made
+                                // the SSTable. Record it as indexed rather than
+                                // queueing a rebuild, so no reader sees a
+                                // complete index reported as pending.
+                                self.index_tracker.mark_indexed(
+                                    table_id.keyspace(),
+                                    table_id.table(),
+                                    &index_name,
+                                    &sstable_id,
+                                );
+                            }
+                            FlushIndexAction::NeedsBuild => {
+                                self.index_tracker.mark_pending(
+                                    table_id.keyspace(),
+                                    table_id.table(),
+                                    &index_name,
+                                    &sstable_id,
+                                    0,
+                                );
+                                match eager_index_build_job(
+                                    &state.store,
+                                    table_id,
+                                    sstable_id,
+                                    &index_name,
+                                    col_pos,
+                                    clustering_source,
+                                    partition_key_source,
+                                ) {
+                                    Ok(job) => {
+                                        if let Err(e) = scheduler.submit(job) {
+                                            tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                                        }
                                     }
+                                    Err(e) => tracing::error!(
+                                        %e, %index_name,
+                                        "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
+                                    ),
                                 }
-                                Err(e) => tracing::error!(
-                                    %e, %index_name,
-                                    "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
-                                ),
                             }
                         }
                     }
@@ -7974,12 +8411,27 @@ impl StorageEngine {
                         state.store.advance_gen_past(gen_num);
                     }
                     let pre_swap_count = state.store.sstable_count();
+                    // The output carries its inputs' index postings (t_7ac6b0e3):
+                    // swapping it in with no sidecars left every scalar index
+                    // short of the compacted rows until a restart. A merge that
+                    // fails leaves the inputs live rather than the index short.
+                    let output_sidecars = match state.store.merge_sidecars_for_compaction(
+                        &input_id_paths,
+                        dir,
+                        gen,
+                    ) {
+                        Ok(sidecars) => sidecars,
+                        Err(e) => {
+                            tracing::error!(%e, %table_id, "compaction: output sidecars could not be built; keeping the inputs");
+                            continue;
+                        }
+                    };
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
                         output.path.clone(),
                         reader,
-                        std::collections::HashMap::new(),
+                        output_sidecars,
                     ) {
                         tracing::error!(%e, "compaction: swap failed");
                         continue;
@@ -9112,6 +9564,20 @@ impl StorageEngine {
 
     /// Returns true when the named index is registered and its build tracker
     /// has no known pending or failed work.
+    /// Test-only: see `TableStore::sidecar_backings_for_test`.
+    #[cfg(test)]
+    pub(crate) fn sidecar_backings_for_test(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Vec<bool> {
+        self.tables
+            .read()
+            .get(table_id)
+            .map(|state| state.store.sidecar_backings_for_test(index_name))
+            .unwrap_or_default()
+    }
+
     pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
         self.index_tracker
             .is_current(table_id.keyspace(), table_id.table(), index_name)
@@ -9477,6 +9943,9 @@ impl StorageEngine {
             }
         }
 
+        self.upload_pending_index_sidecars(upload_mgr, &manifest)
+            .await;
+
         if uploaded > 0 {
             // Save updated manifest — use CAS if supported, unconditional otherwise.
             let phase_start = Instant::now();
@@ -9498,6 +9967,64 @@ impl StorageEngine {
         }
 
         Ok(uploaded)
+    }
+
+    /// Upload the sidecars the index scheduler built for generations already
+    /// in the manifest (t_7ac6b0e3). A generation not yet in the manifest
+    /// takes its sidecars along in its own upload, which scans every
+    /// `{gen}-*` file. A sidecar that fails to upload is kept for the next
+    /// sync, and said so.
+    async fn upload_pending_index_sidecars(
+        &self,
+        upload_mgr: &crate::upload::UploadManager,
+        manifest: &crate::manifest::Manifest,
+    ) {
+        let pending = std::mem::take(&mut *self.pending_index_uploads.lock());
+        let mut retry = Vec::new();
+        for item in pending {
+            let table = item.table_id.to_string();
+            let in_manifest = manifest
+                .sstables
+                .get(&table)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.id == item.sstable_id));
+            if !in_manifest || !item.path.exists() {
+                continue;
+            }
+            let Some(name) = item
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let task = crate::upload::UploadTask::SSTable {
+                table_id: table.clone(),
+                sstable_id: item.sstable_id.clone(),
+                files: vec![crate::upload::manager::SstableComponentFile::new(
+                    name, &item.path,
+                )],
+                on_complete: Some(tx),
+            };
+            let outcome = match upload_mgr.submit(task).await {
+                Ok(()) => rx
+                    .await
+                    .unwrap_or_else(|_| Err("upload worker dropped the channel".into())),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(msg) = outcome {
+                tracing::error!(
+                    table,
+                    sstable = item.sstable_id,
+                    path = %item.path.display(),
+                    "s3-sync: index sidecar upload failed; will retry on the next sync: {msg}"
+                );
+                retry.push(item);
+            }
+        }
+        if !retry.is_empty() {
+            self.pending_index_uploads.lock().extend(retry);
+        }
     }
 
     /// Download SSTables from S3 to local disk for a specific table.
@@ -9552,6 +10079,17 @@ impl StorageEngine {
                 Self::generation_component_path(&table_dir, &entry.id, component).is_some()
             });
             if local_complete {
+                if let Some(local_dir) = Self::generation_dir_for(&table_dir, &entry.id) {
+                    Self::pull_index_artifacts(
+                        store.as_ref(),
+                        &prefix,
+                        &hex,
+                        &table_id.to_string(),
+                        &entry.id,
+                        &local_dir,
+                    )
+                    .await?;
+                }
                 downloaded += 1;
                 continue;
             }
@@ -9622,6 +10160,20 @@ impl StorageEngine {
                 }
             }
 
+            if let Err(e) = Self::pull_index_artifacts(
+                store.as_ref(),
+                &prefix,
+                &hex,
+                &table_id.to_string(),
+                &entry.id,
+                &staging_dir,
+            )
+            .await
+            {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return Err(e);
+            }
+
             Self::sync_directory(&staging_dir).map_err(|e| {
                 let _ = std::fs::remove_dir_all(&staging_dir);
                 ferrosa_common::Error::InvalidFormat(format!(
@@ -9665,6 +10217,92 @@ impl StorageEngine {
         }
 
         Ok(downloaded)
+    }
+
+    /// The directory holding generation `gen`'s components: its own
+    /// generation directory, or the flat table directory.
+    fn generation_dir_for(table_dir: &std::path::Path, gen: &str) -> Option<std::path::PathBuf> {
+        Self::generation_component_path(table_dir, gen, "Data.db")
+            .and_then(|data| data.parent().map(std::path::Path::to_path_buf))
+    }
+
+    /// Whether `component` (a file name after `{gen}-`) is an index artifact
+    /// rather than an SSTable component: a scalar `.sidecar`, or a full-text,
+    /// vector or quantized-vector index file.
+    fn is_index_artifact(component: &str) -> bool {
+        component.ends_with(".sidecar")
+            || component.starts_with("FTI-")
+            || component.starts_with("VEC-")
+            || component.starts_with("QVEC-")
+    }
+
+    /// Pull every index artifact S3 holds for generation `gen` into `dest_dir`,
+    /// completely, before anything maps it (t_7ac6b0e3). Artifacts already on
+    /// disk are left alone; each download streams to a temp file and is renamed
+    /// into place, so a partially fetched sidecar is never visible. Without
+    /// this a node restored from S3 had SSTables but no indexes over them.
+    pub(crate) async fn pull_index_artifacts(
+        store: &dyn object_store::ObjectStore,
+        prefix: &str,
+        hex: &str,
+        table_id: &str,
+        gen: &str,
+        dest_dir: &std::path::Path,
+    ) -> ferrosa_common::Result<usize> {
+        use futures::StreamExt;
+
+        let generation_prefix =
+            object_store::path::Path::from(format!("{prefix}/{hex}/{table_id}/{gen}"));
+        let name_prefix = format!("{gen}-");
+        let mut listing = store.list(Some(&generation_prefix));
+        let mut pulled = 0usize;
+        while let Some(object) = listing.next().await {
+            let object = object.map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "listing index artifacts for generation {gen} of {table_id}: {e}"
+                ))
+            })?;
+            let Some(file_name) = object.location.filename() else {
+                continue;
+            };
+            let Some(component) = file_name.strip_prefix(&name_prefix) else {
+                continue;
+            };
+            if !Self::is_index_artifact(component) {
+                continue;
+            }
+            let final_path = dest_dir.join(file_name);
+            if final_path.exists() {
+                continue;
+            }
+            let temp_path = dest_dir.join(format!(".{file_name}.download.tmp"));
+            match Self::download_sstable_component_to_path(store, &object.location, &temp_path)
+                .await?
+            {
+                Some(_) => {
+                    tokio::fs::rename(&temp_path, &final_path)
+                        .await
+                        .map_err(|e| {
+                            ferrosa_common::Error::InvalidFormat(format!(
+                                "publishing pulled index artifact {}: {e}",
+                                final_path.display()
+                            ))
+                        })?;
+                    pulled += 1;
+                }
+                None => {
+                    // Listed, then gone: deleted between list and get.
+                    tracing::warn!(
+                        path = %object.location,
+                        "index artifact vanished from S3 between listing and download"
+                    );
+                }
+            }
+        }
+        if pulled > 0 {
+            tracing::info!(table_id, gen, pulled, "pulled index artifacts from S3");
+        }
+        Ok(pulled)
     }
 
     fn temp_download_directory(
@@ -10115,13 +10753,18 @@ impl StorageEngine {
             durable_local,
         );
 
-        let (index_scheduler, index_tracker) = build_index_scheduler(&config);
+        let tables = Arc::new(RwLock::new(HashMap::new()));
+        let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (index_scheduler, index_tracker) =
+            build_index_scheduler(&config, &tables, &pending_index_uploads);
 
         Ok(Self {
             config,
-            tables: RwLock::new(HashMap::new()),
+            tables,
+            pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
             compaction_executor,
             upload_manager,
             compaction_upload_manager,
@@ -10881,6 +11524,407 @@ mod tests {
             }],
             extensions: Default::default(),
         }
+    }
+
+    /// A table that has a STATIC column, which `test_schema` does not.
+    ///
+    /// Every other schema helper in this file declares `static_columns: vec![]`,
+    /// which is why nothing here has ever exercised the offset between the two
+    /// column-index spaces.
+    ///
+    /// Cell indices, per `TableSchema`'s own contract and
+    /// `memtable::validate_row_against_schema`: statics occupy
+    /// `0..static_columns.len()`, regulars follow at `static_columns.len()..`.
+    /// So for this table: `s1` → 0, `r1` → 1, `r2` → 2.
+    fn schema_with_a_static_column() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "static_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![ColumnDefinition {
+                name: "s1".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "r1".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "r2".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    /// The cell position `index_name` was registered at, as the memtable will
+    /// read it.
+    fn registered_index_position(
+        engine: &StorageEngine,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Option<usize> {
+        engine
+            .tables
+            .read()
+            .get(table_id)?
+            .store
+            .indexed_columns()
+            .iter()
+            .find(|(name, _)| name == index_name)
+            .map(|(_, position)| *position)
+    }
+
+    /// An index registered by `register_index_in_engine` must point at the
+    /// cell the WRITE path stores, which counts statics first.
+    ///
+    /// `regular_column_position` returns the ordinal WITHIN `regular_columns`
+    /// and never adds `static_columns.len()`, while claiming in its own doc
+    /// comment to be "matching the ordinal convention used by the CREATE INDEX
+    /// wire path". The wire path (`route_create_index`) uses
+    /// `TableMetadata::storage_column_index`, which counts statics first — and
+    /// says why: "the index must register that exact position or it would read
+    /// the wrong cell".
+    ///
+    /// So on a table with N statics the index lands N cells too low and reads
+    /// a different column's bytes. It is silent: the index is created,
+    /// `declares_index` returns true, and every existing test passes, because
+    /// every other schema helper here has zero static columns.
+    ///
+    /// This is the restart-reload resolver, so it has always been wrong after
+    /// a restart; #402 reused it for replicated DDL, so it is now also wrong
+    /// at CREATE INDEX on every replica.
+    #[test]
+    fn an_index_on_a_regular_column_is_registered_past_the_static_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "static_table");
+
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_r2",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "r2",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(built, "r2 is a regular column, so it must be built");
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_r2"),
+            Some(2),
+            "r2 is the second regular column on a table with one static, so the \
+             write path stores its cell at index 1 + 1 = 2. Registering it at 1 \
+             points the index at r1 and every read through it decodes the wrong \
+             column's bytes."
+        );
+    }
+
+    fn schema_named(table: &str) -> TableSchema {
+        TableSchema {
+            table: table.to_string(),
+            ..test_schema()
+        }
+    }
+
+    /// A replicated `CREATE INDEX` can reach a node before the node has
+    /// registered the table, and the index must still end up built.
+    ///
+    /// This is ordinary ordering, not a failure, and both existing policies
+    /// get it wrong. #402's Raft arm turns the `Err` into an `ApplyError` and
+    /// fails the apply. #403's wiring logs a WARN and leaves it, explicitly
+    /// waiting for "the next restart's reload" — which makes a restart
+    /// load-bearing for correctness on a path that happens normally.
+    ///
+    /// Neither builds the index. The registration is recorded and completed
+    /// when the table arrives, so no restart is involved and the apply does
+    /// not fail.
+    #[test]
+    fn an_index_registered_before_its_table_is_built_when_the_table_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let table_id = TableId::new("test_ks", "late_table");
+
+        // The table is NOT registered here: the DDL won the race.
+        let options = std::collections::HashMap::new();
+        engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_val",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: true,
+                    site: "test",
+                },
+            )
+            .expect("an unregistered table is an ordering case, never an error");
+
+        assert!(
+            !engine.declares_index(&table_id, "idx_val"),
+            "nothing to build against yet"
+        );
+
+        engine.register_table(schema_named("late_table")).unwrap();
+
+        assert!(
+            engine.declares_index(&table_id, "idx_val"),
+            "the deferred index must be built when its table registers. Waiting \
+             for a restart leaves the planner selecting an index this node \
+             cannot answer, for however long the node stays up."
+        );
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_val"),
+            Some(0),
+            "and it must land at the same cell a non-deferred build would"
+        );
+    }
+
+    /// The restart reload must NOT defer: there, an absent table is an orphan.
+    ///
+    /// Every live table is registered before indexes are replayed at boot, so
+    /// a `system_schema.indexes` row whose table is missing is a dangling
+    /// registration from a pre-cascade `DROP TABLE`. Its table will never
+    /// arrive. Holding those would grow a map keyed by dropped tables for the
+    /// life of the process — a leak that only shows up on a cluster with churn,
+    /// which is the worst place to find it.
+    #[test]
+    fn a_reload_does_not_defer_an_index_whose_table_will_never_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let table_id = TableId::new("test_ks", "dropped_table");
+
+        let options = std::collections::HashMap::new();
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_orphan",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: false,
+                    site: "after restart",
+                },
+            )
+            .unwrap();
+        assert!(!built, "there is no table to build against");
+
+        assert!(
+            engine.deferred_index_builds.lock().is_empty(),
+            "an orphaned index row must be skipped, not held forever"
+        );
+    }
+
+    /// A table with a vector column, spelled the way the ENGINE spells it.
+    fn schema_with_a_vector_column() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "vec_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "embedding".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.VectorType(FloatType,3)".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// A replicated `CREATE INDEX` of a VECTOR index must build it here too.
+    ///
+    /// `register_index_in_engine` refused vectors outright — "vector index
+    /// needs a dedicated rebuild path" — so a replica applying the DDL got
+    /// nothing, and so did the restart reload that shares this resolver. Only
+    /// the node whose CQL session ran the statement had the index; the planner
+    /// selects it everywhere, because the schema is replicated.
+    ///
+    /// Two things blocked it and both are now gone: the dimension lives in the
+    /// column's type, which the engine spells `VectorType(FloatType,3)` and
+    /// only a CQL-form parser could read; and the method lives in the index
+    /// options, which `IndexToRegister` did not carry.
+    ///
+    /// `hvq` is asserted rather than the default `hnsw` because
+    /// `vector_index_method` answers `Hnsw` for an index it has never heard
+    /// of — asserting the default would pass against a table with no vector
+    /// index at all.
+    #[test]
+    fn a_replicated_vector_index_is_built_in_the_local_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_vector_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "vec_table");
+
+        let options = std::collections::HashMap::from([("method".to_string(), "hvq".to_string())]);
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_embedding",
+                    index_type: ferrosa_index::IndexType::Vector,
+                    target_col: "embedding",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: false,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            built,
+            "a vector index on a vector column must be built on the node applying the DDL"
+        );
+
+        assert_eq!(
+            engine
+                .vector_index_method(&table_id, "idx_embedding")
+                .unwrap(),
+            VectorIndexMethod::QuantizedIvf,
+            "the method from the index options must reach the engine; Hnsw here \
+             means the index was never registered at all"
+        );
+    }
+
+    /// A vector index whose target is not a vector column must not be built,
+    /// and must say so — the dimension is unreadable, so the artifact would be
+    /// meaningless.
+    #[test]
+    fn a_vector_index_on_a_non_vector_column_is_declined_not_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        let options = std::collections::HashMap::new();
+        let built = engine
+            .register_index_in_engine(
+                &table_id(),
+                IndexToRegister {
+                    index_name: "idx_not_a_vector",
+                    index_type: ferrosa_index::IndexType::Vector,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &options,
+                    defer_until_table_exists: false,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            !built,
+            "`val` is UTF8Type and carries no dimension, so there is nothing to build"
+        );
+    }
+
+    /// A static column is a stored cell too, and the executing node indexes it
+    /// (`storage_column_index` returns `Some` for `ColumnKind::Static`).
+    ///
+    /// `regular_column_position` searched only `regular_columns`, so a static
+    /// target resolved to nothing, fell past the clustering and partition-key
+    /// branches, and returned `Ok(false)` — "cannot resolve index target
+    /// column". A replica silently declined to build an index the executing
+    /// node had built.
+    #[test]
+    fn an_index_on_a_static_column_is_registered_at_its_own_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "static_table");
+
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_s1",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "s1",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            built,
+            "a static column is a stored cell, so its index must be built here"
+        );
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_s1"),
+            Some(0),
+            "statics occupy 0..static_columns.len(), so the only static is cell 0"
+        );
+    }
+
+    /// The fix must be the static OFFSET, not a renumbering.
+    ///
+    /// On a table with no statics the two index spaces coincide, which is the
+    /// case every other test in this file exercises and the reason the bug
+    /// stayed invisible. This pins that behaviour so a future change cannot
+    /// "fix" the offset in the wrong direction and move every existing index.
+    #[test]
+    fn an_index_on_a_table_without_statics_keeps_its_regular_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        engine
+            .register_index_in_engine(
+                &table_id(),
+                IndexToRegister {
+                    index_name: "idx_val",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    options: &std::collections::HashMap::new(),
+                    defer_until_table_exists: false,
+                    site: "test",
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id(), "idx_val"),
+            Some(0),
+            "with no statics the offset is zero and the first regular column is cell 0"
+        );
     }
 
     fn make_key(s: &str) -> DecoratedKey {
@@ -17375,6 +18419,84 @@ mod tests {
     // Task 3.2: Sidecar files survive table re-registration
     // =========================================================================
 
+    /// The flush's own postings count: an index it wrote needs no rebuild.
+    ///
+    /// The end-to-end version of this only fails when the rebuild job is slow
+    /// enough to still be queued when the read arrives, which is a loaded
+    /// machine and not a reproducible test. The decision itself is pure, so
+    /// this pins it directly.
+    #[test]
+    fn a_flushed_index_is_marked_indexed_not_rebuilt() {
+        let covered = ["val_idx".to_string(), "city_idx".to_string()];
+        let already: HashSet<String> = HashSet::new();
+
+        assert_eq!(
+            flush_index_action(&covered, "val_idx", &already, "7"),
+            FlushIndexAction::AlreadyWritten,
+            "the flush wrote this index's postings for this generation, so the \
+             generation is indexed — marking it pending calls a complete index \
+             incomplete for as long as the rebuild sits in the queue"
+        );
+        assert_eq!(
+            flush_index_action(&covered, "other_idx", &already, "7"),
+            FlushIndexAction::NeedsBuild,
+            "an index the flush had no memtable postings for is genuinely \
+             unbuilt for this generation and must be built from the SSTable"
+        );
+
+        let already: HashSet<String> = ["7".to_string()].into_iter().collect();
+        assert_eq!(
+            flush_index_action(&covered, "other_idx", &already, "7"),
+            FlushIndexAction::Nothing,
+            "a generation already recorded as indexed needs neither"
+        );
+    }
+
+    /// A flush must not report the generation it just indexed as pending.
+    ///
+    /// `TableStore::flush` writes and installs that generation's sidecars
+    /// inline, from the memtable index it swapped out — the postings are on
+    /// disk and in the view before `flush` returns. The engine then marked the
+    /// same generation pending and queued a rebuild anyway, so for as long as
+    /// that job sat in the queue the tracker called a complete index
+    /// incomplete.
+    ///
+    /// Nothing reacted to that window until reads started believing the
+    /// tracker. Now two things do: a read through the index is refused
+    /// outright at the storage layer, and the planner withholds the index and
+    /// scans instead. Either way every flush opened a window in which the
+    /// index it had just written was treated as unusable — which showed up as
+    /// `sidecar_survives_table_reregistration` failing under a loaded suite
+    /// and passing alone.
+    #[test]
+    fn an_index_is_current_the_moment_its_flush_returns() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("user1"), make_row(b"alice", 1000), 1000)
+            .unwrap();
+
+        engine.flush(&tid).unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the flush wrote and installed this generation's sidecar before returning, \
+             so the index covers every row in it; leaving it pending makes readers \
+             refuse or rescan an index that is complete"
+        );
+        let results = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"alice".to_vec()))
+            .expect("a complete index answers");
+        assert_eq!(results.len(), 1, "the flushed row is readable by index");
+        engine.shutdown().unwrap();
+    }
+
     #[test]
     fn sidecar_survives_table_reregistration() {
         use ferrosa_index::IndexKey;
@@ -17722,6 +18844,231 @@ mod tests {
     /// The storage schema carries no partition-key column NAMES (only the
     /// composite key type), so the reload is told them by the caller, which
     /// holds the CQL schema.
+    /// t_7ac6b0e3: an index created over data already flushed answers for
+    /// that data as soon as its backfill completes. The scheduler wrote the
+    /// backfilled sidecar to disk and marked the SSTable indexed, but never
+    /// installed it: the index read nothing for pre-existing SSTables until a
+    /// restart loaded the file.
+    #[test]
+    fn a_backfilled_sidecar_is_served_without_a_restart() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        (0..15).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        // Hang guard, not a timing assertion: the backfill always completes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill must complete"
+        );
+
+        let found = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .unwrap()
+            .len();
+        assert_eq!(
+            found, 15,
+            "once its backfill is current, the index answers for data that predates it"
+        );
+        assert!(
+            engine
+                .sidecar_backings_for_test(&tid, "val_idx")
+                .iter()
+                .all(|mapped| *mapped),
+            "the backfilled sidecar is mapped"
+        );
+    }
+
+    /// A planner-visible index with outstanding backfill work must never answer
+    /// an empty or partial result as though it were complete. Callers can retry
+    /// after the tracker becomes current, but they cannot recover rows hidden by
+    /// a false successful response.
+    #[test]
+    fn a_pending_index_read_fails_loud() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("present"), make_row(b"shared", 1000), 1000)
+            .unwrap();
+        engine.index_tracker.mark_pending(
+            tid.keyspace(),
+            tid.table(),
+            "val_idx",
+            "backfill-not-installed",
+            1,
+        );
+
+        let error = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .expect_err("a pending index must refuse to return a partial result");
+        assert!(
+            error.to_string().contains("not current"),
+            "pending-index error must explain why the read was refused: {error}"
+        );
+    }
+
+    /// t_7ac6b0e3: an index still answers for rows a compaction merged. The
+    /// swap used to install the output SSTable with NO sidecars (and the
+    /// rebuilt file was written to disk but never installed), so every scalar
+    /// index silently lost the compacted rows until the next restart.
+    #[tokio::test]
+    async fn an_index_answers_for_rows_a_compaction_merged() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        config.compaction.min_threshold = 2;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        (0..10).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("a{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        (0..10).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("b{i}")),
+                    make_row(b"shared", 2000),
+                    2000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+        let key = IndexKey(b"shared".to_vec());
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &key)
+                .unwrap()
+                .len(),
+            20,
+            "precondition: both SSTables' sidecars answer"
+        );
+
+        {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let metadata = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            engine
+                .compaction_executor
+                .submit(crate::compaction::metadata::CompactionTask {
+                    inputs: metadata,
+                    output_dir: dir.path().join("compaction"),
+                    schema: test_schema(),
+                    table_id: tid.clone(),
+                })
+                .unwrap();
+        }
+        // Hang guard (~30s), not a timing assertion.
+        let mut swapped = false;
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(swapped, "the compaction must merge the two SSTables");
+
+        assert_eq!(
+            collect_index_results(&engine, &tid, "val_idx", &key)
+                .unwrap()
+                .len(),
+            20,
+            "after the compaction, without a restart, the index must still answer \
+             for every row the compaction merged"
+        );
+        assert!(
+            engine
+                .sidecar_backings_for_test(&tid, "val_idx")
+                .iter()
+                .all(|mapped| *mapped),
+            "the compaction output's sidecar is mapped"
+        );
+    }
+
+    /// t_7ac6b0e3: a flushed sidecar is served from its file through a
+    /// memory map. Flush used to keep a heap copy of every flushed sidecar in
+    /// the view for the life of the SSTable, beside the file it had written.
+    #[test]
+    fn a_flushed_sidecar_is_read_through_a_memory_map() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        (0..20).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+
+        let backings = engine.sidecar_backings_for_test(&tid, "val_idx");
+        assert!(!backings.is_empty(), "the flush produced a sidecar");
+        assert!(
+            backings.iter().all(|mapped| *mapped),
+            "every flushed sidecar must be mapped, not a heap image: {backings:?}"
+        );
+        let found = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .unwrap()
+            .len();
+        assert_eq!(
+            found, 20,
+            "the mapped sidecar answers for every flushed row"
+        );
+    }
+
     #[test]
     fn a_partition_key_index_survives_restart_and_answers() {
         use ferrosa_index::IndexKey;
@@ -21690,6 +23037,61 @@ mod tests {
         (dir, engine, store, prefix, tid)
     }
 
+    /// t_7ac6b0e3: a sidecar built after its generation is already in S3 (a
+    /// CREATE INDEX backfill over uploaded data) is uploaded too. The sync
+    /// skips any generation already in the manifest, so such a sidecar was
+    /// never uploaded, and a node restored from S3 had no index over that
+    /// generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sidecar_built_after_its_generation_was_uploaded_reaches_s3() {
+        use futures::StreamExt;
+
+        let (_dir, engine, store, _prefix, tid) = s3_sync_fixture("test-late-sidecar", &[]);
+        (0..5).for_each(|i| {
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("k{i}")),
+                    make_row(b"shared", 1000),
+                    1000,
+                )
+                .unwrap();
+        });
+        engine.flush(&tid).unwrap();
+        assert!(
+            engine.sync_sstables_to_s3().await.unwrap() >= 1,
+            "the generation is uploaded"
+        );
+
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !engine.index_is_current(&tid, "val_idx") && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the backfill completes"
+        );
+
+        engine.sync_sstables_to_s3().await.unwrap();
+
+        let mut listing = store.list(None);
+        let mut sidecar_objects = Vec::new();
+        while let Some(object) = listing.next().await {
+            let object = object.unwrap();
+            if object.location.as_ref().ends_with("-val_idx.sidecar") {
+                sidecar_objects.push(object.location.to_string());
+            }
+        }
+        assert_eq!(
+            sidecar_objects.len(),
+            1,
+            "the backfilled sidecar must be uploaded beside its generation: {sidecar_objects:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sync_s3_rejects_generation_missing_required_rows_component() {
         let (_dir, engine, store, prefix, tid) = s3_sync_fixture(
@@ -23019,6 +24421,106 @@ mod tests {
             let table_dir = dir.path().join("sstables").join(&table_id_str);
             assert!(StorageEngine::generation_component_path(&table_dir, "1", "Data.db").is_some());
             assert!(StorageEngine::generation_component_path(&table_dir, "2", "Data.db").is_none());
+
+            engine.shutdown().unwrap();
+        });
+    }
+
+    /// t_7ac6b0e3: restoring a generation from S3 pulls its index sidecars
+    /// down completely, beside its components, so a node rebuilt from its S3
+    /// prefix has its indexes. Restore used to fetch only the SSTable's seven
+    /// components: every generation came back with no sidecar and every
+    /// scalar index read as empty for it.
+    #[test]
+    fn download_sstables_from_s3_pulls_the_generations_index_sidecars() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let prefix = "test-sidecar-restore".to_string();
+            let tid = table_id();
+            let table_id_str = tid.to_string();
+
+            let engine = StorageEngine::new_with_upload_store(
+                StorageEngineConfig::test_config(dir.path()),
+                Arc::clone(&store),
+                prefix.clone(),
+                &tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+
+            let mut manifest = crate::manifest::Manifest::new();
+            manifest.add_sstable(
+                &table_id_str,
+                crate::manifest::ManifestEntry {
+                    id: "1".to_string(),
+                    size: 4,
+                    min_token: 0,
+                    max_token: 0,
+                    min_timestamp: 0,
+                    max_timestamp: 0,
+                },
+            );
+
+            // A real v2 sidecar image, uploaded as the generation's object.
+            let staging = tempfile::tempdir().unwrap();
+            let sidecar_path = staging.path().join("1-val_idx.sidecar");
+            crate::index::sidecar::SidecarWriter::write(
+                &sidecar_path,
+                &[(
+                    ferrosa_index::IndexKey(b"shared".to_vec()),
+                    ferrosa_index::RowPosition {
+                        partition_key: b"k1".to_vec(),
+                        clustering_key: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+            let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+
+            let hex = crate::upload::manager::hex_prefix_for("1");
+            for (component, bytes) in [
+                ("Data.db", b"data".to_vec()),
+                ("Partitions.db", b"partitions".to_vec()),
+                ("Rows.db", b"rows".to_vec()),
+                ("val_idx.sidecar", sidecar_bytes.clone()),
+            ] {
+                let path = crate::upload::manager::sstable_object_key(
+                    &prefix,
+                    &hex,
+                    &table_id_str,
+                    "1",
+                    component,
+                );
+                store
+                    .put(
+                        &path,
+                        object_store::PutPayload::from(bytes::Bytes::from(bytes)),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let downloaded = engine
+                .download_sstables_from_s3(&tid, &manifest)
+                .await
+                .expect("restore");
+            assert_eq!(downloaded, 1);
+
+            let table_dir = dir.path().join("sstables").join(&table_id_str);
+            let restored =
+                StorageEngine::generation_component_path(&table_dir, "1", "val_idx.sidecar")
+                    .expect("the generation's sidecar must be restored beside its components");
+            assert_eq!(
+                std::fs::read(&restored).unwrap(),
+                sidecar_bytes,
+                "the sidecar is pulled down completely, byte for byte"
+            );
 
             engine.shutdown().unwrap();
         });
