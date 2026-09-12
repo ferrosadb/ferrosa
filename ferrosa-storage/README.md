@@ -172,6 +172,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   only the composite key type), so an index on a partition-key column — the
   tenant index of a `((tenant_id, session_id), ..)` table — is restored and
   backfilled through `add_partition_key_index` rather than skipped (ST-20).
+  That resolution now lives in `register_index_in_engine(&TableId,
+  IndexToRegister)`, which the reload calls per row and `ferrosa-cluster` calls
+  when a replicated `CREATE INDEX` arrives. Before it was shared, only the CQL
+  router built indexes, so every node except the one whose session ran the DDL
+  had the index in schema and nothing in the engine (CL-18). It returns
+  `Ok(false)`, with a log line saying why, for the kinds it deliberately does
+  not build here: a vector index (needs its dimension and a dedicated rebuild)
+  and a non-scalar index on a key column.
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index

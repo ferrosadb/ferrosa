@@ -1122,6 +1122,31 @@ pub struct IndexReloadOutcome {
     pub skipped: usize,
 }
 
+/// One index for [`StorageEngine::register_index_in_engine`] to build.
+///
+/// A struct rather than six positional parameters because five of the six are
+/// borrowed strings, and a caller that swapped two of them would still compile.
+pub struct IndexToRegister<'a> {
+    /// The index's name, as the schema and the planner know it.
+    pub index_name: &'a str,
+    /// Which index flavour to build.
+    pub index_type: ferrosa_index::IndexType,
+    /// The column the index targets. A multi-column `target` is passed as its
+    /// first column: a generic single-column index is what gets built.
+    pub target_col: &'a str,
+    /// The table's partition-key columns in key order, needed to resolve an
+    /// index on one of them. The storage [`TableSchema`] carries only the
+    /// composite key TYPE, never the column names, so the caller supplies
+    /// them; an empty slice means "this table offers none".
+    pub partition_key_columns: &'a [String],
+    /// The decoded predicate of a partial (`Filtered`) index. Required for
+    /// that kind and ignored by every other.
+    pub filter_predicate: Option<ferrosa_index::FilterPredicate>,
+    /// Where the registration came from, for the log line — e.g.
+    /// `"after restart"` or `"replicated DDL (raft apply)"`.
+    pub site: &'a str,
+}
+
 /// Partition-key column NAMES per table, in key order, for
 /// [`StorageEngine::reload_indexes_from_system_schema`].
 ///
@@ -3600,105 +3625,10 @@ impl StorageEngine {
             return Ok(false);
         };
 
-        // Vector indexes need their dimension + HNSW params to rebuild and use
-        // a dedicated path; skip them here. FullText is re-registered after
-        // column resolution below (and its sidecars rebuilt) — leaving it
-        // skipped made fts_match return EMPTY after a restart even though the
-        // on-disk FTI sidecars were intact, because the engine's
-        // fulltext_indexes map (column position) was never repopulated.
-        if matches!(index_type, ferrosa_index::IndexType::Vector) {
-            tracing::warn!(
-                keyspace,
-                table,
-                index_name,
-                kind,
-                "skipping reload of vector index — needs dedicated rebuild path"
-            );
-            return Ok(false);
-        }
-
         let table_id = TableId::new(keyspace, &table);
         // `target` may be a "col_a, col_b" join; the first column drives the
         // ordinal (generic single-column indexes target one column).
         let target_col = target.split(", ").next().unwrap_or(&target);
-        let Some(column_position) = self.regular_column_position(&table_id, target_col) else {
-            // Not a regular column: it may be a CLUSTERING column index
-            // (t_430c4188), re-registered through its own path so restart does
-            // not silently drop it.
-            if let Some(component) = self.clustering_column_position(&table_id, target_col) {
-                if matches!(
-                    index_type,
-                    ferrosa_index::IndexType::Filtered | ferrosa_index::IndexType::FullText
-                ) {
-                    tracing::warn!(
-                        keyspace,
-                        table,
-                        index_name,
-                        target_col,
-                        kind,
-                        "clustering-column index reload supports scalar index kinds only — skipping"
-                    );
-                    return Ok(false);
-                }
-                self.add_clustering_index(&table_id, &index_name, component, index_type)?;
-                tracing::info!(
-                    keyspace,
-                    table,
-                    index_name,
-                    kind,
-                    "re-registered persisted clustering-column index after restart"
-                );
-                return Ok(true);
-            }
-            // Or a PARTITION-KEY column index (t_50c8bc7d). Dropping this one
-            // is not a lost optimisation: the CQL schema still lists the index,
-            // the planner still selects it, and a consult of an index the
-            // engine no longer has answers with zero rows.
-            if let Some(component) = partition_keys
-                .get(&table_id)
-                .and_then(|names| names.iter().position(|name| name == target_col))
-            {
-                if !matches!(
-                    index_type,
-                    ferrosa_index::IndexType::BTree
-                        | ferrosa_index::IndexType::Hash
-                        | ferrosa_index::IndexType::Composite
-                        | ferrosa_index::IndexType::Phonetic
-                ) {
-                    tracing::warn!(
-                        keyspace,
-                        table,
-                        index_name,
-                        target_col,
-                        kind,
-                        "partition-key-column index reload supports scalar index kinds only — skipping"
-                    );
-                    return Ok(false);
-                }
-                self.add_partition_key_index(&table_id, &index_name, component, index_type)?;
-                tracing::info!(
-                    keyspace,
-                    table,
-                    index_name,
-                    kind,
-                    "re-registered persisted partition-key-column index after restart"
-                );
-                return Ok(true);
-            }
-            // Debug, not warn: this is the per-orphan case (dangling
-            // registration from a pre-cascade DROP TABLE) that used to churn
-            // one warn per orphan on every boot. The caller emits one summary
-            // warn with the skipped count and bumps
-            // `ferrosa_storage_index_reload_skipped_rows_total`.
-            tracing::debug!(
-                keyspace,
-                table,
-                index_name,
-                target_col,
-                "cannot resolve index target column to a position — table unregistered or column missing"
-            );
-            return Ok(false);
-        };
 
         // Reconstruct the partial-index predicate for a Filtered index. The
         // CREATE path persisted the fully-encoded `FilterPredicate` as JSON
@@ -3724,20 +3654,172 @@ impl StorageEngine {
             None
         };
 
+        self.register_index_in_engine(
+            &table_id,
+            IndexToRegister {
+                index_name: &index_name,
+                index_type,
+                target_col,
+                partition_key_columns: partition_keys
+                    .get(&table_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                filter_predicate,
+                site: "after restart",
+            },
+        )
+    }
+
+    /// Register one index in THIS engine: resolve its target column to the
+    /// storage position and index flavour, then build it.
+    ///
+    /// Two callers reach this, and they were two implementations:
+    ///
+    /// * the restart reload, replaying `system_schema.indexes`; and
+    /// * a `CREATE INDEX` that arrived from another node, which records the
+    ///   index in `Schema` and in `system_schema.indexes` and had nothing at
+    ///   all to build it here.
+    ///
+    /// Only the CQL router built indexes, and it runs on the single node whose
+    /// session received the statement. Every other replica was left holding an
+    /// index the planner selects — the schema is replicated, so it is listed
+    /// everywhere — and the engine cannot answer. A global index read fans out
+    /// to every replica, so those nodes answered for their whole slice of the
+    /// table with nothing, or refuse the read outright. Neither is an answer.
+    ///
+    /// `partition_key_columns` names the table's partition-key columns in key
+    /// order. The storage `TableSchema` carries only the composite key TYPE,
+    /// so an index on a partition-key column cannot be resolved without them;
+    /// pass an empty slice when the table has none to offer.
+    ///
+    /// `site` names the caller for the log line, e.g. `"after restart"`.
+    ///
+    /// Returns `Ok(false)` when the index is deliberately NOT built here — a
+    /// vector index, or a non-scalar index on a key column. Every such case
+    /// logs the reason; none of them is silent.
+    pub fn register_index_in_engine(
+        &self,
+        table_id: &TableId,
+        index: IndexToRegister<'_>,
+    ) -> ferrosa_common::Result<bool> {
+        let IndexToRegister {
+            index_name,
+            index_type,
+            target_col,
+            partition_key_columns,
+            filter_predicate,
+            site,
+        } = index;
+        // Vector indexes need their dimension + HNSW params to rebuild and use
+        // a dedicated path; skip them here. FullText is re-registered after
+        // column resolution below (and its sidecars rebuilt) — leaving it
+        // skipped made fts_match return EMPTY after a restart even though the
+        // on-disk FTI sidecars were intact, because the engine's
+        // fulltext_indexes map (column position) was never repopulated.
+        if matches!(index_type, ferrosa_index::IndexType::Vector) {
+            tracing::warn!(
+                keyspace = table_id.keyspace(),
+                table = table_id.table(),
+                index_name,
+                ?index_type,
+                "vector index needs a dedicated rebuild path — not built here {site}"
+            );
+            return Ok(false);
+        }
+
+        let Some(column_position) = self.regular_column_position(table_id, target_col) else {
+            // Not a regular column: it may be a CLUSTERING column index
+            // (t_430c4188), re-registered through its own path so restart does
+            // not silently drop it.
+            if let Some(component) = self.clustering_column_position(table_id, target_col) {
+                if matches!(
+                    index_type,
+                    ferrosa_index::IndexType::Filtered | ferrosa_index::IndexType::FullText
+                ) {
+                    tracing::warn!(
+                        keyspace = table_id.keyspace(),
+                        table = table_id.table(),
+                        index_name,
+                        target_col,
+                        ?index_type,
+                        "clustering-column index reload supports scalar index kinds only — skipping"
+                    );
+                    return Ok(false);
+                }
+                self.add_clustering_index(table_id, index_name, component, index_type)?;
+                tracing::info!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name,
+                    ?index_type,
+                    "registered clustering-column index {site}"
+                );
+                return Ok(true);
+            }
+            // Or a PARTITION-KEY column index (t_50c8bc7d). Dropping this one
+            // is not a lost optimisation: the CQL schema still lists the index,
+            // the planner still selects it, and a consult of an index the
+            // engine no longer has answers with zero rows.
+            if let Some(component) = partition_key_columns
+                .iter()
+                .position(|name| name == target_col)
+            {
+                if !matches!(
+                    index_type,
+                    ferrosa_index::IndexType::BTree
+                        | ferrosa_index::IndexType::Hash
+                        | ferrosa_index::IndexType::Composite
+                        | ferrosa_index::IndexType::Phonetic
+                ) {
+                    tracing::warn!(
+                        keyspace = table_id.keyspace(),
+                        table = table_id.table(),
+                        index_name,
+                        target_col,
+                        ?index_type,
+                        "partition-key-column index reload supports scalar index kinds only — skipping"
+                    );
+                    return Ok(false);
+                }
+                self.add_partition_key_index(table_id, index_name, component, index_type)?;
+                tracing::info!(
+                    keyspace = table_id.keyspace(),
+                    table = table_id.table(),
+                    index_name,
+                    ?index_type,
+                    "registered partition-key-column index {site}"
+                );
+                return Ok(true);
+            }
+            // Debug, not warn: this is the per-orphan case (dangling
+            // registration from a pre-cascade DROP TABLE) that used to churn
+            // one warn per orphan on every boot. The caller emits one summary
+            // warn with the skipped count and bumps
+            // `ferrosa_storage_index_reload_skipped_rows_total`.
+            tracing::debug!(
+                keyspace = table_id.keyspace(),
+                table = table_id.table(),
+                index_name,
+                target_col,
+                "cannot resolve index target column to a position — table unregistered or column missing"
+            );
+            return Ok(false);
+        };
+
         // FullText: repopulate the engine's fulltext_indexes map (so fts_match
         // can resolve the column and read the on-disk FTI sidecars / scan
         // sidecar-less SSTables), then submit rebuild jobs so any SSTable that
         // predates the index gets its FTI sidecar reindexed. This is the
         // restart reindex path whose absence silently broke lexical search.
         if matches!(index_type, ferrosa_index::IndexType::FullText) {
-            self.add_fulltext_index(&table_id, &index_name, column_position)?;
+            self.add_fulltext_index(table_id, index_name, column_position)?;
             if let Some(ref scheduler) = self.index_scheduler {
                 let tables = self.tables.read();
-                if let Some(state) = tables.get(&table_id) {
+                if let Some(state) = tables.get(table_id) {
                     for sstable_id in state.store.sstable_generation_ids() {
                         let job = crate::index::IndexBuildJob {
                             sstable_id,
-                            index_name: index_name.clone(),
+                            index_name: index_name.to_string(),
                             index_type,
                             table: (
                                 table_id.keyspace().to_string(),
@@ -3757,28 +3839,28 @@ impl StorageEngine {
                 }
             }
             tracing::info!(
-                keyspace,
-                table,
+                keyspace = table_id.keyspace(),
+                table = table_id.table(),
                 index_name,
-                kind,
-                "re-registered + reindexed full-text index after restart"
+                ?index_type,
+                "registered + reindexed full-text index {site}"
             );
             return Ok(true);
         }
 
         self.add_index_with_predicate(
-            &table_id,
-            &index_name,
+            table_id,
+            index_name,
             column_position,
             index_type,
             filter_predicate,
         )?;
         tracing::info!(
-            keyspace,
-            table,
+            keyspace = table_id.keyspace(),
+            table = table_id.table(),
             index_name,
-            kind,
-            "re-registered persisted index after restart"
+            ?index_type,
+            "registered index {site}"
         );
         Ok(true)
     }

@@ -26,6 +26,53 @@ use crate::pair::ddl::{DdlCoordinator, DdlOperation};
 use crate::raft::{FerrosRaft, RaftCommand, RaftOp};
 use crate::system_table_writer::SystemTableWriter;
 
+/// Build an index this node learned about from somewhere other than a CQL
+/// session — a replicated `CREATE INDEX`, by any of the three DDL paths.
+///
+/// Only [`route_create_index`] in `ferrosa-cql` wires an index into storage,
+/// and it runs on the one node whose session received the statement. Every
+/// other replica recorded the index in `Schema` and in `system_schema.indexes`
+/// and built nothing, while `DropIndex` three arms down has always called
+/// `engine.drop_index`. The planner reads the replicated schema, so it selects
+/// the index on every node; a global index read fans out to all of them, and
+/// the replicas that never built it either answered for their whole slice with
+/// zero rows or refuse the read outright.
+///
+/// Registering is best-effort in one narrow sense only: a table this node has
+/// not registered yet cannot take an index, and that is reported by
+/// `register_index_in_engine` returning `Ok(false)` after logging why. A real
+/// failure is returned, not swallowed.
+pub(crate) fn build_replicated_index(
+    engine: &Arc<StorageEngine>,
+    idx: &ferrosa_schema::metadata::index::IndexMetadata,
+    partition_key: &[String],
+    site: &str,
+) -> Result<()> {
+    let Some(target_col) = idx.target_columns.first() else {
+        tracing::warn!(
+            keyspace = %idx.keyspace,
+            table = %idx.table,
+            index = %idx.name,
+            "replicated CREATE INDEX has no target column — nothing to build"
+        );
+        return Ok(());
+    };
+    engine
+        .register_index_in_engine(
+            &ferrosa_storage::TableId::new(&idx.keyspace, &idx.table),
+            ferrosa_storage::engine::IndexToRegister {
+                index_name: &idx.name,
+                index_type: idx.index_type,
+                target_col,
+                partition_key_columns: partition_key,
+                filter_predicate: idx.filter_predicate.clone(),
+                site,
+            },
+        )
+        .map_err(ClusterError::Storage)?;
+    Ok(())
+}
+
 /// Maximum schema operations retained while a node is forming a Raft group.
 ///
 /// Clients already receive a retriable error in this state. This queue only
@@ -322,6 +369,17 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
             schema
                 .create_index_internal(idx.clone())
                 .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+            build_replicated_index(
+                engine,
+                idx,
+                schema
+                    .snapshot()
+                    .tables
+                    .get(&(idx.keyspace.clone(), idx.table.clone()))
+                    .map(|t| t.partition_key.as_slice())
+                    .unwrap_or(&[]),
+                "replicated DDL",
+            )?;
             SystemTableWriter::new(Arc::clone(engine))
                 .apply(
                     ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(
