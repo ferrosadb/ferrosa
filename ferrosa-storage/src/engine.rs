@@ -769,6 +769,47 @@ fn sidecar_installer(
 /// Returns `(Option<IndexBuildScheduler>, Arc<IndexStateTracker>)`.
 /// When `index_backend` is `Off`, the scheduler is `None` and no worker
 /// threads are spawned.
+/// What a flush still owes an index for the generation it just wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushIndexAction {
+    /// The generation is already recorded as indexed for this index.
+    Nothing,
+    /// The flush wrote this index's postings for this generation itself, so
+    /// the generation is indexed the moment the flush returns.
+    AlreadyWritten,
+    /// This index had no memtable postings in the flush, so the generation's
+    /// rows are genuinely unindexed until a build reads them off the SSTable.
+    NeedsBuild,
+}
+
+/// Decide it for one index, given what the flush covered.
+///
+/// `TableStore::flush` writes and installs a sidecar for every index it held a
+/// memtable index for, from the postings that went into this very SSTable —
+/// before `flush` returns. Marking those generations pending anyway declares a
+/// complete index incomplete until the rebuild is dequeued, and readers now
+/// act on that: the storage layer refuses an index that is not current, and
+/// the planner withholds it and scans. So every flush opened a window in which
+/// the index it had just written was unusable.
+///
+/// An index the flush had no postings for is a different case and still needs
+/// the build: it exists on the table but nothing put its entries in the
+/// memtable index, so only a pass over the SSTable can fill it.
+fn flush_index_action(
+    covered_by_flush: &[String],
+    index_name: &str,
+    indexed_sstables: &HashSet<String>,
+    sstable_id: &str,
+) -> FlushIndexAction {
+    if indexed_sstables.contains(sstable_id) {
+        return FlushIndexAction::Nothing;
+    }
+    if covered_by_flush.iter().any(|name| name == index_name) {
+        return FlushIndexAction::AlreadyWritten;
+    }
+    FlushIndexAction::NeedsBuild
+}
+
 fn build_index_scheduler(
     config: &StorageEngineConfig,
     tables: &Arc<RwLock<HashMap<TableId, TableState>>>,
@@ -7735,6 +7776,7 @@ impl StorageEngine {
                         },
                     ))
                     .collect::<Vec<_>>();
+                let written_by_flush = state.store.indexes_written_by_last_flush();
                 for (index_name, col_pos, clustering_source, partition_key_source) in index_sources
                 {
                     let tracker_state = self.index_tracker.get_state(
@@ -7745,32 +7787,53 @@ impl StorageEngine {
                     // Only submit if the index needs building (not already current).
                     if let Some(idx_state) = tracker_state {
                         let sstable_id = format!("{gen}");
-                        if !idx_state.indexed_sstables.contains(&sstable_id) {
-                            self.index_tracker.mark_pending(
-                                table_id.keyspace(),
-                                table_id.table(),
-                                &index_name,
-                                &sstable_id,
-                                0,
-                            );
-                            match eager_index_build_job(
-                                &state.store,
-                                table_id,
-                                sstable_id,
-                                &index_name,
-                                col_pos,
-                                clustering_source,
-                                partition_key_source,
-                            ) {
-                                Ok(job) => {
-                                    if let Err(e) = scheduler.submit(job) {
-                                        tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                        match flush_index_action(
+                            &written_by_flush,
+                            &index_name,
+                            &idx_state.indexed_sstables,
+                            &sstable_id,
+                        ) {
+                            FlushIndexAction::Nothing => {}
+                            FlushIndexAction::AlreadyWritten => {
+                                // The flush wrote this index's sidecar for this
+                                // generation from the memtable index that made
+                                // the SSTable. Record it as indexed rather than
+                                // queueing a rebuild, so no reader sees a
+                                // complete index reported as pending.
+                                self.index_tracker.mark_indexed(
+                                    table_id.keyspace(),
+                                    table_id.table(),
+                                    &index_name,
+                                    &sstable_id,
+                                );
+                            }
+                            FlushIndexAction::NeedsBuild => {
+                                self.index_tracker.mark_pending(
+                                    table_id.keyspace(),
+                                    table_id.table(),
+                                    &index_name,
+                                    &sstable_id,
+                                    0,
+                                );
+                                match eager_index_build_job(
+                                    &state.store,
+                                    table_id,
+                                    sstable_id,
+                                    &index_name,
+                                    col_pos,
+                                    clustering_source,
+                                    partition_key_source,
+                                ) {
+                                    Ok(job) => {
+                                        if let Err(e) = scheduler.submit(job) {
+                                            tracing::error!(%e, %index_name, "flush: failed to submit eager index build");
+                                        }
                                     }
+                                    Err(e) => tracing::error!(
+                                        %e, %index_name,
+                                        "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
+                                    ),
                                 }
-                                Err(e) => tracing::error!(
-                                    %e, %index_name,
-                                    "flush: cannot resolve ordinal layout; SSTable left tracker-pending (unindexed)"
-                                ),
                             }
                         }
                     }
@@ -17608,6 +17671,84 @@ mod tests {
     // =========================================================================
     // Task 3.2: Sidecar files survive table re-registration
     // =========================================================================
+
+    /// The flush's own postings count: an index it wrote needs no rebuild.
+    ///
+    /// The end-to-end version of this only fails when the rebuild job is slow
+    /// enough to still be queued when the read arrives, which is a loaded
+    /// machine and not a reproducible test. The decision itself is pure, so
+    /// this pins it directly.
+    #[test]
+    fn a_flushed_index_is_marked_indexed_not_rebuilt() {
+        let covered = ["val_idx".to_string(), "city_idx".to_string()];
+        let already: HashSet<String> = HashSet::new();
+
+        assert_eq!(
+            flush_index_action(&covered, "val_idx", &already, "7"),
+            FlushIndexAction::AlreadyWritten,
+            "the flush wrote this index's postings for this generation, so the \
+             generation is indexed — marking it pending calls a complete index \
+             incomplete for as long as the rebuild sits in the queue"
+        );
+        assert_eq!(
+            flush_index_action(&covered, "other_idx", &already, "7"),
+            FlushIndexAction::NeedsBuild,
+            "an index the flush had no memtable postings for is genuinely \
+             unbuilt for this generation and must be built from the SSTable"
+        );
+
+        let already: HashSet<String> = ["7".to_string()].into_iter().collect();
+        assert_eq!(
+            flush_index_action(&covered, "other_idx", &already, "7"),
+            FlushIndexAction::Nothing,
+            "a generation already recorded as indexed needs neither"
+        );
+    }
+
+    /// A flush must not report the generation it just indexed as pending.
+    ///
+    /// `TableStore::flush` writes and installs that generation's sidecars
+    /// inline, from the memtable index it swapped out — the postings are on
+    /// disk and in the view before `flush` returns. The engine then marked the
+    /// same generation pending and queued a rebuild anyway, so for as long as
+    /// that job sat in the queue the tracker called a complete index
+    /// incomplete.
+    ///
+    /// Nothing reacted to that window until reads started believing the
+    /// tracker. Now two things do: a read through the index is refused
+    /// outright at the storage layer, and the planner withholds the index and
+    /// scans instead. Either way every flush opened a window in which the
+    /// index it had just written was treated as unusable — which showed up as
+    /// `sidecar_survives_table_reregistration` failing under a loaded suite
+    /// and passing alone.
+    #[test]
+    fn an_index_is_current_the_moment_its_flush_returns() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table_with_indexes(test_schema(), vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("user1"), make_row(b"alice", 1000), 1000)
+            .unwrap();
+
+        engine.flush(&tid).unwrap();
+
+        assert!(
+            engine.index_is_current(&tid, "val_idx"),
+            "the flush wrote and installed this generation's sidecar before returning, \
+             so the index covers every row in it; leaving it pending makes readers \
+             refuse or rescan an index that is complete"
+        );
+        let results = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"alice".to_vec()))
+            .expect("a complete index answers");
+        assert_eq!(results.len(), 1, "the flushed row is readable by index");
+        engine.shutdown().unwrap();
+    }
 
     #[test]
     fn sidecar_survives_table_reregistration() {

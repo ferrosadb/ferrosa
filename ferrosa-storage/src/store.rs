@@ -564,6 +564,10 @@ pub struct TableStore<F: FlushTarget> {
     pool_table_key: String,
     /// Serializes concurrent flushes. The read/write paths never touch this.
     flush_guard: Mutex<()>,
+    /// The indexes the most recent flush wrote a sidecar for, published for
+    /// the engine's post-flush bookkeeping. Shared by pointer, so reading it
+    /// copies no names: the engine only asks whether a name is in the set.
+    last_flush_indexes: ArcSwap<Vec<String>>,
     /// Write barrier: writes hold shared (read), flush holds exclusive (write)
     /// during the memtable swap. This ensures no writer is mid-put when the
     /// active memtable is swapped, preventing writes to a stale memtable.
@@ -1259,6 +1263,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
+            last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
@@ -1455,6 +1460,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
+            last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
@@ -1535,6 +1541,7 @@ impl<F: FlushTarget> TableStore<F> {
             schema: ArcSwap::from_pointee(schema),
             view: ArcSwap::from_pointee(initial_view),
             flush_guard: Mutex::new(()),
+            last_flush_indexes: ArcSwap::from_pointee(Vec::new()),
             flush_target: Arc::new(flush_target),
             options,
             index_types: default_index_types(&indexed_columns),
@@ -2843,6 +2850,15 @@ impl<F: FlushTarget> TableStore<F> {
             .iter()
             .map(|(index_name, memtable_idx)| (index_name.as_str(), memtable_idx.pin()))
             .collect();
+        // Publish what this flush covers before writing it: these indexes take
+        // their postings for this generation from the pins above, so the engine
+        // must not queue a rebuild for them (see `flush_index_action`).
+        self.last_flush_indexes.store(Arc::new(
+            pinned_indexes
+                .iter()
+                .map(|(index_name, _)| (*index_name).to_string())
+                .collect::<Vec<_>>(),
+        ));
         let sidecar_sources: Vec<(&str, &dyn crate::index::sidecar::SidecarSource)> =
             pinned_indexes
                 .iter()
@@ -6322,6 +6338,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// Returns the generation number of the most recently flushed SSTable.
     pub fn last_flush_generation(&self) -> u64 {
         self.flush_target.last_generation()
+    }
+
+    /// The indexes the most recent flush wrote a sidecar for.
+    ///
+    /// Those generations are indexed the moment `flush` returns — the
+    /// postings came from the memtable index that produced the SSTable, and
+    /// the sidecar is on disk and in the view before it returns. The engine
+    /// uses this to avoid queueing a rebuild for work already done, which
+    /// would leave the tracker reporting a complete index as pending.
+    pub fn indexes_written_by_last_flush(&self) -> Arc<Vec<String>> {
+        self.last_flush_indexes.load_full()
     }
 
     /// Returns generation IDs for all SSTables currently in the store.
