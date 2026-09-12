@@ -3837,8 +3837,8 @@ impl StorageEngine {
             return Ok(false);
         }
 
-        let Some(column_position) = self.regular_column_position(table_id, target_col) else {
-            // Not a regular column: it may be a CLUSTERING column index
+        let Some(column_position) = self.storage_cell_position(table_id, target_col) else {
+            // Not a stored cell: it may be a CLUSTERING column index
             // (t_430c4188), re-registered through its own path so restart does
             // not silently drop it.
             if let Some(component) = self.clustering_column_position(table_id, target_col) {
@@ -3975,16 +3975,39 @@ impl StorageEngine {
         Ok(true)
     }
 
-    /// Position of `column_name` within a registered table's regular columns,
-    /// matching the ordinal convention used by the CREATE INDEX wire path.
-    fn regular_column_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
+    /// The cell position the WRITE path stores `column_name` at, or `None` if
+    /// it is not a cell (a partition-key or clustering column, which are
+    /// encoded in the key and have their own index families).
+    ///
+    /// This is one index space, defined by [`TableSchema`] and implemented by
+    /// `memtable::validate_row_against_schema`: statics occupy
+    /// `0..static_columns.len()`, regulars follow at `static_columns.len()..`.
+    /// `TableMetadata::storage_column_index` is the same space computed from
+    /// the schema side, and is what `route_create_index` registers on the node
+    /// that executes the DDL.
+    ///
+    /// Its predecessor, `regular_column_position`, returned the ordinal WITHIN
+    /// `regular_columns` and never added the static offset, while its doc
+    /// comment claimed to match the wire path. On a table with statics every
+    /// index it registered pointed at the wrong cell, silently — the index was
+    /// declared, so nothing reported a problem and reads decoded a different
+    /// column's bytes. It went unseen because every schema helper in this
+    /// file's tests declares no static columns.
+    fn storage_cell_position(&self, table_id: &TableId, column_name: &str) -> Option<usize> {
         let tables = self.tables.read();
-        let state = tables.get(table_id)?;
-        state
-            .schema
+        let schema = &tables.get(table_id)?.schema;
+        if let Some(position) = schema
+            .static_columns
+            .iter()
+            .position(|c| c.name == column_name)
+        {
+            return Some(position);
+        }
+        schema
             .regular_columns
             .iter()
             .position(|c| c.name == column_name)
+            .map(|position| position + schema.static_columns.len())
     }
 
     /// Position of `column_name` within a registered table's CLUSTERING
@@ -11260,6 +11283,192 @@ mod tests {
             }],
             extensions: Default::default(),
         }
+    }
+
+    /// A table that has a STATIC column, which `test_schema` does not.
+    ///
+    /// Every other schema helper in this file declares `static_columns: vec![]`,
+    /// which is why nothing here has ever exercised the offset between the two
+    /// column-index spaces.
+    ///
+    /// Cell indices, per `TableSchema`'s own contract and
+    /// `memtable::validate_row_against_schema`: statics occupy
+    /// `0..static_columns.len()`, regulars follow at `static_columns.len()..`.
+    /// So for this table: `s1` → 0, `r1` → 1, `r2` → 2.
+    fn schema_with_a_static_column() -> TableSchema {
+        TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "static_table".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![ColumnDefinition {
+                name: "ck".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            static_columns: vec![ColumnDefinition {
+                name: "s1".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            regular_columns: vec![
+                ColumnDefinition {
+                    name: "r1".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "r2".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            extensions: Default::default(),
+        }
+    }
+
+    /// The cell position `index_name` was registered at, as the memtable will
+    /// read it.
+    fn registered_index_position(
+        engine: &StorageEngine,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Option<usize> {
+        engine
+            .tables
+            .read()
+            .get(table_id)?
+            .store
+            .indexed_columns()
+            .iter()
+            .find(|(name, _)| name == index_name)
+            .map(|(_, position)| *position)
+    }
+
+    /// An index registered by `register_index_in_engine` must point at the
+    /// cell the WRITE path stores, which counts statics first.
+    ///
+    /// `regular_column_position` returns the ordinal WITHIN `regular_columns`
+    /// and never adds `static_columns.len()`, while claiming in its own doc
+    /// comment to be "matching the ordinal convention used by the CREATE INDEX
+    /// wire path". The wire path (`route_create_index`) uses
+    /// `TableMetadata::storage_column_index`, which counts statics first — and
+    /// says why: "the index must register that exact position or it would read
+    /// the wrong cell".
+    ///
+    /// So on a table with N statics the index lands N cells too low and reads
+    /// a different column's bytes. It is silent: the index is created,
+    /// `declares_index` returns true, and every existing test passes, because
+    /// every other schema helper here has zero static columns.
+    ///
+    /// This is the restart-reload resolver, so it has always been wrong after
+    /// a restart; #402 reused it for replicated DDL, so it is now also wrong
+    /// at CREATE INDEX on every replica.
+    #[test]
+    fn an_index_on_a_regular_column_is_registered_past_the_static_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "static_table");
+
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_r2",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "r2",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(built, "r2 is a regular column, so it must be built");
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_r2"),
+            Some(2),
+            "r2 is the second regular column on a table with one static, so the \
+             write path stores its cell at index 1 + 1 = 2. Registering it at 1 \
+             points the index at r1 and every read through it decodes the wrong \
+             column's bytes."
+        );
+    }
+
+    /// A static column is a stored cell too, and the executing node indexes it
+    /// (`storage_column_index` returns `Some` for `ColumnKind::Static`).
+    ///
+    /// `regular_column_position` searched only `regular_columns`, so a static
+    /// target resolved to nothing, fell past the clustering and partition-key
+    /// branches, and returned `Ok(false)` — "cannot resolve index target
+    /// column". A replica silently declined to build an index the executing
+    /// node had built.
+    #[test]
+    fn an_index_on_a_static_column_is_registered_at_its_own_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .register_table(schema_with_a_static_column())
+            .unwrap();
+        let table_id = TableId::new("test_ks", "static_table");
+
+        let built = engine
+            .register_index_in_engine(
+                &table_id,
+                IndexToRegister {
+                    index_name: "idx_s1",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "s1",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    site: "test",
+                },
+            )
+            .unwrap();
+        assert!(
+            built,
+            "a static column is a stored cell, so its index must be built here"
+        );
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id, "idx_s1"),
+            Some(0),
+            "statics occupy 0..static_columns.len(), so the only static is cell 0"
+        );
+    }
+
+    /// The fix must be the static OFFSET, not a renumbering.
+    ///
+    /// On a table with no statics the two index spaces coincide, which is the
+    /// case every other test in this file exercises and the reason the bug
+    /// stayed invisible. This pins that behaviour so a future change cannot
+    /// "fix" the offset in the wrong direction and move every existing index.
+    #[test]
+    fn an_index_on_a_table_without_statics_keeps_its_regular_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+
+        engine
+            .register_index_in_engine(
+                &table_id(),
+                IndexToRegister {
+                    index_name: "idx_val",
+                    index_type: ferrosa_index::IndexType::BTree,
+                    target_col: "val",
+                    partition_key_columns: &[],
+                    filter_predicate: None,
+                    site: "test",
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            registered_index_position(&engine, &table_id(), "idx_val"),
+            Some(0),
+            "with no statics the offset is zero and the first regular column is cell 0"
+        );
     }
 
     fn make_key(s: &str) -> DecoratedKey {
