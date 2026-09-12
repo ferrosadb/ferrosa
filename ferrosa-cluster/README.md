@@ -60,7 +60,16 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   `system_schema.indexes` registrations (t_ae06e925). `DropIndex` apply now
   also calls `engine.drop_index`, so live memtable/vector index state, sidecar
   read guards, and `IndexStateTracker` entries are removed on the applying node
-  immediately.
+  immediately. `CreateIndex` apply is now symmetric with it: it calls
+  `ddl_path::build_replicated_index`, so a `CREATE INDEX` that reaches this node
+  through the log — rather than through a CQL session — is BUILT here and not
+  merely recorded. It previously registered the index in `Schema` and
+  `system_schema.indexes` and wired nothing, which left every node but the DDL
+  coordinator holding an index the planner selects and the engine cannot answer
+  (CL-18). The same call is made by `apply_ddl_locally` (pair) and by the shared
+  `ddl_path` apply, and all three delegate to
+  `StorageEngine::register_index_in_engine` — the resolver the restart reload
+  uses — so the wiring cannot drift between the paths again.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst

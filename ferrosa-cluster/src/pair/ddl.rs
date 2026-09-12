@@ -332,6 +332,17 @@ impl DdlCoordinator {
                 self.schema
                     .create_index_internal(idx.clone())
                     .map_err(|e| ClusterError::Internal(format!("create_index: {e}")))?;
+                crate::ddl_path::build_replicated_index(
+                    &self.engine,
+                    idx,
+                    self.schema
+                        .snapshot()
+                        .tables
+                        .get(&(idx.keyspace.clone(), idx.table.clone()))
+                        .map(|t| t.partition_key.as_slice())
+                        .unwrap_or(&[]),
+                    "replicated DDL (pair)",
+                )?;
                 crate::system_table_writer::SystemTableWriter::new(Arc::clone(&self.engine))
                     .apply(
                         ferrosa_schema::system::persistence::SystemTableMutation::IndexCreated(
