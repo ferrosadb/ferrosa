@@ -75,7 +75,10 @@ flowchart TD
 **Read path.** A bound subject plans to `SubjectLookup` (point read on the
 partition key); a bound predicate to `PredicateScan` (streaming range scan +
 filter); a bound object to `ObjectScan` (secondary index
-`rdf_triples_object_idx`, falling back to a streaming range scan); nothing bound
+`rdf_triples_object_idx` when this node declares it — checked up front with
+`WritePath::declares_index_locally`, because an undeclared index read is now
+refused rather than answered empty — otherwise a streaming range scan; nothing
+creates that index today, so the scan is the live path); nothing bound
 to `FullScan`. Range scans pull one partition at a time from
 `WritePath::range_read_stream_all` and bind each row as it arrives — no
 intermediate `Vec` of fetched triples exists. The executor folds each

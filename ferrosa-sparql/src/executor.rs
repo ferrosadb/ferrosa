@@ -623,6 +623,21 @@ where
                 let _ = scan.feed(&partition)?;
             }
         }
+        TripleOp::ObjectScan { object, .. }
+            if !write_path.declares_index_locally(&table_id, OBJECT_INDEX_NAME) =>
+        {
+            // No object index on this node (nothing creates one today), so
+            // scan. This used to be reached by reading the missing index as
+            // "no hits"; an undeclared index is now refused, not answered
+            // empty (t_50c8bc7d), so the choice is made here, up front.
+            tracing::warn!(
+                object,
+                index = OBJECT_INDEX_NAME,
+                "ObjectScan: object index is not declared; streaming full scan \
+                 with filtering"
+            );
+            stream_scan(&table_id, write_path, &mut scan).await?;
+        }
         TripleOp::ObjectScan { object, .. } => {
             // Keyed index read first. The stream keeps transport bounded and
             // lets the scan stop as soon as its sink is satisfied.
