@@ -6773,6 +6773,12 @@ impl StorageEngine {
         after: Option<&ferrosa_index::RowPosition>,
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> ferrosa_common::Result<()> {
+        if !self.index_is_current(table_id, index_name) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "secondary index '{index_name}' on {table_id} is not current; refusing to return \
+                 incomplete results while index backfill is pending or failed"
+            )));
+        }
         let tables = self.tables.read();
         let state = tables.get(table_id).ok_or_else(|| {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -18002,6 +18008,41 @@ mod tests {
                 .iter()
                 .all(|mapped| *mapped),
             "the backfilled sidecar is mapped"
+        );
+    }
+
+    /// A planner-visible index with outstanding backfill work must never answer
+    /// an empty or partial result as though it were complete. Callers can retry
+    /// after the tracker becomes current, but they cannot recover rows hidden by
+    /// a false successful response.
+    #[test]
+    fn a_pending_index_read_fails_loud() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("present"), make_row(b"shared", 1000), 1000)
+            .unwrap();
+        engine.index_tracker.mark_pending(
+            tid.keyspace(),
+            tid.table(),
+            "val_idx",
+            "backfill-not-installed",
+            1,
+        );
+
+        let error = collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec()))
+            .expect_err("a pending index must refuse to return a partial result");
+        assert!(
+            error.to_string().contains("not current"),
+            "pending-index error must explain why the read was refused: {error}"
         );
     }
 

@@ -176,7 +176,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index
   means schema and engine disagree, and an empty answer from one node is
-  unioned by the coordinator into a short result (ST-20).
+  unioned by the coordinator into a short result (ST-20). The same read also
+  refuses an index whose tracker is not `Current`: CREATE INDEX backfill and a
+  failed sidecar publish may leave only a subset of postings available, and
+  that subset must never be reported as a complete result. Callers can retry
+  after the bounded background build finishes.
   Index postings are kept in row order — `(partition key, clustering)` — in
   every source: `MemtableIndex` inserts each key's postings sorted and unique,
   and sidecars are written in `(key, row)` order and re-sorted once at load,

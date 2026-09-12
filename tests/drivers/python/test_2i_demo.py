@@ -22,6 +22,7 @@ import uuid
 
 import pytest
 from cassandra.cluster import Cluster
+from cassandra.query import BatchStatement, BatchType
 from cassandra.policies import RoundRobinPolicy
 
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
@@ -76,14 +77,36 @@ def timed_query(session, cql, label=""):
     return rows, elapsed_ms
 
 
-def wait_for_index_build(session, ks, table, index_name, timeout_s=30):
+def wait_for_index_build(session, probe_cql, index_name, timeout_s=30):
     """Poll until the index appears to be functional.
 
     After CREATE INDEX, ferrosa builds sidecar files in the background.
     We poll by running a known-match query until it returns results or
     we timeout.
     """
-    time.sleep(1)  # initial settle time for index registration
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            if list(session.execute(probe_cql)):
+                return
+        except Exception as error:  # index reads fail loud until backfill is current
+            last_error = error
+        time.sleep(0.1)
+
+    pytest.fail(
+        f"index {index_name} did not become queryable within {timeout_s}s; "
+        f"last error: {last_error}"
+    )
+
+
+def seed_unlogged_batch(session, insert_cql, rows):
+    """Seed one demo table without paying one network round trip per row."""
+    prepared = session.prepare(insert_cql)
+    batch = BatchStatement(batch_type=BatchType.UNLOGGED)
+    for row in rows:
+        batch.add(prepared, row)
+    session.execute(batch)
 
 
 def print_comparison(index_type, without_ms, with_ms, rows_without, rows_with):
@@ -120,18 +143,32 @@ class TestBTreeIndex:
         )
 
         # Insert ROW_COUNT rows with predictable distribution
-        cities = ["NYC", "SF", "LA", "Chicago", "Boston",
-                  "Seattle", "Denver", "Miami", "Dallas", "Portland"]
-        for i in range(ROW_COUNT):
-            uid = uuid.uuid4()
-            email = f"user{i}@example.com"
-            age = 18 + (i % 60)
-            city = cities[i % len(cities)]
-            session.execute(
-                f"INSERT INTO {keyspace}.{self.TABLE} "
-                f"(id, email, age, city) VALUES "
-                f"({uid}, '{email}', {age}, '{city}')"
-            )
+        cities = [
+            "NYC",
+            "SF",
+            "LA",
+            "Chicago",
+            "Boston",
+            "Seattle",
+            "Denver",
+            "Miami",
+            "Dallas",
+            "Portland",
+        ]
+        seed_unlogged_batch(
+            session,
+            f"INSERT INTO {keyspace}.{self.TABLE} "
+            "(id, email, age, city) VALUES (?, ?, ?, ?)",
+            (
+                (
+                    uuid.uuid4(),
+                    f"user{i}@example.com",
+                    18 + (i % 60),
+                    cities[i % len(cities)],
+                )
+                for i in range(ROW_COUNT)
+            ),
+        )
 
         yield
 
@@ -151,7 +188,11 @@ class TestBTreeIndex:
             f"CREATE INDEX IF NOT EXISTS idx_btree_email "
             f"ON {keyspace}.{self.TABLE} (email) USING 'btree'"
         )
-        wait_for_index_build(session, keyspace, self.TABLE, "idx_btree_email")
+        wait_for_index_build(
+            session,
+            f"SELECT * FROM {keyspace}.{self.TABLE} WHERE email = '{target_email}'",
+            "idx_btree_email",
+        )
 
         # WITH index — indexed lookup
         rows_with, ms_with = timed_query(
@@ -181,7 +222,11 @@ class TestBTreeIndex:
             f"CREATE INDEX IF NOT EXISTS idx_btree_age "
             f"ON {keyspace}.{self.TABLE} (age) USING 'btree'"
         )
-        wait_for_index_build(session, keyspace, self.TABLE, "idx_btree_age")
+        wait_for_index_build(
+            session,
+            f"SELECT * FROM {keyspace}.{self.TABLE} WHERE age > 70 LIMIT 1",
+            "idx_btree_age",
+        )
 
         # WITH index — range scan
         rows_with, ms_with = timed_query(
@@ -218,15 +263,15 @@ class TestHashIndex:
         )
 
         statuses = ["active", "inactive", "suspended", "pending"]
-        for i in range(ROW_COUNT):
-            uid = uuid.uuid4()
-            username = f"user_{i:05d}"
-            status = statuses[i % len(statuses)]
-            session.execute(
-                f"INSERT INTO {keyspace}.{self.TABLE} "
-                f"(id, username, status) VALUES "
-                f"({uid}, '{username}', '{status}')"
-            )
+        seed_unlogged_batch(
+            session,
+            f"INSERT INTO {keyspace}.{self.TABLE} "
+            "(id, username, status) VALUES (?, ?, ?)",
+            (
+                (uuid.uuid4(), f"user_{i:05d}", statuses[i % len(statuses)])
+                for i in range(ROW_COUNT)
+            ),
+        )
 
         yield
 
@@ -246,7 +291,11 @@ class TestHashIndex:
             f"CREATE INDEX IF NOT EXISTS idx_hash_username "
             f"ON {keyspace}.{self.TABLE} (username) USING 'hash'"
         )
-        wait_for_index_build(session, keyspace, self.TABLE, "idx_hash_username")
+        wait_for_index_build(
+            session,
+            f"SELECT * FROM {keyspace}.{self.TABLE} WHERE username = '{target}'",
+            "idx_hash_username",
+        )
 
         # WITH index
         rows_with, ms_with = timed_query(
@@ -275,7 +324,11 @@ class TestHashIndex:
             f"CREATE INDEX IF NOT EXISTS idx_hash_status "
             f"ON {keyspace}.{self.TABLE} (status) USING 'hash'"
         )
-        wait_for_index_build(session, keyspace, self.TABLE, "idx_hash_status")
+        wait_for_index_build(
+            session,
+            f"SELECT * FROM {keyspace}.{self.TABLE} WHERE status = 'suspended' LIMIT 1",
+            "idx_hash_status",
+        )
 
         # WITH index
         rows_with, ms_with = timed_query(
@@ -314,22 +367,45 @@ class TestCompositeIndex:
             ")"
         )
 
-        last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones",
-                      "Garcia", "Miller", "Davis", "Rodriguez", "Martinez"]
-        first_names = ["Alice", "Bob", "Carol", "Dave", "Eve",
-                       "Frank", "Grace", "Hank", "Iris", "Jack"]
+        last_names = [
+            "Smith",
+            "Johnson",
+            "Williams",
+            "Brown",
+            "Jones",
+            "Garcia",
+            "Miller",
+            "Davis",
+            "Rodriguez",
+            "Martinez",
+        ]
+        first_names = [
+            "Alice",
+            "Bob",
+            "Carol",
+            "Dave",
+            "Eve",
+            "Frank",
+            "Grace",
+            "Hank",
+            "Iris",
+            "Jack",
+        ]
         depts = ["Engineering", "Sales", "Marketing", "Support", "Finance"]
-
-        for i in range(ROW_COUNT):
-            uid = uuid.uuid4()
-            last = last_names[i % len(last_names)]
-            first = first_names[(i // len(last_names)) % len(first_names)]
-            dept = depts[i % len(depts)]
-            session.execute(
-                f"INSERT INTO {keyspace}.{self.TABLE} "
-                f"(id, last_name, first_name, department) VALUES "
-                f"({uid}, '{last}', '{first}', '{dept}')"
-            )
+        seed_unlogged_batch(
+            session,
+            f"INSERT INTO {keyspace}.{self.TABLE} "
+            "(id, last_name, first_name, department) VALUES (?, ?, ?, ?)",
+            (
+                (
+                    uuid.uuid4(),
+                    last_names[i % len(last_names)],
+                    first_names[(i // len(last_names)) % len(first_names)],
+                    depts[i % len(depts)],
+                )
+                for i in range(ROW_COUNT)
+            ),
+        )
 
         yield
 
@@ -347,7 +423,12 @@ class TestCompositeIndex:
             f"CREATE INDEX IF NOT EXISTS idx_composite_name "
             f"ON {keyspace}.{self.TABLE} (last_name, first_name) USING 'composite'"
         )
-        wait_for_index_build(session, keyspace, self.TABLE, "idx_composite_name")
+        wait_for_index_build(
+            session,
+            f"SELECT * FROM {keyspace}.{self.TABLE} "
+            "WHERE last_name = 'Smith' AND first_name = 'Alice' LIMIT 1",
+            "idx_composite_name",
+        )
 
         # WITH index
         rows_with, ms_with = timed_query(
