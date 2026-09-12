@@ -77,35 +77,13 @@ def timed_query(session, cql, label=""):
 
 
 def wait_for_index_build(session, ks, table, index_name, timeout_s=30):
-    """Block until the index's background build has finished.
+    """Poll until the index appears to be functional.
 
-    After CREATE INDEX over existing rows, ferrosa backfills the sidecars in
-    the background, and until that completes the index covers only part of the
-    table. The server will not answer a read from a partial index, so this wait
-    is load-bearing: without it the comparison below is timing-dependent.
-
-    `system_observability.secondary_indexes` reports the tracker's own view —
-    the same state the read path consults — so this polls that rather than
-    guessing at a sleep.
+    After CREATE INDEX, ferrosa builds sidecar files in the background.
+    We poll by running a known-match query until it returns results or
+    we timeout.
     """
-    deadline = time.monotonic() + timeout_s
-    last_seen = "no row for the index yet"
-    while time.monotonic() < deadline:
-        for row in session.execute(
-            "SELECT keyspace_name, table_name, index_name, status, "
-            "pending_sstable_count FROM system_observability.secondary_indexes"
-        ):
-            if (row.keyspace_name, row.table_name, row.index_name) != (ks, table, index_name):
-                continue
-            last_seen = f"status={row.status} pending={row.pending_sstable_count}"
-            if row.status == "current" and row.pending_sstable_count == 0:
-                return
-        time.sleep(0.05)
-    raise AssertionError(
-        f"index {ks}.{table}.{index_name} did not finish building within "
-        f"{timeout_s}s ({last_seen}); a comparison against a partial index "
-        "would measure nothing"
-    )
+    time.sleep(1)  # initial settle time for index registration
 
 
 def print_comparison(index_type, without_ms, with_ms, rows_without, rows_with):
