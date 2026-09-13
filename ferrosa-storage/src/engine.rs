@@ -370,6 +370,27 @@ impl Drop for TempSortTableReservation {
 
 /// Configuration for the entire storage engine.
 ///
+/// What one [`StorageEngine::rebuild_index`] call actually did.
+///
+/// Carries both numbers on purpose. `sstables_rebuilt` alone cannot
+/// distinguish a complete repair from a partial one, and a partial repair
+/// leaves reads through the index incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildOutcome {
+    /// SSTables whose sidecar was built and installed.
+    pub sstables_rebuilt: usize,
+    /// SSTables the table held when the rebuild started.
+    pub sstables_total: usize,
+}
+
+impl RebuildOutcome {
+    /// Whether every SSTable is now covered.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.sstables_rebuilt == self.sstables_total
+    }
+}
+
 /// Composes sub-configurations for each component. Use `from_env()` for
 /// production (reads `FERROSA_*` env vars) or `test_config()` for tests.
 pub struct StorageEngineConfig {
@@ -4530,6 +4551,35 @@ impl StorageEngine {
         //
         // Mark each SSTable pending BEFORE submitting, so a consult that finds
         // the index empty can only trust it once the backfill has completed.
+        self.backfill_partition_key_index(
+            state,
+            table_id,
+            index_name,
+            partition_key_component,
+            index_type,
+        );
+
+        Ok(())
+    }
+
+    /// Build (or rebuild) the partition-key index sidecars for every SSTable
+    /// this table currently holds, installing each into the live view.
+    ///
+    /// Shared by `add_partition_key_index` and [`Self::rebuild_index`] on
+    /// purpose: a repair that took a different code path from the original
+    /// build would be a second implementation of the thing that broke, and
+    /// the two would drift.
+    ///
+    /// Returns the number of SSTables successfully indexed.
+    fn backfill_partition_key_index(
+        &self,
+        state: &mut TableState,
+        table_id: &TableId,
+        index_name: &str,
+        partition_key_component: usize,
+        index_type: ferrosa_index::IndexType,
+    ) -> usize {
+        let mut rebuilt = 0usize;
         let pk_total = state.store.partition_key_column_count();
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
@@ -4616,6 +4666,7 @@ impl StorageEngine {
                         index_name,
                         &sst_id,
                     );
+                    rebuilt += 1;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4637,7 +4688,92 @@ impl StorageEngine {
             }
         }
 
-        Ok(())
+        rebuilt
+    }
+
+    /// Rebuild one index's sidecars over every SSTable this table holds.
+    ///
+    /// The remedy for the state `ferrosa-ctl index list` reports as `stale` or
+    /// `failed`: SSTables whose backfill never ran or errored, leaving reads
+    /// through the index short. A `failed` index does not clear on its own —
+    /// the retry backoff runs out and the rows stay missing.
+    ///
+    /// Runs the SAME backfill path as `add_partition_key_index`. A repair that
+    /// took a different route from the original build would be a second
+    /// implementation of the thing that broke, and the two would drift.
+    ///
+    /// Synchronous, like the initial backfill: it returns when the index is
+    /// actually usable, which is what an operator running a repair expects
+    /// "done" to mean.
+    ///
+    /// # Errors
+    ///
+    /// Fails loudly when the table is not registered, or when this store has
+    /// no index by that name. Reporting success for an index that does not
+    /// exist would tell an operator their repair worked.
+    pub fn rebuild_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> ferrosa_common::Result<RebuildOutcome> {
+        let mut tables = self.tables.write();
+        let state = tables.get_mut(table_id).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+        })?;
+
+        // Distinguish "there is no such index" from "that index exists and this
+        // rebuild cannot do it yet". Reporting the second as the first sends an
+        // operator hunting a typo in a name that is correct — which is exactly
+        // what happened the first time this was run against a live cluster,
+        // where all six broken indexes are `secondary` rather than
+        // partition-key.
+        let (component, index_type) = match state.store.partition_key_index_def(index_name) {
+            Some(def) => def,
+            None => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "{table_id} has no PARTITION-KEY index named '{index_name}'. If that index \
+                     exists and is of another kind, rebuild does not handle it yet — \
+                     `ferrosa-ctl index list` shows each index's kind."
+                )));
+            }
+        };
+
+        let sstables_total = state.store.sstable_generation_ids().len();
+        tracing::info!(
+            index_name,
+            table = %table_id,
+            sstables_total,
+            "engine: index rebuild starting"
+        );
+
+        let sstables_rebuilt =
+            self.backfill_partition_key_index(state, table_id, index_name, component, index_type);
+
+        // Report the shortfall rather than only the success count: a rebuild
+        // that indexed 3 of 17 SSTables has not repaired the index, and an
+        // operator reading "rebuilt 3" would reasonably think it had.
+        if sstables_rebuilt < sstables_total {
+            tracing::warn!(
+                index_name,
+                table = %table_id,
+                sstables_rebuilt,
+                sstables_total,
+                "engine: index rebuild did NOT cover every SSTable; reads through this \
+                 index are still incomplete. See the backfill errors above for why."
+            );
+        } else {
+            tracing::info!(
+                index_name,
+                table = %table_id,
+                sstables_rebuilt,
+                "engine: index rebuild complete"
+            );
+        }
+
+        Ok(RebuildOutcome {
+            sstables_rebuilt,
+            sstables_total,
+        })
     }
 
     /// Register a full-text index on a table.
@@ -11944,6 +12080,29 @@ mod tests {
         TableId::new("test_ks", "test_table")
     }
 
+    /// Every `*.sidecar` file under a data dir, at any depth.
+    ///
+    /// Hand-rolled rather than pulling in `walkdir` for one test: the tree is
+    /// a tempdir with a handful of entries.
+    fn walkdir_sidecars(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "sidecar") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
     fn collect_index_results(
         engine: &StorageEngine,
         table_id: &TableId,
@@ -18827,6 +18986,141 @@ mod tests {
              flushed BEFORE the index existed, and the index returned {found}. \
              Zero means no backfill was submitted; a partial count means it was \
              submitted and did not finish."
+        );
+    }
+
+    /// Commanding a rebuild must actually put the rows back in the index.
+    ///
+    /// The live condition this exists for: `ferrosa-ctl index list` reports
+    /// six of thirty-one indexes on a dev cluster as `stale` or `failed`, with
+    /// 11 to 17 SSTables queued apiece, on the tables memory search reads.
+    /// `failed` never clears on its own — the retry backoff runs out and the
+    /// rows stay missing.
+    ///
+    /// The assertion is deliberately about ROWS, not about the command being
+    /// accepted. A rebuild that returns `Ok(())` and indexes nothing is the
+    /// failure mode worth guarding: it reads as a repair and leaves the index
+    /// exactly as short as it was.
+    #[test]
+    fn a_rebuild_restores_an_index_whose_sidecars_were_lost() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let tid = TableId::new("test_ks", "entity_store");
+
+        let schema = || ferrosa_common::TableSchema {
+            keyspace: "test_ks".into(),
+            table: "entity_store".into(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ferrosa_common::ColumnDefinition {
+                name: "body".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            }],
+            extensions: Default::default(),
+        };
+        engine.register_table(schema()).unwrap();
+
+        // Data first, flushed, so the index has something to backfill.
+        let mut tenant_a_rows = 0usize;
+        for i in 0..8u8 {
+            let mut tenant = [0u8; 16];
+            tenant[0] = if i % 2 == 0 { 1 } else { 2 };
+            if i % 2 == 0 {
+                tenant_a_rows += 1;
+            }
+            let mut session = [0u8; 16];
+            session[0] = i;
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(format!("row-{i}").into_bytes(), 1000))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1000),
+            };
+            engine
+                .write(&tid, &make_entity_store_pk(tenant, session), row, 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        engine
+            .add_partition_key_index(&tid, "idx_by_tenant", 0, ferrosa_index::IndexType::BTree)
+            .unwrap();
+
+        let mut tenant_a = [0u8; 16];
+        tenant_a[0] = 1;
+        let key = IndexKey(tenant_a.to_vec());
+
+        let count = |e: &StorageEngine| -> usize {
+            collect_index_results(e, &tid, "idx_by_tenant", &key)
+                .unwrap()
+                .iter()
+                .map(|p| p.rows.len())
+                .sum()
+        };
+
+        assert_eq!(
+            count(&engine),
+            tenant_a_rows,
+            "precondition: the fresh backfill must cover the flushed rows"
+        );
+
+        // Now break it the way the cluster is broken: the sidecars that carry
+        // the index for those SSTables are gone. Nothing else changes — the
+        // schema still declares the index and the data is untouched.
+        let mut removed = 0usize;
+        for entry in walkdir_sidecars(dir.path()) {
+            std::fs::remove_file(&entry).unwrap();
+            removed += 1;
+        }
+        assert!(
+            removed > 0,
+            "the test must actually remove sidecars to mean anything"
+        );
+
+        assert!(
+            walkdir_sidecars(dir.path()).is_empty(),
+            "precondition: the sidecars must actually be gone"
+        );
+
+        // The command under test. Note what is NOT used to set this up:
+        // `add_partition_key_index` backfills on its own, so calling it again
+        // would repair the index before `rebuild_index` was ever reached — the
+        // first cut of this test did exactly that and passed 4 of 4 without
+        // exercising the rebuild at all.
+        let outcome = engine.rebuild_index(&tid, "idx_by_tenant").unwrap();
+
+        // Did it do real work? The sidecars are the artifact a rebuild
+        // produces; asserting only on rows would pass on a rebuild that
+        // silently did nothing while the in-memory index still answered.
+        assert!(
+            !walkdir_sidecars(dir.path()).is_empty(),
+            "a rebuild must write the sidecars back to disk, so the repair survives a restart"
+        );
+        assert!(
+            outcome.sstables_rebuilt > 0,
+            "the outcome must report the work it did, so an operator can tell a \
+             repair from a rebuild that found nothing to do"
+        );
+        assert!(
+            outcome.is_complete(),
+            "every SSTable must be covered: {} of {} were rebuilt, and a partial \
+             rebuild leaves reads through this index incomplete",
+            outcome.sstables_rebuilt,
+            outcome.sstables_total
+        );
+
+        // And is it still usable?
+        assert_eq!(
+            count(&engine),
+            tenant_a_rows,
+            "after a commanded rebuild the index must answer for every row: \
+             {tenant_a_rows} exist for this tenant"
         );
     }
 
