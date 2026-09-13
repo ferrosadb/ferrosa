@@ -4499,11 +4499,7 @@ pub async fn route_prepared_select_fast(
     // serve: every WHERE clause an equality on a bound term, no ORDER BY, no
     // ANN, no aggregation. A query that needs filtering does not reach the end
     // of them.
-    if s.distinct
-        || !s.order_by.is_empty()
-        || s.ann_of.is_some()
-        || s.where_clauses.is_empty()
-    {
+    if s.distinct || !s.order_by.is_empty() || s.ann_of.is_some() || s.where_clauses.is_empty() {
         return None;
     }
     if s.columns.iter().any(|col| match col {
