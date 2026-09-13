@@ -156,11 +156,30 @@ enum Commands {
         force: bool,
     },
 
+    /// Secondary index build state, and repair for the ones that need it.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+
     /// Offline SSTable analysis and recovery (operates on a data directory; no
     /// live node connection required).
     Sstable {
         #[command(subcommand)]
         action: SstableAction,
+    },
+}
+
+/// Index sub-actions. These ask ONE node: an index can be built on this
+/// replica and failed on another, so the answers name the node they came from.
+#[derive(Debug, Subcommand)]
+enum IndexAction {
+    /// Show every index this node has, and whether reads through it are
+    /// complete. Reads `system_observability.secondary_indexes`.
+    List {
+        /// Show only indexes that cannot answer in full.
+        #[arg(long)]
+        problems: bool,
     },
 }
 
@@ -620,6 +639,11 @@ async fn main() {
             )
             .await
         }
+        Commands::Index { action } => match action {
+            IndexAction::List { problems } => commands::index::run_index_list(addr, problems)
+                .await
+                .map_err(Into::into),
+        },
         Commands::Sstable { action } => match action {
             SstableAction::Scan {
                 dir,

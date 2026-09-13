@@ -16,6 +16,11 @@ use tabled::settings::Style;
 use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
 
+/// Index health and rebuild (`ferrosa-ctl index ...`). Names the same two
+/// states the query planner already distinguishes when it withholds an index
+/// and takes a scan instead.
+pub mod index;
+
 /// Offline SSTable analysis & recovery (`ferrosa-ctl sstable ...`). Operates on
 /// an on-disk table directory with no network connection.
 pub mod sstable;
