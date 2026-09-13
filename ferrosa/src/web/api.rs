@@ -113,6 +113,91 @@ struct RepairParams {
     rf: Option<usize>,
 }
 
+/// Index repair routes, nested at `/api/index`.
+pub fn index_routes() -> Router<WebAppState> {
+    Router::new().route("/rebuild", post(index_rebuild_handler))
+}
+
+#[derive(serde::Deserialize)]
+struct IndexRebuildParams {
+    keyspace: Option<String>,
+    table: Option<String>,
+    index: Option<String>,
+}
+
+/// `POST /api/index/rebuild?keyspace=X&table=Y&index=Z` — rebuild one index's
+/// sidecars over every SSTable this node holds.
+///
+/// The therapeutic half of index observability. `system_observability
+/// .secondary_indexes` reports an index as `stale` or `failed`; this is what
+/// an operator can do about it. A `failed` index does not clear on its own —
+/// the retry backoff runs out and the rows stay missing.
+///
+/// Acts on THIS node only, like the diagnostic it pairs with. An index can be
+/// healthy here and failed on a replica, so repairing a cluster means asking
+/// each node. Saying "rebuilt" for one node while implying three would be the
+/// expensive direction to be wrong in.
+///
+/// Answers with the counts, not just a status: a rebuild that covered 3 of 17
+/// SSTables has not repaired the index, and `complete: false` says so.
+async fn index_rebuild_handler(
+    State(state): State<crate::web::WebAppState>,
+    axum::extract::Query(params): axum::extract::Query<IndexRebuildParams>,
+) -> (StatusCode, Json<Value>) {
+    // Every parameter is required. Defaulting any of them would mean
+    // rebuilding something the operator did not name.
+    let (keyspace, table, index) = match (params.keyspace, params.table, params.index) {
+        (Some(k), Some(t), Some(i)) => (k, t, i),
+        (k, t, i) => {
+            let mut missing = Vec::new();
+            if k.is_none() {
+                missing.push("keyspace");
+            }
+            if t.is_none() {
+                missing.push("table");
+            }
+            if i.is_none() {
+                missing.push("index");
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("missing required query parameter(s): {}", missing.join(", ")),
+                })),
+            );
+        }
+    };
+
+    let table_id = ferrosa_storage::TableId::new(&keyspace, &table);
+    match state.storage.rebuild_index(&table_id, &index) {
+        Ok(outcome) => {
+            let body = json!({
+                "keyspace": keyspace,
+                "table": table,
+                "index": index,
+                "sstables_rebuilt": outcome.sstables_rebuilt,
+                "sstables_total": outcome.sstables_total,
+                "complete": outcome.is_complete(),
+            });
+            if outcome.is_complete() {
+                (StatusCode::OK, Json(body))
+            } else {
+                // 207: the rebuild ran and did not finish the job. Answering
+                // 200 here would tell an operator the index is repaired while
+                // reads through it are still incomplete.
+                (StatusCode::MULTI_STATUS, Json(body))
+            }
+        }
+        // The engine refuses an unregistered table or an index this node does
+        // not have. Both are the operator naming something that is not there,
+        // which is a 400 — and must never be a 200.
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 /// `POST /api/cluster/repair?keyspace=X&table=Y[&rf=N]` — run anti-entropy
 /// repair against every peer that replicates the given table. Requires the
 /// node to be in cluster mode with a token ring and a live `PeerManager`.
@@ -1195,6 +1280,58 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A rebuild of an index that does not exist must NOT report success.
+    ///
+    /// The therapeutic endpoint's whole value is that an operator can trust
+    /// "done" to mean the rows are back. An endpoint that answers 200 for a
+    /// typo'd index name teaches them the opposite.
+    #[tokio::test]
+    async fn api_index_rebuild_refuses_an_index_that_does_not_exist() {
+        let state = make_state();
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/index/rebuild?keyspace=agent_memory&table=entity_store&index=idx_typo")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a rebuild of an index the node does not have must not answer 200"
+        );
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "404 here means the route is unwired, not that the index is missing"
+        );
+    }
+
+    /// Missing parameters are a client error, not a silent no-op.
+    #[tokio::test]
+    async fn api_index_rebuild_requires_keyspace_table_and_index() {
+        for uri in [
+            "/api/index/rebuild",
+            "/api/index/rebuild?keyspace=agent_memory",
+            "/api/index/rebuild?keyspace=agent_memory&table=entity_store",
+        ] {
+            let router = crate::web::build_router(make_state());
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri} omits a required parameter and must say so"
+            );
+        }
     }
 
     /// Decommission endpoint rejects invalid UUIDs with 400 Bad Request.

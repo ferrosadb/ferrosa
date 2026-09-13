@@ -100,6 +100,7 @@ pub fn build_router(state: WebAppState) -> Router {
         .nest("/api", snapshots::snapshot_routes())
         .nest("/api", observability::routes())
         .nest("/api/cluster", api::cluster_routes())
+        .nest("/api/index", api::index_routes())
         .nest("/api/debug", debug::debug_routes())
         .route("/api/ws", get(ws::ws_handler))
         .nest("/admin", api::admin_routes())

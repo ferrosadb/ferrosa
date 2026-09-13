@@ -181,6 +181,18 @@ enum IndexAction {
         #[arg(long)]
         problems: bool,
     },
+
+    /// Rebuild one index's sidecars on this node, so reads through it are
+    /// complete again. Exits non-zero if the rebuild does not cover every
+    /// SSTable — a partial repair is not a success.
+    Rebuild {
+        /// Keyspace holding the table.
+        keyspace: String,
+        /// Table the index is on.
+        table: String,
+        /// Index to rebuild.
+        index: String,
+    },
 }
 
 /// SSTable analysis / recovery sub-actions (offline, filesystem-only).
@@ -643,6 +655,14 @@ async fn main() {
             IndexAction::List { problems } => commands::index::run_index_list(addr, problems)
                 .await
                 .map_err(Into::into),
+            IndexAction::Rebuild {
+                keyspace,
+                table,
+                index,
+            } => {
+                commands::index::run_index_rebuild(&web_host, web_port, &keyspace, &table, &index)
+                    .await
+            }
         },
         Commands::Sstable { action } => match action {
             SstableAction::Scan {

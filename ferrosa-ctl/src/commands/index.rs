@@ -224,6 +224,117 @@ pub async fn run_index_list(addr: SocketAddr, problems_only: bool) -> Result<(),
     Ok(())
 }
 
+/// Build the rebuild URL for one index on one node.
+///
+/// Split out so the query-string construction is testable without a server —
+/// a misspelled parameter name would otherwise surface as a 400 at 3am.
+#[must_use]
+pub fn rebuild_url(host: &str, web_port: u16, keyspace: &str, table: &str, index: &str) -> String {
+    format!(
+        "http://{host}:{web_port}/api/index/rebuild?keyspace={keyspace}&table={table}&index={index}"
+    )
+}
+
+/// What the node said about a rebuild it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildReport {
+    pub sstables_rebuilt: u64,
+    pub sstables_total: u64,
+    pub complete: bool,
+}
+
+/// Read the node's rebuild response.
+///
+/// `complete` is taken from the node rather than recomputed here: the node
+/// knows how many SSTables it holds, and a client that guessed would drift.
+/// A response missing the counts is a disagreement about the API, reported
+/// rather than defaulted — defaulting to zero would render a failed repair as
+/// "rebuilt 0 of 0, complete".
+///
+/// # Errors
+///
+/// Returns a message when the body is not the expected shape.
+pub fn parse_rebuild_report(body: &serde_json::Value) -> Result<RebuildReport, String> {
+    let rebuilt = body
+        .get("sstables_rebuilt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("response has no `sstables_rebuilt`; this ferrosa-ctl and the node disagree about /api/index/rebuild")?;
+    let total = body
+        .get("sstables_total")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("response has no `sstables_total`; this ferrosa-ctl and the node disagree about /api/index/rebuild")?;
+    let complete = body
+        .get("complete")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("response has no `complete`; refusing to guess whether the repair finished")?;
+    Ok(RebuildReport {
+        sstables_rebuilt: rebuilt,
+        sstables_total: total,
+        complete,
+    })
+}
+
+/// `ferrosa-ctl index rebuild` — repair one index on one node.
+///
+/// # Errors
+///
+/// Fails when the node is unreachable, refuses the request, or answers in a
+/// shape this tool does not recognise.
+pub async fn run_index_rebuild(
+    web_host: &str,
+    web_port: u16,
+    keyspace: &str,
+    table: &str,
+    index: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = rebuild_url(web_host, web_port, keyspace, table, index);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status.as_u16() == 404 {
+        return Err(format!(
+            "the node at {web_host}:{web_port} has no /api/index/rebuild endpoint (HTTP 404). \
+             It is older than this ferrosa-ctl."
+        )
+        .into());
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("could not read the node's response ({e}): {text}"))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&text);
+        return Err(format!("{keyspace}.{table} index '{index}': {msg}").into());
+    }
+
+    let report = parse_rebuild_report(&body)?;
+    if report.complete {
+        println!(
+            "Rebuilt '{index}' on {keyspace}.{table}: {} of {} SSTables. Reads through it are \
+             complete on {web_host}.",
+            report.sstables_rebuilt, report.sstables_total
+        );
+        Ok(())
+    } else {
+        // A partial rebuild is NOT a success. Saying so in the exit code is
+        // what keeps a repair script from marching on.
+        Err(format!(
+            "Rebuilt '{index}' on {keyspace}.{table}: only {} of {} SSTables. Reads through \
+             this index are STILL incomplete — check the node log for `index backfill FAILED` \
+             and the reason.",
+            report.sstables_rebuilt, report.sstables_total
+        )
+        .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +443,59 @@ mod tests {
             err.to_string().contains("newer than the node"),
             "the message must say what to do about it: {err}"
         );
+    }
+    #[test]
+    fn the_rebuild_url_names_every_parameter_the_node_requires() {
+        let u = rebuild_url(
+            "10.0.0.4",
+            9090,
+            "agent_memory",
+            "entity_store",
+            "idx_entity_by_id",
+        );
+        assert!(
+            u.starts_with("http://10.0.0.4:9090/api/index/rebuild?"),
+            "{u}"
+        );
+        assert!(u.contains("keyspace=agent_memory"), "{u}");
+        assert!(u.contains("table=entity_store"), "{u}");
+        assert!(u.contains("index=idx_entity_by_id"), "{u}");
+    }
+
+    #[test]
+    fn a_complete_rebuild_reports_complete() {
+        let body = serde_json::json!({
+            "sstables_rebuilt": 17, "sstables_total": 17, "complete": true
+        });
+        let r = parse_rebuild_report(&body).unwrap();
+        assert!(r.complete);
+        assert_eq!(r.sstables_rebuilt, 17);
+    }
+
+    #[test]
+    fn a_partial_rebuild_is_not_reported_as_complete() {
+        // 3 of 17 leaves reads incomplete. Rendering that as success is the
+        // failure this whole command exists to avoid.
+        let body = serde_json::json!({
+            "sstables_rebuilt": 3, "sstables_total": 17, "complete": false
+        });
+        let r = parse_rebuild_report(&body).unwrap();
+        assert!(!r.complete);
+    }
+
+    #[test]
+    fn a_response_missing_the_counts_is_refused_not_defaulted() {
+        // Defaulting to zero would render a failed repair as
+        // "rebuilt 0 of 0, complete".
+        let err = parse_rebuild_report(&serde_json::json!({ "ok": true }))
+            .expect_err("a shapeless response must not parse");
+        assert!(err.contains("sstables_rebuilt"), "{err}");
+    }
+
+    #[test]
+    fn a_response_without_complete_is_refused_rather_than_guessed() {
+        let body = serde_json::json!({ "sstables_rebuilt": 5, "sstables_total": 5 });
+        let err = parse_rebuild_report(&body).expect_err("must not infer completeness");
+        assert!(err.contains("refusing to guess"), "{err}");
     }
 }
