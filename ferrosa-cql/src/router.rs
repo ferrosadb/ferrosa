@@ -4481,12 +4481,25 @@ pub async fn route_prepared_select_fast(
     s: &SelectStatement,
     bound_terms: &[Term],
 ) -> Option<Result<RouteResult, CqlError>> {
-    if s.distinct
-        || s.allow_filtering
-        || !s.order_by.is_empty()
-        || s.ann_of.is_some()
-        || s.where_clauses.is_empty()
-    {
+    // `allow_filtering` is deliberately NOT disqualifying.
+    //
+    // It is a PERMISSION — "I will take the scan if no index can serve me" —
+    // not a request to be scanned. A query that supplies the whole partition
+    // key needs no permission and must not be punished for carrying one.
+    //
+    // It used to bail here, and the memory server sets the flag on every read
+    // (see the note at the top of the secondary-index planner). So every one
+    // of its reads, including exact single-partition lookups, was disqualified
+    // from this path, fell through to the index planner, found no index, and
+    // ran as ScanPlan::FullScan. On a live cluster that was thousands of full
+    // scans of tables whose partition key the query fully specified, enough
+    // I/O to freeze a node's CQL runtime and time out replica reads.
+    //
+    // The checks below still establish that this is the shape this path can
+    // serve: every WHERE clause an equality on a bound term, no ORDER BY, no
+    // ANN, no aggregation. A query that needs filtering does not reach the end
+    // of them.
+    if s.distinct || !s.order_by.is_empty() || s.ann_of.is_some() || s.where_clauses.is_empty() {
         return None;
     }
     if s.columns.iter().any(|col| match col {
@@ -15018,6 +15031,91 @@ mod tests {
             _ => panic!("expected rows result"),
         }
         assert_eq!(state.query_tracker.total_executed(), executed_before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_complete_partition_key_is_keyed_even_with_allow_filtering() {
+        // ALLOW FILTERING is a PERMISSION, not a mandate. It says "I will take
+        // the scan if no index can serve me" — it does not ask to be scanned
+        // when the partition key is fully specified and no scan is needed.
+        //
+        // `route_prepared_select_fast` bailed on `s.allow_filtering` outright.
+        // The memory server sets the flag on EVERY read (see the comment at
+        // the top of the secondary-index planner), so every one of its reads —
+        // including exact single-partition lookups — was disqualified from the
+        // keyed path, fell through to the index planner, found no index, and
+        // was executed as ScanPlan::FullScan.
+        //
+        // Measured on a live 3-node cluster before this fix: 2,582 full scans
+        // of `agent_memory.document_phonetic_terms` and 2,341 of
+        // `context_segment_terms` in one log window, on a table whose whole
+        // partition key the query supplies. The I/O saturated a node's CQL
+        // runtime ("a worker blocked (likely saturated disk I/O)"), which
+        // timed out replica reads, which made quorum reads fail.
+        let (state, _dir) = setup();
+        let current_keyspace = Some("keyedaf".to_string());
+        let auth = dev_auth();
+        let ctx = test_ctx(&auth, &current_keyspace);
+
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE KEYSPACE keyedaf WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        // A COMPOSITE partition key, as document_phonetic_terms has: the bug
+        // is not specific to a single-column key.
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE TABLE keyedaf.terms (tenant_id int, session_id int, code text, \
+                 chunk_id int, PRIMARY KEY ((tenant_id, session_id, code), chunk_id))",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "INSERT INTO keyedaf.terms (tenant_id, session_id, code, chunk_id) \
+                 VALUES (1, 2, 'KN', 9)",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut select = match crate::parser::parse(
+            "SELECT chunk_id FROM terms WHERE tenant_id = ? AND session_id = ? AND code = ?",
+        )
+        .unwrap()
+        {
+            Statement::Select(select) => select,
+            other => panic!("expected select, got {other:?}"),
+        };
+        // Exactly what the driver does for every memory-server read.
+        select.allow_filtering = true;
+
+        let bound_terms = vec![
+            Term::IntegerLiteral(1),
+            Term::IntegerLiteral(2),
+            Term::StringLiteral("KN".to_string()),
+        ];
+
+        let taken = route_prepared_select_fast(&state, &ctx, &select, &bound_terms).await;
+        assert!(
+            taken.is_some(),
+            "a query supplying the whole partition key must take the keyed path; \
+             ALLOW FILTERING permits a scan, it does not require one"
+        );
+        taken.unwrap().expect("the keyed read should succeed");
     }
 
     #[tokio::test]
