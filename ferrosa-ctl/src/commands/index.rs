@@ -58,6 +58,7 @@ mod col {
     pub const KEYSPACE: usize = 0;
     pub const TABLE: usize = 1;
     pub const NAME: usize = 2;
+    pub const KIND: usize = 3;
     pub const STATUS: usize = 4;
     pub const PENDING: usize = 6;
 }
@@ -68,6 +69,10 @@ pub struct IndexRow {
     pub keyspace: String,
     pub table: String,
     pub name: String,
+    /// What kind of index this is. Shown because `index rebuild` currently
+    /// only handles partition-key indexes, and an operator refused a rebuild
+    /// needs to see WHY without reading the source.
+    pub kind: String,
     /// The tracker's own word: `current`, `building`, `stale`, or `failed`.
     pub status: String,
     /// SSTables awaiting indexing. Non-zero means reads through them are
@@ -142,6 +147,7 @@ fn decode(result: &QueryResult) -> Result<Vec<IndexRow>, CqlError> {
             keyspace: cell(row, col::KEYSPACE),
             table: cell(row, col::TABLE),
             name: cell(row, col::NAME),
+            kind: cell(row, col::KIND),
             status: cell(row, col::STATUS),
             pending: count(row, col::PENDING)?,
         });
@@ -178,13 +184,14 @@ pub async fn run_index_list(addr: SocketAddr, problems_only: bool) -> Result<(),
 
     let mut builder = tabled::builder::Builder::default();
     builder.push_record(vec![
-        "keyspace", "table", "index", "status", "pending", "reads",
+        "keyspace", "table", "index", "kind", "status", "pending", "reads",
     ]);
     for r in &shown {
         builder.push_record(vec![
             r.keyspace.clone(),
             r.table.clone(),
             r.name.clone(),
+            r.kind.clone(),
             r.status.clone(),
             r.pending.to_string(),
             if r.reads_are_incomplete() {
@@ -344,6 +351,7 @@ mod tests {
             keyspace: "agent_memory".into(),
             table: "entity_warmth".into(),
             name: name.into(),
+            kind: "btree".into(),
             status: status.into(),
             pending,
         }

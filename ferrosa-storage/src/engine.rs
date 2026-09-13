@@ -4721,15 +4721,22 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
         })?;
 
-        let (component, index_type) =
-            state
-                .store
-                .partition_key_index_def(index_name)
-                .ok_or_else(|| {
-                    ferrosa_common::Error::InvalidFormat(format!(
-                        "{table_id} has no partition-key index named '{index_name}'"
-                    ))
-                })?;
+        // Distinguish "there is no such index" from "that index exists and this
+        // rebuild cannot do it yet". Reporting the second as the first sends an
+        // operator hunting a typo in a name that is correct — which is exactly
+        // what happened the first time this was run against a live cluster,
+        // where all six broken indexes are `secondary` rather than
+        // partition-key.
+        let (component, index_type) = match state.store.partition_key_index_def(index_name) {
+            Some(def) => def,
+            None => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "{table_id} has no PARTITION-KEY index named '{index_name}'. If that index \
+                     exists and is of another kind, rebuild does not handle it yet — \
+                     `ferrosa-ctl index list` shows each index's kind."
+                )));
+            }
+        };
 
         let sstables_total = state.store.sstable_generation_ids().len();
         tracing::info!(
