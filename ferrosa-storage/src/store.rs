@@ -5679,6 +5679,26 @@ impl<F: FlushTarget> TableStore<F> {
 
     /// Partition-key secondary index declarations:
     /// `(index_name, partition_key_component)` pairs.
+    /// The definition of one partition-key index: which key component it
+    /// covers and what kind it is.
+    ///
+    /// `None` means this store has no such index — which is the answer a
+    /// rebuild needs, so it can refuse rather than build nothing and report
+    /// success.
+    pub fn partition_key_index_def(&self, index_name: &str) -> Option<(usize, IndexType)> {
+        let component = self
+            .indexed_partition_key_columns
+            .iter()
+            .find(|(n, _)| n == index_name)
+            .map(|(_, c)| *c)?;
+        let index_type = self
+            .index_types
+            .get(index_name)
+            .copied()
+            .unwrap_or(IndexType::BTree);
+        Some((component, index_type))
+    }
+
     pub fn indexed_partition_key_columns(&self) -> &[(String, usize)] {
         &self.indexed_partition_key_columns
     }
