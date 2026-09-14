@@ -6,6 +6,7 @@
 //! background worker threads following the same channel-based pattern as
 //! `CompactionExecutor`.
 
+pub mod orphan;
 pub mod remote_backend;
 pub mod scheduler;
 pub mod sidecar;

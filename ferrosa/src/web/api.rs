@@ -177,6 +177,11 @@ async fn index_rebuild_handler(
                 "index": index,
                 "sstables_rebuilt": outcome.sstables_rebuilt,
                 "sstables_total": outcome.sstables_total,
+                // SSTables that were compacted away with their metadata left
+                // behind. Reported so a caller seeing a smaller denominator
+                // than the generation count on disk can account for the rest.
+                "sstables_vanished": outcome.sstables_vanished,
+                "sstables_indexable": outcome.sstables_indexable(),
                 "complete": outcome.is_complete(),
             });
             if outcome.is_complete() {
