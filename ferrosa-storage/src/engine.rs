@@ -381,13 +381,31 @@ pub struct RebuildOutcome {
     pub sstables_rebuilt: usize,
     /// SSTables the table held when the rebuild started.
     pub sstables_total: usize,
+    /// SSTables whose data file was gone — compacted away with their metadata
+    /// left behind. They hold no rows, so they are neither built nor missing.
+    ///
+    /// Counted separately rather than folded into either number: an operator
+    /// who can see 21 generations on disk and is told "1 of 1" needs the other
+    /// twenty accounted for, or the smaller denominator reads as a lie.
+    pub sstables_vanished: usize,
 }
 
 impl RebuildOutcome {
-    /// Whether every SSTable is now covered.
+    /// Whether every SSTable that HOLDS ROWS is now covered.
+    ///
+    /// Vanished SSTables cannot leave an index incomplete: an index covering
+    /// every SSTable that has rows covers every row. Requiring them to be
+    /// "rebuilt" is what made a repaired index report failure forever, because
+    /// the data files were compacted away on purpose and are never coming back.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.sstables_rebuilt == self.sstables_total
+        self.sstables_rebuilt + self.sstables_vanished >= self.sstables_total
+    }
+
+    /// SSTables that actually had rows to index.
+    #[must_use]
+    pub fn sstables_indexable(&self) -> usize {
+        self.sstables_total.saturating_sub(self.sstables_vanished)
     }
 }
 
@@ -4578,8 +4596,8 @@ impl StorageEngine {
         index_name: &str,
         partition_key_component: usize,
         index_type: ferrosa_index::IndexType,
-    ) -> usize {
-        let mut rebuilt = 0usize;
+    ) -> crate::index::orphan::Coverage {
+        let mut coverage = crate::index::orphan::Coverage::default();
         let pk_total = state.store.partition_key_column_count();
         let sstable_ids = state.store.sstable_generation_ids();
         for sst_id in sstable_ids {
@@ -4666,7 +4684,35 @@ impl StorageEngine {
                         index_name,
                         &sst_id,
                     );
-                    rebuilt += 1;
+                    coverage.built += 1;
+                }
+                // An SSTable whose data file is GONE is not a failure. It was
+                // compacted away and only its TOC and sidecars survive, so it
+                // holds no rows and skipping it removes nothing from the index.
+                //
+                // Marking it failed is what wedged six indexes on the live
+                // cluster for a day: every retry re-read the same absent files,
+                // re-marked the same failure, and the server went on correctly
+                // refusing to read through an index that could never become
+                // current. Retrying cannot fix an SSTable that no longer exists.
+                Err(e) if crate::index::orphan::data_file_is_absent(&e) => {
+                    tracing::info!(
+                        index_name,
+                        table = %table_id,
+                        sstable = %sst_id,
+                        "engine: SSTable has no data file — compacted away with its metadata \
+                         left behind. Nothing to index; not counted against this index."
+                    );
+                    coverage.vanished += 1;
+                    // Cleared rather than left pending: the tracker asked about
+                    // an SSTable that does not exist, and leaving it pending
+                    // keeps the index short of a row count it can never reach.
+                    self.index_tracker.mark_indexed(
+                        table_id.keyspace(),
+                        table_id.table(),
+                        index_name,
+                        &sst_id,
+                    );
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4684,11 +4730,12 @@ impl StorageEngine {
                         e,
                         std::time::Duration::from_secs(60),
                     );
+                    coverage.failed += 1;
                 }
             }
         }
 
-        rebuilt
+        coverage
     }
 
     /// Rebuild one index's sidecars over every SSTable this table holds.
@@ -4746,18 +4793,20 @@ impl StorageEngine {
             "engine: index rebuild starting"
         );
 
-        let sstables_rebuilt =
+        let coverage =
             self.backfill_partition_key_index(state, table_id, index_name, component, index_type);
+        let sstables_rebuilt = coverage.built;
 
         // Report the shortfall rather than only the success count: a rebuild
         // that indexed 3 of 17 SSTables has not repaired the index, and an
         // operator reading "rebuilt 3" would reasonably think it had.
-        if sstables_rebuilt < sstables_total {
+        if coverage.failed > 0 {
             tracing::warn!(
                 index_name,
                 table = %table_id,
                 sstables_rebuilt,
                 sstables_total,
+                vanished = coverage.vanished,
                 "engine: index rebuild did NOT cover every SSTable; reads through this \
                  index are still incomplete. See the backfill errors above for why."
             );
@@ -4766,6 +4815,7 @@ impl StorageEngine {
                 index_name,
                 table = %table_id,
                 sstables_rebuilt,
+                vanished = coverage.vanished,
                 "engine: index rebuild complete"
             );
         }
@@ -4773,6 +4823,7 @@ impl StorageEngine {
         Ok(RebuildOutcome {
             sstables_rebuilt,
             sstables_total,
+            sstables_vanished: coverage.vanished,
         })
     }
 
