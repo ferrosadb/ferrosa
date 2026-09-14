@@ -755,3 +755,138 @@ async fn a_windowed_index_producer_survives_a_posting_list_larger_than_the_route
         "a window that delivers nothing is not back-pressure, it is a stall"
     );
 }
+
+/// Collects raw frames so a test can read the Done's resume position, which
+/// `StreamConsumeOutcome` does not carry.
+struct FrameCollector {
+    frames: std::sync::Mutex<Vec<Message>>,
+}
+
+#[async_trait]
+impl ChunkSink for FrameCollector {
+    async fn send(&self, msg: Message) {
+        self.frames.lock().unwrap().push(msg);
+    }
+}
+
+/// Walk one tenant's index the way `WindowedReplicaForwarder` does: request a
+/// window, read the Done's resume position, request the next window from
+/// there, until a Done reports no resume.
+///
+/// Returns every partition key delivered, in arrival order, and the number of
+/// windows it took.
+async fn walk_index_by_windows(
+    node: Arc<ferrosa_storage::StorageEngine>,
+    window: u32,
+) -> (Vec<Vec<u8>>, usize) {
+    let mut delivered: Vec<Vec<u8>> = Vec::new();
+    let mut start: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut windows = 0usize;
+
+    loop {
+        windows += 1;
+        assert!(
+            windows < 200,
+            "the continuation loop must terminate; a window that never reports \
+             `resume: None` spins forever"
+        );
+        let sink = FrameCollector {
+            frames: std::sync::Mutex::new(Vec::new()),
+        };
+        let req = RangeReadStreamRequestPayload {
+            request_id: 0x0C_0C_0C,
+            keyspace: "agent_memory".into(),
+            table: "entity_store".into(),
+            index_name: Some(TENANT_INDEX.into()),
+            index_key: Some(tenant_index_key(TENANT_A)),
+            projected_regular_ordinals: None,
+            start_key: start.as_ref().map(|(k, _)| k.clone()),
+            start_clustering: start.as_ref().map(|(_, c)| c.clone()),
+            max_chunks: window,
+        };
+        handle_stream_request(req, Arc::new(node.clone()), &sink, CHUNK_PARTITIONS).await;
+
+        let frames = std::mem::take(&mut *sink.frames.lock().unwrap());
+        let mut resume = None;
+        for frame in &frames {
+            match frame {
+                Message::RangeReadStreamChunk(b) => {
+                    let chunk: super::super::raft::handlers::RangeReadStreamChunkPayload =
+                        bincode::deserialize(b).unwrap();
+                    delivered.extend(chunk.partitions.into_iter().map(|p| p.key_bytes));
+                }
+                Message::RangeReadStreamDone(b) => {
+                    let done: super::super::raft::handlers::RangeReadStreamDonePayload =
+                        bincode::deserialize(b).unwrap();
+                    assert!(!done.truncated, "a window stop is not a truncation");
+                    resume = done.resume.map(|r| (r.partition_key, r.clustering));
+                }
+                _ => {}
+            }
+        }
+        match resume {
+            Some(next) => start = Some(next),
+            None => break,
+        }
+    }
+    (delivered, windows)
+}
+
+/// The half a single window cannot prove: a windowed index walk must actually
+/// FINISH, delivering every row of the posting list exactly once.
+///
+/// Stopping at the window is only half a fix. If the continuation re-walked the
+/// posting list from the top, or resumed one row early, a bounded route would
+/// have been bought with duplicate rows or an endless loop — and a count built
+/// on it would be wrong rather than absent, which is worse.
+///
+/// Driven here against a REAL index on a real storage engine. The producer's
+/// existing window tests use a StaticReader, so the index source had never been
+/// walked across a window boundary before this.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_windowed_index_walk_delivers_every_row_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = crowded_tenant_node(dir.path());
+
+    let (delivered, windows) = walk_index_by_windows(node, STREAM_WINDOW_CHUNKS).await;
+
+    assert!(
+        windows > 1,
+        "the posting list must be big enough to cross a window boundary, \
+         or this test proves nothing: took {windows} window(s)"
+    );
+
+    let unique: std::collections::BTreeSet<_> = delivered.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        delivered.len(),
+        "a resumed window must not re-deliver rows it already sent: {} delivered, \
+         {} distinct",
+        delivered.len(),
+        unique.len()
+    );
+    assert_eq!(
+        delivered.len(),
+        CROWDED_SESSIONS as usize,
+        "every row of the tenant's posting list must arrive across the windows"
+    );
+}
+
+/// The same walk unwindowed delivers the same rows — the window changes how
+/// many requests it takes, never the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn windowing_does_not_change_which_rows_an_index_walk_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = crowded_tenant_node(dir.path());
+
+    let (windowed, _) = walk_index_by_windows(node.clone(), STREAM_WINDOW_CHUNKS).await;
+    let (unwindowed, single) = walk_index_by_windows(node, 0).await;
+
+    assert_eq!(single, 1, "an unwindowed walk is one request by definition");
+    let windowed: std::collections::BTreeSet<_> = windowed.into_iter().collect();
+    let unwindowed: std::collections::BTreeSet<_> = unwindowed.into_iter().collect();
+    assert_eq!(
+        windowed, unwindowed,
+        "flow control must not change the result set"
+    );
+}
