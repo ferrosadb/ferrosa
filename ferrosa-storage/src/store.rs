@@ -3348,6 +3348,32 @@ impl<F: FlushTarget> TableStore<F> {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> Result<u64> {
+        self.count_range_matching(start, end, &|_| true)
+    }
+
+    /// `count_range`, counting only partitions whose key satisfies `matches`.
+    ///
+    /// The predicate is applied to the merged partition KEY, inside the same
+    /// metadata-only pass — no cell payload is decoded for a partition that is
+    /// counted, and none for one that is skipped either.
+    ///
+    /// This exists so `COUNT(*) WHERE <partition-key component> = ?` can stay
+    /// on the ADR-020 fast path. Without it any predicate drops the query onto
+    /// the secondary index and a lookup per posting: measured on a live
+    /// cluster at 24s against the unfiltered count's 0.32s over the same
+    /// 103,664 rows, and four times slower than shipping every row to the
+    /// client.
+    ///
+    /// It has to be a predicate rather than a key range. `DecoratedKey` orders
+    /// by token first, so partitions sharing a partition-key component are
+    /// scattered across the ring; a prefix range would silently count a
+    /// different set.
+    pub fn count_range_matching(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> Result<u64> {
         let view = self.view.load_full();
         let start_owned = start.cloned();
         let end_owned = end.cloned();
@@ -3384,6 +3410,9 @@ impl<F: FlushTarget> TableStore<F> {
         // semantics for COUNT(*) include the static row when
         // present).
         while let Some(p) = merger.next_merged_partition()? {
+            if !matches(&p.key) {
+                continue;
+            }
             total = total.saturating_add(p.rows.len() as u64);
             if p.static_row.is_some() {
                 total = total.saturating_add(1);
@@ -8042,6 +8071,69 @@ mod tests {
     /// `count_range` (ADR-020 fast path); the full scan goes through
     /// `range_iter`. Both must agree, and both must equal N regardless of
     /// storage layout (pure memtable, sstable-only, or a mix).
+    /// A COUNT(*) with a partition-key predicate must count from METADATA,
+    /// the same pass the unfiltered count uses, rather than falling back to a
+    /// row walk.
+    ///
+    /// Measured on the live cluster 2026-09-14, entity_store, 103,664 rows:
+    ///
+    ///   COUNT(*) unfiltered                     103,664    0.32s
+    ///   COUNT(*) WHERE tenant_id = ?            102,840   24.07s
+    ///   every row shipped to the client          103,656    6.75s
+    ///
+    /// Any WHERE clause disqualifies the ADR-020 fast path (router.rs
+    /// `no_where`), so the filtered count resolves through the secondary index
+    /// and does one lookup per posting. With that tenant owning 99.2% of the
+    /// table the index is the worst available plan — four times slower than
+    /// the sequential scan it declined.
+    ///
+    /// The fix cannot be a key range. `DecoratedKey` orders by TOKEN first, so
+    /// partitions sharing a partition-key component are scattered across the
+    /// ring, not contiguous — a prefix range would count the wrong partitions
+    /// and look plausible doing it. The predicate has to be applied per
+    /// partition inside the existing metadata merge, where the key is already
+    /// in hand and no cell payload is ever decoded.
+    #[test]
+    fn count_range_matching_counts_only_partitions_whose_key_passes() {
+        let store = test_store();
+        // Ten partitions, five of which "belong" to the tenant under test.
+        for i in 0..10 {
+            let owner = if i % 2 == 0 { "t-keep" } else { "t-other" };
+            store
+                .write(
+                    &make_composite_key(&[owner, &format!("s{i}")]),
+                    make_row(b"v", 1000 + i),
+                )
+                .unwrap();
+        }
+
+        let all = store.count_range(None, None).unwrap();
+        assert_eq!(all, 10, "fixture must hold ten partitions, got {all}");
+
+        let kept = store
+            .count_range_matching(None, None, &|key: &DecoratedKey| {
+                key.key.as_bytes().windows(6).any(|w| w == b"t-keep")
+            })
+            .unwrap();
+        assert_eq!(
+            kept, 5,
+            "only the five matching partitions may be counted, got {kept}"
+        );
+
+        let none = store
+            .count_range_matching(None, None, &|_: &DecoratedKey| false)
+            .unwrap();
+        assert_eq!(none, 0, "a predicate matching nothing counts nothing");
+
+        let every = store
+            .count_range_matching(None, None, &|_: &DecoratedKey| true)
+            .unwrap();
+        assert_eq!(
+            every, all,
+            "a predicate matching everything must equal the unfiltered count"
+        );
+    }
+
     #[test]
     fn count_range_counts_every_partition_memtable_only() {
         let store = test_store();
