@@ -503,23 +503,42 @@ fn safe_partition_key_filter_row_limit(
         return None;
     }
 
-    let partition_keys: std::collections::HashSet<&str> = table_meta
-        .partition_key
-        .iter()
-        .map(String::as_str)
-        .collect();
+    // Safe only when the predicates DETERMINE the partition: every predicate is
+    // an equality on a partition-key component, AND together they constrain
+    // every component. For a determined partition all rows satisfy the
+    // predicates, so returning at most LIMIT rows per partition cannot underfill
+    // due to a row-level post-filter.
+    //
+    // Membership alone is not enough, and testing only membership is what this
+    // used to do. A PREFIX passes that test -- `WHERE tenant_id = ?` on a
+    // (tenant_id, session_id) key -- but does not pin the partition, so the scan
+    // must walk partitions that do not match and the cap stops it after LIMIT
+    // rows of ANY partition. Measured on a live cluster 2026-09-14 against
+    // agent_memory.entity_store:
+    //
+    //     WHERE tenant_id=? AND session_id=?   -> 3 rows
+    //     WHERE tenant_id=?            LIMIT 5 -> 0 rows
+    //     unfiltered scan                      -> 78 rows for that tenant
+    //
+    // Zero rows and no error, for data plainly present. A dense value hides it:
+    // its rows are everywhere, so a truncated scan still finds some, and only a
+    // sparse value comes back empty.
+    // Neither check collects. A predicate list and a partition key are both
+    // short, but this runs on EVERY select, and two HashSets built per query to
+    // answer a question that nested iterator passes answer directly are two
+    // allocations that should not exist.
+    let is_pk_equality = |wc: &WhereClause| {
+        !wc.token_fn && wc.op == ComparisonOp::Eq && table_meta.partition_key.contains(&wc.column)
+    };
 
-    // Safe only when every predicate is an equality on a partition-key
-    // component. For matching partitions, all rows satisfy those predicates,
-    // so returning at most LIMIT rows per partition cannot underfill due to a
-    // row-level post-filter. Non-PK predicates must continue using uncapped
-    // partition rows to avoid dropping the first matching row after the cap.
-    s.where_clauses
-        .iter()
-        .all(|wc| {
-            !wc.token_fn && wc.op == ComparisonOp::Eq && partition_keys.contains(wc.column.as_str())
-        })
-        .then_some(limit)
+    let every_predicate_is_a_pk_equality = s.where_clauses.iter().all(is_pk_equality);
+    let whole_partition_key_is_pinned = table_meta.partition_key.iter().all(|key| {
+        s.where_clauses
+            .iter()
+            .any(|wc| !wc.token_fn && wc.op == ComparisonOp::Eq && wc.column == *key)
+    });
+
+    (every_predicate_is_a_pk_equality && whole_partition_key_is_pinned).then_some(limit)
 }
 
 /// Return the exclusive clustering resume and row bound for the streaming
@@ -27833,6 +27852,93 @@ mod tests {
     /// SSTable projected read decode the wrong column, so the projected column
     /// came back NULL once the memtable flushed (e.g. a 768-d embedding → the
     /// ANN query then failed "must contain vector values").
+    /// A LIMIT may only cap a partition-key filter when the predicates
+    /// DETERMINE the partition.
+    ///
+    /// The cap's safety proof is that "for matching partitions, all rows
+    /// satisfy those predicates, so returning at most LIMIT rows per partition
+    /// cannot underfill". That holds only when the predicates pin the whole
+    /// partition key. The check tested membership instead -- every predicate
+    /// column had to BE a partition-key column -- which a PREFIX also passes.
+    ///
+    /// With a prefix the scan must walk partitions that do not match, and the
+    /// cap stops it after LIMIT rows of ANY partition. Measured on the live
+    /// cluster 2026-09-14, on `entity_store` whose partition key is
+    /// (tenant_id, session_id):
+    ///
+    ///   WHERE tenant_id=? AND session_id=?  -> 3 rows
+    ///   WHERE tenant_id=?           LIMIT 5 -> 0 rows
+    ///   unfiltered scan                     -> 78 rows for that tenant
+    ///
+    /// Zero rows, no error, for data that is plainly there. A dense tenant hid
+    /// it: its rows are everywhere, so any truncated scan still finds some.
+    #[test]
+    fn a_partial_partition_key_equality_must_not_cap_the_scan() {
+        use std::collections::HashSet;
+        let mut columns = indexmap::IndexMap::new();
+        for (i, (name, kind)) in [
+            ("tenant_id", ColumnKind::PartitionKey),
+            ("session_id", ColumnKind::PartitionKey),
+            ("entity_name", ColumnKind::Regular),
+        ]
+        .iter()
+        .enumerate()
+        {
+            columns.insert(
+                (*name).to_string(),
+                ColumnMetadata {
+                    name: (*name).to_string(),
+                    kind: *kind,
+                    position: i as i32,
+                    column_type: "text".to_string(),
+                    clustering_order: ferrosa_schema::ClusteringOrder::None,
+                    mask: None,
+                },
+            );
+        }
+        let table_meta = TableMetadata {
+            keyspace: "ks".into(),
+            name: "entity_store".into(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["tenant_id".into(), "session_id".into()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+
+        let parse_select = |q: &str| {
+            let Statement::Select(sel) = crate::parser::parse(q).unwrap() else {
+                panic!("expected SELECT");
+            };
+            sel
+        };
+
+        // PREFIX of the partition key: must NOT cap.
+        let partial =
+            parse_select("SELECT entity_name FROM ks.entity_store WHERE tenant_id = 'a' LIMIT 5");
+        assert_eq!(
+            safe_partition_key_filter_row_limit(&partial, &table_meta, false),
+            None,
+            "a prefix of the partition key does not determine the partition, so capping \
+             the scan at LIMIT rows silently returns nothing for a sparse value"
+        );
+
+        // WHOLE partition key: capping is sound and must be kept.
+        let whole = parse_select(
+            "SELECT entity_name FROM ks.entity_store \
+             WHERE tenant_id = 'a' AND session_id = 'b' LIMIT 5",
+        );
+        assert_eq!(
+            safe_partition_key_filter_row_limit(&whole, &table_meta, false),
+            Some(5),
+            "a full partition-key equality does determine the partition, and the cap is \
+             what keeps a bounded read bounded"
+        );
+    }
+
     #[test]
     fn projection_storage_ordinals_use_name_sorted_storage_order_not_table_position() {
         let mk = |name: &str, kind: ColumnKind, position: i32, ty: &str| ColumnMetadata {
