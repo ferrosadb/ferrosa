@@ -52,7 +52,7 @@ const STREAMING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-request buffer for the StreamRouter receiver. Bounded so a
 /// slow consumer back-pressures the inbound dispatch (chunks queue
 /// up at the lane until the consumer drains).
-const STREAM_RECEIVER_BUFFER: usize = 32;
+pub(crate) const STREAM_RECEIVER_BUFFER: usize = 32;
 
 /// Default per-chunk partition count emitted by the streaming
 /// range-read handler. Picked so each chunk message fits comfortably
@@ -77,7 +77,7 @@ pub const STREAMING_CHUNK_PARTITIONS: usize = 64;
 /// per stream are therefore ≤ `STREAM_WINDOW_CHUNKS` + 1 (Done) + a few
 /// heartbeats (which are lossy on a full buffer), comfortably under
 /// [`STREAM_RECEIVER_BUFFER`].
-const STREAM_WINDOW_CHUNKS: u32 = 16;
+pub(crate) const STREAM_WINDOW_CHUNKS: u32 = 16;
 
 const _: () = assert!(
     (STREAM_WINDOW_CHUNKS as usize) + 1 < STREAM_RECEIVER_BUFFER,
@@ -1809,9 +1809,24 @@ impl ClusterCoordinator {
                     None,
                     Some((index_name, index_key_bytes)),
                     resume.as_ref(),
-                    // One request per page: the cursor, not a window resume,
-                    // is how an index walk continues.
-                    0,
+                    // A posting list is not bounded by anything the caller
+                    // said. `idx_entity_by_tenant` on the live cluster holds
+                    // ~103,000 rows under one key — about 1,600 chunks at
+                    // STREAMING_CHUNK_PARTITIONS — against a
+                    // STREAM_RECEIVER_BUFFER-slot route.
+                    //
+                    // This used to pass 0 (unbounded), reasoning that an index
+                    // walk continues by cursor rather than by window resume.
+                    // That holds only while the posting list fits the route.
+                    // Past it the producer fire-hoses, StreamRouter fail-loud
+                    // closes the route, and the read surfaces as a retryable
+                    // ReadTimeout the driver retries forever — 0.34s to fail,
+                    // reported to the user as an empty memory (t_bf9b4adf).
+                    //
+                    // The cursor still drives paging BETWEEN pages; the window
+                    // bounds one page's frames in flight. They are different
+                    // axes, and the walk needs both.
+                    STREAM_WINDOW_CHUNKS,
                 )
                 .await
             {
@@ -2286,6 +2301,40 @@ mod tests {
                 "coordinate_index_read_stream must not use `{forbidden}`"
             );
         }
+    }
+
+    /// t_bf9b4adf: the index read must ask its replicas for a BOUNDED window.
+    ///
+    /// `max_chunks: 0` is unbounded on the wire. An index source spawned with
+    /// it fire-hoses the whole posting list at a `STREAM_RECEIVER_BUFFER`-slot
+    /// route, which `StreamRouter::route` fail-loud-closes, and the read dies
+    /// as a retryable ReadTimeout. On the live cluster that killed every
+    /// tenant-filtered count — ~103,000 rows on one index key, failing in
+    /// 0.34s, reported to the user as "Memory is empty".
+    ///
+    /// The call site used to pass a literal `0` on the reasoning that an index
+    /// walk continues by cursor rather than by window resume. True for a short
+    /// posting list; for a long one the producer never gets to the cursor
+    /// because the route is already closed.
+    ///
+    /// Source-level because `spawn_replica_fragment_stream` fires through a
+    /// concrete `PeerManager` that a unit test cannot stand in for — the same
+    /// reason the tripwire above this one reads the source. The end-to-end
+    /// proof that a window is what saves this read lives in
+    /// `streaming_e2e_tests`.
+    #[test]
+    fn the_index_read_requests_a_bounded_producer_window() {
+        let source = include_str!("range_read_stream.rs");
+        let body = source
+            .split("pub async fn coordinate_index_read_stream(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("coordinate_index_read_stream must exist");
+        assert!(
+            body.contains("STREAM_WINDOW_CHUNKS"),
+            "the index read must spawn its replica streams with a bounded \
+             producer window, not an unbounded one"
+        );
     }
 
     #[test]
