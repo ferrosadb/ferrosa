@@ -503,12 +503,6 @@ fn safe_partition_key_filter_row_limit(
         return None;
     }
 
-    let partition_keys: std::collections::HashSet<&str> = table_meta
-        .partition_key
-        .iter()
-        .map(String::as_str)
-        .collect();
-
     // Safe only when the predicates DETERMINE the partition: every predicate is
     // an equality on a partition-key component, AND together they constrain
     // every component. For a determined partition all rows satisfy the
@@ -529,17 +523,20 @@ fn safe_partition_key_filter_row_limit(
     // Zero rows and no error, for data plainly present. A dense value hides it:
     // its rows are everywhere, so a truncated scan still finds some, and only a
     // sparse value comes back empty.
-    let constrained: std::collections::HashSet<&str> = s
-        .where_clauses
-        .iter()
-        .filter(|wc| !wc.token_fn && wc.op == ComparisonOp::Eq)
-        .map(|wc| wc.column.as_str())
-        .collect();
+    // Neither check collects. A predicate list and a partition key are both
+    // short, but this runs on EVERY select, and two HashSets built per query to
+    // answer a question that nested iterator passes answer directly are two
+    // allocations that should not exist.
+    let is_pk_equality = |wc: &WhereClause| {
+        !wc.token_fn && wc.op == ComparisonOp::Eq && table_meta.partition_key.contains(&wc.column)
+    };
 
-    let every_predicate_is_a_pk_equality = s.where_clauses.iter().all(|wc| {
-        !wc.token_fn && wc.op == ComparisonOp::Eq && partition_keys.contains(wc.column.as_str())
+    let every_predicate_is_a_pk_equality = s.where_clauses.iter().all(is_pk_equality);
+    let whole_partition_key_is_pinned = table_meta.partition_key.iter().all(|key| {
+        s.where_clauses
+            .iter()
+            .any(|wc| !wc.token_fn && wc.op == ComparisonOp::Eq && wc.column == *key)
     });
-    let whole_partition_key_is_pinned = partition_keys.iter().all(|key| constrained.contains(key));
 
     (every_predicate_is_a_pk_equality && whole_partition_key_is_pinned).then_some(limit)
 }
