@@ -628,3 +628,130 @@ async fn a_resumed_tenant_read_returns_only_rows_after_the_cursor_from_every_nod
          sessions, from whichever node holds them"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A posting list bigger than the coordinator's route buffer.
+//
+// t_bf9b4adf. On the live 3-node cluster, `SELECT COUNT(*) FROM entity_store
+// WHERE tenant_id = <9a5f8fbf…>` — ~103,000 of the table's 103,664 rows on one
+// index key — failed in 0.34 SECONDS with
+//
+//   read timeout: CL=ONE, received=0, required=1, data_present=false
+//
+// A read that "times out" in a third of a second did not time out. node1's log
+// at that instant:
+//
+//   stream consumer buffer full; closing route so consumer fails instead of
+//   returning partial data   msg_type=RangeReadStreamChunk
+//   streaming range read: remote stream closed before Done — returning
+//   retryable ReadTimeout   delivered_done=0 expected_done=1
+//
+// The producer had no flow-control window, so it fired the whole posting list
+// at a bounded route. The tests above never caught it because they register a
+// 64-slot route for a handful of rows; production registers
+// STREAM_RECEIVER_BUFFER and the tenant's posting list is ~1,600 chunks.
+// ---------------------------------------------------------------------------
+
+use super::range_read_stream::{STREAM_RECEIVER_BUFFER, STREAM_WINDOW_CHUNKS};
+
+/// Sessions on the crowded tenant. At `CHUNK_PARTITIONS` per chunk this is
+/// comfortably more chunks than the route can hold, which is the whole point:
+/// the tenant that broke production owns almost every row in the table.
+const CROWDED_SESSIONS: u8 = 80;
+const CHUNK_PARTITIONS: usize = 2;
+
+/// Read one tenant's index with the producer running AHEAD of the consumer.
+///
+/// The producer is driven to completion before the consumer drains a single
+/// frame. That is not an artificial ordering — it is the loopback cluster,
+/// where the wire outruns a consumer doing a k-way merge and a count fold. It
+/// just makes the race deterministic.
+async fn index_read_with_producer_ahead_of_consumer(
+    node: Arc<ferrosa_storage::StorageEngine>,
+    max_chunks: u32,
+) -> Result<super::stream_consumer::StreamConsumeOutcome, StreamConsumeError> {
+    const REQ_ID: u32 = 0x0F_10_0D;
+    let router = Arc::new(StreamRouter::new());
+    // The PRODUCTION route size. Registering anything larger tests a cluster
+    // that does not exist.
+    let rx = router.register(REQ_ID, STREAM_RECEIVER_BUFFER);
+    let frame_router = Arc::new(StreamFrameRouter::new(router.clone()));
+    let req = RangeReadStreamRequestPayload {
+        request_id: REQ_ID,
+        keyspace: "agent_memory".into(),
+        table: "entity_store".into(),
+        index_name: Some(TENANT_INDEX.into()),
+        index_key: Some(tenant_index_key(TENANT_A)),
+        projected_regular_ordinals: None,
+        start_key: None,
+        start_clustering: None,
+        max_chunks,
+    };
+    let sink = FakeWireSinkShared {
+        frame_router: frame_router.clone(),
+        from: (Uuid::from_u128(1), "127.0.0.1:7101".parse().unwrap()),
+    };
+
+    // Producer first, to completion. Only then does the consumer look.
+    handle_stream_request(req, Arc::new(node), &sink, CHUNK_PARTITIONS).await;
+    consume_range_stream(rx, IDLE, 1, REQ_ID).await
+}
+
+fn crowded_tenant_node(dir: &std::path::Path) -> Arc<ferrosa_storage::StorageEngine> {
+    let sessions: Vec<(u8, u8)> = (1..=CROWDED_SESSIONS).map(|s| (TENANT_A, s)).collect();
+    tenant_node(dir, &sessions, true)
+}
+
+/// RED for t_bf9b4adf: an unwindowed producer overflows the route and the read
+/// dies, even though every row was present and readable.
+///
+/// This is the failure the live cluster shows. It is kept as a test rather than
+/// deleted with the fix: `max_chunks: 0` is still a legal wire value (legacy
+/// peers), so the day someone reintroduces it on a scan path, this says what
+/// happens.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unwindowed_index_producer_overflows_the_route_and_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = crowded_tenant_node(dir.path());
+
+    let outcome = index_read_with_producer_ahead_of_consumer(node, 0).await;
+
+    match outcome {
+        Err(StreamConsumeError::ChannelClosedBeforeDone {
+            delivered_done,
+            expected_done,
+        }) => {
+            assert_eq!((delivered_done, expected_done), (0, 1));
+        }
+        other => panic!(
+            "an unwindowed producer must overflow a {STREAM_RECEIVER_BUFFER}-slot route \
+             for a {CROWDED_SESSIONS}-row posting list; got {other:?}"
+        ),
+    }
+}
+
+/// GREEN for t_bf9b4adf: the same posting list, the same route, a window.
+///
+/// The producer stops at the window and reports where to resume, so the route
+/// never overflows and the read stays alive. It does NOT deliver every row in
+/// one request — that is the point of a window, and the coordinator's
+/// `WindowedReplicaForwarder` fires the continuation once the consumer drains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_windowed_index_producer_survives_a_posting_list_larger_than_the_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = crowded_tenant_node(dir.path());
+
+    let outcome = index_read_with_producer_ahead_of_consumer(node, STREAM_WINDOW_CHUNKS)
+        .await
+        .expect("a windowed producer must not overflow the route");
+
+    assert!(
+        outcome.partitions.len() <= STREAM_WINDOW_CHUNKS as usize * CHUNK_PARTITIONS,
+        "the producer must stop AT the window, not stream past it: got {} partitions",
+        outcome.partitions.len()
+    );
+    assert!(
+        !outcome.partitions.is_empty(),
+        "a window that delivers nothing is not back-pressure, it is a stall"
+    );
+}
