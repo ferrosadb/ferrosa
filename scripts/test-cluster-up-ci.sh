@@ -43,18 +43,49 @@ else
     docker build \
         -t ferrosa-test-node:latest \
         -f "${REPO_ROOT}/Dockerfile" \
-        "${REPO_ROOT}"
+        "${REPO_ROOT}" >&2
 fi
 
 # ── Bring up cluster (no --build; uses the pre-built image via image: tag) ──
 echo "Starting Ferrosa CI test cluster (profile: ${PROFILE}, project: ${PROJECT_NAME})..." >&2
 echo "Ports: CQL 9042/9043/9044 on host (RustFS is internal-only on the compose network)" >&2
 
+# Compose pulls the infrastructure images lazily and in parallel. A transient
+# registry failure then aborts the entire cluster before a single node starts;
+# the failure is particularly opaque when the registry returns an auth-shaped
+# error such as `Unknown service key`. Reuse cached images, and otherwise pull
+# each one with a bounded retry so a temporary registry response does not turn
+# into a false storage/cluster failure. Exhausting the retries still fails
+# loudly and leaves the test unable to proceed.
+pull_image() {
+    local image="$1"
+    local attempt
+    if docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Using cached ${image}." >&2
+        return 0
+    fi
+    for attempt in 1 2 3 4; do
+        if docker pull "$image" >&2; then
+            return 0
+        fi
+        if [ "$attempt" -lt 4 ]; then
+            echo "Pull failed for ${image} (attempt ${attempt}/4); retrying in $((attempt * 5))s..." >&2
+            sleep $((attempt * 5))
+        fi
+    done
+    echo "ERROR: could not pull ${image} after 4 attempts." >&2
+    return 1
+}
+
+pull_image alpine
+pull_image rustfs/rustfs:latest
+pull_image quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+
 docker compose \
     -f "${COMPOSE_BASE}" \
     --project-name "${PROJECT_NAME}" \
     --profile "${PROFILE}" \
-    up -d
+    up -d >&2
 
 # ── Wait for health ───────────────────────────────────────────────────────────
 echo "Waiting for all 3 nodes to become healthy (timeout: 180s)..." >&2
