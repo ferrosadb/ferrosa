@@ -198,9 +198,35 @@ impl RpcClient {
         let alive_tx_clone = alive_tx.clone();
         let read_loop_peer = peer_addr;
         task_pool.spawn(async move {
-            while let Some(Ok(frame)) = stream.next().await {
+            while let Some(read) = stream.next().await {
+                // A frame the codec rejects (e.g. `FrameTooLarge`) ends the
+                // connection. Say so: the request waiting on that frame is
+                // only released by its lane timeout, which otherwise reads
+                // exactly like a slow peer.
+                let frame = match read {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        tracing::error!(
+                            peer = %read_loop_peer,
+                            %e,
+                            "RPC response stream failed; closing the connection. Requests \
+                             pending on it fail at their lane timeout"
+                        );
+                        break;
+                    }
+                };
                 let stream_id = frame.header.stream_id;
-                if let Ok(msg) = Message::decode(frame.header.msg_type, &mut frame.body.clone()) {
+                let decoded = Message::decode(frame.header.msg_type, &mut frame.body.clone());
+                if let Err(e) = &decoded {
+                    tracing::error!(
+                        peer = %read_loop_peer,
+                        stream_id,
+                        msg_type = ?frame.header.msg_type,
+                        %e,
+                        "RPC response could not be decoded; its caller fails at the lane timeout"
+                    );
+                }
+                if let Ok(msg) = decoded {
                     // Lock-free: DashMap::remove is a single atomic operation.
                     if let Some((_, sender)) = pending_clone.remove(&stream_id) {
                         // Caller-gone (Err): the response future was dropped
