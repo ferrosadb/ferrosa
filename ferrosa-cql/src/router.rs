@@ -490,6 +490,54 @@ fn is_count_only_select(columns: &[SelectColumn]) -> bool {
         })
 }
 
+/// The partition-key equalities a metadata COUNT can be built from, in
+/// partition-key order, or `None` when this query cannot use one.
+///
+/// A `COUNT(*)` with no WHERE already counts from SSTable metadata in a single
+/// pass. Any predicate used to disqualify that outright, dropping the query
+/// onto a secondary-index walk: measured on a live cluster at 24.07s against
+/// the unfiltered count's 0.32s over the same 103,664 rows, and four times
+/// slower than shipping every row to the client.
+///
+/// The metadata pass can only see partition KEYS, so it can stand in for the
+/// WHERE clause only when the whole clause is decidable from one. Every
+/// predicate must therefore be a plain equality on a partition-key component:
+///
+/// - a regular column cannot be decided from the key at all;
+/// - an inequality is not an equality;
+/// - `token()` compares a hash rather than the key bytes;
+/// - and ONE non-qualifying predicate disqualifies the query, because counting
+///   key-matching partitions while ignoring the rest of the clause returns a
+///   confidently wrong number — the failure this whole area keeps producing.
+///
+/// A PREFIX of the partition key is fine here, unlike in
+/// `safe_partition_key_filter_row_limit` where it is not. That function caps
+/// rows per partition and needs the partition determined; this one decides
+/// per partition whether to count it at all, which a prefix answers exactly.
+fn partition_key_equalities_for_count(
+    s: &SelectStatement,
+    table_meta: &TableMetadata,
+) -> Option<Vec<(usize, Term)>> {
+    if s.where_clauses.is_empty() {
+        return None;
+    }
+    let mut found: Vec<(usize, Term)> = Vec::new();
+    for wc in &s.where_clauses {
+        if wc.token_fn || wc.op != ComparisonOp::Eq {
+            return None;
+        }
+        let position = table_meta
+            .partition_key
+            .iter()
+            .position(|key| *key == wc.column)?;
+        found.push((position, wc.value.clone()));
+    }
+    // Partition-key order, not WHERE order: the caller compares against
+    // components decoded positionally.
+    found.sort_by_key(|(position, _)| *position);
+    Some(found)
+}
+
 fn safe_partition_key_filter_row_limit(
     s: &SelectStatement,
     table_meta: &TableMetadata,
@@ -5442,6 +5490,51 @@ async fn route_select_user_table(
     let no_where = s.where_clauses.is_empty();
     let no_order_by = s.order_by.is_empty();
     let no_limit = s.limit.is_none();
+    // Same metadata pass, but counting only the partitions a partition-key
+    // equality selects. Without this, ANY predicate drops COUNT(*) onto a
+    // secondary-index walk — 24.07s against this path's 0.32s over the same
+    // 103,664 rows on a live cluster, and four times slower than the
+    // sequential scan the planner declined.
+    if count_only_select && !no_where && no_order_by && no_limit && pk_result.is_err() {
+        if let Some(equalities) = partition_key_equalities_for_count(s, table_meta) {
+            // Encode each literal to the raw component bytes `decode_pk`
+            // yields. A single-component key IS those bytes, which is what
+            // makes the two halves symmetric.
+            let mut expected: Vec<(usize, Vec<u8>)> = Vec::with_capacity(equalities.len());
+            for (position, term) in &equalities {
+                let name = &table_meta.partition_key[*position];
+                let cql_type =
+                    resolve_col_type(&table_meta.columns[name].column_type, ks, &state.schema)?;
+                let value = bridge::term_to_cql_value(term, &cql_type)?;
+                let key = bridge::build_decorated_key(
+                    std::slice::from_ref(&value),
+                    std::slice::from_ref(&cql_type),
+                )?;
+                expected.push((*position, key.key.as_bytes().to_vec()));
+            }
+            let components = table_meta.partition_key.len();
+            let matches = move |key: &ferrosa_common::key::DecoratedKey| {
+                let decoded = ferrosa_row_bridge::decode_pk(key, components);
+                expected
+                    .iter()
+                    .all(|(position, want)| decoded.get(*position).is_some_and(|got| got == want))
+            };
+            let count = state
+                .write_path
+                .load()
+                .count_range_matching_with(&table_id, ctx.consistency, &matches)
+                .await?;
+            return Ok(SelectRawResult {
+                column_names: col_names.to_vec(),
+                column_types: col_types.to_vec(),
+                rows: vec![vec![Some(CqlValue::Bigint(count as i64))]],
+                keyspace: ks.to_string(),
+                table: s.table.clone(),
+                paging_state: None,
+            });
+        }
+    }
+
     if count_only_select && no_where && no_order_by && no_limit && pk_result.is_err() {
         // Pass the CLIENT's consistency, not the node default. The full
         // SELECT path below threads `ctx.consistency`; if this fast path
@@ -27936,6 +28029,124 @@ mod tests {
             Some(5),
             "a full partition-key equality does determine the partition, and the cap is \
              what keeps a bounded read bounded"
+        );
+    }
+
+    /// A COUNT whose predicates are all partition-key equalities can be
+    /// answered from SSTable metadata; anything else cannot.
+    ///
+    /// Measured on the live cluster: `COUNT(*)` unfiltered is 0.32s over
+    /// 103,664 rows because it never leaves the metadata merge. Add
+    /// `WHERE tenant_id = ?` and it becomes 24.07s, because ANY predicate used
+    /// to disqualify the fast path and drop the query onto a secondary-index
+    /// walk — one lookup per posting, four times slower than the sequential
+    /// scan the planner declined.
+    ///
+    /// The predicate is applied to partition KEYS, so it can only stand in for
+    /// a filter over columns the key actually carries. A predicate on a regular
+    /// column, an inequality, or a token() call must all fall through to the
+    /// real read path: counting only key-matching partitions would ignore the
+    /// rest of the WHERE clause and return a confidently wrong number.
+    #[test]
+    fn only_partition_key_equalities_qualify_for_a_metadata_count() {
+        use std::collections::HashSet;
+        let mut columns = indexmap::IndexMap::new();
+        for (i, (name, kind)) in [
+            ("tenant_id", ColumnKind::PartitionKey),
+            ("session_id", ColumnKind::PartitionKey),
+            ("entity_name", ColumnKind::Regular),
+        ]
+        .iter()
+        .enumerate()
+        {
+            columns.insert(
+                (*name).to_string(),
+                ColumnMetadata {
+                    name: (*name).to_string(),
+                    kind: *kind,
+                    position: i as i32,
+                    column_type: "text".to_string(),
+                    clustering_order: ferrosa_schema::ClusteringOrder::None,
+                    mask: None,
+                },
+            );
+        }
+        let table_meta = TableMetadata {
+            keyspace: "ks".into(),
+            name: "entity_store".into(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["tenant_id".into(), "session_id".into()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        };
+        let parse_select = |q: &str| {
+            let Statement::Select(sel) = crate::parser::parse(q).unwrap() else {
+                panic!("expected SELECT");
+            };
+            sel
+        };
+
+        // A partition-key PREFIX equality qualifies. It does not identify one
+        // partition — that is exactly why the index walk was so expensive —
+        // but it is decidable from each partition's key alone.
+        let partial = parse_select("SELECT COUNT(*) FROM ks.entity_store WHERE tenant_id = 'a'");
+        let eqs = partition_key_equalities_for_count(&partial, &table_meta)
+            .expect("a partition-key equality must qualify");
+        assert_eq!(eqs, vec![(0usize, Term::StringLiteral("a".into()))]);
+
+        // Every component, in key order, whichever order they were written.
+        let whole = parse_select(
+            "SELECT COUNT(*) FROM ks.entity_store WHERE session_id = 'b' AND tenant_id = 'a'",
+        );
+        assert_eq!(
+            partition_key_equalities_for_count(&whole, &table_meta),
+            Some(vec![
+                (0, Term::StringLiteral("a".into())),
+                (1, Term::StringLiteral("b".into()))
+            ]),
+            "components must come back in partition-key order, not WHERE order"
+        );
+
+        // Everything that must NOT qualify.
+        for (q, why) in [
+            (
+                "SELECT COUNT(*) FROM ks.entity_store WHERE entity_name = 'x'",
+                "a regular column is not in the partition key, so no key predicate can decide it",
+            ),
+            (
+                "SELECT COUNT(*) FROM ks.entity_store WHERE tenant_id > 'a'",
+                "an inequality is not an equality",
+            ),
+            (
+                "SELECT COUNT(*) FROM ks.entity_store WHERE tenant_id = 'a' AND entity_name = 'x'",
+                "one non-key predicate poisons the whole clause; counting on the key alone \
+                 would ignore it and over-count",
+            ),
+            (
+                "SELECT COUNT(*) FROM ks.entity_store WHERE token(tenant_id) = 5",
+                "token() compares a hash, not the key bytes",
+            ),
+        ] {
+            assert_eq!(
+                partition_key_equalities_for_count(&parse_select(q), &table_meta),
+                None,
+                "{why}: {q}"
+            );
+        }
+
+        // No WHERE at all stays on the existing unfiltered fast path rather
+        // than taking this one with an empty predicate list.
+        assert_eq!(
+            partition_key_equalities_for_count(
+                &parse_select("SELECT COUNT(*) FROM ks.entity_store"),
+                &table_meta
+            ),
+            None,
+            "no predicates is the unfiltered fast path's job"
         );
     }
 
