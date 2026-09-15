@@ -43,7 +43,7 @@ else
     docker build \
         -t ferrosa-test-node:latest \
         -f "${REPO_ROOT}/Dockerfile" \
-        "${REPO_ROOT}"
+        "${REPO_ROOT}" >&2
 fi
 
 # ── Bring up cluster (no --build; uses the pre-built image via image: tag) ──
@@ -65,7 +65,7 @@ pull_image() {
         return 0
     fi
     for attempt in 1 2 3 4; do
-        if docker pull "$image"; then
+        if docker pull "$image" >&2; then
             return 0
         fi
         if [ "$attempt" -lt 4 ]; then
@@ -85,7 +85,7 @@ docker compose \
     -f "${COMPOSE_BASE}" \
     --project-name "${PROJECT_NAME}" \
     --profile "${PROFILE}" \
-    up -d
+    up -d >&2
 
 # ── Wait for health ───────────────────────────────────────────────────────────
 echo "Waiting for all 3 nodes to become healthy (timeout: 180s)..." >&2
