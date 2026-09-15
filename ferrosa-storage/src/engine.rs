@@ -978,6 +978,13 @@ thread_local! {
     /// orphaned/dangling registrations (t_ee98faa0 layer 2, suspect 2).
     pub(crate) static FTS_SIDECAR_FILES_CONSULTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Test-only observability: live SSTables whose rows `fulltext_search`
+    /// decoded and tokenized IN FULL on this thread because no FTI sidecar
+    /// covered them. This is the per-query cost that pushed a replica's
+    /// search past the 3 s Bulk-lane budget once compaction left every
+    /// merged SSTable without a sidecar.
+    pub(crate) static FTS_SSTABLE_FULL_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Test-only reference selector for fixed metadata vectors. Production uses
@@ -7504,36 +7511,8 @@ impl StorageEngine {
         use ferrosa_index::fulltext::analyzer::default_analyzer;
         use ferrosa_index::fulltext::query::{analyze_query, parse_fts_query};
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
 
-        let table_dir = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join(table_id.to_string());
-        let fti_suffix = format!("-FTI-{index_name}.db");
-
-        // Collect the on-disk FTI sidecar files AND the set of SSTable
-        // generations they cover, so we can fall back to scanning any LIVE
-        // SSTable that is (transiently) missing its sidecar — e.g. during the
-        // async index rebuild window after compaction (BUG-F-007 / t_0455c0a1).
-        let mut fti_files: Vec<std::path::PathBuf> = Vec::new();
-        let mut covered_gens: HashSet<String> = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&table_dir) {
-            for e in entries.flatten() {
-                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
-                    continue;
-                };
-                if let Some(gen) = name.strip_suffix(&fti_suffix) {
-                    covered_gens.insert(gen.to_string());
-                    fti_files.push(e.path());
-                }
-            }
-        }
-
-        if !self.tables.read().contains_key(table_id) {
-            return Ok(vec![]);
-        }
         // Parse once, up front: an invalid query fails loudly before any
         // sidecar/scan work instead of erroring only when a sidecar exists.
         let parsed = parse_fts_query(query).map_err(|e| {
@@ -7548,6 +7527,15 @@ impl StorageEngine {
         let parsed = match analyze_query(&parsed, analyzer.as_ref()) {
             Some(q) => q,
             None => return Ok(vec![]),
+        };
+
+        // The LIVE SSTables' sidecars, plus the generations they cover so any
+        // live SSTable still without one is scanned instead of dropped
+        // (BUG-F-007 / t_0455c0a1).
+        let Some((fti_files, covered_gens)) =
+            self.fulltext_sidecars_for_query(table_id, index_name)
+        else {
+            return Ok(vec![]);
         };
 
         let mut score_map: HashMap<Vec<u8>, f64> = HashMap::new();
@@ -7648,6 +7636,40 @@ impl StorageEngine {
         Ok(results.into_iter().map(|(pk, _)| pk).collect())
     }
 
+    /// The FTI sidecars a query against `table_id`'s `index_name` reads, and
+    /// the generations they cover. `None` if the table is not registered.
+    ///
+    /// First builds a sidecar for any live SSTable that has none, so a query
+    /// tokenizes such an SSTable at most once instead of on every call. The
+    /// build runs with the table lock released and is single-flight per table;
+    /// a failure is logged by the build and leaves that SSTable to the
+    /// full-scan fallback, which still returns its rows.
+    fn fulltext_sidecars_for_query(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+    ) -> Option<(Vec<std::path::PathBuf>, std::collections::HashSet<String>)> {
+        let build = self
+            .tables
+            .read()
+            .get(table_id)?
+            .store
+            .plan_missing_fulltext_sidecars(index_name);
+        if !build.is_empty() {
+            let outcome = build.run();
+            tracing::debug!(table = %table_id, index_name, ?outcome, "fts: sidecar backfill before query");
+        }
+        let live = self
+            .tables
+            .read()
+            .get(table_id)?
+            .store
+            .fulltext_live_sidecars(index_name);
+        let covered_gens = live.iter().map(|(gen, _)| gen.clone()).collect();
+        let files = live.into_iter().map(|(_, path)| path).collect();
+        Some((files, covered_gens))
+    }
+
     /// Streaming full-text search: hands each matching doc key to `on_hit` as
     /// it is found, holding a bounded working set — the non-materializing twin
     /// of [`Self::fulltext_search`] for the no-`LIMIT` shape that OOM-killed
@@ -7692,7 +7714,6 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<()> {
         use ferrosa_index::fulltext::analyzer::default_analyzer;
         use ferrosa_index::fulltext::query::{analyze_query, parse_fts_query, FtsQuery};
-        use std::collections::HashSet;
         use std::ops::ControlFlow;
 
         // Parse once, up front: an invalid query fails loudly before any
@@ -7723,25 +7744,11 @@ impl StorageEngine {
             return Ok(());
         };
 
-        let table_dir = self
-            .config
-            .data_dir
-            .join("sstables")
-            .join(table_id.to_string());
-        let fti_suffix = format!("-FTI-{index_name}.db");
-        let mut fti_files: Vec<std::path::PathBuf> = Vec::new();
-        let mut covered_gens: HashSet<String> = HashSet::new();
-        if let Ok(entries) = std::fs::read_dir(&table_dir) {
-            for e in entries.flatten() {
-                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
-                    continue;
-                };
-                if let Some(gen) = name.strip_suffix(&fti_suffix) {
-                    covered_gens.insert(gen.to_string());
-                    fti_files.push(e.path());
-                }
-            }
-        }
+        let Some((fti_files, covered_gens)) =
+            self.fulltext_sidecars_for_query(table_id, index_name)
+        else {
+            return Ok(());
+        };
 
         // Memtable overlay — collect under the lock, forward after release.
         let memtable_hits = {
@@ -8597,6 +8604,33 @@ impl StorageEngine {
                     continue;
                 }
             };
+
+            // Full-text sidecars for the output, built BEFORE the swap and with
+            // the table lock released. Compaction used to write none, so every
+            // compacted SSTable was re-tokenized in full by every fts_match
+            // query for the rest of its life — on the live cluster that pushed
+            // each replica's search to 7–13 s against the 3 s Bulk-lane budget.
+            // A failure is logged by the build; the output is still swapped in
+            // and queries fall back to scanning it until a sidecar exists.
+            let fulltext_build = self.tables.read().get(table_id).map(|state| {
+                state
+                    .store
+                    .plan_fulltext_sidecars_for_output(gen, dir, &reader)
+            });
+            if let Some(build) = fulltext_build {
+                let fulltext_start = Instant::now();
+                let outcome = build.run();
+                if outcome.built + outcome.failed > 0 {
+                    tracing::info!(
+                        %table_id,
+                        output = %gen,
+                        built = outcome.built,
+                        failed = outcome.failed,
+                        elapsed_ms = fulltext_start.elapsed().as_millis() as u64,
+                        "compaction: built full-text sidecars for output"
+                    );
+                }
+            }
 
             // Swap: remove input SSTables by ID, insert output.
             // Compaction output gen may collide with flush gen (different dirs).
@@ -24582,6 +24616,247 @@ mod tests {
             keys,
             vec!["doc_0000".to_string()],
             "fts_match must find the row even when its SSTable has no FTI sidecar"
+        );
+    }
+
+    // ── Fulltext search cost must not grow with compaction history ──────────
+    //
+    // Live, 2026-09-15, 3-node loopback cluster: every `fts_match` failed with
+    // `fulltext search from node … net: timeout: Bulk lane timeout`, both
+    // remote replicas at once, because each replica's local search took
+    // 7–13 s against the coordinator's 3 s BULK_READ_TIMEOUT (the orphan RPC
+    // responses arrived 4–10 s after the timeout fired). Per node the
+    // `entity_store` table dir held 11 live SSTables but 5,122 FTI sidecars
+    // for the queried index (519 MB), and the 8 live compacted SSTables
+    // (163 MB of Data.db) had NO sidecar at all. So every query:
+    //   * read every `*-FTI-{index}.db` the directory listing turned up,
+    //     including thousands left behind by compacted-away generations, and
+    //   * decoded + tokenized every compacted SSTable in full, because
+    //     compaction never writes an FTI sidecar and the "transient"
+    //     missing-sidecar fallback therefore ran on every query forever.
+
+    /// Force every table's SSTables into one compaction and wait for the swap.
+    async fn compact_and_wait_for_swap(engine: &StorageEngine, tid: &TableId) {
+        let before = engine.sstable_count(tid);
+        assert!(
+            before >= 2,
+            "compaction needs at least 2 SSTables, have {before}"
+        );
+        engine.force_compact_all();
+        for _ in 0..400 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(tid) < before {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!(
+            "compaction did not swap within 10 s (sstable_count stayed {})",
+            engine.sstable_count(tid)
+        );
+    }
+
+    fn fts_partition_keys(hits: &[Vec<u8>]) -> Vec<String> {
+        let mut keys: Vec<String> = hits
+            .iter()
+            .map(|dk| {
+                let pk = ferrosa_index::fulltext::keys::doc_key_partition(dk)
+                    .expect("fulltext_search returns row-granular doc keys");
+                String::from_utf8_lossy(pk).to_string()
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// An FTI sidecar whose generation is not a live SSTable describes rows
+    /// that no longer exist in that form. Consulting it costs a file read per
+    /// query and returns keys for superseded data.
+    #[test]
+    fn fts_search_ignores_sidecars_of_generations_that_are_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        const PROBE: &str = "ferrosaftsorphanprobe";
+        engine
+            .write(
+                &tid,
+                &make_key("live_doc"),
+                make_row(format!("{PROBE} live row").as_bytes(), 1),
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Sidecars left behind by generations compaction already removed: same
+        // index, same naming, no SSTable in the view.
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        for gen in 1..=25u64 {
+            let mut builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+            builder.add_document(
+                ferrosa_index::fulltext::keys::encode_doc_key(
+                    format!("ghost_{gen:02}").as_bytes(),
+                    &[0, 0, 0, 1],
+                ),
+                &format!("{PROBE} superseded row"),
+            );
+            std::fs::write(
+                table_dir.join(format!("{gen}-FTI-idx_body.db")),
+                builder.finish().unwrap(),
+            )
+            .unwrap();
+        }
+
+        FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(0));
+        let hits = engine
+            .fulltext_search(&tid, "idx_body", PROBE, Some(100))
+            .unwrap();
+        let consulted = FTS_SIDECAR_FILES_CONSULTED.with(|c| c.get());
+
+        assert_eq!(
+            fts_partition_keys(&hits),
+            vec!["live_doc".to_string()],
+            "only the live SSTable's row may match; sidecars of non-live \
+             generations must not contribute keys"
+        );
+        assert_eq!(
+            consulted, 1,
+            "one live SSTable → one sidecar consulted, but {consulted} were"
+        );
+    }
+
+    /// The live shape end to end: a row rewritten across flushes, then
+    /// compacted. The query must see only the current text, and must be
+    /// answered from sidecars — not by re-tokenizing the compacted SSTable.
+    #[tokio::test]
+    async fn fts_after_compaction_uses_a_sidecar_and_sees_only_current_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        const OLD: &str = "ferrosaftssupersededtext";
+        const NEW: &str = "ferrosaftscurrenttext";
+        engine
+            .write(&tid, &make_key("doc"), make_row(OLD.as_bytes(), 1), 1)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        engine
+            .write(&tid, &make_key("doc"), make_row(NEW.as_bytes(), 2), 2)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        for batch in 0..3i64 {
+            let ts = 10 + batch;
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("filler_{batch}")),
+                    make_row(b"filler row text", ts),
+                    ts,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        compact_and_wait_for_swap(&engine, &tid).await;
+        let live = engine.sstable_count(&tid);
+
+        FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(0));
+        FTS_SSTABLE_FULL_SCANS.with(|c| c.set(0));
+        let old_hits = engine
+            .fulltext_search(&tid, "idx_body", OLD, Some(10))
+            .unwrap();
+        let new_hits = engine
+            .fulltext_search(&tid, "idx_body", NEW, Some(10))
+            .unwrap();
+        let full_scans = FTS_SSTABLE_FULL_SCANS.with(|c| c.get());
+        let consulted = FTS_SIDECAR_FILES_CONSULTED.with(|c| c.get());
+
+        assert!(
+            old_hits.is_empty(),
+            "text overwritten before compaction must not match, got {:?}",
+            fts_partition_keys(&old_hits)
+        );
+        assert_eq!(fts_partition_keys(&new_hits), vec!["doc".to_string()]);
+        assert_eq!(
+            full_scans, 0,
+            "compaction must leave its output covered by an FTI sidecar; \
+             {full_scans} live SSTable(s) were tokenized in full on the query path"
+        );
+        assert_eq!(
+            consulted,
+            2 * live,
+            "two queries over {live} live SSTable(s) must consult exactly \
+             {} sidecars, consulted {consulted}",
+            2 * live
+        );
+    }
+
+    /// A live SSTable with no sidecar (compacted by a build that did not write
+    /// one, or a failed sidecar write) is tokenized ONCE, and the resulting
+    /// sidecar is kept — the next query must not pay for it again.
+    #[tokio::test]
+    async fn fts_sidecar_less_live_sstable_is_tokenized_once_not_per_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        const PROBE: &str = "ferrosaftsbackfillprobe";
+        engine
+            .write(
+                &tid,
+                &make_key("doc_0000"),
+                make_row(format!("{PROBE} row").as_bytes(), 1),
+                1,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        let sidecars = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.to_string_lossy().ends_with("-FTI-idx_body.db"))
+                .collect()
+        };
+        for path in sidecars(&table_dir) {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(sidecars(&table_dir).is_empty());
+
+        FTS_SSTABLE_FULL_SCANS.with(|c| c.set(0));
+        let first = engine
+            .fulltext_search(&tid, "idx_body", PROBE, Some(10))
+            .unwrap();
+        let first_scans = FTS_SSTABLE_FULL_SCANS.with(|c| c.get());
+        let second = engine
+            .fulltext_search(&tid, "idx_body", PROBE, Some(10))
+            .unwrap();
+        let total_scans = FTS_SSTABLE_FULL_SCANS.with(|c| c.get());
+
+        assert_eq!(fts_partition_keys(&first), vec!["doc_0000".to_string()]);
+        assert_eq!(fts_partition_keys(&second), vec!["doc_0000".to_string()]);
+        assert_eq!(first_scans, 1, "the uncovered SSTable is scanned once");
+        assert_eq!(
+            total_scans, 1,
+            "the second query must use the sidecar the first one built, \
+             but the SSTable was tokenized again"
+        );
+        assert_eq!(
+            sidecars(&table_dir).len(),
+            1,
+            "the sidecar built for the uncovered SSTable must be persisted"
         );
     }
 

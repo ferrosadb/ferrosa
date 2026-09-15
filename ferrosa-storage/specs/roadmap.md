@@ -26,6 +26,14 @@ open work lives in specs and the items below.
 
 ## Next
 
+- **Remove index artifacts with the generation they index (FMEA ST-24).**
+  `evict_local_input_sstable_files` and `delete_sstable_files` remove only the
+  seven SSTable components, so every compacted or evicted generation leaves its
+  `.sidecar`, `FTI-` and `VEC-` files behind (5,122 FTI sidecars against 11 live
+  SSTables per node on one cluster). The query path no longer reads them, but
+  they cost disk, and a one-time sweep is needed for tables that already
+  accumulated them. Deleting must respect S3-evicted generations whose sidecars
+  are still live.
 - **Proactive disk-pressure flush throttle (FMEA ST-4).** Beyond the
   `local_disk_free_reserve_bytes` fail-closed admission gate, add an earlier
   signal that throttles/accelerates flush+upload as local NVMe usage climbs, so

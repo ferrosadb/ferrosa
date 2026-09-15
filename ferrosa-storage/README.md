@@ -221,10 +221,21 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   completely before publishing it, and the S3 sync uploads sidecars built
   after their generation was already in the manifest.
 - **Full-text search** (`fulltext_search(table, index, query, limit)`) —
-  searches the memtable FTI + each per-SSTable `-FTI-{index}.db` sidecar, and
-  **falls back to scanning any live SSTable whose sidecar is transiently
-  missing** (the async index-rebuild window after compaction), so a stable row
-  is never dropped from `fts_match` (BUG-F-007 / t_0455c0a1). Memory is
+  searches the memtable FTI + the `-FTI-{index}.db` sidecar of each **live**
+  SSTable, found from the store view (`TableStore::fulltext_live_sidecars`),
+  never from a directory listing: compaction leaves its inputs' index
+  artifacts on disk, and reading those returned keys for superseded rows and
+  made every query's cost grow with the table's whole compaction history.
+  **Compaction builds the output's FTI sidecar before the swap**, and a query
+  that finds a live SSTable without one builds and persists it first
+  (`plan_missing_fulltext_sidecars` → `FulltextSidecarBuild::run`: planned
+  under the table lock, run without it, single-flight per table, atomic
+  temp-file + rename). Only an SSTable whose sidecar cannot be built (logged
+  at ERROR) or a non-persisting target falls back to scanning it on every
+  query, so a stable row is never dropped from `fts_match` (BUG-F-007 /
+  t_0455c0a1). Before this, compaction wrote no sidecar and the fallback ran
+  on every query for the life of every compacted SSTable — 7–13 s per replica
+  on a live cluster, past the coordinator's 3 s Bulk-lane budget (FMEA ST-24). Memory is
   bounded (t_ee98faa0 layer 2 — a broad `fts_match` used to OOM every
   replica): `limit` is the QUERY-derived `LIMIT k` pushed down by the
   coordinator (never a server cap) and bounds every per-source working set to
@@ -235,8 +246,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   uncovered SSTables at once. Only the queried index's sidecars are consulted
   — orphaned registrations are never touched on the query path. Guarded by
   `tests/fulltext_replica_memory_bound.rs` (allocator-tracked peak: O(k),
-  independent of matching-doc count) and
-  `engine::tests::fts_search_touches_only_queried_index_sidecars`.
+  independent of matching-doc count),
+  `engine::tests::fts_search_touches_only_queried_index_sidecars`,
+  `fts_search_ignores_sidecars_of_generations_that_are_not_live`,
+  `fts_after_compaction_uses_a_sidecar_and_sees_only_current_rows` and
+  `fts_sidecar_less_live_sstable_is_tokenized_once_not_per_query`.
   The no-`LIMIT` shape has a streaming twin, **`fulltext_search_each(table,
   index, query, on_hit)`** (t_4ae47a9f layer 2b): single-term walks hand each
   matching doc key to the callback with an O(1) working set (no score map;

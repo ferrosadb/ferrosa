@@ -412,6 +412,33 @@ pub trait FlushTarget {
         Ok(())
     }
 
+    /// Whether [`FlushTarget::write_fti_sidecar_in`] persists anything. Callers
+    /// skip building a sidecar a target would discard.
+    fn persists_fti_sidecars(&self) -> bool {
+        false
+    }
+
+    /// Write generation `generation`'s FTI sidecar for `index_name` into
+    /// `dir` — the SSTable's own component directory — atomically: readers
+    /// see the complete file or no file.
+    ///
+    /// Used for SSTables that did not get a sidecar at flush time (compaction
+    /// outputs, and SSTables written before those were built). The default is
+    /// an error, so a caller that skipped [`FlushTarget::persists_fti_sidecars`]
+    /// fails loudly instead of believing a discarded sidecar was written.
+    fn write_fti_sidecar_in(
+        &self,
+        _dir: &Path,
+        generation: &str,
+        index_name: &str,
+        _fti_bytes: &[u8],
+    ) -> Result<()> {
+        Err(ferrosa_common::Error::InvalidFormat(format!(
+            "this flush target does not persist FTI sidecars \
+             (generation {generation}, index {index_name})"
+        )))
+    }
+
     /// Write a vector (HNSW) sidecar file alongside the SSTable.
     ///
     /// Writes `{gen}-VEC-{index_name}.db` to the SSTable directory (or
@@ -1626,6 +1653,47 @@ impl FlushTarget for FileFlushTarget {
             readers.insert((*index_name).to_string(), reader);
         }
         Ok(readers)
+    }
+
+    fn persists_fti_sidecars(&self) -> bool {
+        true
+    }
+
+    fn write_fti_sidecar_in(
+        &self,
+        dir: &Path,
+        generation: &str,
+        index_name: &str,
+        fti_bytes: &[u8],
+    ) -> Result<()> {
+        use std::io::Write;
+
+        let dir = if dir.as_os_str().is_empty() {
+            self.base_dir.as_path()
+        } else {
+            dir
+        };
+        let path = dir.join(crate::store::fti_sidecar_file_name(generation, index_name));
+        // Not `{gen}-` prefixed, so nothing that enumerates a generation's
+        // components can pick up a half-written file; `.tmp`, so startup
+        // cleanup removes one a crash left behind.
+        let tmp = dir.join(format!(
+            ".fti-{generation}-{index_name}.{}.tmp",
+            std::process::id()
+        ));
+        let written = std::fs::File::create(&tmp).and_then(|mut file| {
+            file.write_all(fti_bytes)?;
+            file.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+            if let Err(cleanup) = std::fs::remove_file(&tmp) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %tmp.display(), %cleanup, "fts: could not remove temp FTI sidecar");
+                }
+            }
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     fn write_fti_sidecar(&self, generation: u64, index_name: &str, fti_bytes: &[u8]) -> Result<()> {

@@ -33,6 +33,13 @@ this roadmap is gap- and risk-driven rather than scraped from the code.
 
 ## Next
 
+- **Fail pending requests when their connection dies (FMEA NET-12).** The
+  client read loop now logs a rejected frame or undecodable response, but the
+  request waiting on it still fails only at its lane timeout. Dropping the
+  connection's pending senders when the read loop ends would fail those callers
+  at once, with an error that says the connection closed. Check the
+  reconnect/retry predicates that match on error text before changing what
+  those callers see.
 - **Mutual TLS (client auth)** (FMEA NET-8). Both `build_tls_acceptor` and
   `build_tls_connector` use `with_no_client_auth`. Add an opt-in mTLS mode that
   verifies the peer certificate against the configured CA, so TLS authenticates
