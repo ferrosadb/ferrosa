@@ -7225,9 +7225,23 @@ impl StorageEngine {
         start: Option<&DecoratedKey>,
         end: Option<&DecoratedKey>,
     ) -> ferrosa_common::Result<u64> {
+        self.count_range_matching(table_id, start, end, &|_| true)
+    }
+
+    /// `count_range`, counting only partitions whose key satisfies `matches`.
+    ///
+    /// Keeps `COUNT(*) WHERE <partition-key component> = ?` on the metadata
+    /// fast path instead of dropping it onto a secondary-index walk.
+    pub fn count_range_matching(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> ferrosa_common::Result<u64> {
         let tables = self.tables.read();
         match tables.get(table_id) {
-            Some(state) => state.store.count_range(start, end),
+            Some(state) => state.store.count_range_matching(start, end, matches),
             None => Ok(0),
         }
     }

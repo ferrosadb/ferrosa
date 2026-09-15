@@ -896,11 +896,33 @@ impl WritePath {
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
     ) -> crate::error::Result<u64> {
+        self.count_range_matching_with(table_id, cl, &|_| true)
+            .await
+    }
+
+    /// `count_range_with`, counting only partitions whose key satisfies
+    /// `matches` — the metadata fast path for a COUNT with a partition-key
+    /// equality.
+    pub async fn count_range_matching_with(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
         match self {
             Self::Cluster(coordinator) => {
-                coordinator.coordinate_range_count_with(table_id, cl).await
+                coordinator
+                    .coordinate_range_count_matching(table_id, cl, matches)
+                    .await
             }
-            _ => self.count_range(table_id).await,
+            Self::Direct(engine) => engine
+                .count_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .count_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Unavailable => self.count_range(table_id).await,
         }
     }
 

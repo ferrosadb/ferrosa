@@ -172,6 +172,28 @@ impl ClusterCoordinator {
         table_id: &TableId,
         cl: crate::consistency::ConsistencyLevel,
     ) -> crate::error::Result<u64> {
+        self.coordinate_range_count_matching(table_id, cl, &|_| true)
+            .await
+    }
+
+    /// `coordinate_range_count_with`, counting only partitions whose key
+    /// satisfies `matches`.
+    ///
+    /// The predicate is applied at the COORDINATOR in both branches — the
+    /// local metadata count and the fanned-out merge — because both have the
+    /// partition key in hand. Nothing new goes on the wire, so a mixed-version
+    /// cluster needs no upgrade ordering for this.
+    ///
+    /// What it is for: any WHERE clause used to disqualify the ADR-020 fast
+    /// path entirely, sending `COUNT(*) WHERE <pk component> = ?` through a
+    /// secondary-index walk — 24s against the unfiltered count's 0.32s over
+    /// the same 103,664 rows on a live cluster.
+    pub async fn coordinate_range_count_matching(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
         // Correctness over speed (forge t_8c4e44e8): the local replica only
         // holds the partitions whose tokens fall in ITS owned ranges. When the
         // keyspace RF does not span the whole ring (`RF < node_count`, or any
@@ -189,7 +211,7 @@ impl ClusterCoordinator {
         if remotes.is_empty() {
             return self
                 .storage
-                .count_range(table_id, None, None)
+                .count_range_matching(table_id, None, None, matches)
                 .map_err(ClusterError::Storage);
         }
 
@@ -206,6 +228,9 @@ impl ClusterCoordinator {
         let mut total: u64 = 0;
         while let Some(item) = stream.next().await {
             let partition = item?;
+            if !matches(&partition.key) {
+                continue;
+            }
             total = total.saturating_add(partition.rows.len() as u64);
             if partition.static_row.is_some() {
                 total = total.saturating_add(1);
