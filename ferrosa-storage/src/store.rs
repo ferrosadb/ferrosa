@@ -6376,17 +6376,37 @@ impl<F: FlushTarget> TableStore<F> {
     /// Used by `add_index` to submit backfill jobs for existing SSTables.
     /// Returns IDs based on the flush target's generation counter: the most
     /// recent flush is `last_generation`, and prior ones count down from there.
+    /// The generation id of every SSTable this store currently holds.
+    ///
+    /// Read from the live view, because that is the only thing that knows. This
+    /// used to synthesise a contiguous range — `last_generation()` from the
+    /// flush target, minus the live count, and every integer between — on the
+    /// assumption that generations are dense and end at `last_gen`.
+    ///
+    /// They are not. Ids come from a separate counter (`next_sstable_id`),
+    /// `advance_gen_past` jumps it on recovery and around compaction output,
+    /// and compaction retires arbitrary generations. The two drift apart
+    /// immediately and the range is then mostly fiction.
+    ///
+    /// What that cost, measured on a live cluster: a rebuild of
+    /// `idx_entity_by_tenant` was handed 21 ids, found no data file for 20 of
+    /// them, classified all 20 as "compacted away — nothing to index", indexed
+    /// the 1 that happened to be real, and reported the index complete. The
+    /// node held 8 SSTables with data and none with orphaned metadata, so the
+    /// 20 were never files and 7 real ones were never scanned. Reads through
+    /// that index then returned 32,632 rows where the table held 102,840 —
+    /// a wrong answer with no error anywhere, which is the outcome the whole
+    /// index-currency machinery exists to prevent.
+    ///
+    /// Six call sites in `engine.rs` take their SSTable list from here, so
+    /// every index backfill inherited it, not only `ferrosa-ctl index rebuild`.
     pub fn sstable_generation_ids(&self) -> Vec<String> {
-        let count = self.sstable_count();
-        let last_gen = self.flush_target.last_generation();
-        // Generations are numbered 1..=last_gen.
-        // The store holds `count` SSTables (may be fewer than last_gen after compaction).
-        // Return the most recent `count` generation IDs.
-        if count == 0 || last_gen == 0 {
-            return vec![];
-        }
-        let start = last_gen.saturating_sub(count as u64) + 1;
-        (start..=last_gen).map(|g| format!("{g}")).collect()
+        self.view
+            .load()
+            .sstables
+            .iter()
+            .map(|descriptor| descriptor.gen.clone())
+            .collect()
     }
 
     /// Translate a current-schema regular-column ordinal to the physical
@@ -7208,6 +7228,79 @@ mod tests {
     /// once even when two sources hold it, resumable strictly after a row.
     /// That is what lets a tenant-wide read page through a node holding only
     /// a cursor per source, never the result (t_50c8bc7d).
+    /// The index rebuild asks this for the SSTables to scan, so it must name
+    /// the ones the store ACTUALLY holds — not a guess.
+    ///
+    /// It used to synthesise a contiguous range: take `last_generation()` from
+    /// the flush target, subtract the live SSTable count, and emit every integer
+    /// between. That is only right while generations are dense and end at
+    /// `last_gen`. Generations are allocated from a SEPARATE counter
+    /// (`next_sstable_id` / `next_gen`) and compaction retires arbitrary ones,
+    /// so in practice the two diverge and the range is mostly fiction.
+    ///
+    /// Live cluster, 2026-09-14: a rebuild of `idx_entity_by_tenant` on
+    /// agent_memory.entity_store reported `sstables_total=21`, then logged 20 of
+    /// them as "no data file — compacted away" and indexed 1. On disk that node
+    /// held 8 generations WITH a Data.db and ZERO with a TOC but no Data.db —
+    /// so the 20 were not orphaned metadata, they were ids that never existed,
+    /// and 7 real SSTables were never enumerated at all. The index was then
+    /// marked current while covering an eighth of the table, and
+    /// `SELECT COUNT(*) WHERE tenant_id = …` returned 32,632 against a true
+    /// 102,840.
+    ///
+    /// Six call sites in engine.rs take their SSTable list from here, so every
+    /// index backfill inherited the same fiction — not only `index rebuild`.
+    #[test]
+    fn generation_ids_name_the_sstables_the_store_holds() {
+        let store = test_store();
+        store.write(&make_key("k1"), make_row(b"v", 1000)).unwrap();
+        store.flush().unwrap();
+        // Generations do not stay dense. `advance_gen_past` is called on
+        // recovery and around compaction output so new files cannot collide
+        // with existing ones, and it jumps BOTH counters. After it, the live
+        // set is {1, 1001} while the arithmetic guess covers {1000, 1001}:
+        // one id that never existed, one real SSTable never named.
+        store.advance_gen_past(1000);
+        store.write(&make_key("k2"), make_row(b"v", 2000)).unwrap();
+        store.flush().unwrap();
+
+        assert!(
+            store.sstable_count() >= 2,
+            "fixture must actually hold SSTables or this test proves nothing; held {}",
+            store.sstable_count()
+        );
+
+        let ids = store.sstable_generation_ids();
+        assert_eq!(
+            ids.len(),
+            store.sstable_count(),
+            "the store holds {} SSTables and the enumeration named {}: {ids:?}",
+            store.sstable_count(),
+            ids.len()
+        );
+
+        // And they must be the REAL generations, not fabricated ones. Anything
+        // named here that the store does not hold sends a backfill looking for
+        // a file that was never written, which it then classifies as
+        // "compacted away" and discounts from coverage.
+        let live: Vec<String> = store
+            .view
+            .load()
+            .sstables
+            .iter()
+            .map(|d| d.gen.clone())
+            .collect();
+        let mut got = ids.clone();
+        let mut want = live.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "enumeration must match the live SSTable set exactly; \
+             named {got:?} but the store holds {want:?}"
+        );
+    }
+
     #[test]
     fn index_reads_merge_sources_in_row_order_and_resume_after_a_row() {
         let store = TableStore::new_with_indexes(
