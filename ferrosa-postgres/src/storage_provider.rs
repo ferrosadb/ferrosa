@@ -8,13 +8,56 @@
 //! Real ferrosa storage, by contrast, exposes its range scan as an **async**
 //! `Stream<Item = Result<Partition>>` ([`ferrosa_storage::StorageEngine::range_iter`]).
 //!
-//! We resolve this by **materializing the scan asynchronously up front**: an async
-//! loader ([`load_table`]) drains the storage stream, decomposes every partition
-//! into rows, and hands back a fully-populated [`ferrosa_sql::InMemoryTable`]. The
-//! sync scan/filter/join operators then run over that in-memory snapshot. We do
-//! **not** `block_on` inside the sync `scan()` — doing so on the server's async
-//! runtime risks deadlock. The query executor is expected to call [`load_table`]
-//! (await it) before it runs the sync operators.
+//! We resolve this with a **bounded hand-off**, not a materialization.
+//! [`load_table`] resolves the table's metadata and decode context, then returns
+//! a [`StreamingTable`] that has read no rows at all. Each call to its `scan()`
+//! spawns an async producer that drains `range_iter` and pushes decoded rows
+//! into an [`mpsc`] channel of capacity [`SCAN_BUFFER_ROWS`]; the sync iterator
+//! on the other end pulls with `blocking_recv`. The channel is what supplies
+//! backpressure: the producer may run at most `SCAN_BUFFER_ROWS` rows ahead of
+//! the consumer, so the source-side peak is **one partition plus the channel**,
+//! never the table.
+//!
+//! ### Why this is safe to block on
+//!
+//! `blocking_recv` would panic on an async worker, and blocking one would be the
+//! deadlock this module used to avoid by materializing. It is legal here because
+//! the synchronous executor no longer runs on an async worker: the `offload`
+//! module moved `ferrosa_sql::execute` onto `spawn_blocking` (t_d3b2dec1). That
+//! change is the prerequisite for this one — the sync consumer is now *allowed* to
+//! block, which is exactly what a bounded channel needs.
+//!
+//! ### What is bounded, and what is not
+//!
+//! [`SCAN_BUFFER_ROWS`] is a **work bound** — how many rows may be in flight —
+//! and never a result bound. Every row of the table is still delivered; the
+//! channel only decides how far ahead the producer may run. A cap on rows
+//! *returned* would be a different thing entirely and is not what this is.
+//!
+//! This bounds the **source** side. The relational executor still collects its
+//! base row set (`ferrosa-sql`, `seq_scan(..).collect()`) and `QueryResult.rows`
+//! is a `Vec`, so an end-to-end `SELECT *` peak remains O(result) until that is
+//! streamed (t_50d99192). Those sites carry their own audit allowlist entries;
+//! nothing here hides them.
+//!
+//! ### Re-scannable, because `scan()` is
+//!
+//! `TableProvider::scan(&self)` may be called more than once on the same
+//! provider — a self-join (`FROM t JOIN t`) resolves both sides to one
+//! `Arc`. A single-shot channel would hand the second scan an empty relation,
+//! which is a wrong answer rather than a loud one. So each `scan()` spawns its
+//! own producer and re-reads from storage. That trades a second pass over
+//! storage for a memory bound, which is the trade this module exists to make.
+//!
+//! ### A storage error must not become a short result
+//!
+//! `scan()` returns `Iterator<Item = Row>`, which has no way to report a
+//! mid-stream failure: a producer that died on a storage error would simply
+//! close the channel and the query would return *fewer rows, successfully*.
+//! That is the silent-truncation failure this codebase forbids. Instead the
+//! producer records the error in a [`ScanFailure`] slot shared by every table in
+//! the catalog, and the query layer checks that slot after `execute` returns and
+//! fails the whole query loud. The rows already produced are discarded.
 //!
 //! ## R15 guard: missing table is NOT an empty table
 //!
@@ -55,12 +98,15 @@
 //! - Collections / composites: `List`, `Set`, `Map`, `Tuple`, `Udt`, `Vector`
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
-use ferrosa_common::CqlValue;
+use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema, TableMetadata};
-use ferrosa_sql::{Column, ColumnType, InMemoryTable, RelSchema, Row, Value};
+use ferrosa_sql::{Column, ColumnType, RelSchema, Row, TableProvider, Value};
 use ferrosa_storage::{StorageEngine, TableId};
 use futures::StreamExt;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 /// Convert a single ferrosa [`CqlValue`] to the engine's [`ferrosa_sql::Value`].
 ///
@@ -240,25 +286,185 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
     pairs.into_iter().map(|(_, table_idx)| table_idx).collect()
 }
 
-/// Load every row of `keyspace.table` from ferrosa storage into an in-memory,
-/// synchronously-scannable [`InMemoryTable`].
+/// How many decoded rows may sit between the async producer and the sync
+/// consumer at once.
 ///
-/// This is the async materialization step described in the module docs: it
-/// awaits the full `range_iter` stream up front so the sync engine operators can
-/// run over real data without ever blocking the runtime.
+/// This is a **work bound**, not a result bound: it caps how far the storage
+/// scan may run ahead of the executor, and every row of the table is still
+/// delivered. Sized so a scan of wide rows keeps its in-flight window in the
+/// low megabytes while still leaving the producer enough slack to stay busy
+/// across a partition boundary.
+pub const SCAN_BUFFER_ROWS: usize = 64;
+
+/// The first storage error hit by any scan in one query, shared by every table
+/// in that query's catalog.
+///
+/// A scan producer cannot return an error through `Iterator<Item = Row>`, so it
+/// records it here and stops. The query layer takes this slot after `execute`
+/// returns; a recorded failure turns the whole query into an `ErrorResponse`
+/// instead of a short, successful-looking result. First failure wins — later
+/// ones are consequences of the same collapse and would only obscure it.
+#[derive(Clone, Default)]
+pub struct ScanFailure(Arc<Mutex<Option<String>>>);
+
+impl ScanFailure {
+    /// Record `message` unless a failure is already recorded.
+    ///
+    /// Poisoning is impossible in practice (the guarded value is a `String` and
+    /// nothing panics while held), but recovering rather than unwrapping means a
+    /// poisoned lock still reports the error instead of masking it with a panic
+    /// on the way out.
+    pub fn record(&self, message: String) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    /// Take the recorded failure, if any, leaving the slot empty.
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl fmt::Debug for ScanFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_tuple("ScanFailure").field(&*slot).finish()
+    }
+}
+
+/// Everything a scan producer needs, resolved once at load time so that
+/// re-scanning costs a storage pass and not a metadata pass.
+struct ScanContext {
+    engine: Arc<StorageEngine>,
+    table_id: TableId,
+    col_names: Vec<String>,
+    col_types: Vec<CqlType>,
+    pk_idx: Vec<usize>,
+    ck_idx: Vec<usize>,
+    storage_to_table: Vec<usize>,
+}
+
+/// Drain `range_iter` into `tx`, decoding one partition at a time.
+///
+/// Returns — releasing the storage stream and the engine handle — on any of the
+/// three exits: the stream ends, storage errors (recorded in `failure` first),
+/// or the consumer drops its receiver. Nothing is left running behind a
+/// cancelled or short-circuited query.
+async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: ScanFailure) {
+    let mut stream = ctx.engine.range_iter(&ctx.table_id, None, None);
+    while let Some(item) = stream.next().await {
+        let partition = match item {
+            Ok(p) => p,
+            Err(e) => {
+                // Fail loud. The consumer only sees the channel close, so this
+                // slot is the ONLY thing standing between a storage error and a
+                // silently-truncated result set.
+                failure.record(format!(
+                    "scan of {}.{} failed: {e}",
+                    ctx.table_id.keyspace, ctx.table_id.table
+                ));
+                return;
+            }
+        };
+        // Mirror the CQL SELECT path: one engine row per logical CQL row, with
+        // values in the table's declared column order. The decomposition is
+        // per-partition, so this holds one partition's rows, not the table's.
+        for cql_row in ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
+            &partition,
+            &ctx.col_names,
+            &ctx.col_types,
+            &ctx.pk_idx,
+            &ctx.ck_idx,
+            &ctx.storage_to_table,
+        ) {
+            let values = cql_row
+                .iter()
+                .map(|cell| cell.as_ref().map_or(Value::Null, cql_to_value))
+                .collect();
+            if tx.send(Row::new(values)).await.is_err() {
+                // The consumer is gone: the executor short-circuited, errored,
+                // or the connection dropped. Not a failure — stop producing.
+                return;
+            }
+        }
+    }
+}
+
+/// The sync half of the hand-off: pulls rows the producer pushes.
+///
+/// `blocking_recv` is legal here because the relational executor runs on a
+/// `spawn_blocking` thread (see the `offload` module). Dropping this iterator
+/// closes the channel, which is what tells the producer to stop.
+struct ScanIter {
+    rx: mpsc::Receiver<Row>,
+}
+
+impl Iterator for ScanIter {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Row> {
+        self.rx.blocking_recv()
+    }
+}
+
+/// A [`TableProvider`] that streams `keyspace.table` from storage on demand.
+///
+/// Holds no rows. Each `scan()` opens a fresh bounded channel and spawns its own
+/// producer, so the provider is re-scannable (see the module docs on self-joins)
+/// and never accumulates.
+pub struct StreamingTable {
+    schema: RelSchema,
+    ctx: Arc<ScanContext>,
+    /// Captured at load time so `scan()` — which is sync and may run on a
+    /// blocking thread with no runtime of its own — can still spawn a producer.
+    handle: Handle,
+    failure: ScanFailure,
+}
+
+impl fmt::Debug for StreamingTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamingTable")
+            .field("table", &self.ctx.table_id)
+            .field("columns", &self.schema.columns.len())
+            .finish()
+    }
+}
+
+impl TableProvider for StreamingTable {
+    fn schema(&self) -> &RelSchema {
+        &self.schema
+    }
+
+    fn scan(&self) -> Box<dyn Iterator<Item = Row> + '_> {
+        let (tx, rx) = mpsc::channel(SCAN_BUFFER_ROWS);
+        self.handle
+            .spawn(produce_scan(self.ctx.clone(), tx, self.failure.clone()));
+        Box::new(ScanIter { rx })
+    }
+}
+
+/// Open `keyspace.table` for streaming scans, resolving its schema and decode
+/// context up front.
+///
+/// Reads **no rows**: the returned [`StreamingTable`] pulls from storage only
+/// when scanned. `failure` is the query-wide slot a scan records a storage error
+/// into; the caller must check it after execution (see [`ScanFailure`]).
 ///
 /// # Errors
 ///
 /// - [`LoadError::NoSuchTable`] if the table is not in the schema snapshot (the
 ///   R15 guard — never returns an empty relation for a missing table).
-/// - [`LoadError::Storage`] if the storage stream yields an error, or a column
-///   type string fails to parse.
+/// - [`LoadError::Storage`] if a column type string fails to parse. A storage
+///   error *during* a scan cannot surface here — it lands in `failure`.
 pub async fn load_table(
-    engine: &StorageEngine,
+    engine: &Arc<StorageEngine>,
     schema: &Schema,
     keyspace: &str,
     table: &str,
-) -> Result<InMemoryTable, LoadError> {
+    failure: ScanFailure,
+) -> Result<StreamingTable, LoadError> {
     let snapshot = schema.snapshot();
 
     // R15 guard: existence is decided by schema metadata, never by an empty
@@ -285,32 +491,22 @@ pub async fn load_table(
     let ck_idx = ck_indices(meta);
     let storage_to_table = storage_to_table_indices(meta);
 
-    // Materialize the async scan up front (full-table: no key bounds).
-    let table_id = TableId::new(keyspace, table);
-    let mut stream = engine.range_iter(&table_id, None, None);
-
-    let mut rows: Vec<Row> = Vec::new();
-    while let Some(item) = stream.next().await {
-        let partition = item.map_err(|e| LoadError::Storage(e.to_string()))?;
-        // Mirror the CQL SELECT path: one engine row per logical CQL row, with
-        // values in the table's declared column order.
-        for cql_row in ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
-            &partition,
-            &col_names,
-            &col_types,
-            &pk_idx,
-            &ck_idx,
-            &storage_to_table,
-        ) {
-            let values = cql_row
-                .iter()
-                .map(|cell| cell.as_ref().map_or(Value::Null, cql_to_value))
-                .collect();
-            rows.push(Row::new(values));
-        }
-    }
-
-    Ok(InMemoryTable::new(rel_schema, rows))
+    // No scan happens here: the provider reads from storage only when scanned
+    // (full-table, no key bounds), one bounded window of rows at a time.
+    Ok(StreamingTable {
+        schema: rel_schema,
+        ctx: Arc::new(ScanContext {
+            engine: engine.clone(),
+            table_id: TableId::new(keyspace, table),
+            col_names,
+            col_types,
+            pk_idx,
+            ck_idx,
+            storage_to_table,
+        }),
+        handle: Handle::current(),
+        failure,
+    })
 }
 
 #[cfg(test)]
@@ -649,10 +845,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn load_table_materializes_rows_in_declared_order() {
+    /// Drive a provider's scan the way the server does: on a blocking thread.
+    ///
+    /// The bounded channel's receive blocks, which is legal on the blocking
+    /// pool and a panic on an async worker — so a test that scanned inline
+    /// would be testing something the server never does.
+    async fn scan_rows(table: Arc<StreamingTable>) -> Vec<Row> {
+        tokio::task::spawn_blocking(move || table.scan().collect())
+            .await
+            .expect("scan task")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_table_streams_rows_in_declared_order() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
         engine.register_table(storage_schema()).unwrap();
 
         let schema = schema_with_table();
@@ -671,9 +878,11 @@ mod tests {
             .write(&tid, &key_b, storage_row(1, "bob", 30, 1002), 1002)
             .unwrap();
 
-        let table = load_table(&engine, &schema, "ks", "t")
-            .await
-            .expect("load succeeds");
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", ScanFailure::default())
+                .await
+                .expect("load succeeds"),
+        );
 
         // Schema is in declared order: id, ck, name, score.
         let cols: Vec<&str> = table
@@ -687,7 +896,7 @@ mod tests {
         assert_eq!(table.schema().columns[1].ty, ColumnType::Int); // ck int
         assert_eq!(table.schema().columns[3].ty, ColumnType::Int); // score int
 
-        let mut rows: Vec<Row> = table.scan().collect();
+        let mut rows: Vec<Row> = scan_rows(table.clone()).await;
         assert_eq!(rows.len(), 3, "two partitions, three logical rows");
 
         // Sort for deterministic assertions: by (id, ck).
@@ -718,14 +927,105 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
-    #[tokio::test]
+    /// `scan()` must be repeatable.
+    ///
+    /// A self-join (`FROM t JOIN t`) resolves both sides to ONE provider and
+    /// scans it twice. A single-shot channel would hand the second scan an
+    /// empty relation — a wrong answer that no error reports. Each scan gets
+    /// its own producer, so both see the whole table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_is_repeatable_so_a_self_join_sees_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+
+        let key_a = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
+        let key_b = DecoratedKey::new(PartitionKey::new(b"beta".to_vec()));
+        engine
+            .write(&tid, &key_a, storage_row(1, "ann", 10, 1000), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &key_b, storage_row(1, "bob", 30, 1002), 1002)
+            .unwrap();
+
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", ScanFailure::default())
+                .await
+                .expect("load succeeds"),
+        );
+
+        let first = scan_rows(table.clone()).await;
+        let second = scan_rows(table.clone()).await;
+
+        assert_eq!(first.len(), 2, "first scan sees the whole table");
+        assert_eq!(
+            second.len(),
+            2,
+            "the SECOND scan must see the whole table too, not an empty relation"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// A scan of a table the engine does not have registered yields zero rows
+    /// and records NO failure — the empty stream is the storage layer's answer
+    /// for an unregistered table, and the R15 guard above is what distinguishes
+    /// that from a missing table. This pins the failure slot to real storage
+    /// errors so it cannot quietly become a second existence check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_records_no_failure_when_storage_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+
+        let failure = ScanFailure::default();
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", failure.clone())
+                .await
+                .expect("load succeeds"),
+        );
+        let rows = scan_rows(table).await;
+
+        assert_eq!(rows.len(), 0);
+        assert_eq!(
+            failure.take(),
+            None,
+            "a healthy empty scan must not record a failure"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// The failure slot keeps the FIRST error and survives being taken.
+    ///
+    /// Two tables in one query share one slot; the second collapse is a
+    /// consequence of the first and must not overwrite the cause.
+    #[test]
+    fn scan_failure_keeps_the_first_error_and_takes_once() {
+        let failure = ScanFailure::default();
+        assert_eq!(failure.take(), None, "empty slot takes as None");
+
+        failure.record("first".to_string());
+        failure.record("second".to_string());
+
+        // A clone shares the slot: this is how every provider in a catalog
+        // reports into the one place the query layer checks.
+        let seen = failure.clone().take();
+        assert_eq!(seen.as_deref(), Some("first"), "first failure wins");
+        assert_eq!(failure.take(), None, "taking empties the slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_table_missing_table_is_no_such_table() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
         let schema = schema_with_table();
 
         // "ghost" is not in the schema snapshot -> NoSuchTable, NOT empty Ok.
-        let err = load_table(&engine, &schema, "ks", "ghost")
+        let err = load_table(&engine, &schema, "ks", "ghost", ScanFailure::default())
             .await
             .expect_err("missing table must error");
         match err {
@@ -739,19 +1039,25 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_table_existing_empty_table_is_ok_zero_rows() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
         engine.register_table(storage_schema()).unwrap();
         let schema = schema_with_table();
 
         // Registered + declared, but no rows written: distinct from NoSuchTable.
-        let table = load_table(&engine, &schema, "ks", "t")
-            .await
-            .expect("existing empty table loads ok");
-        assert_eq!(table.scan().count(), 0, "empty table yields zero rows");
+        let table = Arc::new(
+            load_table(&engine, &schema, "ks", "t", ScanFailure::default())
+                .await
+                .expect("existing empty table loads ok"),
+        );
         assert_eq!(table.schema().width(), 4, "schema still has all 4 columns");
+        assert_eq!(
+            scan_rows(table).await.len(),
+            0,
+            "empty table yields zero rows"
+        );
 
         engine.shutdown().unwrap();
     }
