@@ -1,13 +1,15 @@
 ---
 crate: ferrosa-sql
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-09-15
 executive_summary: >
   The bespoke relational query engine (lexer + recursive-descent parser, binder/
   planner, Volcano-style physical operators) behind Ferrosa's Postgres front-end.
   Decision D3: NO DataFusion / Arrow — the crate owns its own value model,
   three-valued NULL (Kleene) logic, and C-collation ordering so semantics are
-  auditable end-to-end. It is a standalone leaf with no ferrosa-* dependencies.
+  auditable end-to-end. Its blocking operators (sort, hash aggregate, join build,
+  DISTINCT dedup) spill to disk through ferrosa-storage's bounded external merge
+  sort, which is its only ferrosa-* dependency edge (ferrosa-storage).
 ---
 
 # ferrosa-sql — Architecture Overview
@@ -32,7 +34,8 @@ inner equi-join — and widens outward.
 | Module | LoC | Responsibility |
 |--------|-----|----------------|
 | `types` (`src/types.rs`) | ~488 | `Value` enum, `Row`, `Column`, `ColumnType`, `RelSchema`; `Value::sql_cmp` three-valued comparison + numeric normalization |
-| `exec` (`src/exec.rs`) | ~791 | Physical operators: `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `limit_offset`; `Predicate`, `CmpOp`, `AggFunc` |
+| `exec` (`src/exec.rs`) | ~900 | Physical operators: streaming `seq_scan`, `filter`, `project`; **blocking, spilling** `hash_join`, `sort`, `hash_aggregate`, `dedup`; `limit_offset`, `Predicate`, `CmpOp`, `AggFunc` |
+| `spill` (`src/spill.rs`) | ~700 | Spill backing for the blocking operators: `SpillCtx`/`SpillReserver` (per-node temp location), `SpillSort` over `ferrosa_storage::ExternalSorter`, `ReplayBuffer` (the join's replayable inner group), `canonical_cmp` (type-aware total order for grouping/DISTINCT), orphan sweep |
 | `parser` (`src/parser.rs`) | ~1752 | Hand-written lexer + recursive-descent parser; `parse`, `parse_statement`, `ParseError`, typed-literal parsing |
 | `plan` (`src/plan.rs`) | ~1598 | Binder + planner: `execute`, `describe`, `infer_param_types`; scope resolution, Kleene WHERE/HAVING eval, `ExecError` |
 | `ast` (`src/ast.rs`) | ~207 | Logical AST: `Statement`, `SelectStmt`, DML statements, `Expr`, `Operand`, `Projection`, `OrderItem` |

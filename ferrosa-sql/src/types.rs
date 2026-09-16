@@ -33,7 +33,10 @@ use num_bigint::BigInt;
 ///
 /// Out of scope (separate large efforts, see the storage-provider doc list):
 /// collections (List/Set/Map/Tuple/UDT/Vector) and binary-format `numeric`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `Serialize`/`Deserialize` are load-bearing, not incidental: spilled sort runs
+/// are length-prefixed JSON records, so every blocking operator's bounded-memory
+/// path depends on a `Value` round-tripping exactly (forge t_50d99192).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Int(i64),
@@ -218,7 +221,10 @@ impl RelSchema {
 }
 
 /// A row: positional values matching a [`RelSchema`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-encodable because a blocking operator spills rows to disk; see
+/// [`Value`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Row(pub Vec<Value>);
 
 impl Row {

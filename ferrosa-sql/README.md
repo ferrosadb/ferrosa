@@ -48,13 +48,41 @@ numeric compare.
 **Operators** (`exec`): `seq_scan`, `filter`, `project`, `hash_join` (inner
 equi-join; NULL keys never match), `sort` (stable, multi-key, Postgres NULL
 placement: ASC⇒NULLS LAST, DESC⇒NULLS FIRST), `hash_aggregate` (first-seen group
-order; ungrouped-empty yields one row), `limit_offset`.
+order; ungrouped-empty yields one row), `dedup` (DISTINCT, first-occurrence
+order), `limit_offset`.
 
-**Planner** (`plan`): `execute`, `describe` (RowDescription shape without running
+**Spill** (`spill`): the four BLOCKING operators — `sort`, `hash_aggregate`,
+`hash_join` and `dedup` — cannot emit a first row before consuming their whole
+input, so they **spill to disk** rather than buffering it (forge `t_50d99192`).
+They reuse `ferrosa_storage::external_sort::ExternalSorter`, the same bounded
+external merge sort behind `ferrosa-cql` and `ferrosa-graph`: accumulate to a
+byte threshold, spill sorted runs, cascade-merge to a bounded fan-in, k-way merge
+on finish, fail loud on any spill/merge I/O error.
+
+- **Nothing caps a result.** The only knob is a resident-BYTES threshold — a work
+  bound. A query that could be answered is never refused or truncated.
+- **Temp location is configurable per node**: inject a `SpillReserver`, or set
+  `FERROSA_SQL_TEMP_DIR`; the threshold follows the storage engine's
+  `FERROSA_RANGE_SPILL_THRESHOLD_*`.
+- **Cancellation and cleanup share one path**: the temp directory is held by a
+  `TempSortTableReservation` moved into the output stream, so dropping the stream
+  — exhausted, cancelled or abandoned — removes it. `sweep_orphaned_temp_dirs`
+  reclaims what a killed process left behind, and runs once on first use.
+- **Output order is unchanged.** Each sort-based operator restores the in-memory
+  operator's order with a second sort on the arrival tag, so first-seen group
+  order, DISTINCT first-occurrence order and the join's left-input order all
+  survive. Grouping and DISTINCT sort under a type-aware total order consistent
+  with `Value`'s structural `Eq`, never under `sql_cmp` (which would merge
+  `Int(1)` with `Text("1")`).
+
+**Planner** (`plan`): `execute`, `execute_with` (caller-supplied spill context),
+`describe` (RowDescription shape without running
 operators), `infer_param_types` (extended-protocol ParameterDescription).
 Fail-loud binding: unknown table/column, ambiguous unqualified column, unknown
 qualifier, non-grouped column, aggregate-in-WHERE, invalid ORDER BY ordinal, and
-missing `$N` parameter all return a typed `ExecError`.
+missing `$N` parameter all return a typed `ExecError`; a spill/merge I/O failure
+returns `ExecError::Spill` (SQLSTATE `58030` on the wire) rather than a short
+result.
 
 ## How it works
 
@@ -62,12 +90,19 @@ missing `$N` parameter all return a typed `ExecError`.
 parse_statement ─▶ Statement (ast)
                      └─ Select(SelectStmt) ─▶ execute(stmt, catalog, schema, params)
                                                  │ resolve_scope (bind via Catalog)
-                                                 │ seq_scan [→ hash_join] → filter
-                                                 │ → simple project | hash_aggregate
-                                                 │ → sort → limit_offset
+                                                 │ seq_scan [→ hash_join*] → filter
+                                                 │ → simple project | hash_aggregate*
+                                                 │ → dedup* → sort* → limit_offset
                                                  ▼
                                               QueryResult { columns, rows }
 ```
+
+`*` marks a blocking operator: it spills to disk past the context's byte
+threshold and streams its output. Everything upstream of `QueryResult` is
+bounded. The `rows` `Vec` itself is not — the Postgres front end's
+`render_result` builds every `DataRow` before writing any, so handing it a stream
+would relocate the buffer rather than remove it. Streaming the result to the wire
+is front-end work, tracked separately.
 
 ## Public API (key entry points)
 
@@ -75,29 +110,46 @@ parse_statement ─▶ Statement (ast)
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
 | AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
-| Plan | `execute`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
-| Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `limit_offset`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream` |
+| Plan | `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
+| Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
+| Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
 | Catalog | `Catalog`, `MapCatalog`, `SharedTable`, `TableProvider`, `InMemoryTable` |
 | Types | `Value`, `Row`, `Column`, `ColumnType`, `RelSchema` |
 
 ## Dependencies
 
-**Calls** (ferrosa crates this depends on): **none.** `Cargo.toml` lists no
-`ferrosa-*` path dependencies — not even `ferrosa-common`. The engine carries its
-own `Value`/`Row`/`RelSchema` model so it stays a standalone leaf. External crates
-only: `ordered-float` (total-order `f64` for join/group keys), `num-bigint`
-(arbitrary-precision `Numeric`), `uuid`, `chrono` (std-only, typed temporal
-literal parsing).
+**Calls** (ferrosa crates this depends on): `ferrosa-storage` only, for the
+bounded external merge sort and the cancellable temp-table reservation the
+blocking operators spill through. Nothing else from it is used, and the engine
+still carries its own `Value`/`Row`/`RelSchema` model — it does not adopt
+`CqlValue`.
+
+This is a deliberate change from the crate's original standalone-leaf position
+(forge `t_50d99192`): reimplementing an external merge sort here to preserve the
+leaf status would have duplicated machinery `ferrosa-cql` and `ferrosa-graph`
+already share, and duplicated its failure handling with it.
+
+External crates: `ordered-float` (total-order `f64` for join/group keys),
+`num-bigint` (arbitrary-precision `Numeric`), `uuid`, `chrono` (std-only, typed
+temporal literal parsing), `serde` + `serde_json` (spilled runs are
+length-prefixed JSON records), `tracing`.
 
 **Called by**: `ferrosa-postgres` — lowers parsed SQL onto this engine's
 operators and serves results over the Postgres wire.
 
 ## Tests
 
-In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs` (24), `parser.rs`
-(44), `plan.rs` (42), `types.rs` (15), `catalog.rs` (2) — ~127 total. They cover
+In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs`, `parser.rs`,
+`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 144 total. They cover
 NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
-normalization, join key resolution, and binder fail-loud paths.
+normalization, join key resolution, binder fail-loud paths, and the spill
+module's orders, replay buffer and orphan sweep.
+
+`tests/spill_operators.rs` (10 tests) holds the per-operator spill invariant:
+given an input larger than the threshold, the operator returns EVERY row, peak
+resident rows stay an order of magnitude below the rows processed, output order
+is unchanged, a dropped stream removes its temp directory, and a reservation
+failure is loud.
 
 ## Specs
 

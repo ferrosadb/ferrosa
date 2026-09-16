@@ -1143,27 +1143,6 @@ owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
-path = "ferrosa-sql/src/exec.rs"
-rule = "returns-vec-partition-or-row"
-reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
-path = "ferrosa-sql/src/plan.rs"
-rule = "collect-vec-partition-or-row"
-reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
-path = "ferrosa-sql/src/plan.rs"
-rule = "returns-vec-partition-or-row"
-reason = "CONFIRMED REAL materialization. Tracked for fix as t_50d99192; delete this entry when the path is bounded or streamed."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
 path = "ferrosa-sql/src/provider.rs"
 rule = "cloned-stream-elements"
 reason = "t_a49d88c3 TRIAGED: BOUNDED: InMemoryTable::scan is a lazy iter().cloned(), one row at a time; no simultaneous materialization."
