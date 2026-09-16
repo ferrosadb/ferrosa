@@ -71,7 +71,11 @@ resolved port.
   a plan the executor streams. **Scope**: this bounds the *response*, not the
   query — phase A of `Expand` still materializes the frontier, and the
   buffering plan variants above still materialize, so a high-fan-out query can
-  still exhaust memory. The trailing `"stats"` object is built **after** the
+  still exhaust memory. What it can no longer do is exhaust memory on a
+  *low*-fan-out query: every storage SCAN in the crate now pulls one partition
+  at a time (`range_read_stream_all`), so an anchor, hop, var-length or
+  reconcile scan costs one partition rather than the whole table
+  (t_bc5f0e6f; guarded by `tests/graph_range_read_memory_bound.rs`). The trailing `"stats"` object is built **after** the
   last row, so `execution_ms` now covers the projection too (a larger, more
   accurate number than the buffered path reported). A failure that surfaces
   after the first chunk **aborts the body**; the client sees a `200` with a
@@ -158,7 +162,8 @@ edge and the missing key rather than returning a null endpoint.
 
 **Calls** (ferrosa crates this depends on):
 
-- **`ferrosa-cluster`** — `WritePath` (read/range_read/write), `DdlPath` +
+- **`ferrosa-cluster`** — `WritePath` (read / `range_read_stream_all` / write;
+  the materializing `range_read` is deliberately unused here), `DdlPath` +
   `DdlOperation` for replicated adjacency DDL, `ConsistencyLevel`,
   `ReplicationStrategy`, `ClusterError`.
 - **`ferrosa-common`** — `DecoratedKey`, `PartitionKey`, `CellValue`, `Error`.

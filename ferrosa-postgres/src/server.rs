@@ -577,9 +577,11 @@ async fn infer_param_oids(
     stmt: &ferrosa_sql::SelectStmt,
     declared: &[i32],
 ) -> Result<Vec<i32>, BackendMessage> {
-    let catalog =
+    // Type inference reads only the catalog's schemas, never its rows, so the
+    // streaming providers opened here never touch storage.
+    let (catalog, _scans) =
         match query::load_catalog(&ctx.engine, &ctx.schema, stmt, &ctx.default_schema).await {
-            Ok(catalog) => catalog,
+            Ok(loaded) => loaded,
             Err(err) => return Err(session.fail(err)),
         };
     let inferred = match ferrosa_sql::infer_param_types(stmt, &catalog, &ctx.default_schema) {
@@ -604,9 +606,11 @@ async fn describe_columns(
     session: &mut Session,
     stmt: &ferrosa_sql::SelectStmt,
 ) -> Result<Vec<ferrosa_sql::Column>, BackendMessage> {
-    let catalog =
+    // Describe resolves columns from the catalog's schemas alone; no scan runs,
+    // so no rows are read to answer it.
+    let (catalog, _scans) =
         match query::load_catalog(&ctx.engine, &ctx.schema, stmt, &ctx.default_schema).await {
-            Ok(catalog) => catalog,
+            Ok(loaded) => loaded,
             Err(err) => return Err(session.fail(err)),
         };
     match ferrosa_sql::describe(stmt, &catalog, &ctx.default_schema) {
@@ -644,11 +648,11 @@ async fn execute_portal(
 
     match parsed {
         PreparedKind::Select(select) => {
-            let catalog =
+            let (catalog, failure) =
                 match query::load_catalog(&ctx.engine, &ctx.schema, &select, &ctx.default_schema)
                     .await
                 {
-                    Ok(catalog) => catalog,
+                    Ok(loaded) => loaded,
                     Err(err) => return vec![session.fail(err)],
                 };
             // Offloaded for the same reason as the simple-query path: the
@@ -661,6 +665,12 @@ async fn execute_portal(
                 params.clone(),
             )
             .await;
+            // A scan that died on a storage error closed its channel, leaving
+            // the executor with a short row set it cannot tell is short. Fail
+            // the query loud rather than encode a truncated result.
+            if let Some(err) = query::check_scan_failure(&failure) {
+                return vec![session.fail(err)];
+            }
             let errored = result.is_err();
             let msgs = query::render_execute_result(result, &result_formats);
             // On an execution error, set the skip flag so the rest of the

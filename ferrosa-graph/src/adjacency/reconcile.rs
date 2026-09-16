@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use ferrosa_cluster::write_path::WritePath;
@@ -85,14 +86,43 @@ pub async fn reconcile_once(
             .unwrap_or_else(|| edge_tid.table.clone());
         let edge_table_fqn = format!("{}.{}", edge_tid.keyspace, edge_tid.table);
 
-        // Scan all edge table partitions.
-        let partitions = match write_path.range_read(edge_tid).await {
-            Ok(p) => p,
-            Err(_) => continue,
+        // Scan all edge table partitions — STREAMED, one partition per pull
+        // (t_bc5f0e6f). This loop already yielded every N partitions, but it
+        // pre-collected the WHOLE edge table into a `Vec<Partition>` first, so
+        // the yielding bought latency without bounding memory: a background
+        // safety-net scan could hold a tenant-sized table resident and OOM the
+        // node. Nothing here needs more than the partition in hand.
+        let mut partitions = match write_path.range_read_stream_all(edge_tid, 0).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                // Best-effort by design (this is a periodic safety net, not a
+                // read path), but never silent: the next pass retries, and an
+                // edge table that keeps failing is visible in the log.
+                tracing::warn!(
+                    table = %edge_table_fqn,
+                    error = %e,
+                    "adjacency reconcile: could not open the edge-table scan; \
+                     skipping this table for this pass"
+                );
+                continue;
+            }
         };
 
         let mut edge_partitions_scanned = 0usize;
-        for partition in &partitions {
+        while let Some(partition) = partitions.next().await {
+            let partition = match partition {
+                Ok(partition) => partition,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %edge_table_fqn,
+                        partitions_scanned = edge_partitions_scanned,
+                        error = %e,
+                        "adjacency reconcile: edge-table scan failed mid-stream; \
+                         abandoning this table for this pass"
+                    );
+                    break;
+                }
+            };
             edge_partitions_scanned += 1;
             let source_id = partition.key.key.as_bytes().to_vec();
             let source_key = partition.key.clone();
@@ -173,14 +203,40 @@ pub async fn reconcile_once(
 
     // Phase 2: Scan adjacency index for orphans.
     // For each adjacency entry, verify the source edge still exists.
-    let adj_partitions = write_path
-        .range_read(&adj_table_id)
-        .await
-        .unwrap_or_default();
+    // Streamed for the same reason as phase 1 (t_bc5f0e6f): the adjacency
+    // index is as large as the edge data it mirrors. The previous
+    // `unwrap_or_default()` also swallowed the scan error whole — an
+    // unreachable adjacency table looked exactly like an empty one, i.e. like
+    // "no orphans to remove".
+    let adj_partitions = match write_path.range_read_stream_all(&adj_table_id, 0).await {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            tracing::warn!(
+                keyspace = %keyspace,
+                error = %e,
+                "adjacency reconcile: could not open the adjacency-index scan; \
+                 orphan removal is skipped for this pass"
+            );
+            None
+        }
+    };
 
-    {
+    if let Some(mut adj_partitions) = adj_partitions {
         let mut adjacency_partitions_scanned = 0usize;
-        for partition in &adj_partitions {
+        while let Some(partition) = adj_partitions.next().await {
+            let partition = match partition {
+                Ok(partition) => partition,
+                Err(e) => {
+                    tracing::warn!(
+                        keyspace = %keyspace,
+                        partitions_scanned = adjacency_partitions_scanned,
+                        error = %e,
+                        "adjacency reconcile: adjacency-index scan failed mid-stream; \
+                         abandoning orphan removal for this pass"
+                    );
+                    break;
+                }
+            };
             adjacency_partitions_scanned += 1;
             let vertex_id = partition.key.key.as_bytes().to_vec();
 

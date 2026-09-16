@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use futures::StreamExt;
+
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
@@ -24,6 +26,35 @@ use crate::executor::result::{GraphResult, QueryStats};
 use crate::parser::Direction;
 use crate::parser::ReturnClause;
 use crate::planner::physical::{Anchor, Hop};
+
+/// Admit one discovered neighbour into the next BFS frontier.
+///
+/// Cycle detection (FMEA F2) and the total-visited budget (FMEA F3, threat T13)
+/// are applied AT DISCOVERY, so neither a hub vertex's adjacency list nor a
+/// whole-edge-table fallback scan can build an unbounded neighbour Vec before
+/// the budget is consulted (t_bc5f0e6f).
+///
+/// The budget is a WORK bound on traversal, not a cap on the answer: exceeding
+/// it is a loud `ResourceLimit` error, never a silently truncated path set.
+fn admit_neighbor(
+    neighbor_id: Vec<u8>,
+    visited: &mut HashSet<Vec<u8>>,
+    next_frontier: &mut Vec<DecoratedKey>,
+    max_visited: usize,
+) -> Result<()> {
+    if visited.contains(&neighbor_id) {
+        return Ok(());
+    }
+    if visited.len() >= max_visited {
+        return Err(GraphError::ResourceLimit(format!(
+            "variable-length path visited vertex budget exceeded: {} (limit: {max_visited})",
+            visited.len(),
+        )));
+    }
+    visited.insert(neighbor_id.clone());
+    next_frontier.push(DecoratedKey::new(PartitionKey::new(neighbor_id)));
+    Ok(())
+}
 
 /// Execute a variable-length path expansion using BFS.
 ///
@@ -56,21 +87,38 @@ pub async fn execute_var_length(
 
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
 
-    let anchor_partitions = if is_virtual {
+    // STREAMED anchor seed (t_bc5f0e6f): this used to drain the whole anchor
+    // table into a `Vec<Partition>` before looking at the first vertex, so the
+    // BFS seed cost as much RAM as the tenant's vertex data. Only the surviving
+    // `DecoratedKey` outlives each iteration, and partitions are dropped as the
+    // scan walks past them. The seed set itself is NOT capped — a var-length
+    // path may legitimately start at every vertex, and truncating it would
+    // silently return a wrong (short) answer instead of a slow one.
+    let mut anchor_partitions = if is_virtual {
         // Virtual tables are not supported for variable-length paths yet.
         // Fall back to storage (which will return empty for virtual tables).
-        vec![]
+        None
     } else {
-        write_path.range_read(&anchor_table_id).await?
+        Some(
+            write_path
+                .range_read_stream_all(&anchor_table_id, 0)
+                .await?,
+        )
     };
-    stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
     // Apply WHERE filters to anchor partitions.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let mut seed_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    let mut seed_keys: Vec<DecoratedKey> = Vec::new();
     let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-    for partition in &anchor_partitions {
+    while let Some(partition) = match anchor_partitions.as_mut() {
+        Some(stream) => stream.next().await,
+        None => None,
+    } {
+        let partition = partition?;
+        let partition = &partition;
+        stats.vertices_read += 1;
+        check_timeout(start, config.query_timeout)?;
         if let Some(meta) = anchor_meta.as_ref() {
             for row in &partition.rows {
                 let row_json = row_to_json(meta, partition, row);
@@ -173,7 +221,16 @@ pub async fn execute_var_length(
             // Read adjacency entries for this vertex. If adjacency has not been
             // materialized yet (for example in tiny HTTP seam tests), fall back
             // to the edge table's source-partition rows.
-            let mut neighbor_ids = Vec::new();
+            //
+            // Neighbours are admitted into the next frontier AT DISCOVERY
+            // (t_bc5f0e6f). They used to be collected into a `neighbor_ids`
+            // Vec first and only then checked against the visited budget, so a
+            // hub vertex allocated its whole neighbour list before the FMEA-F3
+            // guard could fire. `neighbors_found` only counts, so the fallback
+            // below still triggers on exactly the same condition as before
+            // (adjacency yielded nothing for this vertex) — including when
+            // every neighbour it yielded was already visited.
+            let mut neighbors_found = 0usize;
             let adj_partition = write_path.read(&adj_table_id, vertex_key).await?;
             if let Some(partition) = adj_partition {
                 stats.edges_read += partition.rows.len();
@@ -181,12 +238,18 @@ pub async fn execute_var_length(
                     if let Some(neighbor_id) =
                         extract_neighbor_id(&row.clustering, hop.edge_label.as_deref())
                     {
-                        neighbor_ids.push(neighbor_id);
+                        neighbors_found += 1;
+                        admit_neighbor(
+                            neighbor_id,
+                            &mut visited,
+                            &mut next_frontier,
+                            config.max_var_path_visited,
+                        )?;
                     }
                 }
             }
 
-            if neighbor_ids.is_empty() {
+            if neighbors_found == 0 {
                 if let (Some(edge_table_id), Some(edge_table)) =
                     (&fallback_edge_table_id, hop.edge_table.as_ref())
                 {
@@ -199,7 +262,15 @@ pub async fn execute_var_length(
                         let Some(target_col) = meta.extensions.get("graph.target") else {
                             continue;
                         };
-                        for partition in write_path.range_read(edge_table_id).await? {
+                        // STREAMED (t_bc5f0e6f): the adjacency-miss fallback
+                        // scanned the entire edge table into RAM, ONCE PER
+                        // FRONTIER VERTEX. Nothing is collected now — each
+                        // matching neighbour is admitted as it is found, under
+                        // the visited budget.
+                        let mut edge_partitions =
+                            write_path.range_read_stream_all(edge_table_id, 0).await?;
+                        while let Some(partition) = edge_partitions.next().await {
+                            let partition = partition?;
                             stats.edges_read += partition.rows.len();
                             for row in &partition.rows {
                                 let source = extract_column_bytes_from_row(
@@ -215,26 +286,34 @@ pub async fn execute_var_length(
                                     target_col,
                                 );
                                 let current = vertex_key.key.as_bytes();
+                                let mut admit = |id: Vec<u8>| -> Result<()> {
+                                    admit_neighbor(
+                                        id,
+                                        &mut visited,
+                                        &mut next_frontier,
+                                        config.max_var_path_visited,
+                                    )
+                                };
                                 match hop.direction {
                                     Direction::Out if source.as_deref() == Some(current) => {
                                         if let Some(target) = target {
-                                            neighbor_ids.push(target);
+                                            admit(target)?;
                                         }
                                     }
                                     Direction::In if target.as_deref() == Some(current) => {
                                         if let Some(source) = source {
-                                            neighbor_ids.push(source);
+                                            admit(source)?;
                                         }
                                     }
                                     Direction::Both => {
                                         if source.as_deref() == Some(current) {
                                             if let Some(target) = target.clone() {
-                                                neighbor_ids.push(target);
+                                                admit(target)?;
                                             }
                                         }
                                         if target.as_deref() == Some(current) {
                                             if let Some(source) = source {
-                                                neighbor_ids.push(source);
+                                                admit(source)?;
                                             }
                                         }
                                     }
@@ -244,25 +323,6 @@ pub async fn execute_var_length(
                         }
                     }
                 }
-            }
-
-            for neighbor_id in neighbor_ids {
-                // Cycle detection (FMEA F2): skip already-visited vertices.
-                if visited.contains(&neighbor_id) {
-                    continue;
-                }
-
-                // Budget check (FMEA F3, threat T13): cap total visited.
-                if visited.len() >= config.max_var_path_visited {
-                    return Err(GraphError::ResourceLimit(format!(
-                        "variable-length path visited vertex budget exceeded: {} (limit: {})",
-                        visited.len(),
-                        config.max_var_path_visited
-                    )));
-                }
-
-                visited.insert(neighbor_id.clone());
-                next_frontier.push(DecoratedKey::new(PartitionKey::new(neighbor_id)));
             }
         }
 

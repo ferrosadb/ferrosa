@@ -13,6 +13,7 @@ pub mod exec;
 pub mod parser;
 pub mod plan;
 pub mod provider;
+pub mod spill;
 pub mod types;
 
 pub use ast::SelectStmt;
@@ -22,10 +23,14 @@ pub use ast::{
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{
-    filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort, AggFunc, CmpOp,
-    Predicate, RowStream, SortDir, SortKey,
+    dedup, fallible, filter, hash_aggregate, hash_join, limit_offset, project, seq_scan, sort,
+    try_filter, try_project, AggFunc, CmpOp, Predicate, RowStream, SortDir, SortKey, TryRowStream,
 };
 pub use parser::{parse, parse_statement, ParseError};
-pub use plan::{describe, execute, infer_param_types, ExecError, QueryResult};
+pub use plan::{describe, execute, execute_with, infer_param_types, ExecError, QueryResult};
 pub use provider::{InMemoryTable, TableProvider};
+pub use spill::{
+    default_temp_root, sweep_orphaned_temp_dirs, DirReserver, SpillCtx, SpillError, SpillReserver,
+    SpillStats,
+};
 pub use types::{Column, ColumnType, RelSchema, Row, Value};
