@@ -62,8 +62,9 @@ resolved Bolt port.
 
 **Query path:** `execute_with_params` → `parse` → `bind_statement_params` →
 (FOREACH / CALL {} expanded by the engine) → `validate` (resolve labels +
-authorize) → `plan` → `execute`. Anchor partitions are read via
-`WritePath::range_read`; each hop reads `system_graph_<ks>.adjacency` to find
+authorize) → `plan` → `execute`. Anchor partitions are **streamed** via
+`WritePath::range_read_stream_all` — one partition per pull, never the whole
+table at once (t_bc5f0e6f); each hop reads `system_graph_<ks>.adjacency` to find
 neighbors; results are evaluated/aggregated/sorted into a `GraphResult`.
 
 **Write path:** a `CREATE`/`MERGE`/`SET`/`DELETE` plan writes the edge/vertex row

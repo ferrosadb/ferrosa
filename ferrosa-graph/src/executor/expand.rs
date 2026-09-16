@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
-use ferrosa_cluster::write_path::WritePath;
+use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
-use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
+use futures::StreamExt as _;
 
 use crate::adjacency::observer::derive_adjacency_mutations;
 use crate::adjacency::schema::{adjacency_keyspace_name, DIRECTION_IN, DIRECTION_OUT};
@@ -1711,9 +1712,8 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         (states, &hops[1..])
     } else {
         let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-        let anchor_partitions =
-            read_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
-        stats.vertices_read += anchor_partitions.len();
+        let mut anchor_partitions =
+            stream_anchor_partitions(write_path, anchor, anchor_meta.as_ref(), schema).await?;
         check_timeout(start, config.query_timeout)?;
 
         // Resolve column names from schema for property mapping.
@@ -1724,9 +1724,19 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         // Skip partitions that are fully tombstoned (no live cells in any row
         // and no live static row) — these represent deleted vertices whose
         // tombstones have not yet been purged by compaction.
+        //
+        // The scan is PULLED one partition at a time (t_bc5f0e6f): a partition
+        // that fails the anchor predicates is dropped before the next is read,
+        // so an anchor whose filters select a handful of vertices costs a
+        // handful of states no matter how large the table is. `check_timeout`
+        // per partition keeps the WORK bounded — deliberately a work bound, not
+        // a result bound: nothing here truncates `states`.
         let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-        let mut states: Vec<ExpandState> = Vec::with_capacity(anchor_partitions.len());
-        for partition in &anchor_partitions {
+        let mut states: Vec<ExpandState> = Vec::new();
+        while let Some(partition) = anchor_partitions.next().await {
+            let partition = &partition?;
+            stats.vertices_read += 1;
+            check_timeout(start, config.query_timeout)?;
             if is_partition_dead(partition) {
                 continue;
             }
@@ -2142,35 +2152,44 @@ async fn finish_expand_buffered(
     })
 }
 
-/// Read the anchor table's candidate partitions: a direct primary-key lookup
-/// when the anchor's properties pin the full key, else a range scan of the
+/// Stream the anchor table's candidate partitions: a direct primary-key lookup
+/// when the anchor's properties pin the full key, else a lazy range scan of the
 /// table.
 ///
 /// Extracted from `execute_expand` so the anchor read strategy is one named
 /// decision the pull-based streaming `AnchorScan` (t_4ce82a3e,
-/// specs/streaming-executor-design.md) can reuse. NOTE for that work: the
-/// `range_read` arm is the unbounded materialization — the streaming operator
-/// replaces it with a lazy scan, while the pk arm is already bounded.
-async fn read_anchor_partitions(
+/// specs/streaming-executor-design.md) can reuse.
+///
+/// The range arm USED TO return `Vec<Partition>` — the single widest-blast-
+/// radius materialization in the graph read path (t_250fa355, t_bc5f0e6f):
+/// every `MATCH` whose anchor properties do not pin the full primary key read
+/// the entire anchor table into RAM before examining one candidate. Both arms
+/// now hand back a stream, so the caller holds one partition at a time. The pk
+/// arm was already bounded and yields at most one.
+///
+/// This bounds MEMORY, not the answer: the scan still visits every partition
+/// and the caller still keeps every state that passes its filters.
+async fn stream_anchor_partitions(
     write_path: &WritePath,
     anchor: &Anchor,
     anchor_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
     schema: Option<&Schema>,
-) -> Result<Vec<Partition>> {
+) -> Result<PartitionResultStream> {
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
     if let Some(meta) = anchor_meta {
         if let Some((key, _clustering)) =
             build_direct_lookup_shape(meta, &HashMap::new(), &anchor.props, &HashMap::new())?
         {
             let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
-            return Ok(write_path
+            let hit = write_path
                 .pk_read(&anchor_table_id, &key, ConsistencyLevel::One, &strategy)
-                .await?
-                .into_iter()
-                .collect());
+                .await?;
+            return Ok(Box::pin(futures::stream::iter(hit.into_iter().map(Ok))));
         }
     }
-    Ok(write_path.range_read(&anchor_table_id).await?)
+    Ok(write_path
+        .range_read_stream_all(&anchor_table_id, 0)
+        .await?)
 }
 
 /// Project one expand state's bindings into a result row per the RETURN items.
@@ -2638,20 +2657,24 @@ async fn try_edge_anchored_initial_states(
 
     let edge_tid = TableId::new(&edge_table.keyspace, &edge_table.table);
     let strategy = graph_replication_strategy(schema, &edge_table.keyspace)?;
-    let edge_partitions: Vec<Partition> = if let Some((key, _clustering)) =
+    // STREAMED (t_bc5f0e6f): this fast path exists to replace a pathological
+    // vertex-table scan with a single relationship-table scan — but it read
+    // that relationship table into a `Vec<Partition>` first, which is the same
+    // unbounded materialization one table over. Both arms now yield partitions
+    // one at a time; the pk arm yields at most one.
+    let mut edge_partitions: PartitionResultStream = if let Some((key, _clustering)) =
         build_direct_lookup_shape(
             &edge_meta,
             &HashMap::new(),
             &hop.prop_filters,
             &HashMap::new(),
         )? {
-        write_path
+        let hit = write_path
             .pk_read(&edge_tid, &key, ConsistencyLevel::One, &strategy)
-            .await?
-            .into_iter()
-            .collect()
+            .await?;
+        Box::pin(futures::stream::iter(hit.into_iter().map(Ok)))
     } else {
-        write_path.range_read(&edge_tid).await?
+        write_path.range_read_stream_all(&edge_tid, 0).await?
     };
     let source_vertex_tid = TableId::new(&anchor.table.keyspace, &anchor.table.table);
     let source_vertex_meta =
@@ -2662,7 +2685,8 @@ async fn try_edge_anchored_initial_states(
         target_vertex.and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
     let mut states = Vec::new();
-    for partition in edge_partitions {
+    while let Some(partition) = edge_partitions.next().await {
+        let partition = partition?;
         if is_partition_dead(&partition) {
             continue;
         }
@@ -3152,7 +3176,13 @@ async fn find_edge_match(
         return Ok(None);
     }
 
-    for partition in write_path.range_read(table_id).await? {
+    // STREAMED with an early return (t_bc5f0e6f): this wants the FIRST edge
+    // matching (source, target), yet it drained the whole relationship table
+    // into RAM before comparing the first row. Pulling one partition at a time
+    // bounds memory AND stops the scan at the match, instead of after it.
+    let mut partitions = write_path.range_read_stream_all(table_id, 0).await?;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition?;
         for row in &partition.rows {
             let row_source =
                 extract_column_bytes_from_row(meta, partition.key.key.as_bytes(), row, source_col);
@@ -3211,7 +3241,11 @@ async fn find_vertex_match(
         }
     }
 
-    for partition in write_path.range_read(table_id).await? {
+    // STREAMED with an early return (t_bc5f0e6f): same shape as
+    // `find_edge_match` — one neighbour vertex is wanted, not the whole table.
+    let mut partitions = write_path.range_read_stream_all(table_id, 0).await?;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition?;
         if is_partition_dead(&partition) {
             continue;
         }
@@ -3355,7 +3389,14 @@ async fn find_table_row_by_props(
         return Ok(None);
     }
 
-    for partition in write_path.range_read(table_id).await? {
+    // STREAMED with an early return (t_bc5f0e6f). The comment above already
+    // called the whole-table scan out as something that "can overload live
+    // multi-tenant tables" — it did so by materializing every partition before
+    // testing the first row. It now pulls one partition at a time and stops at
+    // the first match.
+    let mut partitions = write_path.range_read_stream_all(table_id, 0).await?;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition?;
         if is_partition_dead(&partition) {
             continue;
         }

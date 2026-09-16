@@ -35,9 +35,9 @@ sequenceDiagram
     A-->>P: ok (AuthContext permits)
     P->>P: logical plan then physical Expand plan
     E->>X: execute(Expand, keyspace, config)
-    X->>W: range_read(Person)  %% anchor lookup
-    W->>S: read anchor partitions
-    S-->>X: anchor rows (filter name='alice')
+    X->>W: range_read_stream_all(Person)  %% anchor scan, lazy
+    W->>S: pull one anchor partition
+    S-->>X: anchor rows (filter name='alice'), one partition at a time
     loop each hop
         X->>W: read(adjacency, key=src, dir=OUT, label=KNOWS)
         W->>S: read adjacency partition
@@ -49,8 +49,11 @@ sequenceDiagram
     E-->>C: JSON / Bolt RECORD stream
 ```
 
-Notes: the anchor is read with `range_read`; each hop reads the adjacency index
-for `(direction, edge_label, neighbor_id)`. Limits (`max_fan_out_per_hop`,
+Notes: the anchor is **streamed** with `range_read_stream_all` — a partition
+that fails the anchor predicates is dropped before the next is read, so an
+unanchored `MATCH` costs one partition of memory rather than the whole table
+(t_bc5f0e6f). Each hop reads the adjacency index for
+`(direction, edge_label, neighbor_id)`. Limits (`max_fan_out_per_hop`,
 `max_result_rows`, `query_timeout`, and `max_var_path_visited` for `[*]`) bound
 cost. Because traversal reads the index rather than the edge table, an
 adjacency-index desync (FMEA G-1/G-2) shows up here as **missing rows, not an
@@ -85,12 +88,12 @@ sequenceDiagram
 
     Note over R: fallback only - not the primary path
     loop every reconciliation_interval (0 = disabled by default)
-        R->>W: range_read(edge_table)
+        R->>W: range_read_stream_all(edge_table)
         R->>W: read(adjacency) per edge row
         alt OUT/IN entry missing
             R->>W: write make_adjacency_mutation (repair)
         end
-        R->>W: range_read(adjacency) then read(edge_table)
+        R->>W: range_read_stream_all(adjacency) then read(edge_table)
         alt adjacency row has no surviving edge
             R->>W: write tombstone (remove orphan)
         end

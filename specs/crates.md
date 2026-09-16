@@ -20,7 +20,7 @@
 | `ferrosa-flight` | Apache Arrow Flight gRPC endpoint — CQL SELECT -> Arrow batches, bearer auth | ferrosa-cluster, ferrosa-common, ferrosa-cql, ferrosa-schema | [README](../ferrosa-flight/README.md) · [specs](../ferrosa-flight/specs/) |
 | `ferrosa-graph` | Property-graph engine — Cypher, Bolt v5, HTTP, adjacency index | ferrosa-cluster, ferrosa-common, ferrosa-schema, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-graph/README.md) · [specs](../ferrosa-graph/specs/) |
 | `ferrosa-sparql` | SPARQL 1.1 endpoint (Query + Update, RDF*, property paths) | ferrosa-cluster, ferrosa-common, ferrosa-index, ferrosa-schema, ferrosa-sstable, ferrosa-storage | [README](../ferrosa-sparql/README.md) · [specs](../ferrosa-sparql/specs/) |
-| `ferrosa-sql` | Bespoke relational engine (D3, no DataFusion) backing the Postgres front-end | — | [README](../ferrosa-sql/README.md) · [specs](../ferrosa-sql/specs/) |
+| `ferrosa-sql` | Bespoke relational engine (D3, no DataFusion) backing the Postgres front-end | ferrosa-storage (external merge sort for the blocking operators' spill) | [README](../ferrosa-sql/README.md) · [specs](../ferrosa-sql/specs/) |
 | `ferrosa-udf` | User-defined functions — Wasmtime sandbox, fuel/epoch limits, AssemblyScript | ferrosa-common | [README](../ferrosa-udf/README.md) · [specs](../ferrosa-udf/specs/) |
 | `ferrosa-row-bridge` | The single canonical CQL row codec shared by both front-ends (D10) | ferrosa-common, ferrosa-schema, ferrosa-sstable | [README](../ferrosa-row-bridge/README.md) · [specs](../ferrosa-row-bridge/specs/) |
 
@@ -174,6 +174,7 @@ graph TD
     ferrosa_session --> ferrosa_schema
     ferrosa_session --> ferrosa_storage
     ferrosa_session --> ferrosa_udf
+    ferrosa_sql --> ferrosa_storage
     ferrosa_sparql --> ferrosa_cluster
     ferrosa_sparql --> ferrosa_common
     ferrosa_sparql --> ferrosa_index
