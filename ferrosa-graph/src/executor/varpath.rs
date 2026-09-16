@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use futures::StreamExt;
+
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
@@ -56,21 +58,34 @@ pub async fn execute_var_length(
 
     let anchor_table_id = TableId::new(&anchor.table.keyspace, &anchor.table.table);
 
-    let anchor_partitions = if is_virtual {
+    // STREAMED anchor seed (t_bc5f0e6f): this used to drain the whole anchor
+    // table into a `Vec<Partition>` before looking at the first vertex, so the
+    // BFS seed cost as much RAM as the tenant's vertex data. Only the surviving
+    // `DecoratedKey` outlives each iteration, and partitions are dropped as the
+    // scan walks past them. The seed set itself is NOT capped — a var-length
+    // path may legitimately start at every vertex, and truncating it would
+    // silently return a wrong (short) answer instead of a slow one.
+    let mut anchor_partitions = if is_virtual {
         // Virtual tables are not supported for variable-length paths yet.
         // Fall back to storage (which will return empty for virtual tables).
-        vec![]
+        None
     } else {
-        write_path.range_read(&anchor_table_id).await?
+        Some(write_path.range_read_stream_all(&anchor_table_id, 0).await?)
     };
-    stats.vertices_read += anchor_partitions.len();
     check_timeout(start, config.query_timeout)?;
 
     // Apply WHERE filters to anchor partitions.
     let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
-    let mut seed_keys: Vec<DecoratedKey> = Vec::with_capacity(anchor_partitions.len());
+    let mut seed_keys: Vec<DecoratedKey> = Vec::new();
     let anchor_meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table);
-    for partition in &anchor_partitions {
+    while let Some(partition) = match anchor_partitions.as_mut() {
+        Some(stream) => stream.next().await,
+        None => None,
+    } {
+        let partition = partition?;
+        let partition = &partition;
+        stats.vertices_read += 1;
+        check_timeout(start, config.query_timeout)?;
         if let Some(meta) = anchor_meta.as_ref() {
             for row in &partition.rows {
                 let row_json = row_to_json(meta, partition, row);
@@ -199,7 +214,14 @@ pub async fn execute_var_length(
                         let Some(target_col) = meta.extensions.get("graph.target") else {
                             continue;
                         };
-                        for partition in write_path.range_read(edge_table_id).await? {
+                        // STREAMED (t_bc5f0e6f): the adjacency-miss fallback
+                        // scanned the entire edge table into RAM, ONCE PER
+                        // FRONTIER VERTEX. Only `neighbor_ids` accumulates now,
+                        // and that is bounded by `max_var_path_visited` below.
+                        let mut edge_partitions =
+                            write_path.range_read_stream_all(edge_table_id, 0).await?;
+                        while let Some(partition) = edge_partitions.next().await {
+                            let partition = partition?;
                             stats.edges_read += partition.rows.len();
                             for row in &partition.rows {
                                 let source = extract_column_bytes_from_row(
