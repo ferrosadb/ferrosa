@@ -619,6 +619,12 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         ExecError::InvalidOrderBy(_) => ("42P10", err.to_string()),
         // A `$N` with no bound value: undefined_parameter.
         ExecError::MissingParameter(_) => ("42P02", err.to_string()),
+        // A blocking operator could not read or write its spilled state. This
+        // is an operator failure, not bad SQL, so it maps to Class 58
+        // (system_error) — and it is reported rather than being papered over
+        // with a short result the client could not distinguish from a complete
+        // one (forge t_50d99192).
+        ExecError::Spill(_) => ("58030", err.to_string()),
     };
     error_response(sqlstate, &message)
 }

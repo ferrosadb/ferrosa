@@ -9,18 +9,27 @@
 use std::fmt;
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
 
 use crate::ast::{
     AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef, Term,
 };
 use crate::catalog::Catalog;
 use crate::exec::{
-    hash_aggregate, hash_join, limit_offset, seq_scan, sort, AggFunc, CmpOp, SortKey,
+    dedup, fallible, hash_aggregate, hash_join, limit_offset, seq_scan, sort, try_project, AggFunc,
+    CmpOp, SortKey, TryRowStream,
 };
+use crate::spill::{SpillCtx, SpillError};
 use crate::types::{Column, ColumnType, RelSchema, Row, Value};
 
-/// The result of executing a query: output column metadata + materialized rows.
+/// The result of executing a query: output column metadata + its rows.
+///
+/// The row `Vec` is the one materialization left in this crate, and it is
+/// deliberate rather than overlooked. Every operator that feeds it now streams
+/// or spills (forge t_50d99192), so peak memory inside the engine is bounded by
+/// the spill threshold; but the Postgres front end's `render_result` builds all
+/// of its `DataRow` messages before writing any, so handing it a stream would
+/// move the buffer rather than remove it. Streaming the result to the wire is
+/// tracked separately — it belongs to the front end, not to the operators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
@@ -47,6 +56,10 @@ pub enum ExecError {
     /// A `$N` parameter placeholder referenced an index with no bound value
     /// (out of range of the supplied `params`). Carries the 1-based index.
     MissingParameter(usize),
+    /// A blocking operator could not read or write its spilled state. Loud on
+    /// purpose: a lost run would silently shorten the result, so the query
+    /// fails rather than returning rows it cannot vouch for.
+    Spill(SpillError),
 }
 
 impl fmt::Display for ExecError {
@@ -74,6 +87,7 @@ impl fmt::Display for ExecError {
             ExecError::MissingParameter(n) => {
                 write!(f, "there is no parameter ${n}")
             }
+            ExecError::Spill(e) => write!(f, "{e}"),
         }
     }
 }
@@ -176,6 +190,23 @@ pub fn execute(
     default_schema: &str,
     params: &[Value],
 ) -> Result<QueryResult, ExecError> {
+    execute_with(stmt, catalog, default_schema, params, &SpillCtx::default())
+}
+
+/// [`execute`], with the spill context supplied by the caller.
+///
+/// A node injects its own [`crate::spill::SpillReserver`] here to place query
+/// temp state under `<data_dir>/tmp`, and tests inject a tempdir-backed one with
+/// a tiny threshold to exercise the spill path. [`execute`] uses
+/// [`SpillCtx::default`], which spills under `$FERROSA_SQL_TEMP_DIR` (or the
+/// system temp dir) at the storage engine's detected threshold.
+pub fn execute_with(
+    stmt: &SelectStmt,
+    catalog: &dyn Catalog,
+    default_schema: &str,
+    params: &[Value],
+    ctx: &SpillCtx,
+) -> Result<QueryResult, ExecError> {
     // Fail loud up front if a referenced `$N` has no bound value.
     if let Some(f) = &stmt.filter {
         validate_params(f, params)?;
@@ -186,10 +217,13 @@ pub fn execute(
 
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
 
-    // Scan the FROM (and hash-join the JOIN, if any) into the base row set. The
-    // binding scope / combined schema already came from `resolve_scope`.
+    // Scan the FROM (and hash-join the JOIN, if any) into the base row stream.
+    // The binding scope / combined schema already came from `resolve_scope`.
+    //
+    // `hash_join` returns an owning stream, so the join provider's borrow ends
+    // at the call even though its rows keep flowing.
     let from_provider = resolve_table(catalog, &stmt.from, default_schema)?;
-    let base_rows: Vec<Row> = if let Some(join) = &stmt.join {
+    let base_rows: TryRowStream<'_> = if let Some(join) = &stmt.join {
         let join_provider = resolve_table(catalog, &join.table, default_schema)?;
         let from_schema = from_provider.schema();
         let join_schema = join_provider.schema();
@@ -204,25 +238,30 @@ pub fn execute(
             &join.right,
         )?;
         hash_join(
-            seq_scan(&*from_provider),
-            seq_scan(&*join_provider),
+            fallible(seq_scan(&*from_provider)),
+            fallible(seq_scan(&*join_provider)),
             left_key,
             right_key,
+            ctx,
         )
+        .map_err(ExecError::Spill)?
     } else {
-        seq_scan(&*from_provider).collect()
+        fallible(seq_scan(&*from_provider))
     };
 
     // WHERE: pre-resolve every comparison's column operand to a scope index
     // (aggregates are illegal here), then keep rows that evaluate to Some(true)
-    // under Kleene logic.
-    let filtered: Vec<Row> = if let Some(f) = &stmt.filter {
+    // under Kleene logic. Streaming — a filter holds nothing.
+    let filtered: TryRowStream<'_> = if let Some(f) = &stmt.filter {
         let idx_map = resolve_where_operands(f, &scope)?;
-        let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
-        base_rows
-            .into_iter()
-            .filter(|r| eval_kleene(f, r, params, &resolve) == Some(true))
-            .collect()
+        Box::new(base_rows.filter(move |r| match r {
+            // Never swallow a spill failure to make a predicate tidy.
+            Err(_) => true,
+            Ok(row) => {
+                let resolve = |op: &Operand| idx_map[&OperandKey::of(op)];
+                eval_kleene(f, row, params, &resolve) == Some(true)
+            }
+        }))
     } else {
         base_rows
     };
@@ -235,17 +274,29 @@ pub fn execute(
             if items.iter().any(|i| matches!(i, SelectItem::Aggregate { .. })));
 
     let (columns, rows) = if is_aggregate {
-        plan_aggregate(stmt, &scope, &combined_schema, filtered, params)?
+        plan_aggregate(stmt, &scope, &combined_schema, filtered, params, ctx)?
     } else {
-        plan_simple(stmt, &scope, &combined_schema, filtered)?
+        plan_simple(stmt, &scope, &combined_schema, filtered, ctx)?
     };
 
-    // LIMIT / OFFSET apply to the final output rows.
+    // LIMIT / OFFSET apply lazily to the final output rows, so neither forces
+    // the rest of the stream to be read. Neither is a bound on what the query
+    // could return — only on what the client asked for.
     let offset = stmt.offset.unwrap_or(0) as usize;
     let limit = stmt.limit.map(|n| n as usize);
-    let rows = limit_offset(rows, offset, limit);
+    let out = limit_offset(rows, offset, limit);
 
-    Ok(QueryResult { columns, rows })
+    // Drain the operator pipeline into the buffered `QueryResult` contract.
+    // Every operator upstream of here is bounded; this last step is not, and is
+    // the known remaining gap (see [`QueryResult`]).
+    let mut buffered = Vec::new();
+    for row in out {
+        buffered.push(row.map_err(ExecError::Spill)?);
+    }
+    Ok(QueryResult {
+        columns,
+        rows: buffered,
+    })
 }
 
 /// Build the FROM/JOIN binding scope and the combined output schema for `stmt`,
@@ -440,24 +491,19 @@ fn simple_projection(
 /// scope (so it may name a non-selected column) and is applied before
 /// projection. With DISTINCT, the rows are projected and deduped first, then
 /// ORDER BY resolves against the OUTPUT columns.
-fn plan_simple(
+fn plan_simple<'a>(
     stmt: &SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    rows: Vec<Row>,
-) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
+    rows: TryRowStream<'a>,
+    ctx: &SpillCtx,
+) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
     // Resolve the projection into output columns + source indices.
     let (columns, indices) = simple_projection(stmt, scope, combined_schema)?;
 
-    let project = |rows: Vec<Row>| -> Vec<Row> {
-        rows.into_iter()
-            .map(|r| Row(indices.iter().map(|&i| r.0[i].clone()).collect()))
-            .collect()
-    };
-
     if stmt.distinct {
         // DISTINCT: project + dedup first, then ORDER BY against output columns.
-        let deduped = dedup_rows(project(rows));
+        let deduped = dedup(try_project(rows, indices), ctx).map_err(ExecError::Spill)?;
         let out = if stmt.order_by.is_empty() {
             deduped
         } else {
@@ -466,13 +512,13 @@ fn plan_simple(
                 let col = resolve_output_position(&item.column, &columns)?;
                 keys.push(SortKey { col, dir: item.dir });
             }
-            sort(deduped, &keys)
+            sort(deduped, &keys, ctx).map_err(ExecError::Spill)?
         };
         return Ok((columns, out));
     }
 
     // No DISTINCT: ORDER BY against the input scope, applied before projecting.
-    let rows = if stmt.order_by.is_empty() {
+    let ordered: TryRowStream<'a> = if stmt.order_by.is_empty() {
         rows
     } else {
         let mut keys = Vec::with_capacity(stmt.order_by.len());
@@ -480,10 +526,10 @@ fn plan_simple(
             let col = resolve_column(scope, &item.column)?;
             keys.push(SortKey { col, dir: item.dir });
         }
-        sort(rows, &keys)
+        sort(rows, &keys, ctx).map_err(ExecError::Spill)?
     };
 
-    Ok((columns, project(rows)))
+    Ok((columns, try_project(ordered, indices)))
 }
 
 /// Aggregate path. Compute the UNION of aggregates referenced by the SELECT list
@@ -491,13 +537,14 @@ fn plan_simple(
 /// evaluate HAVING against that layout (keep groups where it is `Some(true)`),
 /// then project the SELECT items, dedup if DISTINCT, and ORDER BY against the
 /// output columns.
-fn plan_aggregate(
-    stmt: &SelectStmt,
+fn plan_aggregate<'a>(
+    stmt: &'a SelectStmt,
     scope: &[Bound],
     combined_schema: &RelSchema,
-    rows: Vec<Row>,
-    params: &[Value],
-) -> Result<(Vec<Column>, Vec<Row>), ExecError> {
+    rows: TryRowStream<'a>,
+    params: &'a [Value],
+    ctx: &SpillCtx,
+) -> Result<(Vec<Column>, TryRowStream<'a>), ExecError> {
     // Resolve GROUP BY columns to global indices.
     let mut group_cols = Vec::with_capacity(stmt.group_by.len());
     for cr in &stmt.group_by {
@@ -576,38 +623,41 @@ fn plan_aggregate(
     };
 
     // Compute the internal layout `[group values..., union agg values...]`.
-    let internal_rows = hash_aggregate(rows, &group_cols, &agg_defs);
+    // Spilling, sort-based: one accumulator set is resident whatever the GROUP BY
+    // cardinality, and first-seen group order is preserved.
+    let internal_rows =
+        hash_aggregate(rows, &group_cols, &agg_defs, ctx).map_err(ExecError::Spill)?;
 
     // HAVING filter over the internal layout (Kleene; keep Some(true)).
     let group_len = group_cols.len();
-    let kept: Vec<Row> = if let (Some(h), Some(map)) = (&stmt.having, &having_map) {
-        let resolve = |op: &Operand| map[&OperandKey::of(op)];
-        internal_rows
-            .into_iter()
-            .filter(|r| eval_kleene(h, r, params, &resolve) == Some(true))
-            .collect()
-    } else {
-        internal_rows
+    let kept: TryRowStream<'a> = match (&stmt.having, having_map) {
+        (Some(h), Some(map)) => Box::new(internal_rows.filter(move |r| match r {
+            // Never swallow a spill failure to make a predicate tidy.
+            Err(_) => true,
+            Ok(row) => {
+                let resolve = |op: &Operand| map[&OperandKey::of(op)];
+                eval_kleene(h, row, params, &resolve) == Some(true)
+            }
+        })),
+        _ => internal_rows,
     };
 
     // Project the SELECT items out of the internal layout.
-    let projected: Vec<Row> = kept
-        .into_iter()
-        .map(|r| {
-            let values = slots
+    let projected: TryRowStream<'a> = Box::new(kept.map(move |r| {
+        r.map(|r| {
+            Row(slots
                 .iter()
                 .map(|slot| match slot {
                     Slot::Group(i) => r.0[*i].clone(),
                     Slot::Agg(i) => r.0[group_len + *i].clone(),
                 })
-                .collect();
-            Row(values)
+                .collect())
         })
-        .collect();
+    }));
 
     // DISTINCT dedup (first-occurrence order), then ORDER BY against output.
     let deduped = if stmt.distinct {
-        dedup_rows(projected)
+        dedup(projected, ctx).map_err(ExecError::Spill)?
     } else {
         projected
     };
@@ -620,7 +670,7 @@ fn plan_aggregate(
             let col = resolve_output_position(&item.column, &out_columns)?;
             keys.push(SortKey { col, dir: item.dir });
         }
-        sort(deduped, &keys)
+        sort(deduped, &keys, ctx).map_err(ExecError::Spill)?
     };
 
     Ok((out_columns, out_rows))
@@ -693,18 +743,6 @@ fn intern_agg(
     agg_defs.push((func, arg_col));
     agg_keys.push(key);
     agg_defs.len() - 1
-}
-
-/// Deduplicate rows preserving first-occurrence order.
-fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
-    let mut seen: HashSet<Vec<Value>> = HashSet::new();
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        if seen.insert(r.0.clone()) {
-            out.push(r);
-        }
-    }
-    out
 }
 
 /// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
