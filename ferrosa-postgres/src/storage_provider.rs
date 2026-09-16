@@ -22,9 +22,9 @@
 //!
 //! `blocking_recv` would panic on an async worker, and blocking one would be the
 //! deadlock this module used to avoid by materializing. It is legal here because
-//! the synchronous executor no longer runs on an async worker: [`crate::offload`]
-//! moved `ferrosa_sql::execute` onto `spawn_blocking` (t_d3b2dec1). That change
-//! is the prerequisite for this one — the sync consumer is now *allowed* to
+//! the synchronous executor no longer runs on an async worker: the `offload`
+//! module moved `ferrosa_sql::execute` onto `spawn_blocking` (t_d3b2dec1). That
+//! change is the prerequisite for this one — the sync consumer is now *allowed* to
 //! block, which is exactly what a bounded channel needs.
 //!
 //! ### What is bounded, and what is not
@@ -395,7 +395,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
 /// The sync half of the hand-off: pulls rows the producer pushes.
 ///
 /// `blocking_recv` is legal here because the relational executor runs on a
-/// `spawn_blocking` thread (see [`crate::offload`]). Dropping this iterator
+/// `spawn_blocking` thread (see the `offload` module). Dropping this iterator
 /// closes the channel, which is what tells the producer to stop.
 struct ScanIter {
     rx: mpsc::Receiver<Row>,
