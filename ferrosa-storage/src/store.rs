@@ -643,6 +643,160 @@ pub struct TableStore<F: FlushTarget> {
     /// replica. Keyed by `gen`; the covered range is recovered from the live
     /// descriptor (still in the view until repair swaps it out).
     quarantined_sstables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Serializes FTI sidecar builds for this table, so a burst of concurrent
+    /// queries that all find the same SSTable uncovered builds its sidecar
+    /// once instead of tokenizing it once per query at the same time.
+    fulltext_sidecar_build_lock: Arc<Mutex<()>>,
+}
+
+/// File name of generation `gen`'s FTI sidecar for `index_name`.
+pub(crate) fn fti_sidecar_file_name(gen: &str, index_name: &str) -> String {
+    format!("{gen}-FTI-{index_name}.db")
+}
+
+/// Build the full-text index of one SSTable's `column_position` column: one
+/// document per row, keyed by the row's full primary key (t_da51e20c).
+///
+/// Errors on any open, iterator or decode failure rather than returning the
+/// rows read so far: a partial index persisted as a sidecar would hide the
+/// remaining rows from every later query.
+fn build_sstable_fti<R: ReadAt>(
+    sstable: &SSTableReader<R>,
+    schema: &TableSchema,
+    column_position: usize,
+) -> Result<ferrosa_index::fulltext::builder::FullTextIndex> {
+    let mapping = ColumnOrdinalMapping::for_header(schema, sstable.header());
+    let mut iter = sstable.partitions_iter()?;
+    let mut builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
+    while let Some(mut partition) = iter.next_partition()? {
+        mapping.remap_partition(&mut partition);
+        let pk_bytes = partition.key.key.as_bytes();
+        for row in &partition.rows {
+            let mut text = String::new();
+            for (col_idx, cell) in &row.cells {
+                if *col_idx as usize != column_position {
+                    continue;
+                }
+                if let Some(s) = cell
+                    .value
+                    .as_deref()
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                {
+                    text.push_str(s);
+                    text.push(' ');
+                }
+            }
+            if !text.is_empty() {
+                let doc_key =
+                    ferrosa_index::fulltext::keys::encode_doc_key(pk_bytes, &row.clustering);
+                builder.add_document(doc_key, text.trim());
+            }
+        }
+    }
+    Ok(builder.build())
+}
+
+/// One FTI sidecar to build: generation `gen`'s `index_name` sidecar, written
+/// beside the SSTable's component files in `dir`.
+struct FulltextSidecarJob<R: ReadAt> {
+    gen: String,
+    dir: std::path::PathBuf,
+    index_name: String,
+    column_position: usize,
+    /// The same pooled reader the read path uses, so the build opens the
+    /// SSTable exactly as a query would.
+    reader: Arc<SSTableReader<R>>,
+}
+
+/// What a [`FulltextSidecarBuild`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FulltextSidecarOutcome {
+    /// Sidecars written.
+    pub built: usize,
+    /// Sidecars a concurrent build had already written by the time this one
+    /// reached them.
+    pub already_present: usize,
+    /// Sidecars that could not be built or written. Each is logged at ERROR;
+    /// queries keep scanning that SSTable in full until one is built.
+    pub failed: usize,
+}
+
+/// FTI sidecars planned under the engine's table lock and built without it.
+///
+/// Holds only shared handles (flush target, schema snapshot, readers, the
+/// table's single-flight lock), so tokenizing a large SSTable never holds the lock
+/// every read, write and DDL statement on the node goes through.
+#[must_use = "a planned sidecar build does nothing until it is run"]
+pub struct FulltextSidecarBuild<F: FlushTarget> {
+    flush_target: Arc<F>,
+    schema: Arc<TableSchema>,
+    single_flight: Arc<Mutex<()>>,
+    jobs: Vec<FulltextSidecarJob<F::Reader>>,
+}
+
+impl<F: FlushTarget> FulltextSidecarBuild<F> {
+    /// Whether there is anything to build.
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// Build and persist every planned sidecar, one at a time.
+    pub fn run(self) -> FulltextSidecarOutcome {
+        let mut outcome = FulltextSidecarOutcome::default();
+        if self.jobs.is_empty() {
+            return outcome;
+        }
+        let _single_flight = self.single_flight.lock();
+        for job in &self.jobs {
+            if job
+                .dir
+                .join(fti_sidecar_file_name(&job.gen, &job.index_name))
+                .is_file()
+            {
+                outcome.already_present += 1;
+                continue;
+            }
+            let start = Instant::now();
+            match self.build_one(job) {
+                Ok(doc_count) => {
+                    outcome.built += 1;
+                    tracing::info!(
+                        gen = %job.gen,
+                        index = %job.index_name,
+                        doc_count,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "fts: built FTI sidecar for a live SSTable that had none; \
+                         queries no longer tokenize it in full"
+                    );
+                }
+                Err(e) => {
+                    outcome.failed += 1;
+                    tracing::error!(
+                        %e,
+                        gen = %job.gen,
+                        index = %job.index_name,
+                        "fts: FTI sidecar build failed; every query keeps tokenizing \
+                         this SSTable in full until one is built"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    fn build_one(&self, job: &FulltextSidecarJob<F::Reader>) -> Result<u32> {
+        #[cfg(test)]
+        crate::engine::FTS_SSTABLE_FULL_SCANS.with(|c| c.set(c.get() + 1));
+        let fti = build_sstable_fti(&job.reader, &self.schema, job.column_position)?;
+        let doc_count = fti.doc_count;
+        let bytes = ferrosa_index::fulltext::builder::serialize_fti(&fti).map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!("serialize FTI sidecar: {e}"))
+        })?;
+        drop(fti);
+        self.flush_target
+            .write_fti_sidecar_in(&job.dir, &job.gen, &job.index_name, &bytes)?;
+        Ok(doc_count)
+    }
 }
 
 fn new_memtable() -> Arc<dyn Memtable> {
@@ -1277,6 +1431,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -1474,6 +1629,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -1555,6 +1711,7 @@ impl<F: FlushTarget> TableStore<F> {
             next_gen: std::sync::atomic::AtomicU64::new(1),
             vector_index_scopes: parking_lot::Mutex::new(HashMap::new()),
             quarantined_sstables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            fulltext_sidecar_build_lock: Arc::new(Mutex::new(())),
             write_barrier: parking_lot::RwLock::new(()),
             sstable_read_errors: std::sync::atomic::AtomicU64::new(0),
             view_retry_exhausted: std::sync::atomic::AtomicU64::new(0),
@@ -5926,7 +6083,6 @@ impl<F: FlushTarget> TableStore<F> {
         covered_gens: &std::collections::HashSet<String>,
         limit: Option<usize>,
     ) -> ferrosa_common::Result<Vec<(Vec<u8>, f64)>> {
-        use ferrosa_index::fulltext::builder::FullTextIndexBuilder;
         use ferrosa_index::fulltext::query::parse_fts_query;
         use ferrosa_index::fulltext::reader::FullTextIndexReader;
 
@@ -5952,6 +6108,8 @@ impl<F: FlushTarget> TableStore<F> {
             if covered_gens.contains(&desc.gen) || self.is_sstable_quarantined(&desc.gen) {
                 continue;
             }
+            #[cfg(test)]
+            crate::engine::FTS_SSTABLE_FULL_SCANS.with(|c| c.set(c.get() + 1));
             let sstable = match self.open_reader(desc) {
                 Ok(r) => r,
                 Err(e) => {
@@ -5959,53 +6117,16 @@ impl<F: FlushTarget> TableStore<F> {
                     continue;
                 }
             };
-            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            let mut iter = match sstable.partitions_iter() {
-                Ok(it) => it,
-                Err(e) => {
-                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: broken iterator");
-                    continue;
-                }
-            };
             // One transient FTI per SSTable, dropped before the next one is
             // scanned — peak stays O(this SSTable's indexed column), not
             // O(every uncovered SSTable at once).
-            let mut builder = FullTextIndexBuilder::new();
-            loop {
-                match iter.next_partition() {
-                    Ok(Some(mut p)) => {
-                        mapping.remap_partition(&mut p);
-                        let pk_bytes = p.key.key.as_bytes();
-                        // Per-row document keyed by the full primary key (t_da51e20c).
-                        for row in &p.rows {
-                            let mut text = String::new();
-                            for (col_idx, cell) in &row.cells {
-                                if *col_idx as usize == col_pos {
-                                    if let Some(ref val) = cell.value {
-                                        if let Ok(s) = std::str::from_utf8(val) {
-                                            text.push_str(s);
-                                            text.push(' ');
-                                        }
-                                    }
-                                }
-                            }
-                            if !text.is_empty() {
-                                let doc_key = ferrosa_index::fulltext::keys::encode_doc_key(
-                                    pk_bytes,
-                                    &row.clustering,
-                                );
-                                builder.add_document(doc_key, text.trim());
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: decode error");
-                        break;
-                    }
+            let fti = match build_sstable_fti(&sstable, &schema, col_pos) {
+                Ok(fti) => fti,
+                Err(e) => {
+                    tracing::warn!(%e, gen = %desc.gen, "fts sidecar-less scan: SSTable could not be indexed; its rows are missing from this search");
+                    continue;
                 }
-            }
-            let fti = builder.build();
+            };
             if fti.doc_count == 0 {
                 continue;
             }
@@ -6020,6 +6141,137 @@ impl<F: FlushTarget> TableStore<F> {
         }
         drop(guard);
         Ok(out)
+    }
+
+    /// The directory holding `desc`'s component files.
+    fn descriptor_dir(&self, desc: &SstableDescriptor) -> std::path::PathBuf {
+        if desc.dir.as_os_str().is_empty() {
+            self.flush_target.base_dir().to_path_buf()
+        } else {
+            desc.dir.clone()
+        }
+    }
+
+    /// `desc`'s on-disk FTI sidecar for `index_name`, if it has one: beside its
+    /// own component files (a compaction output's generation directory), or in
+    /// the flat table directory where flush writes them.
+    fn existing_fti_sidecar(
+        &self,
+        desc: &SstableDescriptor,
+        index_name: &str,
+    ) -> Option<std::path::PathBuf> {
+        let name = fti_sidecar_file_name(&desc.gen, index_name);
+        let own = self.descriptor_dir(desc).join(&name);
+        if own.is_file() {
+            return Some(own);
+        }
+        let flat = self.flush_target.base_dir().join(&name);
+        (flat != own && flat.is_file()).then_some(flat)
+    }
+
+    /// The FTI sidecars a query against `index_name` must read: one per LIVE,
+    /// unquarantined SSTable that has one, as `(generation, path)`.
+    ///
+    /// Derived from the store view, never from a directory listing. Compaction
+    /// leaves its inputs' index artifacts on disk, so a listing of
+    /// `*-FTI-{index}.db` grows with every generation the table has EVER had —
+    /// 5,122 files against 11 live SSTables on the cluster where this was found
+    /// — and each of those sidecars returns keys for rows as they were before
+    /// they were rewritten or compacted away.
+    pub fn fulltext_live_sidecars(&self, index_name: &str) -> Vec<(String, std::path::PathBuf)> {
+        let guard = self.view.load();
+        guard
+            .sstables
+            .iter()
+            .filter(|desc| !self.is_sstable_quarantined(&desc.gen))
+            .filter_map(|desc| {
+                self.existing_fti_sidecar(desc, index_name)
+                    .map(|path| (desc.gen.clone(), path))
+            })
+            .collect()
+    }
+
+    /// Plan FTI sidecars for every live SSTable that has none for
+    /// `index_name`. Run the plan with the engine's table lock RELEASED.
+    ///
+    /// Without a sidecar, each query decodes and tokenizes the SSTable in full
+    /// (`fulltext_sstable_scan_missing_sidecar`). That fallback was written for
+    /// a transient window, but nothing ever closed the window: compaction wrote
+    /// no sidecar, so every compacted SSTable was re-tokenized on every query
+    /// for the rest of its life. Building the sidecar once turns that per-query
+    /// cost into a one-time one.
+    ///
+    /// Empty for targets that do not persist sidecars (in-memory), where the
+    /// fallback scan remains the only way to search SSTable rows.
+    pub fn plan_missing_fulltext_sidecars(&self, index_name: &str) -> FulltextSidecarBuild<F> {
+        let mut plan = self.empty_fulltext_sidecar_build();
+        if !self.flush_target.persists_fti_sidecars() {
+            return plan;
+        }
+        let Some((_, column_position)) = self
+            .fulltext_indexes
+            .iter()
+            .find(|(name, _)| name == index_name)
+        else {
+            return plan;
+        };
+        let guard = self.view.load();
+        for desc in guard.sstables.iter() {
+            if self.is_sstable_quarantined(&desc.gen)
+                || self.existing_fti_sidecar(desc, index_name).is_some()
+            {
+                continue;
+            }
+            // An SSTable that cannot be opened is left to the fallback scan,
+            // which reports the same failure for every query that misses it.
+            let Ok(reader) = self.open_reader(desc) else {
+                continue;
+            };
+            plan.jobs.push(FulltextSidecarJob {
+                gen: desc.gen.clone(),
+                dir: self.descriptor_dir(desc),
+                index_name: index_name.to_string(),
+                column_position: *column_position,
+                reader,
+            });
+        }
+        plan
+    }
+
+    /// Plan FTI sidecars, for every full-text index, for a compaction output
+    /// that is about to be swapped in. Built before the swap, a query never
+    /// sees the output without its sidecar.
+    pub fn plan_fulltext_sidecars_for_output(
+        &self,
+        gen: &str,
+        dir: &std::path::Path,
+        reader: &Arc<SSTableReader<F::Reader>>,
+    ) -> FulltextSidecarBuild<F> {
+        let mut plan = self.empty_fulltext_sidecar_build();
+        if !self.flush_target.persists_fti_sidecars() {
+            return plan;
+        }
+        plan.jobs = self
+            .fulltext_indexes
+            .iter()
+            .map(|(index_name, column_position)| FulltextSidecarJob {
+                gen: gen.to_string(),
+                dir: dir.to_path_buf(),
+                index_name: index_name.clone(),
+                column_position: *column_position,
+                reader: Arc::clone(reader),
+            })
+            .collect();
+        plan
+    }
+
+    fn empty_fulltext_sidecar_build(&self) -> FulltextSidecarBuild<F> {
+        FulltextSidecarBuild {
+            flush_target: Arc::clone(&self.flush_target),
+            schema: self.schema.load_full(),
+            single_flight: Arc::clone(&self.fulltext_sidecar_build_lock),
+            jobs: Vec::new(),
+        }
     }
 
     /// Register a full-text index for this table.

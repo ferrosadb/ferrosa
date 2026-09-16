@@ -197,6 +197,12 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Next
 
+- **A replica's failed fulltext search must not answer "no matches".**
+  `FulltextSearchHandler` (and `IndexReadInPartitionHandler`) log a storage
+  error at WARN and respond with an empty key set, so the coordinator unions a
+  failed replica as if it had matched nothing. The response payload has no
+  error field; adding one is a bincode wire change that needs the usual
+  all-nodes-together upgrade note.
 - **Retire the election-storm safety nets once Jepsen is clean (CL-2).**
   `election_guard.rs` (W4.11) and `snapshot_pusher.rs` (W4.12) are explicitly
   marked for deletion after a clean Jepsen window. Do NOT remove before CL-1
