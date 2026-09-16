@@ -41,7 +41,7 @@ use ferrosa_sql::{
 use ferrosa_storage::{Mutation, StorageEngine};
 
 use crate::messages::{BackendMessage, FieldDescription};
-use crate::storage_provider::{load_table, LoadError};
+use crate::storage_provider::{load_table, LoadError, ScanFailure};
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -684,7 +684,7 @@ fn render_result(result: QueryResult, result_formats: &[i16]) -> Vec<BackendMess
 /// describe the outcome — a result set on success, or exactly one
 /// `ErrorResponse` on any failure. The caller appends `ReadyForQuery`.
 pub async fn execute_query(
-    engine: &StorageEngine,
+    engine: &Arc<StorageEngine>,
     schema: &Schema,
     sql: &str,
     default_schema: &str,
@@ -701,21 +701,28 @@ pub async fn execute_query(
         // `load_table` — a missing table is `NoSuchTable`, never an empty
         // scan), then execute over the materialized snapshots.
         Statement::Select(select) => {
-            let catalog = match load_catalog(engine, schema, &select, default_schema).await {
-                Ok(catalog) => catalog,
-                Err(err_msg) => return vec![err_msg],
-            };
+            let (catalog, failure) =
+                match load_catalog(engine, schema, &select, default_schema).await {
+                    Ok(loaded) => loaded,
+                    Err(err_msg) => return vec![err_msg],
+                };
             // Offloaded: the relational executor is synchronous and CPU-bound
             // (sort/hash-join), so running it inline would pin an async worker
             // for the whole query — the PR #131 starvation shape. See `offload`.
-            match crate::offload::execute_offloaded(
+            let result = crate::offload::execute_offloaded(
                 *select,
                 catalog,
                 default_schema.to_string(),
                 Vec::new(),
             )
-            .await
-            {
+            .await;
+            // Before the result is trusted: a scan that hit a storage error
+            // closed its channel, so the executor finished "successfully" over
+            // a truncated row set.
+            if let Some(err_msg) = check_scan_failure(&failure) {
+                return vec![err_msg];
+            }
+            match result {
                 Ok(result) => render_result(result, &[]), // simple query: all text
                 Err(e) => vec![exec_error_response(&e)],
             }
@@ -1723,24 +1730,37 @@ fn default_scalar_name(value: &ScalarValue) -> String {
     }
 }
 
-/// Load every table referenced by `stmt` (FROM + optional JOIN) into a
-/// [`MapCatalog`], so the sync engine can scan them. Returns the populated
-/// catalog, or a single fail-loud [`BackendMessage::ErrorResponse`] (undefined
-/// table `42P01` or storage error `58000`) — never a silently-empty relation.
+/// Open every table referenced by `stmt` (FROM + optional JOIN) as a streaming
+/// provider in a [`MapCatalog`], so the sync engine can scan them. Returns the
+/// catalog together with the [`ScanFailure`] slot its providers share, or a
+/// single fail-loud [`BackendMessage::ErrorResponse`] (undefined table `42P01`
+/// or storage error `58000`) — never a silently-empty relation.
+///
+/// This reads **no rows**. Table data is pulled only when the executor scans,
+/// which is also why the Describe path below can resolve a statement's columns
+/// without touching storage at all.
+///
+/// The returned `ScanFailure` MUST be checked after execution — see
+/// [`check_scan_failure`]. A storage error mid-scan cannot travel back through
+/// the executor's `Iterator`, so an unchecked slot is a truncated result set
+/// reported as success.
 ///
 /// Shared by the simple-query path ([`execute_query`]) and the extended-query
 /// path (Describe/Execute), so both resolve tables identically.
 pub(crate) async fn load_catalog(
-    engine: &StorageEngine,
+    engine: &Arc<StorageEngine>,
     schema: &Schema,
     stmt: &ferrosa_sql::SelectStmt,
     default_schema: &str,
-) -> Result<MapCatalog, BackendMessage> {
+) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     let mut catalog = MapCatalog::new();
+    // One slot per query: every provider records into it, and the query layer
+    // takes it once after `execute` returns.
+    let failure = ScanFailure::default();
     let referenced = std::iter::once(&stmt.from).chain(stmt.join.as_ref().map(|j| &j.table));
     for table_ref in referenced {
         let keyspace = table_ref.schema.as_deref().unwrap_or(default_schema);
-        match load_table(engine, schema, keyspace, &table_ref.table).await {
+        match load_table(engine, schema, keyspace, &table_ref.table, failure.clone()).await {
             Ok(table) => {
                 catalog = catalog.with_table(keyspace, &table_ref.table, Arc::new(table));
             }
@@ -1753,7 +1773,21 @@ pub(crate) async fn load_catalog(
             }
         }
     }
-    Ok(catalog)
+    Ok((catalog, failure))
+}
+
+/// Turn a recorded scan failure into a fail-loud `ErrorResponse`, discarding
+/// whatever partial result the executor built on top of the truncated scan.
+///
+/// Call this after every `execute`, ahead of trusting either arm of its result:
+/// a scan that died part-way leaves the executor with a short row set it has no
+/// way to know is short, so `Ok(result)` here means "these are all the rows that
+/// arrived", not "these are all the rows". The storage error is the real cause
+/// and outranks any `ExecError` computed from the fragment.
+pub(crate) fn check_scan_failure(failure: &ScanFailure) -> Option<BackendMessage> {
+    failure
+        .take()
+        .map(|msg| error_response("58000", &format!("{msg} (query aborted; result discarded)")))
 }
 
 /// Render a `QueryResult` (or an `ExecError`) into backend messages for the
@@ -2571,7 +2605,7 @@ mod txn_buffer_tests {
 
     /// How many `kv` rows whose `k` equals `key` are visible in storage, read
     /// back through the SAME `execute_query` SELECT path the front-end serves.
-    async fn row_count(engine: &StorageEngine, schema: &Schema, key: &str) -> usize {
+    async fn row_count(engine: &Arc<StorageEngine>, schema: &Schema, key: &str) -> usize {
         let msgs = execute_query(
             engine,
             schema,
@@ -2591,9 +2625,9 @@ mod txn_buffer_tests {
             .count()
     }
 
-    async fn new_engine_and_schema() -> (tempfile::TempDir, StorageEngine, Schema) {
+    async fn new_engine_and_schema() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
         let dir = tempfile::tempdir().unwrap();
-        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
         engine.register_table(kv_storage_schema()).unwrap();
         let schema = schema_with_kv();
         (dir, engine, schema)

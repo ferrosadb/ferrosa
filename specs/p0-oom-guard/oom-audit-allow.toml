@@ -1108,13 +1108,6 @@ owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
-path = "ferrosa-postgres/src/storage_provider.rs"
-rule = "stream-push-accumulation"
-reason = "CONFIRMED REAL materialization. Tracked for fix as t_f348ba0b; delete this entry when the path is bounded or streamed."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
 path = "ferrosa-schema/src/system/aggregate_tables.rs"
 rule = "returns-vec-partition-or-row"
 reason = "t_a49d88c3 TRIAGED: BOUNDED: per-aggregate/per-table system rows = schema (registry pattern; not individually opened)."
