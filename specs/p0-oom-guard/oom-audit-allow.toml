@@ -1003,13 +1003,6 @@ owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
-path = "ferrosa-graph/src/adjacency/reconcile.rs"
-rule = "materializing-range-read-call-site"
-reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
 path = "ferrosa-graph/src/bolt/codec.rs"
 rule = "with-capacity-limit"
 reason = "t_a49d88c3 TRIAGED: BOUNDED for query data: one Bolt frame's element count, not query-sized. NOTE the wire-declared count is a pre-auth allocation-amplification issue tracked separately as t_3e665492."
@@ -1046,20 +1039,6 @@ expires = "2026-10-01"
 
 [[allow]]
 path = "ferrosa-graph/src/executor/expand.rs"
-rule = "materializing-range-read-call-site"
-reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
-path = "ferrosa-graph/src/executor/expand.rs"
-rule = "returns-vec-partition-or-row"
-reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_250fa355; delete this entry when the call site streams."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
-path = "ferrosa-graph/src/executor/expand.rs"
 rule = "stream-push-accumulation"
 reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: streaming SET/REMOVE loops consume rows one at a time; push targets a per-column assignment vec sized by SET-clause arity, not the stream."
 owner = "storage"
@@ -1073,25 +1052,11 @@ owner = "storage"
 expires = "2026-10-01"
 
 [[allow]]
-path = "ferrosa-graph/src/executor/leapfrog.rs"
-rule = "materializing-range-read-call-site"
-reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
-owner = "storage"
-expires = "2026-09-15"
-
-[[allow]]
 path = "ferrosa-graph/src/executor/stream.rs"
 rule = "stream-push-accumulation"
 reason = "t_a49d88c3 TRIAGED: collect_to_graph_result breaks at max_rows. collect_rows is uncapped BY DESIGN (the caller bounds the stream so the limit stops upstream production); its 3 production callers are under verification in t_daf898e1."
 owner = "storage"
 expires = "2026-10-01"
-
-[[allow]]
-path = "ferrosa-graph/src/executor/varpath.rs"
-rule = "materializing-range-read-call-site"
-reason = "CONFIRMED REAL materialization, not a false positive. Tracked for fix as t_bc5f0e6f; delete this entry when the call site streams."
-owner = "storage"
-expires = "2026-09-15"
 
 [[allow]]
 path = "ferrosa-graph/src/http.rs"

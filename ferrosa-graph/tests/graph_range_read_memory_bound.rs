@@ -210,7 +210,10 @@ fn create_graph_schema(schema: &Schema) {
         "id".to_string(),
         column("id", ColumnKind::PartitionKey, 0, "text"),
     );
-    person_cols.insert("name".to_string(), column("name", ColumnKind::Regular, -1, "text"));
+    person_cols.insert(
+        "name".to_string(),
+        column("name", ColumnKind::Regular, -1, "text"),
+    );
     person_cols.insert(
         "payload".to_string(),
         column("payload", ColumnKind::Regular, -1, "text"),
@@ -249,7 +252,10 @@ fn create_graph_schema(schema: &Schema) {
         "payload".to_string(),
         column("payload", ColumnKind::Regular, -1, "text"),
     );
-    knows_cols.insert("tag".to_string(), column("tag", ColumnKind::Regular, -1, "text"));
+    knows_cols.insert(
+        "tag".to_string(),
+        column("tag", ColumnKind::Regular, -1, "text"),
+    );
     schema
         .create_table(
             TableMetadata {
@@ -405,10 +411,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
                     clustering: vec![],
                     cells: vec![
                         (name_idx, CellValue::live(name.into_bytes(), ts)),
-                        (
-                            person_payload_idx,
-                            CellValue::live(payload_bytes(i), ts),
-                        ),
+                        (person_payload_idx, CellValue::live(payload_bytes(i), ts)),
                     ],
                     deletion: DeletionTime::LIVE,
                     primary_key_liveness: LivenessInfo::with_timestamp(ts),
@@ -485,7 +488,9 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
 fn materialize_baseline_peak(fx: &Fixture, rt: &tokio::runtime::Runtime, table: &str) -> i64 {
     let wp = fx.write_path.load_full();
     let tid = fx.table(table);
-    let warm = rt.block_on(wp.range_read(&tid)).expect("warm-up range_read");
+    let warm = rt
+        .block_on(wp.range_read(&tid))
+        .expect("warm-up range_read");
     assert!(!warm.is_empty(), "warm-up must read the seeded partitions");
     drop(warm);
     let (partitions, peak) = measure_peak(|| rt.block_on(wp.range_read(&tid)).expect("range_read"));
