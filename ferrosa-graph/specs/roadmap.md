@@ -28,10 +28,19 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Next
 
-- **Surface reconciler read errors (FMEA G-7).** Stop discarding `range_read` /
-  `read` failures via `Err(_) => continue` and `unwrap_or_default()`; log them and
-  reflect skipped tables/partitions in `ReconcileMetrics` so a degraded pass is
-  not reported as success (fail-loud).
+- **Reflect reconciler read failures in `ReconcileMetrics` (FMEA G-7).** The
+  discarded `Err(_) => continue` / `unwrap_or_default()` paths are gone — both
+  scans stream and log every failure with the table and how far it got
+  (t_bc5f0e6f). What remains is the metrics half: a caller reading
+  `ReconcileMetrics` still cannot distinguish a complete pass from one that
+  skipped a table.
+- **Stream phase A of `Expand` end to end (FMEA G-9, t_4ce82a3e).** The anchor
+  SCAN no longer materializes, but the frontier it feeds still collects one
+  `ExpandState` per surviving anchor row. That is bounded by the answer rather
+  than by the table, so it is no longer an OOM-on-any-table vector — but a query
+  whose filters keep most of a large table still holds a query-sized frontier.
+  The `AnchorScan` operator in `specs/streaming-executor-design.md` is the
+  remaining step.
 - **Cost-aware variable-length paths (FMEA G-4).** Add a planner estimate for
   `[*min..max]` fan-out and reject/flag unbounded `[*]` at `EXPLAIN` time; make the
   vertex budget cardinality-aware rather than a single global cap.
