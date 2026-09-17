@@ -6323,18 +6323,49 @@ impl<F: FlushTarget> TableStore<F> {
             return; // already registered
         }
 
-        // Insert an empty VectorMemtableIndex into the current view so that
-        // writes made after this call are indexed immediately.
+        // Build the index from every live memtable before publishing it. If an
+        // index is created after rows have already been written, publishing an
+        // empty index makes the planner select it and turns a correct brute-force
+        // ANN query into an empty result set. Include the flushing memtable too:
+        // it remains part of the read view until its SSTable and sidecars are
+        // installed.
         let current = self.view.load();
+        let vector_index = Arc::new(VectorMemtableIndex::new(
+            config.metric,
+            config.m,
+            config.ef_construction,
+        ));
+        let backfill = |memtable: &Arc<dyn Memtable>| {
+            for partition in memtable.range_iter(None, None) {
+                for row in partition.static_row.iter().chain(partition.rows.iter()) {
+                    let Some(value) = row
+                        .cells
+                        .iter()
+                        .find(|(idx, _)| *idx as usize == config.column_position)
+                        .and_then(|(_, cell)| cell.value.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
+                        continue;
+                    };
+                    let position =
+                        ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
+                    vector_index.insert_with_scope(
+                        position,
+                        vector,
+                        Some(partition.key.key.as_bytes().to_vec()),
+                    );
+                }
+            }
+        };
+        backfill(&current.active);
+        if let Some(flushing) = current.flushing.as_ref() {
+            backfill(flushing);
+        }
+
         let mut new_vi = (*current.vector_indexes).clone();
-        new_vi.insert(
-            config.index_name.clone(),
-            Arc::new(VectorMemtableIndex::new(
-                config.metric,
-                config.m,
-                config.ef_construction,
-            )),
-        );
+        new_vi.insert(config.index_name.clone(), vector_index);
         let new_view = StoreView {
             active: Arc::clone(&current.active),
             flushing: current.flushing.clone(),
@@ -11385,6 +11416,47 @@ mod tests {
             !partitions[0].rows.is_empty(),
             "recovered partition must contain its row(s)"
         );
+    }
+
+    #[test]
+    fn vector_index_created_after_writes_backfills_live_rows() {
+        for method in [VectorIndexMethod::Hnsw, VectorIndexMethod::QuantizedIvf] {
+            let flush_target = InMemoryFlushTarget::new();
+            let mut store: TableStore<InMemoryFlushTarget> = TableStore::new(
+                vector_schema(),
+                flush_target,
+                WriteOptions {
+                    compression: None,
+                    ..WriteOptions::default()
+                },
+            );
+
+            store
+                .write(&make_key("near"), make_vector_row(&[1.0, 0.0, 0.0], 1000))
+                .unwrap();
+            store
+                .write(&make_key("far"), make_vector_row(&[0.0, 1.0, 0.0], 1001))
+                .unwrap();
+
+            let config = VectorIndexConfig {
+                index_name: "vec_idx".to_string(),
+                column_position: 0,
+                metric: ferrosa_index::DistanceMetric::L2,
+                m: 8,
+                ef_construction: 50,
+            };
+            store.add_vector_index_with_method(config, method);
+
+            let partitions = store
+                .ann_search_partitions("vec_idx", &[1.0, 0.0, 0.0], 1, 20)
+                .expect("a newly-created vector index must search pre-existing live rows");
+            assert_eq!(
+                partitions.len(),
+                1,
+                "{method:?} index should backfill rows present before CREATE INDEX"
+            );
+            assert_eq!(partitions[0].key.key.as_bytes(), b"near");
+        }
     }
 
     #[test]

@@ -106,10 +106,10 @@ volume or changing query results.
 5. **Index registration is replay-safe and complete for live rows.** Repeating
    the same index declaration preserves the active memtable index and its
    unflushed postings; a conflicting column position or index type fails loud
-   instead of silently replacing it. A new scalar declaration streams the
-   active and flushing memtables into the index before publication, so rows
+   instead of silently replacing it. A new scalar or vector declaration streams
+   the active and flushing memtables into the index before publication, so rows
    written before CREATE INDEX are visible without materializing a fallback
-   table scan.
+   table scan or briefly publishing an empty ANN index.
 6. **Table registration is compare-and-install.** A schema replay that loses
    the table-map install race merges declarations into the already-live store;
    it cannot replace active memtable rows or index postings.

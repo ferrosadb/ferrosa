@@ -24680,10 +24680,10 @@ mod tests {
     }
 
     /// Vector index: an `ORDER BY ... ANN OF` query returns the nearest rows in
-    /// distance order, and the vector index is registered in storage. The
-    /// router ANN path is brute-force pending Phase 2 vector read dispatch, so
-    /// this asserts correctness + index registration rather than an
-    /// index_usage hit it cannot honestly demonstrate.
+    /// distance order when the index is created after the rows already exist.
+    /// This is the end-to-end form of the live-memtable backfill contract: once
+    /// the schema advertises the index, the router must not switch a correct
+    /// brute-force query to an empty storage index.
     #[tokio::test]
     async fn vector_index_registered_and_ann_orders_correctly() {
         let (state, _dir) = setup();
@@ -24693,9 +24693,9 @@ mod tests {
         for cql in [
             "CREATE KEYSPACE vec WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
             "CREATE TABLE vec.items (id int PRIMARY KEY, embedding vector<float, 4>)",
-            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
             "INSERT INTO vec.items (id, embedding) VALUES (1, [0.90, 0.10, 0.00, 0.00])",
             "INSERT INTO vec.items (id, embedding) VALUES (2, [0.00, 0.00, 0.90, 0.10])",
+            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
         ] {
             route(&state, &ctx, crate::parser::parse(cql).unwrap())
                 .await
@@ -24719,6 +24719,7 @@ mod tests {
             RouteResult::Result(b) => {
                 let count = extract_row_count(&b);
                 assert_eq!(count, 1, "ANN OF LIMIT 1 must return exactly 1 row");
+                assert_eq!(extract_int_column_values(&b, "id"), vec![1]);
             }
             _ => panic!("expected Result"),
         }
