@@ -2411,6 +2411,14 @@ pub async fn route_transactional(
         Statement::BeginTransaction { timeout_ms } => {
             Some(begin_transaction(state, owner, shim, now, *timeout_ms))
         }
+        Statement::TransactionBlock {
+            timeout_ms,
+            statements,
+            rollback,
+        } => Some(
+            route_transaction_block(state, ctx, shim, now, *timeout_ms, statements, *rollback)
+                .await,
+        ),
         Statement::Commit { txn_id } => {
             Some(commit_transaction(state, owner, shim, now, txn_id.as_deref()).await)
         }
@@ -2428,6 +2436,38 @@ pub async fn route_transactional(
             Some(stage_dml(state, ctx, owner, now, id, stmt))
         }
         _ => None,
+    }
+}
+
+async fn route_transaction_block(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    now: std::time::Instant,
+    timeout_ms: Option<u64>,
+    statements: &[Statement],
+    rollback: bool,
+) -> Result<RouteResult, CqlError> {
+    let owner = ctx.auth.role.as_str();
+    begin_transaction(state, owner, shim, now, timeout_ms)?;
+    let id = shim.ok_or_else(|| {
+        CqlError::ServerError("transaction block did not receive a transaction id".to_string())
+    })?;
+    let id_text = id.to_string();
+
+    for statement in statements {
+        if let Err(error) = route_in_transaction(state, ctx, owner, now, &id_text, statement).await
+        {
+            // A body error must not leave an open transaction for the reaper.
+            let _ = rollback_transaction(state, owner, shim, Some(&id_text));
+            return Err(error);
+        }
+    }
+
+    if rollback {
+        rollback_transaction(state, owner, shim, Some(&id_text))
+    } else {
+        commit_transaction(state, owner, shim, now, Some(&id_text)).await
     }
 }
 
@@ -3408,6 +3448,7 @@ pub async fn route(
         // Accord transaction control statements are handled by route_transactional
         // (the connection layer) before reaching here. If one arrives, return void.
         Statement::BeginTransaction { .. }
+        | Statement::TransactionBlock { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. } => Ok(RouteResult::Result(crate::result::encode_void())),
         // A transaction-scoped statement must be handled by route_transactional; if
@@ -15523,6 +15564,43 @@ mod tests {
             matches!(committed, Some(Err(_))),
             "COMMIT without a cluster committer must fail loud, not fake success"
         );
+    }
+
+    #[tokio::test]
+    async fn route_documented_transaction_blocks_without_leaking_registry_entries() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let mut shim = None;
+        let now = std::time::Instant::now();
+
+        let rollback = crate::parser::parse(
+            "BEGIN TRANSACTION; SELECT * FROM system.local; ROLLBACK TRANSACTION;",
+        )
+        .unwrap();
+        assert!(matches!(
+            route_transactional(&state, &ctx, &rollback, &mut shim, now).await,
+            Some(Ok(_))
+        ));
+        assert!(shim.is_none());
+        assert!(state.txn_registry.lock().is_empty());
+
+        let commit = crate::parser::parse("BEGIN TRANSACTION; COMMIT TRANSACTION;").unwrap();
+        assert!(matches!(
+            route_transactional(&state, &ctx, &commit, &mut shim, now).await,
+            Some(Err(CqlError::Invalid(message)))
+                if message.contains("require cluster mode")
+        ));
+        assert!(shim.is_none());
+        assert!(state.txn_registry.lock().is_empty());
     }
 
     /// Regression for the Elle-cert "nested transactions" defect: consecutive
