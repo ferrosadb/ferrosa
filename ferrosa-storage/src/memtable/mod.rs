@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::{validate_cell_bytes, validate_clustering_shape};
-use ferrosa_common::{Error, Result, TableSchema};
+use ferrosa_common::{CellValue, Error, Result, TableSchema};
 use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 
 /// Fail-loud guard: validate every cell in `row` against the column's
@@ -41,6 +41,187 @@ use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 /// real data.
 pub(crate) fn is_partition_tombstone(row: &Row) -> bool {
     row.clustering.is_empty() && row.cells.is_empty() && row.deletion != DeletionTime::LIVE
+}
+
+#[derive(Clone, Copy)]
+enum RawCollectionKind {
+    List,
+    Set,
+    Map,
+}
+
+fn raw_collection_kind(type_name: &str) -> Option<RawCollectionKind> {
+    let head = type_name.split('(').next()?.rsplit('.').next()?.trim();
+    match head {
+        "ListType" => Some(RawCollectionKind::List),
+        "SetType" => Some(RawCollectionKind::Set),
+        "MapType" => Some(RawCollectionKind::Map),
+        _ => None,
+    }
+}
+
+fn take_collection_value(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    let len_bytes = bytes
+        .get(*pos..*pos + 4)
+        .ok_or_else(|| Error::InvalidData("truncated collection element length".into()))?;
+    *pos += 4;
+    let len = i32::from_be_bytes(len_bytes.try_into().expect("four-byte slice"));
+    let len = usize::try_from(len)
+        .map_err(|_| Error::InvalidData("negative collection element length".into()))?;
+    let value = bytes
+        .get(*pos..*pos + len)
+        .ok_or_else(|| Error::InvalidData("truncated collection element value".into()))?
+        .to_vec();
+    *pos += len;
+    Ok(value)
+}
+
+fn expand_legacy_collection_cell(
+    kind: RawCollectionKind,
+    blob: &CellValue,
+) -> Result<Vec<CellValue>> {
+    let bytes = blob
+        .value
+        .as_deref()
+        .ok_or_else(|| Error::InvalidData("live collection blob has no value".into()))?;
+    let count_bytes = bytes
+        .get(..4)
+        .ok_or_else(|| Error::InvalidData("truncated collection element count".into()))?;
+    let count = i32::from_be_bytes(count_bytes.try_into().expect("four-byte slice"));
+    let count = usize::try_from(count)
+        .map_err(|_| Error::InvalidData("negative collection element count".into()))?;
+    let minimum_entry_bytes = match kind {
+        RawCollectionKind::List | RawCollectionKind::Set => 4,
+        RawCollectionKind::Map => 8,
+    };
+    if count > bytes.len().saturating_sub(4) / minimum_entry_bytes {
+        return Err(Error::InvalidData(format!(
+            "collection element count {count} exceeds the encoded byte length"
+        )));
+    }
+    if matches!(kind, RawCollectionKind::List) && count > u16::MAX as usize + 1 {
+        return Err(Error::InvalidData(format!(
+            "list element count {count} exceeds the cell-path sequence space"
+        )));
+    }
+    let mut pos = 4;
+    let mut cells = Vec::with_capacity(count + 1);
+
+    // A whole-collection assignment is a deletion immediately before its new
+    // elements. The one-microsecond offset leaves those replacement elements
+    // live while shadowing older path-keyed cells.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    cells.push(CellValue::tombstone(
+        blob.timestamp.saturating_sub(1),
+        i32::try_from(now_secs).unwrap_or(i32::MAX),
+    ));
+
+    for seq in 0..count {
+        let (path, value) = match kind {
+            RawCollectionKind::List => (
+                ferrosa_row_bridge::collection::list_cell_path(blob.timestamp, seq as u16),
+                take_collection_value(bytes, &mut pos)?,
+            ),
+            RawCollectionKind::Set => (take_collection_value(bytes, &mut pos)?, Vec::new()),
+            RawCollectionKind::Map => {
+                let key = take_collection_value(bytes, &mut pos)?;
+                let value = take_collection_value(bytes, &mut pos)?;
+                (key, value)
+            }
+        };
+        cells.push(CellValue {
+            value: Some(value),
+            timestamp: blob.timestamp,
+            ttl: blob.ttl,
+            local_deletion_time: blob.local_deletion_time,
+            path: Some(path),
+        });
+    }
+    if pos != bytes.len() {
+        return Err(Error::InvalidData(format!(
+            "collection blob has {} trailing bytes",
+            bytes.len() - pos
+        )));
+    }
+    Ok(cells)
+}
+
+/// Convert legacy whole-value collection cells when either side of a row merge
+/// already uses element paths. Keeping one representation prevents a live
+/// pathless cell from reaching an SSTable marked for complex collections.
+pub(crate) fn normalize_collection_rows_for_merge(
+    existing: &mut Row,
+    incoming: &mut Row,
+    schema: &TableSchema,
+) -> Result<()> {
+    let complex_columns: std::collections::HashSet<u16> = existing
+        .cells
+        .iter()
+        .chain(&incoming.cells)
+        .filter_map(|(idx, cell)| cell.path.is_some().then_some(*idx))
+        .collect();
+    if complex_columns.is_empty() {
+        return Ok(());
+    }
+    let has_legacy_blob = existing
+        .cells
+        .iter()
+        .chain(&incoming.cells)
+        .any(|(idx, cell)| {
+            complex_columns.contains(idx) && cell.path.is_none() && !cell.is_tombstone()
+        });
+    if !has_legacy_blob {
+        return Ok(());
+    }
+
+    // Parse every blob before changing either row, so a malformed incoming
+    // value cannot partially rewrite the existing row before rejection.
+    let plan = |row: &Row| -> Result<std::collections::HashMap<u16, Vec<CellValue>>> {
+        let mut replacements = std::collections::HashMap::new();
+        for (idx, cell) in &row.cells {
+            if complex_columns.contains(idx) && cell.path.is_none() && !cell.is_tombstone() {
+                let column = schema.regular_columns.get(*idx as usize).ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "collection cell column index {idx} is outside the regular schema"
+                    ))
+                })?;
+                let kind = raw_collection_kind(&column.type_name).ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "path-bearing cell for non-collection column {}",
+                        column.name
+                    ))
+                })?;
+                replacements.insert(*idx, expand_legacy_collection_cell(kind, cell)?);
+            }
+        }
+        Ok(replacements)
+    };
+    let mut existing_replacements = plan(existing)?;
+    let mut incoming_replacements = plan(incoming)?;
+
+    let apply =
+        |row: &mut Row, replacements: &mut std::collections::HashMap<u16, Vec<CellValue>>| {
+            let cells = std::mem::take(&mut row.cells);
+            let replacement_len: usize = replacements.values().map(Vec::len).sum();
+            let mut normalized = Vec::with_capacity(cells.len() + replacement_len);
+            for (idx, cell) in cells {
+                if cell.path.is_none() && !cell.is_tombstone() {
+                    if let Some(elements) = replacements.remove(&idx) {
+                        normalized.extend(elements.into_iter().map(|element| (idx, element)));
+                        continue;
+                    }
+                }
+                normalized.push((idx, cell));
+            }
+            normalized.sort_by(|(a_idx, a), (b_idx, b)| (a_idx, &a.path).cmp(&(b_idx, &b.path)));
+            row.cells = normalized;
+        };
+    apply(existing, &mut existing_replacements);
+    apply(incoming, &mut incoming_replacements);
+    Ok(())
 }
 
 pub(crate) fn validate_row_against_schema(row: &Row, schema: &TableSchema) -> Result<()> {

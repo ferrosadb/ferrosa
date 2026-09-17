@@ -22,7 +22,11 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Memtable** — sharded write buffer behind the `Memtable` trait. Default build
   uses `SkipListMemtable` (crossbeam skiplist, feature `skiplist-memtable`);
   `ShardedBTreeMemtable` (64 `parking_lot::RwLock` shards) is the alternative.
-  Per-partition merge-on-write (cell-level LWW, tombstone merge).
+  Per-partition merge-on-write (cell-level LWW, tombstone merge). When a legacy
+  whole-value collection and path-keyed collection elements meet during replay
+  or a live update, the merge expands the whole value into a deletion sentinel
+  plus sorted element cells. Flush therefore sees one collection
+  representation and cannot panic on a live pathless complex cell.
 - **Commit log** (`commitlog/`) — segmented WAL with CAS-based lock-free
   allocation, forward-linked sync markers, crash-recovery replay, CDC reader,
   S3 archiver for PITR, and per-table checkpoints. Three sync strategies
