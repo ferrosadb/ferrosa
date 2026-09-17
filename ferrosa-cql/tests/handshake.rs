@@ -251,10 +251,6 @@ fn encode_startup_frame_v5() -> BytesMut {
 
 /// Read a v5 framed response: 6-byte LE header + CRC24 + payload + CRC32.
 /// Extracts the 9-byte envelope from inside the frame.
-///
-/// Retained for the future v5 modern-framing work; ferrosa currently caps at
-/// v4 so no test exchanges v5 frames.
-#[allow(dead_code)]
 async fn read_v5_frame(stream: &mut TcpStream) -> RawFrame {
     // Read 6-byte frame header.
     let mut frame_hdr = [0u8; 6];
@@ -290,10 +286,6 @@ async fn read_v5_frame(stream: &mut TcpStream) -> RawFrame {
 }
 
 /// Send a v5 framed message.
-///
-/// Retained for the future v5 modern-framing work; ferrosa currently caps at
-/// v4 so no test exchanges v5 frames.
-#[allow(dead_code)]
 async fn send_v5_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
     let header = FrameHeader {
         version: 0x05,
@@ -302,29 +294,8 @@ async fn send_v5_frame(stream: &mut TcpStream, opcode: Opcode, body: &[u8]) {
         opcode,
         length: body.len() as u32,
     };
-    let mut envelope = BytesMut::new();
-    header.encode(&mut envelope);
-    envelope.extend_from_slice(body);
-
-    let payload_len = envelope.len();
-
-    // Build 3-byte LE header: payload_length(17 bits) | isSelfContained(1 bit)
-    let header_bits: u32 = (payload_len as u32) | (1 << 17);
-    let h_bytes = header_bits.to_le_bytes();
-
-    // CRC24 of header bytes.
-    let crc24 = ferrosa_cql::frame::crc24_public(&h_bytes[..3]);
-    let crc24_bytes = crc24.to_le_bytes();
-
-    // CRC32 of payload.
-    let crc32 = ferrosa_cql::frame::crc32_public(&envelope);
-    let crc32_bytes = crc32.to_le_bytes();
-
     let mut buf = BytesMut::new();
-    buf.put_slice(&h_bytes[..3]);
-    buf.put_slice(&crc24_bytes[..3]);
-    buf.put_slice(&envelope);
-    buf.put_slice(&crc32_bytes[..4]);
+    ferrosa_cql::frame::encode_v5_frame(&header, body, &mut buf);
 
     stream.write_all(&buf).await.unwrap();
 }
@@ -426,6 +397,33 @@ fn assert_result(resp: &RawFrame) {
 }
 
 // ── Original handshake tests (un-ignored) ────────────────────────────────
+
+/// Native protocol v5 switches to checksummed framing immediately after the
+/// server sends AUTHENTICATE. Python-driver enables its segment decoder at that
+/// boundary; sending raw AUTH_SUCCESS makes it interpret response byte 0x85 as
+/// a segment header and raise CrcMismatchException.
+#[tokio::test]
+async fn v5_auth_response_and_auth_success_use_modern_framing() {
+    let (state, _dir) = setup_state();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    stream.write_all(&encode_startup_frame_v5()).await.unwrap();
+    let authenticate = read_frame(&mut stream).await;
+    assert_eq!(authenticate.opcode, Opcode::Authenticate);
+    assert_eq!(authenticate.header.version, 0x85);
+
+    let sasl = b"\0cassandra\0cassandra";
+    let mut body = BytesMut::new();
+    body.put_i32(sasl.len() as i32);
+    body.put_slice(sasl);
+    send_v5_frame(&mut stream, Opcode::AuthResponse, &body).await;
+
+    let success = read_v5_frame(&mut stream).await;
+    assert_eq!(success.opcode, Opcode::AuthSuccess);
+    assert_eq!(success.header.version, 0x85);
+}
 
 /// Bug: auth-enabled cluster times out for cdrs-tokio with
 /// `ferrosa_admin / ferrosa_admin` credentials. This is the documented

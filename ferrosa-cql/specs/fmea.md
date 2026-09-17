@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-09-05
+last_updated: 2026-09-16
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -12,6 +12,8 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+
+| CQL-21 | Auth-enabled v5 connections delayed modern framing until after `AUTH_SUCCESS`, while clients enable segment decoding immediately after the unframed `AUTHENTICATE` response. | Python-driver and cqlsh interpreted raw response byte `0x85` as a segment header and failed with `CrcMismatchException`; valid credentials could not connect on v5. | 8 | 10 | 2 | 160 → 8 | **Fixed:** the connection enables negotiated framing immediately after sending `AUTHENTICATE`, so both `AUTH_RESPONSE` and `AUTH_SUCCESS` are checksummed frames. Regression: `v5_auth_response_and_auth_success_use_modern_framing`. |
 
 | CQL-1 | LWT routed to Accord in standalone/pair mode where `peer_manager`/`accord_clock` are absent | `INSERT ... IF NOT EXISTS` / `IF <cond>` return `ServerError` ("not yet implemented") instead of executing | 8 | 5 | 2 | 80 | **Designed fail-loud** (p0-03): `route()` returns a clear error rather than a silent non-linearizable local path. Full coordinator driver tracked on `fix/p0-03b-accord-network`. Real functional gap, but observable. |
 | CQL-2 | `paging_state` cursor is opaque but **unsigned** — `PagingState::encode/decode` is a plain length-prefixed pk+ck+flag with no HMAC | A client can forge/tamper a paging token to resume at an arbitrary key, bypassing the original query's partition scope (cross-partition read / IDOR-style) | 7 | 4 | 7 | 196 → 24 | **Implemented.** `encode` appends `HMAC-SHA256(process_key, payload)`; `decode` verifies it constant-time (`Mac::verify_slice`) before parsing, rejecting any forged/tampered cursor. Key from `FERROSA_PAGING_HMAC_KEY` (64 hex) or a random per-process key (multi-node clusters must share it). Tests: `tampered_paging_state_is_rejected`, `unsigned_forged_paging_state_is_rejected`. |
