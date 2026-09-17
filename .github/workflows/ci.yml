@@ -45,7 +45,7 @@ jobs:
       - name: Check release binary path resolution
         run: python3 -m unittest tests.ci.test_resolve_release_bin_dir
       - name: Check CI cache workflow contract
-        run: python3 -m pytest -q tests/ci/test_ci_cache_workflow.py
+        run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
 
   no-memory-public:
     name: memory-public is NOT TO BE USED
