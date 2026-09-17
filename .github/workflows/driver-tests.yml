@@ -59,10 +59,7 @@ jobs:
         # local build (run-all.sh) if it never appears (e.g. fork PRs).
         continue-on-error: true
         run: |
-          # pull_request_target's github.sha is the default branch, not the PR
-          # checkout selected above. ci.yml publishes both merge and head tags;
-          # select the head tag here so the driver suite exercises this PR.
-          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node:${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa-test-node:${{ github.sha }}"
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || exit 0
           for i in $(seq 1 90); do
             if docker pull "$IMAGE" 2>/dev/null; then
