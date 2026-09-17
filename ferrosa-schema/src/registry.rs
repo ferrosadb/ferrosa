@@ -2,6 +2,11 @@
 //!
 //! Contains `SchemaSnapshot` (the immutable point-in-time view),
 //! `SchemaConfig` (bootstrap configuration), and `AuthMethod`.
+//! Correctness: restored roles replace bootstrap state, while normal replicated
+//! creates remain idempotent.
+//! Last revised: 2026-09-16.
+//! Last changed: added authoritative role restoration and cleared rotated
+//! bootstrap-password markers.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -493,6 +498,34 @@ impl Schema {
         }
         snap.roles.insert(role.name.clone(), role);
         self.inner.store(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Restore one authoritative role row from system_auth.roles.
+    ///
+    /// Unlike create_role_internal, restart recovery must replace a bootstrap
+    /// role that already exists in a fresh registry. Otherwise the built-in
+    /// cassandra hash and seeded ferrosa_admin hash win over a password an
+    /// operator rotated before the restart.
+    pub fn restore_role_internal(&self, role: RoleMetadata) -> crate::Result<()> {
+        let name = role.name.clone();
+        let cassandra_uses_default = name == "cassandra"
+            && role.salted_hash.as_deref().is_some_and(|hash| {
+                PasswordHasher::verify_password_any("cassandra", hash).unwrap_or(false)
+            });
+
+        let _lock = self.write_lock.lock().unwrap();
+        let mut snap = (**self.inner.load()).clone();
+        snap.roles.insert(name.clone(), role);
+        snap.version = Uuid::new_v4();
+        self.inner.store(Arc::new(snap));
+
+        let mut defaults = self.default_password_roles.lock().unwrap();
+        if cassandra_uses_default {
+            defaults.insert(name);
+        } else {
+            defaults.remove(&name);
+        }
         Ok(())
     }
 
@@ -1389,6 +1422,9 @@ impl Schema {
         }
         snap.version = Uuid::new_v4();
         self.inner.store(Arc::new(snap));
+        if password_changed {
+            self.default_password_roles.lock().unwrap().remove(name);
+        }
         self.emit_audit_with_actor(
             AuditEventKind::RoleAltered {
                 role: name.to_string(),
@@ -2760,6 +2796,29 @@ mod tests {
         assert!(
             !PasswordHasher::verify_password_any("oldpass", r.salted_hash.as_ref().unwrap())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn altering_bootstrap_password_clears_must_change_marker() {
+        let schema = test_schema();
+        schema
+            .alter_role(
+                "cassandra",
+                RoleUpdates {
+                    password: Some("rotated-cassandra".to_string()),
+                    ..Default::default()
+                },
+                &superuser_auth(),
+            )
+            .unwrap();
+
+        let auth = schema
+            .authenticate("cassandra", "rotated-cassandra")
+            .unwrap();
+        assert!(
+            !auth.must_change_password,
+            "a rotated bootstrap credential must not remain marked default"
         );
     }
 

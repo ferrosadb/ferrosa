@@ -70,6 +70,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+- `SystemTableLoader` reconstructs durable schema/auth state during cold
+  start. Persisted `system_auth.roles` rows replace fresh-process bootstrap
+  roles before missing seed roles are created, so rotated hashes survive both
+  graceful and commit-log recovery paths.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
   inspection/reset tooling.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
