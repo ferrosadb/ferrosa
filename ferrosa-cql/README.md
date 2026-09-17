@@ -136,7 +136,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Result encoding** (`result.rs`, `types.rs`) — CQL RESULT-frame encoder, the
   16-bit type system, and the re-exported `encode_value`/`decode_value` codec.
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the
-  MD5 of the query text, weight-bounded.
+  MD5 of the query text, weight-bounded. EXECUTE preserves the exact wire
+  encoding for scalar types that lack lossless parser literals (`date`, `time`,
+  `duration`, `decimal`, and arbitrarily large `varint`) until the value is
+  decoded against its prepared column type.
 - **Pagination** (`paging.rs`) — opaque `paging_state` cursor (pk + ck +
   remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Paged full-table
   scans resume WITHIN a wide partition (t_a0f922a3): the router decodes the

@@ -2766,20 +2766,14 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
         CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
         CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
         CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
-        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
-        CqlValue::Time(t) => Term::IntegerLiteral(*t),
-        CqlValue::Varint(big) => {
-            // Best-effort: try to fit into i64, otherwise render as string.
-            match i64::try_from(big) {
-                Ok(n) => Term::IntegerLiteral(n),
-                Err(_) => Term::StringLiteral(big.to_string()),
-            }
-        }
-        CqlValue::Decimal { .. } => {
-            // Decimals don't have a direct Term representation; use string.
-            Term::StringLiteral(format!("{v:?}"))
-        }
-        CqlValue::Duration { .. } => Term::StringLiteral(format!("{v:?}")),
+        // These types do not have parser literals that can represent every wire
+        // value without loss. Keep their exact CQL encoding and let
+        // `term_to_cql_value` decode it against the prepared column type.
+        CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Duration { .. } => Term::BlobLiteral(encode_value(v)),
         // Collections: encode back to blob bytes so the router re-decodes them.
         CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
         CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
@@ -4317,6 +4311,58 @@ mod tests {
             assert!(matches!(&i.values[2], Term::IntegerLiteral(42)));
         } else {
             panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn prepared_scalar_values_preserve_their_wire_types() {
+        let types = vec![
+            CqlType::Date,
+            CqlType::Time,
+            CqlType::Duration,
+            CqlType::Decimal,
+            CqlType::Varint,
+        ];
+        let values = vec![
+            CqlValue::Date((1u32 << 31) + 19_981),
+            CqlValue::Time(45_296_123_456_789),
+            CqlValue::Duration {
+                months: 14,
+                days: 3,
+                nanos: 4_005_006_007,
+            },
+            CqlValue::Decimal {
+                scale: 9,
+                unscaled: num_bigint::BigInt::from(123_456_789_012_345_678i64),
+            },
+            CqlValue::Varint(
+                num_bigint::BigInt::parse_bytes(b"123456789012345678901234567890", 10).unwrap(),
+            ),
+        ];
+        let plan = make_plan(
+            "INSERT INTO ks.t (d, t, dur, dec, vi) VALUES (?, ?, ?, ?, ?)",
+            vec![
+                ("d", CqlType::Date),
+                ("t", CqlType::Time),
+                ("dur", CqlType::Duration),
+                ("dec", CqlType::Decimal),
+                ("vi", CqlType::Varint),
+            ],
+        );
+        let encoded: Vec<Vec<u8>> = values.iter().map(encode_value).collect();
+        let encoded_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+
+        let statement = substitute_bound_values(&plan, &encode_values(&encoded_refs), 4).unwrap();
+        let Statement::Insert(insert) = statement else {
+            panic!("expected INSERT");
+        };
+
+        for ((term, cql_type), expected) in insert.values.iter().zip(&types).zip(&values) {
+            let actual = bridge::term_to_cql_value(term, cql_type).unwrap();
+            assert_eq!(
+                &actual, expected,
+                "prepared {cql_type:?} changed type or value"
+            );
         }
     }
 
