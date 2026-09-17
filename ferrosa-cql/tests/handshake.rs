@@ -404,7 +404,7 @@ fn assert_result(resp: &RawFrame) {
 /// a segment header and raise CrcMismatchException.
 #[tokio::test]
 async fn v5_auth_response_and_auth_success_use_modern_framing() {
-    let (state, _dir) = setup_state();
+    let (state, _dir) = setup_state_with_seeded_roles();
     let server = CqlServer::new(test_config(false), state);
     let addr = server.start_background().await.unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -414,7 +414,7 @@ async fn v5_auth_response_and_auth_success_use_modern_framing() {
     assert_eq!(authenticate.opcode, Opcode::Authenticate);
     assert_eq!(authenticate.header.version, 0x85);
 
-    let sasl = b"\0cassandra\0cassandra";
+    let sasl = b"\0ferrosa_admin\0ferrosa_admin";
     let mut body = BytesMut::new();
     body.put_i32(sasl.len() as i32);
     body.put_slice(sasl);
