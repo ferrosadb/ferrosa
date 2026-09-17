@@ -375,7 +375,7 @@ async fn connect_and_authenticate(addr: std::net::SocketAddr) -> TcpStream {
     let resp = read_frame(&mut stream).await;
     assert_eq!(resp.opcode, Opcode::Authenticate);
 
-    let auth = encode_auth_response("cassandra", "cassandra");
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
     stream.write_all(&auth).await.unwrap();
     let resp = read_frame(&mut stream).await;
     assert_eq!(resp.opcode, Opcode::AuthSuccess);
@@ -750,7 +750,7 @@ async fn seeded_ferrosa_user_can_authenticate_over_v4_tcp() {
 
 #[tokio::test]
 async fn startup_then_authenticate_then_auth_success() {
-    let (state, _dir) = setup_state();
+    let (state, _dir) = setup_state_with_seeded_roles();
     let server = CqlServer::new(test_config(false), state);
     let addr = server.start_background().await.unwrap();
 
@@ -765,7 +765,7 @@ async fn startup_then_authenticate_then_auth_success() {
     assert_eq!(resp.opcode, Opcode::Authenticate);
 
     // Send AUTH_RESPONSE with valid credentials
-    let auth = encode_auth_response("cassandra", "cassandra");
+    let auth = encode_auth_response("ferrosa_admin", "ferrosa_admin");
     stream.write_all(&auth).await.unwrap();
 
     // Read AUTH_SUCCESS

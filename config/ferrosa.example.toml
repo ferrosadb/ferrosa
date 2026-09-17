@@ -109,6 +109,9 @@ bind = "127.0.0.1:9090"
 #
 # Roles and password hashes are stored INSIDE ferrosa, in the system_auth
 # keyspace (Cassandra-compatible) — there is NO external auth.yaml file.
+# The historical cassandra/cassandra superuser is not created. To opt into a
+# legacy `cassandra` compatibility account, provide a non-default password via
+# FERROSA_SUPERUSER_PASSWORD before the first start.
 #
 # SEED CREDENTIALS
 # ----------------

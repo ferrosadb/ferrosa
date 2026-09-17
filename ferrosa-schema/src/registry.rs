@@ -3,10 +3,10 @@
 //! Contains `SchemaSnapshot` (the immutable point-in-time view),
 //! `SchemaConfig` (bootstrap configuration), and `AuthMethod`.
 //! Correctness: restored roles replace bootstrap state, while normal replicated
-//! creates remain idempotent.
-//! Last revised: 2026-09-16.
-//! Last changed: added authoritative role restoration and cleared rotated
-//! bootstrap-password markers.
+//! creates remain idempotent. The legacy `cassandra` superuser is opt-in and is
+//! never created with an implicit password.
+//! Last revised: 2026-09-17.
+//! Last changed: made the legacy compatibility superuser explicit-secret only.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -148,10 +148,10 @@ pub struct Schema {
 impl Schema {
     /// Bootstrap a new schema registry from the given configuration.
     ///
-    /// Creates the default `cassandra` superuser role. If the secrets
-    /// provider supplies a `superuser_password`, that password is hashed.
-    /// Otherwise the default password `"cassandra"` is used and the role
-    /// is flagged as must-change.
+    /// Creates the legacy `cassandra` superuser role only when the secrets
+    /// provider supplies an explicit `superuser_password`. Fresh installs use
+    /// the separately bootstrapped `ferrosa_admin` role and never expose the
+    /// historical `cassandra/cassandra` credential.
     pub fn new(config: SchemaConfig) -> crate::Result<Self> {
         let mut snapshot = SchemaSnapshot::new();
 
@@ -161,26 +161,22 @@ impl Schema {
             .get_secret("superuser_password")
             .unwrap_or(None);
 
-        let (password, is_default) = match superuser_password {
-            Some(pw) => (pw, false),
-            None => ("cassandra".to_string(), true),
-        };
-
-        // Hash the password and derive the SCRAM verifier (D4) from the same
-        // cleartext so the bootstrap superuser can authenticate over Postgres.
-        let salted_hash = config.hasher.hash_password(&password)?;
-        let scram = crate::auth::scram::derive_with_random_salt(&password);
-
-        // Create the cassandra superuser role
-        let role = RoleMetadata {
-            name: "cassandra".to_string(),
-            is_superuser: true,
-            can_login: true,
-            salted_hash: Some(salted_hash),
-            member_of: HashSet::new(),
-            scram: Some(scram),
-        };
-        snapshot.roles.insert("cassandra".to_string(), role);
+        if let Some(password) = superuser_password {
+            // Hash the password and derive the SCRAM verifier (D4) from the same
+            // cleartext so an explicitly enabled compatibility superuser can
+            // authenticate over both CQL and Postgres.
+            let salted_hash = config.hasher.hash_password(&password)?;
+            let scram = crate::auth::scram::derive_with_random_salt(&password);
+            let role = RoleMetadata {
+                name: "cassandra".to_string(),
+                is_superuser: true,
+                can_login: true,
+                salted_hash: Some(salted_hash),
+                member_of: HashSet::new(),
+                scram: Some(scram),
+            };
+            snapshot.roles.insert("cassandra".to_string(), role);
+        }
 
         // Bootstrap system keyspaces so they are visible in the schema snapshot.
         //
@@ -220,11 +216,6 @@ impl Schema {
             },
         );
 
-        let mut default_password_roles = HashSet::new();
-        if is_default {
-            default_password_roles.insert("cassandra".to_string());
-        }
-
         let schema = Self {
             inner: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             write_lock: Mutex::new(()),
@@ -232,7 +223,7 @@ impl Schema {
             password_policy: config.password_policy,
             rate_limiter: AuthRateLimiter::new(config.rate_limit),
             audit_sink: config.audit_sink,
-            default_password_roles: Mutex::new(default_password_roles),
+            default_password_roles: Mutex::new(HashSet::new()),
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
         };
 
@@ -247,10 +238,6 @@ impl Schema {
 
         // Emit bootstrap audit event
         schema.emit_audit(AuditEventKind::SchemaBootstrapped);
-
-        if is_default {
-            schema.emit_audit(AuditEventKind::SuperuserPasswordMustChange);
-        }
 
         Ok(schema)
     }
@@ -1855,6 +1842,17 @@ mod tests {
     /// Mutex to serialize tests that manipulate the FERROSA_SUPERUSER_PASSWORD env var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    struct FixedSuperuserSecret(&'static str);
+
+    impl SecretsProvider for FixedSuperuserSecret {
+        fn get_secret(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<String>, crate::secrets::SecretsError> {
+            Ok((key == "superuser_password").then(|| self.0.to_string()))
+        }
+    }
+
     fn test_config() -> SchemaConfig {
         SchemaConfig {
             hasher: PasswordHasher::Bcrypt { cost: 4 },
@@ -1882,6 +1880,15 @@ mod tests {
         }
         Schema::new(SchemaConfig {
             audit_sink: Box::new(sink),
+            ..test_config()
+        })
+        .unwrap()
+    }
+
+    fn test_schema_with_explicit_legacy_superuser(sink: Arc<TestAuditSink>) -> Schema {
+        Schema::new(SchemaConfig {
+            audit_sink: Box::new(sink),
+            secrets: Box::new(FixedSuperuserSecret("configured-cassandra")),
             ..test_config()
         })
         .unwrap()
@@ -1943,25 +1950,23 @@ mod tests {
     // ---- Task 17 tests ----
 
     #[test]
-    fn schema_new_creates_default_superuser() {
+    fn schema_new_does_not_create_legacy_superuser_without_secret() {
         let schema = test_schema();
         let snap = schema.snapshot();
-        let role = snap.roles.get("cassandra").expect("cassandra role exists");
-        assert!(role.is_superuser);
-        assert!(role.can_login);
-        assert!(role.salted_hash.is_some());
+        assert!(
+            !snap.roles.contains_key("cassandra"),
+            "the legacy cassandra superuser must require an explicit configured password"
+        );
+        assert!(schema.authenticate("cassandra", "cassandra").is_err());
     }
 
     #[test]
-    fn schema_new_with_env_password() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("FERROSA_SUPERUSER_PASSWORD", "s3cure!Pass");
-        }
-        let schema = Schema::new(test_config()).unwrap();
-        unsafe {
-            std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
-        }
+    fn schema_new_with_configured_legacy_password() {
+        let schema = Schema::new(SchemaConfig {
+            secrets: Box::new(FixedSuperuserSecret("s3cure!Pass")),
+            ..test_config()
+        })
+        .unwrap();
 
         let snap = schema.snapshot();
         let role = snap.roles.get("cassandra").expect("cassandra role exists");
@@ -1974,11 +1979,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_new_without_env_password_marks_must_change() {
+    fn schema_new_without_env_password_has_no_default_password_marker() {
         let schema = test_schema();
-        // The cassandra role should be in the default_password_roles set
         let defaults = schema.default_password_roles.lock().unwrap();
-        assert!(defaults.contains("cassandra"));
+        assert!(defaults.is_empty());
     }
 
     #[test]
@@ -1996,11 +2000,11 @@ mod tests {
         let _schema = test_schema_with_sink(sink.clone());
 
         let events = sink.events();
-        // Should have SchemaBootstrapped and SuperuserPasswordMustChange
+        // Bootstrap remains auditable, but there is no implicit password to rotate.
         assert!(events
             .iter()
             .any(|e| matches!(&e.event, AuditEventKind::SchemaBootstrapped)));
-        assert!(events
+        assert!(!events
             .iter()
             .any(|e| matches!(&e.event, AuditEventKind::SuperuserPasswordMustChange)));
     }
@@ -2009,12 +2013,13 @@ mod tests {
 
     #[test]
     fn authenticate_valid_credentials() {
-        let schema = test_schema();
-        // Default password is "cassandra"
-        let ctx = schema.authenticate("cassandra", "cassandra").unwrap();
+        let schema = test_schema_with_explicit_legacy_superuser(Arc::new(TestAuditSink::new()));
+        let ctx = schema
+            .authenticate("cassandra", "configured-cassandra")
+            .unwrap();
         assert_eq!(ctx.role, "cassandra");
         assert!(ctx.is_superuser);
-        assert!(ctx.must_change_password); // default password
+        assert!(!ctx.must_change_password);
     }
 
     #[test]
@@ -2043,10 +2048,12 @@ mod tests {
     #[test]
     fn authenticate_emits_success_audit() {
         let sink = Arc::new(TestAuditSink::new());
-        let schema = test_schema_with_sink(sink.clone());
+        let schema = test_schema_with_explicit_legacy_superuser(sink.clone());
 
         sink.clear(); // Clear bootstrap events
-        let _ctx = schema.authenticate("cassandra", "cassandra").unwrap();
+        let _ctx = schema
+            .authenticate("cassandra", "configured-cassandra")
+            .unwrap();
 
         let events = sink.events();
         assert!(events.iter().any(|e| matches!(
@@ -2800,8 +2807,8 @@ mod tests {
     }
 
     #[test]
-    fn altering_bootstrap_password_clears_must_change_marker() {
-        let schema = test_schema();
+    fn altering_explicit_legacy_password_keeps_no_must_change_marker() {
+        let schema = test_schema_with_explicit_legacy_superuser(Arc::new(TestAuditSink::new()));
         schema
             .alter_role(
                 "cassandra",

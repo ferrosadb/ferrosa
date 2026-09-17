@@ -155,7 +155,7 @@ fn storage_config(dir: &TempDir) -> StorageEngineConfig {
 
 fn superuser() -> AuthContext {
     AuthContext {
-        role: "cassandra".to_string(),
+        role: "ferrosa_admin".to_string(),
         is_superuser: true,
         must_change_password: false,
     }
@@ -191,7 +191,7 @@ fn create_graph_schema(schema: &Schema) {
         .unwrap();
     schema
         .grant(
-            "cassandra",
+            "ferrosa_admin",
             &Resource::Keyspace(KEYSPACE.to_string()),
             HashSet::from([
                 Permission::Select,
@@ -368,6 +368,7 @@ fn fixture(n: usize, with_edges: bool) -> Fixture {
         })
         .unwrap(),
     );
+    ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
     create_graph_schema(&schema);
     register_storage_tables(&storage);
 

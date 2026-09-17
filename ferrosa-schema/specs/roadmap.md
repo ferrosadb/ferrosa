@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-schema
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-09-17
 ---
 
 # ferrosa-schema — Roadmap
@@ -20,11 +20,11 @@ exist in the source — the gaps below come from code review, not grep.
   TLS config into `ProductionCheckConfig` so a `FERROSA_MODE=production` node
   with TLS disabled actually fails the gate. This is a silent safety no-op today.
 
-- **Close the seed-credential gap** (FMEA SC-1). Extend
-  `validate_production_requirements` (or `auth::bootstrap`) to either generate
-  random passwords for `ferrosa_admin` / `ferrosa_user` in production, or flag
-  them as a `ProductionViolation` when they still equal the default. The
-  superuser path is half-covered; the seed roles are not covered at all.
+- **Keep development seed credentials confined to development** (FMEA SC-1).
+  Production now generates random passwords, and the legacy `cassandra` role
+  requires an explicit secret. The remaining risk is operational: a development
+  node still uses documented `ferrosa_admin` / `ferrosa_user` credentials and
+  must not be exposed to untrusted networks.
 
 ## Next
 
