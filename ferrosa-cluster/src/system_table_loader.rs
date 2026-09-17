@@ -635,8 +635,8 @@ mod tests {
 
         let schema = test_schema();
         assert!(
-            schema.authenticate("cassandra", "cassandra").is_ok(),
-            "precondition: a fresh registry carries the bootstrap credential"
+            !schema.snapshot().roles.contains_key("cassandra"),
+            "precondition: the legacy role is absent without an explicit secret"
         );
 
         let count = SystemTableLoader::new(engine)

@@ -65,6 +65,7 @@ pub fn standalone_for_test(data_dir: &Path) -> Arc<SharedState> {
         })
         .unwrap(),
     );
+    ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
     let node_config = Arc::new(NodeConfig {
         cluster_name: "test".into(),
         data_center: "dc1".into(),

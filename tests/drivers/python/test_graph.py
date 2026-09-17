@@ -92,7 +92,7 @@ class TestErrors:
             data="this is not json",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Basic Y2Fzc2FuZHJhOmNhc3NhbmRyYQ==",  # cassandra:cassandra
+                "Authorization": "Basic ZmVycm9zYV9hZG1pbjpmZXJyb3NhX2FkbWlu",
             },
             timeout=10,
         )
@@ -106,7 +106,7 @@ class TestErrors:
             f"{BASE_URL}/graph/query",
             json={"query": "MATCH (n) RETURN n"},  # missing keyspace
             headers={
-                "Authorization": "Basic Y2Fzc2FuZHJhOmNhc3NhbmRyYQ==",
+                "Authorization": "Basic ZmVycm9zYV9hZG1pbjpmZXJyb3NhX2FkbWlu",
             },
             timeout=10,
         )
@@ -119,7 +119,7 @@ class TestErrors:
             data="not json",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Basic Y2Fzc2FuZHJhOmNhc3NhbmRyYQ==",
+                "Authorization": "Basic ZmVycm9zYV9hZG1pbjpmZXJyb3NhX2FkbWlu",
             },
             timeout=10,
         )
@@ -132,12 +132,12 @@ class TestErrors:
 class TestQueryEndpoints:
     """Smoke-test query and explain with Basic auth.
 
-    These use the default cassandra:cassandra credentials.  The graph
+    These use the development ferrosa_admin credentials. The graph
     engine may return errors if no graph keyspace is configured, but the
     HTTP layer should still process the request (not 401/400).
     """
 
-    AUTH_HEADER = "Basic Y2Fzc2FuZHJhOmNhc3NhbmRyYQ=="  # cassandra:cassandra
+    AUTH_HEADER = "Basic ZmVycm9zYV9hZG1pbjpmZXJyb3NhX2FkbWlu"
 
     def test_query_endpoint_accepts_request(self):
         """POST /graph/query with valid auth and body is processed."""

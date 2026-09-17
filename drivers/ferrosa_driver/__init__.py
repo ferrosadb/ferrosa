@@ -16,7 +16,7 @@ over a dedicated connection via :func:`subscribe` (or the added
 ``session.subscribe(...)``), yielding each change in real time:
 
     cluster = Cluster(["127.0.0.1"], port=9042,
-                      auth_provider=PlainTextAuthProvider("cassandra", "cassandra"))
+                      auth_provider=PlainTextAuthProvider("ferrosa_admin", "ferrosa_admin"))
     session = cluster.connect()
     session.execute("INSERT INTO ks.t (id, v) VALUES (1, 'a')")   # standard path
     with session.subscribe("SUBSCRIBE SELECT * FROM ks.t ON COMMITTED") as stream:

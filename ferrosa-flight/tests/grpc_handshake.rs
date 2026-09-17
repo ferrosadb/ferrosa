@@ -68,11 +68,11 @@ async fn full_grpc_handshake_then_do_get() {
         .await
         .expect("connect to flight server");
 
-    // Handshake with the seeded default superuser -> bearer token.
+    // Handshake with the seeded Ferrosa administrator -> bearer token.
     let handshake = stream::once(async {
         HandshakeRequest {
             protocol_version: 0,
-            payload: b"cassandra\0cassandra".to_vec().into(),
+            payload: b"ferrosa_admin\0ferrosa_admin".to_vec().into(),
         }
     });
     let mut hs_resp = client
@@ -148,7 +148,7 @@ async fn do_put_writes_rows_then_do_get_reads_them_back() {
     let handshake = stream::once(async {
         HandshakeRequest {
             protocol_version: 0,
-            payload: b"cassandra\0cassandra".to_vec().into(),
+            payload: b"ferrosa_admin\0ferrosa_admin".to_vec().into(),
         }
     });
     let token = String::from_utf8(

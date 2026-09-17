@@ -3486,6 +3486,7 @@ mod tests {
             mode: DeploymentMode::Development,
         })
         .unwrap();
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
         Arc::new(schema)
     }
 
@@ -3750,8 +3751,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 authenticate_off_runtime_observed(
                     s,
-                    "cassandra".into(),
-                    "cassandra".into(),
+                    "ferrosa_admin".into(),
+                    "ferrosa_admin".into(),
                     TaskPool::current("test-auth"),
                     move || tx.send(std::thread::current().id()).unwrap(),
                 )
@@ -3764,7 +3765,7 @@ mod tests {
             let res = h.await.unwrap();
             assert!(
                 res.is_ok(),
-                "auth should succeed against the default cassandra user: {res:?}"
+                "auth should succeed against the seeded Ferrosa administrator: {res:?}"
             );
         }
 
@@ -3786,7 +3787,7 @@ mod tests {
     async fn authenticate_off_runtime_returns_failure_for_bad_password() {
         let schema = build_minimal_schema_for_test();
         let result =
-            authenticate_off_runtime(schema, "cassandra".into(), "wrong-password".into()).await;
+            authenticate_off_runtime(schema, "ferrosa_admin".into(), "wrong-password".into()).await;
         assert!(matches!(
             result,
             Err(ferrosa_schema::SchemaError::AuthenticationFailed)

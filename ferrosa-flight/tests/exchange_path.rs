@@ -92,7 +92,7 @@ async fn do_exchange_upserts_each_batch_and_acks() {
     let handshake = stream::once(async {
         HandshakeRequest {
             protocol_version: 0,
-            payload: b"cassandra\0cassandra".to_vec().into(),
+            payload: b"ferrosa_admin\0ferrosa_admin".to_vec().into(),
         }
     });
     let token = String::from_utf8(

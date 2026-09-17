@@ -45,6 +45,10 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   or `argon2id`) with auto-rehash on login, `PasswordPolicy` (incl.
   `iso27001()`), per-username `AuthRateLimiter`, and SCRAM-SHA-256 verifier
   derivation (`scram`, decision D4) for Postgres login.
+  Fresh installs do not create the historical `cassandra/cassandra` account.
+  A legacy `cassandra` superuser is created only when the secrets provider
+  supplies an explicit `superuser_password` (`FERROSA_SUPERUSER_PASSWORD` for
+  `EnvSecretsProvider`); ordinary installs use the seeded `ferrosa_admin` role.
   Restart recovery uses `restore_role_internal` to replace fresh-process
   bootstrap credentials with authoritative rows from `system_auth.roles`;
   rotating the built-in password also clears its must-change marker.
