@@ -153,10 +153,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   live memtable. Replaying an already-registered declaration is a no-op only
   when its column and index type agree; it preserves unflushed memtable
   postings (including phonetic postings) instead of replacing the live index.
-  A newly registered scalar index streams rows already present in the active
-  or flushing memtable into its `MemtableIndex` before publication; CREATE
-  INDEX therefore covers pre-existing unflushed rows without a query-time
-  full-scan fallback or a temporary row collection.
+  A newly registered scalar or vector index streams rows already present in the
+  active or flushing memtable into its in-memory index before publication;
+  CREATE INDEX therefore covers pre-existing unflushed rows without exposing
+  an empty index to the query planner or collecting a temporary fallback scan.
   `update_schema` (the ALTER TABLE apply) remaps every positional index
   declaration through the old schema's column name, because adding a column
   that sorts before an indexed column shifts the indexed column's cell
@@ -181,9 +181,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   when a replicated `CREATE INDEX` arrives. Before it was shared, only the CQL
   router built indexes, so every node except the one whose session ran the DDL
   had the index in schema and nothing in the engine (CL-18). It returns
-  `Ok(false)`, with a log line saying why, for the kinds it deliberately does
-  not build here: a vector index (needs its dimension and a dedicated rebuild)
-  and a non-scalar index on a key column.
+  Vector registrations recover their dimension from the target column type and
+  their HNSW/HVQ method from the persisted options. It returns `Ok(false)`, with
+  a log line saying why, for a non-scalar index on a key column or a vector
+  target whose declared type carries no dimension.
   A global index read (`read_by_index_each`) of an index the table does not
   declare returns an error naming the index, never zero rows: the planner
   chooses indexes from the CQL schema, so a consult of an undeclared index
