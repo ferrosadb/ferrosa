@@ -12,6 +12,10 @@ real backlog is structural and security-shaped.
 
 ## Recently addressed
 
+- **Decodable system-schema aggregates (CQL-20, 2026-09-17).**
+  `SELECT count(*) FROM system_schema.tables` now emits one bigint column and
+  one aggregate row through the shared system-table encoder; ordinary projected
+  reads retain their exact requested column shape.
 - **Full-text index selection with shared columns (t_bf1aa16c / CQL-18).**
   `fts_match` now selects only a registered full-text index, so an earlier
   phonetic or scalar index on the same column cannot produce a false empty
