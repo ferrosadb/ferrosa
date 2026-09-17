@@ -1,8 +1,8 @@
 //! Module: Per-connection CQL native-protocol handler.
 //! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
 //! substitution preserve the CQL wire contract for every accepted opcode.
-//! Last revised: 2026-08-27
-//! Last changed: Validate and substitute prepared SELECT LIMIT markers before routing.
+//! Last revised: 2026-09-16
+//! Last changed: Begin v5 framing after AUTHENTICATE on auth-enabled connections.
 //!
 //! Per-connection CQL protocol handler.
 //!
@@ -742,8 +742,14 @@ pub(crate) async fn handle_connection<S>(
                             break;
                         }
 
-                        // After READY or AUTH_SUCCESS, enable post-handshake features.
-                        if opcode == Opcode::Ready || opcode == Opcode::AuthSuccess {
+                        // V5 framing begins immediately after the response to
+                        // STARTUP: READY when auth is disabled, AUTHENTICATE
+                        // when auth is enabled. AUTH_RESPONSE and AUTH_SUCCESS
+                        // therefore already travel inside checksummed frames.
+                        if matches!(
+                            opcode,
+                            Opcode::Ready | Opcode::Authenticate | Opcode::AuthSuccess
+                        ) {
                             if let Some(compression) = pending_compression.take() {
                                 debug!(
                                     "enabling {} compression for {peer}",
@@ -751,11 +757,9 @@ pub(crate) async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // For native protocol v5, switch to the modern framed
-                            // transport after the STARTUP/READY exchange. The
-                            // handshake itself (STARTUP + READY/ERROR) still uses
-                            // the legacy 9-byte envelope so the version can be
-                            // agreed before framing is active.
+                            // STARTUP and its direct response use legacy
+                            // envelopes. Every later v5 message uses modern
+                            // framing, including the authentication exchange.
                             if client_protocol_version == VERSION_REQUEST {
                                 debug!("enabling v5 modern framing for {peer}");
                                 framed.codec_mut().enable_v5_framing();
