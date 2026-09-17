@@ -116,7 +116,7 @@ fn test_role(name: &str) -> RoleMetadata {
 fn full_workflow_create_role_auth_keyspace_table_query() {
     let sink = Arc::new(TestAuditSink::new());
     let schema = test_schema_with_sink(sink.clone());
-    let auth = schema.authenticate("cassandra", "cassandra").unwrap();
+    let auth = superuser_auth();
     assert!(auth.is_superuser);
 
     // Create a keyspace

@@ -138,7 +138,7 @@ def bolt_driver(fraud_graph):
     from neo4j import GraphDatabase
     driver = GraphDatabase.driver(
         f"bolt://{FERROSA_HOST}:{FERROSA_BOLT_PORT}",
-        auth=("cassandra", "cassandra"),
+        auth=("ferrosa_admin", "ferrosa_admin"),
         database=fraud_graph,
     )
     yield driver

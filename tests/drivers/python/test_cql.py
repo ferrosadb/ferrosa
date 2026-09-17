@@ -8,11 +8,13 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 from cassandra.cluster import Cluster
 from cassandra.policies import RoundRobinPolicy
 from cassandra.query import BatchStatement, BatchType, SimpleStatement
+from cassandra.util import Date, Duration, Time
 
 FERROSA_HOST = os.environ.get("FERROSA_HOST", "127.0.0.1")
 FERROSA_CQL_PORT = int(os.environ.get("FERROSA_CQL_PORT", "9042"))
@@ -104,6 +106,21 @@ class TestDDL:
                 ts timestamp,
                 data text,
                 PRIMARY KEY (user_id, ts)
+            )
+            """
+        )
+
+    def test_create_prepared_scalar_table(self, session):
+        session.set_keyspace(KEYSPACE)
+        session.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prepared_scalars (
+                id int PRIMARY KEY,
+                d date,
+                t time,
+                dur duration,
+                dec decimal,
+                vi varint
             )
             """
         )
@@ -214,6 +231,26 @@ class TestPrepared:
         rows = list(session.execute(prepared, (1,)))
         assert len(rows) == 1
         assert rows[0].name == "Alice"
+
+    def test_prepare_exact_scalar_wire_types(self, session):
+        values = (
+            Date("2024-09-16"),
+            Time("12:34:56.123456789"),
+            Duration(months=14, days=3, nanoseconds=4_005_006_007),
+            Decimal("123456789.012345678"),
+            123456789012345678901234567890,
+        )
+        prepared = session.prepare(
+            "INSERT INTO prepared_scalars (id, d, t, dur, dec, vi) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        session.execute(prepared, (1, *values))
+
+        row = session.execute(
+            "SELECT d, t, dur, dec, vi FROM prepared_scalars WHERE id = 1"
+        ).one()
+        assert row is not None
+        assert (row.d, row.t, row.dur, row.dec, row.vi) == values
 
 
 # ---- UDT (User-Defined Type) --------------------------------------------

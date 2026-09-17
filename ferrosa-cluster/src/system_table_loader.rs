@@ -3,13 +3,20 @@
 //! [`SystemTableLoader`] reads `system_schema.*` and `system_auth.*` tables
 //! to reconstruct partial schema state. The caller validates this against
 //! Raft state (Raft wins on conflict).
+//! Correctness: persisted system rows are decoded fail-loud and replayed before
+//! callers create missing bootstrap state.
+//! Last revised: 2026-09-16.
+//! Last changed: restored authoritative role hashes from system_auth.roles.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use ferrosa_common::Error as FerrosaError;
-use ferrosa_schema::system::persistence::PERMISSIONS_COL_PERMISSIONS;
+use ferrosa_schema::system::persistence::{
+    PERMISSIONS_COL_PERMISSIONS, ROLES_COL_CAN_LOGIN, ROLES_COL_IS_SUPERUSER,
+    ROLES_COL_SALTED_HASH, ROLES_COL_SCRAM,
+};
 use ferrosa_schema::{
-    GrantEntry, Permission, Resource, Schema, UserFunctionMetadata, UserTypeMetadata,
+    GrantEntry, Permission, Resource, RoleMetadata, Schema, UserFunctionMetadata, UserTypeMetadata,
 };
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -39,6 +46,94 @@ impl SystemTableLoader {
             .filter_map(|p| String::from_utf8(p.key.key.as_bytes().to_vec()).ok())
             .collect();
         Ok(names)
+    }
+
+    /// Load authoritative role records from system_auth.roles.
+    pub fn load_roles(&self) -> ferrosa_common::Result<Vec<RoleMetadata>> {
+        let tid = TableId::new("system_auth", "roles");
+        let partitions = self.engine.read_range(&tid, None, None, 10_000)?;
+        let mut roles = Vec::new();
+
+        for partition in partitions {
+            if !partition.deletion.is_live() {
+                continue;
+            }
+            let name = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
+                FerrosaError::InvalidData(format!("invalid roles role key utf8: {e}"))
+            })?;
+            let Some(row) = partition
+                .rows
+                .into_iter()
+                .find(|row| row.deletion.is_live())
+            else {
+                continue;
+            };
+            let mut cells: HashMap<_, _> = row.cells.into_iter().collect();
+            let bool_cell = |column, field: &str| -> ferrosa_common::Result<bool> {
+                let bytes = cells
+                    .get(&column)
+                    .and_then(|cell| cell.value.as_deref())
+                    .ok_or_else(|| {
+                        FerrosaError::InvalidData(format!(
+                            "role {name} is missing required {field}"
+                        ))
+                    })?;
+                match bytes {
+                    [0] => Ok(false),
+                    [1] => Ok(true),
+                    _ => Err(FerrosaError::InvalidData(format!(
+                        "role {name} has invalid {field} encoding"
+                    ))),
+                }
+            };
+            let is_superuser = bool_cell(ROLES_COL_IS_SUPERUSER, "is_superuser")?;
+            let can_login = bool_cell(ROLES_COL_CAN_LOGIN, "can_login")?;
+            let salted_hash = cells
+                .remove(&ROLES_COL_SALTED_HASH)
+                .and_then(|cell| cell.value)
+                .map(|bytes| {
+                    String::from_utf8(bytes).map_err(|e| {
+                        FerrosaError::InvalidData(format!(
+                            "role {name} has invalid salted_hash utf8: {e}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let scram = cells
+                .remove(&ROLES_COL_SCRAM)
+                .and_then(|cell| cell.value)
+                .map(|bytes| {
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        FerrosaError::InvalidData(format!(
+                            "role {name} has invalid SCRAM verifier: {e}"
+                        ))
+                    })
+                })
+                .transpose()?;
+
+            roles.push(RoleMetadata {
+                name,
+                is_superuser,
+                can_login,
+                salted_hash,
+                member_of: Default::default(),
+                scram,
+            });
+        }
+
+        Ok(roles)
+    }
+
+    /// Replace fresh-process bootstrap roles with persisted role records.
+    pub fn replay_roles_into_schema(&self, schema: &Schema) -> ferrosa_common::Result<usize> {
+        let roles = self.load_roles()?;
+        let count = roles.len();
+        for role in roles {
+            schema.restore_role_internal(role).map_err(|e| {
+                FerrosaError::InvalidData(format!("failed to replay persisted role: {e}"))
+            })?;
+        }
+        Ok(count)
     }
 
     /// Load persisted grants from `system_auth.role_permissions`.
@@ -511,6 +606,69 @@ mod tests {
         );
         assert!(grants[0].permissions.contains(&Permission::Modify));
         assert!(grants[0].permissions.contains(&Permission::Select));
+    }
+
+    #[test]
+    fn replay_roles_replaces_bootstrap_credentials_with_persisted_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let persisted_hash = PasswordHasher::Bcrypt { cost: 4 }
+            .hash_password("rotated-password")
+            .unwrap();
+        let persisted_scram =
+            ferrosa_schema::auth::scram::derive_with_random_salt("rotated-password");
+        SystemTableWriter::new(Arc::clone(&engine))
+            .apply(
+                ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(
+                    RoleMetadata {
+                        name: "cassandra".to_string(),
+                        is_superuser: true,
+                        can_login: true,
+                        salted_hash: Some(persisted_hash.clone()),
+                        member_of: Default::default(),
+                        scram: Some(persisted_scram.clone()),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let schema = test_schema();
+        assert!(
+            !schema.snapshot().roles.contains_key("cassandra"),
+            "precondition: the legacy role is absent without an explicit secret"
+        );
+
+        let count = SystemTableLoader::new(engine)
+            .replay_roles_into_schema(&schema)
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert!(
+            schema.authenticate("cassandra", "cassandra").is_err(),
+            "restart replay must replace the built-in credential"
+        );
+        assert!(
+            schema.authenticate("cassandra", "rotated-password").is_ok(),
+            "the persisted rotated credential must authenticate after replay"
+        );
+        assert_eq!(
+            schema
+                .snapshot()
+                .roles
+                .get("cassandra")
+                .and_then(|role| role.salted_hash.as_deref()),
+            Some(persisted_hash.as_str())
+        );
+        assert_eq!(
+            schema
+                .snapshot()
+                .roles
+                .get("cassandra")
+                .and_then(|role| role.scram.as_ref()),
+            Some(&persisted_scram),
+            "Postgres verifier must survive role replay"
+        );
     }
 
     #[test]

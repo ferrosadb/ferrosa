@@ -75,6 +75,11 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **Vector CREATE INDEX live-row backfill (2026-09-17).** Dynamic HNSW and HVQ
+  registration now indexes rows in the active and flushing memtables before the
+  new view is published, so switching ANN execution to the new index cannot
+  turn a correct pre-index query into an empty result.
+
 - **Crash-safe schema snapshot ownership (ST-17, 2026-08-27).** The engine no
   longer writes its table array to the registry-owned `schema.json`.
   `SchemaSnapshotStore` owns the discriminated, size-bounded registry format,

@@ -28,6 +28,11 @@
 //! The default credentials match the ones documented in
 //! `specs/decisions/design-cql-role-auth-rollout.md` and the ddl file
 //! `ferrosa-memory/ddl/100_roles.cql`.
+//!
+//! Correctness: every plaintext seed password derives both the CQL password
+//! hash and the SCRAM verifier required by the Postgres listener.
+//! Last revised: 2026-09-16.
+//! Last changed: made seeded roles usable over Postgres and restart-safe.
 
 use std::collections::HashSet;
 
@@ -338,7 +343,7 @@ fn seed_role_if_absent(
         can_login: true,
         salted_hash: Some(hashed),
         member_of: HashSet::new(),
-        scram: None,
+        scram: Some(crate::auth::scram::derive_with_random_salt(password)),
     };
     schema.create_role_internal(role)?;
     warn!(
@@ -428,6 +433,16 @@ mod tests {
         assert!(snap.roles.get(SEED_ADMIN_USER).unwrap().is_superuser);
         assert!(!snap.roles.get(SEED_GRAPH_ENGINE_USER).unwrap().is_superuser);
         assert!(!snap.roles.get(SEED_APP_READER_USER).unwrap().is_superuser);
+        for name in [
+            SEED_ADMIN_USER,
+            SEED_GRAPH_ENGINE_USER,
+            SEED_APP_READER_USER,
+        ] {
+            assert!(
+                snap.roles.get(name).unwrap().scram.is_some(),
+                "seeded login role {name} must authenticate over Postgres"
+            );
+        }
     }
 
     #[test]

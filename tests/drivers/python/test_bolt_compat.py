@@ -39,7 +39,7 @@ FERROSA_AUTH_DISABLED = os.environ.get("FERROSA_AUTH_DISABLED", "false").lower()
 }
 
 BOLT_URI = f"bolt://{FERROSA_HOST}:{FERROSA_BOLT_PORT}"
-BOLT_AUTH = ("cassandra", "cassandra")
+BOLT_AUTH = ("ferrosa_admin", "ferrosa_admin")
 
 KEYSPACE = "bolt_compat_test"
 

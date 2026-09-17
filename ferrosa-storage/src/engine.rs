@@ -22092,6 +22092,227 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_list_then_element_append_flushes_without_mixed_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let schema = collection_schema(
+            "test_ks",
+            "mixed_list_table",
+            "org.apache.cassandra.db.marshal.ListType(\
+             org.apache.cassandra.db.marshal.UTF8Type)",
+        );
+        engine.register_table(schema).unwrap();
+
+        let tid = TableId::new("test_ks", "mixed_list_table");
+        let key = make_key("pk4");
+        let baseline = encode_cql_sequence(&[b"first", b"second"]);
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(baseline, 1_000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1_000,
+                    ),
+                },
+                1_000,
+            )
+            .unwrap();
+
+        engine
+            .write(
+                &tid,
+                &key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(b"third".to_vec(), 2_000)
+                            .with_path(ferrosa_row_bridge::collection::list_cell_path(2_000, 0)),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        2_000,
+                    ),
+                },
+                2_000,
+            )
+            .unwrap();
+
+        engine.flush(&tid).unwrap();
+        let partition = engine.read(&tid, &key).unwrap().unwrap();
+        let cells = &partition.rows[0].cells;
+        assert_eq!(cells.len(), 4, "deletion sentinel plus three elements");
+        assert!(cells[0].1.path.is_none() && cells[0].1.is_tombstone());
+        assert!(cells[1..].iter().all(|(_, cell)| cell.path.is_some()));
+        let refs: Vec<&CellValue> = cells.iter().map(|(_, cell)| cell).collect();
+        let assembled = ferrosa_row_bridge::collection::assemble_column_cells(
+            &ferrosa_common::CqlType::List(Box::new(ferrosa_common::CqlType::Varchar)),
+            &refs,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            assembled,
+            Some(ferrosa_common::CqlValue::List(vec![
+                ferrosa_common::CqlValue::Text("first".into()),
+                ferrosa_common::CqlValue::Text("second".into()),
+                ferrosa_common::CqlValue::Text("third".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn legacy_set_and_map_then_element_updates_flush_without_mixed_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let set_schema = collection_schema(
+            "test_ks",
+            "mixed_set_table",
+            "org.apache.cassandra.db.marshal.SetType(\
+             org.apache.cassandra.db.marshal.UTF8Type)",
+        );
+        engine.register_table(set_schema).unwrap();
+        let set_tid = TableId::new("test_ks", "mixed_set_table");
+        let set_key = make_key("set-pk");
+        engine
+            .write(
+                &set_tid,
+                &set_key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(encode_cql_sequence(&[b"alpha"]), 1_000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1_000,
+                    ),
+                },
+                1_000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &set_tid,
+                &set_key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(Vec::new(), 2_000).with_path(b"beta".to_vec()),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        2_000,
+                    ),
+                },
+                2_000,
+            )
+            .unwrap();
+        engine.flush(&set_tid).unwrap();
+        let set_partition = engine.read(&set_tid, &set_key).unwrap().unwrap();
+        let set_refs: Vec<&CellValue> = set_partition.rows[0]
+            .cells
+            .iter()
+            .map(|(_, cell)| cell)
+            .collect();
+        assert_eq!(
+            ferrosa_row_bridge::collection::assemble_column_cells(
+                &ferrosa_common::CqlType::Set(Box::new(ferrosa_common::CqlType::Varchar)),
+                &set_refs,
+                0,
+            )
+            .unwrap(),
+            Some(ferrosa_common::CqlValue::Set(vec![
+                ferrosa_common::CqlValue::Text("alpha".into()),
+                ferrosa_common::CqlValue::Text("beta".into()),
+            ]))
+        );
+
+        let map_schema = collection_schema(
+            "test_ks",
+            "mixed_map_table",
+            "org.apache.cassandra.db.marshal.MapType(\
+             org.apache.cassandra.db.marshal.UTF8Type,\
+             org.apache.cassandra.db.marshal.Int32Type)",
+        );
+        engine.register_table(map_schema).unwrap();
+        let map_tid = TableId::new("test_ks", "mixed_map_table");
+        let map_key = make_key("map-pk");
+        engine
+            .write(
+                &map_tid,
+                &map_key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(encode_cql_map(&[(b"one", &1i32.to_be_bytes())]), 1_000),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1_000,
+                    ),
+                },
+                1_000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &map_tid,
+                &map_key,
+                Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        CellValue::live(2i32.to_be_bytes().to_vec(), 2_000)
+                            .with_path(b"two".to_vec()),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        2_000,
+                    ),
+                },
+                2_000,
+            )
+            .unwrap();
+        engine.flush(&map_tid).unwrap();
+        let map_partition = engine.read(&map_tid, &map_key).unwrap().unwrap();
+        let map_refs: Vec<&CellValue> = map_partition.rows[0]
+            .cells
+            .iter()
+            .map(|(_, cell)| cell)
+            .collect();
+        assert_eq!(
+            ferrosa_row_bridge::collection::assemble_column_cells(
+                &ferrosa_common::CqlType::Map(
+                    Box::new(ferrosa_common::CqlType::Varchar),
+                    Box::new(ferrosa_common::CqlType::Int),
+                ),
+                &map_refs,
+                0,
+            )
+            .unwrap(),
+            Some(ferrosa_common::CqlValue::Map(vec![
+                (
+                    ferrosa_common::CqlValue::Text("one".into()),
+                    ferrosa_common::CqlValue::Int(1),
+                ),
+                (
+                    ferrosa_common::CqlValue::Text("two".into()),
+                    ferrosa_common::CqlValue::Int(2),
+                ),
+            ]))
+        );
+    }
+
     // ── Schema persistence across restarts ──────────────────────────────────
 
     #[test]

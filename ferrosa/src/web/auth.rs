@@ -193,7 +193,7 @@ mod tests {
         unsafe {
             std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
         }
-        Schema::new(SchemaConfig {
+        let schema = Schema::new(SchemaConfig {
             hasher: PasswordHasher::Bcrypt { cost: 4 },
             password_policy: PasswordPolicy::permissive(),
             auth_method: AuthMethod::Password,
@@ -202,7 +202,9 @@ mod tests {
             secrets: Box::new(EnvSecretsProvider),
             mode: DeploymentMode::Development,
         })
-        .expect("test schema construction must not fail")
+        .expect("test schema construction must not fail");
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
+        schema
     }
 
     /// Build a test router wrapped with auth middleware.
@@ -285,13 +287,13 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(env)]
-    async fn superuser_cassandra_returns_200() {
+    async fn seeded_ferrosa_admin_returns_200() {
         let (router, _) = test_router(false);
         let req = Request::builder()
             .uri("/test")
             .header(
                 header::AUTHORIZATION,
-                basic_auth_header("cassandra", "cassandra"),
+                basic_auth_header("ferrosa_admin", "ferrosa_admin"),
             )
             .body(Body::empty())
             .unwrap();
@@ -410,6 +412,7 @@ mod tests {
             })
             .expect("test schema"),
         );
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
         let host_id = uuid::Uuid::new_v4();
         let registry = std::sync::Arc::new(HandlerRegistry::new());
         let (mode_controller, _handles) = ModeController::new(
@@ -459,7 +462,7 @@ mod tests {
             .uri("/admin/membership-snapshot")
             .header(
                 axum::http::header::AUTHORIZATION,
-                basic_auth_header("cassandra", "cassandra"),
+                basic_auth_header("ferrosa_admin", "ferrosa_admin"),
             )
             .body(axum::body::Body::empty())
             .unwrap();

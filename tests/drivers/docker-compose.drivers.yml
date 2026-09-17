@@ -185,6 +185,7 @@ services:
       - -v
       - test_graph.py::TestAuth
       - test_bolt_compat.py::TestBoltWireProtocol::test_bolt_auth_invalid_credentials
+      - test_cql_v5_auth.py
 
   # -------------------------------------------------------------------------
   # Python driver tests (CQL + Graph HTTP)

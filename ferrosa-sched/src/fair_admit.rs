@@ -452,17 +452,14 @@ mod tests {
         const BUDGET: usize = 6000;
         const SCANS: usize = 4;
 
-        // All four scans must be RUNNING before any of them consumes the shared
-        // budget. Without this, the measurement is a thread-start race, not a
-        // fairness measurement: `spawn_blocking` threads start at the OS's
-        // discretion, so on a loaded/low-core machine one group could drain
-        // most of the budget before the other group's thread had started at
-        // all — producing a ratio that says nothing about admission fairness.
-        // Observed as a real CI failure (ratio 2.26, forge t_ffb53cf9).
-        //
-        // The barrier equalizes the START, not the outcome: the 0.5..=2.0 bound
-        // is unchanged and every rescheduling decision is still made by the
-        // live admission path.
+        // Release all four worker threads together, then make the first admitted
+        // scan wait until the other three are present in the admission state.
+        // The barrier alone only equalizes thread starts: on a loaded machine the
+        // first thread can still acquire the admission mutex and consume the
+        // entire shared budget before another thread gets scheduled. Since the
+        // pool has capacity one, the other scans cannot return from `admit` and
+        // rendezvous at a second barrier; the running scan must instead observe
+        // that every contender is either running or queued.
         let start_line = Arc::new(std::sync::Barrier::new(SCANS));
 
         let run = |group: GroupId| {
@@ -479,6 +476,16 @@ mod tests {
                     SchedClass::Bulk,
                     std::future::pending::<()>(),
                 )));
+                loop {
+                    let enrolled = {
+                        let state = admit.state.lock().expect("fair-admit poisoned");
+                        state.running.len() + state.queue.len()
+                    };
+                    if enrolled == SCANS {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
                 while total.fetch_add(1, Ordering::SeqCst) < BUDGET {
                     *served.lock().unwrap().entry(group).or_insert(0) += 1;
                     admit.reschedule(&handle, id, 10);

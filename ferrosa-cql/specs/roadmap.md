@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-09-05
+last_updated: 2026-09-17
 ---
 
 # ferrosa-cql — Roadmap
@@ -12,6 +12,15 @@ real backlog is structural and security-shaped.
 
 ## Recently addressed
 
+- **Decodable system-schema aggregates (CQL-22, 2026-09-17).**
+  `SELECT count(*) FROM system_schema.tables` now emits one bigint column and
+  one aggregate row through the shared system-table encoder; ordinary projected
+  reads retain their exact requested column shape.
+- **Documented transaction blocks (CQL-23).** A single CQL request containing
+  `BEGIN TRANSACTION;` followed by SELECT/DML statements and
+  `COMMIT TRANSACTION;` or `ROLLBACK TRANSACTION;` now parses and runs through
+  the existing registry-backed Accord path. Invalid body statements fail at
+  parse time, and execution errors abort the open registry entry.
 - **Full-text index selection with shared columns (t_bf1aa16c / CQL-18).**
   `fts_match` now selects only a registered full-text index, so an earlier
   phonetic or scalar index on the same column cannot produce a false empty

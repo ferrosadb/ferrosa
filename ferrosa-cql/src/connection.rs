@@ -1,8 +1,8 @@
 //! Module: Per-connection CQL native-protocol handler.
 //! Correctness: Correct when protocol state transitions, prepared metadata, and bound-value
 //! substitution preserve the CQL wire contract for every accepted opcode.
-//! Last revised: 2026-08-27
-//! Last changed: Validate and substitute prepared SELECT LIMIT markers before routing.
+//! Last revised: 2026-09-16
+//! Last changed: Begin v5 framing after AUTHENTICATE on auth-enabled connections.
 //!
 //! Per-connection CQL protocol handler.
 //!
@@ -742,8 +742,14 @@ pub(crate) async fn handle_connection<S>(
                             break;
                         }
 
-                        // After READY or AUTH_SUCCESS, enable post-handshake features.
-                        if opcode == Opcode::Ready || opcode == Opcode::AuthSuccess {
+                        // V5 framing begins immediately after the response to
+                        // STARTUP: READY when auth is disabled, AUTHENTICATE
+                        // when auth is enabled. AUTH_RESPONSE and AUTH_SUCCESS
+                        // therefore already travel inside checksummed frames.
+                        if matches!(
+                            opcode,
+                            Opcode::Ready | Opcode::Authenticate | Opcode::AuthSuccess
+                        ) {
                             if let Some(compression) = pending_compression.take() {
                                 debug!(
                                     "enabling {} compression for {peer}",
@@ -751,11 +757,9 @@ pub(crate) async fn handle_connection<S>(
                                 );
                                 framed.codec_mut().set_compression(compression);
                             }
-                            // For native protocol v5, switch to the modern framed
-                            // transport after the STARTUP/READY exchange. The
-                            // handshake itself (STARTUP + READY/ERROR) still uses
-                            // the legacy 9-byte envelope so the version can be
-                            // agreed before framing is active.
+                            // STARTUP and its direct response use legacy
+                            // envelopes. Every later v5 message uses modern
+                            // framing, including the authentication exchange.
                             if client_protocol_version == VERSION_REQUEST {
                                 debug!("enabling v5 modern framing for {peer}");
                                 framed.codec_mut().enable_v5_framing();
@@ -2766,20 +2770,14 @@ fn cql_value_to_term(v: &CqlValue) -> Term {
         CqlValue::Uuid(u) | CqlValue::Timeuuid(u) => Term::UuidLiteral(*u),
         CqlValue::Blob(b) => Term::BlobLiteral(b.clone()),
         CqlValue::Inet(addr) => Term::StringLiteral(addr.to_string()),
-        CqlValue::Date(d) => Term::IntegerLiteral(*d as i64),
-        CqlValue::Time(t) => Term::IntegerLiteral(*t),
-        CqlValue::Varint(big) => {
-            // Best-effort: try to fit into i64, otherwise render as string.
-            match i64::try_from(big) {
-                Ok(n) => Term::IntegerLiteral(n),
-                Err(_) => Term::StringLiteral(big.to_string()),
-            }
-        }
-        CqlValue::Decimal { .. } => {
-            // Decimals don't have a direct Term representation; use string.
-            Term::StringLiteral(format!("{v:?}"))
-        }
-        CqlValue::Duration { .. } => Term::StringLiteral(format!("{v:?}")),
+        // These types do not have parser literals that can represent every wire
+        // value without loss. Keep their exact CQL encoding and let
+        // `term_to_cql_value` decode it against the prepared column type.
+        CqlValue::Date(_)
+        | CqlValue::Time(_)
+        | CqlValue::Varint(_)
+        | CqlValue::Decimal { .. }
+        | CqlValue::Duration { .. } => Term::BlobLiteral(encode_value(v)),
         // Collections: encode back to blob bytes so the router re-decodes them.
         CqlValue::List(items) => Term::ListLiteral(items.iter().map(cql_value_to_term).collect()),
         CqlValue::Set(items) => Term::SetLiteral(items.iter().map(cql_value_to_term).collect()),
@@ -3486,6 +3484,7 @@ mod tests {
             mode: DeploymentMode::Development,
         })
         .unwrap();
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
         Arc::new(schema)
     }
 
@@ -3750,8 +3749,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 authenticate_off_runtime_observed(
                     s,
-                    "cassandra".into(),
-                    "cassandra".into(),
+                    "ferrosa_admin".into(),
+                    "ferrosa_admin".into(),
                     TaskPool::current("test-auth"),
                     move || tx.send(std::thread::current().id()).unwrap(),
                 )
@@ -3764,7 +3763,7 @@ mod tests {
             let res = h.await.unwrap();
             assert!(
                 res.is_ok(),
-                "auth should succeed against the default cassandra user: {res:?}"
+                "auth should succeed against the seeded Ferrosa administrator: {res:?}"
             );
         }
 
@@ -3786,7 +3785,7 @@ mod tests {
     async fn authenticate_off_runtime_returns_failure_for_bad_password() {
         let schema = build_minimal_schema_for_test();
         let result =
-            authenticate_off_runtime(schema, "cassandra".into(), "wrong-password".into()).await;
+            authenticate_off_runtime(schema, "ferrosa_admin".into(), "wrong-password".into()).await;
         assert!(matches!(
             result,
             Err(ferrosa_schema::SchemaError::AuthenticationFailed)
@@ -4317,6 +4316,58 @@ mod tests {
             assert!(matches!(&i.values[2], Term::IntegerLiteral(42)));
         } else {
             panic!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn prepared_scalar_values_preserve_their_wire_types() {
+        let types = vec![
+            CqlType::Date,
+            CqlType::Time,
+            CqlType::Duration,
+            CqlType::Decimal,
+            CqlType::Varint,
+        ];
+        let values = vec![
+            CqlValue::Date((1u32 << 31) + 19_981),
+            CqlValue::Time(45_296_123_456_789),
+            CqlValue::Duration {
+                months: 14,
+                days: 3,
+                nanos: 4_005_006_007,
+            },
+            CqlValue::Decimal {
+                scale: 9,
+                unscaled: num_bigint::BigInt::from(123_456_789_012_345_678i64),
+            },
+            CqlValue::Varint(
+                num_bigint::BigInt::parse_bytes(b"123456789012345678901234567890", 10).unwrap(),
+            ),
+        ];
+        let plan = make_plan(
+            "INSERT INTO ks.t (d, t, dur, dec, vi) VALUES (?, ?, ?, ?, ?)",
+            vec![
+                ("d", CqlType::Date),
+                ("t", CqlType::Time),
+                ("dur", CqlType::Duration),
+                ("dec", CqlType::Decimal),
+                ("vi", CqlType::Varint),
+            ],
+        );
+        let encoded: Vec<Vec<u8>> = values.iter().map(encode_value).collect();
+        let encoded_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+
+        let statement = substitute_bound_values(&plan, &encode_values(&encoded_refs), 4).unwrap();
+        let Statement::Insert(insert) = statement else {
+            panic!("expected INSERT");
+        };
+
+        for ((term, cql_type), expected) in insert.values.iter().zip(&types).zip(&values) {
+            let actual = bridge::term_to_cql_value(term, cql_type).unwrap();
+            assert_eq!(
+                &actual, expected,
+                "prepared {cql_type:?} changed type or value"
+            );
         }
     }
 

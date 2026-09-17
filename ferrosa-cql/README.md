@@ -28,8 +28,11 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   the 9-byte CQL header + body, opcode table, LZ4/Snappy body compression, and a
   custom `STREAMING_FLAG` (bit 0x10) for SUBSCRIBE response frames.
   On a v5 connection the envelope is additionally wrapped in the modern frame
-  format (3-byte length/flag header + CRC24, payload, CRC32). A payload is
-  capped at `V5_MAX_PAYLOAD` (2^17−1 = 128 KiB) by the 17-bit length field, so
+  format (3-byte length/flag header + CRC24, payload, CRC32).
+  Auth-enabled connections switch at the `AUTHENTICATE` response boundary, so
+  `AUTH_RESPONSE` and `AUTH_SUCCESS` use checksummed v5 frames as clients expect.
+  A payload is capped at `V5_MAX_PAYLOAD` (2^17−1 = 128 KiB) by the 17-bit
+  length field, so
   **an envelope larger than that is split across consecutive frames, every one
   of them marked `isSelfContained=0`**; the receiver reassembles by reading the
   envelope header's own length and accumulating until it is satisfied, since a
@@ -53,6 +56,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
   plan. Carries the security mitigations (M8 permissions, M12 batch cap).
+  Standalone role create/alter/drop handlers also write the authoritative
+  `system_auth.roles` row before acknowledging success, matching the
+  pair/cluster persistence contract.
   The `DEFAULT_RANGE_READ_LIMIT` (10_000) result cap is removed for the
   O(1)-streamable full-scan shapes, which are bounded only by the query's own
   `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
@@ -120,10 +126,17 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   ferrosa-memory's entity streams into 500s across `main` and every open PR
   (t_12457d3e). Once the index is current, an empty global lookup is a real miss
   and never falls back to a scan.
+  Virtual `system_schema` reads share one projection/aggregate encoder: ordinary
+  projections expose exactly the requested metadata, and `count(*)` returns one
+  `bigint` row instead of a zero-column frame that standard drivers cannot
+  decode.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
   `ferrosa-row-bridge`.
+  Map element assignments (`map[key] = value`) are emitted as complex cells
+  whose path is the encoded key and whose value is the encoded map value. They
+  therefore compose safely with whole-map inserts and later key removals.
   **Timestamp bounds validation (Bug C, t_a0f922a3)**: `validate_timestamp_ms`
   rejects any `timestamp` cell outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]`
   (chrono `MIN_UTC`/`MAX_UTC` millis) at the **write** boundary — integer-literal,
@@ -136,7 +149,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 - **Result encoding** (`result.rs`, `types.rs`) — CQL RESULT-frame encoder, the
   16-bit type system, and the re-exported `encode_value`/`decode_value` codec.
 - **Prepared statements** (`prepared.rs`) — `moka` W-TinyLFU cache keyed by the
-  MD5 of the query text, weight-bounded.
+  MD5 of the query text, weight-bounded. EXECUTE preserves the exact wire
+  encoding for scalar types that lack lossless parser literals (`date`, `time`,
+  `duration`, `decimal`, and arbitrarily large `varint`) until the value is
+  decoded against its prepared column type.
 - **Pagination** (`paging.rs`) — opaque `paging_state` cursor (pk + ck +
   remaining-in-partition flag, HMAC-signed) for CQL v5 paging. Paged full-table
   scans resume WITHIN a wide partition (t_a0f922a3): the router decodes the
@@ -169,7 +185,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `transaction_limits.rs`) — routing decision (Accord in cluster mode, local in
   standalone), `IF [NOT] EXISTS` / `IF <cond>` CAS semantics with the `[applied]`
   result column, partition-key extraction for Accord, and per-connection
-  transaction limits (concurrency / timeout / key count).
+  transaction limits (concurrency / timeout / key count). Both separately sent
+  `BEGIN` / body / `COMMIT` statements and the documented single-query
+  `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` block form use the same
+  registry-backed Accord path; body errors roll the block back immediately.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast

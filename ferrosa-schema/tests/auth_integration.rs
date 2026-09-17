@@ -66,15 +66,15 @@ fn bootstrap_with_env_password_no_must_change() {
 }
 
 #[test]
-fn bootstrap_without_env_password_must_change() {
+fn bootstrap_without_env_password_omits_legacy_superuser() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Safety: env var mutation is not thread-safe; protected by ENV_LOCK.
     unsafe {
         std::env::remove_var("FERROSA_SUPERUSER_PASSWORD");
     }
     let schema = Schema::new(test_config()).unwrap();
-    let ctx = schema.authenticate("cassandra", "cassandra").unwrap();
-    assert!(ctx.must_change_password);
+    assert!(!schema.snapshot().roles.contains_key("cassandra"));
+    assert!(schema.authenticate("cassandra", "cassandra").is_err());
 }
 
 #[test]

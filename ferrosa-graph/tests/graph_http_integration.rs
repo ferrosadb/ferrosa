@@ -97,19 +97,20 @@ fn setup() -> (Arc<Schema>, Arc<StorageEngine>, TempDir) {
         })
         .unwrap(),
     );
+    ferrosa_schema::auth::bootstrap::seed_default_roles(&schema).unwrap();
     (schema, storage, dir)
 }
 
 fn superuser_auth() -> AuthContext {
     AuthContext {
-        role: "cassandra".to_string(),
+        role: "ferrosa_admin".to_string(),
         is_superuser: true,
         must_change_password: false,
     }
 }
 
 fn basic_auth_header() -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode("cassandra:cassandra");
+    let encoded = base64::engine::general_purpose::STANDARD.encode("ferrosa_admin:ferrosa_admin");
     format!("Basic {encoded}")
 }
 
@@ -222,7 +223,7 @@ fn create_social_graph_schema(schema: &Schema) {
     // Grant all permissions on the keyspace
     schema
         .grant(
-            "cassandra",
+            "ferrosa_admin",
             &Resource::Keyspace("social".to_string()),
             HashSet::from([
                 Permission::Select,
@@ -3550,7 +3551,7 @@ async fn merge_edge_clustering_matches_dst_key() {
 //
 // Test invariants (must never regress):
 //   - `app_reader` is DENIED MERGE (403): SELECT-only on graph tables.
-//   - `cassandra` (superuser) is ALLOWED MERGE (200): superuser bypass.
+//   - `ferrosa_admin` (superuser) is ALLOWED MERGE (200): superuser bypass.
 //   - `graph_engine` is ALLOWED MERGE (200): has MODIFY grant on graph tables.
 
 /// Helper: build a Basic auth header for an arbitrary username/password.
@@ -3586,7 +3587,7 @@ fn json_request_with_auth(
 /// `app_reader` (non-superuser, SELECT-only on graph tables) must receive HTTP 403 on MERGE.
 ///
 /// `graph_engine` (non-superuser but has MODIFY grant on graph tables) and
-/// `cassandra` (superuser) must receive HTTP 200 on the same MERGE.
+/// `ferrosa_admin` (superuser) must receive HTTP 200 on the same MERGE.
 ///
 /// This test does NOT disable auth; it fails loud per safety.md: a missing 403
 /// means auth was bypassed (P0 security regression). A missing 200 for
@@ -3635,19 +3636,19 @@ async fn merge_denied_for_app_reader_role() {
         "app_reader must be denied MERGE (403); if this is 200 auth enforcement is broken"
     );
 
-    // --- cassandra (superuser) MUST succeed (200) ---
+    // --- ferrosa_admin (superuser) MUST succeed (200) ---
     let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
     let req = json_request_with_auth(
         "POST",
         "/graph/query",
         Some(merge_query.clone()),
-        basic_auth_for("cassandra", "cassandra"),
+        basic_auth_for("ferrosa_admin", "ferrosa_admin"),
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "cassandra (superuser) must be allowed MERGE (200)"
+        "ferrosa_admin (superuser) must be allowed MERGE (200)"
     );
 
     // --- graph_engine MUST succeed (200): has MODIFY grant on graph tables ---
@@ -3696,7 +3697,7 @@ fn create_memory_graph_schema(schema: &Schema) {
 
     schema
         .grant(
-            "cassandra",
+            "ferrosa_admin",
             &Resource::Keyspace("memory".to_string()),
             HashSet::from([
                 Permission::Select,
@@ -3869,7 +3870,7 @@ fn create_agent_memory_real_graph_schema(schema: &Schema) {
 
     schema
         .grant(
-            "cassandra",
+            "ferrosa_admin",
             &Resource::Keyspace("agent_memory".to_string()),
             HashSet::from([
                 Permission::Select,

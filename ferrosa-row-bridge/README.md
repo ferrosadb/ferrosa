@@ -17,7 +17,8 @@ ordering — the top FMEA risk for the SQL front-end — so it lives here once.
 
 - **CQL wire codec** — `encode_value` / `decode_value` for the scalar CQL types
   (int family, text/ascii, bool, float/double, uuid/timeuuid, blob, timestamp,
-  date, time, inet, decimal, varint).
+  date, time, duration, inet, decimal, varint). Duration components use
+  Cassandra's signed leading-ones vint encoding and reject trailing bytes.
 - **CQL type-name parser** — `parse_cql_type` / `parse_cql_type_in_keyspace`.
 - **Write-direction row assembly** — `build_decorated_key` (single + composite
   partition keys), `build_row`, `build_delete_row`, `encode_clustering`.
@@ -81,9 +82,10 @@ External: `num-bigint`, `uuid`, `tracing`. **Never** depends on `ferrosa-cql`.
 
 ## Tests
 
-The canonical codec/row unit tests currently live in `ferrosa-cql`'s `bridge`
-module (they were not moved with the functions). In-crate test coverage is a
-tracked gap — see [specs/fmea.md](specs/fmea.md) and [specs/roadmap.md](specs/roadmap.md).
+Duration wire compatibility is covered in-crate with a Cassandra protocol
+vector and a trailing-byte rejection test. Most canonical codec/row unit tests
+still live in `ferrosa-cql`'s `bridge` module; moving the remainder is a tracked
+gap — see [specs/fmea.md](specs/fmea.md) and [specs/roadmap.md](specs/roadmap.md).
 
 ## Specs
 

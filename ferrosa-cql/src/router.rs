@@ -11,8 +11,8 @@
 //! Correctness: compound clustering restrictions validate declared key order,
 //! and bounded single-column clustering resumes stop before materializing a
 //! wide partition tail.
-//! Last revised: 2026-08-27.
-//! Last changed: stream full-PK `ck > value LIMIT n` reads from the clustering bound.
+//! Last revised: 2026-09-16.
+//! Last changed: persist standalone role mutations to system_auth before reply.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -2411,6 +2411,14 @@ pub async fn route_transactional(
         Statement::BeginTransaction { timeout_ms } => {
             Some(begin_transaction(state, owner, shim, now, *timeout_ms))
         }
+        Statement::TransactionBlock {
+            timeout_ms,
+            statements,
+            rollback,
+        } => Some(
+            route_transaction_block(state, ctx, shim, now, *timeout_ms, statements, *rollback)
+                .await,
+        ),
         Statement::Commit { txn_id } => {
             Some(commit_transaction(state, owner, shim, now, txn_id.as_deref()).await)
         }
@@ -2428,6 +2436,38 @@ pub async fn route_transactional(
             Some(stage_dml(state, ctx, owner, now, id, stmt))
         }
         _ => None,
+    }
+}
+
+async fn route_transaction_block(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    shim: &mut Option<crate::txn_registry::CqlTxnId>,
+    now: std::time::Instant,
+    timeout_ms: Option<u64>,
+    statements: &[Statement],
+    rollback: bool,
+) -> Result<RouteResult, CqlError> {
+    let owner = ctx.auth.role.as_str();
+    begin_transaction(state, owner, shim, now, timeout_ms)?;
+    let id = shim.ok_or_else(|| {
+        CqlError::ServerError("transaction block did not receive a transaction id".to_string())
+    })?;
+    let id_text = id.to_string();
+
+    for statement in statements {
+        if let Err(error) = route_in_transaction(state, ctx, owner, now, &id_text, statement).await
+        {
+            // A body error must not leave an open transaction for the reaper.
+            let _ = rollback_transaction(state, owner, shim, Some(&id_text));
+            return Err(error);
+        }
+    }
+
+    if rollback {
+        rollback_transaction(state, owner, shim, Some(&id_text))
+    } else {
+        commit_transaction(state, owner, shim, now, Some(&id_text)).await
     }
 }
 
@@ -3408,6 +3448,7 @@ pub async fn route(
         // Accord transaction control statements are handled by route_transactional
         // (the connection layer) before reaching here. If one arrives, return void.
         Statement::BeginTransaction { .. }
+        | Statement::TransactionBlock { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. } => Ok(RouteResult::Result(crate::result::encode_void())),
         // A transaction-scoped statement must be handled by route_transactional; if
@@ -3955,20 +3996,18 @@ async fn route_select(
                     ]
                 })
                 .collect();
-            // p1-37: honor the SELECT projection — scylla 0.15 issues
-            // `SELECT keyspace_name, table_name FROM system_schema.tables`
-            // and type-checks the result against a 2-tuple. Without
-            // projection we'd return 3 cols and trip a column-count
-            // mismatch.
-            let (filt_names, filt_types, filt_rows) =
-                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
-            Ok(result::encode_rows(
-                &filt_names,
-                &filt_types,
+            // Honor both ordinary projection and aggregates. The lightweight
+            // `filter_system_columns` helper silently omits count(*), producing
+            // zero column specs followed by one payload row per table; drivers
+            // then decode beyond the malformed frame and close the connection.
+            apply_system_select(
+                &s.columns,
+                &col_names,
+                &col_types,
+                &rows,
                 "system_schema",
                 "tables",
-                &filt_rows,
-            ))
+            )
         }
         ("system_schema", "columns") => {
             let snap = state.schema.snapshot();
@@ -8520,24 +8559,40 @@ async fn route_update(
                     }
                 }
             }
-            Assignment::Element {
-                column,
-                key: _,
-                value,
-            } => {
-                // Map/list element set: coerce value to the element type, not the collection type
+            Assignment::Element { column, key, value } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-                let value_type = match &cql_type {
-                    CqlType::Map(_, v) => (**v).clone(),
-                    CqlType::List(v) => (**v).clone(),
-                    _ => cql_type.clone(),
-                };
-                let val = bridge::term_to_cql_value(value, &value_type)?;
-                (column.as_str(), val)
+                match cql_type {
+                    CqlType::Map(key_type, value_type) => {
+                        let key = bridge::term_to_cql_value(key, &key_type)?;
+                        let value = bridge::term_to_cql_value(value, &value_type)?;
+                        let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
+                            CqlError::Invalid(format!(
+                                "column '{}' not found in storage schema",
+                                column
+                            ))
+                        })?;
+                        complex_cells.push((
+                            col_idx,
+                            ferrosa_common::CellValue::live(encode_value(&value), timestamp)
+                                .with_path(encode_value(&key)),
+                        ));
+                        continue;
+                    }
+                    CqlType::List(_) => {
+                        return Err(CqlError::Invalid(format!(
+                            "column '{column}': list index updates require a read-modify-write path"
+                        )));
+                    }
+                    _ => {
+                        return Err(CqlError::Invalid(format!(
+                            "column '{column}' does not support element updates"
+                        )));
+                    }
+                }
             }
         };
         let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
@@ -10825,6 +10880,19 @@ async fn route_drop_index(
 
 // ── DDL: Role ────────────────────────────────────────────────────────────
 
+fn persist_role_row_direct(state: &SharedState, name: &str) -> Result<(), CqlError> {
+    let role = state
+        .schema
+        .snapshot()
+        .roles
+        .get(name)
+        .cloned()
+        .ok_or_else(|| CqlError::ServerError(format!("role disappeared before persist: {name}")))?;
+    ferrosa_cluster::system_table_writer::SystemTableWriter::new(state.engine.clone())
+        .apply(ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(role))
+        .map_err(|e| CqlError::ServerError(format!("persist role {name}: {e}")))
+}
+
 async fn route_create_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -10867,6 +10935,7 @@ async fn route_create_role(
                     .schema
                     .create_role(base_role, s.password.as_deref(), ctx.auth)?;
             }
+            persist_role_row_direct(state, &s.name)?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
@@ -10943,6 +11012,7 @@ async fn route_alter_role(
                 member_of: None,
             };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
+            persist_role_row_direct(state, &s.name)?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: `alter_role_internal` (registry.rs:481)
@@ -11015,6 +11085,15 @@ async fn route_drop_role(
     match ddl {
         DdlPath::Direct { .. } => {
             state.schema.drop_role(&s.name, ctx.auth)?;
+            ferrosa_cluster::system_table_writer::SystemTableWriter::new(state.engine.clone())
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::RoleDropped(
+                        s.name.clone(),
+                    ),
+                )
+                .map_err(|e| {
+                    CqlError::ServerError(format!("persist dropped role {}: {e}", s.name))
+                })?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropRole(s.name.clone());
@@ -15525,6 +15604,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn route_documented_transaction_blocks_without_leaking_registry_entries() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let ctx = RequestContext {
+            auth: &auth,
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        let mut shim = None;
+        let now = std::time::Instant::now();
+
+        let rollback = crate::parser::parse(
+            "BEGIN TRANSACTION; SELECT * FROM system.local; ROLLBACK TRANSACTION;",
+        )
+        .unwrap();
+        assert!(matches!(
+            route_transactional(&state, &ctx, &rollback, &mut shim, now).await,
+            Some(Ok(_))
+        ));
+        assert!(shim.is_none());
+        assert!(state.txn_registry.lock().is_empty());
+
+        let commit = crate::parser::parse("BEGIN TRANSACTION; COMMIT TRANSACTION;").unwrap();
+        assert!(matches!(
+            route_transactional(&state, &ctx, &commit, &mut shim, now).await,
+            Some(Err(CqlError::Invalid(message)))
+                if message.contains("require cluster mode")
+        ));
+        assert!(shim.is_none());
+        assert!(state.txn_registry.lock().is_empty());
+    }
+
     /// Regression for the Elle-cert "nested transactions" defect: consecutive
     /// BEGINs on ONE connection must BOTH succeed with distinct ids. The txn-id
     /// model has no connection-scoped nested transaction; the old guard spuriously
@@ -15766,6 +15882,31 @@ mod tests {
             materialize_update(&state, &ctx, &remove, 123).is_err(),
             "list remove-by-value needs a read — must stay fail-loud in a transaction"
         );
+    }
+
+    #[tokio::test]
+    async fn map_element_put_then_key_remove_keeps_complex_cell_shape() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, props map<text, text>)",
+            "INSERT INTO ks.t (k, props) VALUES (1, {'color': 'red', 'size': 'large'})",
+            "UPDATE ks.t SET props['weight'] = 'heavy' WHERE k = 1",
+            "UPDATE ks.t SET props = props - {'color'} WHERE k = 1",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("failed `{cql}`: {error}"));
+        }
     }
 
     /// The Accord transaction write path flags a `list` append cell so the replica
@@ -24680,10 +24821,10 @@ mod tests {
     }
 
     /// Vector index: an `ORDER BY ... ANN OF` query returns the nearest rows in
-    /// distance order, and the vector index is registered in storage. The
-    /// router ANN path is brute-force pending Phase 2 vector read dispatch, so
-    /// this asserts correctness + index registration rather than an
-    /// index_usage hit it cannot honestly demonstrate.
+    /// distance order when the index is created after the rows already exist.
+    /// This is the end-to-end form of the live-memtable backfill contract: once
+    /// the schema advertises the index, the router must not switch a correct
+    /// brute-force query to an empty storage index.
     #[tokio::test]
     async fn vector_index_registered_and_ann_orders_correctly() {
         let (state, _dir) = setup();
@@ -24693,9 +24834,9 @@ mod tests {
         for cql in [
             "CREATE KEYSPACE vec WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
             "CREATE TABLE vec.items (id int PRIMARY KEY, embedding vector<float, 4>)",
-            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
             "INSERT INTO vec.items (id, embedding) VALUES (1, [0.90, 0.10, 0.00, 0.00])",
             "INSERT INTO vec.items (id, embedding) VALUES (2, [0.00, 0.00, 0.90, 0.10])",
+            "CREATE INDEX vec_ann ON vec.items (embedding) USING 'vector'",
         ] {
             route(&state, &ctx, crate::parser::parse(cql).unwrap())
                 .await
@@ -24719,6 +24860,7 @@ mod tests {
             RouteResult::Result(b) => {
                 let count = extract_row_count(&b);
                 assert_eq!(count, 1, "ANN OF LIMIT 1 must return exactly 1 row");
+                assert_eq!(extract_int_column_values(&b, "id"), vec![1]);
             }
             _ => panic!("expected Result"),
         }
@@ -26923,6 +27065,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alter_role_persists_rotated_password_in_system_auth() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE ROLE restart_role WITH PASSWORD = 'before-restart' AND LOGIN = true",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        route(
+            &state,
+            &ctx,
+            Statement::AlterRole(AlterRoleStatement {
+                name: "restart_role".into(),
+                password: Some("after-restart".into()),
+                hashed_password: None,
+                superuser: None,
+                login: None,
+                options: Vec::new(),
+                access: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let persisted =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone())
+                .load_roles()
+                .unwrap();
+        let role = persisted
+            .iter()
+            .find(|role| role.name == "restart_role")
+            .expect("ALTER ROLE must persist the authoritative role row");
+        assert!(ferrosa_schema::PasswordHasher::verify_password_any(
+            "after-restart",
+            role.salted_hash.as_deref().unwrap()
+        )
+        .unwrap());
+        assert!(
+            role.scram.is_some(),
+            "the durable role row must carry its Postgres SCRAM verifier"
+        );
+    }
+
+    #[tokio::test]
     async fn drop_role_removes_from_schema() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -26954,6 +27154,14 @@ mod tests {
 
         let snap = state.schema.snapshot();
         assert!(!snap.roles.contains_key("dr_role"), "role should be gone");
+        let persisted =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone())
+                .load_roles()
+                .unwrap();
+        assert!(
+            persisted.iter().all(|role| role.name != "dr_role"),
+            "DROP ROLE must tombstone the durable role row"
+        );
     }
 
     // ── DROP INDEX routing tests ──────────────────────────────────────
@@ -28589,6 +28797,40 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    #[tokio::test]
+    async fn count_system_schema_tables_returns_one_bigint_row() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let current_keyspace = None;
+        let ctx = RequestContext {
+            auth: &dev,
+            current_keyspace: &current_keyspace,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE count_schema WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE count_schema.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT count(*) FROM system_schema.tables WHERE keyspace_name = 'count_schema'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_first_bigint_value(&body), 1);
     }
 
     #[tokio::test]

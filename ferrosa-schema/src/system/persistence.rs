@@ -50,6 +50,8 @@ pub const ROLES_COL_IS_SUPERUSER: u16 = 0;
 pub const ROLES_COL_CAN_LOGIN: u16 = 1;
 /// `salted_hash` text (nullable).
 pub const ROLES_COL_SALTED_HASH: u16 = 2;
+/// `scram` JSON-encoded SCRAM-SHA-256 verifier (nullable).
+pub const ROLES_COL_SCRAM: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // system_auth.role_members column indices
@@ -382,6 +384,13 @@ pub fn role_to_row(role: &RoleMetadata) -> (DecoratedKey, Row, i64) {
         Some(h) => CellValue::live(h.as_bytes().to_vec(), ts),
         None => CellValue::tombstone(ts, (ts / 1_000_000) as i32),
     };
+    let scram_cell = match &role.scram {
+        Some(scram) => CellValue::live(
+            serde_json::to_vec(scram).expect("ScramCredential serialization is infallible"),
+            ts,
+        ),
+        None => CellValue::tombstone(ts, (ts / 1_000_000) as i32),
+    };
 
     let row = Row {
         clustering: vec![],
@@ -395,6 +404,7 @@ pub fn role_to_row(role: &RoleMetadata) -> (DecoratedKey, Row, i64) {
                 CellValue::live(encode_bool(role.can_login), ts),
             ),
             (ROLES_COL_SALTED_HASH, hash_cell),
+            (ROLES_COL_SCRAM, scram_cell),
         ],
         deletion: DeletionTime::LIVE,
         primary_key_liveness: LivenessInfo::with_timestamp(ts),
@@ -698,6 +708,10 @@ pub fn roles_table_schema() -> TableSchema {
                 name: "salted_hash".to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
+            ColumnDefinition {
+                name: "scram".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            },
         ],
         extensions: Default::default(),
     }
@@ -897,6 +911,7 @@ mod tests {
         assert_eq!(ROLES_COL_IS_SUPERUSER, 0);
         assert_eq!(ROLES_COL_CAN_LOGIN, 1);
         assert_eq!(ROLES_COL_SALTED_HASH, 2);
+        assert_eq!(ROLES_COL_SCRAM, 3);
     }
 
     // -- Task 2: TableSchema builder tests --
@@ -937,7 +952,7 @@ mod tests {
         let schema = roles_table_schema();
         assert_eq!(schema.keyspace, "system_auth");
         assert_eq!(schema.table, "roles");
-        assert_eq!(schema.regular_columns.len(), 3);
+        assert_eq!(schema.regular_columns.len(), 4);
     }
 
     #[test]
@@ -1148,7 +1163,7 @@ mod tests {
         let (key, row, _ts) = role_to_row(&role);
 
         assert_eq!(key.key.as_bytes(), b"analyst");
-        assert_eq!(row.cells.len(), 3);
+        assert_eq!(row.cells.len(), 4);
 
         let (idx, cell) = &row.cells[0];
         assert_eq!(*idx, ROLES_COL_IS_SUPERUSER);

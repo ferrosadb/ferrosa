@@ -58,9 +58,20 @@ pub fn parse(input: &str) -> Result<Statement, CqlError> {
     let _entered = span.enter();
     let lexer = Lexer::new(input)?;
     let mut parser = Parser::new(lexer);
-    let stmt = parser.parse_statement()?;
+    let mut stmt = parser.parse_statement()?;
     // Consume optional trailing semicolon
     parser.lexer.eat(&TokenKind::Semicolon)?;
+    // The documented block form is one CQL request containing BEGIN, a body,
+    // and COMMIT/ROLLBACK. A standalone BEGIN still returns immediately when
+    // the first semicolon (or whitespace) is followed by EOF.
+    if let Statement::BeginTransaction { timeout_ms } = stmt {
+        if parser.lexer.peek()?.kind != TokenKind::Eof {
+            stmt = parser.parse_transaction_block(timeout_ms)?;
+            parser.lexer.eat(&TokenKind::Semicolon)?;
+        } else {
+            stmt = Statement::BeginTransaction { timeout_ms };
+        }
+    }
     // Verify we consumed everything
     let tok = parser.lexer.peek()?;
     if tok.kind != TokenKind::Eof {
@@ -647,6 +658,52 @@ impl<'input> Parser<'input> {
         // Otherwise it's a BATCH statement — delegate to parse_batch_body
         // (BEGIN already consumed)
         self.parse_batch_body().map(Statement::Batch)
+    }
+
+    fn parse_transaction_block(&mut self, timeout_ms: Option<u64>) -> Result<Statement, CqlError> {
+        let mut statements = Vec::new();
+        loop {
+            let statement = self.parse_statement()?;
+            match statement {
+                Statement::Commit { txn_id: None } => {
+                    return Ok(Statement::TransactionBlock {
+                        timeout_ms,
+                        statements,
+                        rollback: false,
+                    });
+                }
+                Statement::Rollback { txn_id: None } => {
+                    return Ok(Statement::TransactionBlock {
+                        timeout_ms,
+                        statements,
+                        rollback: true,
+                    });
+                }
+                Statement::BeginTransaction { .. } | Statement::TransactionBlock { .. } => {
+                    return Err(CqlError::SyntaxError(
+                        "nested transactions are not supported".to_string(),
+                    ));
+                }
+                Statement::Select(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_) => statements.push(statement),
+                Statement::Commit { txn_id: Some(_) }
+                | Statement::Rollback { txn_id: Some(_) }
+                | Statement::InTransaction { .. } => {
+                    return Err(CqlError::SyntaxError(
+                        "transaction blocks cannot target an explicit transaction id".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(CqlError::SyntaxError(
+                        "only SELECT, INSERT, UPDATE, and DELETE are allowed in a transaction block"
+                            .to_string(),
+                    ));
+                }
+            }
+            self.lexer.expect(&TokenKind::Semicolon)?;
+        }
     }
 
     fn parse_commit(&mut self) -> Result<Statement, CqlError> {
@@ -5947,6 +6004,61 @@ mod tests {
             matches!(stmt, Statement::Rollback { txn_id: None }),
             "expected Rollback, got {stmt:?}"
         );
+    }
+
+    #[test]
+    fn parse_documented_transaction_block() {
+        let statement = parse(
+            "BEGIN TRANSACTION;\
+             SELECT balance FROM accounts WHERE id = 1;\
+             UPDATE accounts SET balance = balance - 100 WHERE id = 1;\
+             UPDATE accounts SET balance = balance + 100 WHERE id = 2;\
+             COMMIT TRANSACTION;",
+        )
+        .expect("documented transaction block");
+        let Statement::TransactionBlock {
+            timeout_ms,
+            statements,
+            rollback,
+        } = statement
+        else {
+            panic!("expected transaction block, got {statement:?}");
+        };
+        assert_eq!(timeout_ms, None);
+        assert!(!rollback);
+        assert_eq!(statements.len(), 3);
+        assert!(matches!(statements[0], Statement::Select(_)));
+        assert!(matches!(statements[1], Statement::Update(_)));
+        assert!(matches!(statements[2], Statement::Update(_)));
+    }
+
+    #[test]
+    fn transaction_block_rejects_nested_transactions_and_ddl() {
+        let nested =
+            parse("BEGIN TRANSACTION; BEGIN TRANSACTION; COMMIT TRANSACTION; COMMIT TRANSACTION;")
+                .unwrap_err();
+        assert!(nested.to_string().contains("nested transactions"));
+
+        let ddl = parse(
+            "BEGIN TRANSACTION; CREATE TABLE forbidden (id int PRIMARY KEY); COMMIT TRANSACTION;",
+        )
+        .unwrap_err();
+        assert!(ddl
+            .to_string()
+            .contains("only SELECT, INSERT, UPDATE, and DELETE"));
+    }
+
+    #[test]
+    fn parse_empty_rollback_transaction_block() {
+        let statement = parse("BEGIN TRANSACTION ROLLBACK TRANSACTION").unwrap();
+        assert!(matches!(
+            statement,
+            Statement::TransactionBlock {
+                statements,
+                rollback: true,
+                ..
+            } if statements.is_empty()
+        ));
     }
 
     #[test]
