@@ -130,6 +130,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
   `ferrosa-row-bridge`.
+  Map element assignments (`map[key] = value`) are emitted as complex cells
+  whose path is the encoded key and whose value is the encoded map value. They
+  therefore compose safely with whole-map inserts and later key removals.
   **Timestamp bounds validation (Bug C, t_a0f922a3)**: `validate_timestamp_ms`
   rejects any `timestamp` cell outside `[TIMESTAMP_MIN_MS, TIMESTAMP_MAX_MS]`
   (chrono `MIN_UTC`/`MAX_UTC` millis) at the **write** boundary — integer-literal,

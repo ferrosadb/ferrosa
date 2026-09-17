@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-09-16
+last_updated: 2026-09-17
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -35,6 +35,7 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 | CQL-17 | Compound clustering-key tuple slices were rejected at the left parenthesis. | Applications could not express a unique keyset cursor over tied leading clustering values and had to synthesize a packed cursor column. | 5 | 7 | 2 | 70 → 10 | **Fixed (t_4d8925f4):** parser arity checks, ordered PREPARE markers, declared clustering-order validation, and lexicographic execution. End-to-end regression retains `(10, 'b')` after cursor `(10, 'a')`. |
 | CQL-18 | Full-text resolution selected the first index targeting a column without checking its index kind. | When phonetic/scalar and full-text indexes shared a column, `fts_match` consulted the incompatible index and returned an empty result despite successful DDL. | 8 | 3 | 5 | 120 → 16 | **Fixed (t_bf1aa16c):** dedicated full-text resolution now requires `IndexType::FullText`; regression covers a non-full-text-only registration and an end-to-end multi-index column. |
 | CQL-19 | The planner selected a secondary index whose backfill had not finished. | `CREATE INDEX` over existing rows builds asynchronously. Until it completed the index covered part of the table, and the global index arm consulted it anyway — returning that fraction as the whole answer (0 of 1 rows, 2374 of 2500 in `test_2i_demo.py`) with nothing to distinguish it from a genuinely empty result. The tracker knew (`mark_pending` precedes every build); the read path never asked. | 8 | 6 | 8 | 384 → 16 | **Fixed (t_edd3be70, t_12457d3e):** `index_cannot_answer_completely` withholds from the planner any index this node cannot answer from in full — absent locally, or still building — so the read takes the scan its `ALLOW FILTERING` licenses (at WARN) and is refused, naming each index and why, only when it licensed none. Refusing the licensed case is what turned this into an outage: ferrosa-memory entity streams got `Internal server error` on `main` and every open PR. Regressions: `a_still_building_index_does_not_answer_a_read_short`, `a_still_building_index_refuses_a_read_it_cannot_serve`, `a_tenant_index_the_engine_lost_falls_back_to_the_scan_it_licensed`. |
+| CQL-21 | `map[key] = value` stored the scalar map value as a pathless whole-column cell | A later collection operation mixed that scalar with path-keyed map cells. SSTable flush panicked before collection normalization; after normalization was added, it failed loud while decoding the scalar bytes as a collection blob. | 8 | 5 | 2 | 80 → 8 | **Fixed:** non-transactional map element assignment now writes the encoded key as the cell path and the encoded value as its payload. The regression executes whole-map insert → element put → key removal through the router. List index assignment now fails clearly until its required read-modify-write path is implemented. |
 
 ## Top risks to act on
 

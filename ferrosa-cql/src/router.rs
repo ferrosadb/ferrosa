@@ -8520,24 +8520,40 @@ async fn route_update(
                     }
                 }
             }
-            Assignment::Element {
-                column,
-                key: _,
-                value,
-            } => {
-                // Map/list element set: coerce value to the element type, not the collection type
+            Assignment::Element { column, key, value } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
                     .ok_or_else(|| CqlError::Invalid(format!("unknown column: {}", column)))?;
                 let cql_type = resolve_col_type(&col_meta.column_type, ks, &state.schema)?;
-                let value_type = match &cql_type {
-                    CqlType::Map(_, v) => (**v).clone(),
-                    CqlType::List(v) => (**v).clone(),
-                    _ => cql_type.clone(),
-                };
-                let val = bridge::term_to_cql_value(value, &value_type)?;
-                (column.as_str(), val)
+                match cql_type {
+                    CqlType::Map(key_type, value_type) => {
+                        let key = bridge::term_to_cql_value(key, &key_type)?;
+                        let value = bridge::term_to_cql_value(value, &value_type)?;
+                        let col_idx = table_meta.storage_column_index(column).ok_or_else(|| {
+                            CqlError::Invalid(format!(
+                                "column '{}' not found in storage schema",
+                                column
+                            ))
+                        })?;
+                        complex_cells.push((
+                            col_idx,
+                            ferrosa_common::CellValue::live(encode_value(&value), timestamp)
+                                .with_path(encode_value(&key)),
+                        ));
+                        continue;
+                    }
+                    CqlType::List(_) => {
+                        return Err(CqlError::Invalid(format!(
+                            "column '{column}': list index updates require a read-modify-write path"
+                        )));
+                    }
+                    _ => {
+                        return Err(CqlError::Invalid(format!(
+                            "column '{column}' does not support element updates"
+                        )));
+                    }
+                }
             }
         };
         let col_idx = table_meta.storage_column_index(col_name).ok_or_else(|| {
@@ -15790,6 +15806,31 @@ mod tests {
             materialize_update(&state, &ctx, &remove, 123).is_err(),
             "list remove-by-value needs a read — must stay fail-loud in a transaction"
         );
+    }
+
+    #[tokio::test]
+    async fn map_element_put_then_key_remove_keeps_complex_cell_shape() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        for cql in [
+            "CREATE KEYSPACE ks WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE ks.t (k int PRIMARY KEY, props map<text, text>)",
+            "INSERT INTO ks.t (k, props) VALUES (1, {'color': 'red', 'size': 'large'})",
+            "UPDATE ks.t SET props['weight'] = 'heavy' WHERE k = 1",
+            "UPDATE ks.t SET props = props - {'color'} WHERE k = 1",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("failed `{cql}`: {error}"));
+        }
     }
 
     /// The Accord transaction write path flags a `list` append cell so the replica
