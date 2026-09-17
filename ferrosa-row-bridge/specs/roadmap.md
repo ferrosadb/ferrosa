@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-row-bridge
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-09-17
 ---
 
 # ferrosa-row-bridge — Roadmap
@@ -16,12 +16,14 @@ dependency/usage review.
   `cargo test -p ferrosa-row-bridge` does not exercise this crate's core. Bring
   `build_decorated_key` / `build_row` / `build_delete_row` / `encode_clustering`
   / `encode_value` / `decode_value` round-trip tests here.
+  Duration's signed-vint compatibility and malformed trailing-byte cases are
+  already covered in-crate.
 
 ## Next
 
 - **Enumerate the supported-type matrix per front-end.** Make explicit which CQL
   types `encode_value`/`decode_value` round-trip vs. which decode to NULL
-  (Duration, collections, UDT, tuple, vector). Surface unsupported types as
+  (collections, UDT, tuple, vector). Surface unsupported types as
   fail-loud where a front-end requires them, rather than silent NULL.
 - **De-duplicate `ferrosa-cql`'s remaining metadata decomposition variants** that
   still live in `ferrosa-cql` but reuse this crate's liveness helpers — fold them

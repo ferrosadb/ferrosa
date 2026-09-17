@@ -3,6 +3,10 @@
 //! Moved verbatim (behaviour-identical) from `ferrosa-cql` so both the CQL and
 //! Postgres front-ends share one decode path. The only change from the original
 //! is the error type: `CqlError::Invalid(msg)` -> [`RowBridgeError::invalid`].
+//! Correctness: encoded values must match the Cassandra native-protocol byte
+//! representation and decode without accepting trailing bytes.
+//! Last revised: 2026-09-17.
+//! Last changed: corrected duration components to use Cassandra signed vints.
 
 use std::net::IpAddr;
 
@@ -225,6 +229,11 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBri
             let months = decode_vint(bytes, &mut offset)? as i32;
             let days = decode_vint(bytes, &mut offset)? as i32;
             let nanos = decode_vint(bytes, &mut offset)?;
+            if offset != bytes.len() {
+                return Err(RowBridgeError::invalid(
+                    "duration contains trailing bytes after three vints",
+                ));
+            }
             Ok(CqlValue::Duration {
                 months,
                 days,
@@ -344,45 +353,23 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBri
     }
 }
 
-/// Zigzag-encode and write a signed integer as a variable-length byte sequence.
-/// This is the encoding Cassandra uses for the CQL duration type (0x0015).
+/// Zigzag-encode and write a signed integer using Cassandra's leading-ones
+/// variable-length encoding for the CQL duration type (0x0015).
 fn encode_vint(value: i64) -> Vec<u8> {
-    let zigzag = if value >= 0 {
-        (value as u64) << 1
-    } else {
-        ((-(value + 1)) as u64) << 1 | 1
-    };
-    let mut buf = Vec::new();
-    let mut v = zigzag;
-    loop {
-        if v < 0x80 {
-            buf.push(v as u8);
-            break;
-        }
-        buf.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    buf
+    let mut buf = [0u8; 9];
+    let len = ferrosa_sstable::varint::write_signed_vint(&mut buf, value);
+    buf[..len].to_vec()
 }
 
 /// Decode a zigzag-encoded variable-length integer from `data` at `offset`.
 fn decode_vint(data: &[u8], offset: &mut usize) -> Result<i64, RowBridgeError> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    loop {
-        if *offset >= data.len() {
-            return Err(RowBridgeError::invalid("truncated vint in duration"));
-        }
-        let byte = data[*offset];
-        *offset += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    // Zigzag decode
-    Ok(((result >> 1) as i64) ^ (-((result & 1) as i64)))
+    let remaining = data
+        .get(*offset..)
+        .ok_or_else(|| RowBridgeError::invalid("truncated vint in duration"))?;
+    let (value, consumed) = ferrosa_sstable::varint::read_signed_vint(remaining)
+        .map_err(|_| RowBridgeError::invalid("truncated vint in duration"))?;
+    *offset += consumed;
+    Ok(value)
 }
 
 /// Read the 4-byte element count from a collection header.
@@ -686,5 +673,29 @@ impl<'a> TypeParser<'a> {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod duration_vint_tests {
+    use super::*;
+
+    #[test]
+    fn duration_uses_cassandra_vint_wire_format() {
+        let value = CqlValue::Duration {
+            months: 14,
+            days: 3,
+            nanos: 4_005_006_007,
+        };
+
+        let encoded = encode_value(&value);
+        assert_eq!(encoded, [0x1c, 0x06, 0xf1, 0xdd, 0x6f, 0x15, 0x6e]);
+        assert_eq!(decode_value(&CqlType::Duration, &encoded).unwrap(), value);
+    }
+
+    #[test]
+    fn duration_rejects_trailing_bytes() {
+        let err = decode_value(&CqlType::Duration, &[0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"));
     }
 }
