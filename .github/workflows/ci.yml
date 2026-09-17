@@ -44,6 +44,8 @@ jobs:
         run: python3 -m unittest tests.ci.test_install_smoke_workflow
       - name: Check release binary path resolution
         run: python3 -m unittest tests.ci.test_resolve_release_bin_dir
+      - name: Check CI cache workflow contract
+        run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
 
   no-memory-public:
     name: memory-public is NOT TO BE USED
@@ -240,7 +242,24 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y capnproto
       - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build glibc release binary (once)
-        run: cargo build --release -p ferrosa -p ferrosa-ctl
+        # The hosted image already contains a different `sccache` on PATH. Use
+        # the action-managed binary explicitly so its GHA backend and reported
+        # statistics describe the compiler process Cargo actually invoked.
+        run: RUSTC_WRAPPER="$SCCACHE_PATH" cargo build --release -p ferrosa -p ferrosa-ctl
+      - name: Verify sccache handled compiler requests
+        run: |
+          "$SCCACHE_PATH" --show-stats --stats-format=json > /tmp/sccache-stats.json
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/sccache-stats.json", encoding="utf-8") as stats_file:
+              requests = json.load(stats_file)["stats"]["compile_requests"]
+          if requests <= 0:
+              raise SystemExit(
+                  "sccache handled zero compiler requests; release build bypassed the cache"
+              )
+          print(f"sccache handled {requests} compiler requests")
+          PY
       - name: Package into a thin runtime image
         run: |
           mkdir -p node-bin
