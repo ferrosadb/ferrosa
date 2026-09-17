@@ -3955,20 +3955,18 @@ async fn route_select(
                     ]
                 })
                 .collect();
-            // p1-37: honor the SELECT projection — scylla 0.15 issues
-            // `SELECT keyspace_name, table_name FROM system_schema.tables`
-            // and type-checks the result against a 2-tuple. Without
-            // projection we'd return 3 cols and trip a column-count
-            // mismatch.
-            let (filt_names, filt_types, filt_rows) =
-                filter_system_columns(&s.columns, &col_names, &col_types, &rows);
-            Ok(result::encode_rows(
-                &filt_names,
-                &filt_types,
+            // Honor both ordinary projection and aggregates. The lightweight
+            // `filter_system_columns` helper silently omits count(*), producing
+            // zero column specs followed by one payload row per table; drivers
+            // then decode beyond the malformed frame and close the connection.
+            apply_system_select(
+                &s.columns,
+                &col_names,
+                &col_types,
+                &rows,
                 "system_schema",
                 "tables",
-                &filt_rows,
-            ))
+            )
         }
         ("system_schema", "columns") => {
             let snap = state.schema.snapshot();
@@ -28589,6 +28587,40 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    #[tokio::test]
+    async fn count_system_schema_tables_returns_one_bigint_row() {
+        let (state, _dir) = setup();
+        let dev = dev_auth();
+        let current_keyspace = None;
+        let ctx = RequestContext {
+            auth: &dev,
+            current_keyspace: &current_keyspace,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE count_schema WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE count_schema.items (id int PRIMARY KEY)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("{cql}: {e:?}"));
+        }
+
+        let stmt = crate::parser::parse(
+            "SELECT count(*) FROM system_schema.tables WHERE keyspace_name = 'count_schema'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_first_bigint_value(&body), 1);
     }
 
     #[tokio::test]

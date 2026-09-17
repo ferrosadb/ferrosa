@@ -120,6 +120,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   ferrosa-memory's entity streams into 500s across `main` and every open PR
   (t_12457d3e). Once the index is current, an empty global lookup is a real miss
   and never falls back to a scan.
+  Virtual `system_schema` reads share one projection/aggregate encoder: ordinary
+  projections expose exactly the requested metadata, and `count(*)` returns one
+  `bigint` row instead of a zero-column frame that standard drivers cannot
+  decode.
 - **Bridge** (`bridge.rs`) — parser `Term` → wire `CqlValue` → storage
   `CellValue`/`Row` conversions, server-side function eval (`now()`,
   `toTimestamp()`), and the **re-export** of the row codec from
