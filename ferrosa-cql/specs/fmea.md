@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: fmea
-last_updated: 2026-09-05
+last_updated: 2026-09-16
 ---
 
 # ferrosa-cql — FMEA / Known Issues
@@ -12,6 +12,7 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+| CQL-20 | **Standalone role DDL changed only the in-memory schema.** Direct `CREATE ROLE`, `ALTER ROLE`, and `DROP ROLE` bypassed the replicated DDL path's `SystemTableWriter`. | Role creation/deletion and password rotations appeared successful but were lost on restart; seed accounts reverted to defaults. | 10 | 10 | 2 | 200 → 10 | **Fixed:** direct role DDL now writes or tombstones `system_auth.roles`, including the bcrypt hash and SCRAM verifier. Regression: `alter_role_persists_rotated_password_in_system_auth`. |
 
 | CQL-1 | LWT routed to Accord in standalone/pair mode where `peer_manager`/`accord_clock` are absent | `INSERT ... IF NOT EXISTS` / `IF <cond>` return `ServerError` ("not yet implemented") instead of executing | 8 | 5 | 2 | 80 | **Designed fail-loud** (p0-03): `route()` returns a clear error rather than a silent non-linearizable local path. Full coordinator driver tracked on `fix/p0-03b-accord-network`. Real functional gap, but observable. |
 | CQL-2 | `paging_state` cursor is opaque but **unsigned** — `PagingState::encode/decode` is a plain length-prefixed pk+ck+flag with no HMAC | A client can forge/tamper a paging token to resume at an arbitrary key, bypassing the original query's partition scope (cross-partition read / IDOR-style) | 7 | 4 | 7 | 196 → 24 | **Implemented.** `encode` appends `HMAC-SHA256(process_key, payload)`; `decode` verifies it constant-time (`Mac::verify_slice`) before parsing, rejecting any forged/tampered cursor. Key from `FERROSA_PAGING_HMAC_KEY` (64 hex) or a random per-process key (multi-node clusters must share it). Tests: `tampered_paging_state_is_rejected`, `unsigned_forged_paging_state_is_rejected`. |

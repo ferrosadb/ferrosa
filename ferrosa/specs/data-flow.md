@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 doc: data-flow
-last_updated: 2026-08-07
+last_updated: 2026-09-16
 ---
 
 # ferrosa — Startup & Composition Data Flow
@@ -34,9 +34,10 @@ sequenceDiagram
     Main->>Cdc: CdcBus::new(1024)
     Cdc-->>Store: set_cdc_bus() attach to commit log
     Main->>Schema: Schema::new(config)
-    Schema->>Schema: seed roles if auth; restore local then S3 then fresh
-    Schema->>Store: re-register indexes, UDTs, UDFs, perms
+    Schema->>Schema: restore local schema, then S3, then fresh
     Main->>Store: replay pending commitlog mutations
+    Schema->>Store: re-register indexes, UDTs, UDFs, roles, perms
+    Schema->>Schema: seed only roles still missing after recovery
     Main->>Cluster: ModeController::new(cfg, net_cfg, host_id, store, schema, registry)
     Main->>Net: PeerManager::new(net_cfg, host_id, mode_controller)
     Net-->>Cluster: PeerManager set as PeerEventListener

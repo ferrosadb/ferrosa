@@ -16,6 +16,11 @@
 //! 13. Wait for shutdown signal
 //! 14. Graceful shutdown with timeout
 //!
+//! Correctness: commit-log recovery precedes system-table reconstruction, and
+//! persisted roles are restored before missing seed credentials are created.
+//! Last revised: 2026-09-16.
+//! Last changed: made rotated role passwords authoritative across restart.
+//!
 //! Correctness: consensus supervision is installed after the controller exists
 //! and before any OpenRaft task can start.
 //! Last revised: 2026-08-27
@@ -1236,39 +1241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "runtime-stall detector armed on the CQL request runtime"
     );
 
-    // 4a. Seed default roles if auth is enabled.
-    //
-    // `ferrosa_schema::Schema::new` always creates the built-in `cassandra`
-    // superuser; the bootstrap helper creates three additional well-known
-    // roles (`ferrosa_admin` SUPERUSER, `graph_engine` and `app_reader`
-    // unprivileged LOGIN) so a fresh cluster with auth enabled is never
-    // locked out. All calls are idempotent — subsequent restarts are no-ops.
-    //
-    // A one-shot 5-minute task fires a loud WARN if `ferrosa_admin` is
-    // still using the default seed password. This mirrors Cassandra's
-    // default-credentials nag and gives the operator a single reminder
-    // window to rotate.
-    if storage_auth_enabled {
-        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
-        let schema_for_warn = Arc::clone(&schema);
-        runtimes.background.spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
-            if ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema_for_warn) {
-                tracing::warn!(
-                    "ferrosa_admin is still using the default seed password \
-                     after 5 minutes — rotate it NOW. See \
-                     specs/decisions/design-cql-role-auth-rollout.md Sprint A."
-                );
-            }
-        });
-    } else {
-        tracing::info!(
-            "auth_enabled=false — skipping seed-role bootstrap. Set \
-             FERROSA_AUTH_ENABLED=true to enforce CQL role auth."
-        );
-    }
-
-    // 4b. Restore schema from local disk or S3.
+    // 4a. Restore schema from local disk or S3.
     //
     // Priority:
     //   1. Local schema.json (survives binary upgrades with same data dir)
@@ -1305,6 +1278,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Persist the S3 schema locally so future restarts don't need S3
             persist_schema_locally(data_path, &schema)?;
+        }
+    }
+
+    // Replay the commit log before reconstructing indexes, types, functions,
+    // and roles from their system tables. An acknowledged ALTER ROLE may exist
+    // only in the commit log after a crash; loading system_auth first would
+    // miss that row and seed the default password again.
+    if !pending_mutations.is_empty() {
+        tracing::info!(
+            count = pending_mutations.len(),
+            "replaying commit log mutations into memtables"
+        );
+        if let Err(e) = storage.replay_mutations(pending_mutations) {
+            tracing::error!(%e, "commit log replay failed — some data may be lost");
+        } else {
+            tracing::info!("commit log replay complete — all pending mutations restored");
         }
     }
 
@@ -1414,6 +1403,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if storage_auth_enabled {
         let loader =
             ferrosa_cluster::system_table_loader::SystemTableLoader::new(Arc::clone(&storage));
+        match loader.replay_roles_into_schema(&schema) {
+            Ok(count) if count > 0 => {
+                tracing::info!(count, "replayed persisted roles from system_auth")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%e, "failed to replay persisted roles"),
+        }
+
+        // Seed only after both schema.json and system_auth.roles have been
+        // restored. A fresh registry always contains the built-in cassandra
+        // role; seeding before recovery recreated the other defaults on every
+        // start and let a stale bootstrap hash win after an unclean shutdown.
+        ferrosa_schema::auth::bootstrap::seed_default_roles(&schema)?;
+        let schema_for_warn = Arc::clone(&schema);
+        runtimes.background.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+            if ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema_for_warn) {
+                tracing::warn!(
+                    "ferrosa_admin is still using the default seed password \
+                     after 5 minutes — rotate it NOW. See \
+                     specs/decisions/design-cql-role-auth-rollout.md Sprint A."
+                );
+            }
+        });
+
         match loader.replay_role_permissions_into_schema(&schema) {
             Ok(count) if count > 0 => {
                 tracing::info!(
@@ -1424,19 +1438,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => {}
             Err(e) => tracing::warn!(%e, "failed to replay persisted role permissions"),
         }
-    }
-
-    // 4c. Replay pending commit log mutations now that tables are registered.
-    if !pending_mutations.is_empty() {
+    } else {
         tracing::info!(
-            count = pending_mutations.len(),
-            "replaying commit log mutations into memtables"
+            "auth_enabled=false — skipping seed-role bootstrap. Set \
+             FERROSA_AUTH_ENABLED=true to enforce CQL role auth."
         );
-        if let Err(e) = storage.replay_mutations(pending_mutations) {
-            tracing::error!(%e, "commit log replay failed — some data may be lost");
-        } else {
-            tracing::info!("commit log replay complete — all pending mutations restored");
-        }
     }
 
     // 5. Create ModeController — starts in standalone mode

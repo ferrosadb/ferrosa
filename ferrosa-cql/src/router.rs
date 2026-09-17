@@ -11,8 +11,8 @@
 //! Correctness: compound clustering restrictions validate declared key order,
 //! and bounded single-column clustering resumes stop before materializing a
 //! wide partition tail.
-//! Last revised: 2026-08-27.
-//! Last changed: stream full-PK `ck > value LIMIT n` reads from the clustering bound.
+//! Last revised: 2026-09-16.
+//! Last changed: persist standalone role mutations to system_auth before reply.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -10825,6 +10825,19 @@ async fn route_drop_index(
 
 // ── DDL: Role ────────────────────────────────────────────────────────────
 
+fn persist_role_row_direct(state: &SharedState, name: &str) -> Result<(), CqlError> {
+    let role = state
+        .schema
+        .snapshot()
+        .roles
+        .get(name)
+        .cloned()
+        .ok_or_else(|| CqlError::ServerError(format!("role disappeared before persist: {name}")))?;
+    ferrosa_cluster::system_table_writer::SystemTableWriter::new(state.engine.clone())
+        .apply(ferrosa_schema::system::persistence::SystemTableMutation::RoleCreated(role))
+        .map_err(|e| CqlError::ServerError(format!("persist role {name}: {e}")))
+}
+
 async fn route_create_role(
     state: &SharedState,
     ctx: &RequestContext<'_>,
@@ -10867,6 +10880,7 @@ async fn route_create_role(
                     .schema
                     .create_role(base_role, s.password.as_deref(), ctx.auth)?;
             }
+            persist_role_row_direct(state, &s.name)?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: serialise `DdlOperation::CreateRole(role)`
@@ -10943,6 +10957,7 @@ async fn route_alter_role(
                 member_of: None,
             };
             state.schema.alter_role(&s.name, updates, ctx.auth)?;
+            persist_role_row_direct(state, &s.name)?;
         }
         DdlPath::Pair(_) | DdlPath::Cluster { .. } => {
             // Pair/Cluster paths: `alter_role_internal` (registry.rs:481)
@@ -11015,6 +11030,15 @@ async fn route_drop_role(
     match ddl {
         DdlPath::Direct { .. } => {
             state.schema.drop_role(&s.name, ctx.auth)?;
+            ferrosa_cluster::system_table_writer::SystemTableWriter::new(state.engine.clone())
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::RoleDropped(
+                        s.name.clone(),
+                    ),
+                )
+                .map_err(|e| {
+                    CqlError::ServerError(format!("persist dropped role {}: {e}", s.name))
+                })?;
         }
         DdlPath::Pair(coordinator) => {
             let op = DdlOperation::DropRole(s.name.clone());
@@ -26923,6 +26947,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alter_role_persists_rotated_password_in_system_auth() {
+        let (state, _dir) = setup();
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+        route(
+            &state,
+            &ctx,
+            crate::parser::parse(
+                "CREATE ROLE restart_role WITH PASSWORD = 'before-restart' AND LOGIN = true",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        route(
+            &state,
+            &ctx,
+            Statement::AlterRole(AlterRoleStatement {
+                name: "restart_role".into(),
+                password: Some("after-restart".into()),
+                hashed_password: None,
+                superuser: None,
+                login: None,
+                options: Vec::new(),
+                access: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let persisted =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone())
+                .load_roles()
+                .unwrap();
+        let role = persisted
+            .iter()
+            .find(|role| role.name == "restart_role")
+            .expect("ALTER ROLE must persist the authoritative role row");
+        assert!(ferrosa_schema::PasswordHasher::verify_password_any(
+            "after-restart",
+            role.salted_hash.as_deref().unwrap()
+        )
+        .unwrap());
+        assert!(
+            role.scram.is_some(),
+            "the durable role row must carry its Postgres SCRAM verifier"
+        );
+    }
+
+    #[tokio::test]
     async fn drop_role_removes_from_schema() {
         let (state, _dir) = setup();
         let ctx = RequestContext {
@@ -26954,6 +27036,14 @@ mod tests {
 
         let snap = state.schema.snapshot();
         assert!(!snap.roles.contains_key("dr_role"), "role should be gone");
+        let persisted =
+            ferrosa_cluster::system_table_loader::SystemTableLoader::new(state.engine.clone())
+                .load_roles()
+                .unwrap();
+        assert!(
+            persisted.iter().all(|role| role.name != "dr_role"),
+            "DROP ROLE must tombstone the durable role row"
+        );
     }
 
     // ── DROP INDEX routing tests ──────────────────────────────────────

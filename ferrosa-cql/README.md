@@ -53,6 +53,9 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `route_batch` and the DDL/role handlers. Fast paths exist for prepared
   SELECT/INSERT. ORDER BY classification picks an inline vs. spillable temp-sort
   plan. Carries the security mitigations (M8 permissions, M12 batch cap).
+  Standalone role create/alter/drop handlers also write the authoritative
+  `system_auth.roles` row before acknowledging success, matching the
+  pair/cluster persistence contract.
   The `DEFAULT_RANGE_READ_LIMIT` (10_000) result cap is removed for the
   O(1)-streamable full-scan shapes, which are bounded only by the query's own
   `LIMIT` — never a server-side row cap: projected scans (e.g. `SELECT DISTINCT
