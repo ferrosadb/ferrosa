@@ -159,6 +159,15 @@ pub enum Statement {
     BeginTransaction {
         timeout_ms: Option<u64>,
     },
+    /// A documented single-query transaction block:
+    /// `BEGIN TRANSACTION; <DML/SELECT>; ...; COMMIT|ROLLBACK [TRANSACTION];`.
+    /// The connection layer executes the body through the same registry-backed
+    /// transaction path used by separately submitted control statements.
+    TransactionBlock {
+        timeout_ms: Option<u64>,
+        statements: Vec<Statement>,
+        rollback: bool,
+    },
     /// `COMMIT [TRANSACTION [<id>]]` — commits a transaction. `txn_id = Some(id)`
     /// targets a connection-independent transaction by id; `None` resolves via the
     /// connection's compat-shim binding (bare `COMMIT`).

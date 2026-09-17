@@ -185,7 +185,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `transaction_limits.rs`) — routing decision (Accord in cluster mode, local in
   standalone), `IF [NOT] EXISTS` / `IF <cond>` CAS semantics with the `[applied]`
   result column, partition-key extraction for Accord, and per-connection
-  transaction limits (concurrency / timeout / key count).
+  transaction limits (concurrency / timeout / key count). Both separately sent
+  `BEGIN` / body / `COMMIT` statements and the documented single-query
+  `BEGIN TRANSACTION; ...; COMMIT TRANSACTION;` block form use the same
+  registry-backed Accord path; body errors roll the block back immediately.
 - **SUBSCRIBE / CDC** (`subscribe.rs`, `event.rs`) — per-connection streaming
   subscriptions that re-run an inner SELECT on an interval and push delta frames;
   dual-timestamp (Accord ts + apply ts) events; CQL `EVENT` push via a broadcast
