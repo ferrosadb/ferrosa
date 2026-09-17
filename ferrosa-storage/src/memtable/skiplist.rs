@@ -73,7 +73,7 @@ impl Memtable for SkipListMemtable {
             let old_size = estimate_partition_size(&current);
 
             let mut merged = (*current).clone();
-            super::sharded::merge_row_into_partition(&mut merged, row.clone());
+            super::sharded::merge_row_into_partition(&mut merged, row.clone(), schema)?;
             let new_size = estimate_partition_size(&merged);
 
             let new_arc = Arc::new(merged);

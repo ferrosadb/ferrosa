@@ -156,7 +156,7 @@ impl Memtable for ShardedBTreeMemtable {
             // write lock, no other thread can be reading/writing this shard.
             // Use Arc::make_mut for copy-on-write if there are other Arc refs.
             let partition = Arc::make_mut(existing);
-            merge_row_into_partition(partition, row);
+            merge_row_into_partition(partition, row, schema)?;
 
             let new_size = Self::estimate_partition_size(partition);
             // Update size delta (could be negative if overwrite with smaller value,
@@ -312,7 +312,11 @@ impl Memtable for ShardedBTreeMemtable {
 /// Binary searches the partition's rows by clustering key. If a row with the
 /// same clustering key exists, merges cells (newer timestamp wins per cell).
 /// Otherwise inserts the row at the correct sorted position.
-pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) {
+pub(crate) fn merge_row_into_partition(
+    partition: &mut Partition,
+    mut new_row: Row,
+    schema: &TableSchema,
+) -> Result<()> {
     // A partition-tombstone marker is a partition-level DELETE: merge it into
     // `Partition::deletion` (newer tombstone wins, LWW) rather than storing it
     // as a clustered row. Otherwise it would sit in `rows` as a phantom
@@ -321,7 +325,7 @@ pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) 
         if new_row.deletion.marked_for_delete_at > partition.deletion.marked_for_delete_at {
             partition.deletion = new_row.deletion;
         }
-        return;
+        return Ok(());
     }
 
     // Binary search by clustering key
@@ -333,6 +337,8 @@ pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) 
         Ok(idx) => {
             // Row with same clustering key exists — merge cells
             let existing_row = &mut partition.rows[idx];
+
+            super::normalize_collection_rows_for_merge(existing_row, &mut new_row, schema)?;
 
             // Update row-level deletion: newer tombstone wins (LWW).
             if new_row.deletion.marked_for_delete_at > existing_row.deletion.marked_for_delete_at {
@@ -377,6 +383,7 @@ pub(crate) fn merge_row_into_partition(partition: &mut Partition, new_row: Row) 
             partition.rows.insert(idx, new_row);
         }
     }
+    Ok(())
 }
 
 /// K-way merge of pre-sorted partition vectors into a single sorted vector.
@@ -618,8 +625,8 @@ mod tests {
         // paths both survive — the convergence a single whole-collection cell cannot
         // express, and the reason a list-append no longer needs a read-modify-write.
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"a", 10));
-        merge_row_into_partition(&mut p, complex_row(0, b"pB", b"b", 11));
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"a", 10), &test_schema()).unwrap();
+        merge_row_into_partition(&mut p, complex_row(0, b"pB", b"b", 11), &test_schema()).unwrap();
         let cells = &p.rows[0].cells;
         assert_eq!(cells.len(), 2, "both element cells retained");
         // Cells stay sorted by (col, path): pA before pB.
@@ -631,8 +638,10 @@ mod tests {
     #[test]
     fn merge_reconciles_same_path_by_lww() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"old", 10));
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"new", 20));
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"old", 10), &test_schema())
+            .unwrap();
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"new", 20), &test_schema())
+            .unwrap();
         assert_eq!(
             p.rows[0].cells.len(),
             1,
@@ -643,7 +652,8 @@ mod tests {
             Some(b"new".as_slice())
         );
         // A stale write (lower ts) does not win.
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"stale", 5));
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"stale", 5), &test_schema())
+            .unwrap();
         assert_eq!(
             p.rows[0].cells[0].1.value.as_deref(),
             Some(b"new".as_slice())
@@ -653,11 +663,11 @@ mod tests {
     #[test]
     fn merge_same_path_tombstone_wins_equal_timestamp() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"v", 10));
+        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"v", 10), &test_schema()).unwrap();
         // A remove (tombstone) at the SAME timestamp wins the tie — element gone.
         let mut remove = complex_row(0, b"pA", b"v", 10);
         remove.cells[0].1 = CellValue::tombstone(10, i32::MAX).with_path(b"pA".to_vec());
-        merge_row_into_partition(&mut p, remove);
+        merge_row_into_partition(&mut p, remove, &test_schema()).unwrap();
         assert!(
             p.rows[0].cells[0].1.is_tombstone(),
             "tombstone wins the equal-ts tie"
@@ -665,17 +675,12 @@ mod tests {
     }
 
     #[test]
-    fn merge_simple_and_complex_cells_are_distinct_keys() {
-        // A path=None (simple) cell and a path=Some (complex) cell on the same column
-        // index are distinct merge keys; both survive. Defensive — a real column is
-        // either simple or complex — but it pins that the merge keys uniformly on
-        // (col, path) and never conflates the two.
+    fn merge_rejects_path_cell_for_scalar_column() {
         let mut p = empty_partition();
-        merge_row_into_partition(&mut p, make_row(0, b"s", 10)); // path None
-        merge_row_into_partition(&mut p, complex_row(0, b"pA", b"c", 11));
-        assert_eq!(p.rows[0].cells.len(), 2);
-        assert_eq!(p.rows[0].cells[0].1.path, None, "None sorts first");
-        assert_eq!(p.rows[0].cells[1].1.path.as_deref(), Some(b"pA".as_slice()));
+        merge_row_into_partition(&mut p, make_row(0, b"s", 10), &test_schema()).unwrap();
+        let err = merge_row_into_partition(&mut p, complex_row(0, b"pA", b"c", 11), &test_schema())
+            .unwrap_err();
+        assert!(err.to_string().contains("non-collection column val"));
     }
 
     /// Schema with a TimeUUID column at index 0. Used for the fail-loud
