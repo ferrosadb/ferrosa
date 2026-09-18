@@ -59,6 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+mod log_rotation;
 mod repair_wiring;
 mod runtime;
 mod sentry_reporting;
@@ -880,7 +881,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // lives until the process exits.
     let env_filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let (non_blocking_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
+
+    // The config file is read HERE, before the subscriber exists, because the
+    // process has to know how to maintain its own log before it writes to it.
+    // It is read again below for everything else; a second parse of a small
+    // TOML costs nothing next to getting this wrong.
+    let early_config_path =
+        std::env::var("FERROSA_CONFIG").unwrap_or_else(|_| "/etc/ferrosa/ferrosa.toml".to_string());
+    let early_config = load_config(&early_config_path).unwrap_or_else(|_| {
+        // A malformed config is reported by the real load below, which can fail
+        // the boot properly. Here it only means "no logging section".
+        toml::Value::Table(toml::map::Map::new())
+    });
+    let rotation =
+        log_rotation::LogRotationConfig::from_config(&early_config, |key| std::env::var(key).ok());
+    if let Err(error) = rotation.validate() {
+        // Before any subscriber exists, so this is the only way to say it.
+        eprintln!("ferrosa: refusing to start: {error}");
+        std::process::exit(2);
+    }
+    // A directory turns on process-owned rotation. Without one the process
+    // writes to stdout exactly as before, which is what a foreground run wants.
+    let log_dir =
+        config_val_opt("FERROSA_LOG_DIR", &early_config, "logging", "directory").map(expand_tilde);
+
+    let (non_blocking_writer, _log_guard) = match (&log_dir, rotation.enabled) {
+        (Some(dir), true) => {
+            let dir = std::path::PathBuf::from(dir);
+            match log_rotation::RotatingWriter::open(&dir, "ferrosa.log", rotation.clone()) {
+                Ok(writer) => tracing_appender::non_blocking(writer),
+                Err(error) => {
+                    // Say so and keep the logs, rather than start a database
+                    // that silently writes its diagnostics nowhere.
+                    eprintln!(
+                        "ferrosa: cannot open the log directory {}: {error} -- logging to stdout",
+                        dir.display()
+                    );
+                    tracing_appender::non_blocking(std::io::stdout())
+                }
+            }
+        }
+        _ => tracing_appender::non_blocking(std::io::stdout()),
+    };
 
     // Before the subscriber. The Sentry layer is inert without a client, and
     // the errors most worth having from a database are the ones raised while

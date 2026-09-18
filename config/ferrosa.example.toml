@@ -137,3 +137,34 @@ bind = "127.0.0.1:9090"
 # (no auth required) so Prometheus scrapers work without credentials.
 # All other /api/* and /admin/* routes require auth when
 # FERROSA_MODE=production (or auth_disabled=false).
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+# The process maintains its own log files. Rotation is NOT delegated to launchd
+# or systemd: neither configures it by default, which is how node1.out.log
+# reached 1.6 GB and saturated the disk the storage engine needs (t_e94d7d38).
+[logging]
+# Where to write. Set this and the process owns its log file and rotates it.
+# Leave it unset and the process logs to stdout exactly as before, which is
+# what a foreground run wants -- but then nothing bounds the file, so a service
+# that redirects stdout should always set this.
+# directory = "~/.ferrosa/logs"
+
+# Roll the live file once it reaches this many megabytes. Default 64.
+# Refused below 1: rotation that frequent discards the context around a failure.
+# max_size_mb = 64
+
+# How many rolled generations to keep beside the live file. Default 5, so the
+# directory settles at roughly (max_files + 1) * max_size_mb. Refused at 0 --
+# use enabled = false if no log is wanted.
+# max_files = 5
+
+# Set false to write to stdout and roll nothing, where something else genuinely
+# owns rotation. Rotation is ON by default: the failure this prevents is an
+# operator who never knew the setting existed.
+# enabled = true
+
+# Environment overrides, which win over this file:
+#   FERROSA_LOG_DIR, FERROSA_LOG_MAX_SIZE_MB, FERROSA_LOG_MAX_FILES,
+#   FERROSA_LOG_ROTATION_ENABLED
