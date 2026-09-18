@@ -66,24 +66,35 @@ pub const DEFAULT_TICK: Duration = Duration::from_millis(100);
 pub const DEFAULT_THRESHOLD: Duration = Duration::from_millis(300);
 
 /// Spawn the runtime-stall monitor on the current tokio runtime. It wakes every
-/// `tick` and, on any wake that is `>= threshold` late, records the stall and
-/// invokes `on_stall(overrun)` (the caller logs — this leaf crate stays free of
-/// a logging dependency). Call once at boot from within the runtime being
-/// watched. The returned [`tokio::task::JoinHandle`] can be dropped (fire-and-forget).
-pub fn spawn<F>(tick: Duration, threshold: Duration, on_stall: F) -> tokio::task::JoinHandle<()>
+/// `tick` and records every wake that is `>= threshold` late. Call once at boot
+/// from within the runtime being watched. The returned
+/// [`tokio::task::JoinHandle`] can be dropped (fire-and-forget).
+///
+/// `on_edge` is invoked only when an outage BEGINS or ENDS — never once per
+/// stalled tick — and the caller does the logging, so this leaf crate stays free
+/// of a logging dependency. Every stall is still counted into the metrics
+/// regardless of whether it produced an edge.
+pub fn spawn<F>(tick: Duration, threshold: Duration, on_edge: F) -> tokio::task::JoinHandle<()>
 where
-    F: Fn(Duration) + Send + 'static,
+    F: Fn(StallEdge) + Send + 'static,
 {
     tokio::spawn(async move {
         let mut last = tokio::time::Instant::now();
+        let mut edges = StallEdges::default();
         loop {
             tokio::time::sleep(tick).await;
             let now = tokio::time::Instant::now();
             let gap = now.duration_since(last);
             last = now;
-            if let Some(overrun) = stall_overrun(gap, tick, threshold) {
-                record_stall(overrun);
-                on_stall(overrun);
+            let edge = match stall_overrun(gap, tick, threshold) {
+                Some(overrun) => {
+                    record_stall(overrun);
+                    edges.on_stall(overrun)
+                }
+                None => edges.on_clear(),
+            };
+            if let Some(edge) = edge {
+                on_edge(edge);
             }
         }
     })
@@ -116,6 +127,63 @@ pub fn render_prometheus(out: &mut String) {
         "ferrosa_sched_runtime_stall_max_micros {}\n",
         runtime_stall_max_micros()
     ));
+}
+
+/// What a caller should say about a stall, if anything.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum StallEdge {
+    /// The runtime has just started stalling.
+    Started { overrun: Duration },
+    /// It has stopped, having stalled `stalls` times, worst `worst`.
+    Recovered { stalls: u64, worst: Duration },
+}
+
+/// Turns a stream of per-tick stall observations into outage edges.
+///
+/// The detector fired once per stalled tick and the caller logged every one.
+/// One node recorded 19,115 of them, each a ~280-byte WARN, into a log with no
+/// rotation on the disk whose saturation caused the stalls. A line per event
+/// buries the one that mattered, and here it also fed the fault.
+///
+/// Two lines per outage, however long it lasts: it started, and it recovered
+/// with what it cost. The counters behind `stall_events_total` and
+/// `stall_max_micros` still record every event for metrics -- this governs only
+/// what is written to the log.
+#[derive(Debug, Default)]
+pub struct StallEdges {
+    in_stall: bool,
+    stalls: u64,
+    worst: Duration,
+}
+
+impl StallEdges {
+    /// Observe a stalled tick. Reports only the first of an outage.
+    pub fn on_stall(&mut self, overrun: Duration) -> Option<StallEdge> {
+        self.stalls = self.stalls.saturating_add(1);
+        if overrun > self.worst {
+            self.worst = overrun;
+        }
+        if self.in_stall {
+            return None;
+        }
+        self.in_stall = true;
+        Some(StallEdge::Started { overrun })
+    }
+
+    /// Observe a healthy tick. Reports only the recovery that ends an outage.
+    pub fn on_clear(&mut self) -> Option<StallEdge> {
+        if !self.in_stall {
+            return None;
+        }
+        let edge = StallEdge::Recovered {
+            stalls: self.stalls,
+            worst: self.worst,
+        };
+        self.in_stall = false;
+        self.stalls = 0;
+        self.worst = Duration::ZERO;
+        Some(edge)
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +257,79 @@ mod tests {
             hits.load(Ordering::SeqCst) > 0,
             "a >400ms block of the runtime worker must register a stall"
         );
+    }
+
+    #[test]
+    fn the_first_stall_in_a_quiet_period_is_reported() {
+        let mut edges = StallEdges::default();
+        assert_eq!(
+            edges.on_stall(Duration::from_millis(400)),
+            Some(StallEdge::Started {
+                overrun: Duration::from_millis(400)
+            })
+        );
+    }
+
+    #[test]
+    fn a_stall_while_already_stalling_is_counted_not_logged() {
+        let mut edges = StallEdges::default();
+        edges.on_stall(Duration::from_millis(400));
+        assert_eq!(edges.on_stall(Duration::from_millis(900)), None);
+        assert_eq!(edges.on_stall(Duration::from_millis(50)), None);
+    }
+
+    #[test]
+    fn recovery_reports_once_with_what_the_outage_cost() {
+        let mut edges = StallEdges::default();
+        edges.on_stall(Duration::from_millis(400));
+        edges.on_stall(Duration::from_millis(900));
+        assert_eq!(
+            edges.on_clear(),
+            Some(StallEdge::Recovered {
+                stalls: 2,
+                worst: Duration::from_millis(900),
+            })
+        );
+        // Only once: a quiet tick after recovery is not another edge.
+        assert_eq!(edges.on_clear(), None);
+    }
+
+    #[test]
+    fn a_clear_tick_with_no_stall_behind_it_reports_nothing() {
+        let mut edges = StallEdges::default();
+        assert_eq!(edges.on_clear(), None);
+    }
+
+    #[test]
+    fn a_new_outage_after_recovery_reports_again() {
+        let mut edges = StallEdges::default();
+        edges.on_stall(Duration::from_millis(400));
+        edges.on_clear();
+        assert_eq!(
+            edges.on_stall(Duration::from_millis(120)),
+            Some(StallEdge::Started {
+                overrun: Duration::from_millis(120)
+            })
+        );
+    }
+
+    #[test]
+    fn nineteen_thousand_stalls_in_one_outage_produce_two_edges() {
+        // The shape actually observed: 19,115 stall events on one node. Two
+        // lines, not 19,115 -- the log must not become the write load.
+        let mut edges = StallEdges::default();
+        let mut reported = 0;
+        for i in 0..19_115u64 {
+            if edges
+                .on_stall(Duration::from_millis(100 + i % 50))
+                .is_some()
+            {
+                reported += 1;
+            }
+        }
+        if edges.on_clear().is_some() {
+            reported += 1;
+        }
+        assert_eq!(reported, 2, "one outage must cost two log lines");
     }
 }

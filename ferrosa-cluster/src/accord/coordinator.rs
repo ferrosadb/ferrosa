@@ -1421,7 +1421,11 @@ impl AccordCoordinatorDriver {
             return Err(AccordDriverError::QuorumUnavailable);
         }
 
-        tracing::info!(
+        // debug!, not info!: this fires once per transaction. At INFO it was 70%
+        // of a 1.6 GB unrotated log, and those writes saturated the disk the CQL
+        // runtime needs -- which is what stopped this same code answering read
+        // votes. Guarded by tests/consensus_logging_is_bounded.rs.
+        tracing::debug!(
             txn_id = ?txn_id,
             t = ?commit_t,
             deps = ?commit_deps.len(),
@@ -1635,7 +1639,7 @@ impl AccordCoordinatorDriver {
                         Some(agreed_row_bytes.as_slice())
                     };
                     if !gate(row_arg) {
-                        tracing::info!(
+                        tracing::debug!(
                             txn_id = ?txn_id,
                             "accord: generic IF condition not met — [applied]=false, no Apply"
                         );
@@ -1655,7 +1659,7 @@ impl AccordCoordinatorDriver {
                 match decide_existence_votes(votes_true, votes_false, sq) {
                     ExistenceVoteDecision::Apply => {}
                     ExistenceVoteDecision::ConditionNotMet => {
-                        tracing::info!(
+                        tracing::debug!(
                             txn_id = ?txn_id,
                             votes_false,
                             sq,
@@ -1783,7 +1787,7 @@ impl AccordCoordinatorDriver {
             return Err(AccordDriverError::ApplyQuorumUnavailable);
         }
 
-        tracing::info!(
+        tracing::debug!(
             txn_id = ?txn_id,
             "accord: Apply phase complete — [applied]=true"
         );

@@ -1225,14 +1225,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ferrosa_sched::runtime_monitor::spawn(
             ferrosa_sched::runtime_monitor::DEFAULT_TICK,
             std::time::Duration::from_millis(stall_threshold_ms),
-            |overrun| {
-                tracing::warn!(
-                    stall_ms = overrun.as_millis() as u64,
-                    "runtime scheduling stall: the CQL request runtime was frozen \
-                     — a worker blocked (likely saturated disk I/O). Interactive \
-                     latency degraded for this window. See ferrosa_sched_runtime_stall_* \
-                     and specs/decisions/022-scheduler-vruntime-unit.md (Phase 3)."
-                );
+            // Edges, not events. This fired once per stalled tick, and one node
+            // logged 19,115 of them into an unrotated file on the very disk
+            // whose saturation caused the stalls. Two lines an outage: it began,
+            // it ended, and what it cost. Every stall is still counted into
+            // ferrosa_sched_runtime_stall_*.
+            |edge| match edge {
+                ferrosa_sched::runtime_monitor::StallEdge::Started { overrun } => {
+                    tracing::warn!(
+                        stall_ms = overrun.as_millis() as u64,
+                        "runtime scheduling stall STARTED: the CQL request runtime is frozen \
+                         — a worker is blocked (likely saturated disk I/O). Interactive \
+                         latency is degraded until this recovers. See \
+                         ferrosa_sched_runtime_stall_* and \
+                         specs/decisions/022-scheduler-vruntime-unit.md (Phase 3)."
+                    );
+                }
+                ferrosa_sched::runtime_monitor::StallEdge::Recovered { stalls, worst } => {
+                    tracing::warn!(
+                        stalls,
+                        worst_ms = worst.as_millis() as u64,
+                        "runtime scheduling stall RECOVERED: the CQL request runtime is \
+                         scheduling normally again."
+                    );
+                }
             },
         );
     });
