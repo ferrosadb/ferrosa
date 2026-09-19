@@ -1192,25 +1192,22 @@ impl CommitLog {
     /// all mutations are readable.
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
         let segment = self.active.load();
-        // Write an EOF sync marker so SegmentReader can follow the chain.
-        // Count the marker as an in-flight writer, exactly as `append` counts
-        // an entry: a flusher that snapshots a position past this allocation
-        // must wait for the eight bytes to exist, or it writes the hole and
-        // leaves an uncrossable marker on disk. The full rewrite this replaced
-        // papered over that by resending the whole buffer every time.
-        let Some(offset) = segment.allocate_and_begin_write(segment::SYNC_MARKER_SIZE) else {
+        // Reserve an EOF sync marker and link it in, so SegmentReader can
+        // follow the chain. Reserving and linking are one call because doing
+        // them apart lets two concurrent callers link their markers in the
+        // reverse of the order they reserved them, which ends the chain early
+        // and loses every entry after it.
+        let Some(prev_marker_offset) = segment.allocate_and_link_sync_marker() else {
             // The segment cannot hold another marker; the chain already ends
             // where it ends, and the buffered entries still owe durability.
             return segment.flush_to_disk();
         };
-        // write_sync_marker_at also patches the PREVIOUS marker so it points
-        // at this one, and that write goes backwards — below the watermark an
-        // incremental flush writes forward from. Hand the flush that offset so
-        // it repairs those eight bytes in place. Rewriting the whole segment
-        // to carry one backwards patch made this quadratic in the bytes
-        // already accumulated, on a path that runs per Accord apply.
-        let prev_marker_offset = segment.write_sync_marker_at(offset, 0);
-        segment.writer_done();
+        // Linking patches the PREVIOUS marker so it points at this one, and
+        // that write goes backwards — below the watermark an incremental
+        // flush writes forward from. Hand the flush that offset so it repairs
+        // those eight bytes in place. Rewriting the whole segment to carry one
+        // backwards patch made this quadratic in the bytes already
+        // accumulated, on a path that runs per Accord apply.
         segment.flush_to_disk_repairing_marker(prev_marker_offset)
     }
 
@@ -2388,6 +2385,81 @@ mod tests {
         assert_eq!(
             replayed, expected,
             "every force_synced entry must be replayable from the segment file"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// Concurrent `force_sync` callers must not lose committed entries.
+    ///
+    /// `StorageEngine::write_atomic_batch` force_syncs on every Accord apply,
+    /// from whatever thread applies, so this is the production shape. Each
+    /// call links a new marker in by patching its predecessor — and when two
+    /// callers choose that predecessor independently, one link is overwritten
+    /// by the other, or the two markers end up linked in the reverse of the
+    /// order they were allocated in. `SegmentReader::open_next_section` stops
+    /// at a `next` that does not advance, so everything past the break is
+    /// unreplayable: entries this log told its caller were durable.
+    ///
+    /// The assertion counts DISTINCT tables rather than comparing a sequence,
+    /// because the interleaving — and so the replay order — is genuinely
+    /// nondeterministic. What must be deterministic is that all of them are
+    /// there.
+    #[test]
+    fn concurrent_force_sync_keeps_every_entry_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(1),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = Arc::new(CommitLog::new(config).unwrap());
+        let path = cl.active.load().path().to_path_buf();
+
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 25;
+
+        // A barrier between the append and the force_sync of every round.
+        // Turned loose, the threads drift into lockstep often enough that the
+        // bug hides in about half of the runs — the marker writes have to
+        // actually overlap to collide. Re-aligning them each round makes the
+        // overlap the rule instead of the accident, which is what a durability
+        // regression test has to be able to promise. It costs ROUNDS barrier
+        // waits and no sleeping.
+        let gate = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let cl = Arc::clone(&cl);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    for r in 0..ROUNDS {
+                        cl.append(&mutation_for_table("ks", &format!("t{t}_{r}")))
+                            .unwrap();
+                        gate.wait();
+                        cl.force_sync().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        cl.force_sync().unwrap();
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let replayed: std::collections::HashSet<String> = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.table)
+            .collect();
+        assert_eq!(
+            replayed.len(),
+            THREADS * ROUNDS,
+            "concurrent force_sync lost committed entries: only {} of {} replayable",
+            replayed.len(),
+            THREADS * ROUNDS
         );
         cl.shutdown().unwrap();
     }
