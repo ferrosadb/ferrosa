@@ -1193,13 +1193,25 @@ impl CommitLog {
     pub fn force_sync(&self) -> ferrosa_common::Result<()> {
         let segment = self.active.load();
         // Write an EOF sync marker so SegmentReader can follow the chain.
-        if let Some(offset) = segment.allocate(segment::SYNC_MARKER_SIZE) {
-            segment.write_sync_marker_at(offset, 0);
-        }
-        // Full rewrite: write_sync_marker_at updates the PREVIOUS marker
-        // in the buffer (at an earlier offset). Incremental flush wouldn't
-        // capture that update, so we rewrite the entire file.
-        segment.force_full_flush()
+        // Count the marker as an in-flight writer, exactly as `append` counts
+        // an entry: a flusher that snapshots a position past this allocation
+        // must wait for the eight bytes to exist, or it writes the hole and
+        // leaves an uncrossable marker on disk. The full rewrite this replaced
+        // papered over that by resending the whole buffer every time.
+        let Some(offset) = segment.allocate_and_begin_write(segment::SYNC_MARKER_SIZE) else {
+            // The segment cannot hold another marker; the chain already ends
+            // where it ends, and the buffered entries still owe durability.
+            return segment.flush_to_disk();
+        };
+        // write_sync_marker_at also patches the PREVIOUS marker so it points
+        // at this one, and that write goes backwards — below the watermark an
+        // incremental flush writes forward from. Hand the flush that offset so
+        // it repairs those eight bytes in place. Rewriting the whole segment
+        // to carry one backwards patch made this quadratic in the bytes
+        // already accumulated, on a path that runs per Accord apply.
+        let prev_marker_offset = segment.write_sync_marker_at(offset, 0);
+        segment.writer_done();
+        segment.flush_to_disk_repairing_marker(prev_marker_offset)
     }
 
     /// Shuts down the commit log cleanly.
@@ -2244,6 +2256,139 @@ mod tests {
         );
 
         bytes[0] = 1; // keep the local buffer used so the test documents intent.
+        cl.shutdown().unwrap();
+    }
+
+    /// `force_sync` must not rewrite the bytes it already put on disk.
+    ///
+    /// The flush counters are process-global and every other test in this
+    /// binary bumps them while this one runs, so a delta taken around these
+    /// calls proves nothing. This watches the file instead. A sentinel planted
+    /// in the segment HEADER is a byte the in-memory buffer disagrees with,
+    /// and the header is a region no incremental flush and no marker patch
+    /// ever writes. A full rewrite restores it from the buffer; an incremental
+    /// flush cannot touch it. Its survival across N force_syncs is exactly the
+    /// claim that each call writes its own bytes and not the whole segment.
+    #[test]
+    fn force_sync_leaves_already_flushed_bytes_alone() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            // Large enough that the whole test stays inside one segment;
+            // rotation writes a fresh file and would hide a rewrite.
+            segment_size: 64 * 1024,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        cl.append(&simple_mutation()).unwrap();
+        cl.force_sync().unwrap();
+
+        // Offset 4 sits inside the 17-byte header, below the first sync marker.
+        const SENTINEL_OFFSET: usize = 4;
+        let before = std::fs::read(&path).unwrap();
+        let sentinel = !before[SENTINEL_OFFSET];
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&[sentinel], SENTINEL_OFFSET as u64).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        for _ in 0..4 {
+            cl.append(&simple_mutation()).unwrap();
+            cl.force_sync().unwrap();
+        }
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after[SENTINEL_OFFSET], sentinel,
+            "force_sync rewrote the already-flushed prefix of the segment"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// Repeated force_syncs must leave a chain a reader can still walk.
+    ///
+    /// Each call links a new EOF marker in by patching the PREVIOUS marker,
+    /// which by then sits behind the flush watermark. Those eight bytes are
+    /// what the reader follows from section to section, so losing them would
+    /// truncate replay at the first force_sync boundary.
+    #[test]
+    fn repeated_force_sync_keeps_every_entry_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 64 * 1024,
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        const ROUNDS: usize = 6;
+        let expected: Vec<String> = (0..ROUNDS).map(|i| format!("t{i}")).collect();
+        for table in &expected {
+            cl.append(&mutation_for_table("ks", table)).unwrap();
+            cl.force_sync().unwrap();
+        }
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let replayed: Vec<String> = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.table)
+            .collect();
+        assert_eq!(
+            replayed, expected,
+            "the sync-marker chain must survive every force_sync"
+        );
+        cl.shutdown().unwrap();
+    }
+
+    /// `force_sync` must stay correct while a background flusher races it.
+    ///
+    /// The marker patch goes backwards, behind the watermark a forward flush
+    /// writes from, and a periodic flush can move that watermark — or write
+    /// the marker's bytes before they exist — in between. Every entry must
+    /// still be reachable by walking the chain from the file alone.
+    ///
+    /// One force_sync caller, not several: concurrent force_syncs corrupt the
+    /// chain on `main` too (each picks its predecessor independently, and the
+    /// markers can end up linked out of order), so a multi-writer version of
+    /// this test fails identically with and without this change. That is a
+    /// separate defect, not one this test should be flaky about.
+    #[test]
+    fn force_sync_survives_a_concurrent_periodic_flusher() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CommitLogConfig {
+            segment_size: 1024 * 1024,
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_millis(1),
+            },
+            ..CommitLogConfig::test_config(dir.path())
+        };
+        let cl = CommitLog::new(config).unwrap();
+        let path = cl.active.load().path().to_path_buf();
+
+        const ROUNDS: usize = 100;
+        let expected: Vec<String> = (0..ROUNDS).map(|r| format!("t{r}")).collect();
+        for table in &expected {
+            cl.append(&mutation_for_table("ks", table)).unwrap();
+            cl.force_sync().unwrap();
+        }
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let replayed: Vec<String> = reader
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m.table)
+            .collect();
+        assert_eq!(
+            replayed, expected,
+            "every force_synced entry must be replayable from the segment file"
+        );
         cl.shutdown().unwrap();
     }
 }

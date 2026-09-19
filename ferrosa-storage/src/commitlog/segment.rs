@@ -199,6 +199,29 @@ fn sync_commitlog_file(file: &fs::File) -> ferrosa_common::Result<()> {
     }
 }
 
+/// Rewrites, in place, the sync marker that a forward flush skipped.
+///
+/// `write_all_at` is pwrite: it does not move the file cursor, so the
+/// appending `write_all` that ran just before it keeps its place and the next
+/// incremental flush still lands at the tail.
+fn repair_marker_in_place(
+    file: &fs::File,
+    buf: &[u8],
+    patch: &std::ops::Range<u64>,
+) -> ferrosa_common::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    let start = patch.start as usize;
+    let end = patch.end as usize;
+    if end > buf.len() {
+        return Err(ferrosa_common::Error::InvalidData(format!(
+            "commit-log marker repair {start}..{end} lies outside the {}-byte segment buffer",
+            buf.len()
+        )));
+    }
+    file.write_all_at(&buf[start..end], patch.start)?;
+    Ok(end - start)
+}
+
 fn sync_parent_dir(path: &Path) -> ferrosa_common::Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent)?;
@@ -570,6 +593,32 @@ impl Segment {
             .fetch_add(SYNC_MARKER_SIZE as u64, Ordering::AcqRel);
     }
 
+    /// Which already-flushed bytes a backwards marker patch dirtied, if any.
+    ///
+    /// `write_sync_marker_at` patches the PREVIOUS marker so it points at the
+    /// new one. That write goes backwards, and `flush_to_disk` only ever writes
+    /// forward from `last_flushed` -- so a patch below that watermark would
+    /// never reach disk.
+    ///
+    /// `force_sync` used to answer this by rewriting the whole segment:
+    /// `open(O_TRUNC)` plus every byte accumulated so far plus a hardware cache
+    /// flush, on every call. Inside one 32 MB segment that is quadratic in the
+    /// number of batches, and it ran on every Accord apply. The region actually
+    /// dirtied is SYNC_MARKER_SIZE bytes -- eight.
+    ///
+    /// `None` means the patch sits at or above the watermark and the ordinary
+    /// incremental flush already covers it.
+    pub(crate) fn marker_patch_to_rewrite(
+        prev_offset: u64,
+        already_flushed: u64,
+    ) -> Option<std::ops::Range<u64>> {
+        let end = prev_offset.saturating_add(SYNC_MARKER_SIZE as u64);
+        // Any overlap at all with what is already on disk, not just full
+        // containment: a marker straddling the watermark has its leading bytes
+        // below it, and those are exactly the bytes a forward flush skips.
+        (prev_offset < already_flushed).then_some(prev_offset..end)
+    }
+
     /// Writes a sync marker at an explicitly allocated offset, linking it
     /// into the forward chain.
     ///
@@ -578,12 +627,18 @@ impl Segment {
     ///
     /// The previous sync marker's `next_marker_offset` is patched to point to
     /// this new marker, creating the forward-linked chain for crash recovery.
-    pub fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) {
+    ///
+    /// Returns the offset of that previous marker — the one the caller hands
+    /// to
+    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker).
+    /// Reading the tracker separately would name a different marker once a
+    /// second writer has moved it.
+    pub fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) -> u64 {
         let buf = unsafe { &mut *self.buffer.get() };
 
         // Patch the previous marker to point to this one.
-        let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire) as usize;
-        Self::write_sync_marker_to_buffer(buf, prev_offset, self.id, offset as u32);
+        let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire);
+        Self::write_sync_marker_to_buffer(buf, prev_offset as usize, self.id, offset as u32);
 
         // Write the new marker (EOF by default).
         Self::write_sync_marker_to_buffer(buf, offset as usize, self.id, next_marker_offset);
@@ -591,6 +646,8 @@ impl Segment {
         // Update the tracker.
         self.last_sync_marker_offset
             .store(offset, Ordering::Release);
+
+        prev_offset
     }
 
     /// Internal helper to write a sync marker into a buffer at a given offset.
@@ -616,6 +673,26 @@ impl Segment {
     /// Uses incremental flush: only writes bytes since the last flush.
     /// Waits for all in-flight writers to complete before reading the buffer.
     pub fn flush_to_disk(&self) -> ferrosa_common::Result<()> {
+        self.flush_inner(None)
+    }
+
+    /// Flushes, and repairs the sync marker at `prev_marker_offset` if the
+    /// backwards patch [`write_sync_marker_at`](Self::write_sync_marker_at)
+    /// made to it now sits behind the flush watermark.
+    ///
+    /// The repair is decided inside the flush, under the file lock, against
+    /// the watermark the flush itself uses. Deciding it in the caller would be
+    /// a race: between the caller's marker write and this call a concurrent
+    /// flusher can carry those bytes to disk, or run past them with their
+    /// pre-patch contents, and only the lock holder can tell which happened.
+    pub fn flush_to_disk_repairing_marker(
+        &self,
+        prev_marker_offset: u64,
+    ) -> ferrosa_common::Result<()> {
+        self.flush_inner(Some(prev_marker_offset))
+    }
+
+    fn flush_inner(&self, repair_marker_at: Option<u64>) -> ferrosa_common::Result<()> {
         let sync_start = Instant::now();
         let _span = tracing::info_span!("commitlog.sync", segment_id = self.id,).entered();
         let mut phases = SyncPhaseDurations::default();
@@ -647,6 +724,8 @@ impl Segment {
         );
         let last_flushed = self.last_flushed.load(Ordering::Acquire) as usize;
         let current_pos = snapshot_pos;
+        let marker_patch = repair_marker_at
+            .and_then(|prev| Self::marker_patch_to_rewrite(prev, last_flushed as u64));
 
         // If `release_buffer()` ran before us, the data is already on disk
         // (force_rotate calls flush_to_disk first) and the buffer is empty.
@@ -661,6 +740,8 @@ impl Segment {
         match handle.as_mut() {
             None => {
                 // First flush: create file, write from beginning (header + sync marker + entries).
+                // Nothing is on disk yet, so a marker patch anywhere in
+                // `buf[..current_pos]` goes out with this write.
                 if let Some(parent) = self.path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -710,11 +791,16 @@ impl Segment {
                     .store(current_pos as u64, Ordering::Release);
             }
             Some(file) if current_pos > last_flushed => {
-                // Incremental: append only new bytes.
+                // Incremental: append only new bytes, plus the eight bytes of
+                // any marker the forward write would have skipped. Both land
+                // before the single fsync below, so durability is unchanged.
                 use std::io::Write;
-                let written = current_pos - last_flushed;
+                let mut written = current_pos - last_flushed;
                 let write_start = Instant::now();
                 file.write_all(&buf[last_flushed..current_pos])?;
+                if let Some(patch) = marker_patch.as_ref() {
+                    written += repair_marker_in_place(file, buf, patch)?;
+                }
                 phases.write = write_start.elapsed();
                 observe_phase(
                     &SYNC_WRITE_MICROS_TOTAL,
@@ -738,8 +824,35 @@ impl Segment {
                 self.last_flushed
                     .store(current_pos as u64, Ordering::Release);
             }
-            Some(_) => {
-                // Nothing new to flush.
+            Some(file) => {
+                // Nothing new to append. A marker repair can still be owed:
+                // a concurrent flusher can have carried this segment past the
+                // patched marker already, writing its pre-patch bytes.
+                let Some(patch) = marker_patch else {
+                    return Ok(());
+                };
+                let write_start = Instant::now();
+                let written = repair_marker_in_place(file, buf, &patch)?;
+                phases.write = write_start.elapsed();
+                observe_phase(
+                    &SYNC_WRITE_MICROS_TOTAL,
+                    &SYNC_WRITE_MICROS_MAX,
+                    phases.write,
+                );
+                let sync_data_start = Instant::now();
+                sync_commitlog_file(file)?;
+                phases.sync_data = sync_data_start.elapsed();
+                observe_phase(
+                    &SYNC_DATA_MICROS_TOTAL,
+                    &SYNC_DATA_MICROS_MAX,
+                    phases.sync_data,
+                );
+                INCREMENTAL_FLUSHES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                INCREMENTAL_FLUSH_BYTES_TOTAL.fetch_add(written as u64, Ordering::Relaxed);
+                SYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let total = sync_start.elapsed();
+                observe_sync(total);
+                maybe_warn_slow_sync(self.id, written, total, &phases);
             }
         }
 
@@ -749,9 +862,15 @@ impl Segment {
     /// Rewrites the entire segment file from scratch.
     ///
     /// Unlike `flush_to_disk` which only appends new bytes, this writes
-    /// `buf[0..position]` to the file. Required when sync markers at earlier
-    /// offsets have been updated after an incremental flush (e.g., during
-    /// `force_sync` for catch-up replay).
+    /// `buf[0..position]` to the file.
+    ///
+    /// Nothing calls this any more. `force_sync` did, to carry the eight-byte
+    /// backwards marker patch that a forward flush skips, which cost a whole
+    /// `open(O_TRUNC)` plus every accumulated byte plus a hardware cache flush
+    /// per call — quadratic within one segment. That is now
+    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker).
+    /// A new caller wanting a full rewrite should say why the incremental path
+    /// cannot express it.
     pub fn force_full_flush(&self) -> ferrosa_common::Result<()> {
         let sync_start = Instant::now();
         let mut phases = SyncPhaseDurations::default();
@@ -1397,5 +1516,50 @@ mod tests {
                 h.join().expect("flush thread must not panic");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod marker_patch_tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_below_the_watermark_must_be_rewritten() {
+        // The bytes are already on disk and the forward flush will not revisit
+        // them, so eight bytes have to be written back.
+        assert_eq!(
+            Segment::marker_patch_to_rewrite(1_000, 5_000),
+            Some(1_000..1_008)
+        );
+    }
+
+    #[test]
+    fn a_patch_at_or_above_the_watermark_needs_nothing_extra() {
+        // Not yet flushed: the ordinary incremental flush carries it.
+        assert_eq!(Segment::marker_patch_to_rewrite(5_000, 5_000), None);
+        assert_eq!(Segment::marker_patch_to_rewrite(6_000, 5_000), None);
+    }
+
+    #[test]
+    fn a_patch_straddling_the_watermark_is_still_rewritten() {
+        // Its leading bytes are below the watermark, and those are precisely
+        // the ones a forward flush skips.
+        assert_eq!(
+            Segment::marker_patch_to_rewrite(4_996, 5_000),
+            Some(4_996..5_004)
+        );
+    }
+
+    #[test]
+    fn nothing_flushed_yet_means_nothing_to_rewrite() {
+        assert_eq!(Segment::marker_patch_to_rewrite(0, 0), None);
+    }
+
+    #[test]
+    fn the_rewrite_is_one_marker_wide_and_never_the_segment() {
+        // The whole point: bounded at eight bytes regardless of how much the
+        // segment has accumulated.
+        let patch = Segment::marker_patch_to_rewrite(10, 32 * 1024 * 1024).expect("below mark");
+        assert_eq!(patch.end - patch.start, SYNC_MARKER_SIZE as u64);
     }
 }
