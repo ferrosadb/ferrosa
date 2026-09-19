@@ -307,7 +307,26 @@ pub struct Segment {
     /// Used to build the forward-linked marker chain: when a new marker is
     /// written, the previous marker's `next_marker_offset` is patched to
     /// point to the new one.
+    ///
+    /// Only ever read or written under `marker_link`. It stays an atomic so
+    /// the field carries no interior-mutability ceremony of its own; the lock
+    /// is what makes the read-modify-write a single step.
     last_sync_marker_offset: AtomicU64,
+
+    /// Serializes marker allocation together with marker linking.
+    ///
+    /// The chain must come out in ALLOCATION order, and nothing weaker than
+    /// one lock over both steps gets that. A swap on
+    /// `last_sync_marker_offset` stops two callers from claiming the same
+    /// predecessor, but it does not stop the caller who allocated the LATER
+    /// offset from claiming first — and a marker whose `next` points
+    /// backwards ends the chain as far as `SegmentReader` is concerned, which
+    /// is silent loss of everything after it. Allocating under the same lock
+    /// makes "claimed earlier" and "sits earlier in the file" the same fact.
+    ///
+    /// It guards the eight-byte buffer writes only, not the flush, so
+    /// concurrent `force_sync` callers still fsync in parallel.
+    marker_link: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -396,6 +415,7 @@ impl Segment {
             file_handle: Mutex::new(None),
             last_flushed: AtomicU64::new(INITIAL_POSITION),
             last_sync_marker_offset: AtomicU64::new(HEADER_SIZE as u64),
+            marker_link: Mutex::new(()),
         }
     }
 
@@ -619,6 +639,35 @@ impl Segment {
         (prev_offset < already_flushed).then_some(prev_offset..end)
     }
 
+    /// Reserves an EOF sync marker and links it onto the end of the forward
+    /// chain, as one step.
+    ///
+    /// Returns the offset of the PREVIOUS marker — the one this call patched,
+    /// and the one the caller hands to
+    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker),
+    /// because that backwards patch is the write an incremental flush would
+    /// otherwise skip. Reading the tracker separately would name a different
+    /// marker once a second writer has moved it. `None` means the segment
+    /// cannot hold another marker and the chain ends where it ends.
+    ///
+    /// Reserving and linking are inseparable. Each is individually
+    /// atomic already; doing them apart is what corrupts the chain, because a
+    /// caller can win the allocation and lose the race to link, leaving a
+    /// marker pointing backwards at one allocated before it. The
+    /// `marker_link` field documents why nothing lock-free covers this.
+    ///
+    /// The marker counts as an in-flight writer for the whole window, exactly
+    /// as `append` counts an entry: a flusher that snapshots a position past
+    /// this allocation must wait for the eight bytes to exist, or it writes
+    /// the hole and leaves an uncrossable marker on disk.
+    pub fn allocate_and_link_sync_marker(&self) -> Option<u64> {
+        let _linking = self.marker_link.lock();
+        let offset = self.allocate_and_begin_write(SYNC_MARKER_SIZE)?;
+        let prev_offset = self.write_sync_marker_at(offset, 0);
+        self.writer_done();
+        Some(prev_offset)
+    }
+
     /// Writes a sync marker at an explicitly allocated offset, linking it
     /// into the forward chain.
     ///
@@ -628,22 +677,21 @@ impl Segment {
     /// The previous sync marker's `next_marker_offset` is patched to point to
     /// this new marker, creating the forward-linked chain for crash recovery.
     ///
-    /// Returns the offset of that previous marker — the one the caller hands
-    /// to
-    /// [`flush_to_disk_repairing_marker`](Self::flush_to_disk_repairing_marker).
-    /// Reading the tracker separately would name a different marker once a
-    /// second writer has moved it.
-    pub fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) -> u64 {
+    /// The caller must hold `marker_link`; see
+    /// [`allocate_and_link_sync_marker`](Self::allocate_and_link_sync_marker).
+    fn write_sync_marker_at(&self, offset: u64, next_marker_offset: u32) -> u64 {
         let buf = unsafe { &mut *self.buffer.get() };
 
-        // Patch the previous marker to point to this one.
+        // The new marker's own bytes go down BEFORE anything points at them.
+        // A flusher racing us reads the buffer without taking this lock, so
+        // the order these two writes land in is the order it can observe. A
+        // predecessor pointing at eight bytes that are still zero is a marker
+        // with a zero CRC, which a reader treats as the end of the log.
+        Self::write_sync_marker_to_buffer(buf, offset as usize, self.id, next_marker_offset);
+
         let prev_offset = self.last_sync_marker_offset.load(Ordering::Acquire);
         Self::write_sync_marker_to_buffer(buf, prev_offset as usize, self.id, offset as u32);
 
-        // Write the new marker (EOF by default).
-        Self::write_sync_marker_to_buffer(buf, offset as usize, self.id, next_marker_offset);
-
-        // Update the tracker.
         self.last_sync_marker_offset
             .store(offset, Ordering::Release);
 
