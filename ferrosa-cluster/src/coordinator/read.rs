@@ -1967,9 +1967,17 @@ impl ClusterCoordinator {
         index_name: &str,
         query: &str,
         limit: Option<usize>,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
+        // Token ranges and who owns them, so a node that fails can be judged by
+        // what it COVERED rather than by the bare fact that it failed.
+        let range_owners: Vec<(u64, Vec<u64>)> = node_ids
+            .iter()
+            .flat_map(|&id| ring.tokens_for_node(id))
+            .map(|token| (token as u64, ring.replicas_for_strategy(token, strategy)))
+            .collect();
         let nodes: Vec<(u64, Option<(uuid::Uuid, String)>)> = node_ids
             .iter()
             .map(|&id| (id, ring.get_node(id).map(|n| (n.host_id, n.addr.clone()))))
@@ -2002,6 +2010,7 @@ impl ClusterCoordinator {
                 let coordinator = self;
 
                 async move {
+                    let outcome = async {
                     if node_id == local_id {
                         // Offload the blocking local FTI scan so it does not
                         // starve raft heartbeats / CQL keepalives on the
@@ -2054,6 +2063,9 @@ impl ClusterCoordinator {
                             ))),
                         }
                     }
+                    }
+                    .await;
+                    (node_id, outcome)
                 }
             })
             .collect();
@@ -2063,9 +2075,12 @@ impl ClusterCoordinator {
         let mut first_error: Option<ClusterError> = None;
         let mut failed_nodes = 0usize;
 
-        while let Some(result) = futs.next().await {
+        let mut responded: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        while let Some((node_id, result)) = futs.next().await {
             match result {
                 Ok(keys) => {
+                    responded.insert(node_id);
                     for k in keys {
                         if seen.insert(k.clone()) {
                             all_keys.push(k);
@@ -2082,17 +2097,43 @@ impl ClusterCoordinator {
             }
         }
 
-        if let Some(err) = first_error {
-            tracing::error!(
-                failed_nodes,
-                keys_received = all_keys.len(),
-                %err,
-                "coordinate_fulltext_search: replica failure makes the result incomplete"
-            );
-            return Err(err);
+        // A failed node does not imply a short result. Replicas of a range hold
+        // the same rows, so one answer for a range is the whole range; ask what
+        // the responders COVERED. Counting failures instead failed searches that
+        // were already complete -- and a failed search trips `fulltext_guard`,
+        // which disables EVERY lexical leg for a 30-60s backoff, turning one
+        // replica hiccup into a sustained search outage.
+        use crate::coordinator::fulltext_coverage::{classify_fulltext_coverage, FulltextCoverage};
+        match classify_fulltext_coverage(&range_owners, &responded) {
+            FulltextCoverage::Complete => {
+                if failed_nodes > 0 {
+                    tracing::info!(
+                        failed_nodes,
+                        responded = responded.len(),
+                        keys = all_keys.len(),
+                        "coordinate_fulltext_search: a replica failed but every token range \
+                         was covered by another; serving the complete union"
+                    );
+                }
+                Ok(all_keys)
+            }
+            FulltextCoverage::Incomplete { uncovered } => {
+                let err = first_error.unwrap_or_else(|| {
+                    ClusterError::Internal(
+                        "fulltext search: no replica answered for some token ranges".into(),
+                    )
+                });
+                tracing::error!(
+                    failed_nodes,
+                    uncovered_ranges = uncovered.len(),
+                    keys_received = all_keys.len(),
+                    %err,
+                    "coordinate_fulltext_search: no replica answered for some token ranges, \
+                     so the match set would be short"
+                );
+                Err(err)
+            }
         }
-
-        Ok(all_keys)
     }
 }
 
@@ -2588,7 +2629,15 @@ mod tests {
         );
 
         let mut keys = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "hello", None)
+            .coordinate_fulltext_search(
+                &table_id,
+                "val_fti",
+                "hello",
+                None,
+                &crate::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .unwrap();
         keys.sort();
@@ -2642,7 +2691,15 @@ mod tests {
         );
 
         let error = coordinator
-            .coordinate_fulltext_search(&table_id, "val_fti", "no-such-token", None)
+            .coordinate_fulltext_search(
+                &table_id,
+                "val_fti",
+                "no-such-token",
+                None,
+                &crate::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect_err("a remote FTI failure must not return a partial union");
         assert!(

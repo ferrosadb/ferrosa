@@ -278,7 +278,14 @@ fn cluster_fts_stream_peak(n: usize, doc_bytes: usize) -> (usize, i64) {
     // Warm sanity pass OUTSIDE the window: the stream is real and complete.
     let warm: usize = rt.block_on(async {
         let mut rx = wp
-            .fulltext_search_stream(&table_id, IDX, "memory")
+            .fulltext_search_stream(
+                &table_id,
+                IDX,
+                "memory",
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect("open fulltext stream");
         let mut count = 0usize;
@@ -292,7 +299,14 @@ fn cluster_fts_stream_peak(n: usize, doc_bytes: usize) -> (usize, i64) {
     measure_peak(|| {
         rt.block_on(async {
             let mut rx = wp
-                .fulltext_search_stream(&table_id, IDX, "memory")
+                .fulltext_search_stream(
+                    &table_id,
+                    IDX,
+                    "memory",
+                    &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                        replication_factor: 1,
+                    },
+                )
                 .await
                 .expect("open fulltext stream");
             let mut count = 0usize;
@@ -370,7 +384,14 @@ fn cluster_fulltext_stream_early_drop_stops_cleanly() {
 
     rt.block_on(async {
         let mut rx = wp
-            .fulltext_search_stream(&table_id, IDX, "memory")
+            .fulltext_search_stream(
+                &table_id,
+                IDX,
+                "memory",
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect("open fulltext stream");
         // Take one batch, then abandon the stream.

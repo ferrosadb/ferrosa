@@ -334,7 +334,15 @@ fn coordinated_fulltext_search_fits_the_bulk_lane_budget_after_compaction() {
         ] {
             let start = Instant::now();
             let result = coordinator
-                .coordinate_fulltext_search(&table, INDEX, query, Some(20))
+                .coordinate_fulltext_search(
+                    &table,
+                    INDEX,
+                    query,
+                    Some(20),
+                    &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                        replication_factor: 1,
+                    },
+                )
                 .await;
             let elapsed = start.elapsed();
             latencies.push(elapsed);
@@ -488,7 +496,15 @@ fn slow_replica_inside_the_budget_counts_and_a_hung_one_fails_loudly() {
         .await;
         let start = Instant::now();
         let keys = coordinator
-            .coordinate_fulltext_search(&table, INDEX, "anything", Some(10))
+            .coordinate_fulltext_search(
+                &table,
+                INDEX,
+                "anything",
+                Some(10),
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect("a replica answering in 1 s is inside the 3 s budget");
         assert_eq!(
@@ -514,7 +530,15 @@ fn slow_replica_inside_the_budget_counts_and_a_hung_one_fails_loudly() {
         .await;
         let start = Instant::now();
         let err = coordinator
-            .coordinate_fulltext_search(&table, INDEX, "anything", Some(10))
+            .coordinate_fulltext_search(
+                &table,
+                INDEX,
+                "anything",
+                Some(10),
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect_err("a replica that never answers must fail the query");
         let elapsed = start.elapsed();
@@ -566,7 +590,15 @@ fn down_replica_fails_the_query_naming_the_node() {
 
         let start = Instant::now();
         let err = coordinator
-            .coordinate_fulltext_search(&TableId::new(KS, TBL), INDEX, "anything", Some(10))
+            .coordinate_fulltext_search(
+                &TableId::new(KS, TBL),
+                INDEX,
+                "anything",
+                Some(10),
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect_err("a down replica must fail the query, not shrink the result");
         assert!(
@@ -616,7 +648,15 @@ fn replica_response_near_the_frame_limit_is_delivered_and_over_it_fails_the_quer
         let coordinator =
             coordinator_over(&config, local.clone(), &[(near_id, near_addr, true)]).await;
         let keys = coordinator
-            .coordinate_fulltext_search(&table, INDEX, "anything", None)
+            .coordinate_fulltext_search(
+                &table,
+                INDEX,
+                "anything",
+                None,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect("a response under the frame limit must be delivered");
         assert_eq!(keys.len(), fits, "every key in a near-limit response");
@@ -633,7 +673,15 @@ fn replica_response_near_the_frame_limit_is_delivered_and_over_it_fails_the_quer
         let coordinator = coordinator_over(&config, local, &[(over_id, over_addr, true)]).await;
         let start = Instant::now();
         let err = coordinator
-            .coordinate_fulltext_search(&table, INDEX, "anything", None)
+            .coordinate_fulltext_search(
+                &table,
+                INDEX,
+                "anything",
+                None,
+                &ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 1,
+                },
+            )
             .await
             .expect_err("a response over the frame limit must fail the query");
         eprintln!(

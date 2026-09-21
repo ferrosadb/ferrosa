@@ -1193,6 +1193,7 @@ impl WritePath {
         index_name: &str,
         query: &str,
         limit: Option<usize>,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         match self {
             Self::Direct(engine) => {
@@ -1210,7 +1211,7 @@ impl WritePath {
             }
             Self::Cluster(coordinator) => {
                 coordinator
-                    .coordinate_fulltext_search(table_id, index_name, query, limit)
+                    .coordinate_fulltext_search(table_id, index_name, query, limit, strategy)
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
@@ -1239,6 +1240,7 @@ impl WritePath {
         table_id: &TableId,
         index_name: &str,
         query: &str,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
     ) -> crate::error::Result<tokio::sync::mpsc::Receiver<crate::error::Result<Vec<Vec<u8>>>>> {
         match self {
             Self::Direct(engine) => Ok(local_fulltext_key_stream(
@@ -1264,7 +1266,7 @@ impl WritePath {
                     // Legacy fallback: materialize the union (old memory
                     // profile) and deliver it as a single batch.
                     let keys = coordinator
-                        .coordinate_fulltext_search(table_id, index_name, query, None)
+                        .coordinate_fulltext_search(table_id, index_name, query, None, strategy)
                         .await?;
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     let _ = tx.send(Ok(keys)).await;
