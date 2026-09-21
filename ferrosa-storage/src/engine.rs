@@ -7561,29 +7561,78 @@ impl StorageEngine {
             );
         }
 
+        // One plan for this query, shared with the replica handler's log line.
+        let plan = crate::fulltext_observability::plan_for_query(&parsed);
+
         for fti_path in fti_files {
             #[cfg(test)]
             FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(c.get() + 1));
             // Single-term queries (the live-OOM shape) stream postings straight
             // off the sidecar file with a bounded top-k working set — the whole
             // index is never read or deserialized into memory.
-            if let ferrosa_index::fulltext::query::FtsQuery::Term(term) = &parsed {
-                match ferrosa_index::fulltext::stream::scan_term_top_k(&fti_path, term, limit) {
-                    Ok(hits) => {
+            // One decision, made once, in `fulltext_observability::plan_for_query`
+            // — the same value the replica handler logs. Matching on the plan
+            // here rather than re-matching the query shape is what stops the log
+            // drifting out of step with what the engine actually does.
+            match &plan {
+                crate::fulltext_observability::FulltextPlan::StreamSingleTerm(term) => {
+                    match ferrosa_index::fulltext::stream::scan_term_top_k(
+                        &fti_path,
+                        term.as_str(),
+                        limit,
+                    ) {
+                        Ok(hits) => merge_hits(
+                            &mut score_map,
+                            hits.into_iter()
+                                .map(|h| (h.partition_key, h.score))
+                                .collect(),
+                        ),
+                        Err(e) => {
+                            tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}")
+                        }
+                    }
+                    continue;
+                }
+                crate::fulltext_observability::FulltextPlan::StreamConjunction(terms) => {
+                    // Stream each term's postings and intersect. `limit` is
+                    // applied to the INTERSECTION, never per term: the best
+                    // conjunction hit need not be any single term's best hit, so
+                    // per-term top-k would drop it before the intersection saw it.
+                    let mut per_term = Vec::with_capacity(terms.len());
+                    let mut stream_failed = false;
+                    for term in terms {
+                        match ferrosa_index::fulltext::stream::scan_term_top_k(
+                            &fti_path,
+                            term.as_str(),
+                            None,
+                        ) {
+                            Ok(hits) => per_term.push(hits),
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %fti_path.display(),
+                                    "bad FTI (multi-term stream): {e}"
+                                );
+                                stream_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !stream_failed {
+                        let hits = ferrosa_index::fulltext::stream::intersect_conjunction(per_term);
                         merge_hits(
                             &mut score_map,
                             hits.into_iter()
                                 .map(|h| (h.partition_key, h.score))
                                 .collect(),
                         );
-                        continue;
                     }
-                    Err(e) => {
-                        tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}");
-                        continue;
-                    }
+                    continue;
                 }
+                // No streaming path for this shape yet: fall through to the
+                // whole-file read below, whose cost is the size of the index.
+                crate::fulltext_observability::FulltextPlan::ReadWholeSidecar => {}
             }
+
             let bytes = match std::fs::read(&fti_path) {
                 Ok(b) => b,
                 Err(e) => {

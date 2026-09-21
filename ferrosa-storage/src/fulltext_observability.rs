@@ -17,13 +17,18 @@
 //!    sidecar with a bounded working set, or READ THE WHOLE SIDECAR into memory
 //!    and deserialize it.
 //!
-//! The second is the one that matters for diagnosis. `fulltext_search` streams
-//! only `FtsQuery::Term`; every other shape reads the whole file. On the live
-//! cluster `idx_entity_context_snippet_fts` is 1,097 MB across 49 sidecars, so a
-//! plain multi-word query — which parses to `MultiTerm`, not `Term` — reads and
-//! deserializes that much per replica, per query. Logging the plan alongside the
-//! duration turns "it was slow" into "it was slow BECAUSE it materialized", and
-//! once the streaming fix lands the same line proves the plan flipped.
+//! The second is the one that matters for diagnosis, and it is not merely
+//! descriptive: `fulltext_search` MATCHES on this plan to choose its path, so
+//! the logged plan is by construction the plan that ran.
+//!
+//! It also records how much is still materializing. Single terms and plain
+//! multi-word conjunctions now stream their postings; phrase, prefix, explicit
+//! AND/OR and NOT still read the whole sidecar. On the live cluster
+//! `idx_entity_context_snippet_fts` is 1,097 MB across 49 sidecars, so a shape
+//! still on `ReadWholeSidecar` reads and deserializes that much per replica per
+//! query — which is what blew the coordinator's 60s deadline while the node sat
+//! at 0% CPU, blocked on I/O. Logging the plan beside the duration turns "it was
+//! slow" into "it was slow BECAUSE it materialized".
 
 use std::time::Duration;
 
@@ -64,32 +69,49 @@ pub fn classify_search_duration(
 }
 
 /// How a query will be executed against one sidecar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This is the SINGLE source of truth for that decision: `fulltext_search`
+/// matches on this value to choose its path, and the replica handler logs the
+/// same value. An earlier version mirrored the engine's `match` here for
+/// logging, which drifted silently the moment the engine changed — the log then
+/// reported `ReadWholeSidecar` for a query that had just been moved onto
+/// streaming, and the test pinning the mirror still passed. Carrying the terms
+/// makes the plan executable, so a mirror cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FulltextPlan {
-    /// Postings are streamed off the file with a bounded working set. The
-    /// sidecar is never read whole.
-    StreamedPostings,
-    /// The entire sidecar is read into memory and deserialized before the query
-    /// runs. Cost is the size of the index, not the size of the answer.
+    /// One term: stream its postings with a bounded top-k working set.
+    StreamSingleTerm(String),
+    /// A conjunction: stream each term's postings and intersect. The limit is
+    /// applied to the intersection, never per term.
+    StreamConjunction(Vec<String>),
+    /// No streaming path yet: the entire sidecar is read into memory and
+    /// deserialized before the query runs. Cost is the size of the index, not
+    /// the size of the answer.
     ReadWholeSidecar,
 }
 
 impl FulltextPlan {
     /// Whether this plan's cost scales with the INDEX rather than the result.
-    pub fn reads_whole_index(self) -> bool {
+    pub fn reads_whole_index(&self) -> bool {
         matches!(self, Self::ReadWholeSidecar)
+    }
+
+    /// A short, stable label for logs — the variant without its payload, so a
+    /// log line does not carry query text.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::StreamSingleTerm(_) => "StreamSingleTerm",
+            Self::StreamConjunction(_) => "StreamConjunction",
+            Self::ReadWholeSidecar => "ReadWholeSidecar",
+        }
     }
 }
 
 /// Which plan `fulltext_search` will take for `query`.
-///
-/// Mirrors the branch in `StorageEngine::fulltext_search`: only a bare
-/// single-term query streams today. This exists so the replica can SAY which
-/// path it took, rather than leaving an operator to infer it from the query
-/// text.
 pub fn plan_for_query(query: &FtsQuery) -> FulltextPlan {
     match query {
-        FtsQuery::Term(_) => FulltextPlan::StreamedPostings,
+        FtsQuery::Term(term) => FulltextPlan::StreamSingleTerm(term.clone()),
+        FtsQuery::MultiTerm(terms) => FulltextPlan::StreamConjunction(terms.clone()),
         _ => FulltextPlan::ReadWholeSidecar,
     }
 }
@@ -190,40 +212,49 @@ mod tests {
 
     // ---- plan_for_query --------------------------------------------------
 
-    /// The one shape that streams today.
+    /// A single term streams its postings.
     #[test]
     fn a_single_term_query_streams_postings() {
         let plan = plan_for_query(&FtsQuery::Term("prevote".into()));
-        assert_eq!(plan, FulltextPlan::StreamedPostings);
+        assert_eq!(plan, FulltextPlan::StreamSingleTerm("prevote".into()));
         assert!(!plan.reads_whole_index());
+        assert_eq!(plan.label(), "StreamSingleTerm");
     }
 
-    /// The live shape. A plain multi-word query parses to `MultiTerm`, which
-    /// does NOT stream — it reads the whole sidecar. On the live cluster that
-    /// is 1,097 MB across 49 files for `idx_entity_context_snippet_fts`, per
-    /// replica, per query.
+    /// The live shape. A plain multi-word query parses to `MultiTerm`, and it
+    /// now streams each term and intersects instead of reading the whole
+    /// sidecar — which on the live cluster was ~1.1 GB per replica per query.
     #[test]
-    fn a_plain_multi_word_query_reads_the_whole_sidecar() {
+    fn a_plain_multi_word_query_streams_a_conjunction() {
         let plan = plan_for_query(&FtsQuery::MultiTerm(vec![
             "prevote".into(),
             "transport".into(),
         ]));
         assert_eq!(
             plan,
-            FulltextPlan::ReadWholeSidecar,
-            "MultiTerm is the shape ferrosa-memory sends and it does not stream"
+            FulltextPlan::StreamConjunction(vec!["prevote".into(), "transport".into()]),
+            "MultiTerm is the shape a search client sends and it must stream"
         );
-        assert!(plan.reads_whole_index());
+        assert!(!plan.reads_whole_index());
     }
 
-    /// Every remaining shape also materializes. Pinned individually so that
-    /// when one of them is moved onto the streaming path, this test fails and
-    /// has to be updated deliberately rather than drifting.
+    /// The plan carries the terms, so it can be EXECUTED rather than merely
+    /// described. That is what stops a logging-only mirror of the engine's
+    /// branch drifting out of step with the engine.
     #[test]
-    fn every_non_single_term_shape_reads_the_whole_sidecar() {
+    fn a_streaming_plan_carries_the_terms_it_will_scan() {
+        match plan_for_query(&FtsQuery::MultiTerm(vec!["a".into(), "b".into()])) {
+            FulltextPlan::StreamConjunction(terms) => assert_eq!(terms, vec!["a", "b"]),
+            other => panic!("expected StreamConjunction, got {other:?}"),
+        }
+    }
+
+    /// Shapes with no streaming path yet. Pinned individually so moving one
+    /// onto streaming has to update this test deliberately rather than drift.
+    #[test]
+    fn shapes_without_a_streaming_path_read_the_whole_sidecar() {
         let shapes = [
             FtsQuery::Phrase(vec!["bulk".into(), "lane".into()]),
-            FtsQuery::MultiTerm(vec!["a".into(), "b".into()]),
             FtsQuery::Prefix("prev".into()),
             FtsQuery::And(
                 Box::new(FtsQuery::Term("a".into())),
@@ -236,11 +267,20 @@ mod tests {
             FtsQuery::Not(Box::new(FtsQuery::Term("a".into()))),
         ];
         for shape in shapes {
+            let plan = plan_for_query(&shape);
             assert_eq!(
-                plan_for_query(&shape),
+                plan,
                 FulltextPlan::ReadWholeSidecar,
-                "{shape:?} should be reported as materializing until it is moved to streaming"
+                "{shape:?} still materializes; update this deliberately when it streams"
             );
+            assert!(plan.reads_whole_index());
         }
+    }
+
+    /// The label never carries query text into a log line.
+    #[test]
+    fn the_log_label_carries_no_query_text() {
+        let plan = plan_for_query(&FtsQuery::MultiTerm(vec!["secret-token".into()]));
+        assert!(!plan.label().contains("secret"));
     }
 }

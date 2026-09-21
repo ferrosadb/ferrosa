@@ -1601,9 +1601,7 @@ impl RpcHandler for FulltextSearchHandler {
         {
             use ferrosa_storage::fulltext_observability::{classify_search_duration, SearchReport};
             let elapsed_ms = elapsed.as_millis();
-            let plan = plan
-                .map(|p| format!("{p:?}"))
-                .unwrap_or_else(|| "unparseable".to_string());
+            let plan = plan.as_ref().map_or("unparseable", |p| p.label());
             match classify_search_duration(elapsed, FULLTEXT_SLOW_AFTER, FULLTEXT_CALLER_DEADLINE) {
                 SearchReport::Quiet => {
                     tracing::debug!(elapsed_ms, plan, "FulltextSearchHandler: search complete")

@@ -229,6 +229,204 @@ fn read_u64(r: &mut impl Read) -> Result<u64, String> {
     Ok(u64::from_le_bytes(b))
 }
 
+/// Combine per-term hit lists into conjunction (AND) hits, best-first.
+///
+/// A document survives only if it matched EVERY term; its score is the sum of
+/// its per-term scores, which is how BM25 composes across a conjunction.
+///
+/// # Why this is not per-term top-k
+///
+/// The tempting shortcut — ask each term for its own top-k and intersect the
+/// results — is wrong, and quietly so. The best conjunction hit need not be any
+/// single term's best hit: a document ranked 51st for one term and 1st for
+/// another can be the only document matching both, and per-term top-k drops it
+/// before the intersection ever sees it. The truncation must happen AFTER the
+/// intersection, which is why this takes complete per-term lists and why the
+/// caller applies `limit` to the result rather than to the inputs.
+///
+/// Working set is the union of the supplied posting lists — the terms actually
+/// queried — not the whole index.
+pub fn intersect_conjunction(per_term: Vec<Vec<FtsHit>>) -> Vec<FtsHit> {
+    // An empty query matches nothing. Returning "everything" here would turn a
+    // degenerate query into a full scan.
+    if per_term.is_empty() {
+        return Vec::new();
+    }
+
+    use std::collections::HashMap;
+
+    // Seed from the first term, collapsing any duplicate posting for the same
+    // document so it cannot be counted twice and outrank a document that
+    // genuinely matched more terms.
+    let mut acc: HashMap<Vec<u8>, f64> = HashMap::new();
+    for hit in per_term[0].iter() {
+        let entry = acc.entry(hit.partition_key.clone()).or_insert(0.0);
+        *entry = entry.max(hit.score);
+    }
+
+    for term_hits in per_term.iter().skip(1) {
+        if term_hits.is_empty() || acc.is_empty() {
+            // A conjunction with an unmatched term matches nothing.
+            return Vec::new();
+        }
+        let mut this_term: HashMap<Vec<u8>, f64> = HashMap::new();
+        for hit in term_hits {
+            let entry = this_term.entry(hit.partition_key.clone()).or_insert(0.0);
+            *entry = entry.max(hit.score);
+        }
+        acc.retain(|key, score| match this_term.get(key) {
+            Some(extra) => {
+                *score += extra;
+                true
+            }
+            None => false,
+        });
+    }
+
+    let mut out: Vec<FtsHit> = acc
+        .into_iter()
+        .map(|(partition_key, score)| FtsHit {
+            partition_key,
+            score,
+        })
+        .collect();
+
+    // Best-first so a later top-k keeps the best documents. Equal scores
+    // tie-break on the key, so the order is stable across calls and a truncated
+    // or paged result does not reshuffle.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.partition_key.cmp(&b.partition_key))
+    });
+    out
+}
+
+#[cfg(test)]
+mod conjunction_tests {
+    use super::*;
+
+    fn hit(key: &str, score: f64) -> FtsHit {
+        FtsHit {
+            partition_key: key.as_bytes().to_vec(),
+            score,
+        }
+    }
+
+    fn keys(hits: &[FtsHit]) -> Vec<String> {
+        hits.iter()
+            .map(|h| String::from_utf8(h.partition_key.clone()).unwrap())
+            .collect()
+    }
+
+    /// One term: the conjunction is that term's hits.
+    #[test]
+    fn a_single_term_conjunction_is_that_terms_hits() {
+        let out = intersect_conjunction(vec![vec![hit("a", 2.0), hit("b", 1.0)]]);
+        assert_eq!(keys(&out), vec!["a", "b"]);
+    }
+
+    /// A conjunction keeps only documents that matched EVERY term.
+    #[test]
+    fn only_documents_matching_every_term_survive() {
+        let out = intersect_conjunction(vec![
+            vec![hit("a", 1.0), hit("b", 1.0), hit("c", 1.0)],
+            vec![hit("b", 1.0), hit("c", 1.0)],
+            vec![hit("c", 1.0)],
+        ]);
+        assert_eq!(keys(&out), vec!["c"]);
+    }
+
+    /// Scores add across terms, so a document matching both terms strongly
+    /// outranks one that matched both weakly.
+    #[test]
+    fn scores_sum_across_terms() {
+        let out = intersect_conjunction(vec![
+            vec![hit("strong", 3.0), hit("weak", 0.5)],
+            vec![hit("strong", 4.0), hit("weak", 0.25)],
+        ]);
+        assert_eq!(keys(&out), vec!["strong", "weak"]);
+        assert!((out[0].score - 7.0).abs() < f64::EPSILON);
+        assert!((out[1].score - 0.75).abs() < f64::EPSILON);
+    }
+
+    /// Results come back best-first, so a later top-k truncation keeps the
+    /// best documents rather than an arbitrary slice.
+    #[test]
+    fn results_are_ordered_best_first() {
+        let out = intersect_conjunction(vec![
+            vec![hit("low", 0.1), hit("high", 9.0), hit("mid", 1.0)],
+            vec![hit("low", 0.1), hit("high", 9.0), hit("mid", 1.0)],
+        ]);
+        assert_eq!(keys(&out), vec!["high", "mid", "low"]);
+    }
+
+    /// Equal scores tie-break on the key, so the order is deterministic and a
+    /// paged or truncated result does not reshuffle between calls.
+    #[test]
+    fn equal_scores_tie_break_deterministically() {
+        let a = intersect_conjunction(vec![vec![hit("b", 1.0), hit("a", 1.0), hit("c", 1.0)]]);
+        let b = intersect_conjunction(vec![vec![hit("c", 1.0), hit("a", 1.0), hit("b", 1.0)]]);
+        assert_eq!(keys(&a), keys(&b));
+        assert_eq!(keys(&a), vec!["a", "b", "c"]);
+    }
+
+    /// One term matching nothing empties the conjunction — it is an AND.
+    #[test]
+    fn a_term_with_no_hits_empties_the_conjunction() {
+        let out = intersect_conjunction(vec![
+            vec![hit("a", 1.0), hit("b", 1.0)],
+            vec![],
+            vec![hit("a", 1.0)],
+        ]);
+        assert!(out.is_empty(), "got {:?}", keys(&out));
+    }
+
+    /// No terms is not "everything". An empty query matches nothing.
+    #[test]
+    fn no_terms_matches_nothing() {
+        assert!(intersect_conjunction(vec![]).is_empty());
+    }
+
+    /// A document repeated inside ONE term's postings must not be counted
+    /// twice, or it would outrank documents that genuinely matched more terms.
+    #[test]
+    fn a_repeated_document_within_one_term_is_not_double_counted() {
+        let out = intersect_conjunction(vec![
+            vec![hit("a", 2.0), hit("a", 2.0)],
+            vec![hit("a", 1.0)],
+        ]);
+        assert_eq!(keys(&out), vec!["a"]);
+        assert!(
+            (out[0].score - 3.0).abs() < f64::EPSILON,
+            "score was {}, expected 2.0 + 1.0 with the duplicate collapsed",
+            out[0].score
+        );
+    }
+
+    /// The trap this function exists to avoid, stated as a test.
+    ///
+    /// Per-term top-k then intersect is NOT top-k of the intersection. Here
+    /// `mid` is 2nd for both terms and is the ONLY document matching both, so
+    /// it is the correct top-1 conjunction hit. A per-term top-1 would have
+    /// kept only `x` and `y` and returned NOTHING.
+    #[test]
+    fn the_best_conjunction_hit_need_not_be_any_terms_best_hit() {
+        let term_a = vec![hit("x", 9.0), hit("mid", 5.0)];
+        let term_b = vec![hit("y", 9.0), hit("mid", 5.0)];
+
+        let out = intersect_conjunction(vec![term_a, term_b]);
+
+        assert_eq!(
+            keys(&out),
+            vec!["mid"],
+            "intersecting per-term top-1 would have dropped the only real match"
+        );
+        assert!((out[0].score - 10.0).abs() < f64::EPSILON);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
