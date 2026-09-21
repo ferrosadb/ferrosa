@@ -1609,8 +1609,8 @@ impl RpcHandler for FulltextSearchHandler {
                 SearchReport::Slow => tracing::warn!(
                     elapsed_ms,
                     plan,
-                    "FulltextSearchHandler: slow full-text search; a ReadWholeSidecar plan \
-                     costs the size of the index, not the size of the answer"
+                    "FulltextSearchHandler: slow full-text search; `plan` says whether the \
+                     cost scaled with the index (ReadWholeSidecar) or with the answer"
                 ),
                 SearchReport::TooLate => tracing::error!(
                     elapsed_ms,
