@@ -5354,7 +5354,7 @@ async fn route_select_user_table(
                     let mut rx = state
                         .write_path
                         .load()
-                        .fulltext_search_stream(&table_id, index_name, fts_query)
+                        .fulltext_search_stream(&table_id, index_name, fts_query, &table_strategy)
                         .await
                         .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
                     let mut matched: std::collections::HashSet<Vec<u8>> = Default::default();
@@ -5370,7 +5370,7 @@ async fn route_select_user_table(
                     let matching_pks = state
                         .write_path
                         .load()
-                        .fulltext_search(&table_id, index_name, fts_query, Some(k))
+                        .fulltext_search(&table_id, index_name, fts_query, Some(k), &table_strategy)
                         .await
                         .map_err(|e| CqlError::Invalid(format!("fts_match search failed: {e}")))?;
                     // Complete ⇔ no replica can have truncated its local hit

@@ -1603,6 +1603,15 @@ pub struct FulltextSearchResponsePayload {
 /// keys. `fts_match` has no partition key, so the coordinator fans this out to
 /// every node and unions the results — fixing the coordinator-local lookup that
 /// made `fts_match` non-deterministic on a cluster (BUG-F-007).
+/// A full-text search slower than this is worth a warning. Chosen well under
+/// the caller's deadline so a search trending slow is visible before it starts
+/// failing.
+const FULLTEXT_SLOW_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The caller's timeout for a remote full-text request (`Lane::Bulk`). A search
+/// that runs past this produced an answer nobody was waiting for.
+const FULLTEXT_CALLER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct FulltextSearchHandler {
     storage: Arc<StorageEngine>,
 }
@@ -1640,21 +1649,68 @@ impl RpcHandler for FulltextSearchHandler {
         let index_name = req.index_name;
         let query = req.query;
         let limit = req.limit.map(|k| k as usize);
-        let matching_keys = match tokio::task::spawn_blocking(move || {
+
+        // Which plan this query will take, decided BEFORE running it so the
+        // report below can say whether the cost scaled with the index or with
+        // the answer. Only a bare single-term query streams; everything else
+        // reads the whole sidecar. Parsing here is cheap and independent of the
+        // search itself; an unparseable query simply has no plan to report and
+        // fails inside `fulltext_search` as before.
+        let plan = ferrosa_index::fulltext::query::parse_fts_query(&query)
+            .ok()
+            .map(|parsed| ferrosa_storage::fulltext_observability::plan_for_query(&parsed));
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::task::spawn_blocking(move || {
             storage.fulltext_search(&table_id, &index_name, &query, limit)
         })
-        .await
+        .await;
+        let elapsed = started.elapsed();
+
+        // A replica that misses the caller's deadline used to leave no trace at
+        // all: the coordinator reported `Bulk lane timeout` and this side said
+        // nothing, so "slow handler" and "delayed in transport" were
+        // indistinguishable. Report the edges — ordinary searches stay at debug
+        // so they cannot bury the one that mattered.
         {
+            use ferrosa_storage::fulltext_observability::{classify_search_duration, SearchReport};
+            let elapsed_ms = elapsed.as_millis();
+            let plan = plan.as_ref().map_or("unparseable", |p| p.label());
+            match classify_search_duration(elapsed, FULLTEXT_SLOW_AFTER, FULLTEXT_CALLER_DEADLINE) {
+                SearchReport::Quiet => {
+                    tracing::debug!(elapsed_ms, plan, "FulltextSearchHandler: search complete")
+                }
+                SearchReport::Slow => tracing::warn!(
+                    elapsed_ms,
+                    plan,
+                    "FulltextSearchHandler: slow full-text search; `plan` says whether the \
+                     cost scaled with the index (ReadWholeSidecar) or with the answer"
+                ),
+                SearchReport::TooLate => tracing::error!(
+                    elapsed_ms,
+                    plan,
+                    deadline_ms = FULLTEXT_CALLER_DEADLINE.as_millis(),
+                    "FulltextSearchHandler: full-text search finished AFTER the caller's \
+                     deadline — the coordinator has already failed this search and the work \
+                     was wasted"
+                ),
+            }
+        }
+
+        let matching_keys = match outcome {
             Ok(Ok(keys)) => keys,
             Ok(Err(e)) => {
-                tracing::warn!("FulltextSearchHandler: fulltext_search failed: {e}");
-                vec![]
+                // Fail loud: serving `vec![]` here reports a storage failure as
+                // "no matches", and the coordinator cannot tell the difference.
+                tracing::error!(%e, "FulltextSearchHandler: fulltext_search failed");
+                return None;
             }
             Err(join_err) => {
-                tracing::warn!(
-                    "FulltextSearchHandler: fulltext_search task join failed: {join_err}"
+                tracing::error!(
+                    %join_err,
+                    "FulltextSearchHandler: fulltext_search task join failed"
                 );
-                vec![]
+                return None;
             }
         };
 
