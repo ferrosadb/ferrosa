@@ -1695,10 +1695,17 @@ fn plain_projection_page_shape(s: &SelectStatement) -> bool {
 
 /// The client's page size, or the server default when the request is unpaged
 /// — an unpaged read still gets a bounded page and a cursor.
-/// How many DISTINCT row keys stay resident before the set spills to its temp
-/// table. Bounds the coordinator's DISTINCT working set independently of how
-/// many distinct rows the query actually matches.
-const DISTINCT_RESIDENT_KEY_LIMIT: usize = 65_536;
+/// How many DISTINCT row keys the de-duplication set holds in memory before it
+/// spills the rest to its temp table.
+///
+/// **Not a result cap.** It bounds only where a key lives — resident or
+/// spilled — never whether it counts. Every distinct row is still returned; a
+/// key past this point is written to the temp table and still de-duplicated
+/// against. Results remain bounded only by the query's own LIMIT/paging.
+///
+/// Named a capacity because that is what it is: the capacity of the resident
+/// portion of the set, in the same sense as `Vec::with_capacity`.
+const DISTINCT_DEDUP_RESIDENT_CAPACITY: usize = 65_536;
 
 fn request_scan_bound(ctx: &RequestContext<'_>) -> crate::paging::ScanBound {
     crate::paging::ScanBound::from_request(ctx.paging.page_size)
@@ -7241,7 +7248,7 @@ async fn route_select_user_table(
             .map_err(|e| CqlError::ServerError(format!("DISTINCT temp-table setup failed: {e}")))?;
         let mut seen = ferrosa_storage::spilling_dedup::SpillingDedup::new(
             reservation.path(),
-            DISTINCT_RESIDENT_KEY_LIMIT,
+            DISTINCT_DEDUP_RESIDENT_CAPACITY,
         );
         let mut deduped = Vec::new();
         for row in selected_rows {
