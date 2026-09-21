@@ -3028,10 +3028,37 @@ impl StorageEngine {
         keyspace: &str,
         table: &str,
     ) -> ferrosa_common::Result<TempSortTableReservation> {
-        let root = self.config.data_dir.join("tmp_order_by_sort");
+        self.reserve_query_temp_table("tmp_order_by_sort", "ORDER BY temp-sort", keyspace, table)
+    }
+
+    /// Reserve a temporary table directory for a spillable `DISTINCT`
+    /// de-duplication set.
+    ///
+    /// `DISTINCT` deduped with a `BTreeSet` holding a full clone of every
+    /// distinct row — `O(distinct rows x row size)` resident and unbounded for a
+    /// large result. The spilling set keeps a bounded number of keys resident
+    /// and writes the rest here; this guard deletes the directory on drop, so a
+    /// cancelled query cleans up the same way a completed one does.
+    pub fn reserve_distinct_temp_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<TempSortTableReservation> {
+        self.reserve_query_temp_table("tmp_distinct", "DISTINCT temp", keyspace, table)
+    }
+
+    /// Shared body for the per-query temp table reservations above.
+    fn reserve_query_temp_table(
+        &self,
+        root_name: &str,
+        purpose: &str,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<TempSortTableReservation> {
+        let root = self.config.data_dir.join(root_name);
         std::fs::create_dir_all(&root).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create ORDER BY temp-sort root {}: {e}",
+                "failed to create {purpose} root {}: {e}",
                 root.display()
             ))
         })?;
@@ -3044,7 +3071,7 @@ impl StorageEngine {
         let path = root.join(name);
         std::fs::create_dir(&path).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create ORDER BY temp-sort table {}: {e}",
+                "failed to create {purpose} table {}: {e}",
                 path.display()
             ))
         })?;

@@ -243,6 +243,102 @@ pub const DEFAULT_SCAN_PAGE_SIZE: usize = 5_000;
 /// Resolve the default scan page size from the environment, falling back to
 /// [`DEFAULT_SCAN_PAGE_SIZE`]. The python driver's default `fetch_size` is
 /// 5000, so an unpaged client query gets the same effective bound.
+/// Build the byte key a `DISTINCT` de-duplication set stores for one row.
+///
+/// `DISTINCT` previously deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which
+/// keeps a full clone of every distinct row resident — `O(distinct rows x row
+/// size)` in coordinator memory, unbounded for a large result. Keying to bytes
+/// lets [`ferrosa_storage::spilling_dedup::SpillingDedup`] hold a bounded number
+/// resident and spill the rest to a temp directory it removes on drop, so a
+/// cancelled read cleans up by construction.
+///
+/// # Framing
+///
+/// Cells are **length-prefixed**, not concatenated. Concatenation collides
+/// across cell boundaries — `["a", "bc"]` and `["ab", "c"]` both flatten to
+/// `abc` — and a `DISTINCT` collision silently discards a row that was not a
+/// duplicate. The arity is prefixed for the same reason, so a shorter row is
+/// never a prefix-duplicate of a longer one, and `NULL` takes a distinct marker
+/// so it never equals an empty value.
+pub fn distinct_dedup_key(row: &[Option<crate::types::CqlValue>]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + row.len() * 16);
+    key.extend_from_slice(&(row.len() as u32).to_be_bytes());
+    for cell in row {
+        match cell {
+            None => key.push(0u8),
+            Some(value) => {
+                key.push(1u8);
+                // Debug is a faithful, injective rendering for CqlValue: every
+                // variant is structurally distinct and String/Vec contents are
+                // escaped, so two different values never render identically.
+                let rendered = format!("{value:?}");
+                key.extend_from_slice(&(rendered.len() as u32).to_be_bytes());
+                key.extend_from_slice(rendered.as_bytes());
+            }
+        }
+    }
+    key
+}
+
+/// How a scan bounds itself, and whether it may advertise a continuation.
+///
+/// These two properties are one decision, not two, which is why they live on
+/// one type. **A row cap without a cursor is silent truncation** — the client
+/// receives a short result it believes is complete. So a bound either caps rows
+/// and can say so, or reads to the end and says nothing.
+///
+/// Until 2026-09-21 the scan path conflated them: `request_page_size`
+/// substituted a server default when the client sent no page size, the scan
+/// then stopped at that default and advertised a cursor, and the CQL protocol
+/// forbids a continuation on a request the client made unpaged.
+/// scylla-rust-driver rejects such a frame outright —
+///
+/// ```text
+/// Protocol error: Unpaged query returned a non-empty paging state!
+/// This is a driver-side or server-side bug.
+/// ```
+///
+/// — and tears down the whole connection, so every later query on it fails too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanBound {
+    /// The client asked for paging: stop after `page_size` rows and hand back a
+    /// continuation when more remain.
+    Paged { page_size: usize },
+
+    /// The client sent no page size: return every matching row and never
+    /// advertise a continuation. The scan must still stream rather than
+    /// materialize — see `encode_rows_with_writer`.
+    Unpaged,
+}
+
+impl ScanBound {
+    /// Classify a request's `page_size`.
+    ///
+    /// A non-positive page size is not a page size. Reading `Some(0)` as a
+    /// zero-row cap would answer a legitimate query with an empty result.
+    pub fn from_request(page_size: Option<i32>) -> Self {
+        match page_size {
+            Some(size) if size > 0 => Self::Paged {
+                page_size: size as usize,
+            },
+            Some(_) | None => Self::Unpaged,
+        }
+    }
+
+    /// The maximum rows this scan may return, or `None` to read to the end.
+    pub fn row_cap(self) -> Option<usize> {
+        match self {
+            Self::Paged { page_size } => Some(page_size),
+            Self::Unpaged => None,
+        }
+    }
+
+    /// Whether a continuation token may appear in the response.
+    pub fn may_emit_cursor(self) -> bool {
+        matches!(self, Self::Paged { .. })
+    }
+}
+
 pub fn default_scan_page_size() -> usize {
     std::env::var("FERROSA_CQL_DEFAULT_PAGE_SIZE")
         .ok()
@@ -340,6 +436,149 @@ pub fn apply_pagination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- distinct_dedup_key ---------------------------------------------
+
+    fn txt(v: &str) -> Option<crate::types::CqlValue> {
+        Some(crate::types::CqlValue::Text(v.to_string()))
+    }
+
+    /// Equal rows must key equal, or DISTINCT emits the same row twice.
+    #[test]
+    fn equal_rows_produce_equal_dedup_keys() {
+        let a = [txt("alpha"), txt("beta")];
+        let b = [txt("alpha"), txt("beta")];
+        assert_eq!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// Rows differing in any cell must key differently, or DISTINCT drops a row
+    /// that was not a duplicate — silent data loss.
+    #[test]
+    fn rows_differing_in_a_cell_produce_different_dedup_keys() {
+        let a = [txt("alpha"), txt("beta")];
+        let b = [txt("alpha"), txt("gamma")];
+        assert_ne!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// The trap. A key built by concatenating cell bytes collides across
+    /// boundaries: `["a", "bc"]` and `["ab", "c"]` both flatten to `abc`, so
+    /// DISTINCT would silently discard the second row as a duplicate. The key
+    /// must be unambiguous about where each cell ends.
+    #[test]
+    fn dedup_keys_do_not_collide_across_cell_boundaries() {
+        let a = [txt("a"), txt("bc")];
+        let b = [txt("ab"), txt("c")];
+        assert_ne!(
+            distinct_dedup_key(&a),
+            distinct_dedup_key(&b),
+            "cell boundaries must be encoded; concatenation alone collides"
+        );
+    }
+
+    /// NULL and the empty string are different values and must key differently.
+    #[test]
+    fn null_and_empty_string_produce_different_dedup_keys() {
+        let null_row = [None, txt("x")];
+        let empty_row = [txt(""), txt("x")];
+        assert_ne!(
+            distinct_dedup_key(&null_row),
+            distinct_dedup_key(&empty_row)
+        );
+    }
+
+    /// A NULL in a different position is a different row.
+    #[test]
+    fn null_position_changes_the_dedup_key() {
+        let a = [None, txt("x")];
+        let b = [txt("x"), None];
+        assert_ne!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// Differing arity must key differently — a shorter row is not a prefix
+    /// duplicate of a longer one.
+    #[test]
+    fn row_arity_changes_the_dedup_key() {
+        let short = [txt("a")];
+        let long = [txt("a"), txt("")];
+        assert_ne!(distinct_dedup_key(&short), distinct_dedup_key(&long));
+    }
+
+    // ---- ScanBound -------------------------------------------------------
+
+    /// A client page size means: stop at that many rows, hand back a cursor.
+    #[test]
+    fn a_positive_page_size_is_a_paged_scan() {
+        assert_eq!(
+            ScanBound::from_request(Some(100)),
+            ScanBound::Paged { page_size: 100 }
+        );
+        assert_eq!(ScanBound::Paged { page_size: 100 }.row_cap(), Some(100));
+        assert!(ScanBound::Paged { page_size: 100 }.may_emit_cursor());
+    }
+
+    /// No page size means unpaged: every row, never a cursor.
+    ///
+    /// The protocol forbids a continuation on a request the client made
+    /// unpaged — scylla-rust-driver rejects the frame and tears down the whole
+    /// connection ("Unpaged query returned a non-empty paging state!").
+    #[test]
+    fn no_page_size_is_an_unpaged_scan() {
+        assert_eq!(ScanBound::from_request(None), ScanBound::Unpaged);
+        assert_eq!(ScanBound::Unpaged.row_cap(), None);
+        assert!(!ScanBound::Unpaged.may_emit_cursor());
+    }
+
+    /// A non-positive page size is not a page size. Treating `Some(0)` as a
+    /// zero-row cap would return an empty result for a legitimate query.
+    #[test]
+    fn a_non_positive_page_size_is_unpaged() {
+        assert_eq!(ScanBound::from_request(Some(0)), ScanBound::Unpaged);
+        assert_eq!(ScanBound::from_request(Some(-1)), ScanBound::Unpaged);
+        assert_eq!(ScanBound::from_request(Some(i32::MIN)), ScanBound::Unpaged);
+    }
+
+    /// The invariant the whole type exists to hold: **a row cap without a
+    /// cursor is silent truncation.** If a scan may stop early it must be able
+    /// to say so; if it cannot say so it must not stop early. Returning a
+    /// truncated result the client believes is complete is the one outcome
+    /// worse than either erroring or reading everything.
+    #[test]
+    fn a_bound_that_caps_rows_can_always_advertise_a_cursor() {
+        let bounds = [
+            ScanBound::from_request(None),
+            ScanBound::from_request(Some(0)),
+            ScanBound::from_request(Some(-7)),
+            ScanBound::from_request(Some(1)),
+            ScanBound::from_request(Some(5_000)),
+            ScanBound::from_request(Some(i32::MAX)),
+        ];
+        for bound in bounds {
+            if bound.row_cap().is_some() {
+                assert!(
+                    bound.may_emit_cursor(),
+                    "{bound:?} caps rows but cannot advertise a continuation —                      that is silent truncation"
+                );
+            }
+        }
+    }
+
+    /// And the converse: a scan that cannot advertise a cursor must read to
+    /// the end, so `row_cap` must be `None`.
+    #[test]
+    fn a_bound_that_cannot_advertise_a_cursor_reads_to_the_end() {
+        for bound in [
+            ScanBound::from_request(None),
+            ScanBound::from_request(Some(0)),
+        ] {
+            if !bound.may_emit_cursor() {
+                assert_eq!(
+                    bound.row_cap(),
+                    None,
+                    "{bound:?} cannot advertise a continuation, so it must not cap rows"
+                );
+            }
+        }
+    }
 
     #[test]
     fn paging_state_roundtrip() {
