@@ -243,6 +243,65 @@ pub const DEFAULT_SCAN_PAGE_SIZE: usize = 5_000;
 /// Resolve the default scan page size from the environment, falling back to
 /// [`DEFAULT_SCAN_PAGE_SIZE`]. The python driver's default `fetch_size` is
 /// 5000, so an unpaged client query gets the same effective bound.
+/// How a scan bounds itself, and whether it may advertise a continuation.
+///
+/// These two properties are one decision, not two, which is why they live on
+/// one type. **A row cap without a cursor is silent truncation** — the client
+/// receives a short result it believes is complete. So a bound either caps rows
+/// and can say so, or reads to the end and says nothing.
+///
+/// Until 2026-09-21 the scan path conflated them: `request_page_size`
+/// substituted a server default when the client sent no page size, the scan
+/// then stopped at that default and advertised a cursor, and the CQL protocol
+/// forbids a continuation on a request the client made unpaged.
+/// scylla-rust-driver rejects such a frame outright —
+///
+/// ```text
+/// Protocol error: Unpaged query returned a non-empty paging state!
+/// This is a driver-side or server-side bug.
+/// ```
+///
+/// — and tears down the whole connection, so every later query on it fails too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanBound {
+    /// The client asked for paging: stop after `page_size` rows and hand back a
+    /// continuation when more remain.
+    Paged { page_size: usize },
+
+    /// The client sent no page size: return every matching row and never
+    /// advertise a continuation. The scan must still stream rather than
+    /// materialize — see `encode_rows_with_writer`.
+    Unpaged,
+}
+
+impl ScanBound {
+    /// Classify a request's `page_size`.
+    ///
+    /// A non-positive page size is not a page size. Reading `Some(0)` as a
+    /// zero-row cap would answer a legitimate query with an empty result.
+    pub fn from_request(page_size: Option<i32>) -> Self {
+        match page_size {
+            Some(size) if size > 0 => Self::Paged {
+                page_size: size as usize,
+            },
+            Some(_) | None => Self::Unpaged,
+        }
+    }
+
+    /// The maximum rows this scan may return, or `None` to read to the end.
+    pub fn row_cap(self) -> Option<usize> {
+        match self {
+            Self::Paged { page_size } => Some(page_size),
+            Self::Unpaged => None,
+        }
+    }
+
+    /// Whether a continuation token may appear in the response.
+    pub fn may_emit_cursor(self) -> bool {
+        matches!(self, Self::Paged { .. })
+    }
+}
+
 pub fn default_scan_page_size() -> usize {
     std::env::var("FERROSA_CQL_DEFAULT_PAGE_SIZE")
         .ok()
@@ -340,6 +399,83 @@ pub fn apply_pagination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ScanBound -------------------------------------------------------
+
+    /// A client page size means: stop at that many rows, hand back a cursor.
+    #[test]
+    fn a_positive_page_size_is_a_paged_scan() {
+        assert_eq!(
+            ScanBound::from_request(Some(100)),
+            ScanBound::Paged { page_size: 100 }
+        );
+        assert_eq!(ScanBound::Paged { page_size: 100 }.row_cap(), Some(100));
+        assert!(ScanBound::Paged { page_size: 100 }.may_emit_cursor());
+    }
+
+    /// No page size means unpaged: every row, never a cursor.
+    ///
+    /// The protocol forbids a continuation on a request the client made
+    /// unpaged — scylla-rust-driver rejects the frame and tears down the whole
+    /// connection ("Unpaged query returned a non-empty paging state!").
+    #[test]
+    fn no_page_size_is_an_unpaged_scan() {
+        assert_eq!(ScanBound::from_request(None), ScanBound::Unpaged);
+        assert_eq!(ScanBound::Unpaged.row_cap(), None);
+        assert!(!ScanBound::Unpaged.may_emit_cursor());
+    }
+
+    /// A non-positive page size is not a page size. Treating `Some(0)` as a
+    /// zero-row cap would return an empty result for a legitimate query.
+    #[test]
+    fn a_non_positive_page_size_is_unpaged() {
+        assert_eq!(ScanBound::from_request(Some(0)), ScanBound::Unpaged);
+        assert_eq!(ScanBound::from_request(Some(-1)), ScanBound::Unpaged);
+        assert_eq!(ScanBound::from_request(Some(i32::MIN)), ScanBound::Unpaged);
+    }
+
+    /// The invariant the whole type exists to hold: **a row cap without a
+    /// cursor is silent truncation.** If a scan may stop early it must be able
+    /// to say so; if it cannot say so it must not stop early. Returning a
+    /// truncated result the client believes is complete is the one outcome
+    /// worse than either erroring or reading everything.
+    #[test]
+    fn a_bound_that_caps_rows_can_always_advertise_a_cursor() {
+        let bounds = [
+            ScanBound::from_request(None),
+            ScanBound::from_request(Some(0)),
+            ScanBound::from_request(Some(-7)),
+            ScanBound::from_request(Some(1)),
+            ScanBound::from_request(Some(5_000)),
+            ScanBound::from_request(Some(i32::MAX)),
+        ];
+        for bound in bounds {
+            if bound.row_cap().is_some() {
+                assert!(
+                    bound.may_emit_cursor(),
+                    "{bound:?} caps rows but cannot advertise a continuation —                      that is silent truncation"
+                );
+            }
+        }
+    }
+
+    /// And the converse: a scan that cannot advertise a cursor must read to
+    /// the end, so `row_cap` must be `None`.
+    #[test]
+    fn a_bound_that_cannot_advertise_a_cursor_reads_to_the_end() {
+        for bound in [
+            ScanBound::from_request(None),
+            ScanBound::from_request(Some(0)),
+        ] {
+            if !bound.may_emit_cursor() {
+                assert_eq!(
+                    bound.row_cap(),
+                    None,
+                    "{bound:?} cannot advertise a continuation, so it must not cap rows"
+                );
+            }
+        }
+    }
 
     #[test]
     fn paging_state_roundtrip() {

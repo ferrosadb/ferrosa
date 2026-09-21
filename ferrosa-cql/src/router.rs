@@ -1695,11 +1695,8 @@ fn plain_projection_page_shape(s: &SelectStatement) -> bool {
 
 /// The client's page size, or the server default when the request is unpaged
 /// — an unpaged read still gets a bounded page and a cursor.
-fn request_page_size(ctx: &RequestContext<'_>) -> usize {
-    ctx.paging
-        .page_size
-        .and_then(|size| (size > 0).then_some(size as usize))
-        .unwrap_or_else(crate::paging::default_scan_page_size)
+fn request_scan_bound(ctx: &RequestContext<'_>) -> crate::paging::ScanBound {
+    crate::paging::ScanBound::from_request(ctx.paging.page_size)
 }
 
 /// A literal `LIMIT n`, if the statement has one.
@@ -1749,13 +1746,19 @@ struct StreamedPage {
 /// including a wide partition that spans pages.
 async fn collect_page_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
-    page_size: usize,
+    bound: crate::paging::ScanBound,
     resume: Option<StreamResumeCursor>,
     row_context: PartitionRowContext<'_>,
 ) -> Result<StreamedPage, CqlError> {
-    debug_assert!(page_size > 0, "page_size must be positive");
+    // `None` means read to the end: the client sent no page size, so it expects
+    // every row and the protocol forbids handing it a continuation.
+    let row_cap = bound.row_cap();
+    debug_assert!(
+        row_cap != Some(0),
+        "a zero row cap would answer a legitimate query with an empty result"
+    );
 
-    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(page_size);
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(row_cap.unwrap_or(0).min(4096));
     // Cursor bytes for the most recently accepted row.
     let mut last_pk: Vec<u8> = Vec::new();
     let mut last_ck: Vec<u8> = Vec::new();
@@ -1785,16 +1788,18 @@ async fn collect_page_from_partition_stream(
                     }
                 }
 
-                if rows.len() == page_size {
+                if Some(rows.len()) == row_cap {
                     // We already have a full page and just found another row — a
                     // continuation is required. Stop without consuming further.
+                    // Unreachable when unpaged (`row_cap` is `None`), which is
+                    // how an unpaged scan reads to the end.
                     more_rows_remain = true;
                     return ControlFlow::Break(());
                 }
 
                 rows.push(output_row);
                 last_ck = clustering;
-                if rows.len() == page_size {
+                if Some(rows.len()) == row_cap {
                     cursor_from_current_partition = true;
                 }
                 ControlFlow::Continue(())
@@ -1816,7 +1821,11 @@ async fn collect_page_from_partition_stream(
         }
     }
 
-    let next_paging_state = if more_rows_remain {
+    // A continuation may only be advertised to a client that asked for paging.
+    // `more_rows_remain` can only be set when `row_cap` was `Some`, so the
+    // second condition is belt-and-braces — but it is the invariant that keeps
+    // an unpaged response protocol-legal, so it is stated rather than implied.
+    let next_paging_state = if more_rows_remain && bound.may_emit_cursor() {
         Some(
             crate::paging::PagingState {
                 partition_key: last_pk,
@@ -1915,16 +1924,25 @@ async fn collect_distinct_partition_page_from_stream(
 
 async fn collect_filtered_page_from_partition_stream(
     mut stream: ferrosa_cluster::write_path::PartitionResultStream,
-    page_size: usize,
+    bound: crate::paging::ScanBound,
     resume: Option<StreamResumeCursor>,
     row_context: PartitionRowContext<'_>,
     predicate_context: SelectPredicateContext<'_>,
     limit: Option<usize>,
 ) -> Result<StreamedPage, CqlError> {
-    debug_assert!(page_size > 0, "page_size must be positive");
+    debug_assert!(
+        bound.row_cap() != Some(0),
+        "a zero row cap would answer a legitimate query with an empty result"
+    );
 
     let limit = limit.unwrap_or(usize::MAX);
-    let target = std::cmp::min(page_size, limit);
+    // Unpaged reads to the end, so only a `LIMIT` bounds it. `LIMIT` is a query
+    // semantic, not paging: reaching it is a complete answer and must not
+    // advertise a continuation, which `may_emit_cursor` below enforces.
+    let target = match bound.row_cap() {
+        Some(cap) => std::cmp::min(cap, limit),
+        None => limit,
+    };
     if target == 0 {
         return Ok(StreamedPage {
             rows: Vec::new(),
@@ -1932,7 +1950,9 @@ async fn collect_filtered_page_from_partition_stream(
         });
     }
 
-    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(target);
+    // `target` is `usize::MAX` for an unpaged scan with no LIMIT; never
+    // pre-allocate on it.
+    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(target.min(4096));
     let mut last_pk: Vec<u8> = Vec::new();
     let mut last_ck: Vec<u8> = Vec::new();
     let mut more_rows_remain = false;
@@ -2011,7 +2031,8 @@ async fn collect_filtered_page_from_partition_stream(
         }
     }
 
-    let next_paging_state = if more_rows_remain {
+    // Only a client that asked for paging may be handed a continuation.
+    let next_paging_state = if more_rows_remain && bound.may_emit_cursor() {
         Some(
             crate::paging::PagingState {
                 partition_key: last_pk,
@@ -6160,7 +6181,7 @@ async fn route_select_user_table(
                     if page_shape {
                         let page = collect_filtered_page_from_partition_stream(
                             index_stream,
-                            request_page_size(ctx),
+                            request_scan_bound(ctx),
                             resume,
                             row_context,
                             predicate_context,
@@ -6257,7 +6278,7 @@ async fn route_select_user_table(
                     if page_shape {
                         let page = collect_filtered_page_from_partition_stream(
                             index_stream,
-                            request_page_size(ctx),
+                            request_scan_bound(ctx),
                             resume,
                             row_context,
                             predicate_context,
@@ -6416,11 +6437,7 @@ async fn route_select_user_table(
                         streamed_paging_state = Some(page.next_paging_state);
                         page.rows
                     } else if unbounded_scan_shape {
-                        let page_size = ctx
-                            .paging
-                            .page_size
-                            .and_then(|ps| (ps > 0).then_some(ps as usize))
-                            .unwrap_or_else(crate::paging::default_scan_page_size);
+                        let request_bound = request_scan_bound(ctx);
 
                         let resume = StreamResumeCursor::from_paging_state(
                             ctx.paging.paging_state.as_deref(),
@@ -6476,7 +6493,7 @@ async fn route_select_user_table(
 
                         let page = collect_page_from_partition_stream(
                             stream,
-                            page_size,
+                            request_bound,
                             resume,
                             PartitionRowContext {
                                 all_col_names: &all_col_names,
@@ -6515,11 +6532,7 @@ async fn route_select_user_table(
                             && !has_function_projection;
 
                         if stream_filtered_page_shape {
-                            let page_size = ctx
-                                .paging
-                                .page_size
-                                .and_then(|ps| (ps > 0).then_some(ps as usize))
-                                .unwrap_or_else(crate::paging::default_scan_page_size);
+                            let request_bound = request_scan_bound(ctx);
                             let limit_size = s
                                 .limit
                                 .as_ref()
@@ -6550,7 +6563,7 @@ async fn route_select_user_table(
                                 .await?;
                             let page = collect_filtered_page_from_partition_stream(
                                 stream,
-                                page_size,
+                                request_bound,
                                 resume,
                                 PartitionRowContext {
                                     all_col_names: &all_col_names,
@@ -20423,19 +20436,26 @@ mod tests {
             other => panic!("expected select, got {other:?}"),
         };
 
-        let first_page = route_select_raw(&state, &ctx, &select).await.unwrap();
-        let default_page = crate::paging::default_scan_page_size();
+        // Unpaged: every matching row, no continuation. This is what the test's
+        // own name asks for — scanning ALL matching partitions — and the
+        // previous bounded-page-plus-cursor behaviour is what the CQL protocol
+        // forbids on an unpaged request.
+        let unpaged = route_select_raw(&state, &ctx, &select).await.unwrap();
         assert_eq!(
-            first_page.rows.len(),
-            default_page,
-            "unpaged ALLOW FILTERING scan must return a bounded default page, not the whole table"
+            unpaged.rows.len(),
+            matching_rows,
+            "an unpaged ALLOW FILTERING scan must return every matching row"
         );
         assert!(
-            first_page.paging_state.is_some(),
-            "matching rows exceed the default page, so a continuation is required"
+            unpaged.paging_state.is_none(),
+            "an unpaged scan must not advertise a continuation"
         );
 
-        let (all_rows, pages) = collect_all_pages(&state, &auth, &None, &select_cql, None).await;
+        // And an explicitly paged traversal still covers the same rows across
+        // several bounded pages.
+        let page_size = (matching_rows / 3).max(1) as i32;
+        let (all_rows, pages) =
+            collect_all_pages(&state, &auth, &None, &select_cql, Some(page_size)).await;
         assert!(pages > 1, "fixture should require multiple bounded pages");
         assert_eq!(
             all_rows.len(),
@@ -26255,13 +26275,31 @@ mod tests {
             panic!("expected SELECT");
         };
 
-        // Unpaged: one bounded default page and a cursor, like a scan.
+        // An UNPAGED index read returns every match and no cursor. Bounding it
+        // and handing back a continuation is what the CQL protocol forbids; the
+        // bounded-page behaviour below is tested on an explicitly paged request
+        // instead, which is the only request allowed to receive a cursor.
         INDEX_ROWS_VISITED.with(|count| count.set(0));
-        let first = route_select_raw(&state, &ctx, &select).await.unwrap();
+        let unpaged = route_select_raw(&state, &ctx, &select).await.unwrap();
+        assert_eq!(
+            unpaged.rows.len(),
+            n as usize,
+            "an unpaged index read returns every match"
+        );
+        assert!(
+            unpaged.paging_state.is_none(),
+            "an unpaged index read must not advertise a continuation"
+        );
+
+        // Explicitly paged: one bounded page and a cursor.
+        let default_page = crate::paging::DEFAULT_SCAN_PAGE_SIZE;
+        INDEX_ROWS_VISITED.with(|count| count.set(0));
+        let paged_ctx = paging_ctx(&auth, &no_ks, Some(default_page as i32), None);
+        let first = route_select_raw(&state, &paged_ctx, &select).await.unwrap();
         assert_eq!(
             first.rows.len(),
-            crate::paging::DEFAULT_SCAN_PAGE_SIZE,
-            "an unpaged index read returns a bounded default page, not every match"
+            default_page,
+            "a paged index read returns a bounded page, not every match"
         );
         assert!(
             first.paging_state.is_some(),
@@ -26269,8 +26307,7 @@ mod tests {
         );
         // A full page pulls one row past its end to learn a cursor is needed.
         assert!(
-            INDEX_ROWS_VISITED.with(|count| count.get())
-                <= crate::paging::DEFAULT_SCAN_PAGE_SIZE + 1,
+            INDEX_ROWS_VISITED.with(|count| count.get()) <= default_page + 1,
             "the first page must stop pulling rows once it is full"
         );
 
@@ -29437,13 +29474,18 @@ mod tests {
         assert_eq!(unique, ids.len(), "paged traversal emitted duplicate rows");
     }
 
+    /// An unpaged SELECT returns EVERY row and NO continuation.
+    ///
+    /// Replaces the previous contract (bounded first page + cursor), which the
+    /// CQL protocol forbids: scylla-rust-driver rejects a continuation on an
+    /// unpaged request with "Unpaged query returned a non-empty paging state!"
+    /// and tears down the whole connection, so every later query on it fails
+    /// too. Observed 6x on 2026-09-21 under ferrosa-memory's hybrid_search,
+    /// which is what took memory search down.
     #[tokio::test]
-    async fn range_scan_with_no_page_size_applies_default_bounded_page() {
-        // A SELECT with NO client page_size must still return a bounded first
-        // page plus a continuation rather than pulling the whole table.
-        // Fail-before: with no page_size, the scan returned every row.
+    async fn an_unpaged_scan_returns_every_row_and_no_cursor() {
         let default = crate::paging::default_scan_page_size();
-        let n = (default as i64) * 2 + 17; // safely exceeds one default page
+        let n = (default as i64) * 2 + 17; // safely spans several default pages
 
         let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
         let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
@@ -29453,27 +29495,112 @@ mod tests {
         let ctx = paging_ctx(&auth, &ks, None, None);
         let res = route_select_raw(&state, &ctx, &select).await.unwrap();
 
+        assert_eq!(
+            res.rows.len() as i64,
+            n,
+            "an unpaged scan must return every row, got {} of {n}",
+            res.rows.len()
+        );
         assert!(
-            res.rows.len() <= default,
-            "no-page-size scan returned {} rows, exceeds default page {default}",
+            res.paging_state.is_none(),
+            "an unpaged scan must never advertise a continuation — the protocol \
+             forbids it and the driver drops the connection over it"
+        );
+
+        // Every row exactly once, nothing duplicated or skipped.
+        let mut ids: Vec<_> = res.rows.iter().map(|r| r[0].clone()).collect();
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "an unpaged scan returned duplicate rows");
+    }
+
+    /// A zero or negative page size is not a page size. Treating `Some(0)` as a
+    /// zero-row cap would answer a legitimate query with an empty result.
+    #[tokio::test]
+    async fn a_zero_page_size_is_treated_as_unpaged_not_as_an_empty_page() {
+        let (state, _dir, auth, ks) = setup_wide_scan_table(32).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, Some(0), None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert_eq!(res.rows.len(), 32, "page_size 0 must not mean zero rows");
+        assert!(res.paging_state.is_none());
+    }
+
+    /// An explicitly paged request still gets its bounded page and its cursor.
+    /// The unpaged change must not regress real paging.
+    #[tokio::test]
+    async fn an_explicitly_paged_scan_still_gets_a_bounded_page_and_a_cursor() {
+        let page = 10usize;
+        let (state, _dir, auth, ks) = setup_wide_scan_table(page as i64 * 3).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, Some(page as i32), None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert_eq!(
+            res.rows.len(),
+            page,
+            "a paged request must honour its page size"
+        );
+        assert!(
+            res.paging_state.is_some(),
+            "a paged request over a larger table must receive a continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paged_range_scan_bounds_each_page_and_visits_every_row_once() {
+        // Supersedes `range_scan_with_no_page_size_applies_default_bounded_page`,
+        // whose premise (no page_size => bounded page + cursor) the CQL protocol
+        // forbids: a continuation on an unpaged request makes the driver drop the
+        // connection. Unpaged behaviour now lives in
+        // `an_unpaged_scan_returns_every_row_and_no_cursor`; this test keeps the
+        // half that is still a real contract — an explicitly paged traversal
+        // bounds every page and covers every row exactly once.
+        let page = crate::paging::default_scan_page_size();
+        let n = (page as i64) * 2 + 17; // safely spans several pages
+
+        let (state, _dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select = match crate::parser::parse("SELECT * FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, Some(page as i32), None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert!(
+            res.rows.len() <= page,
+            "paged scan returned {} rows, exceeds page size {page}",
             res.rows.len()
         );
         assert!(
             res.paging_state.is_some(),
-            "no-page-size scan over a large table must return a continuation token"
+            "a paged scan over a larger table must return a continuation token"
         );
 
-        // And the full paged traversal (default page applied each call) still
-        // returns every row exactly once.
-        let (paged, _) =
-            collect_all_pages(&state, &auth, &ks, "SELECT * FROM pageks.t", None).await;
+        let (paged, pages) = collect_all_pages(
+            &state,
+            &auth,
+            &ks,
+            "SELECT * FROM pageks.t",
+            Some(page as i32),
+        )
+        .await;
+        assert!(pages > 1, "fixture should require multiple bounded pages");
         let mut ids: Vec<_> = paged.iter().map(|r| r[0].clone()).collect();
         ids.sort();
         ids.dedup();
         assert_eq!(
             ids.len(),
             n as usize,
-            "default-paged traversal must still visit every row exactly once"
+            "a paged traversal must visit every row exactly once"
         );
     }
 
