@@ -1526,6 +1526,8 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::RaftAppendResponse
             | MsgType::RaftVote
             | MsgType::RaftVoteResponse
+            | MsgType::RaftPreVote
+            | MsgType::RaftPreVoteResponse
             | MsgType::RaftInstallSnapshot,
         ) => MessageFamily::Raft,
         Ok(

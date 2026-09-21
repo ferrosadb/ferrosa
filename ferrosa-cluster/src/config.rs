@@ -76,19 +76,31 @@ pub struct ClusterConfig {
     /// Whether to enable PreVote (Ongaro §9.6) — ferrosa fork extension per
     /// ADR-012. Default: `false`.
     ///
-    /// ADR-012 intended this ON, but the pre-vote gate is only half-built: the
-    /// pinned openraft fork hard-gates the tick election path behind a pre-vote
-    /// round (`run_pre_vote_round()` calls `RaftNetwork::pre_vote()`), yet
-    /// `FerrosRaftNetwork` (raft/network.rs) does NOT override `pre_vote`, so the
-    /// default trait impl returns an "unimplemented" NetworkError that counts as
-    /// a NO vote. In any multi-voter cluster a pre-vote quorum is therefore
-    /// structurally impossible: after the seed's single initialize()-driven
-    /// election at term 1, NO further election can ever fire, and a transient
-    /// vote loss becomes a PERMANENT formation stall (candidate frozen at
-    /// term=1). Enabling pre-vote here only SUBTRACTS liveness until the network
-    /// transport exists. See forge t_b0aac0d3 (root cause) and t_32cb5ad3 (the
-    /// stalled fork epic that must land the `pre_vote` transport before this
-    /// flips back on). Override with `FERROSA_RAFT_ENABLE_PRE_VOTE=true`.
+    /// ADR-012 intended this ON. As of 2026-09-21 the transport that was
+    /// missing now exists — `FerrosRaftNetwork::pre_vote` sends
+    /// `Message::RaftPreVote` (wire code 0x15) and `RaftPreVoteHandler` answers
+    /// it — but the flag stays OFF for one more release. This is a **two-phase
+    /// rollout**, and the ordering is not optional:
+    ///
+    /// - **Phase 1 (this release):** every node learns to ANSWER a pre-vote.
+    ///   The receive handler is registered unconditionally in
+    ///   `controller/cluster.rs`, independent of this flag.
+    /// - **Phase 2 (next release, once no Phase-0 node remains):** flip this to
+    ///   `true` so nodes begin SENDING pre-votes.
+    ///
+    /// Flipping it during a rolling upgrade breaks elections. The fork
+    /// hard-gates the tick election path behind `run_pre_vote_round()`, which
+    /// counts any RPC failure as a NO. A Phase-2 node probing a Phase-0 peer
+    /// that does not know message type 0x15 reads the rejection as a NO, cannot
+    /// reach a pre-vote quorum, and never starts an election — a transient vote
+    /// loss becomes a PERMANENT formation stall (candidate frozen at its
+    /// current term).
+    ///
+    /// Why it matters: without PreVote a partitioned node increments its term
+    /// on every election timeout and disrupts the cluster on rejoin. The local
+    /// ferrosa-memory cluster reached **term 1868** this way. See forge
+    /// t_b0aac0d3 (root cause) and t_32cb5ad3 (the fork epic, now unblocked).
+    /// Override with `FERROSA_RAFT_ENABLE_PRE_VOTE=true`.
     pub raft_enable_pre_vote: bool,
     /// CheckQuorum step-down ratio (Ongaro §6.4) — ferrosa fork extension per
     /// ADR-012. Default: `0.75` (ferrosa default; upstream openraft 0.9

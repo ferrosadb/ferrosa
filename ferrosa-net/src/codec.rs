@@ -85,6 +85,11 @@ pub enum MsgType {
     RaftVote = 0x12,
     RaftVoteResponse = 0x13,
     RaftInstallSnapshot = 0x14,
+    /// PreVote probe (Ongaro §9.6, ADR-012). Distinct from `RaftVote` so a
+    /// peer that does not speak PreVote rejects the frame rather than
+    /// misreading a non-mutating probe as a real, term-advancing vote.
+    RaftPreVote = 0x15,
+    RaftPreVoteResponse = 0x16,
     // Data
     MutationForward = 0x20,
     MutationAck = 0x21,
@@ -244,6 +249,8 @@ impl TryFrom<u8> for MsgType {
             0x11 => Ok(Self::RaftAppendResponse),
             0x12 => Ok(Self::RaftVote),
             0x13 => Ok(Self::RaftVoteResponse),
+            0x15 => Ok(Self::RaftPreVote),
+            0x16 => Ok(Self::RaftPreVoteResponse),
             0x14 => Ok(Self::RaftInstallSnapshot),
             0x20 => Ok(Self::MutationForward),
             0x21 => Ok(Self::MutationAck),
@@ -564,6 +571,48 @@ impl Encoder<Frame> for InternodeCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PreVote (Ongaro §9.6, ADR-012) needs its own wire codes so a peer that
+    /// does not speak it rejects the frame instead of misreading it as a real
+    /// vote. A real `RaftVote` advances the sender's persistent term; a
+    /// PreVote must not. Confusing the two would defeat the whole mechanism.
+    #[test]
+    fn prevote_msgtype_roundtrips_through_the_wire_codes() {
+        assert_eq!(MsgType::try_from(0x15).unwrap(), MsgType::RaftPreVote);
+        assert_eq!(
+            MsgType::try_from(0x16).unwrap(),
+            MsgType::RaftPreVoteResponse
+        );
+        assert_eq!(MsgType::RaftPreVote as u8, 0x15);
+        assert_eq!(MsgType::RaftPreVoteResponse as u8, 0x16);
+    }
+
+    /// PreVote must not collide with the real vote codes.
+    #[test]
+    fn prevote_codes_are_distinct_from_vote_codes() {
+        assert_ne!(MsgType::RaftPreVote, MsgType::RaftVote);
+        assert_ne!(MsgType::RaftPreVoteResponse, MsgType::RaftVoteResponse);
+        assert_ne!(MsgType::RaftPreVote as u8, MsgType::RaftVote as u8);
+    }
+
+    /// A PreVote frame survives a header round trip on the Raft lane.
+    #[test]
+    fn prevote_frame_header_roundtrips() {
+        let header = FrameHeader {
+            version: 1,
+            flags: 0,
+            lane: Lane::Raft,
+            msg_type: MsgType::RaftPreVote,
+            stream_id: 7,
+            length: 64,
+            trace_context: TraceContext::EMPTY,
+        };
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE);
+        header.encode(&mut buf);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.msg_type, MsgType::RaftPreVote);
+        assert_eq!(decoded.lane, Lane::Raft);
+    }
 
     #[test]
     fn lane_from_u8_valid() {

@@ -132,8 +132,8 @@ use crate::ddl_path::{execute_via_raft, ClusterDdlForwardHandler, DdlPath};
 use crate::mode::DeploymentMode;
 use crate::pair::ddl::DdlOperation;
 use crate::raft::handlers::{
-    FulltextSearchHandler, IndexReadInPartitionHandler, RaftAppendHandler, RaftSnapshotHandler,
-    RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
+    FulltextSearchHandler, IndexReadInPartitionHandler, RaftAppendHandler, RaftPreVoteHandler,
+    RaftSnapshotHandler, RaftVoteHandler, RangeReadHandler, ReadRequestHandler,
 };
 use crate::raft::log_store::SledLogStore;
 use crate::raft::network::FerrosRaftNetworkFactory;
@@ -1279,6 +1279,15 @@ impl ModeController {
 
         let vote_handler = Arc::new(RaftVoteHandler::new(lazy_raft.clone()));
         self.registry.register(MsgType::RaftVote, vote_handler);
+
+        // The PreVote receive side is registered unconditionally, even while
+        // `raft_enable_pre_vote` is false. A node must be able to ANSWER a
+        // pre-vote before any node is allowed to SEND one, or the first node
+        // upgraded in a rolling restart would probe peers that reject the
+        // frame, read the rejections as "no", and never win an election.
+        let pre_vote_handler = Arc::new(RaftPreVoteHandler::new(lazy_raft.clone()));
+        self.registry
+            .register(MsgType::RaftPreVote, pre_vote_handler);
 
         let snapshot_handler = Arc::new(RaftSnapshotHandler::new(lazy_raft));
         self.registry

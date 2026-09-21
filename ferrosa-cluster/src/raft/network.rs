@@ -15,7 +15,7 @@ use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, U
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    PreVoteRequest, PreVoteResponse, VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
 use uuid::Uuid;
@@ -391,6 +391,60 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
                 tracing::error!(target = %target_host_id, msg_type = ?other.msg_type(), "Vote got unexpected response type");
                 Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
                     format!("expected RaftVoteResponse, got {:?}", other.msg_type()),
+                ))))
+            }
+        }
+    }
+
+    /// Send a PreVote probe (Ongaro §9.6, ADR-012).
+    ///
+    /// Mirrors [`Self::vote`] but carries `Message::RaftPreVote`, so a peer
+    /// running a build without PreVote rejects the frame rather than
+    /// misreading a non-mutating probe as a real, term-advancing vote.
+    ///
+    /// A failure here is a "no", not an error to retry: `run_pre_vote_round`
+    /// counts anything that is not an explicit grant as a rejection and the
+    /// node stays a Follower. That is the safe direction — a missed pre-vote
+    /// costs one election timeout, while a false grant is what inflates terms.
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<PreVoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        let Some(target_host_id) = self.current_target_host_id() else {
+            tracing::warn!(
+                node_id = self.target,
+                "PreVote before host_id registration; Unreachable until it lands"
+            );
+            return Err(RPCError::Unreachable(Unreachable::new(
+                &UnresolvedRaftTarget(self.target),
+            )));
+        };
+        let payload = encode(&rpc)?;
+        let response = match self
+            .peer_manager
+            .send_with_timeout(
+                target_host_id,
+                Message::RaftPreVote(payload),
+                Lane::Raft,
+                lane_timeout_for_rpc(&option),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::debug!(target = %target_host_id, %e, "PreVote send failed");
+                backoff_transient_raft_reconnect(&e).await;
+                return Err(net_error_to_unreachable(e));
+            }
+        };
+
+        match response {
+            Message::RaftPreVoteResponse(bytes) => decode(&bytes),
+            other => {
+                tracing::error!(target = %target_host_id, msg_type = ?other.msg_type(), "PreVote got unexpected response type");
+                Err(RPCError::Network(NetworkError::new(&UnexpectedResponse(
+                    format!("expected RaftPreVoteResponse, got {:?}", other.msg_type()),
                 ))))
             }
         }
