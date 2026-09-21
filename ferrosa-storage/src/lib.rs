@@ -24,6 +24,7 @@ pub mod engine;
 pub mod external_sort;
 pub mod flush;
 pub(crate) mod flush_executor;
+pub mod fulltext_observability;
 pub mod index;
 pub mod manifest;
 pub mod memtable;
