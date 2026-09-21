@@ -144,6 +144,9 @@ pub enum Message {
     RaftAppendResponse(Bytes),
     RaftVote(Bytes),
     RaftVoteResponse(Bytes),
+    /// PreVote probe and its response (Ongaro §9.6, ADR-012).
+    RaftPreVote(Bytes),
+    RaftPreVoteResponse(Bytes),
     RaftInstallSnapshot(Bytes),
 
     // Data — opaque payloads
@@ -345,6 +348,8 @@ impl Message {
             Self::RaftAppendResponse(_) => MsgType::RaftAppendResponse,
             Self::RaftVote(_) => MsgType::RaftVote,
             Self::RaftVoteResponse(_) => MsgType::RaftVoteResponse,
+            Self::RaftPreVote(_) => MsgType::RaftPreVote,
+            Self::RaftPreVoteResponse(_) => MsgType::RaftPreVoteResponse,
             Self::RaftInstallSnapshot(_) => MsgType::RaftInstallSnapshot,
             Self::MutationForward(_) => MsgType::MutationForward,
             Self::MutationAck(_) => MsgType::MutationAck,
@@ -508,6 +513,8 @@ impl Message {
             | Self::RaftAppendResponse(b)
             | Self::RaftVote(b)
             | Self::RaftVoteResponse(b)
+            | Self::RaftPreVote(b)
+            | Self::RaftPreVoteResponse(b)
             | Self::RaftInstallSnapshot(b)
             | Self::MutationForward(b)
             | Self::MutationAck(b)
@@ -705,6 +712,10 @@ impl Message {
                 Self::RaftAppendResponse(body.split_to(body.remaining()))
             }
             MsgType::RaftVote => Self::RaftVote(body.split_to(body.remaining())),
+            MsgType::RaftPreVote => Self::RaftPreVote(body.split_to(body.remaining())),
+            MsgType::RaftPreVoteResponse => {
+                Self::RaftPreVoteResponse(body.split_to(body.remaining()))
+            }
             MsgType::RaftVoteResponse => Self::RaftVoteResponse(body.split_to(body.remaining())),
             MsgType::RaftInstallSnapshot => {
                 Self::RaftInstallSnapshot(body.split_to(body.remaining()))

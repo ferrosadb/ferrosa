@@ -12,6 +12,7 @@
 //! |----------------------------|----------------------|---------------------------|
 //! | `RaftAppendEntries(bytes)` | [`RaftAppendHandler`]| `RaftAppendResponse(bytes)`|
 //! | `RaftVote(bytes)`          | [`RaftVoteHandler`]  | `RaftVoteResponse(bytes)` |
+//! | `RaftPreVote(bytes)`       | [`RaftPreVoteHandler`] | `RaftPreVoteResponse(bytes)` |
 //! | `RaftInstallSnapshot(bytes)`| [`RaftSnapshotHandler`]| `RaftAppendResponse(bytes)`|
 //! | `ReadRequest(bytes)`       | [`ReadRequestHandler`]| `ReadResponse(bytes)`    |
 //! | `PartitionSuffixReadRequest(bytes)` | [`ReadRequestHandler`] | `ReadResponse(bytes)` |
@@ -30,8 +31,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use openraft::raft::{
-    AppendEntriesRequest, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest,
-    VoteResponse,
+    AppendEntriesRequest, InstallSnapshotRequest, InstallSnapshotResponse, PreVoteRequest,
+    PreVoteResponse, VoteRequest, VoteResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -859,6 +860,79 @@ impl RpcHandler for RaftVoteHandler {
 }
 
 // ---------------------------------------------------------------------------
+// RaftPreVoteHandler
+// ---------------------------------------------------------------------------
+
+/// Handles inbound `RaftPreVote` RPCs (Ongaro §9.6, ADR-012).
+///
+/// A PreVote is a **non-mutating** probe: it asks "would you grant me a vote at
+/// the next term?" without the sender having advanced its own term. The
+/// receiver answers from current state and, critically, advances nothing of its
+/// own either. That is what stops a partitioned node from inflating the
+/// cluster's term when it rejoins — the failure mode that left this cluster at
+/// term 1868.
+///
+/// Deliberately mirrors [`RaftVoteHandler`] rather than sharing code with it:
+/// the two must not become interchangeable, because a real vote advances
+/// persistent term state and a pre-vote must never do so.
+pub struct RaftPreVoteHandler {
+    raft: LazyRaft,
+}
+
+impl RaftPreVoteHandler {
+    pub fn new(raft: LazyRaft) -> Self {
+        Self { raft }
+    }
+}
+
+#[async_trait]
+impl RpcHandler for RaftPreVoteHandler {
+    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+        let bytes = match msg {
+            Message::RaftPreVote(b) => b,
+            other => {
+                tracing::error!(msg_type = ?other.msg_type(), "RaftPreVoteHandler: unexpected message type");
+                return None;
+            }
+        };
+
+        let raft = match self.raft.get().await {
+            Some(r) => r,
+            None => {
+                tracing::error!(
+                    "RaftPreVoteHandler: Raft instance not ready (LazyRaft returned None)"
+                );
+                return None;
+            }
+        };
+
+        let req: PreVoteRequest<u64> = match bincode::deserialize(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftPreVoteHandler: deserialize failed: {e}");
+                return None;
+            }
+        };
+
+        let resp: PreVoteResponse<u64> = match raft.pre_vote(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("RaftPreVoteHandler: pre_vote failed: {e}");
+                return None;
+            }
+        };
+
+        match bincode::serialize(&resp) {
+            Ok(bytes) => Some(Message::RaftPreVoteResponse(Bytes::from(bytes))),
+            Err(e) => {
+                tracing::error!("RaftPreVoteHandler: serialize response failed: {e}");
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RaftSnapshotHandler
 // ---------------------------------------------------------------------------
 
@@ -1619,6 +1693,82 @@ mod tests {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
+
+    // ---- PreVote transport (Ongaro §9.6, ADR-012) -------------------------
+
+    fn prevote_req(term: u64, node: u64) -> PreVoteRequest<u64> {
+        PreVoteRequest::new(openraft::Vote::new(term, node), None)
+    }
+
+    /// The wire payload a PreVote carries must survive the same bincode round
+    /// trip the real vote does. Until 2026-09-21 `FerrosRaftNetwork` had no
+    /// `pre_vote` at all, so the trait default returned an "unimplemented"
+    /// NetworkError that `run_pre_vote_round` counted as a NO — making a
+    /// pre-vote quorum structurally impossible and forcing
+    /// `raft_enable_pre_vote` to stay off.
+    #[test]
+    fn prevote_request_survives_the_wire_roundtrip() {
+        let req = prevote_req(1869, 2459565876494606882);
+        let bytes = bincode::serialize(&req).unwrap();
+        let back: PreVoteRequest<u64> = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.vote, req.vote);
+        assert_eq!(back.last_log_id, req.last_log_id);
+    }
+
+    #[test]
+    fn prevote_response_survives_the_wire_roundtrip() {
+        for granted in [true, false] {
+            let resp = PreVoteResponse::<u64> {
+                vote: openraft::Vote::new(1869, 1),
+                vote_granted: granted,
+                last_log_id: None,
+            };
+            let bytes = bincode::serialize(&resp).unwrap();
+            let back: PreVoteResponse<u64> = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back.vote_granted, granted);
+            assert_eq!(back.vote, resp.vote);
+        }
+    }
+
+    /// A PreVote must travel under its own message variant. If it were sent as
+    /// `RaftVote`, a peer would answer it through the real vote path — which
+    /// advances persistent term state. That is precisely the term inflation
+    /// PreVote exists to prevent, so the two must never be interchangeable.
+    #[test]
+    fn prevote_uses_its_own_message_variant_not_raftvote() {
+        let payload = Bytes::from(bincode::serialize(&prevote_req(1869, 1)).unwrap());
+
+        let msg = Message::RaftPreVote(payload.clone());
+        assert_eq!(msg.msg_type(), ferrosa_net::codec::MsgType::RaftPreVote);
+        assert_ne!(msg.msg_type(), ferrosa_net::codec::MsgType::RaftVote);
+
+        let resp = Message::RaftPreVoteResponse(payload);
+        assert_eq!(
+            resp.msg_type(),
+            ferrosa_net::codec::MsgType::RaftPreVoteResponse
+        );
+        assert_ne!(
+            resp.msg_type(),
+            ferrosa_net::codec::MsgType::RaftVoteResponse
+        );
+    }
+
+    /// The handler must refuse a message that is not a PreVote rather than
+    /// coercing it, so a mis-registered handler fails loudly instead of
+    /// answering vote traffic on the pre-vote path.
+    #[tokio::test]
+    async fn prevote_handler_rejects_a_non_prevote_message() {
+        let (_tx, lazy) = LazyRaft::channel();
+        let handler = RaftPreVoteHandler::new(lazy);
+
+        let wrong = Message::RaftVote(Bytes::from_static(b"not a prevote"));
+        let out = handler.handle(make_peer_id(), wrong).await;
+
+        assert!(
+            out.is_none(),
+            "a non-PreVote message must not be answered on the pre-vote path"
+        );
+    }
 
     fn make_peer_id() -> PeerId {
         (uuid::Uuid::new_v4(), "127.0.0.1:7000".parse().unwrap())
