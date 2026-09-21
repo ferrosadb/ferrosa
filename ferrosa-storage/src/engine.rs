@@ -9659,7 +9659,15 @@ impl StorageEngine {
         //
         // Sweep everything belonging to this generation, by prefix, so the
         // directory can actually be removed.
-        if component_dir != table_dir {
+        //
+        // This runs for BOTH layouts. In the flat layout `component_dir ==
+        // table_dir`, so there is no directory to remove and the leak is
+        // quieter but identical: the sidecars are simply orphaned among the
+        // table's files forever. On the live cluster one table carried 33,781
+        // such orphans (21,943 `.sidecar`, 11,809 FTI, 29 VEC) against 8
+        // complete flat-layout SSTables. The `<gen>-` prefix identifies this
+        // SSTable's files uniquely in either layout.
+        {
             let prefix = format!("{gen}-");
             match std::fs::read_dir(&component_dir) {
                 Ok(entries) => {
@@ -12491,6 +12499,51 @@ mod tests {
             !gen_dir.exists(),
             "an SSTable with index sidecars must be removed as a unit; leaving \
              the directory behind is what produced 36,572 husks in production"
+        );
+    }
+
+    /// The same leak in the FLAT layout, where `component_dir == table_dir`.
+    /// There is no directory to remove, so the failure is quieter — the
+    /// sidecars are simply orphaned among the table's files forever. On the
+    /// live cluster one table held 33,781 such orphans (21,943 `.sidecar`,
+    /// 11,809 FTI, 29 VEC) against 8 complete flat-layout SSTables.
+    #[test]
+    fn delete_sstable_files_removes_flat_layout_index_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        for component in ["Data.db", "Partitions.db", "Rows.db", "TOC.txt"] {
+            std::fs::write(table_dir.join(format!("42-{component}")), b"x").unwrap();
+        }
+        for sidecar in [
+            "42-FTI-idx_entity_name_fts.db",
+            "42-idx_entity_scope.sidecar",
+            "42-VEC-idx_entity_embedding__scope_0010.db",
+        ] {
+            std::fs::write(table_dir.join(sidecar), b"xx").unwrap();
+        }
+        // A different generation sharing the same flat directory.
+        std::fs::write(table_dir.join("43-Data.db"), b"x").unwrap();
+        std::fs::write(table_dir.join("43-idx_entity_scope.sidecar"), b"x").unwrap();
+
+        StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        let left: Vec<String> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.starts_with("42-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "flat-layout sidecars must be swept too; orphans left: {left:?}"
+        );
+
+        assert!(
+            table_dir.join("43-Data.db").exists()
+                && table_dir.join("43-idx_entity_scope.sidecar").exists(),
+            "a different generation in the same flat directory must survive"
         );
     }
 
