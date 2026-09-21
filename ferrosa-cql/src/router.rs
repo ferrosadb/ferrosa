@@ -1695,6 +1695,11 @@ fn plain_projection_page_shape(s: &SelectStatement) -> bool {
 
 /// The client's page size, or the server default when the request is unpaged
 /// — an unpaged read still gets a bounded page and a cursor.
+/// How many DISTINCT row keys stay resident before the set spills to its temp
+/// table. Bounds the coordinator's DISTINCT working set independently of how
+/// many distinct rows the query actually matches.
+const DISTINCT_RESIDENT_KEY_LIMIT: usize = 65_536;
+
 fn request_scan_bound(ctx: &RequestContext<'_>) -> crate::paging::ScanBound {
     crate::paging::ScanBound::from_request(ctx.paging.page_size)
 }
@@ -7219,12 +7224,54 @@ async fn route_select_user_table(
     let selected_rows =
         apply_tojson_projections(&s.columns, &col_names, &all_col_names, &rows, selected_rows);
 
+    // DISTINCT deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which keeps a
+    // full clone of every distinct row resident — O(distinct rows x row size),
+    // unbounded for a large result, and the one part of this path that could
+    // still exhaust the coordinator.
+    //
+    // `SpillingDedup` keeps a bounded number of row keys resident and writes the
+    // rest to a temp table. Both it and the reservation delete their directory
+    // on drop, so a cancelled query cleans up by construction rather than by
+    // remembering to — the same discipline ORDER BY's temp-sort table uses.
+    let _distinct_temp_table;
     let selected_rows = if s.distinct {
-        let mut seen = std::collections::BTreeSet::new();
-        selected_rows
-            .into_iter()
-            .filter(|row| seen.insert(row.clone()))
-            .collect()
+        let reservation = state
+            .engine
+            .reserve_distinct_temp_table(ks, &s.table)
+            .map_err(|e| CqlError::ServerError(format!("DISTINCT temp-table setup failed: {e}")))?;
+        let mut seen = ferrosa_storage::spilling_dedup::SpillingDedup::new(
+            reservation.path(),
+            DISTINCT_RESIDENT_KEY_LIMIT,
+        );
+        let mut deduped = Vec::new();
+        for row in selected_rows {
+            // Fail loud: a de-duplication set that silently stops de-duplicating
+            // emits the same row twice, and the caller cannot tell.
+            let first_time = seen
+                .insert(&crate::paging::distinct_dedup_key(&row))
+                .map_err(|e| {
+                    CqlError::ServerError(format!("DISTINCT de-duplication spill failed: {e}"))
+                })?;
+            if first_time {
+                deduped.push(row);
+            }
+        }
+        let stats = seen.stats();
+        if seen.spilled_to_disk() {
+            tracing::info!(
+                keyspace = ks,
+                table = %s.table,
+                distinct = stats.distinct,
+                duplicates = stats.duplicates,
+                spilled = stats.spilled,
+                temp_table = %reservation.path().display(),
+                "DISTINCT de-duplication spilled to its temp table"
+            );
+        }
+        // Hold the reservation until the rows have been built; dropping it
+        // removes the temp table.
+        _distinct_temp_table = reservation;
+        deduped
     } else {
         selected_rows
     };
@@ -29472,6 +29519,62 @@ mod tests {
             u.len()
         };
         assert_eq!(unique, ids.len(), "paged traversal emitted duplicate rows");
+    }
+
+    /// DISTINCT dedups through a spilling set backed by a temp table, and the
+    /// temp table is gone afterwards.
+    ///
+    /// It previously deduped with a `BTreeSet<Vec<Option<CqlValue>>>` holding a
+    /// full clone of every distinct row -- O(distinct rows x row size) resident
+    /// and unbounded, the last place on this path that could exhaust the
+    /// coordinator.
+    #[tokio::test]
+    async fn distinct_dedups_through_a_temp_table_that_is_cleaned_up() {
+        let n = 64i64;
+        let (state, dir, auth, ks) = setup_wide_scan_table(n).await;
+        let select = match crate::parser::parse("SELECT DISTINCT id FROM pageks.t").unwrap() {
+            Statement::Select(s) => s,
+            other => panic!("expected select, got {other:?}"),
+        };
+        let ctx = paging_ctx(&auth, &ks, None, None);
+        let res = route_select_raw(&state, &ctx, &select).await.unwrap();
+
+        assert_eq!(
+            res.rows.len(),
+            n as usize,
+            "every id is distinct, so DISTINCT must return all {n}"
+        );
+
+        // Every returned row is unique.
+        let mut keys: Vec<_> = res
+            .rows
+            .iter()
+            .map(|r| crate::paging::distinct_dedup_key(r))
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            before,
+            "DISTINCT returned a duplicate row: {before} rows, {} unique",
+            keys.len()
+        );
+
+        // The temp table is removed when the query finishes -- the same way a
+        // cancelled query removes it, by dropping the reservation.
+        let distinct_root = dir.path().join("tmp_distinct");
+        if distinct_root.exists() {
+            let leftovers: Vec<_> = std::fs::read_dir(&distinct_root)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "DISTINCT temp tables were left behind: {leftovers:?}"
+            );
+        }
     }
 
     /// An unpaged SELECT returns EVERY row and NO continuation.

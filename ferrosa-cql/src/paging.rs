@@ -243,6 +243,43 @@ pub const DEFAULT_SCAN_PAGE_SIZE: usize = 5_000;
 /// Resolve the default scan page size from the environment, falling back to
 /// [`DEFAULT_SCAN_PAGE_SIZE`]. The python driver's default `fetch_size` is
 /// 5000, so an unpaged client query gets the same effective bound.
+/// Build the byte key a `DISTINCT` de-duplication set stores for one row.
+///
+/// `DISTINCT` previously deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which
+/// keeps a full clone of every distinct row resident — `O(distinct rows x row
+/// size)` in coordinator memory, unbounded for a large result. Keying to bytes
+/// lets [`ferrosa_storage::spilling_dedup::SpillingDedup`] hold a bounded number
+/// resident and spill the rest to a temp directory it removes on drop, so a
+/// cancelled read cleans up by construction.
+///
+/// # Framing
+///
+/// Cells are **length-prefixed**, not concatenated. Concatenation collides
+/// across cell boundaries — `["a", "bc"]` and `["ab", "c"]` both flatten to
+/// `abc` — and a `DISTINCT` collision silently discards a row that was not a
+/// duplicate. The arity is prefixed for the same reason, so a shorter row is
+/// never a prefix-duplicate of a longer one, and `NULL` takes a distinct marker
+/// so it never equals an empty value.
+pub fn distinct_dedup_key(row: &[Option<crate::types::CqlValue>]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + row.len() * 16);
+    key.extend_from_slice(&(row.len() as u32).to_be_bytes());
+    for cell in row {
+        match cell {
+            None => key.push(0u8),
+            Some(value) => {
+                key.push(1u8);
+                // Debug is a faithful, injective rendering for CqlValue: every
+                // variant is structurally distinct and String/Vec contents are
+                // escaped, so two different values never render identically.
+                let rendered = format!("{value:?}");
+                key.extend_from_slice(&(rendered.len() as u32).to_be_bytes());
+                key.extend_from_slice(rendered.as_bytes());
+            }
+        }
+    }
+    key
+}
+
 /// How a scan bounds itself, and whether it may advertise a continuation.
 ///
 /// These two properties are one decision, not two, which is why they live on
@@ -399,6 +436,72 @@ pub fn apply_pagination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- distinct_dedup_key ---------------------------------------------
+
+    fn txt(v: &str) -> Option<crate::types::CqlValue> {
+        Some(crate::types::CqlValue::Text(v.to_string()))
+    }
+
+    /// Equal rows must key equal, or DISTINCT emits the same row twice.
+    #[test]
+    fn equal_rows_produce_equal_dedup_keys() {
+        let a = [txt("alpha"), txt("beta")];
+        let b = [txt("alpha"), txt("beta")];
+        assert_eq!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// Rows differing in any cell must key differently, or DISTINCT drops a row
+    /// that was not a duplicate — silent data loss.
+    #[test]
+    fn rows_differing_in_a_cell_produce_different_dedup_keys() {
+        let a = [txt("alpha"), txt("beta")];
+        let b = [txt("alpha"), txt("gamma")];
+        assert_ne!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// The trap. A key built by concatenating cell bytes collides across
+    /// boundaries: `["a", "bc"]` and `["ab", "c"]` both flatten to `abc`, so
+    /// DISTINCT would silently discard the second row as a duplicate. The key
+    /// must be unambiguous about where each cell ends.
+    #[test]
+    fn dedup_keys_do_not_collide_across_cell_boundaries() {
+        let a = [txt("a"), txt("bc")];
+        let b = [txt("ab"), txt("c")];
+        assert_ne!(
+            distinct_dedup_key(&a),
+            distinct_dedup_key(&b),
+            "cell boundaries must be encoded; concatenation alone collides"
+        );
+    }
+
+    /// NULL and the empty string are different values and must key differently.
+    #[test]
+    fn null_and_empty_string_produce_different_dedup_keys() {
+        let null_row = [None, txt("x")];
+        let empty_row = [txt(""), txt("x")];
+        assert_ne!(
+            distinct_dedup_key(&null_row),
+            distinct_dedup_key(&empty_row)
+        );
+    }
+
+    /// A NULL in a different position is a different row.
+    #[test]
+    fn null_position_changes_the_dedup_key() {
+        let a = [None, txt("x")];
+        let b = [txt("x"), None];
+        assert_ne!(distinct_dedup_key(&a), distinct_dedup_key(&b));
+    }
+
+    /// Differing arity must key differently — a shorter row is not a prefix
+    /// duplicate of a longer one.
+    #[test]
+    fn row_arity_changes_the_dedup_key() {
+        let short = [txt("a")];
+        let long = [txt("a"), txt("")];
+        assert_ne!(distinct_dedup_key(&short), distinct_dedup_key(&long));
+    }
 
     // ---- ScanBound -------------------------------------------------------
 
