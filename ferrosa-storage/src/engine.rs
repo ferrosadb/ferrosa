@@ -7771,10 +7771,16 @@ impl StorageEngine {
     /// * `on_hit` returning [`std::ops::ControlFlow::Break`] halts the entire walk
     ///   immediately (consumer-paced backpressure: dropped downstream
     ///   receiver, satisfied page). No callback fires after a Break.
-    /// * Compound (non-single-`Term`) queries have no streaming evaluator yet:
-    ///   they delegate to [`Self::fulltext_search`] internally and replay its
-    ///   keys, so callers get one code path for every query shape. Their
-    ///   memory is bounded by that path's contract, not this one's.
+    /// * A `MultiTerm` conjunction — what a plain multi-word query parses to —
+    ///   streams too: each term's postings are scanned and intersected WITHIN
+    ///   one sidecar, so the working set is that sidecar's postings for the
+    ///   queried terms and a `Break` stops at the next sidecar boundary.
+    /// * The remaining shapes (`Phrase`, `And`, `Or`, `Prefix`, `Not`) have no
+    ///   streaming evaluator yet: they delegate to [`Self::fulltext_search`]
+    ///   internally and replay its keys, so callers get one code path for every
+    ///   query shape. Their memory is bounded by that path's contract, not this
+    ///   one's — and a `Break` does not save them any work, because the whole
+    ///   match set is built before the first callback fires.
     ///
     /// # Errors
     ///
@@ -7809,15 +7815,30 @@ impl StorageEngine {
             return Ok(());
         }
 
-        // Compound queries: delegate to the materializing evaluator and
-        // replay its keys through the callback (single caller-facing path).
-        let FtsQuery::Term(term) = &parsed else {
-            for key in self.fulltext_search(table_id, index_name, query, None)? {
-                if on_hit(key).is_break() {
-                    return Ok(());
+        /// The shapes this path can walk a sidecar at a time.
+        enum StreamShape<'a> {
+            /// One term: its postings, streamed.
+            Term(&'a str),
+            /// A conjunction: each term's postings streamed and intersected
+            /// within a single sidecar.
+            Conjunction(&'a [String]),
+        }
+
+        let shape = match &parsed {
+            FtsQuery::Term(term) => StreamShape::Term(term.as_str()),
+            FtsQuery::MultiTerm(terms) => StreamShape::Conjunction(terms),
+            // Shapes with no streaming evaluator yet: delegate to the
+            // materializing evaluator and replay its keys through the callback
+            // (single caller-facing path). Their memory is bounded by that
+            // path's contract, not this one's.
+            _ => {
+                for key in self.fulltext_search(table_id, index_name, query, None)? {
+                    if on_hit(key).is_break() {
+                        return Ok(());
+                    }
                 }
+                return Ok(());
             }
-            return Ok(());
         };
 
         let Some((fti_files, covered_gens)) =
@@ -7847,18 +7868,62 @@ impl StorageEngine {
             #[cfg(test)]
             FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(c.get() + 1));
             let mut stopped = false;
-            if let Err(e) =
-                ferrosa_index::fulltext::stream::scan_term_each(&fti_path, term, |hit| {
-                    if on_hit(hit.partition_key).is_break() {
-                        stopped = true;
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
+            match shape {
+                StreamShape::Term(term) => {
+                    if let Err(e) =
+                        ferrosa_index::fulltext::stream::scan_term_each(&fti_path, term, |hit| {
+                            if on_hit(hit.partition_key).is_break() {
+                                stopped = true;
+                                ControlFlow::Break(())
+                            } else {
+                                ControlFlow::Continue(())
+                            }
+                        })
+                    {
+                        tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}");
+                        continue;
                     }
-                })
-            {
-                tracing::warn!(path = %fti_path.display(), "bad FTI (stream): {e}");
-                continue;
+                }
+                StreamShape::Conjunction(terms) => {
+                    // Intersect WITHIN this sidecar, then emit. The working set
+                    // is one sidecar's postings for the queried terms, so a
+                    // consumer that breaks stops at the next sidecar boundary
+                    // instead of after the whole index — which is what
+                    // delegating to the materializing evaluator used to cost.
+                    //
+                    // The per-term scans are unbounded on purpose: a top-k per
+                    // term is NOT the top-k of the intersection, since a doc
+                    // ranked poorly for one term can be the best conjunction
+                    // match. Any limit belongs on the intersection.
+                    let mut per_term = Vec::with_capacity(terms.len());
+                    let mut scan_failed = false;
+                    for term in terms {
+                        match ferrosa_index::fulltext::stream::scan_term_top_k(
+                            &fti_path,
+                            term.as_str(),
+                            None,
+                        ) {
+                            Ok(hits) => per_term.push(hits),
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %fti_path.display(),
+                                    "bad FTI (multi-term stream): {e}"
+                                );
+                                scan_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if scan_failed {
+                        continue;
+                    }
+                    for hit in ferrosa_index::fulltext::stream::intersect_conjunction(per_term) {
+                        if on_hit(hit.partition_key).is_break() {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                }
             }
             if stopped {
                 return Ok(());
@@ -25319,6 +25384,157 @@ mod tests {
             "two queries over {live} live SSTable(s) must consult exactly \
              {} sidecars, consulted {consulted}",
             2 * live
+        );
+    }
+
+    /// Ten sidecars, every one of them holding a row that matches.
+    async fn engine_with_matching_sidecars(
+        dir: &tempfile::TempDir,
+        sidecars: usize,
+    ) -> (StorageEngine, TableId) {
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        for gen in 0..sidecars {
+            let ts = gen as i64 + 1;
+            engine
+                .write(
+                    &tid,
+                    &make_key(&format!("doc_{gen:02}")),
+                    make_row(b"ferrosaftsalpha ferrosaftsbeta", ts),
+                    ts,
+                )
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+        assert_eq!(
+            engine.sstable_count(&tid),
+            sidecars,
+            "each flush should leave its own live SSTable"
+        );
+        (engine, tid)
+    }
+
+    /// `fulltext_search_each` is the STREAMING path. Its contract is an O(1)
+    /// working set and a `ControlFlow::Break` the consumer uses to stop early
+    /// — that is what makes an unpaged `fts_match` cancel-safe and bounded.
+    ///
+    /// The contract held only for a single `Term`. Every other shape delegated
+    /// to the materializing evaluator with `limit = None`, which walks EVERY
+    /// sidecar and builds the complete match set BEFORE the first callback
+    /// fires. Breaking then saves nothing: the work is already paid for and
+    /// the whole match set is already resident.
+    ///
+    /// `MultiTerm` is what a plain multi-word query parses to, and it is what
+    /// ferrosa-memory sends on every search — so this was the live shape, and
+    /// the streaming path was materializing it.
+    #[tokio::test]
+    async fn a_multi_word_streaming_search_stops_early_instead_of_walking_every_sidecar() {
+        const SIDECARS: usize = 10;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, tid) = engine_with_matching_sidecars(&dir, SIDECARS).await;
+
+        FTS_SIDECAR_FILES_CONSULTED.with(|c| c.set(0));
+        let mut seen = 0usize;
+        engine
+            .fulltext_search_each(
+                &tid,
+                "idx_body",
+                "ferrosaftsalpha ferrosaftsbeta",
+                &mut |_key| {
+                    seen += 1;
+                    std::ops::ControlFlow::Break(())
+                },
+            )
+            .unwrap();
+        let consulted = FTS_SIDECAR_FILES_CONSULTED.with(|c| c.get());
+
+        assert_eq!(seen, 1, "the consumer broke on the first hit");
+        assert!(
+            consulted < SIDECARS,
+            "a consumer that stopped after one hit still paid for {consulted} \
+             of {SIDECARS} sidecars — the streaming path materialized the whole \
+             match set before calling back"
+        );
+    }
+
+    /// Streaming must not change the ANSWER. A full walk through the streaming
+    /// path returns exactly what the materializing evaluator returns for the
+    /// same multi-word query — every matching row, each exactly once.
+    #[tokio::test]
+    async fn a_multi_word_streaming_walk_returns_the_same_keys_as_the_materializing_path() {
+        const SIDECARS: usize = 10;
+        const QUERY: &str = "ferrosaftsalpha ferrosaftsbeta";
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, tid) = engine_with_matching_sidecars(&dir, SIDECARS).await;
+
+        let materialized = engine
+            .fulltext_search(&tid, "idx_body", QUERY, None)
+            .unwrap();
+
+        let mut streamed: Vec<Vec<u8>> = Vec::new();
+        engine
+            .fulltext_search_each(&tid, "idx_body", QUERY, &mut |key| {
+                streamed.push(key);
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            fts_partition_keys(&streamed),
+            fts_partition_keys(&materialized),
+            "the streaming walk and the materializing evaluator must agree"
+        );
+        assert_eq!(
+            streamed.len(),
+            SIDECARS,
+            "every row matches both terms, so every row must be emitted once"
+        );
+    }
+
+    /// A conjunction is an INTERSECTION. A row carrying only one of the two
+    /// terms must not be emitted — the trap in streaming per-term postings is
+    /// unioning them by accident.
+    #[tokio::test]
+    async fn a_multi_word_streaming_search_emits_only_rows_matching_every_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine.add_fulltext_index(&tid, "idx_body", 0).unwrap();
+
+        for (name, text) in [
+            ("doc_both", "ferrosaftsalpha ferrosaftsbeta"),
+            ("doc_alpha", "ferrosaftsalpha only"),
+            ("doc_beta", "ferrosaftsbeta only"),
+        ] {
+            engine
+                .write(&tid, &make_key(name), make_row(text.as_bytes(), 1), 1)
+                .unwrap();
+            engine.flush(&tid).unwrap();
+        }
+
+        let mut streamed: Vec<Vec<u8>> = Vec::new();
+        engine
+            .fulltext_search_each(
+                &tid,
+                "idx_body",
+                "ferrosaftsalpha ferrosaftsbeta",
+                &mut |key| {
+                    streamed.push(key);
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            fts_partition_keys(&streamed),
+            vec!["doc_both".to_string()],
+            "only the row carrying BOTH terms may match a conjunction"
         );
     }
 
