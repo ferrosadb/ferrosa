@@ -3028,10 +3028,37 @@ impl StorageEngine {
         keyspace: &str,
         table: &str,
     ) -> ferrosa_common::Result<TempSortTableReservation> {
-        let root = self.config.data_dir.join("tmp_order_by_sort");
+        self.reserve_query_temp_table("tmp_order_by_sort", "ORDER BY temp-sort", keyspace, table)
+    }
+
+    /// Reserve a temporary table directory for a spillable `DISTINCT`
+    /// de-duplication set.
+    ///
+    /// `DISTINCT` deduped with a `BTreeSet` holding a full clone of every
+    /// distinct row — `O(distinct rows x row size)` resident and unbounded for a
+    /// large result. The spilling set keeps a bounded number of keys resident
+    /// and writes the rest here; this guard deletes the directory on drop, so a
+    /// cancelled query cleans up the same way a completed one does.
+    pub fn reserve_distinct_temp_table(
+        &self,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<TempSortTableReservation> {
+        self.reserve_query_temp_table("tmp_distinct", "DISTINCT temp", keyspace, table)
+    }
+
+    /// Shared body for the per-query temp table reservations above.
+    fn reserve_query_temp_table(
+        &self,
+        root_name: &str,
+        purpose: &str,
+        keyspace: &str,
+        table: &str,
+    ) -> ferrosa_common::Result<TempSortTableReservation> {
+        let root = self.config.data_dir.join(root_name);
         std::fs::create_dir_all(&root).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create ORDER BY temp-sort root {}: {e}",
+                "failed to create {purpose} root {}: {e}",
                 root.display()
             ))
         })?;
@@ -3044,7 +3071,7 @@ impl StorageEngine {
         let path = root.join(name);
         std::fs::create_dir(&path).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
-                "failed to create ORDER BY temp-sort table {}: {e}",
+                "failed to create {purpose} table {}: {e}",
                 path.display()
             ))
         })?;
@@ -9759,8 +9786,80 @@ impl StorageEngine {
             }
         }
 
+        // The seven suffixes above are not the whole SSTable. A generation that
+        // carried secondary or full-text indexes also holds
+        // `<gen>-FTI-idx_*.db`, `<gen>-VEC-idx_*.db` and `<gen>-idx_*.sidecar`
+        // components. Deleting only the fixed list left those behind, the
+        // `remove_dir` below then failed because the directory was not empty,
+        // and the error was discarded — leaking one husk directory per
+        // compaction. Compaction planning re-examined each husk every cycle
+        // forever ("required components are missing or empty and no remote
+        // length is registered"). On the live ferrosa-memory cluster this
+        // reached 36,572 husks against 29 real SSTables on a single table and
+        // pushed full-text queries past their deadline.
+        //
+        // Sweep everything belonging to this generation, by prefix, so the
+        // directory can actually be removed.
+        //
+        // This runs for BOTH layouts. In the flat layout `component_dir ==
+        // table_dir`, so there is no directory to remove and the leak is
+        // quieter but identical: the sidecars are simply orphaned among the
+        // table's files forever. On the live cluster one table carried 33,781
+        // such orphans (21,943 `.sidecar`, 11,809 FTI, 29 VEC) against 8
+        // complete flat-layout SSTables. The `<gen>-` prefix identifies this
+        // SSTable's files uniquely in either layout.
+        {
+            let prefix = format!("{gen}-");
+            match std::fs::read_dir(&component_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let Some(name) = name.to_str() else { continue };
+                        if !name.starts_with(&prefix) {
+                            continue;
+                        }
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        if std::fs::remove_file(&path).is_ok() {
+                            reclaimed = reclaimed.saturating_add(size);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    dir = %component_dir.display(),
+                    error = %e,
+                    "delete_sstable_files: could not enumerate the component directory; \
+                     index sidecars may be left behind"
+                ),
+            }
+        }
+
+        // Fail loud. A directory that survives here is a husk that compaction
+        // planning will re-examine and re-warn about on every cycle, forever.
+        // Swallowing this error is what let 36,572 of them accumulate unnoticed.
         if component_dir != table_dir {
-            let _ = std::fs::remove_dir(&component_dir);
+            if let Err(e) = std::fs::remove_dir(&component_dir) {
+                let leftovers: Vec<String> = std::fs::read_dir(&component_dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                            .take(8)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tracing::error!(
+                    dir = %component_dir.display(),
+                    error = %e,
+                    ?leftovers,
+                    "delete_sstable_files: SSTable component directory survived deletion — \
+                     it will be re-examined by compaction planning on every cycle and can \
+                     never be compacted. This is an SSTable husk leak."
+                );
+            }
         }
 
         reclaimed
@@ -12483,6 +12582,161 @@ mod tests {
         assert!(
             !gen_dir.exists(),
             "directory-layout SSTable should be removed as a unit"
+        );
+    }
+
+    /// Regression: a compacted SSTable that carried secondary or full-text
+    /// indexes left its component directory behind forever.
+    ///
+    /// `delete_sstable_files` removes a FIXED list of seven suffixes. An
+    /// SSTable with indexes also holds `<gen>-FTI-idx_*.db` (full-text) and
+    /// `<gen>-idx_*.sidecar` (secondary index) files, which are not in that
+    /// list. `remove_dir` then fails because the directory is not empty, and
+    /// the failure is discarded by `let _ = ...`.
+    ///
+    /// The husk survives, and compaction planning re-examines it on every
+    /// cycle forever, logging "required components are missing or empty and no
+    /// remote length is registered" and skipping it. On the live
+    /// ferrosa-memory cluster this reached **36,572 husk directories** against
+    /// 29 real SSTables on one table, which is what pushed full-text queries
+    /// past their 3s deadline and disabled lexical search entirely.
+    #[test]
+    fn delete_sstable_files_removes_index_sidecars_and_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        let gen_dir = table_dir.join("42");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        for component in [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+            "CompressionInfo.db",
+        ] {
+            std::fs::write(gen_dir.join(format!("42-{component}")), b"x").unwrap();
+        }
+
+        // The components the fixed suffix list does not know about. These are
+        // exactly what the live husks were left holding.
+        for sidecar in [
+            "42-FTI-idx_entity_context_snippet_fts.db",
+            "42-FTI-idx_entity_name_fts.db",
+            "42-idx_entity_by_id.sidecar",
+            "42-idx_entity_by_tenant.sidecar",
+            "42-idx_entity_name_phonetic.sidecar",
+            "42-idx_entity_scope.sidecar",
+            "42-idx_entity_type.sidecar",
+            "42-VEC-idx_entity_embedding__scope_0010.db",
+        ] {
+            std::fs::write(gen_dir.join(sidecar), b"xx").unwrap();
+        }
+
+        StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        assert!(
+            !gen_dir.exists(),
+            "an SSTable with index sidecars must be removed as a unit; leaving \
+             the directory behind is what produced 36,572 husks in production"
+        );
+    }
+
+    /// The same leak in the FLAT layout, where `component_dir == table_dir`.
+    /// There is no directory to remove, so the failure is quieter — the
+    /// sidecars are simply orphaned among the table's files forever. On the
+    /// live cluster one table held 33,781 such orphans (21,943 `.sidecar`,
+    /// 11,809 FTI, 29 VEC) against 8 complete flat-layout SSTables.
+    #[test]
+    fn delete_sstable_files_removes_flat_layout_index_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        for component in ["Data.db", "Partitions.db", "Rows.db", "TOC.txt"] {
+            std::fs::write(table_dir.join(format!("42-{component}")), b"x").unwrap();
+        }
+        for sidecar in [
+            "42-FTI-idx_entity_name_fts.db",
+            "42-idx_entity_scope.sidecar",
+            "42-VEC-idx_entity_embedding__scope_0010.db",
+        ] {
+            std::fs::write(table_dir.join(sidecar), b"xx").unwrap();
+        }
+        // A different generation sharing the same flat directory.
+        std::fs::write(table_dir.join("43-Data.db"), b"x").unwrap();
+        std::fs::write(table_dir.join("43-idx_entity_scope.sidecar"), b"x").unwrap();
+
+        StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        let left: Vec<String> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.starts_with("42-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "flat-layout sidecars must be swept too; orphans left: {left:?}"
+        );
+
+        assert!(
+            table_dir.join("43-Data.db").exists()
+                && table_dir.join("43-idx_entity_scope.sidecar").exists(),
+            "a different generation in the same flat directory must survive"
+        );
+    }
+
+    /// The reclaimed-bytes figure must count the index sidecars too, or the
+    /// caller's disk accounting silently under-reports what compaction freed.
+    #[test]
+    fn delete_sstable_files_counts_index_sidecar_bytes_as_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        let gen_dir = table_dir.join("7");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+
+        std::fs::write(gen_dir.join("7-Data.db"), vec![b'x'; 100]).unwrap();
+        std::fs::write(gen_dir.join("7-TOC.txt"), vec![b'x'; 10]).unwrap();
+        std::fs::write(
+            gen_dir.join("7-FTI-idx_entity_name_fts.db"),
+            vec![b'x'; 500],
+        )
+        .unwrap();
+        std::fs::write(gen_dir.join("7-idx_entity_scope.sidecar"), vec![b'x'; 40]).unwrap();
+
+        let reclaimed = StorageEngine::delete_sstable_files(&table_dir, "7");
+
+        assert_eq!(
+            reclaimed, 650,
+            "reclaimed bytes must include FTI and .sidecar components"
+        );
+    }
+
+    /// A neighbouring generation in the same table directory must survive.
+    /// The sweep is per-generation, not per-table.
+    #[test]
+    fn delete_sstable_files_leaves_other_generations_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join(table_id().to_string());
+        let doomed = table_dir.join("42");
+        let keeper = table_dir.join("43");
+        std::fs::create_dir_all(&doomed).unwrap();
+        std::fs::create_dir_all(&keeper).unwrap();
+
+        std::fs::write(doomed.join("42-Data.db"), b"x").unwrap();
+        std::fs::write(doomed.join("42-idx_entity_scope.sidecar"), b"x").unwrap();
+        std::fs::write(keeper.join("43-Data.db"), b"x").unwrap();
+        std::fs::write(keeper.join("43-idx_entity_scope.sidecar"), b"x").unwrap();
+
+        StorageEngine::delete_sstable_files(&table_dir, "42");
+
+        assert!(!doomed.exists(), "the targeted generation is removed");
+        assert!(
+            keeper.join("43-Data.db").exists()
+                && keeper.join("43-idx_entity_scope.sidecar").exists(),
+            "a neighbouring generation must not be touched"
         );
     }
 
