@@ -47,6 +47,42 @@ use ferrosa_storage::TableId;
 use super::FerrosRaftConfig;
 
 // ---------------------------------------------------------------------------
+// Replying
+// ---------------------------------------------------------------------------
+
+/// Encode a handler's reply, or refuse to answer.
+///
+/// Three handlers used to answer an encode failure with a successfully-encoded
+/// EMPTY payload — `partitions: vec![]`, `matching_keys: vec![]` — on the
+/// reasoning that sending something beat dropping the message. It does not. An
+/// empty reply is indistinguishable from a replica that legitimately matched
+/// nothing, so the coordinator unions it in and serves a short answer as a
+/// complete one. `RangeReadHandler`'s version was the worst of the three: it
+/// also set `truncated: false`, actively asserting that nothing was cut off.
+///
+/// A missing reply, by contrast, is something the caller can see and act on —
+/// it times out or fails coverage, both of which are loud. Silence beats a
+/// confident wrong answer (`skills/rules/safety.md`: never fake success).
+///
+/// Returns `None` when the payload cannot be encoded, having logged the cause
+/// at ERROR — this is a "should be impossible" path, so it is worth a line
+/// every time rather than being sampled.
+fn encode_reply<T: Serialize>(payload: &T, handler: &'static str) -> Option<Bytes> {
+    match bincode::serialize(payload) {
+        Ok(bytes) => Some(Bytes::from(bytes)),
+        Err(e) => {
+            tracing::error!(
+                handler,
+                %e,
+                "failed to serialize reply; sending NO reply rather than an empty one \
+                 that would read as 'nothing matched'"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wire types (serde-capable mirrors for sstable types)
 // ---------------------------------------------------------------------------
 
@@ -977,16 +1013,11 @@ impl RpcHandler for RaftSnapshotHandler {
             })
             .ok()?;
 
-        let resp_bytes = bincode::serialize(&resp)
-            .map_err(|e| {
-                tracing::warn!("RaftSnapshotHandler: failed to serialize response: {e}");
-                e
-            })
-            .ok()?;
+        let resp_bytes = encode_reply(&resp, "RaftSnapshotHandler")?;
 
         // Reuses `RaftAppendResponse` as the snapshot ack wire type, matching
         // the decode side in `FerrosRaftNetwork::install_snapshot`.
-        Some(Message::RaftAppendResponse(Bytes::from(resp_bytes)))
+        Some(Message::RaftAppendResponse(resp_bytes))
     }
 }
 
@@ -1146,14 +1177,9 @@ impl RpcHandler for ReadRequestHandler {
             }
         };
 
-        let resp_bytes = bincode::serialize(&payload)
-            .map_err(|e| {
-                tracing::warn!("ReadRequestHandler: failed to serialize response: {e}");
-                e
-            })
-            .ok()?;
+        let resp_bytes = encode_reply(&payload, "ReadRequestHandler")?;
 
-        Some(Message::ReadResponse(Bytes::from(resp_bytes)))
+        Some(Message::ReadResponse(resp_bytes))
     }
 }
 
@@ -1252,20 +1278,9 @@ impl RpcHandler for RangeReadHandler {
             truncated,
         };
 
-        let resp_bytes = match bincode::serialize(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("RangeReadHandler: failed to serialize response: {e}");
-                // Serialize an empty response instead of dropping the message.
-                bincode::serialize(&RangeReadResponsePayload {
-                    partitions: vec![],
-                    truncated: false,
-                })
-                .unwrap_or_default()
-            }
-        };
+        let resp_bytes = encode_reply(&payload, "RangeReadHandler")?;
 
-        Some(Message::RangeReadResponse(Bytes::from(resp_bytes)))
+        Some(Message::RangeReadResponse(resp_bytes))
     }
 }
 
@@ -1561,18 +1576,9 @@ impl RpcHandler for IndexReadInPartitionHandler {
             partitions: wire_partitions,
         };
 
-        let resp_bytes = match bincode::serialize(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("IndexReadInPartitionHandler: failed to serialize response: {e}");
-                bincode::serialize(&IndexReadResponsePayload { partitions: vec![] })
-                    .unwrap_or_default()
-            }
-        };
+        let resp_bytes = encode_reply(&payload, "IndexReadInPartitionHandler")?;
 
-        Some(Message::IndexReadInPartitionResponse(Bytes::from(
-            resp_bytes,
-        )))
+        Some(Message::IndexReadInPartitionResponse(resp_bytes))
     }
 }
 
@@ -1715,18 +1721,9 @@ impl RpcHandler for FulltextSearchHandler {
         };
 
         let payload = FulltextSearchResponsePayload { matching_keys };
-        let resp_bytes = match bincode::serialize(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("FulltextSearchHandler: failed to serialize response: {e}");
-                bincode::serialize(&FulltextSearchResponsePayload {
-                    matching_keys: vec![],
-                })
-                .unwrap_or_default()
-            }
-        };
+        let resp_bytes = encode_reply(&payload, "FulltextSearchHandler")?;
 
-        Some(Message::FulltextSearchResponse(Bytes::from(resp_bytes)))
+        Some(Message::FulltextSearchResponse(resp_bytes))
     }
 }
 
@@ -2644,5 +2641,62 @@ mod tests {
         let encoded = bincode::serialize(&chunk).expect("encode");
         // bincode default little-endian fixint: u32 occupies bytes 0..4.
         assert_eq!(&encoded[..4], &0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    // ---- encode_reply ----------------------------------------------------
+
+    /// A payload that cannot be encoded.
+    ///
+    /// bincode will not fail on the real reply types, so the failure is
+    /// produced at the serde layer. What is under test is the DECISION taken
+    /// when encoding fails, not bincode's behaviour.
+    struct Unencodable;
+
+    impl serde::Serialize for Unencodable {
+        fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("this payload cannot be encoded"))
+        }
+    }
+
+    #[test]
+    fn an_encodable_reply_is_sent_verbatim() {
+        let payload = FulltextSearchResponsePayload {
+            matching_keys: vec![b"doc-1".to_vec(), b"doc-2".to_vec()],
+        };
+        let bytes = encode_reply(&payload, "TestHandler").expect("an encodable reply must be sent");
+        let decoded: FulltextSearchResponsePayload =
+            bincode::deserialize(&bytes).expect("reply must round-trip");
+        assert_eq!(decoded.matching_keys, payload.matching_keys);
+    }
+
+    /// The defect. Three handlers answered an encode failure with a
+    /// successfully-encoded EMPTY payload, which the coordinator cannot tell
+    /// apart from a replica that genuinely matched nothing.
+    #[test]
+    fn a_reply_that_cannot_be_encoded_is_refused_rather_than_faked() {
+        assert!(
+            encode_reply(&Unencodable, "TestHandler").is_none(),
+            "an encode failure must send NO reply — an empty one reports the \
+             failure as an empty ANSWER, which is a silent wrong result"
+        );
+    }
+
+    /// Regression guard: a new handler must not reintroduce the pattern.
+    ///
+    /// Every one of the three original sites ended in the same call, used to
+    /// turn "I could not even encode the empty fallback" into zero bytes. None
+    /// remain, so any reappearance is this defect coming back.
+    ///
+    /// The needle is assembled rather than written out, because this test reads
+    /// the very file it lives in — spelling it literally would match itself.
+    #[test]
+    fn no_handler_fakes_an_empty_reply_when_encoding_fails() {
+        let needle = concat!("unwrap_or", "_default()");
+        let source = include_str!("handlers.rs");
+        assert!(
+            !source.contains(needle),
+            "a handler is falling back to a default-encoded reply on a \
+             serialization failure; use `encode_reply` and send nothing instead"
+        );
     }
 }
