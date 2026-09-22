@@ -366,6 +366,53 @@ mod tests {
     /// unbounded and stop when a SHARED budget of served chunks is exhausted, so
     /// the split of that budget reflects the scheduler's weighting (not each
     /// scan's own fixed workload).
+    ///
+    /// ## Why the counted section does not start at `admit`
+    ///
+    /// `reschedule` only yields when `queue.peek_min()` finds a waiter -- an
+    /// empty queue means nobody to be unfair to, so a scan that is CURRENTLY
+    /// THE ONLY DEMAND keeps its slot for free. That is correct: idling a
+    /// free slot on the chance a rival arrives later would waste capacity for
+    /// no reason. But it means whichever of the two `spawn_blocking` OS
+    /// threads the scheduler happens to run first gets an uncontested head
+    /// start before the other's `admit` call ever reaches the queue -- and
+    /// under real contention that head start is not bounded to a few turns.
+    /// Measured on an unloaded runner: 1.85 instead of ~4.0 (fg=3244,
+    /// bulk=1756). Measured under a 2-CPU-constrained container with genuine
+    /// background load: as bad as 0.04 (fg=172, bulk=4828) -- one side
+    /// consumed 97% of the whole 5000-turn budget before the other's OS
+    /// thread had run its first instruction.
+    ///
+    /// A `Barrier` crossed immediately before `admit` does not close this: it
+    /// verified, tried first -- 10 of 40 runs still failed under the same
+    /// load, because a `Barrier` only guarantees both threads ARRIVE
+    /// together, not that the OS hands them equal CPU time after release.
+    /// Under contention, one of the two just-released threads can still sit
+    /// unscheduled for an unbounded time while the other races ahead.
+    ///
+    /// So the head start is not prevented; it is excluded from the count.
+    /// Counting per side starts only once BOTH scans are enrolled in
+    /// `FairAdmit`'s own state (running or queued) -- the same technique
+    /// already used a few tests down in
+    /// `tenants_get_equal_share_regardless_of_query_count` for an identical
+    /// reason, so this mirrors a pattern already proven in this file rather
+    /// than inventing a second one.
+    ///
+    /// This cannot be a barrier crossed once before the counted loop starts
+    /// (tried and reverted): with capacity 1, the loser's `admit` only
+    /// resolves once the winner's `reschedule` yields to it, and
+    /// `reschedule` is only ever called from inside the counted loop -- so a
+    /// barrier gating entry to that loop deadlocks both sides waiting on
+    /// each other. Polling `running.len() + queue.len()` sidesteps this
+    /// because enqueuing a waiter needs no cooperation from the slot holder;
+    /// only being GRANTED the slot does, and this loop doesn't wait for
+    /// that, just for both to be present one way or the other. Nor does this
+    /// wait loop call `reschedule` itself (unlike the discarded barrier
+    /// attempt): `reschedule` advances real `vruntime`, so calling it while
+    /// "waiting for the other side" would let the winner accumulate a large
+    /// vruntime lead during the head start and carry that imbalance into the
+    /// counted window, skewing the ratio the other way instead of removing
+    /// the skew.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn foreground_gets_roughly_four_to_one_over_bulk() {
         // capacity 1 so the two scans genuinely contend for the single slot.
@@ -374,6 +421,7 @@ mod tests {
         let ran: Arc<Mutex<Map<&'static str, u64>>> = Arc::new(Mutex::new(Map::new()));
         let served = Arc::new(AtomicUsize::new(0));
         const BUDGET: usize = 5000;
+        const SCANS: usize = 2;
 
         let run = |class: SchedClass, tag: &'static str| {
             let admit = admit.clone();
@@ -383,6 +431,16 @@ mod tests {
             tokio::task::spawn_blocking(move || {
                 let id =
                     slot(handle.block_on(admit.admit(G, GW, class, std::future::pending::<()>())));
+                loop {
+                    let enrolled = {
+                        let state = admit.state.lock().expect("fair-admit poisoned");
+                        state.running.len() + state.queue.len()
+                    };
+                    if enrolled == SCANS {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
                 while served.fetch_add(1, Ordering::SeqCst) < BUDGET {
                     *ran.lock().unwrap().entry(tag).or_insert(0) += 1;
                     admit.reschedule(&handle, id, 10);
