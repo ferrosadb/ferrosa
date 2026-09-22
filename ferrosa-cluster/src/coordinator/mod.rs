@@ -115,7 +115,18 @@ pub struct ClusterCoordinator {
     pub(crate) streaming_fulltext: bool,
 }
 
-fn streaming_range_reads_enabled(value: Option<&str>) -> bool {
+/// Whether a `FERROSA_BULK_STREAMING_*` env var leaves streaming enabled.
+///
+/// Shared by `streaming_range_reads` and `streaming_fulltext`: both opt OUT of
+/// streaming with the same grammar, and both default to ON when unset. Named
+/// for the grammar rather than for one of its callers — it used to be
+/// `streaming_range_reads_enabled`, which meant tightening the range-read
+/// opt-out would silently have changed how full-text search behaves.
+///
+/// Unrecognized values leave streaming ON. That fails safe, but it also means
+/// an operator who writes `False` or `no` has not opted out and is told
+/// nothing; the accepted spellings are exactly the ones matched here.
+fn bulk_streaming_enabled(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim),
         Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
@@ -146,10 +157,19 @@ impl ClusterCoordinator {
         default_cl: ConsistencyLevel,
     ) -> Self {
         let streaming_env = std::env::var("FERROSA_BULK_STREAMING_RANGE_READ").ok();
-        let streaming_range_reads = streaming_range_reads_enabled(streaming_env.as_deref());
+        let streaming_range_reads = bulk_streaming_enabled(streaming_env.as_deref());
         let streaming_fulltext_env = std::env::var("FERROSA_BULK_STREAMING_FULLTEXT").ok();
-        let streaming_fulltext = streaming_range_reads_enabled(streaming_fulltext_env.as_deref());
-        if !streaming_fulltext {
+        let streaming_fulltext = bulk_streaming_enabled(streaming_fulltext_env.as_deref());
+        // Report BOTH branches, matching the range-read flag below. The
+        // fallback used to announce itself only when taken, so a node running
+        // the streaming path said nothing and the two states were
+        // indistinguishable in a log that had rotated.
+        if streaming_fulltext {
+            tracing::info!(
+                configured = streaming_fulltext_env.as_deref().unwrap_or("default"),
+                "coordinator: streaming fulltext search enabled"
+            );
+        } else {
             tracing::warn!(
                 "coordinator: legacy single-message fulltext search enabled via \
                  FERROSA_BULK_STREAMING_FULLTEXT=0; broad no-LIMIT fts_match queries \
@@ -519,14 +539,14 @@ mod tests {
 
     #[test]
     fn streaming_range_reads_are_enabled_by_default() {
-        assert!(streaming_range_reads_enabled(None));
+        assert!(bulk_streaming_enabled(None));
     }
 
     #[test]
     fn streaming_range_reads_allow_explicit_legacy_opt_out() {
         for value in ["0", "false", "FALSE", "off", "OFF"] {
             assert!(
-                !streaming_range_reads_enabled(Some(value)),
+                !bulk_streaming_enabled(Some(value)),
                 "{value} must disable streaming range reads"
             );
         }
@@ -536,8 +556,59 @@ mod tests {
     fn streaming_range_reads_accept_explicit_enable_values() {
         for value in ["1", "true", "TRUE", "on", "anything-else"] {
             assert!(
-                streaming_range_reads_enabled(Some(value)),
+                bulk_streaming_enabled(Some(value)),
                 "{value} must keep streaming range reads enabled"
+            );
+        }
+    }
+
+    // ---- the fulltext flag ------------------------------------------------
+    //
+    // `streaming_fulltext` is parsed by the SAME predicate as
+    // `streaming_range_reads` — deliberately, since both env vars share one
+    // grammar. Until now nothing pinned that, and the predicate was named
+    // after only one of its two callers, so tightening the range-read opt-out
+    // would silently have changed how full-text search behaves.
+
+    #[test]
+    fn streaming_fulltext_is_enabled_by_default() {
+        assert!(
+            bulk_streaming_enabled(None),
+            "an operator who sets nothing must get the streaming path, not the \
+             legacy union that OOM-killed replicas"
+        );
+    }
+
+    #[test]
+    fn streaming_fulltext_allows_explicit_legacy_opt_out() {
+        for value in ["0", "false", "FALSE", "off", "OFF"] {
+            assert!(
+                !bulk_streaming_enabled(Some(value)),
+                "{value} must select the legacy fulltext path"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_fulltext_accepts_explicit_enable_values() {
+        for value in ["1", "true", "TRUE", "on", "anything-else"] {
+            assert!(
+                bulk_streaming_enabled(Some(value)),
+                "{value} must keep streaming fulltext enabled"
+            );
+        }
+    }
+
+    /// An unrecognized spelling fails SAFE: it leaves streaming on rather than
+    /// dropping to the legacy path. Worth pinning, because it means an operator
+    /// who writes `False` or `no` has NOT opted out and gets no warning saying
+    /// so — the accepted spellings are exactly the list above.
+    #[test]
+    fn an_unrecognized_opt_out_spelling_keeps_streaming_on() {
+        for value in ["False", "No", "disabled", ""] {
+            assert!(
+                bulk_streaming_enabled(Some(value)),
+                "{value:?} is not an accepted opt-out spelling, so streaming must stay on"
             );
         }
     }
