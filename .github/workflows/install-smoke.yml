@@ -29,11 +29,8 @@ concurrency:
 
 env:
   SMOKE_VERSION: v0.0.0-smoke
-  # Shared compilation cache (GitHub Actions backend) for the jobs that compile
-  # (build, memory-smoke). The compile-free `smoke` job inherits these but never
-  # invokes cargo, so RUSTC_WRAPPER is unused there.
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
+  # rust-cache is the only build cache (see ci.yml). Incremental state is never
+  # reused from a fresh checkout.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -94,10 +91,12 @@ jobs:
             exit 0
           fi
           brew install capnp
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+          # Under pull_request_target github.ref is the BASE branch, so the
+          # main-only check alone would save PR code into main's cache scope.
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target' && runner.environment == 'github-hosted' }}
       - name: Build ferrosa + ferrosa-ctl (release) and stage the tarball
         # Uses the SAME .github/scripts/stage-release-tarball.sh the real release
         # uses, so the smoke exercises the real artifact layout.
@@ -236,15 +235,20 @@ jobs:
             exit 0
           fi
           brew install capnp
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
+          # tests/install_smoke.sh compiles ferrosa-memory-mcp inside the
+          # ferrosa-memory checkout; ferrosa's own target/ is empty in this job.
+          workspaces: ferrosa-memory -> target
+          # Under pull_request_target github.ref is the BASE branch, so the
+          # main-only check alone would save PR code into main's cache scope.
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target' && runner.environment == 'github-hosted' }}
       - name: Download the prebuilt ferrosa tarball
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ferrosa-tarball-${{ matrix.os }}
           path: prebuilt
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run install smoke with the ferrosa-memory integration
         # Reuses the prebuilt ferrosa tarball (--ferrosa-tarball); only
         # ferrosa-memory-mcp is compiled in this job.

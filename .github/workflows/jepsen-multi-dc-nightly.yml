@@ -21,8 +21,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   CARGO_INCREMENTAL: "0"
 
 permissions:
@@ -38,18 +36,22 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Validate tier-multi-dc wiring (config-only)
         run: |
           set -o pipefail
-          cargo test --release -p ferrosa-jepsen \
+          # --all-features compiles in the live-infra
+          # `tier_multi_dc_one_hour_bank_workload`; the two name filters below
+          # do not select it.
+          cargo test --release -p ferrosa-jepsen --all-features \
             --test tier_multi_dc \
             -- tier_multi_dc_resolves_to_t3 \
                dc_partition_plus_dc_slow_nemesis_registered \
             2>&1 | tee tier-config.log
       - name: Build the jepsen driver binary
-        run: cargo build --release -p ferrosa-jepsen
+        run: cargo build --release -p ferrosa-jepsen --all-features
       - name: Stage the driver artifact (flat layout)
         # Stage into one dir so the artifact has the binary + log at its ROOT
         # (uploading the two source paths directly would preserve

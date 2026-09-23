@@ -8,11 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Shared compilation cache (GitHub Actions backend). Every job that compiles
-  # runs a sccache-action step (the smoke-test job's is gated on the rare musl
-  # fallback). CARGO_INCREMENTAL=0 because incremental bypasses sccache.
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
+  # rust-cache is the only build cache and saves only from main (see ci.yml).
+  # Incremental state is never reused from a fresh checkout.
   CARGO_INCREMENTAL: "0"
 
 permissions:
@@ -28,6 +25,12 @@ jobs:
     # step is bounded by an inner `timeout` (wall-clock budget) BELOW its step
     # timeout, so it exits cleanly and the verdict step always runs.
     timeout-minutes: 45
+    env:
+      # Line-tables debuginfo, the same as ci.yml `test` and `integration`, so
+      # this job restores their dependency cache instead of compiling cold
+      # inside its fuzz budget. Backtraces keep file:line; nothing here runs a
+      # debugger. Job-level so rust-cache hashes it into the key.
+      CARGO_PROFILE_DEV_DEBUG: "1"
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -37,9 +40,11 @@ jobs:
       - name: Install Cap'n Proto compiler
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace-test-all-features-debug1
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
 
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build AssemblyScript UDF toolchain bundle
         # --all-features enables `asc-udf` + `live-infra-tests`, which run the
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
@@ -59,9 +64,12 @@ jobs:
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
           # Enables libtest's `--report-time` on the stable toolchain so the
           # uploaded test-output.log ranks every test by wall-clock duration
-          # (`ok <1.234s>`). Only permits the unstable libtest flag; the code
-          # uses no nightly features, so this does not change what is compiled.
-          RUSTC_BOOTSTRAP: 1
+          # (`ok <1.234s>`). libtest reads RUSTC_BOOTSTRAP when the test binary
+          # RUNS, so it is passed to the test binaries only, through the target
+          # runner. Exported for the compile it WOULD change what is built:
+          # anyhow's build script tracks RUSTC_BOOTSTRAP, which rebuilds most
+          # of the graph and defeats the shared test cache.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "env RUSTC_BOOTSTRAP=1"
         run: |
           set +e
           # --all-features so feature-gated property tests (e.g. the whole
@@ -130,7 +138,7 @@ jobs:
         run: |
           set +e
           timeout --kill-after=30s "${FILEIO_FUZZ_BUDGET_SECS}" \
-            cargo test -p ferrosa-storage --features fuzz-fileio --test repair_fuzz \
+            cargo test -p ferrosa-storage --all-features --test repair_fuzz \
             2>&1 | tee -a test-output.log
           status=${PIPESTATUS[0]}
           # Budget elapsed (124/137) = fuzzed without a failing case → success.
@@ -242,9 +250,6 @@ jobs:
           # the .deb file as a build context. Deleting it here causes a cache miss and
           # "ferrosa.deb: not found" during the compose build.
 
-      - name: Set up sccache (only when the musl fallback compiles)
-        if: steps.nightly_deb.outputs.deb_path == ''
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build x86_64 musl static ferrosa binary (fallback)
         # The smoke test needs a runtime image. We prefer the nightly .deb above.
         # This fallback is compiled only if the reusable download step somehow
@@ -359,13 +364,12 @@ jobs:
       - name: Install Cap'n Proto compiler
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
 
       - name: Run Accord perf regression suite
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: sccache
+        # --all-features: the same build these bounds were set against when
+        # they ran in ci.yml's --all-features `test` job.
         run: |
-          cargo test -p ferrosa-cluster --lib accord::perf_regression -- --nocapture
+          cargo test -p ferrosa-cluster --all-features --lib accord::perf_regression -- --nocapture

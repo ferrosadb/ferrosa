@@ -17,14 +17,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Shared compilation cache across all jobs AND runs, via the GitHub Actions
-  # cache backend. Each COMPILE job runs the sccache-action step (installs +
-  # starts the server); clippy/test/jepsen/musl/node-image otherwise cold-compile
-  # ~the same workspace independently. The fmt job inherits these too but never
-  # compiles, so RUSTC_WRAPPER is unused there. CARGO_INCREMENTAL=0 because
-  # incremental compilation bypasses sccache.
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
+  # Build cache policy (tests/ci/test_ci_cache_workflow.py pins it): rust-cache
+  # is the only cache layer. Every rust-cache step RESTORES on every ref but
+  # SAVES only from main on a hosted runner. GitHub scopes a cache to the ref
+  # that saved it, so a PR / merge-queue / tag save can never be restored by
+  # main, yet it counts against the 10 GB cap and evicts main's caches.
+  # CARGO_INCREMENTAL=0: every run starts from a fresh checkout, so incremental
+  # state is never reused and only inflates the target dir and the cache.
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -67,9 +66,10 @@ jobs:
           components: clippy
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
-      - run: cargo clippy --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Guard against unbounded materializing reads
         run: python3 scripts/check-unbounded-reads.py
       - name: P0 OOM guard — AST read-path materialization audit
@@ -77,20 +77,30 @@ jobs:
         # paths. Passes today via specs/p0-oom-guard/oom-audit-allow.toml; --today
         # is the run date so expired allow entries (the t_15417b35 migration
         # deadline) start failing the gate and force the streaming fix.
-        run: cargo run --quiet -p xtask -- p0-oom-audit --enforce --today "$(date -u +%F)"
+        run: cargo run --quiet -p xtask --all-features -- p0-oom-audit --enforce --today "$(date -u +%F)"
 
   # ── Stage 2: Tests ──────────────────────────────────────────────────
   test:
     name: Test + Coverage
     runs-on: ubuntu-latest
+    env:
+      # Line-tables-only debuginfo for test binaries: the dominant disk cost
+      # in this job. Keeps usable panic backtraces; halves target size.
+      # Job-level (not step-level) so rust-cache hashes it into the cache key:
+      # the jobs sharing `workspace-test-all-features-debug1` all set it.
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
+          # Same workspace, features, profile and debug level as `integration`
+          # and nightly-fuzz `fuzz`, so they restore one dependency cache.
+          shared-key: workspace-test-all-features-debug1
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Free disk space
         # The --all-features debug test build alone exceeds 30GB of target
         # artifacts; the old reclaim (dotnet/android/ghc ≈ 11GB) still left
@@ -109,13 +119,9 @@ jobs:
         # inline-AssemblyScript UDF tests for real against this bundle. Build it
         # (pinned asc version) so those tests run and pass rather than being skipped.
         run: bash ferrosa-udf/examples/asc-poc/build-bundle.sh /tmp/asc-host/asc-bundle.mjs
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run tests
         env:
           FERROSA_ASC_BUNDLE: /tmp/asc-host/asc-bundle.mjs
-          # Line-tables-only debuginfo for test binaries: the dominant disk cost
-          # in this job. Keeps usable panic backtraces; halves target size.
-          CARGO_PROFILE_DEV_DEBUG: "1"
         run: |
           # The trailing `--skip <fuzz prop>` flags exclude the file-IO-heavy
           # repair fuzz harness (ferrosa-storage `fuzz-fileio` feature, on under
@@ -163,14 +169,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Verify docker is available
         run: docker --version
       - name: Pre-pull postgres:16
         run: docker pull postgres:16
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run differential oracle (corpus + restricted-query + DML)
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -179,7 +185,9 @@ jobs:
           # ship both, and their podman/crun setup is not guaranteed to work.
           FERROSA_CONTAINER_RUNTIME: docker
         run: |
-          cargo test -p ferrosa-postgres --features live-infra-tests \
+          # --all-features on `-p ferrosa-postgres` turns on its only feature,
+          # live-infra-tests, which this job provides the container for.
+          cargo test -p ferrosa-postgres --all-features \
             --test differential_oracle -- --test-threads=1 --nocapture
 
   # ── Stage 2b: Musl static build ───────────────────────────────────
@@ -191,13 +199,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: musl
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Install musl tools and capnproto
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build static binary
+        # Curated `ferrosa/full`, NOT --all-features: this is the release
+        # binary's feature set, and the examples job runs this binary.
         run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
       - name: Verify statically linked
         run: |
@@ -235,31 +245,16 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: node-image
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Build glibc release binary (once)
-        # The hosted image already contains a different `sccache` on PATH. Use
-        # the action-managed binary explicitly so its GHA backend and reported
-        # statistics describe the compiler process Cargo actually invoked.
-        run: RUSTC_WRAPPER="$SCCACHE_PATH" cargo build --release -p ferrosa -p ferrosa-ctl
-      - name: Verify sccache handled compiler requests
-        run: |
-          "$SCCACHE_PATH" --show-stats --stats-format=json > /tmp/sccache-stats.json
-          python3 - <<'PY'
-          import json
-
-          with open("/tmp/sccache-stats.json", encoding="utf-8") as stats_file:
-              requests = json.load(stats_file)["stats"]["compile_requests"]
-          if requests <= 0:
-              raise SystemExit(
-                  "sccache handled zero compiler requests; release build bypassed the cache"
-              )
-          print(f"sccache handled {requests} compiler requests")
-          PY
+        # Default features, NOT --all-features: this binary becomes an image
+        # pushed to GHCR for paired repositories to run.
+        run: cargo build --release -p ferrosa -p ferrosa-ctl
       - name: Package into a thin runtime image
         run: |
           mkdir -p node-bin
@@ -325,10 +320,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
           key: jepsen-smoke
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
@@ -339,7 +335,6 @@ jobs:
         run: |
           docker pull rustfs/rustfs:latest
           docker pull quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -348,8 +343,10 @@ jobs:
           # topology-nemesis tests inside ferrosa-jepsen. The container
           # provisioning tests are gated on FERROSA_TEST_CONTAINERS so
           # they panic loudly without the env var instead of silently
-          # passing.
-          cargo test -p ferrosa-jepsen --lib \
+          # passing. --all-features compiles in the `live-infra-tests` lib
+          # tests; every one of them is in the skip list below (the
+          # `rust_driver_connects_to_cluster` filter matches both copies).
+          cargo test -p ferrosa-jepsen --all-features --lib \
             -- --skip orchestrator_docker_cluster_provision \
                --skip orchestrator_cluster_teardown \
                --skip rust_driver_connects_to_cluster \
@@ -358,7 +355,7 @@ jobs:
                --skip ssh_execute_command \
                --skip ssh_upload_file
           # Workflow shape assertions live in the integration tests.
-          cargo test -p ferrosa-jepsen --test ci_workflow
+          cargo test -p ferrosa-jepsen --all-features --test ci_workflow
 
   # ── Stage 2c: Example CQL tests (reuses musl binary) ───────────────
   examples:
@@ -454,7 +451,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           targets: wasm32-unknown-unknown
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Wait for CQL port
         run: |
@@ -545,6 +541,10 @@ jobs:
     # It must also be added to the ruleset's required status checks.
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
     timeout-minutes: 45
+    env:
+      # Matches `test`, so both restore the same dependency cache; line tables
+      # still give panic backtraces file:line.
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -567,10 +567,11 @@ jobs:
           path: .
       - name: Load node image into Docker
         run: docker load < ferrosa-node-image.tar.gz
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+          shared-key: workspace-test-all-features-debug1
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
@@ -583,7 +584,9 @@ jobs:
         env:
           FERROSA_TEST_CONTAINERS: "1"
         run: |
-          cargo test --workspace \
+          # --all-features adds no ignored tests: no #[ignore] test sits behind
+          # a feature gate, so --ignored selects the same set as before.
+          cargo test --workspace --all-features \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -- --ignored
       - name: Collect cluster logs on failure
@@ -606,9 +609,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install capnproto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Generate docs
-        run: cargo doc --no-deps --workspace
+        run: cargo doc --no-deps --workspace --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
