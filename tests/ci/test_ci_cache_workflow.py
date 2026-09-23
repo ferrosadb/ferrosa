@@ -44,6 +44,7 @@ RELEASE_WORKFLOWS = {
 RELEASE_SHAPED_JOBS = {
     ("ci.yml", "musl"): "static release binary, reused by the examples job",
     ("ci.yml", "build-node-image"): "release image pushed to GHCR for paired repos",
+    ("ci.yml", "aarch64-musl"): "checks release.yml's aarch64 packages and features",
     ("install-smoke.yml", "build"): "stages the real release tarball layout",
     ("nightly-fuzz.yml", "smoke-test"): "musl fallback for the nightly .deb image",
 }

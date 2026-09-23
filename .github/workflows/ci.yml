@@ -229,6 +229,40 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           retention-days: 14
 
+  # ── aarch64 musl release target (native arm64) ───────────────────────
+  # release.yml builds the aarch64 tarball natively on ubuntu-24.04-arm, but
+  # only when a tag is pushed. This checks the same target, packages and
+  # features per PR so an aarch64-only break shows up here, not at release
+  # time. `cargo check` runs build scripts, so C dependencies are compiled
+  # with musl-gcc; the final link is exercised only by the release job.
+  aarch64-musl:
+    name: aarch64 musl check (native arm)
+    runs-on: ubuntu-24.04-arm
+    env:
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # Ubuntu's musl-gcc links the distro (glibc) libgcc.a, whose aarch64
+      # outline-atomics init calls glibc's private __getauxval. Any C object
+      # using atomics then fails to link, so jemalloc's configure finds no
+      # atomics and its build stops. Inline LL/SC atomics avoid libgcc's
+      # helpers; they are also what the old `cross` toolchain produced.
+      CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install musl tools and capnproto
+        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: aarch64-musl
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Check the release packages for aarch64 musl
+        # Curated `ferrosa/full`, NOT --all-features: this is release.yml's
+        # aarch64 build, checked without the release profile or the link.
+        run: cargo check --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
+
   # ── Build the runtime node image ONCE (12-factor build/release/run) ──
   # Compile the glibc release binary exactly once (cached via rust-cache; glibc
   # for allocator performance — musl's allocator is slow, so the static musl

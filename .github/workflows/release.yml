@@ -141,41 +141,45 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # ── Linux aarch64 (musl static, cross-compiled) ──────────────────────
+  # ── Linux aarch64 (musl static, native) ──────────────────────────────
   build-linux-aarch64:
-    name: Build Linux aarch64 (musl, cross)
-    runs-on: ubuntu-latest
+    name: Build Linux aarch64 (musl)
+    # Native arm64 hosted runner, free for a public repository. This replaced a
+    # `cross` (docker) build on x86_64: no emulation, no cross toolchain, and
+    # the binaries can be executed on the machine that built them.
+    runs-on: ubuntu-24.04-arm
+    env:
+      # musl-gcc for C dependencies and the final link, the same as the x86_64
+      # musl target in .cargo/config.toml. Without it cc-rs would compile C
+      # against the runner's glibc headers.
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # Ubuntu's musl-gcc links the distro (glibc) libgcc.a, whose aarch64
+      # outline-atomics init calls glibc's private __getauxval. Any C object
+      # using atomics then fails to link, so jemalloc's configure finds no
+      # atomics and its build stops. Inline LL/SC atomics avoid libgcc's
+      # helpers; they are also what the old `cross` toolchain produced.
+      CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
         with:
           targets: aarch64-unknown-linux-musl
+      - name: Install musl tools and capnproto
+        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
 
-      # We use `cross` (https://github.com/cross-rs/cross) for aarch64-musl —
-      # simpler than zigbuild for a workspace this size and well-maintained.
-      - name: Install cross
-        run: cargo install cross --locked --version 0.2.5
-
-      # NOTE: workspace-wide tests are skipped for this target. The runner is
-      # x86_64; we cannot natively execute aarch64 binaries here. Clippy still
-      # runs as a static-analysis gate.
       - name: Clippy (aarch64-musl)
-        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+        run: cargo clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
 
       - name: Build aarch64 musl static binaries
         run: |
-          cross build --release --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
-          # `strip` from binutils handles foreign ELF; use the cross toolchain's
-          # aarch64 strip if present, fall back to plain strip which on modern
-          # binutils is multi-arch capable.
-          if command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
-            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa
-            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-ctl
-          else
-            sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
-            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa
-            aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/ferrosa-ctl
-          fi
+          cargo build --release --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
+          strip target/aarch64-unknown-linux-musl/release/ferrosa
+          strip target/aarch64-unknown-linux-musl/release/ferrosa-ctl
+          file target/aarch64-unknown-linux-musl/release/ferrosa target/aarch64-unknown-linux-musl/release/ferrosa-ctl
+          # Native runner: prove the shipped binaries start before packaging.
+          target/aarch64-unknown-linux-musl/release/ferrosa --version
+          target/aarch64-unknown-linux-musl/release/ferrosa-ctl --version
 
       - name: Stage release tarball
         run: |
