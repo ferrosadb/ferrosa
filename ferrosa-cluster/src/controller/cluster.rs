@@ -1641,9 +1641,15 @@ impl ModeController {
                     if ticks.is_multiple_of(prune_ticks) {
                         // Prune applied Accord transactions to prevent unbounded
                         // memory growth in txn_states and committed_txns.
-                        let pruned = {
-                            let mut sm = accord_state.lock();
-                            sm.prune_applied()
+                        // On the blocking pool: the mutex may be held through a
+                        // protocol-log fsync (see `on_state_machine`).
+                        let counts =
+                            crate::accord::handlers::on_state_machine(&accord_state, |sm| {
+                                (sm.prune_applied(), sm.txn_count())
+                            })
+                            .await;
+                        let Some((pruned, accord_txns)) = counts else {
+                            continue;
                         };
                         if pruned > 0 {
                             tracing::info!(
@@ -1654,7 +1660,6 @@ impl ModeController {
 
                         // Log table-level memory stats.
                         let table_count = storage.table_count();
-                        let accord_txns = accord_state.lock().txn_count();
                         tracing::info!(
                             table_count,
                             closed_buf_bytes,
