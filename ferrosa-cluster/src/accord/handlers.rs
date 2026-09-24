@@ -133,8 +133,8 @@ where
 /// # Deadlock safety
 ///
 /// The `parking_lot` state lock is acquired only to *compute* the pending set
-/// and to grab the apply-notify handle, on the blocking pool (see
-/// [`on_state_machine`]), then released BEFORE every `.await`.
+/// and to grab the apply-notify handle, on the blocking pool (see the private
+/// helper `on_state_machine`), then released BEFORE every `.await`.
 /// `handle_apply` (which fires the notify that unblocks us) takes the same lock,
 /// so holding it across the await would deadlock.
 pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: Timestamp) -> bool {
