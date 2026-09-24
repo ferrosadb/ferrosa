@@ -25,7 +25,7 @@ use std::sync::Arc;
 use ferrosa_cluster::accord::handlers::{AccordHandler, AccordState};
 use ferrosa_cluster::accord::state_machine::AccordStateMachine;
 use ferrosa_cluster::accord::{AccordCoordinatorDriver, AccordDriverError};
-use ferrosa_common::accord::HybridLogicalClock;
+use ferrosa_common::accord::{HybridLogicalClock, TxnPhase};
 use ferrosa_net::codec::MsgType;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
@@ -1264,4 +1264,166 @@ async fn applied_lwt_value_survives_state_machine_restart() {
              (durability via commit-log replay)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// An LWT that commits but then fails must not poison its key.
+// ---------------------------------------------------------------------------
+
+/// A transport that forwards every message through the real `PeerManager`
+/// except `AccordRead`, which fails as a lane timeout. This is the fault seen
+/// in production: the read-vote RPC to a replica times out after the
+/// transaction has already committed on every replica.
+struct ReadVoteTimesOut {
+    peers: Arc<PeerManager>,
+}
+
+#[async_trait::async_trait]
+impl ferrosa_cluster::accord::transport::AccordTransport for ReadVoteTimesOut {
+    async fn send(
+        &self,
+        host_id: uuid::Uuid,
+        msg: ferrosa_net::message::Message,
+        lane: ferrosa_net::codec::Lane,
+    ) -> ferrosa_net::error::Result<ferrosa_net::message::Message> {
+        if msg.msg_type() == MsgType::AccordRead {
+            return Err(ferrosa_net::error::NetError::Timeout(
+                "injected: Data lane timeout".into(),
+            ));
+        }
+        self.peers.send(host_id, msg, lane).await
+    }
+}
+
+/// Once an LWT has committed, every way it can fail short of the Apply phase
+/// must finalize it as a no-write on every replica. Otherwise it stays
+/// `Committed` forever: nothing else will ever apply it, and every later LWT on
+/// the same key dep-waits on it, times out on every replica, abstains, and
+/// fails with "lacked F+1 agreement (got 0 reads)". That failure takes the same
+/// early-return path, so the key stays poisoned until the node restarts.
+///
+/// Txn 1 commits on both replicas, then loses its remote read-vote to a lane
+/// timeout and fails. Txn 2 is a healthy `INSERT IF NOT EXISTS` on the same
+/// key and must apply.
+#[tokio::test]
+async fn a_committed_lwt_that_fails_its_read_vote_does_not_poison_the_key() {
+    let id_a = uuid::Uuid::from_bytes([0xD1; 16]);
+    let id_b = uuid::Uuid::from_bytes([0xD2; 16]);
+
+    let node_a = start_engine_test_node(id_a).await;
+    let node_b = start_engine_test_node(id_b).await;
+
+    node_a
+        .peer_manager
+        .ensure_peer(id_b, &node_b.local_addr.to_string())
+        .await
+        .expect("node_a -> node_b connect");
+    node_b
+        .peer_manager
+        .ensure_peer(id_a, &node_a.local_addr.to_string())
+        .await
+        .expect("node_b -> node_a connect");
+
+    let replica_ids = vec![id_a, id_b];
+    let pk = "poisoned-key";
+    let key = pk.as_bytes().to_vec();
+    let read_row = || ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    };
+    let local_applier = || {
+        Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
+            node_a.engine.clone(),
+        ))
+    };
+    let local_reader = || {
+        Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+            node_a.engine.clone(),
+        ))
+    };
+
+    // Txn 1: commits everywhere, then its remote read-vote times out.
+    let clock = HybridLogicalClock::new(node_a.node_id, 900_000_000);
+    let faulty: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport> =
+        Arc::new(ReadVoteTimesOut {
+            peers: Arc::clone(&node_a.peer_manager),
+        });
+    let mut failed = AccordCoordinatorDriver::new_multi_with_transport(
+        node_a.node_id,
+        replica_ids.clone(),
+        faulty,
+        false,
+        &clock,
+        vec![(key.clone(), e2e_mutation_bytes(pk, 11, 1))],
+    )
+    .with_read_predicate(read_row())
+    .with_local_applier(local_applier())
+    .with_local_reader(local_reader())
+    .with_local_accord_state(node_a.accord_state.clone())
+    .with_condition_gate(if_not_exists_gate());
+
+    let first = failed.run_transaction().await;
+    assert!(
+        matches!(first, Err(AccordDriverError::Network(ref m)) if m.contains("F+1")),
+        "txn 1 must fail its read-vote for lack of F+1 agreement, got {first:?}"
+    );
+    for (name, node) in [("a", &node_a), ("b", &node_b)] {
+        assert_eq!(
+            engine_v(node.engine.clone(), &key),
+            None,
+            "node_{name}: the failed txn must not have written its row"
+        );
+    }
+
+    // Txn 2: a healthy INSERT IF NOT EXISTS on the same key must apply.
+    let mut healthy = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_a.peer_manager),
+        false,
+        &clock,
+        key.clone(),
+        e2e_mutation_bytes(pk, 22, 2),
+    )
+    .with_read_predicate(read_row())
+    .with_local_applier(local_applier())
+    .with_local_reader(local_reader())
+    .with_local_accord_state(node_a.accord_state.clone())
+    .with_condition_gate(if_not_exists_gate());
+
+    let second = healthy.run_transaction().await;
+    assert!(
+        second.is_ok(),
+        "a healthy LWT on a key whose previous LWT failed after commit must apply, \
+         got {second:?}"
+    );
+    assert_eq!(engine_v(node_a.engine.clone(), &key), Some(22));
+    assert_eq!(engine_v(node_b.engine.clone(), &key), Some(22));
+
+    // The mechanism: txn 1 was finalized as a no-write on both replicas. The
+    // remote finalize is spawned, so it is checked only after txn 2, whose
+    // read-vote on node_b could not have answered until txn 1 was Applied there.
+    let failed_txn = failed.txn_id();
+    for (name, node) in [("a", &node_a), ("b", &node_b)] {
+        let phase = node
+            .accord_state
+            .lock()
+            .get_state(&failed_txn)
+            .map(|s| s.phase);
+        assert_eq!(
+            phase,
+            Some(TxnPhase::Applied),
+            "node_{name}: a txn that failed after committing must be finalized as a \
+             no-write, or it blocks every later read-vote on the key"
+        );
+    }
+
+    node_a
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    node_b
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
 }
