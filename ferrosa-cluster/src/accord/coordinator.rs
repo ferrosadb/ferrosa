@@ -965,17 +965,24 @@ impl AccordCoordinatorDriver {
     /// Best-effort: this is a cleanup, not a correctness gate for THIS txn (which
     /// is already aborting). Failures are logged, not propagated.
     async fn finalize_no_write(&self) {
-        self.finalize_no_write_locally();
+        self.finalize_no_write_locally().await;
         self.no_write_fanout().await;
     }
 
     /// Finalize the coordinator's own replica state machine as a no-write (its
     /// self-send is unreachable). Empty payload => no-write finalize.
-    fn finalize_no_write_locally(&self) {
+    ///
+    /// Routed through [`crate::accord::handlers::on_state_machine`] like every
+    /// other state-machine access from async code: `handle_apply` fsyncs the
+    /// protocol log while holding the state machine's mutex, which must not
+    /// happen on an async worker.
+    async fn finalize_no_write_locally(&self) {
         if let Some(local_sm) = &self.local_accord_state {
-            local_sm
-                .lock()
-                .handle_apply(self.coordinator.txn_id, Vec::new());
+            let txn_id = self.coordinator.txn_id;
+            crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                sm.handle_apply(txn_id, Vec::new())
+            })
+            .await;
         }
     }
 
@@ -1084,7 +1091,7 @@ impl AccordCoordinatorDriver {
                     // path the cluster is already slow or failing, so waiting
                     // would add that bound to every failed transaction's latency.
                     // Each remote failure is logged by the fan-out itself.
-                    self.finalize_no_write_locally();
+                    self.finalize_no_write_locally().await;
                     tokio::spawn(self.no_write_fanout());
                 }
                 return Err(e);
@@ -1184,12 +1191,15 @@ impl AccordCoordinatorDriver {
             !has_remote_replica || fast_quorum_size(self.coordinator.rf) > 1;
         if self_is_replica && !self.coordinator.is_leaseholder && self_vote_cannot_short_circuit {
             if let Some(local_sm) = &self.local_accord_state {
-                let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
-                let resp =
-                    local_sm
-                        .lock()
-                        .handle_preaccept_multi(txn_id, t0, &keys, BallotNumber(0), 0);
-                if let crate::accord::state_machine::SmResponse::PreAcceptOK { t, deps, .. } = resp
+                let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+                let resp = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                    sm.handle_preaccept_multi(txn_id, t0, &keys, BallotNumber(0), 0)
+                })
+                .await;
+                if let Some(crate::accord::state_machine::SmResponse::PreAcceptOK {
+                    t, deps, ..
+                }) = resp
                 {
                     decision = self.coordinator.handle_preaccept_ok(PreAcceptResponse {
                         from: self.coordinator.node_id,
@@ -1343,14 +1353,14 @@ impl AccordCoordinatorDriver {
                     self.self_id != uuid::Uuid::nil() && self.replica_ids.contains(&self.self_id);
                 if self_is_replica {
                     if let Some(local_sm) = &self.local_accord_state {
-                        let resp = local_sm.lock().handle_accept(
-                            txn_id,
-                            t0,
-                            t,
-                            accept_deps.clone(),
-                            BallotNumber(1),
-                        );
-                        if let crate::accord::state_machine::SmResponse::AcceptOK { .. } = resp {
+                        let deps = accept_deps.clone();
+                        let resp = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                            sm.handle_accept(txn_id, t0, t, deps, BallotNumber(1))
+                        })
+                        .await;
+                        if let Some(crate::accord::state_machine::SmResponse::AcceptOK { .. }) =
+                            resp
+                        {
                             ac_decision = self.coordinator.handle_accept_ok(AcceptResponse {
                                 from: self.coordinator.node_id,
                                 ballot: BallotNumber(1),
@@ -1454,11 +1464,15 @@ impl AccordCoordinatorDriver {
                     "coordinator is a replica but its local Accord state is unpublished".into(),
                 )
             })?;
-            let mut sm = local_sm.lock();
-            sm.handle_commit(txn_id, t0, commit_t, commit_deps.iter().copied().collect());
-            let locally_committed = sm
-                .get_state(&txn_id)
-                .map(|state| matches!(state.phase, TxnPhase::Committed | TxnPhase::Applied))
+            let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
+            let locally_committed =
+                crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                    sm.handle_commit(txn_id, t0, commit_t, deps);
+                    sm.get_state(&txn_id)
+                        .map(|state| matches!(state.phase, TxnPhase::Committed | TxnPhase::Applied))
+                        .unwrap_or(false)
+                })
+                .await
                 .unwrap_or(false);
             if !locally_committed {
                 return Err(AccordDriverError::Network(
@@ -1562,10 +1576,16 @@ impl AccordCoordinatorDriver {
                         )
                         .await
                         {
-                            let row = local_sm
-                                .lock()
-                                .read_row_bytes_at(keyspace, table, &key, commit_t);
-                            read_rows.push(row.unwrap_or_default());
+                            let (ks, tb, k) = (keyspace.clone(), table.clone(), key.clone());
+                            let row =
+                                crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                                    sm.read_row_bytes_at(&ks, &tb, &k, commit_t)
+                                })
+                                .await;
+                            // `None` is a cancelled read (logged): abstain.
+                            if let Some(row) = row {
+                                read_rows.push(row.unwrap_or_default());
+                            }
                         } else {
                             tracing::error!(
                                 txn_id = ?txn_id,
@@ -1593,10 +1613,16 @@ impl AccordCoordinatorDriver {
                 if crate::accord::handlers::await_conflicting_deps_applied(local_sm, &key, commit_t)
                     .await
                 {
-                    if local_sm.lock().read_condition_holds_at(&key, &commit_t) {
-                        votes_true += 1;
-                    } else {
-                        votes_false += 1;
+                    let k = key.clone();
+                    let holds = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                        sm.read_condition_holds_at(&k, &commit_t)
+                    })
+                    .await;
+                    // `None` is a cancelled read (logged): abstain.
+                    match holds {
+                        Some(true) => votes_true += 1,
+                        Some(false) => votes_false += 1,
+                        None => {}
                     }
                 } else {
                     tracing::error!(
@@ -1796,7 +1822,10 @@ impl AccordCoordinatorDriver {
                 .map(|e| e.mutation.clone())
                 .collect();
             if let Some(local_sm) = &self.local_accord_state {
-                local_sm.lock().handle_apply_writeset(txn_id, owned_writes);
+                crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                    sm.handle_apply_writeset(txn_id, owned_writes)
+                })
+                .await;
                 if !crate::accord::handlers::await_txn_applied(local_sm, txn_id).await {
                     return Err(AccordDriverError::ApplyQuorumUnavailable);
                 }

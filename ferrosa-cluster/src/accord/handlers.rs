@@ -90,6 +90,36 @@ impl AccordHandler {
     }
 }
 
+/// Run `f` against the state machine on tokio's blocking pool.
+///
+/// Every protocol step that persists (PreAccept, Accept, Commit, Apply) fsyncs
+/// the protocol log before it returns, and the storage read of a read-vote hits
+/// disk. Both happen while the state machine's `parking_lot` mutex is held, so
+/// doing them on an async worker blocks that worker for the length of the
+/// fsync and blocks every other worker that reaches for the mutex. On a slow
+/// disk that froze the whole runtime: heartbeats and Raft stopped with it, and
+/// peers' Accord RPCs timed out. On the blocking pool the same wait parks a
+/// blocking thread instead, and the runtime keeps serving.
+///
+/// A panic inside `f` is resumed on the caller. `None` means the task was
+/// cancelled (the runtime is shutting down); it is logged and the caller sends
+/// no reply.
+pub(crate) async fn on_state_machine<R, F>(state: &AccordState, f: F) -> Option<R>
+where
+    R: Send + 'static,
+    F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static,
+{
+    let state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || f(&mut state.lock())).await {
+        Ok(result) => Some(result),
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => {
+            tracing::error!(error = %e, "accord: state-machine task was cancelled; no reply");
+            None
+        }
+    }
+}
+
 /// Block until every conflicting transaction ordered before `t` (`t0 < t`) has
 /// reached `Applied` on the replica behind `state`, or until
 /// `READ_DEP_WAIT_TIMEOUT` elapses.
@@ -103,7 +133,8 @@ impl AccordHandler {
 /// # Deadlock safety
 ///
 /// The `parking_lot` state lock is acquired only to *compute* the pending set
-/// and to grab the apply-notify handle, then released BEFORE every `.await`.
+/// and to grab the apply-notify handle, on the blocking pool (see the private
+/// helper `on_state_machine`), then released BEFORE every `.await`.
 /// `handle_apply` (which fires the notify that unblocks us) takes the same lock,
 /// so holding it across the await would deadlock.
 pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: Timestamp) -> bool {
@@ -114,12 +145,20 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
         // wake fired between unlock and poll could be missed; the bounded poll
         // timeout below makes such a missed wake self-correcting (the loop
         // re-checks the condition under the lock) rather than a hang.
-        let notify = {
-            let sm = state.lock();
-            if sm.unapplied_conflicts_before(key, &t).is_empty() {
-                return true;
+        let owned_key = key.to_vec();
+        let pending = on_state_machine(state, move |sm| {
+            if sm.unapplied_conflicts_before(&owned_key, &t).is_empty() {
+                None
+            } else {
+                Some(sm.applied_notify())
             }
-            sm.applied_notify()
+        })
+        .await;
+        let notify = match pending {
+            Some(None) => return true,
+            Some(Some(notify)) => notify,
+            // Cancelled at shutdown (already logged): abstain.
+            None => return false,
         };
 
         let now = tokio::time::Instant::now();
@@ -148,34 +187,36 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
 pub async fn await_txn_applied(state: &AccordState, txn_id: TxnId) -> bool {
     let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
     loop {
-        let notify = {
-            let sm = state.lock();
-            match sm.get_state(&txn_id) {
-                Some(txn) if txn.phase == TxnPhase::Applied => return true,
-                None => {
-                    tracing::error!(
-                        txn_id = ?txn_id,
-                        "accord: Apply target is absent from local state — refusing ApplyOK"
-                    );
-                    return false;
-                }
-                Some(_) => sm.applied_notify(),
+        let observed = on_state_machine(state, move |sm| {
+            sm.get_state(&txn_id).map(|txn| {
+                (
+                    txn.phase,
+                    txn.deps.len(),
+                    txn.result.as_ref().map_or(0, Vec::len),
+                    sm.applied_notify(),
+                )
+            })
+        })
+        .await;
+        let (phase, dependency_count, result_bytes, notify) = match observed {
+            Some(Some(txn)) => txn,
+            Some(None) => {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    "accord: Apply target is absent from local state — refusing ApplyOK"
+                );
+                return false;
             }
+            // Cancelled at shutdown (already logged): refuse the ack.
+            None => return false,
         };
+        if phase == TxnPhase::Applied {
+            return true;
+        }
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            let (phase, dependency_count, result_bytes) = {
-                let sm = state.lock();
-                match sm.get_state(&txn_id) {
-                    Some(txn) => (
-                        Some(txn.phase),
-                        txn.deps.len(),
-                        txn.result.as_ref().map_or(0, Vec::len),
-                    ),
-                    None => (None, 0, 0),
-                }
-            };
+            let phase = Some(phase);
             tracing::error!(
                 txn_id = ?txn_id,
                 ?phase,
@@ -200,15 +241,16 @@ impl RpcHandler for AccordHandler {
                 let payload: PreAcceptPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordPreAccept: deserialize failed: {e}"))
                     .ok()?;
-                let mut sm = self.state.lock();
-                let resp = sm.handle_preaccept(
-                    payload.txn_id,
-                    payload.t0,
-                    &payload.key,
-                    payload.ballot,
-                    payload.epoch,
-                );
-                drop(sm);
+                let resp = on_state_machine(&self.state, move |sm| {
+                    sm.handle_preaccept(
+                        payload.txn_id,
+                        payload.t0,
+                        &payload.key,
+                        payload.ballot,
+                        payload.epoch,
+                    )
+                })
+                .await?;
                 match resp {
                     SmResponse::PreAcceptOK { t, deps, .. } => {
                         let ok = PreAcceptOkPayload {
@@ -235,16 +277,17 @@ impl RpcHandler for AccordHandler {
                 let payload: PreAcceptV2Payload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordPreAcceptV2: deserialize failed: {e}"))
                     .ok()?;
-                let key_refs: Vec<&[u8]> = payload.keys.iter().map(|k| k.as_slice()).collect();
-                let mut sm = self.state.lock();
-                let resp = sm.handle_preaccept_multi(
-                    payload.txn_id,
-                    payload.t0,
-                    &key_refs,
-                    payload.ballot,
-                    payload.epoch,
-                );
-                drop(sm);
+                let resp = on_state_machine(&self.state, move |sm| {
+                    let key_refs: Vec<&[u8]> = payload.keys.iter().map(|k| k.as_slice()).collect();
+                    sm.handle_preaccept_multi(
+                        payload.txn_id,
+                        payload.t0,
+                        &key_refs,
+                        payload.ballot,
+                        payload.epoch,
+                    )
+                })
+                .await?;
                 match resp {
                     SmResponse::PreAcceptOK { t, deps, .. } => {
                         let ok = PreAcceptOkPayload {
@@ -264,18 +307,18 @@ impl RpcHandler for AccordHandler {
                 let payload: AcceptPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordAccept: deserialize failed: {e}"))
                     .ok()?;
-                let mut sm = self.state.lock();
-                let _resp = sm.handle_accept(
-                    payload.txn_id,
-                    payload.t0,
-                    payload.t,
-                    payload.deps,
-                    payload.ballot,
-                );
-                drop(sm);
-                let ok = AcceptOkPayload {
-                    txn_id: payload.txn_id,
-                };
+                let txn_id = payload.txn_id;
+                let _resp = on_state_machine(&self.state, move |sm| {
+                    sm.handle_accept(
+                        payload.txn_id,
+                        payload.t0,
+                        payload.t,
+                        payload.deps,
+                        payload.ballot,
+                    )
+                })
+                .await?;
+                let ok = AcceptOkPayload { txn_id };
                 let bytes = bincode::serialize(&ok).ok()?;
                 Some(Message::AccordAcceptOK(Bytes::from(bytes)))
             }
@@ -284,9 +327,10 @@ impl RpcHandler for AccordHandler {
                 let payload: CommitPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordCommit: deserialize failed: {e}"))
                     .ok()?;
-                let mut sm = self.state.lock();
-                sm.handle_commit(payload.txn_id, payload.t0, payload.t, payload.deps);
-                drop(sm);
+                on_state_machine(&self.state, move |sm| {
+                    sm.handle_commit(payload.txn_id, payload.t0, payload.t, payload.deps)
+                })
+                .await?;
                 // Commit is fire-and-forget in Accord but we need a response
                 // for the request-response transport.
                 Some(Message::AccordCommit(Bytes::new()))
@@ -297,10 +341,10 @@ impl RpcHandler for AccordHandler {
                     .map_err(|e| tracing::error!("AccordApply: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
-                {
-                    let mut sm = self.state.lock();
-                    sm.handle_apply(txn_id, payload.result_data);
-                }
+                on_state_machine(&self.state, move |sm| {
+                    sm.handle_apply(txn_id, payload.result_data)
+                })
+                .await?;
                 if !await_txn_applied(&self.state, txn_id).await {
                     return None;
                 }
@@ -327,10 +371,10 @@ impl RpcHandler for AccordHandler {
                     .ok()?;
                 let txn_id = payload.txn_id;
                 let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
-                {
-                    let mut sm = self.state.lock();
-                    sm.handle_apply_writeset(txn_id, writes);
-                }
+                on_state_machine(&self.state, move |sm| {
+                    sm.handle_apply_writeset(txn_id, writes)
+                })
+                .await?;
                 if !await_txn_applied(&self.state, txn_id).await {
                     return None;
                 }
@@ -346,9 +390,10 @@ impl RpcHandler for AccordHandler {
                 let payload: RecoverPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordRecover: deserialize failed: {e}"))
                     .ok()?;
-                let mut sm = self.state.lock();
-                let state = sm.handle_recover(payload.txn_id, payload.t0, payload.ballot);
-                drop(sm);
+                let state = on_state_machine(&self.state, move |sm| {
+                    sm.handle_recover(payload.txn_id, payload.t0, payload.ballot)
+                })
+                .await?;
                 let bytes = bincode::serialize(&state).ok()?;
                 Some(Message::AccordRecoverOK(Bytes::from(bytes)))
             }
@@ -403,45 +448,50 @@ impl RpcHandler for AccordHandler {
                         return Some(Message::AccordReadOK(Bytes::new()));
                     }
 
-                    let sm = self.state.lock();
-                    let (condition_holds, current_row) = match &vote_req.predicate {
-                        // INSERT IF NOT EXISTS: existence path (no schema needed).
-                        // condition holds iff the row does NOT exist at `t`.
-                        ReadPredicate::NotExists => (
-                            sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
-                            vec![],
-                        ),
-                        // Unconditional transaction: no IF to evaluate, always
-                        // holds. Defensive — the coordinator skips the read-vote
-                        // for `Always`, so this arm is not normally reached.
-                        ReadPredicate::Always => (true, vec![]),
-                        // Generic IF col=val: the replica does the read-at-`t`
-                        // and returns the row bytes; the coordinator (which owns
-                        // the table schema) evaluates the predicate via the
-                        // injected gate wrapping `eval_if_conditions` and GATES the
-                        // Apply on it. The replica reports `condition_holds=true`
-                        // as a neutral value — the coordinator's evaluation is
-                        // authoritative.
-                        //
-                        // Linearizability of THIS read rests on three guarantees:
-                        // (1) the dep-wait above blocked until every conflicting
-                        //     dep `t0 < t` Applied locally, so the engine's state
-                        //     is the row as-of-`t`;
-                        // (2) the coordinator requires F+1 *identical* row bytes
-                        //     (`agreed_row`) before evaluating the predicate and
-                        //     fails loud on divergence — so the gate verdict is
-                        //     never taken on a non-quorum / skewed read; and
-                        // (3) `EngineStorageReader::read_row_at` bounds cells to
-                        //     `ts <= t.time` (as-of-`t`).
-                        ReadPredicate::ReadRow { keyspace, table } => {
-                            let row =
-                                sm.read_row_bytes_at(keyspace, table, &vote_req.key, vote_req.t);
-                            (true, row.unwrap_or_default())
-                        }
-                    };
-                    drop(sm);
+                    let txn_id = vote_req.txn_id;
+                    let (condition_holds, current_row) =
+                        on_state_machine(&self.state, move |sm| match &vote_req.predicate {
+                            // INSERT IF NOT EXISTS: existence path (no schema needed).
+                            // condition holds iff the row does NOT exist at `t`.
+                            ReadPredicate::NotExists => (
+                                sm.read_condition_holds_at(&vote_req.key, &vote_req.t),
+                                vec![],
+                            ),
+                            // Unconditional transaction: no IF to evaluate, always
+                            // holds. Defensive — the coordinator skips the read-vote
+                            // for `Always`, so this arm is not normally reached.
+                            ReadPredicate::Always => (true, vec![]),
+                            // Generic IF col=val: the replica does the read-at-`t`
+                            // and returns the row bytes; the coordinator (which owns
+                            // the table schema) evaluates the predicate via the
+                            // injected gate wrapping `eval_if_conditions` and GATES the
+                            // Apply on it. The replica reports `condition_holds=true`
+                            // as a neutral value — the coordinator's evaluation is
+                            // authoritative.
+                            //
+                            // Linearizability of THIS read rests on three guarantees:
+                            // (1) the dep-wait above blocked until every conflicting
+                            //     dep `t0 < t` Applied locally, so the engine's state
+                            //     is the row as-of-`t`;
+                            // (2) the coordinator requires F+1 *identical* row bytes
+                            //     (`agreed_row`) before evaluating the predicate and
+                            //     fails loud on divergence — so the gate verdict is
+                            //     never taken on a non-quorum / skewed read; and
+                            // (3) `EngineStorageReader::read_row_at` bounds cells to
+                            //     `ts <= t.time` (as-of-`t`).
+                            ReadPredicate::ReadRow { keyspace, table } => {
+                                let row = sm.read_row_bytes_at(
+                                    keyspace,
+                                    table,
+                                    &vote_req.key,
+                                    vote_req.t,
+                                );
+                                (true, row.unwrap_or_default())
+                            }
+                        })
+                        .await?;
                     let ok = ReadVoteOkPayload {
-                        txn_id: vote_req.txn_id,
+                        txn_id,
                         from: self.local_node_id,
                         condition_holds,
                         current_row,
@@ -604,5 +654,125 @@ mod tests {
             }
             other => panic!("expected AccordPreAcceptOK, got {:?}", other),
         }
+    }
+
+    /// A `SyncWriter` whose fsync takes `delay` of wall time, the way
+    /// `File::sync_all` does on a saturated disk.
+    struct SlowSyncWriter {
+        delay: std::time::Duration,
+    }
+
+    impl ferrosa_storage::accord::sync_writer::SyncWriter for SlowSyncWriter {
+        fn write_and_sync(
+            &self,
+            _data: &[u8],
+        ) -> ferrosa_storage::accord::sync_writer::SyncWriteResult {
+            std::thread::sleep(self.delay);
+            ferrosa_storage::accord::sync_writer::SyncWriteResult::Ok
+        }
+    }
+
+    /// A slow fsync must not freeze the async runtime serving the handler.
+    ///
+    /// Every PreAccept persists before it replies. The handler ran that fsync
+    /// inline on a runtime worker while holding the state machine's
+    /// `parking_lot` mutex, so one slow fsync blocked its own worker and every
+    /// other worker that reached for the mutex. With the disk slow on all
+    /// three nodes, every runtime froze together: heartbeats went unanswered,
+    /// the Raft leader stepped down, and Accord RPCs hit the Data lane timeout.
+    /// That is how the first LWT on a healthy cluster failed.
+    ///
+    /// Four concurrent PreAccepts against a 400 ms fsync, on a two-worker
+    /// runtime, while a 20 ms ticker stands in for the heartbeat. The ticker
+    /// must keep running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_fsync_does_not_freeze_the_runtime_serving_preaccepts() {
+        let writer = std::sync::Arc::new(SlowSyncWriter {
+            delay: std::time::Duration::from_millis(400),
+        });
+        let sm = AccordStateMachine::new(1, writer);
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = std::sync::Arc::new(AccordHandler::new(state, 1));
+
+        let ticker = tokio::spawn(async {
+            let mut worst = std::time::Duration::ZERO;
+            let mut last = tokio::time::Instant::now();
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let now = tokio::time::Instant::now();
+                worst = worst.max(now - last);
+                last = now;
+            }
+            worst
+        });
+
+        let calls: Vec<_> = (0..4u64)
+            .map(|i| {
+                let handler = std::sync::Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let payload = crate::accord::wire::PreAcceptPayload {
+                        txn_id: TxnId::new(1, ts(1000 + i)),
+                        t0: ts(1000 + i),
+                        key: format!("key-{i}").into_bytes(),
+                        ballot: BallotNumber(0),
+                        epoch: 0,
+                    };
+                    let bytes = bincode::serialize(&payload).unwrap();
+                    let peer: PeerId = (
+                        uuid::Uuid::from_u128(2),
+                        "127.0.0.1:0".parse().expect("valid socket addr"),
+                    );
+                    handler
+                        .handle(peer, Message::AccordPreAccept(Bytes::from(bytes)))
+                        .await
+                })
+            })
+            .collect();
+
+        // Read-votes on other keys take the same mutex for their dep-wait
+        // check. They must not park a runtime worker behind a PreAccept that
+        // holds the mutex through its fsync.
+        let reads: Vec<_> = (0..4u64)
+            .map(|i| {
+                let handler = std::sync::Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let payload = ReadVotePayload {
+                        txn_id: TxnId::new(3, ts(2000 + i)),
+                        t: ts(2000 + i),
+                        key: format!("read-key-{i}").into_bytes(),
+                        predicate: crate::accord::wire::ReadPredicate::NotExists,
+                    };
+                    let bytes = bincode::serialize(&payload).unwrap();
+                    let peer: PeerId = (
+                        uuid::Uuid::from_u128(3),
+                        "127.0.0.1:0".parse().expect("valid socket addr"),
+                    );
+                    handler
+                        .handle(peer, Message::AccordRead(Bytes::from(bytes)))
+                        .await
+                })
+            })
+            .collect();
+
+        for call in calls {
+            let resp = call.await.expect("PreAccept task must not panic");
+            assert!(
+                matches!(&resp, Some(Message::AccordPreAcceptOK(b)) if !b.is_empty()),
+                "every PreAccept must still vote, got {resp:?}"
+            );
+        }
+        for read in reads {
+            let resp = read.await.expect("ReadVote task must not panic");
+            assert!(
+                matches!(&resp, Some(Message::AccordReadOK(b)) if !b.is_empty()),
+                "every read-vote on an uncontended key must answer, got {resp:?}"
+            );
+        }
+        let worst = ticker.await.expect("ticker must not panic");
+        assert!(
+            worst < std::time::Duration::from_millis(250),
+            "a 20 ms ticker on the handler's runtime stalled for {worst:?} while \
+             PreAccepts fsynced: the fsync is blocking runtime workers"
+        );
     }
 }
