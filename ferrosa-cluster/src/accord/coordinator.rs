@@ -965,41 +965,60 @@ impl AccordCoordinatorDriver {
     /// Best-effort: this is a cleanup, not a correctness gate for THIS txn (which
     /// is already aborting). Failures are logged, not propagated.
     async fn finalize_no_write(&self) {
+        self.finalize_no_write_locally();
+        self.no_write_fanout().await;
+    }
+
+    /// Finalize the coordinator's own replica state machine as a no-write (its
+    /// self-send is unreachable). Empty payload => no-write finalize.
+    fn finalize_no_write_locally(&self) {
+        if let Some(local_sm) = &self.local_accord_state {
+            local_sm
+                .lock()
+                .handle_apply(self.coordinator.txn_id, Vec::new());
+        }
+    }
+
+    /// The remote half of [`Self::finalize_no_write`]: an empty-payload `Apply`
+    /// to every remote replica. Owns everything it needs, so a caller that must
+    /// not wait on it (see [`Self::run_transaction`]) can spawn it.
+    fn no_write_fanout(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         use crate::accord::wire::ApplyPayload;
         let txn_id = self.coordinator.txn_id;
-
-        // Finalize the coordinator's own replica state machine (its self-send is
-        // unreachable). Empty payload => no-write finalize.
-        if let Some(local_sm) = &self.local_accord_state {
-            local_sm.lock().handle_apply(txn_id, Vec::new());
-        }
-
-        let payload = ApplyPayload {
-            txn_id,
-            result_data: Vec::new(),
-        };
-        let bytes = match bincode::serialize(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(txn_id = ?txn_id, error = %e, "accord: encode no-write finalize failed");
-                return;
-            }
-        };
-        let msg = Message::AccordApply(Bytes::from(bytes));
-
-        let futs: Vec<_> = self
+        let peers = Arc::clone(&self.peers);
+        let remotes: Vec<uuid::Uuid> = self
             .replica_ids
             .iter()
-            .filter(|&&id| id != self.self_id)
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = msg.clone();
-                async move { peers.send(peer_id, msg, Lane::Data).await }
-            })
+            .copied()
+            .filter(|&id| id != self.self_id)
             .collect();
-        for result in futures::future::join_all(futs).await {
-            if let Err(e) = result {
-                tracing::warn!(txn_id = ?txn_id, error = %e, "accord: no-write finalize RPC failed");
+
+        async move {
+            let payload = ApplyPayload {
+                txn_id,
+                result_data: Vec::new(),
+            };
+            let bytes = match bincode::serialize(&payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(txn_id = ?txn_id, error = %e, "accord: encode no-write finalize failed");
+                    return;
+                }
+            };
+            let msg = Message::AccordApply(Bytes::from(bytes));
+
+            let futs: Vec<_> = remotes
+                .into_iter()
+                .map(|peer_id| {
+                    let peers = Arc::clone(&peers);
+                    let msg = msg.clone();
+                    async move { peers.send(peer_id, msg, Lane::Data).await }
+                })
+                .collect();
+            for result in futures::future::join_all(futs).await {
+                if let Err(e) = result {
+                    tracing::warn!(txn_id = ?txn_id, error = %e, "accord: no-write finalize RPC failed");
+                }
             }
         }
     }
@@ -1034,12 +1053,53 @@ impl AccordCoordinatorDriver {
     ///
     /// Broadcast `Apply` to all replicas (carrying the mutation). Wait for F+1
     /// `ApplyOK` responses before returning the LWT outcome to the caller.
+    ///
+    /// # Failing before Apply
+    ///
+    /// A transaction that fails in phases 1-4 is finalized as a no-write on
+    /// every replica: locally before the error is returned, and on the remote
+    /// replicas by a spawned fan-out. By then it may be
+    /// `PreAccepted`, `Accepted` or `Committed` on any replica, and no other
+    /// node will ever finish it, so left alone it would sit in the conflict
+    /// index for good: every later read-vote on its keys would dep-wait on it,
+    /// time out and abstain. Nothing has been written yet (the mutation travels
+    /// only in the Apply phase), so a no-write finalize is the true outcome.
     pub async fn run_transaction(
         &mut self,
     ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
+        let (commit_t, commit_deps) = match self.order_and_gate().await {
+            Ok(ordered) => ordered,
+            Err(e) => {
+                // ConditionNotMet has already been finalized where it was decided.
+                if !matches!(e, AccordDriverError::ConditionNotMet { .. }) {
+                    tracing::warn!(
+                        txn_id = ?self.coordinator.txn_id,
+                        error = %e,
+                        "accord: transaction failed before Apply; finalizing it as a \
+                         no-write so it cannot block later reads on its keys"
+                    );
+                    // The local replica is finalized before we return. The remote
+                    // fan-out is not awaited: a replica holds its reply until the
+                    // txn is Applied or its own bounded wait expires, and on this
+                    // path the cluster is already slow or failing, so waiting
+                    // would add that bound to every failed transaction's latency.
+                    // Each remote failure is logged by the fan-out itself.
+                    self.finalize_no_write_locally();
+                    tokio::spawn(self.no_write_fanout());
+                }
+                return Err(e);
+            }
+        };
+        self.apply_phase(commit_t, commit_deps).await
+    }
+
+    /// Phases 1-4 of [`Self::run_transaction`]: order the transaction
+    /// (PreAccept, Accept, Commit) and gate it on its IF condition (read-vote).
+    /// Returns the committed `(t, deps)` once the transaction may apply.
+    async fn order_and_gate(&mut self) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
-            AcceptOkPayload, AcceptPayload, ApplyOkPayload, CommitPayload, PreAcceptOkPayload,
-            PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
+            AcceptOkPayload, AcceptPayload, CommitPayload, PreAcceptOkPayload, PreAcceptPayload,
+            PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
         };
 
         // Multi-key execution is wired end to end: PreAccept fans `AccordPreAcceptV2`
@@ -1686,6 +1746,23 @@ impl AccordCoordinatorDriver {
                 }
             }
         } // end read-vote phase (skipped for ReadPredicate::Always)
+
+        Ok((commit_t, commit_deps))
+    }
+
+    /// Phase 5 of [`Self::run_transaction`]: apply the committed transaction
+    /// locally and on the remote replicas, and wait for the Apply quorum.
+    async fn apply_phase(
+        &mut self,
+        commit_t: Timestamp,
+        commit_deps: HashSet<TxnId>,
+    ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
+        use crate::accord::wire::ApplyOkPayload;
+
+        let txn_id = self.coordinator.txn_id;
+        let self_id = self.self_id;
+        let self_is_replica = self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil();
+        let participant = self.participant_set();
 
         // ------------------------------------------------------------------
         // Phase 5: Apply broadcast (Gap 5 — dep-wait + storage write)
