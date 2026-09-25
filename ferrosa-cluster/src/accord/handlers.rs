@@ -308,7 +308,7 @@ impl RpcHandler for AccordHandler {
                     .map_err(|e| tracing::error!("AccordAccept: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
-                let _resp = on_state_machine(&self.state, move |sm| {
+                let response = on_state_machine(&self.state, move |sm| {
                     sm.handle_accept(
                         payload.txn_id,
                         payload.t0,
@@ -318,7 +318,11 @@ impl RpcHandler for AccordHandler {
                     )
                 })
                 .await?;
-                let ok = AcceptOkPayload { txn_id };
+                let deps = match response {
+                    crate::accord::state_machine::SmResponse::AcceptOK { deps, .. } => deps,
+                    _ => return None,
+                };
+                let ok = AcceptOkPayload { txn_id, deps };
                 let bytes = bincode::serialize(&ok).ok()?;
                 Some(Message::AccordAcceptOK(Bytes::from(bytes)))
             }

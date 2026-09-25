@@ -277,6 +277,10 @@ strict-serializable multi-key / cross-shard transactions and LWT.
 ### Accord transactions (`accord/`)
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
+  Accept is dependency-monotonic: replicas retain dependencies seen locally
+  after PreAccept and return that effective set in AcceptOK; the coordinator
+  unions the accepted quorum's dependencies before Commit. This prevents a
+  delayed Accept from dropping a conflict discovered during the first round.
   The read-vote phase is the LWT `IF`-condition gate (`ReadPredicate::NotExists`
   for `INSERT IF NOT EXISTS`, `ReadRow` for generic `IF`); a general multi-key
   SQL transaction uses `ReadPredicate::Always`, which **skips the read-vote
