@@ -62,7 +62,15 @@ impl Default for NetConfig {
             // Port 17000 instead of the historical Cassandra default 7000 —
             // 7000 is reserved by macOS ControlCenter and produces an opaque
             // EADDRINUSE crash on every fresh macOS install (BUG-001).
-            bind_addr: "0.0.0.0:17000".parse().unwrap(),
+            //
+            // Loopback by default (DT-13). The internode listener carries
+            // Raft and data traffic and, with no PSK configured, admits any
+            // peer that can reach it; a single-node or single-Mac install must
+            // not listen on every interface just because `[internode]` was
+            // left out of the config. A multi-machine cluster opts in
+            // explicitly with `[internode] bind` or `FERROSA_INTERNODE_BIND`,
+            // e.g. `0.0.0.0:17000`.
+            bind_addr: "127.0.0.1:17000".parse().unwrap(),
             broadcast_addr: "127.0.0.1:17000".parse().unwrap(),
             seeds: Vec::new(),
             cluster_name: "ferrosa".to_string(),
@@ -137,8 +145,14 @@ impl NetConfig {
         let mut cfg = Self::default();
 
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_BIND") {
-            if let Ok(addr) = v.parse() {
-                cfg.bind_addr = addr;
+            match v.parse() {
+                Ok(addr) => cfg.bind_addr = addr,
+                Err(e) => tracing::warn!(
+                    value = %v,
+                    error = %e,
+                    fallback = %cfg.bind_addr,
+                    "ignoring invalid FERROSA_INTERNODE_BIND; using the default bind"
+                ),
             }
         }
         if let Ok(v) = std::env::var("FERROSA_INTERNODE_BROADCAST") {
@@ -250,10 +264,24 @@ mod tests {
         );
     }
 
+    /// DT-13: a config that says nothing about `[internode]` must not open the
+    /// inter-node listener on every interface. Remote peers are an explicit
+    /// opt-in (`[internode] bind` / `FERROSA_INTERNODE_BIND`), never the default.
+    #[test]
+    fn default_bind_is_loopback_not_all_interfaces() {
+        let cfg = NetConfig::default();
+        assert!(
+            cfg.bind_addr.ip().is_loopback(),
+            "default internode bind {} must be loopback",
+            cfg.bind_addr
+        );
+        assert!(!cfg.bind_addr.ip().is_unspecified());
+    }
+
     #[test]
     fn default_config_values() {
         let cfg = NetConfig::default();
-        assert_eq!(cfg.bind_addr, "0.0.0.0:17000".parse().unwrap());
+        assert_eq!(cfg.bind_addr, "127.0.0.1:17000".parse().unwrap());
         assert_eq!(cfg.cluster_name, "ferrosa");
         assert!(cfg.psk.is_none());
         assert_eq!(cfg.max_connections, 512);

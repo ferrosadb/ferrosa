@@ -3031,6 +3031,48 @@ mod tests {
 
     // ---- internode config resolution (TOML-wins) ----------------------
 
+    /// DT-13 regression guard: with no `[internode]` table (what the macOS
+    /// installer wrote for 0.4.12) the resolved internode bind stays loopback.
+    /// A wildcard bind must come from config, never from a default.
+    #[test]
+    fn internode_bind_without_config_is_loopback() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let empty: toml::Value = toml::from_str("[listeners]\ncql = \"127.0.0.1:9042\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &empty);
+        assert!(cfg.bind_addr.ip().is_loopback(), "got {}", cfg.bind_addr);
+    }
+
+    /// A multi-machine cluster opts in to a wildcard bind through config, and
+    /// the config value is what gets bound.
+    #[test]
+    fn internode_wildcard_bind_is_an_explicit_config_opt_in() {
+        let mut cfg = ferrosa_net::config::NetConfig::default();
+        let toml: toml::Value = toml::from_str("[internode]\nbind = \"0.0.0.0:17000\"\n").unwrap();
+        apply_internode_toml_overrides(&mut cfg, &toml);
+        assert!(cfg.bind_addr.ip().is_unspecified());
+    }
+
+    /// Every default listener address in this file is loopback.
+    #[test]
+    fn every_default_listener_bind_is_loopback() {
+        let mut all = vec![
+            DEFAULT_WEB_BIND,
+            DEFAULT_CQL_BIND,
+            DEFAULT_GRAPH_HTTP_BIND,
+            DEFAULT_SPARQL_BIND,
+            DEFAULT_FLIGHT_BIND,
+            DEFAULT_POSTGRES_BIND,
+        ];
+        let net = ferrosa_net::config::NetConfig::default()
+            .bind_addr
+            .to_string();
+        all.push(&net);
+        for bind in all {
+            let addr: std::net::SocketAddr = bind.parse().unwrap();
+            assert!(addr.ip().is_loopback(), "{bind} is not loopback");
+        }
+    }
+
     /// Internode bind from TOML is honored when the env var is unset.
     #[test]
     fn apply_internode_toml_overrides_sets_bind_when_env_unset() {

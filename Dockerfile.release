@@ -18,8 +18,11 @@ COPY dist/${TARGETARCH}/ferrosa-ctl /usr/local/bin/ferrosa-ctl
 # Reference only — NOT the active config. Operators inject via env or a mount.
 COPY config/ferrosa.example.toml    /etc/ferrosa/ferrosa.example.toml
 
+# FERROSA_INTERNODE_BIND is an explicit opt-in to all interfaces: the engine
+# default is loopback (DT-13), which a container's published port cannot reach.
 ENV FERROSA_CONFIG=/etc/ferrosa/ferrosa.toml \
-    FERROSA_DATA_DIR=/var/lib/ferrosa
+    FERROSA_DATA_DIR=/var/lib/ferrosa \
+    FERROSA_INTERNODE_BIND=0.0.0.0:17000
 
 # CQL, internode RPC, web/Prometheus, graph HTTP, Bolt, Arrow Flight gRPC.
 EXPOSE 9042 17000 9090 7474 7687 8815
