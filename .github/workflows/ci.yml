@@ -367,8 +367,11 @@ jobs:
         run: docker --version && docker compose version
       - name: Pre-pull the Jepsen compose images
         run: |
-          docker pull rustfs/rustfs:latest
-          docker pull quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          # Our own digest-pinned mirrors (downloads.ferrosa.ai; digests in
+          # https://downloads.ferrosa.ai/images/services/index.json). Change
+          # them together with every compose file that names them.
+          docker pull downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
+          docker pull downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
       - name: Run Jepsen smoke tier
         env:
           FERROSA_TEST_CONTAINERS: "1"
@@ -434,7 +437,7 @@ jobs:
           cat > /tmp/docker-compose.ci.yml <<'CEOF'
           services:
             rustfs:
-              image: rustfs/rustfs:latest
+              image: downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
               environment:
                 RUSTFS_VOLUMES: /data/rustfs0
                 RUSTFS_ADDRESS: "0.0.0.0:9000"
@@ -447,13 +450,17 @@ jobs:
                 retries: 10
                 start_period: 10s
             rustfs-init:
-              image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+              image: downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
               depends_on:
                 rustfs:
                   condition: service_healthy
+              environment:
+                AWS_ACCESS_KEY_ID: ferrosa_ci_access_key
+                AWS_SECRET_ACCESS_KEY: ferrosa_ci_secret_key  # pragma: allowlist secret
+                AWS_DEFAULT_REGION: us-east-1
               entrypoint: >
-                sh -c "mc alias set local http://rustfs:9000 ferrosa_ci_access_key ferrosa_ci_secret_key &&
-                       mc mb local/ferrosa-test --ignore-existing &&
+                sh -c "aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ferrosa-test ||
+                       aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ferrosa-test &&
                        echo 'bucket ready'"
               restart: "no"
             node1:

@@ -22,6 +22,9 @@ services:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: 0.0.0.0:9042
+      # Peers dial this node on 7000, so it must accept off-container connections;
+      # the engine default is loopback (DT-13).
+      FERROSA_INTERNODE_BIND: 0.0.0.0:7000
       FERROSA_WEB_BIND: 0.0.0.0:9090
       FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
       FERROSA_CLUSTER_MODE: cluster

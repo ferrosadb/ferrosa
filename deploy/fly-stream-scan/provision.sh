@@ -43,6 +43,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     --vm-memory "${VM_MEMORY_MB}" \
     --env "FERROSA_REPLICATION_FACTOR=${REPLICATION_FACTOR}" \
     --env "FERROSA_BULK_STREAMING_RANGE_READ=1" \
+    --env "FERROSA_INTERNODE_BIND=[::]:17000" \
     ${seed_env}
 done
 

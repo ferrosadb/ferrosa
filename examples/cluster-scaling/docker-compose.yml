@@ -19,7 +19,7 @@ services:
 
   # ── S3-compatible object store (RustFS) ──
   rustfs:
-    image: rustfs/rustfs:latest
+    image: downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
@@ -41,13 +41,17 @@ services:
 
   # ── Create the S3 bucket on first run ──
   rustfs-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on:
       rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
-      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
-             mc mb local/ferrosa --ignore-existing &&
+      sh -c "aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ferrosa ||
+             aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ferrosa &&
              echo 'bucket ferrosa ready'"
     restart: "no"
 
@@ -67,6 +71,9 @@ services:
       FERROSA_DATA_DIR: /var/lib/ferrosa
       FERROSA_AUTH_DISABLED: "true"
       FERROSA_CQL_BIND: 0.0.0.0:9042
+      # Peers dial this node on 7000, so it must accept off-container connections;
+      # the engine default is loopback (DT-13).
+      FERROSA_INTERNODE_BIND: 0.0.0.0:7000
       FERROSA_WEB_BIND: 0.0.0.0:9090
       FERROSA_CLUSTER_NAME: ferrosa-scaling-demo
       FERROSA_CLUSTER_MODE: standalone
