@@ -55,7 +55,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   instead of returning with output under a name generation discovery would
   load. Before this ordering, a readback failure was detected only AFTER
   promoting to a live name, so a corrupt SSTable could enter the live view
-  next to the WAL replay of the same rows (FMEA ST-30). Startup sweeps stale
+  next to the WAL replay of the same rows (FMEA ST-31). Startup sweeps stale
   `.tmp` sets and abandoned `.sstable-staging`/`.merge-spill` staging into
   `quarantine/`/removed, before generation discovery runs
   (`StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode` calls
@@ -63,7 +63,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   call it too, as a safety net for callers outside table startup).
 
   **Digest verification on published bytes, unconditional (`publication-safety.md`
-  M2 step 4 / M3, T-012, FMEA ST-31):** between the `.tmp` fsync and the
+  M2 step 4 / M3, T-012, FMEA ST-32):** between the `.tmp` fsync and the
   structural readback walk above, `flush_files` recomputes `Digest.crc32` by
   reading the `.tmp` Data.db back from disk (a reused 1 MiB buffer, never a
   whole-file `Vec`; `POSIX_FADV_DONTNEED` on Linux afterward so the check does
@@ -173,7 +173,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `is_sorted` check for the already-sorted common case), so even a 1-input legacy
   rewrite re-sorts each partition — permanently fixing the on-disk order the
   streaming read path assumes.
-  **Promote directory fsync before input eviction (T-001, FMEA ST-29):**
+  **Promote directory fsync before input eviction (T-001, FMEA ST-30):**
   `promote_compaction_output` renames the staged output into
   `sstables/<table>/<gen>` and then fsyncs `sstables/<table>/` itself, reusing
   the same barrier `flush.rs` uses for its own promoting renames

@@ -3330,7 +3330,7 @@ mod tests {
         );
     }
 
-    /// G1 regression (`publication-safety.md` M2, FMEA F13/ST-30): a refused
+    /// G1 regression (`publication-safety.md` M2, FMEA F13/ST-31): a refused
     /// flush must never leave `*-Data.db` under a LIVE name.
     ///
     /// Before this fix, `flush_files` promoted staged `.tmp` components to
