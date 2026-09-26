@@ -1173,6 +1173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ferrosa_storage::StorageEngine::new(storage_config, Some(&storage_upload_handle))?;
         (engine, Vec::new())
     };
+    // Verify the S3 bucket is reachable and writable. With FERROSA_S3_REQUIRED an
+    // access failure (bad credentials, wrong bucket, no route) stops startup
+    // instead of surfacing later as upload warnings.
+    let s3_required = ferrosa_storage::upload::config::s3_required_from_env()
+        .map_err(|e| format!("invalid FERROSA_S3_REQUIRED: {e}"))?;
+    storage.validate_object_store_access(s3_required).await?;
     // Probe object store for conditional put support (CAS).
     // RustFS/MinIO may not support etag-based conditional writes — log a
     // warning but continue. The manifest CAS retry loop will still attempt

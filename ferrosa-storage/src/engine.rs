@@ -539,7 +539,15 @@ impl StorageEngineConfig {
 
         let compaction = CompactionConfig::from_env(data_dir.join("compaction"));
 
-        let object_store = ObjectStoreConfig::from_env().ok();
+        // A missing S3 configuration used to become `None` (local-only storage)
+        // with no message. It is now logged, and an error when FERROSA_S3_REQUIRED
+        // says S3 is not optional.
+        let s3_required = crate::upload::config::s3_required_from_env()
+            .map_err(ferrosa_common::Error::InvalidFormat)?;
+        let object_store = crate::upload::config::resolve_object_store(
+            s3_required,
+            ObjectStoreConfig::from_env(),
+        )?;
 
         let local_cache_max_bytes = std::env::var("FERROSA_CACHE_MAX_BYTES")
             .ok()
@@ -2353,6 +2361,23 @@ impl StorageEngine {
             }
         }
         Ok(())
+    }
+
+    /// Verify at startup that the configured S3 bucket is reachable and writable.
+    ///
+    /// `required` is `FERROSA_S3_REQUIRED`: an access failure is then an error the
+    /// caller must treat as fatal; otherwise it is logged at WARN and returned as a
+    /// warning. A local `file://` backend, or no object store, has nothing to check.
+    pub async fn validate_object_store_access(
+        &self,
+        required: bool,
+    ) -> ferrosa_common::Result<Vec<String>> {
+        match self.object_store_and_config() {
+            Ok((config, store)) if !config.is_local() => {
+                crate::upload::config::enforce_bucket_access(store.as_ref(), required).await
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Whether the configured S3 store supports CAS (conditional PUT).

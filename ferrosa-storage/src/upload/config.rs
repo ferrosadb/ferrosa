@@ -246,9 +246,198 @@ pub async fn validate_s3_bucket(store: &dyn ObjectStore) -> ferrosa_common::Resu
     Ok(warnings)
 }
 
+/// Parse `FERROSA_S3_REQUIRED`. Absent or empty means not required. A value that is
+/// neither a recognised true nor false is an error: a safety flag that silently
+/// reads as "off" on a typo would hide exactly the failure it exists to surface.
+pub fn parse_s3_required(value: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(false);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(format!(
+            "FERROSA_S3_REQUIRED={raw:?} is not a boolean (use true or false)"
+        )),
+    }
+}
+
+/// Whether S3 storage is required (`FERROSA_S3_REQUIRED`).
+pub fn s3_required_from_env() -> Result<bool, String> {
+    parse_s3_required(std::env::var("FERROSA_S3_REQUIRED").ok().as_deref())
+}
+
+/// Decide the object store from the environment result.
+///
+/// Not required: a missing/invalid S3 configuration means local-only storage, as it
+/// always did. The caller must log that; it is no longer silent. Required: a missing
+/// or invalid configuration, or a local `file://` backend, is an error.
+pub fn resolve_object_store(
+    required: bool,
+    from_env: ferrosa_common::Result<ObjectStoreConfig>,
+) -> ferrosa_common::Result<Option<ObjectStoreConfig>> {
+    match (required, from_env) {
+        (false, Ok(config)) => Ok(Some(config)),
+        (false, Err(reason)) => {
+            tracing::warn!(
+                %reason,
+                "object store is not configured: running with LOCAL-ONLY storage \
+                 (no S3 durability). Set FERROSA_S3_REQUIRED=true to make this an error."
+            );
+            Ok(None)
+        }
+        (true, Err(reason)) => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "FERROSA_S3_REQUIRED is set but the object store is not configured: {reason}"
+        ))),
+        (true, Ok(config)) if config.is_local() => Err(ferrosa_common::Error::InvalidFormat(
+            "FERROSA_S3_REQUIRED is set but FERROSA_LOCAL_STORE_PATH selects a local \
+             file:// backend; unset one of them"
+                .into(),
+        )),
+        (true, Ok(config)) => Ok(Some(config)),
+    }
+}
+
+/// Check bucket access at startup. Required: an access failure is an error naming
+/// `FERROSA_S3_REQUIRED`. Not required: it is logged at WARN and returned as a
+/// warning, never swallowed.
+pub async fn enforce_bucket_access(
+    store: &dyn ObjectStore,
+    required: bool,
+) -> ferrosa_common::Result<Vec<String>> {
+    match validate_s3_bucket(store).await {
+        Ok(warnings) => Ok(warnings),
+        Err(reason) if required => Err(ferrosa_common::Error::InvalidFormat(format!(
+            "S3 access failed and FERROSA_S3_REQUIRED is set: {reason}"
+        ))),
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "S3 access check failed; continuing because FERROSA_S3_REQUIRED is not set. \
+                 SSTable uploads will fail until this is fixed."
+            );
+            Ok(vec![reason.to_string()])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_required_parsing_is_strict() {
+        assert_eq!(parse_s3_required(None), Ok(false));
+        assert_eq!(parse_s3_required(Some("")), Ok(false));
+        assert_eq!(parse_s3_required(Some("  ")), Ok(false));
+        for on in ["1", "true", "TRUE", "True", "on", "yes"] {
+            assert_eq!(parse_s3_required(Some(on)), Ok(true), "{on:?}");
+        }
+        for off in ["0", "false", "FALSE", "off", "no"] {
+            assert_eq!(parse_s3_required(Some(off)), Ok(false), "{off:?}");
+        }
+        for bad in ["treu", "2", "enabled", "s3"] {
+            assert!(
+                parse_s3_required(Some(bad)).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    fn missing_config() -> ferrosa_common::Result<ObjectStoreConfig> {
+        Err(ferrosa_common::Error::InvalidFormat(
+            "FERROSA_S3_ENDPOINT environment variable is required".into(),
+        ))
+    }
+
+    #[test]
+    fn a_missing_s3_config_is_local_only_unless_s3_is_required() {
+        assert!(resolve_object_store(false, missing_config())
+            .unwrap()
+            .is_none());
+        let err = resolve_object_store(true, missing_config())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("FERROSA_S3_REQUIRED"),
+            "names the switch: {err}"
+        );
+        assert!(
+            err.contains("FERROSA_S3_ENDPOINT"),
+            "keeps the cause: {err}"
+        );
+    }
+
+    #[test]
+    fn a_configured_s3_store_is_used_whether_or_not_it_is_required() {
+        for required in [false, true] {
+            let cfg = resolve_object_store(required, Ok(ObjectStoreConfig::test_config()))
+                .unwrap()
+                .expect("configured store");
+            assert_eq!(cfg.bucket, "test-bucket");
+        }
+    }
+
+    #[test]
+    fn a_local_backend_does_not_satisfy_required_s3() {
+        let mut local = ObjectStoreConfig::test_config();
+        local.local_path = Some(std::path::PathBuf::from("/var/lib/ferrosa/store"));
+        assert!(resolve_object_store(false, Ok(local.clone()))
+            .unwrap()
+            .is_some());
+        let err = resolve_object_store(true, Ok(local))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FERROSA_LOCAL_STORE_PATH"), "{err}");
+    }
+
+    /// An S3 endpoint nothing listens on, with retries off so the failure is
+    /// immediate and deterministic.
+    fn unreachable_s3() -> object_store::aws::AmazonS3 {
+        object_store::aws::AmazonS3Builder::new()
+            .with_endpoint("http://127.0.0.1:1")
+            .with_bucket_name("b")
+            .with_region("us-east-1")
+            .with_allow_http(true)
+            .with_access_key_id("k")
+            .with_secret_access_key("s")
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                retry_timeout: std::time::Duration::from_secs(1),
+                ..Default::default()
+            })
+            .build()
+            .expect("s3 client builds without touching the network")
+    }
+
+    #[tokio::test]
+    async fn required_s3_fails_startup_when_the_bucket_is_unreachable() {
+        let err = enforce_bucket_access(&unreachable_s3(), true)
+            .await
+            .expect_err("required S3 must not start against an unreachable bucket")
+            .to_string();
+        assert!(err.contains("FERROSA_S3_REQUIRED"), "{err}");
+        assert!(err.to_lowercase().contains("s3"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn optional_s3_reports_an_unreachable_bucket_instead_of_hiding_it() {
+        let warnings = enforce_bucket_access(&unreachable_s3(), false)
+            .await
+            .expect("not required: startup continues");
+        assert_eq!(warnings.len(), 1, "the failure is returned, not swallowed");
+    }
+
+    #[tokio::test]
+    async fn a_reachable_bucket_passes_whether_or_not_it_is_required() {
+        for required in [false, true] {
+            let store = object_store::memory::InMemory::new();
+            assert!(enforce_bucket_access(&store, required)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
 
     #[test]
     fn test_config_defaults() {
