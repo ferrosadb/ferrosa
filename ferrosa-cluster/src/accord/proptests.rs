@@ -6,6 +6,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::accord::coordinator::{
+        slow_quorum_size, AcceptResponse, AccordCoordinator, CoordinatorDecision, PreAcceptResponse,
+    };
     use crate::accord::recovery::{RecoverOKResponse, RecoveryCoordinator, RecoveryDecision};
     use crate::accord::test_cluster::{TestCluster, TestMessage, TestMessagePayload};
     use ferrosa_common::accord::{
@@ -16,8 +19,213 @@ mod tests {
     use std::collections::HashSet;
 
     // =======================================================================
-    // A3.10 — Property-Based Protocol Tests (4 tests)
+    // A3.10 — Property-Based Protocol Tests
     // =======================================================================
+
+    fn accept_phase_coordinator(t0: Timestamp, rf: usize) -> AccordCoordinator {
+        let txn_id = TxnId::new(1, t0);
+        let mut coord = AccordCoordinator::new(txn_id, t0, b"key".to_vec(), 1, rf, true);
+
+        // The leaseholder contributes one local vote. Add enough distinct
+        // remote replies to reach the slow quorum, with one timestamp conflict.
+        let remote_votes_needed = slow_quorum_size(rf) - 1;
+        let mut decision = CoordinatorDecision::Pending;
+        for i in 0..remote_votes_needed {
+            decision = coord.handle_preaccept_ok(PreAcceptResponse {
+                from: (i + 2) as u64,
+                t: if i == 0 {
+                    Timestamp::synthetic(t0.time + 1)
+                } else {
+                    t0
+                },
+                deps: vec![],
+            });
+        }
+        assert!(matches!(decision, CoordinatorDecision::NeedAccept { .. }));
+        coord
+    }
+
+    // Duplicate replies from one node must never satisfy a quorum. Generated
+    // payload variations ensure the quorum check is independent of vote data.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn proptest_duplicate_accept_replies_do_not_form_quorum(
+            t0_micros in 1u64..10_000,
+            rf in 3usize..=10,
+            sender_seed in 0u64..100,
+            repeated in 2usize..12,
+            dep_times in prop::collection::vec(1u64..10_000, 0..8),
+        ) {
+            let t0 = Timestamp::synthetic(t0_micros);
+            let mut coord = accept_phase_coordinator(t0, rf);
+            let from = 2 + sender_seed % (rf as u64 - 1);
+            let txn_id = coord.txn_id;
+            let deps: Vec<TxnId> = dep_times
+                .into_iter()
+                .enumerate()
+                .map(|(i, time)| TxnId::new((i + 2) as u64, Timestamp::synthetic(time)))
+                .collect();
+            let response = AcceptResponse {
+                from,
+                ballot: BallotNumber(1),
+                deps,
+            };
+
+            for _ in 0..repeated {
+                let decision = coord.handle_accept_ok(response.clone());
+                prop_assert_eq!(
+                    decision,
+                    CoordinatorDecision::Pending,
+                    "one replica's duplicate AcceptOKs formed an RF=5 quorum for {:?}",
+                    txn_id
+                );
+            }
+        }
+    }
+
+    // Duplicate PreAcceptOK messages must not trigger either the slow quorum
+    // or a fast-path decision. Exercise varied timestamps and dependency lists.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+        #[test]
+        fn proptest_duplicate_preaccept_replies_do_not_form_quorum(
+            t0_micros in 1u64..10_000,
+            from in 2u64..=5,
+            response_time in 1u64..20_000,
+            dep_times in prop::collection::vec(1u64..10_000, 0..8),
+        ) {
+            let t0 = Timestamp::synthetic(t0_micros);
+            let mut coord = AccordCoordinator::new(
+                TxnId::new(1, t0), t0, b"key".to_vec(), 1, 5, true,
+            );
+            let response = PreAcceptResponse {
+                from,
+                t: Timestamp::synthetic(response_time),
+                deps: dep_times.into_iter().enumerate().map(|(i, time)| {
+                    TxnId::new((i + 2) as u64, Timestamp::synthetic(time))
+                }).collect(),
+            };
+
+            for _ in 0..8 {
+                prop_assert_eq!(
+                    coord.handle_preaccept_ok(response.clone()),
+                    CoordinatorDecision::Pending,
+                    "one replica's duplicate PreAcceptOKs formed an RF=5 quorum"
+                );
+            }
+        }
+    }
+
+    // Retried messages can arrive after their phase has already completed.
+    // They must be harmless rather than panic on the coordinator's new phase.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+        #[test]
+        fn proptest_late_duplicate_votes_are_idempotent(
+            t0_micros in 1u64..10_000,
+            rf in 3usize..=10,
+            dep_time in 1u64..10_000,
+        ) {
+            let t0 = Timestamp::synthetic(t0_micros);
+
+            let mut preaccept = AccordCoordinator::new(
+                TxnId::new(1, t0), t0, b"key".to_vec(), 1, 3, true,
+            );
+            let agreeing_vote = PreAcceptResponse { from: 2, t: t0, deps: vec![] };
+            prop_assert_eq!(
+                preaccept.handle_preaccept_ok(agreeing_vote.clone()),
+                CoordinatorDecision::Pending
+            );
+            prop_assert!(matches!(
+                preaccept.handle_preaccept_ok(PreAcceptResponse {
+                    from: 3, t: t0, deps: vec![],
+                }),
+                CoordinatorDecision::FastPathCommit { .. }
+            ), "expected fast-path commit");
+            prop_assert_eq!(
+                preaccept.handle_preaccept_ok(agreeing_vote),
+                CoordinatorDecision::Pending
+            );
+
+            let mut accept = accept_phase_coordinator(t0, rf);
+            let response_count = slow_quorum_size(rf);
+            let mut first_vote = None;
+            for i in 0..response_count {
+                let response = AcceptResponse {
+                    from: (i + 2) as u64,
+                    ballot: BallotNumber(1),
+                    deps: vec![],
+                };
+                if i == 0 {
+                    first_vote = Some(response.clone());
+                }
+                let decision = accept.handle_accept_ok(response);
+                if i + 1 == response_count {
+                    prop_assert!(
+                        matches!(decision, CoordinatorDecision::SlowPathCommit { .. }),
+                        "expected slow-path commit"
+                    );
+                } else {
+                    prop_assert_eq!(decision, CoordinatorDecision::Pending);
+                }
+            }
+            let mut duplicate = first_vote.expect("slow quorum has at least one replica vote");
+            duplicate.deps.push(TxnId::new(9, Timestamp::synthetic(dep_time)));
+            prop_assert_eq!(
+                accept.handle_accept_ok(duplicate),
+                CoordinatorDecision::Pending
+            );
+        }
+    }
+
+    // Dependencies discovered by any Accept voter must survive every arrival
+    // order. Each generated replica contributes an arbitrary dependency set.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+        #[test]
+        fn proptest_accept_quorum_keeps_dependency_union(
+            t0_micros in 1u64..10_000,
+            raw_deps in prop::collection::vec(prop::collection::vec(1u64..10_000, 0..8), 3),
+            order_seed in any::<bool>(),
+        ) {
+            let t0 = Timestamp::synthetic(t0_micros);
+            let responses: Vec<AcceptResponse> = raw_deps
+                .into_iter()
+                .enumerate()
+                .map(|(i, times)| AcceptResponse {
+                    from: (i + 2) as u64,
+                    ballot: BallotNumber(1),
+                    deps: times.into_iter().map(|time| {
+                        TxnId::new((i + 2) as u64, Timestamp::synthetic(time))
+                    }).collect(),
+                })
+                .collect();
+            let expected: HashSet<TxnId> = responses
+                .iter()
+                .flat_map(|response| response.deps.iter().copied())
+                .collect();
+
+            let mut coord = accept_phase_coordinator(t0, 5);
+            let mut ordered = responses;
+            if order_seed {
+                ordered.reverse();
+            } else {
+                ordered.rotate_left(1);
+            }
+
+            let mut decision = CoordinatorDecision::Pending;
+            for response in ordered {
+                decision = coord.handle_accept_ok(response);
+            }
+            match decision {
+                CoordinatorDecision::SlowPathCommit { deps, .. } => {
+                    prop_assert!(expected.is_subset(&deps), "Accept quorum lost dependencies");
+                }
+                other => prop_assert!(false, "expected slow-path commit, got {other:?}"),
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 1. proptest_ballot_invariant_never_violated

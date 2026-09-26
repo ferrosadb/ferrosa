@@ -540,8 +540,11 @@ impl AccordStateMachine {
             };
         }
 
-        // Accept: update both ballot fields, timestamp, deps, and phase.
-        let deps_set: HashSet<TxnId> = deps.iter().copied().collect();
+        // Dependencies observed locally during PreAccept are monotonic. A
+        // delayed Accept must not erase a conflict this replica already saw.
+        let mut deps_set: HashSet<TxnId> = deps.iter().copied().collect();
+        deps_set.extend(state.deps.iter().copied());
+        let accepted_deps: Vec<TxnId> = deps_set.iter().copied().collect();
         state.accept(AcceptedBallot(ballot), t, deps_set);
 
         // The slow path may move the execution timestamp; keep the conflict index
@@ -560,7 +563,7 @@ impl AccordStateMachine {
         SmResponse::AcceptOK {
             txn_id,
             ballot,
-            deps,
+            deps: accepted_deps,
         }
     }
 
@@ -2341,6 +2344,31 @@ mod tests {
         let resp = sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
         assert!(matches!(resp, SmResponse::AcceptOK { .. }));
         assert_eq!(sm.get_state(&txn_id).unwrap().phase, TxnPhase::Accepted);
+    }
+
+    /// A delayed Accept must not erase a dependency this replica observed
+    /// after the coordinator assembled its PreAccept quorum.
+    #[test]
+    fn accept_preserves_newly_observed_preaccept_dependencies() {
+        let (mut sm, _writer) = make_sm(2);
+        let earlier = txn(1, 900);
+        let txn_id = txn(1, 1000);
+        let earlier_t0 = ts(900);
+        let t0 = ts(1000);
+
+        sm.handle_preaccept(earlier, earlier_t0, b"key1", BallotNumber(0), 0);
+        let preaccept = sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        assert!(
+            matches!(preaccept, SmResponse::PreAcceptOK { ref deps, .. } if deps.contains(&earlier))
+        );
+
+        // The coordinator's request was built from an earlier quorum that had
+        // not yet observed `earlier`.
+        let accepted = sm.handle_accept(txn_id, t0, t0, vec![], BallotNumber(1));
+        assert!(
+            matches!(accepted, SmResponse::AcceptOK { ref deps, .. } if deps.contains(&earlier))
+        );
+        assert!(sm.get_state(&txn_id).unwrap().deps.contains(&earlier));
     }
 
     /// Accept without PreAccept (recovery path) works.

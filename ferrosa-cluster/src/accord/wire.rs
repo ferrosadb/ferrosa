@@ -132,6 +132,14 @@ pub(crate) struct PreAcceptOkPayload {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AcceptOkPayload {
     pub(crate) txn_id: TxnId,
+    /// Effective dependencies retained by this replica when accepting.
+    pub(crate) deps: Vec<TxnId>,
+}
+
+/// Pre-dependency AcceptOK shape, accepted during rolling upgrades.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LegacyAcceptOkPayload {
+    pub(crate) txn_id: TxnId,
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +363,22 @@ mod tests {
             t,
             deps: vec![dep_a, dep_b],
         });
-        assert_bincode_roundtrip(&AcceptOkPayload { txn_id });
+        assert_bincode_roundtrip(&AcceptOkPayload {
+            txn_id,
+            deps: vec![dep_a, dep_b],
+        });
+        let current_accept_ok = bincode::serialize(&AcceptOkPayload {
+            txn_id,
+            deps: vec![dep_a, dep_b],
+        })
+        .unwrap();
+        assert_eq!(
+            bincode::deserialize::<LegacyAcceptOkPayload>(&current_accept_ok)
+                .unwrap()
+                .txn_id,
+            txn_id,
+            "older coordinators must be able to ignore the trailing dependency field"
+        );
         assert_bincode_roundtrip(&ReadVoteOkPayload {
             txn_id,
             from: 3,

@@ -110,8 +110,11 @@ paths so live `TableStore`/index-tracker state follows the replicated schema.
 
 **Accord transaction.** `AccordCoordinator` runs PreAccept → (fast path or Accept)
 → Commit → Apply across the participating shards, dep-waiting on conflicting
-transactions before applying to storage at the agreed HLC timestamp. See
-[data-flow.md](data-flow.md).
+transactions before applying to storage at the agreed HLC timestamp. On the
+slow path, each AcceptOK reports the replica's effective dependencies, including
+conflicts observed locally after PreAccept; the coordinator carries the accepted
+quorum's dependency union into Commit so Accept cannot erase a newly observed
+ordering edge. See [data-flow.md](data-flow.md).
 
 ## Key invariants
 

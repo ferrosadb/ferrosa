@@ -162,8 +162,12 @@ pub struct AccordCoordinator {
 
     /// Collected PreAcceptOK responses.
     preaccept_responses: Vec<PreAcceptResponse>,
+    /// Replica IDs whose PreAcceptOK has already been counted.
+    preaccept_responders: HashSet<u64>,
     /// Collected AcceptOK responses.
     accept_responses: Vec<AcceptResponse>,
+    /// Replica IDs whose AcceptOK has already been counted.
+    accept_responders: HashSet<u64>,
 
     /// Merged execution timestamp (highest seen across all responses).
     merged_t: Timestamp,
@@ -207,7 +211,9 @@ impl AccordCoordinator {
             is_leaseholder,
             phase: CoordinatorPhase::PreAccepting,
             preaccept_responses: Vec::new(),
+            preaccept_responders: HashSet::new(),
             accept_responses: Vec::new(),
+            accept_responders: HashSet::new(),
             merged_t: t0,
             merged_deps: HashSet::new(),
             rtt_count: 0,
@@ -216,6 +222,7 @@ impl AccordCoordinator {
         // Leaseholder optimization: the coordinator itself implicitly votes
         // for t0 with empty deps (it owns the range, no conflicts seen locally).
         if is_leaseholder {
+            coord.preaccept_responders.insert(node_id);
             coord.preaccept_responses.push(PreAcceptResponse {
                 from: node_id,
                 t: t0,
@@ -235,12 +242,23 @@ impl AccordCoordinator {
     pub fn handle_preaccept_ok(&mut self, response: PreAcceptResponse) -> CoordinatorDecision {
         let _span = tracing::info_span!("accord.preaccept", from = response.from,).entered();
 
+        // A retry can arrive after this phase has already completed. Treat it
+        // as an idempotent duplicate before enforcing the phase transition.
+        if self.preaccept_responders.contains(&response.from) {
+            return CoordinatorDecision::Pending;
+        }
+
         assert_eq!(
             self.phase,
             CoordinatorPhase::PreAccepting,
             "handle_preaccept_ok called in wrong phase: {:?}",
             self.phase
         );
+
+        // Networks and transports may retry a response. A replica can only
+        // contribute one vote to this phase, and retries must not influence
+        // the timestamp or dependency union.
+        self.preaccept_responders.insert(response.from);
 
         self.preaccept_responses.push(response.clone());
 
@@ -335,6 +353,12 @@ impl AccordCoordinator {
     pub fn handle_accept_ok(&mut self, response: AcceptResponse) -> CoordinatorDecision {
         let _span = tracing::info_span!("accord.commit", from = response.from,).entered();
 
+        // Ignore a retry even when the original reply already completed the
+        // slow path and moved the coordinator out of Accepting.
+        if self.accept_responders.contains(&response.from) {
+            return CoordinatorDecision::Pending;
+        }
+
         assert_eq!(
             self.phase,
             CoordinatorPhase::Accepting,
@@ -342,7 +366,16 @@ impl AccordCoordinator {
             self.phase
         );
 
-        self.accept_responses.push(response);
+        // Count quorum members, not packets: duplicate AcceptOK deliveries are
+        // common under retries but cannot stand in for another replica.
+        self.accept_responders.insert(response.from);
+
+        self.accept_responses.push(response.clone());
+
+        // Accept may discover conflicts that were absent from the PreAccept
+        // responses (for example, a delayed concurrent PreAccept). Preserve
+        // those dependencies through the slow-path decision.
+        self.merged_deps.extend(response.deps);
 
         let sq = slow_quorum_size(self.rf);
 
@@ -1105,8 +1138,9 @@ impl AccordCoordinatorDriver {
     /// Returns the committed `(t, deps)` once the transaction may apply.
     async fn order_and_gate(&mut self) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
-            AcceptOkPayload, AcceptPayload, CommitPayload, PreAcceptOkPayload, PreAcceptPayload,
-            PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
+            AcceptOkPayload, AcceptPayload, CommitPayload, LegacyAcceptOkPayload,
+            PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
+            ReadVotePayload,
         };
 
         // Multi-key execution is wired end to end: PreAccept fans `AccordPreAcceptV2`
@@ -1358,13 +1392,15 @@ impl AccordCoordinatorDriver {
                             sm.handle_accept(txn_id, t0, t, deps, BallotNumber(1))
                         })
                         .await;
-                        if let Some(crate::accord::state_machine::SmResponse::AcceptOK { .. }) =
-                            resp
+                        if let Some(crate::accord::state_machine::SmResponse::AcceptOK {
+                            deps: effective_deps,
+                            ..
+                        }) = resp
                         {
                             ac_decision = self.coordinator.handle_accept_ok(AcceptResponse {
                                 from: self.coordinator.node_id,
                                 ballot: BallotNumber(1),
-                                deps: accept_deps.clone(),
+                                deps: effective_deps,
                             });
                         }
                     }
@@ -1378,21 +1414,40 @@ impl AccordCoordinatorDriver {
                         .map(|&peer_id| {
                             let peers = Arc::clone(&self.peers);
                             let msg = ac_msg.clone();
-                            async move { peers.send(peer_id, msg, Lane::Data).await }
+                            async move { (peer_id, peers.send(peer_id, msg, Lane::Data).await) }
                         })
                         .collect();
 
                     let ac_responses = futures::future::join_all(ac_futs).await;
 
-                    for result in &ac_responses {
+                    for (peer_id, result) in &ac_responses {
                         match result {
                             Ok(Message::AccordAcceptOK(b)) if !b.is_empty() => {
-                                let ok: AcceptOkPayload = bincode::deserialize(b)
-                                    .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                                let ok: AcceptOkPayload = match bincode::deserialize(b) {
+                                    Ok(ok) => ok,
+                                    Err(_) => {
+                                        // Older replicas only echo txn_id. Their Accept
+                                        // request carried this coordinator's dependency
+                                        // set, so retain that as the compatibility value.
+                                        let legacy: LegacyAcceptOkPayload = bincode::deserialize(b)
+                                            .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                                        AcceptOkPayload {
+                                            txn_id: legacy.txn_id,
+                                            deps: accept_deps.clone(),
+                                        }
+                                    }
+                                };
                                 let resp = AcceptResponse {
-                                    from: ok.txn_id.0.node, // node ID embedded in txn_id
+                                    // Use the RPC peer identity as the voter. The
+                                    // transaction ID's node field identifies its
+                                    // coordinator and is shared by every AcceptOK.
+                                    from: u64::from_be_bytes(
+                                        peer_id.as_bytes()[..8]
+                                            .try_into()
+                                            .expect("UUID has 16 bytes"),
+                                    ),
                                     ballot: BallotNumber(1),
-                                    deps: accept_deps.clone(),
+                                    deps: ok.deps,
                                 };
                                 ac_decision = self.coordinator.handle_accept_ok(resp);
                                 if ac_decision != CoordinatorDecision::Pending {
@@ -2437,6 +2492,9 @@ mod tests {
         }
 
         // Collect AcceptOK from slow quorum (2 for RF=3).
+        // A replica may have discovered an additional conflict after PreAccept.
+        // The accepted quorum must carry that dependency forward to Commit.
+        let accept_only_dep = make_txn_id(3, 750);
         let a1 = coord.handle_accept_ok(AcceptResponse {
             from: 1,
             ballot: BallotNumber(1),
@@ -2447,9 +2505,18 @@ mod tests {
         let a2 = coord.handle_accept_ok(AcceptResponse {
             from: 2,
             ballot: BallotNumber(1),
-            deps: vec![other_txn],
+            deps: vec![other_txn, accept_only_dep],
         });
-        assert!(matches!(a2, CoordinatorDecision::SlowPathCommit { .. }));
+        match a2 {
+            CoordinatorDecision::SlowPathCommit { deps, .. } => {
+                assert!(deps.contains(&other_txn));
+                assert!(
+                    deps.contains(&accept_only_dep),
+                    "Accept quorum dependency was lost"
+                );
+            }
+            other => panic!("expected SlowPathCommit, got {other:?}"),
+        }
         assert_eq!(coord.rtt_count(), 2); // Two RTTs total
         assert_eq!(coord.phase, CoordinatorPhase::SlowPathCommit);
     }
@@ -3437,7 +3504,10 @@ mod tests {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::time::sleep(self.accept_delay).await;
                         let ap: AcceptPayload = bincode::deserialize(&b).unwrap();
-                        let ok = AcceptOkPayload { txn_id: ap.txn_id };
+                        let ok = AcceptOkPayload {
+                            txn_id: ap.txn_id,
+                            deps: ap.deps,
+                        };
                         Ok(Message::AccordAcceptOK(Bytes::from(
                             bincode::serialize(&ok).unwrap(),
                         )))
@@ -3486,9 +3556,9 @@ mod tests {
         use crate::accord::state_machine::AccordStateMachine;
         use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 
-        let self_host = uuid::Uuid::from_u128(0xC0DE);
-        let remote1 = uuid::Uuid::from_u128(0x1111);
-        let remote2 = uuid::Uuid::from_u128(0x2222);
+        let self_host = uuid::Uuid::from_u128((0xC0DE_u128 << 64) | 0xC0DE);
+        let remote1 = uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111);
+        let remote2 = uuid::Uuid::from_u128((0x2222_u128 << 64) | 0x2222);
         let self_node = node_id_of(self_host);
 
         let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
@@ -3607,9 +3677,9 @@ mod tests {
         use crate::accord::state_machine::AccordStateMachine;
         use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 
-        let self_host = uuid::Uuid::from_u128(0xC0DE);
-        let remote1 = uuid::Uuid::from_u128(0x1111);
-        let remote2 = uuid::Uuid::from_u128(0x2222);
+        let self_host = uuid::Uuid::from_u128((0xC0DE_u128 << 64) | 0xC0DE);
+        let remote1 = uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111);
+        let remote2 = uuid::Uuid::from_u128((0x2222_u128 << 64) | 0x2222);
         let self_node = node_id_of(self_host);
 
         let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
