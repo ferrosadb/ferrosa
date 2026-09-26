@@ -580,6 +580,64 @@ async fn run_batch_atomicity_round(nemesis_name: &str) {
 /// so CI can never stall.
 const TXN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The wiring contract the disk-failure test relies on: a coordinator that is itself
+/// a replica must have its local Accord state published. Without it the driver
+/// refuses to commit, loudly, instead of counting itself as an implicit ack that
+/// never updated its own state (which leaves the replica blind to its own txn).
+#[tokio::test]
+async fn a_replica_coordinator_without_local_state_refuses_to_commit() {
+    // Three healthy nodes: the remote replicas supply the quorum, so the unwired
+    // coordinator gets as far as the commit step where the contract is enforced.
+    let id_a = uuid::Uuid::from_bytes([0xA1; 16]);
+    let id_b = uuid::Uuid::from_bytes([0xB2; 16]);
+    let id_c = uuid::Uuid::from_bytes([0xC3; 16]);
+    let node_a = start_test_node(id_a).await;
+    let node_b = start_test_node(id_b).await;
+    let node_c = start_test_node(id_c).await;
+    cross_connect(&node_a, id_a, &node_b, id_b).await;
+    cross_connect(&node_a, id_a, &node_c, id_c).await;
+    cross_connect(&node_b, id_b, &node_c, id_c).await;
+    let replica_ids = vec![id_a, id_b, id_c];
+    let clock = HybridLogicalClock::new(node_a.node_id, 500_000_000);
+
+    let mut unwired = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids.clone(),
+        Arc::clone(&node_a.peer_manager),
+        true,
+        &clock,
+        b"unwired-key".to_vec(),
+        Vec::new(),
+    );
+    let err = tokio::time::timeout(TXN_TIMEOUT, unwired.run_transaction())
+        .await
+        .expect("must fail fast, not hang")
+        .expect_err("an unwired replica coordinator must not commit");
+    assert!(
+        format!("{err:?}").contains("local Accord state is unpublished"),
+        "the refusal must name the wiring error: {err:?}"
+    );
+
+    let clock2 = HybridLogicalClock::new(node_a.node_id, 500_000_000);
+    let mut wired = AccordCoordinatorDriver::new(
+        node_a.node_id,
+        replica_ids,
+        Arc::clone(&node_a.peer_manager),
+        true,
+        &clock2,
+        b"wired-key".to_vec(),
+        Vec::new(),
+    )
+    .with_local_accord_state(node_a.accord_state.clone());
+    let result = tokio::time::timeout(TXN_TIMEOUT, wired.run_transaction())
+        .await
+        .expect("must not hang");
+    assert!(
+        result.is_ok(),
+        "the same replica set commits once wired: {result:?}"
+    );
+}
+
 /// disk_fail_no_phantom_commits — hermetic, in-process test of Accord's
 /// fsync-before-ack durability invariant.
 ///
@@ -665,7 +723,13 @@ async fn disk_fail_no_phantom_commits() {
         &clock,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    // A coordinator that is itself a replica must have its local Accord state
+    // published, exactly as the production session layer wires it: without it the
+    // driver refuses to commit (an unpublished state is a hard wiring error, since
+    // an implicit self-ack that does not update local state leaves the replica
+    // blind to its own transaction).
+    .with_local_accord_state(node_a.accord_state.clone());
 
     let failed_result = tokio::time::timeout(TXN_TIMEOUT, driver.run_transaction())
         .await
@@ -745,7 +809,8 @@ async fn disk_fail_no_phantom_commits() {
         &clock2,
         key.clone(),
         Vec::new(), // protocol-only test: no mutation payload
-    );
+    )
+    .with_local_accord_state(node_a.accord_state.clone());
 
     let healed_result = tokio::time::timeout(TXN_TIMEOUT, driver2.run_transaction())
         .await
