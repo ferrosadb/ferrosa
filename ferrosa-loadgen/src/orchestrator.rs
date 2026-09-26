@@ -341,7 +341,9 @@ fn run_load_test_inner(
         .input_bytes_reclaimed
         .load(Ordering::Relaxed) as u64;
 
-    let resource_summary = resource_mon.summary();
+    // Always present: a run that ended before the monitor had a baseline says
+    // INCONCLUSIVE instead of silently dropping the leak report.
+    let resource_summary = Some(resource_mon.summary());
 
     let total_bytes_read = bytes_read.load(Ordering::Relaxed);
     stats.finalize(FinalizeContext {

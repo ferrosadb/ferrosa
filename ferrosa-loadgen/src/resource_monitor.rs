@@ -233,11 +233,15 @@ impl ResourceMonitor {
         self.snapshots.last()
     }
 
-    /// Summary of resource deltas for the final report.
-    pub fn summary(&self) -> Option<ResourceSummary> {
-        let baseline = self.baseline()?;
-        let latest = self.latest()?;
-        Some(ResourceSummary {
+    /// Summary of resource deltas for the final report. Always returns a summary: a
+    /// run that ended before the monitor had `warmup + 1` samples is reported as
+    /// [`Coverage::Insufficient`] (verdict INCONCLUSIVE), never omitted.
+    pub fn summary(&self) -> ResourceSummary {
+        let (Some(baseline), Some(latest)) = (self.baseline(), self.latest()) else {
+            return ResourceSummary::insufficient(self.snapshots.len(), self.warmup_samples + 1);
+        };
+        ResourceSummary {
+            coverage: Coverage::Full,
             fd_baseline: baseline.open_fds,
             fd_final: latest.open_fds,
             fd_limit: latest.fd_limit,
@@ -254,13 +258,23 @@ impl ResourceMonitor {
             threads_baseline: baseline.thread_count,
             threads_final: latest.thread_count,
             samples: self.snapshots.len(),
-        })
+        }
     }
+}
+
+/// Whether a [`ResourceSummary`] rests on enough samples to judge a leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// The monitor had a post-warmup baseline: the deltas and verdict are meaningful.
+    Full,
+    /// The run ended first. `needed` is the sample count required (warmup + 1).
+    Insufficient { needed: usize },
 }
 
 /// Summary for the final stats report.
 #[derive(Debug, Clone)]
 pub struct ResourceSummary {
+    pub coverage: Coverage,
     pub fd_baseline: u64,
     pub fd_final: u64,
     pub fd_limit: u64,
@@ -279,10 +293,46 @@ pub struct ResourceSummary {
     pub samples: usize,
 }
 
+impl ResourceSummary {
+    /// A summary for a run that ended before the monitor had a baseline. Only
+    /// `samples` and `coverage` are meaningful; the rest is zero.
+    fn insufficient(samples: usize, needed: usize) -> Self {
+        Self {
+            coverage: Coverage::Insufficient { needed },
+            fd_baseline: 0,
+            fd_final: 0,
+            fd_limit: 0,
+            rss_baseline: 0,
+            rss_final: 0,
+            vsz_baseline: 0,
+            vsz_final: 0,
+            tcp_baseline: 0,
+            tcp_final: 0,
+            segments_baseline: 0,
+            segments_final: 0,
+            sstables_baseline: 0,
+            sstables_final: 0,
+            threads_baseline: 0,
+            threads_final: 0,
+            samples,
+        }
+    }
+}
+
 impl fmt::Display for ResourceSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "--- Resource Leak Detection ---")?;
         writeln!(f, "Samples:            {:>12}", self.samples)?;
+        if let Coverage::Insufficient { needed } = self.coverage {
+            // No baseline was ever taken, so there are no deltas to print and no
+            // basis for a verdict. Say so; do not print CLEAN.
+            return writeln!(
+                f,
+                "Leak verdict:       INCONCLUSIVE (needs {needed} samples, the run ended after {}; \
+                 lengthen the duration or lower the warmup)",
+                self.samples
+            );
+        }
         write_delta(f, "File descriptors", self.fd_baseline, self.fd_final)?;
         writeln!(f, "  (limit: {})", self.fd_limit)?;
         write_delta_mb(f, "RSS", self.rss_baseline, self.rss_final)?;
@@ -680,9 +730,54 @@ mod tests {
         for i in 0..5 {
             mon.record(make_snap(50 + i, 100_000, i));
         }
-        let summary = mon.summary().expect("should have summary");
+        let summary = mon.summary();
+        assert_eq!(summary.coverage, Coverage::Full);
         assert_eq!(summary.samples, 5);
         // Baseline is the third sample (index 2, first post-warmup).
         assert_eq!(summary.fd_baseline, 52);
+        let text = summary.to_string();
+        assert!(text.contains("Leak verdict:"), "{text}");
+        assert!(!text.contains("INCONCLUSIVE"), "{text}");
+    }
+
+    /// A run can end (target data size reached) before the monitor has a post-warmup
+    /// baseline. The report used to drop the whole "Resource Leak Detection" section
+    /// in that case, so a load test looked as if leak detection had passed when it
+    /// had not run. It must say so, and must never say CLEAN.
+    #[test]
+    fn a_run_that_ends_before_the_baseline_is_inconclusive_not_absent() {
+        for recorded in [0usize, 1, 4] {
+            let mut mon = ResourceMonitor::new(4);
+            for i in 0..recorded {
+                mon.record(make_snap(50, 100_000, i as u64));
+            }
+            let summary = mon.summary();
+            assert_eq!(
+                summary.coverage,
+                Coverage::Insufficient { needed: 5 },
+                "{recorded} samples"
+            );
+            assert_eq!(summary.samples, recorded);
+            let text = summary.to_string();
+            assert!(text.contains("Resource Leak Detection"), "{text}");
+            assert!(text.contains("Leak verdict:"), "{text}");
+            assert!(text.contains("INCONCLUSIVE"), "{text}");
+            assert!(
+                text.contains(&format!("{recorded}")),
+                "names the sample count: {text}"
+            );
+            assert!(text.contains('5'), "names the samples needed: {text}");
+            assert!(!text.contains("CLEAN"), "must never claim clean: {text}");
+            assert!(!text.contains("SUSPECT"), "no deltas were measured: {text}");
+        }
+    }
+
+    #[test]
+    fn the_first_post_warmup_sample_is_enough_for_a_full_summary() {
+        let mut mon = ResourceMonitor::new(4);
+        for i in 0..5 {
+            mon.record(make_snap(50, 100_000, i));
+        }
+        assert_eq!(mon.summary().coverage, Coverage::Full);
     }
 }
