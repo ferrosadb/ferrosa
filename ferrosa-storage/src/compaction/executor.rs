@@ -1695,6 +1695,7 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         }
     }
 
