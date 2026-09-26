@@ -1,5 +1,6 @@
 CompressionInfo.db
 Data.db
+Digest.crc32
 Filter.db
 Partitions.db
 Rows.db
