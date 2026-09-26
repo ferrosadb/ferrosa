@@ -23,6 +23,12 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 
 ## Next
 
+- **Wire the aligned write pump (sstable-write-pump plan, T-031 onward).**
+  `pump::PumpConfig` (T-030) exists but nothing reads it yet: `direct::AlignedBuf`
+  takes a runtime alignment and `DirectWriter` still hardcodes `MIN_BLOCK`
+  (4096). The DIO alignment probe, the `SegmentSink`/flusher-thread pump, and
+  `DataSink` (removing `Data.raw`) are separate, larger packets — see
+  `ferrosa-suite/specs/sstable-write-pump/`.
 - **Complex-column support (FMEA ST-3).** Implement collections / UDT / tuple /
   frozen cell encode+decode in the Data.db codec, or surface unsupported complex
   columns as an explicit error to any consuming crate that needs them.

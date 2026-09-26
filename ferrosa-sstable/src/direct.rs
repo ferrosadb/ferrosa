@@ -203,14 +203,20 @@ pub fn direct_wanted(specific_name: &str, warned: &AtomicBool) -> bool {
     }
 }
 
-/// Alignment / write granularity. 4096 is the near-universal page/fs block size
-/// and a safe superset of 512-byte device sectors: a buffer aligned to 4096
-/// satisfies any O_DIRECT alignment a real device imposes.
-pub const BLOCK: usize = 4096;
+/// Minimum alignment / write granularity. 4096 is the near-universal page/fs
+/// block size and a safe superset of 512-byte device sectors: a buffer
+/// aligned to 4096 satisfies any O_DIRECT alignment a real device imposes.
+///
+/// This is a floor, not "the" block size: [`AlignedBuf`] and [`DirectWriter`]
+/// carry their own runtime alignment (probed per file — see `pump.rs` and
+/// `decisions.md` D4), which is always `>= MIN_BLOCK`. Code that needs "the"
+/// block for a specific buffer or writer reads it from that value, not from
+/// this constant.
+pub const MIN_BLOCK: usize = 4096;
 
-/// Staging-buffer capacity (a multiple of [`BLOCK`]). 1 MiB amortizes syscall
-/// overhead while bounding the in-flight buffer (Power-of-10 rule 3).
-pub const STAGING_CAPACITY: usize = 256 * BLOCK;
+/// Staging-buffer capacity (a multiple of [`MIN_BLOCK`]). 1 MiB amortizes
+/// syscall overhead while bounding the in-flight buffer (Power-of-10 rule 3).
+pub const STAGING_CAPACITY: usize = 256 * MIN_BLOCK;
 
 static DIRECT_WRITE_FALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DIRECT_WRITE_FILES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -303,20 +309,26 @@ pub enum DirectMode {
     Buffered,
 }
 
-/// The largest [`BLOCK`]-multiple prefix of `filled` bytes — the amount safe to
+/// The largest `block`-multiple prefix of `filled` bytes — the amount safe to
 /// issue as an aligned device write, leaving a sub-block remainder buffered.
-/// Pure (no I/O) so the alignment arithmetic is unit-tested directly.
-pub fn full_block_prefix(filled: usize) -> usize {
-    filled - (filled % BLOCK)
+/// Pure (no I/O) so the alignment arithmetic is unit-tested directly. `block`
+/// is the caller's runtime block size (`>= MIN_BLOCK`), not a fixed constant.
+pub fn full_block_prefix(filled: usize, block: usize) -> usize {
+    filled - (filled % block)
 }
 
-/// A heap buffer aligned to [`BLOCK`], the O_DIRECT memory-alignment requirement.
+/// A heap buffer aligned to a runtime-chosen power of two, the O_DIRECT
+/// memory-alignment requirement.
 ///
 /// `Vec<u8>` gives no alignment guarantee, so the staging buffer is a manual
-/// aligned allocation. `capacity` is a non-zero multiple of [`BLOCK`].
-struct AlignedBuf {
+/// aligned allocation. `capacity` is a non-zero multiple of `align`, and
+/// `align` must be a power of two no smaller than [`MIN_BLOCK`] — the probed
+/// device block (`pump.rs`'s `dio_align` probe, once T-031 lands) can exceed
+/// 4096, and the allocation must satisfy whatever that probe reports.
+pub(crate) struct AlignedBuf {
     ptr: NonNull<u8>,
     capacity: usize,
+    align: usize,
 }
 
 // SAFETY: `AlignedBuf` uniquely owns its allocation; sending it across threads is
@@ -324,31 +336,45 @@ struct AlignedBuf {
 unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
-    /// Allocate `capacity` bytes aligned to [`BLOCK`]. `capacity` must be a
-    /// non-zero multiple of [`BLOCK`].
-    fn new(capacity: usize) -> Self {
+    /// Allocate `capacity` bytes aligned to `align`. `align` must be a power
+    /// of two `>= MIN_BLOCK`; `capacity` must be a positive multiple of
+    /// `align`. Both are asserted, since a violation here means the O_DIRECT
+    /// invariant is already broken before any I/O happens.
+    pub(crate) fn new(capacity: usize, align: usize) -> Self {
         assert!(
-            capacity > 0 && capacity.is_multiple_of(BLOCK),
-            "capacity must be a positive BLOCK multiple"
+            align.is_power_of_two() && align >= MIN_BLOCK,
+            "align must be a power of two >= MIN_BLOCK ({MIN_BLOCK}), got {align}"
         );
-        let layout = Layout::from_size_align(capacity, BLOCK).expect("valid aligned layout");
+        assert!(
+            capacity > 0 && capacity.is_multiple_of(align),
+            "capacity must be a positive multiple of align ({align}), got {capacity}"
+        );
+        let layout = Layout::from_size_align(capacity, align).expect("valid aligned layout");
         // SAFETY: layout has non-zero size; we check the returned pointer for null.
         let raw = unsafe { alloc(layout) };
         let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        Self { ptr, capacity }
+        Self {
+            ptr,
+            capacity,
+            align,
+        }
     }
 
-    fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn align(&self) -> usize {
+        self.align
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` owns `capacity` initialized-or-writable bytes; callers
         // only read the prefix they have written.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.capacity) }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: `ptr` owns `capacity` bytes and `&mut self` is exclusive.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity) }
     }
@@ -356,7 +382,8 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity, BLOCK).expect("layout matches new()");
+        let layout =
+            Layout::from_size_align(self.capacity, self.align).expect("layout matches new()");
         // SAFETY: `ptr` came from `alloc` with this exact layout and is freed once.
         unsafe { dealloc(self.ptr.as_ptr(), layout) };
     }
@@ -372,11 +399,16 @@ impl Drop for AlignedBuf {
 pub struct DirectWriter {
     file: File,
     buf: AlignedBuf,
-    /// Bytes staged in `buf` not yet flushed to the device (always `< BLOCK`
+    /// Bytes staged in `buf` not yet flushed to the device (always `< block`
     /// after any flush; `<= capacity` transiently while filling).
     filled: usize,
-    /// Physical bytes already written to the device (always a [`BLOCK`] multiple).
+    /// Physical bytes already written to the device (always a `block` multiple).
     physical: u64,
+    /// This writer's block size. Fixed at [`MIN_BLOCK`] for now — `DirectWriter`
+    /// does not yet consume the D4 alignment probe; that wiring is `pump.rs`'s
+    /// job (T-031/T-032). Kept as a field, not a bare constant reference, so the
+    /// block value is always "the value carried by this writer."
+    block: usize,
     mode: DirectMode,
 }
 
@@ -391,9 +423,10 @@ impl DirectWriter {
         let (file, mode) = open_bypassing(path)?;
         Ok(Self {
             file,
-            buf: AlignedBuf::new(STAGING_CAPACITY),
+            buf: AlignedBuf::new(STAGING_CAPACITY, MIN_BLOCK),
             filled: 0,
             physical: 0,
+            block: MIN_BLOCK,
             mode,
         })
     }
@@ -431,11 +464,15 @@ impl DirectWriter {
     /// Write the largest block-multiple prefix of the staged bytes to the device
     /// and shift any sub-block remainder to the front of the buffer.
     fn flush_full_blocks(&mut self) -> Result<()> {
-        let flush_len = full_block_prefix(self.filled);
+        let flush_len = full_block_prefix(self.filled, self.block);
         if flush_len == 0 {
             return Ok(());
         }
-        write_at_offset(&mut self.file, &self.buf.as_slice()[..flush_len])?;
+        write_at_offset(
+            &mut self.file,
+            &self.buf.as_slice()[..flush_len],
+            self.block,
+        )?;
         let remainder = self.filled - flush_len;
         if remainder > 0 {
             self.buf
@@ -451,14 +488,15 @@ impl DirectWriter {
     /// the exact logical length. Consumes the writer.
     pub fn finish(mut self) -> Result<u64> {
         self.flush_full_blocks()?;
-        let tail = self.filled; // < BLOCK
+        let tail = self.filled; // < self.block
         let logical = self.physical + tail as u64;
         if tail > 0 {
             // Zero-pad the partial block to a full aligned block, write it, then
             // truncate the padding off — the standard O_DIRECT tail technique.
-            self.buf.as_mut_slice()[tail..BLOCK].fill(0);
-            write_at_offset(&mut self.file, &self.buf.as_slice()[..BLOCK])?;
-            self.physical += BLOCK as u64;
+            let block = self.block;
+            self.buf.as_mut_slice()[tail..block].fill(0);
+            write_at_offset(&mut self.file, &self.buf.as_slice()[..block], block)?;
+            self.physical += block as u64;
         }
         sync_data(&self.file)?;
         if tail > 0 {
@@ -481,11 +519,11 @@ impl DirectWriter {
 /// lives in one place. `std::io::Write::write_all` retries partial writes with a
 /// suffix slice; because both the offset served and any partial count are block
 /// multiples, the retried buffer pointer and length stay aligned.
-fn write_at_offset(file: &mut File, block_aligned: &[u8]) -> Result<()> {
+fn write_at_offset(file: &mut File, block_aligned: &[u8], block: usize) -> Result<()> {
     use std::io::Write;
     debug_assert!(
-        block_aligned.len().is_multiple_of(BLOCK),
-        "device writes must be BLOCK-aligned"
+        block_aligned.len().is_multiple_of(block),
+        "device writes must be block-aligned"
     );
     file.write_all(block_aligned)?;
     Ok(())
@@ -604,8 +642,8 @@ pub fn direct_read_bytes_total() -> u64 {
     DIRECT_READ_BYTES_TOTAL.load(Ordering::Relaxed)
 }
 
-/// Bounce-buffer capacity for direct reads (a [`BLOCK`] multiple). One read syscall
-/// moves at most this many bytes.
+/// Bounce-buffer capacity for direct reads (a [`MIN_BLOCK`] multiple). One read
+/// syscall moves at most this many bytes.
 const READ_BOUNCE_CAPACITY: usize = STAGING_CAPACITY;
 
 /// A read-only file that keeps its reads out of the OS page cache.
@@ -638,7 +676,7 @@ impl DirectReadFile {
             file,
             len,
             mode,
-            bounce: std::sync::Mutex::new(AlignedBuf::new(READ_BOUNCE_CAPACITY)),
+            bounce: std::sync::Mutex::new(AlignedBuf::new(READ_BOUNCE_CAPACITY, MIN_BLOCK)),
         })
     }
 
@@ -657,15 +695,16 @@ impl crate::io::ReadAt for DirectReadFile {
         }
         let target = buf.len().min((self.len - offset) as usize);
         let mut bounce = self.bounce.lock().expect("direct read bounce poisoned");
+        let block = bounce.align();
         let mut copied = 0;
         while copied < target {
             let pos = offset + copied as u64;
-            let chunk_start = pos - pos % BLOCK as u64;
+            let chunk_start = pos - pos % block as u64;
             let head = (pos - chunk_start) as usize;
             let need = head + (target - copied);
             let chunk_len = need
-                .div_ceil(BLOCK)
-                .saturating_mul(BLOCK)
+                .div_ceil(block)
+                .saturating_mul(block)
                 .min(bounce.capacity());
             let got = self
                 .file
@@ -779,26 +818,100 @@ mod tests {
 
     #[test]
     fn full_block_prefix_rounds_down_to_block_multiple() {
-        assert_eq!(full_block_prefix(0), 0);
-        assert_eq!(full_block_prefix(1), 0);
-        assert_eq!(full_block_prefix(BLOCK - 1), 0);
-        assert_eq!(full_block_prefix(BLOCK), BLOCK);
-        assert_eq!(full_block_prefix(BLOCK + 1), BLOCK);
-        assert_eq!(full_block_prefix(3 * BLOCK + 7), 3 * BLOCK);
+        assert_eq!(full_block_prefix(0, MIN_BLOCK), 0);
+        assert_eq!(full_block_prefix(1, MIN_BLOCK), 0);
+        assert_eq!(full_block_prefix(MIN_BLOCK - 1, MIN_BLOCK), 0);
+        assert_eq!(full_block_prefix(MIN_BLOCK, MIN_BLOCK), MIN_BLOCK);
+        assert_eq!(full_block_prefix(MIN_BLOCK + 1, MIN_BLOCK), MIN_BLOCK);
+        assert_eq!(
+            full_block_prefix(3 * MIN_BLOCK + 7, MIN_BLOCK),
+            3 * MIN_BLOCK
+        );
+    }
+
+    /// `full_block_prefix` must round down to whatever block it is given, not
+    /// just [`MIN_BLOCK`] — the probed device block (D4) can be larger.
+    #[test]
+    fn pump_primitives_full_block_prefix_honours_the_given_block() {
+        for block in [4096usize, 8192, 65536] {
+            assert_eq!(full_block_prefix(0, block), 0);
+            assert_eq!(full_block_prefix(block - 1, block), 0);
+            assert_eq!(full_block_prefix(block, block), block);
+            assert_eq!(full_block_prefix(block + 1, block), block);
+            assert_eq!(full_block_prefix(3 * block + 7, block), 3 * block);
+        }
     }
 
     #[test]
     fn aligned_buf_is_block_aligned_and_addressable() {
-        let mut b = AlignedBuf::new(2 * BLOCK);
-        assert_eq!(b.capacity(), 2 * BLOCK);
+        let mut b = AlignedBuf::new(2 * MIN_BLOCK, MIN_BLOCK);
+        assert_eq!(b.capacity(), 2 * MIN_BLOCK);
         assert_eq!(
-            b.as_slice().as_ptr() as usize % BLOCK,
+            b.as_slice().as_ptr() as usize % MIN_BLOCK,
             0,
-            "buffer must be BLOCK-aligned"
+            "buffer must be block-aligned"
         );
         // Writable across the whole capacity (Miri checks bounds/init).
-        b.as_mut_slice()[2 * BLOCK - 1] = 0xAB;
-        assert_eq!(b.as_slice()[2 * BLOCK - 1], 0xAB);
+        b.as_mut_slice()[2 * MIN_BLOCK - 1] = 0xAB;
+        assert_eq!(b.as_slice()[2 * MIN_BLOCK - 1], 0xAB);
+    }
+
+    /// D4: the probed device block can be larger than [`MIN_BLOCK`] (up to the
+    /// 64 KiB ceiling). `AlignedBuf` must honour whatever alignment it is given,
+    /// with the pointer aligned and capacity an exact multiple.
+    #[test]
+    fn pump_primitives_aligned_buf_honours_runtime_alignment() {
+        for align in [4096usize, 8192, 65536] {
+            let capacity = 3 * align;
+            let mut b = AlignedBuf::new(capacity, align);
+            assert_eq!(b.align(), align);
+            assert_eq!(b.capacity(), capacity);
+            assert!(
+                b.capacity().is_multiple_of(align),
+                "capacity must be an exact multiple of align ({align})"
+            );
+            assert_eq!(
+                b.as_slice().as_ptr() as usize % align,
+                0,
+                "pointer must be aligned to {align}"
+            );
+            b.as_mut_slice()[capacity - 1] = 0xCD;
+            assert_eq!(b.as_slice()[capacity - 1], 0xCD);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "align must be a power of two")]
+    fn pump_primitives_aligned_buf_rejects_non_power_of_two_align() {
+        AlignedBuf::new(4096 * 3, 3000);
+    }
+
+    #[test]
+    #[should_panic(expected = "align must be a power of two")]
+    fn pump_primitives_aligned_buf_rejects_align_below_min_block() {
+        AlignedBuf::new(2048, 2048);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be a positive multiple of align")]
+    fn pump_primitives_aligned_buf_rejects_capacity_not_a_multiple_of_align() {
+        AlignedBuf::new(8192 + 1, 8192);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be a positive multiple of align")]
+    fn pump_primitives_aligned_buf_rejects_zero_capacity() {
+        AlignedBuf::new(0, MIN_BLOCK);
+    }
+
+    /// `AlignedBuf` must remain `Send` (moved by ownership between the producer
+    /// and flusher threads — `decisions.md` D2) and must NOT be `Sync`: a
+    /// static-assertion test rather than a runtime check, so a regression fails
+    /// to compile instead of failing at runtime.
+    #[test]
+    fn pump_primitives_aligned_buf_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AlignedBuf>();
     }
 
     /// The core correctness property: the file's logical content is byte-exact
@@ -809,13 +922,13 @@ mod tests {
         let sizes = [
             0usize,
             1,
-            BLOCK - 1,
-            BLOCK,
-            BLOCK + 1,
-            3 * BLOCK,
-            3 * BLOCK + 7,
+            MIN_BLOCK - 1,
+            MIN_BLOCK,
+            MIN_BLOCK + 1,
+            3 * MIN_BLOCK,
+            3 * MIN_BLOCK + 7,
             STAGING_CAPACITY + 123, // forces a mid-stream buffer flush + refill
-            2 * STAGING_CAPACITY + BLOCK + 5,
+            2 * STAGING_CAPACITY + MIN_BLOCK + 5,
         ];
         let dir = tmp();
         for (i, &size) in sizes.iter().enumerate() {
@@ -846,10 +959,10 @@ mod tests {
         let dir = tmp();
         for &size in &[
             0usize,
-            BLOCK / 2,
-            BLOCK,
+            MIN_BLOCK / 2,
+            MIN_BLOCK,
             STAGING_CAPACITY,
-            STAGING_CAPACITY + BLOCK - 1,
+            STAGING_CAPACITY + MIN_BLOCK - 1,
         ] {
             let path = dir.path().join(format!("one-{size}.db"));
             let expected: Vec<u8> = (0..size).map(|j| (j * 7 % 256) as u8).collect();
@@ -905,10 +1018,10 @@ mod tests {
         for &size in &[
             0usize,
             1,
-            BLOCK - 1,
-            BLOCK,
-            BLOCK + 1,
-            3 * BLOCK + 7,
+            MIN_BLOCK - 1,
+            MIN_BLOCK,
+            MIN_BLOCK + 1,
+            3 * MIN_BLOCK + 7,
             STAGING_CAPACITY + 123,
         ] {
             let path = dir.path().join(format!("r-{size}.db"));
@@ -920,8 +1033,8 @@ mod tests {
                 (0u64, 1usize),
                 (0, size),
                 (1, 100),
-                (BLOCK as u64 - 1, 3),
-                (BLOCK as u64, BLOCK),
+                (MIN_BLOCK as u64 - 1, 3),
+                (MIN_BLOCK as u64, MIN_BLOCK),
                 (size as u64 / 2, size),
                 (size as u64, 10),
                 (size as u64 + 500, 10),
@@ -941,7 +1054,7 @@ mod tests {
     fn direct_read_mode_is_a_real_bypass_on_this_platform() {
         let dir = tmp();
         let path = dir.path().join("mode-r.db");
-        std::fs::write(&path, pattern(BLOCK)).expect("write");
+        std::fs::write(&path, pattern(MIN_BLOCK)).expect("write");
         let before = direct_read_files_total();
         let f = DirectReadFile::open(&path).expect("open");
         #[cfg(target_os = "macos")]
@@ -960,7 +1073,7 @@ mod tests {
         use crate::io::ReadAt;
         let dir = tmp();
         let path = dir.path().join("bytes-r.db");
-        std::fs::write(&path, pattern(2 * BLOCK)).expect("write");
+        std::fs::write(&path, pattern(2 * MIN_BLOCK)).expect("write");
         let f = DirectReadFile::open(&path).expect("open");
         let before = direct_read_bytes_total();
         let mut buf = vec![0u8; 1000];

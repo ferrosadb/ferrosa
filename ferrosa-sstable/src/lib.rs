@@ -27,6 +27,7 @@ pub mod direct;
 pub mod io;
 pub mod marshal;
 pub mod partition_index;
+pub mod pump;
 pub mod reader;
 pub mod row_index;
 pub mod scan;

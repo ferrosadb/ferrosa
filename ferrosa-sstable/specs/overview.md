@@ -59,6 +59,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
 | `types` | ~237 | `Partition`, `Row`, `LivenessInfo`, `DeletionTime` |
+| `pump` | ~150 | `PumpConfig` — aligned-write-pump runtime tunables (segment size, queue depth), env parsing + block-rounding. Primitives only (T-030); no writer wiring yet |
 
 ## Component layout
 

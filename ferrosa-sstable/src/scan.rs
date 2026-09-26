@@ -264,7 +264,7 @@ pub const DEFAULT_SCAN_WINDOW: usize = 1024 * 1024;
 pub const MAX_SCAN_WINDOW: usize = 256 * 1024 * 1024;
 
 /// Parse `FERROSA_COMPACTION_READAHEAD_BYTES`. Absent ⇒ [`DEFAULT_SCAN_WINDOW`].
-/// The result is rounded up to a whole [`crate::direct::BLOCK`]. Unparseable, zero
+/// The result is rounded up to a whole [`crate::direct::MIN_BLOCK`]. Unparseable, zero
 /// or oversized values are an `Err` describing the problem — the caller must log it
 /// and choose the default visibly, never silently.
 pub fn parse_scan_window(value: Option<&str>) -> std::result::Result<usize, String> {
@@ -283,7 +283,7 @@ pub fn parse_scan_window(value: Option<&str>) -> std::result::Result<usize, Stri
             "read-ahead window {bytes} exceeds the {MAX_SCAN_WINDOW}-byte cap"
         ));
     }
-    Ok(bytes.next_multiple_of(crate::direct::BLOCK))
+    Ok(bytes.next_multiple_of(crate::direct::MIN_BLOCK))
 }
 
 #[cfg(test)]

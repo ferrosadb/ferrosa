@@ -82,8 +82,9 @@ resolution beyond the serialization header, or cluster routing.
 | Module | Responsibility |
 |--------|----------------|
 | `io` | `ReadAt`/`WriteAt` positional traits, `FileReadAt`/`FileWriteAt`, bounded block cache (`CachedReadAt`) |
-| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`) |
+| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`). `AlignedBuf` now takes its alignment at construction (`AlignedBuf::new(capacity, align)`, `align` a power of two `>= MIN_BLOCK`) instead of a fixed `BLOCK` constant, and `full_block_prefix(filled, block)` takes the block as a parameter — the device block probed per file (D4) can exceed 4096. `DirectWriter` itself is unchanged behaviorally: it still runs at a fixed `MIN_BLOCK` (4096) internally |
 | `direct` (read side) | `DirectReadFile` — cache-bypassing positional reader (O_DIRECT / `F_NOCACHE`, aligned bounce buffer, any offset/length). Fallback to buffered reads + `POSIX_FADV_DONTNEED` is WARN-logged and counted in `direct_read_fallbacks_total` |
+| `pump` | `PumpConfig` — runtime tunables for the aligned write pump (`FERROSA_SSTABLE_WRITE_SEGMENT_BYTES`, `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH`). Primitives only so far (T-030 of the sstable-write-pump plan); nothing in the writer consumes them yet |
 | `scan` | `ReadAheadReader<R>` — one bounded window plus a background prefetch of the next window (≤ 2 windows resident, ≤ 1 read in flight). `FileReadAt::open_scan` composes it over `DirectReadFile` for compaction input; `parse_scan_window` validates `FERROSA_COMPACTION_READAHEAD_BYTES` |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |
 | `writer` | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]` |
@@ -114,6 +115,7 @@ constant per-partition memory.
 |------|-------|
 | I/O traits | `ReadAt`, `WriteAt`, `FileReadAt`, `FileWriteAt` |
 | Direct I/O | `direct::DirectWriter` (page-cache-bypassing sequential writer: O_DIRECT/`F_NOCACHE`), `direct::DirectReadFile`, `DirectMode`, `direct_write_{fallbacks,files,bytes}_total`, `direct_read_{fallbacks,files,bytes}_total` |
+| Write pump tunables | `pump::PumpConfig` (`from_env`, `effective_segment`), `pump::{SEGMENT_BYTES_ENV, QUEUE_DEPTH_ENV}` |
 | Scan / read-ahead | `scan::ReadAheadReader::{new, with_prefetch}`, `FileReadAt::{open_scan, is_scan}`, `scan::parse_scan_window` |
 | Reader | `SSTableReader::{open, get_partition, get_clustering_row, may_contain_key, partitions_iter, seek_to_token, salvage, validate_data_extent}`, `SSTableComponents` |
 | Writer | `SSTableWriter::{new, new_file_backed, add_partition, finish, finish_to_directory}`, `WriteOptions`, `SSTableOutput`, `SSTableOutputFiles` |
