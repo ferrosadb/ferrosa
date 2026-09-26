@@ -178,13 +178,12 @@ mod tests {
         /// always rolls forward from here, so this asserts that specific
         /// outcome instead of "one of the two": every input generation must
         /// be gone and a disjoint, non-empty output generation must be the
-        /// only thing left. Closes windows C and D (T-022/T-023).
+        /// only thing left. Closes windows C and D (T-022/T-023) and the
+        /// `AfterPromote` sub-window of C (T-022's generation-choice
+        /// reservation, forge t_cb6fa288), and closes window E at the
+        /// per-generation granularity this harness exercises (T-023's
+        /// blanket idempotent retirement retry).
         RolledForward,
-        /// A documented, `known-open-window`-gated case where I2 is
-        /// expected to still fail: window E (T-024, not yet fixed) or the
-        /// `AfterPromote` sub-window of C (a gap in T-022's own commit
-        /// protocol, also not yet fixed -- see that test's comment).
-        KnownOpenWindow,
     }
 
     /// Drives one crash-twin case. `test_name` must be this test's own
@@ -254,32 +253,20 @@ mod tests {
                      thing left; observed {observed:?}"
                 );
             }
-            ExpectedOutcome::KnownOpenWindow => {
-                report.assert_i1_content_matches_oracle();
-                report.assert_i3_no_corrupt_generation();
-                let observed: HashSet<u64> =
-                    StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid))
-                        .into_iter()
-                        .collect();
-                let inputs: HashSet<u64> = input_gens.iter().copied().collect();
-                assert!(
-                    report.duplicate_or_missing_generations.is_some(),
-                    "{point} was gated as a known-open-window case (see this test's comment \
-                     for which gap -- window E/T-024, or the AfterPromote sub-window of C) \
-                     but I2 held anyway (inputs {inputs:?}, observed {observed:?}) -- the \
-                     fixing packet may already be in, in which case remove this gate and \
-                     this test's `known-open-window` feature guard"
-                );
-            }
         }
         let _ = engine.shutdown();
     }
 
     /// Generates one `#[test]` per (point, compression) crash-twin case.
-    /// `clean` cases run by default; `known_open_window` cases compile only
-    /// under `--features known-open-window` (off by default, so `cargo
-    /// test` stays green) and assert the documented I2 violation instead of
-    /// a clean pass.
+    /// `clean` cases crash before the T-022 commit point and always roll
+    /// back; `rolled_forward` cases crash at or after it and always roll
+    /// forward onto the promoted output. There is no longer a gated
+    /// "known-open-window" arm: T-022 (generation reservation, forge
+    /// t_cb6fa288) plus T-023 (startup reconciliation) close every window
+    /// this harness exercises. The remaining T-024 scope (per-component
+    /// retirement atomicity) needs a finer-grained hook than this harness's
+    /// per-generation `CancelPoint::RetireInput` provides -- see
+    /// `ferrosa-storage/specs/roadmap.md`.
     macro_rules! crash_sweep_test {
         ($name:ident, $point:expr, $compressed:expr, clean) => {
             #[test]
@@ -300,18 +287,6 @@ mod tests {
                     $point,
                     $compressed,
                     ExpectedOutcome::RolledForward,
-                );
-            }
-        };
-        ($name:ident, $point:expr, $compressed:expr, known_open_window) => {
-            #[cfg(feature = "known-open-window")]
-            #[test]
-            fn $name() {
-                run_crash_sweep_case(
-                    stringify!($name),
-                    $point,
-                    $compressed,
-                    ExpectedOutcome::KnownOpenWindow,
                 );
             }
         };
@@ -420,51 +395,53 @@ mod tests {
         clean
     );
 
-    // ---- Window D and most of window C are closed by T-022/T-023 and run
+    // ---- Windows C and D are fully closed by T-022/T-023 and run
     // unconditionally below, asserting the specific roll-forward outcome
-    // those packets guarantee. `AfterPromote` (part of window C) and window
-    // E remain gated behind `known-open-window` -- see each section's
-    // comment for why. ----
+    // those packets guarantee. No `known-open-window`-gated case remains in
+    // this file (see the macro's doc comment for the remaining T-024
+    // scope). ----
 
     // Window C (compaction-cancel-safety.md): the output is promoted (live
     // under sstables/<table>/) but the view has not swapped yet.
     //
-    // `AfterPromote` itself is a narrower window T-022/T-023 do NOT close,
-    // found by running this case with the fix in place: `poll_compactions`
-    // fires this cancel point BEFORE it corrects the intent record's
-    // `output_gen` from its pre-promotion placeholder (the staged output's
-    // own id) to the actual promoted generation id -- `promote_compaction_output`
-    // is free to pick a different id to avoid colliding with a concurrent
-    // flush, and routinely does in this scenario. A crash in that gap
-    // leaves a durable, fsynced record whose `output_gen` names a
-    // generation that no longer exists (it was renamed away), so
-    // `reconcile_one_compaction_intent` finds "output missing" and rolls
-    // BACK -- deleting the record and leaving both inputs untouched --
-    // while the real promoted output sits live on disk under its true id,
-    // now an orphan no record points to. Both inputs and the output are
-    // then discoverable after restart: I2 violated, the original window C
-    // shape. This is a gap in T-022's own commit protocol (the two-step
-    // intent write around promotion), not something T-024 covers, and needs
-    // its own fix packet. Kept `known-open-window`-gated pending that fix.
+    // `AfterPromote` used to reproduce this window even with T-022/T-023 in
+    // place: `poll_compactions` fired this cancel point BEFORE it corrected
+    // the intent record's `output_gen` from its pre-promotion placeholder
+    // (the staged output's own id) to the actual promoted generation id --
+    // `promote_compaction_output` was free to pick a different id to avoid
+    // colliding with a concurrent flush, and routinely did in this
+    // scenario. A crash in that gap left a durable, fsynced record whose
+    // `output_gen` named a generation that no longer existed (it had been
+    // renamed away), so `reconcile_one_compaction_intent` found "output
+    // missing" and rolled BACK -- deleting the record and leaving both
+    // inputs untouched -- while the real promoted output sat live on disk
+    // under its true id, an orphan no record pointed to. Both inputs and
+    // the output were then discoverable after restart: I2 violated, the
+    // original window C shape. Closed by T-022 itself (forge t_cb6fa288):
+    // `StorageEngine::reserve_compaction_promotion_target` now chooses and
+    // reserves the final generation id BEFORE the intent record is written,
+    // so the record's `output_gen` is correct from its first write and
+    // `promote_compaction_output` only ever moves data into the id already
+    // committed to disk -- there is nothing left to correct after
+    // `AfterPromote` fires.
     crash_sweep_test!(
         cancel_crash_sweep_after_promote_compressed,
         CancelPoint::AfterPromote,
         true,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_after_promote_uncompressed,
         CancelPoint::AfterPromote,
         false,
-        known_open_window
+        rolled_forward
     );
 
-    // SidecarBuild and BeforeSwap: by these points `poll_compactions` has
-    // already corrected the intent record's `output_gen` to the real
-    // promoted id and re-fsynced it (immediately after `AfterPromote` fires,
-    // see above), so T-023's C3 reconciliation finds the promoted output
-    // under the recorded id and rolls forward. Closed by T-022 (C2) + T-023
-    // (C3).
+    // SidecarBuild and BeforeSwap: by these points the intent record has
+    // named the real promoted id since its first (and now only) write (see
+    // `AfterPromote` above), so T-023's C3 reconciliation finds the
+    // promoted output under the recorded id and rolls forward. Closed by
+    // T-022 (C2) + T-023 (C3).
     crash_sweep_test!(
         cancel_crash_sweep_sidecar_build_compressed,
         CancelPoint::SidecarBuild,
@@ -508,25 +485,37 @@ mod tests {
         rolled_forward
     );
 
-    // Window E: input retirement stops after zero inputs are removed (the
-    // output is already live, both inputs still are too). NOT YET fixed —
-    // T-024 (C4: atomic, fsynced per-generation retirement) is the only
-    // remaining `known-open-window` case now that windows C and D are
-    // closed by T-022/T-023 above. This packet's `CancelPoint` granularity
-    // is per whole input generation, not per component file, so it does not
-    // reach the finer-grained "one input half-deleted" shape the design doc
-    // also describes under window E — that needs a per-component hook a
-    // later packet can add alongside its fix.
+    // Window E, at this harness's granularity: `RetireInput(0)` fires before
+    // generation 0's first component file is unlinked, i.e. zero inputs
+    // removed, output already live. The design doc (`compaction-cancel-safety.md`)
+    // describes this as open until T-024's atomic per-generation retirement
+    // (C4). It turns out T-023's reconciliation already closes it AT THIS
+    // GRANULARITY: `reconcile_one_compaction_intent` doesn't ask how much of
+    // a generation's retirement completed, it just retires every input the
+    // record lists, unconditionally and idempotently
+    // (`evict_local_input_sstable_files` treats an already-missing component
+    // as a no-op) -- so whether zero, some, or all of a generation's files
+    // survived a crash, startup finishes the job the same way. Verified by
+    // running this case with `known-open-window` still asserting the
+    // documented violation: the assertion itself failed ("I2 held anyway"),
+    // which is exactly the self-check that comment was written to catch.
+    //
+    // What T-024 (C4) still owns: retirement atomicity WITHIN a single
+    // generation at per-component granularity -- "one input half-deleted"
+    // (some of a generation's own component files gone, some not) -- which
+    // needs a hook finer than this harness's per-generation
+    // `CancelPoint::RetireInput(k)` can express. See
+    // `ferrosa-storage/specs/roadmap.md`.
     crash_sweep_test!(
         cancel_crash_sweep_retire_input_0_compressed,
         CancelPoint::RetireInput(0),
         true,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_retire_input_0_uncompressed,
         CancelPoint::RetireInput(0),
         false,
-        known_open_window
+        rolled_forward
     );
 }

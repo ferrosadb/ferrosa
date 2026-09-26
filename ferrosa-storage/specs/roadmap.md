@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: roadmap
-last_updated: 2026-07-03
+last_updated: 2026-09-26
 ---
 
 # ferrosa-storage — Roadmap
@@ -26,19 +26,31 @@ open work lives in specs and the items below.
 
 ## Next
 
-- **Compaction cancel safety — commit point + reconciliation (T-021 through
-  T-024, `compaction-cancel-safety.md`).** Compaction cannot be cancelled
-  today and has no durable record of which output replaces which inputs.
-  The T-020 test harness (`cancel_harness_*`/`cancel_crash_sweep_*`) proves
-  three windows are still open, each gated behind the `known-open-window`
-  feature until its packet lands: promoted-but-not-swapped leaves a
-  duplicate generation discoverable at restart (window C, T-022); swapped
-  but inputs not yet deleted, same shape (window D, T-023, paired with the
-  `.promote-*` staging debris of window B); and input retirement stopping
-  partway through the input list leaves an orphan input alongside the new
-  output (window E, T-024). None of these lose data — tombstones are never
-  purged today, so a duplicate generation is a disk leak, not corruption —
-  but that safety margin goes away once tombstone purging is added (CS12).
+- **Compaction cancel safety — cancellation itself (T-021,
+  `compaction-cancel-safety.md`).** T-022 (durable replacement record, with
+  the output generation chosen and reserved before the record is written,
+  forge t_cb6fa288) and T-023 (startup reconciliation) landed and, between
+  them, close every window the T-020 crash-sweep (`cancel_harness_*`/
+  `cancel_crash_sweep_*`) exercises — including window E (input retirement
+  stopping partway through the input list) at the sweep's per-generation
+  granularity, and the `AfterPromote` sub-window of C that T-022's initial
+  landing left open (a crash between promotion and a since-removed
+  post-promotion `output_gen` correction). No `cancel_crash_sweep_*` case is
+  feature-gated any more; the `known-open-window` feature was deleted
+  2026-09-26. **Remaining scope, still open:**
+  - **T-021 itself: actual cancellation.** Nothing today can interrupt an
+    in-flight compaction early (shutdown still joins every worker and waits
+    out the merge) — the crash-sweep only proves what a *crash* leaves
+    behind, not that a *voluntary* cancel is fast or possible at all.
+  - **T-024, narrowed: per-component retirement atomicity within one
+    generation.** `evict_local_input_sstable_files` unlinks a generation's
+    component files one at a time with no atomicity across them ("one input
+    half-deleted" — some of a single generation's own files gone, some
+    not). The crash-sweep's `CancelPoint::RetireInput(k)` fires once per
+    whole input generation, not per component, so it cannot exercise this
+    shape; C4 (atomic, fsynced per-generation retirement, e.g. rename to
+    `.retired-<gen>/` before unlinking) needs a per-component hook a future
+    packet can add alongside the fix.
 - **Remove index artifacts with the generation they index (FMEA ST-24).**
   `evict_local_input_sstable_files` and `delete_sstable_files` remove only the
   seven SSTable components, so every compacted or evicted generation leaves its

@@ -573,7 +573,7 @@ cargo test -p ferrosa-storage --features race-stress --release \
 
 Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
-### Compaction cancel-safety harness (T-020) and real cancellation (T-021)
+### Compaction cancel-safety and crash recovery (T-020–T-023)
 
 `src/compaction/cancel_harness.rs` names every step in the compaction
 lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`
@@ -581,10 +581,10 @@ hook to call at each one, behind `cfg(any(test, feature = "test-support"))`
 (a no-op, compiled to nothing, otherwise). `src/compaction/cancel_oracle.rs`
 is a plain model of every acknowledged write (`WriteOracle`) plus
 `assert_cancel_invariants`, which checks I1 (content matches the oracle), I2
-(exactly one of {inputs, output} discoverable — against **today's** startup,
-which has no reconciliation yet), I3 (every discoverable generation opens
-and walks), and I4 (no `.promote-*`/`.retired-*`/stale-`.tmp`/staging leaks).
-See `specs/sstable-write-pump/compaction-cancel-safety.md`.
+(exactly one of {inputs, output} discoverable after startup reconciliation
+runs), I3 (every discoverable generation opens and walks), and I4 (no
+`.promote-*`/`.retired-*`/stale-`.tmp`/staging leaks). See
+`specs/sstable-write-pump/compaction-cancel-safety.md`.
 
 **T-021 makes cancellation real**, unconditionally (in every build, not only
 tests): `try_submit` creates a `CancelToken`, and every merge-time
@@ -617,30 +617,33 @@ merely record having reached — a `CancelPoint`:
   signal, reopens a fresh engine on the same data dir, and checks I1-I4.
 
 Points strictly before the C2 commit point (input open through
-`BeforePromote`) roll back cleanly today, both for a live cancel (T-021) and
-for a crash (because `compaction/<table>/` staging is unconditionally wiped
-at every engine open) — these run by default. Points from `AfterPromote`
-(window C), `AfterSwap` (window D), and input retirement (window E) leave a
-duplicate/orphan generation today (no reconciliation exists until
-T-022/T-023/T-024) and are not yet real cancel points; those crash-sweep
-cases are gated behind the `known-open-window` feature (off by default, so
-`cargo test` stays green) and assert the documented I2 violation instead of a
-clean pass:
+`BeforePromote`) roll back cleanly, because `compaction/<table>/` staging is
+unconditionally wiped at every engine open. Every point at or after the
+commit (`AfterPromote` through input retirement) rolls forward cleanly onto
+the promoted output: T-022 writes the durable replacement record with the
+real, already-reserved output generation id before promotion runs (forge
+t_cb6fa288 — `StorageEngine::reserve_compaction_promotion_target`), and
+T-023's startup reconciliation retires every input the record lists,
+unconditionally and idempotently, regardless of how far retirement got
+before the crash. All `cancel_crash_sweep_*` cases therefore run
+unconditionally today; there is no `known-open-window`-gated case (the
+feature that used to exist under that name was deleted 2026-09-26 once
+nothing gated on it):
 
 ```bash
 cargo test -p ferrosa-storage cancel_harness_
 cargo test -p ferrosa-storage cancel_token_
 cargo test -p ferrosa-storage cancel_crash_sweep_
-cargo test -p ferrosa-storage --features known-open-window cancel_crash_sweep_
 cargo test -p ferrosa-common cancel
 ```
 
-The crash-sweep harness is Unix-only (signal-based crash detection);
-`cancel_token_*` has no such restriction. The `RetireInput` `CancelPoint`
-fires once per whole input generation; it does not reach the finer-grained
-"one generation half-deleted mid-component-loop" shape window E's own
-description also covers — a follow-up needs a per-component hook alongside
-its fix.
+
+Unix-only (signal-based crash detection). The `RetireInput` `CancelPoint`
+fires once per whole input generation, not per component file, so it cannot
+exercise "one generation half-deleted mid-component-loop" (some of a single
+generation's own component files gone, some not) — the remaining scope of
+T-024 (C4: atomic per-generation retirement) needs a finer, per-component
+hook. See [Roadmap](specs/roadmap.md).
 
 ## Specs
 

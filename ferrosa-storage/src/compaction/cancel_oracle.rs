@@ -19,11 +19,13 @@
 //!
 //! I2 ("exactly one of {inputs, output}") reports whether the input
 //! generations, the output generation, or a mixture of both are discoverable
-//! after a (re)open. Startup now runs T-023's C3 reconciliation, so this
-//! only reports a mixture for the two windows that remain open -- window E
-//! (T-024) and the `AfterPromote` sub-window of C (a gap in T-022's own
-//! commit protocol) -- each documented at its crash-sweep call site and
-//! gated behind the `known-open-window` feature.
+//! after a (re)open. T-022 (generation reservation, forge t_cb6fa288) and
+//! T-023 (C3 startup reconciliation) together close every window this
+//! crate's crash-sweep exercises, so no `cancel_crash_sweep_*` case is gated
+//! behind a "known open window" feature any more. The remaining T-024 scope
+//! (per-component retirement atomicity within one generation) needs a finer
+//! hook than the crash-sweep's per-generation `CancelPoint` provides -- see
+//! `ferrosa-storage/specs/roadmap.md`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -124,8 +126,8 @@ impl WriteOracle {
 
 /// The result of checking I1-I4 for one compaction scenario. Each field is a
 /// pass/fail plus enough detail to explain a failure; callers decide whether
-/// a given failure is expected (a documented, `known-open-window`-gated
-/// today's-bug case) or a real regression.
+/// a given failure is expected (a documented, still-open window, feature
+/// gated if one exists) or a real regression.
 #[derive(Debug, Default)]
 pub struct CancelInvariantReport {
     /// I1: mismatches against the oracle (empty = content intact).
@@ -177,9 +179,8 @@ impl CancelInvariantReport {
     }
 
     /// Panics on the first invariant this report failed. Prefer the
-    /// per-invariant asserters when a scenario is a documented
-    /// `known-open-window` case that is expected to fail exactly one of
-    /// I1-I4.
+    /// per-invariant asserters when a scenario is a documented, still-open
+    /// window that is expected to fail exactly one of I1-I4.
     pub fn assert_all(&self) {
         self.assert_i1_content_matches_oracle();
         self.assert_i2_exactly_one();

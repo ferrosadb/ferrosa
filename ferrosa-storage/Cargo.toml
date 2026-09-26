@@ -108,20 +108,17 @@ repair-fuzz-known-failures = ["test-generators"]
 # a Fly app per run. Run it by hand on a CPU-starved host, env-scaled via
 # RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
 race-stress = []
-# Compaction cancel-safety crash sweep (T-020, `compaction-cancel-safety.md`):
-# gates the `cancel_crash_sweep_*` cases for the two windows today's code
-# does not yet close: E, input retirement stops partway through the input
-# list (T-024); and the `AfterPromote` sub-window of C, where a crash lands
-# between promotion and the intent record's post-promotion `output_gen`
-# correction, so reconciliation looks for the output under the wrong
-# generation id, finds nothing, and rolls back while the real (differently
-# numbered) output sits live and orphaned -- a gap in T-022's own commit
-# protocol, not yet fixed. The rest of window C and all of window D ARE
-# closed by T-022 (durable replacement record) + T-023 (startup
-# reconciliation) and now run unconditionally, asserting the roll-forward
-# outcome those packets guarantee. Off by default so `cargo test` stays
-# green; each fix removes its case's gate from this feature.
-known-open-window = []
+# Removed 2026-09-26: the `known-open-window` feature used to gate
+# `cancel_crash_sweep_*` cases the code didn't yet close (windows C, D, E,
+# `compaction-cancel-safety.md`). T-022 (durable replacement record with the
+# generation choice reserved before it is written, forge t_cb6fa288) + T-023
+# (startup reconciliation) close every window that crate's crash-sweep
+# exercises, so the feature now gated nothing and was deleted rather than
+# kept as permanent dead weight. The remaining T-024 scope (per-component
+# retirement atomicity within one generation) needs a finer hook than the
+# crash-sweep's per-generation `CancelPoint` provides -- see
+# `specs/roadmap.md`. If a future packet needs a new gated case, reintroduce
+# a feature rather than resurrecting this one under the same name.
 # slow tests; run nightly by nightly-slow-tests.yml; PR CI skips `::slow::`
 slow-tests = []
 
