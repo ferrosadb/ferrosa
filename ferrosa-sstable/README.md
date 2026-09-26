@@ -55,7 +55,27 @@ resolution beyond the serialization header, or cluster routing.
   index (Partitions.db) and the row index (Rows.db) for wide clustered
   partitions.
 - **Compression** — `Compression::{None, Lz4, Zstd { level }}` with per-chunk
-  CRC32 validation on read.
+  CRC32 validation on read. `compress_bound(len)` / `compress_into(src, dst)`
+  (T-036) compress into a caller-owned buffer instead of returning a fresh
+  `Vec`, for the write pump's `ChunkCompressor` (T-038) to preallocate once
+  and reuse per chunk. Into-buffer API per codec: `None` is a plain
+  `copy_from_slice`; `Lz4` uses `lz4_flex::block::{compress_into,
+  get_maximum_output_size}` with a manually-written 4-byte length prefix
+  (matching `compress_prepend_size`'s on-disk format); `Zstd` drives
+  `zstd_safe::CCtx` directly through `compress_stream`/`end_stream` (the
+  same calls `zstd::encode_all` makes under its `Write`-based `Encoder`),
+  reusing one `CCtx` per thread — `zstd::bulk::Compressor::compress_to_buffer`
+  (`ZSTD_compress2`) was tried first but produces a different frame header
+  (it auto-pledges the input length; `encode_all` never does), and the
+  streaming `write::Encoder` wrapper matches byte-for-byte but allocates a
+  fresh 32 KiB `Vec` per call with no way to reuse it. `compress_into`'s
+  output is proven byte-identical to `compress`'s for every codec
+  (`compress_into_matches_compress_*`, `ferrosa-sstable/src/compression.rs`).
+  **`Lz4` is not fully allocation-free**: `lz4_flex` 0.11's public block API
+  always allocates a fresh match-finding hash table per call (no reusable
+  state is exposed); `tests/compress_into_alloc.rs` measures and documents
+  this rather than hiding it — `None` and `Zstd` are zero-allocation after
+  one warm-up call, `Lz4` is a bounded one allocation per call.
 - **Bloom filter** — Cassandra-compatible double-hashing over the Murmur3
   `h1`/`h2` pair from `ferrosa-common`.
 - **Corruption resilience** — `validate_data_extent` (index-vs-data truncation
@@ -207,6 +227,19 @@ writer reproduces every golden file byte-for-byte),
 1000 proptest cases), and `oracle_golden_reads_back_through_reader` (golden
 files read back through `SSTableReader` with the expected partition/row
 counts).
+
+### `compress_into` (T-036)
+
+`compress_into_*` tests in `src/compression.rs` (`compress_into_matches_compress_{none,lz4,zstd}`
+plus their `_prop_*` proptest siblings over input lengths `0..=65536`, and
+`compress_into_dst_too_small_errs`) prove `compress_into`'s output is
+byte-identical to `compress`'s and that an undersized `dst` errors without
+writing anything. `tests/compress_into_alloc.rs` is a separate integration
+test binary with its own counting `#[global_allocator]`
+(`compress_into_alloc_{none,zstd}_is_zero_after_warmup`,
+`compress_into_alloc_lz4_is_one_bounded_allocation_per_call_not_zero`) that
+proves `None`/`Zstd` allocate nothing after their first call and documents
+`Lz4`'s one-allocation-per-call floor (see "What's implemented" above).
 
 ## Specs
 

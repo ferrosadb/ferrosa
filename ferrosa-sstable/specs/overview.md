@@ -58,7 +58,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `statistics` (`src/statistics.rs`) | ~1006 | Statistics.db, `SerializationHeader` |
 | `partition_index` / `row_index` | ~875 | Trie-backed Partitions.db / Rows.db |
 | `byte_comparable` | ~347 | Byte-comparable key encoding for the index |
-| `compression` | ~348 | `Compression` enum, chunk compress/decompress + CRC |
+| `compression` | ~500 | `Compression` enum, chunk compress/decompress + CRC. `compress_bound`/`compress_into` (T-036) compress into a caller-owned buffer for the write pump's `ChunkCompressor` (T-038) |
 | `varint` / `marshal` | ~473 | Cassandra VInt codec, `AbstractType` marshalling |
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
@@ -163,6 +163,52 @@ skips the opt-in) keeps working.
    trailers for a compressed table, raw bytes for an uncompressed one —
    matching Cassandra's contract. `CRC.db`'s chunk size is the table's
    `WriteOptions.chunk_size`, independent of any compression chunking.
+
+## Compression into caller-owned buffers (T-036)
+
+`Compression::compress` allocates a fresh `Vec` per call — fine for the
+current whole-buffer writer, not for the streaming write pump
+(`ferrosa-suite/specs/sstable-write-pump/architecture.md` § Bounded-ring
+rule), which pre-allocates its `ChunkCompressor` input/output buffers once at
+open and must not allocate per chunk after that. `compress_bound(len)` /
+`compress_into(src, dst)` add that path without changing `compress`'s
+behavior or output:
+
+- **`None`**: `compress_bound = len`; `compress_into` is a `copy_from_slice`.
+- **`Lz4`**: `compress_bound = 4 + lz4_flex::block::get_maximum_output_size(len)`;
+  `compress_into` writes the 4-byte little-endian length prefix itself (the
+  same on-disk shape `lz4_flex::compress_prepend_size` produces, so
+  `decompress_size_prepended` reads either), then calls
+  `lz4_flex::block::compress_into` for the body.
+- **`Zstd { level }`**: `compress_bound = zstd_safe::compress_bound(len)`;
+  `compress_into` drives `zstd_safe::CCtx` directly through
+  `compress_stream`/`end_stream` — the same two calls `zstd::encode_all`
+  makes underneath its `Write`-based `Encoder` — reusing one `CCtx` per
+  thread. Two more obvious options were tried and rejected: `zstd::bulk::
+  Compressor::compress_to_buffer` (`ZSTD_compress2`) hands zstd the whole
+  buffer in one call with immediate `ZSTD_e_end`, which auto-pledges the
+  exact input length and produces a *different* frame header than
+  `encode_all` (confirmed empirically — a byte-for-byte diff on every fixed
+  test case); `zstd::stream::write::Encoder` (the streaming wrapper
+  `encode_all` itself uses) matches byte-for-byte but allocates a fresh
+  32 KiB `Vec` per encoder with no public way to reclaim and reuse it across
+  calls.
+
+`compress_into`'s output is proven byte-identical to `compress`'s for every
+codec, across empty/1-byte/16 KiB/64 KiB fixed cases plus a `0..=65536`-length
+proptest (`compress_into_matches_compress_*`,
+`ferrosa-sstable/src/compression.rs`), and `dst` shorter than
+`compress_bound` always errors before writing anything.
+
+**Allocation reality, not aspiration**: `tests/compress_into_alloc.rs` (a
+separate integration-test binary with its own counting `#[global_allocator]`)
+proves `None` and `Zstd` allocate nothing after one warm-up call. `Lz4` does
+not reach that bar: `lz4_flex` 0.11's public `block` API allocates a fresh
+match-finding hash table (`HashTable4KU16`/`HashTable4K`, boxed, 8–16 KiB) on
+every call, with no reusable-state entry point exposed outside the crate. The
+test measures and asserts this (a bounded, constant one allocation per call,
+not scaling with chunk size) instead of a false "zero" claim — a real
+regression (the count growing) still fails the test.
 
 ## Position in the dependency graph
 

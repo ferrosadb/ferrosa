@@ -38,6 +38,17 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 - **Snappy / Deflate compression.** Currently only None / LZ4 / Zstd are
   supported. Add the remaining Cassandra algorithms behind the `Compression`
   enum for broader fixture compatibility.
+- **`Lz4` chunk compression cannot reach zero allocations (T-036 finding).**
+  `compress_into`'s `Lz4` arm calls `lz4_flex::block::compress_into`, which
+  allocates a fresh boxed match-finding hash table every call — the pinned
+  `lz4_flex = "0.11"` exposes no reusable-state entry point (the private
+  `compress_internal`/`HashTable` types would need to be reused, and aren't
+  `pub`). `None` and `Zstd` are zero-allocation after warm-up
+  (`tests/compress_into_alloc.rs`); `Lz4` is a bounded, constant one
+  allocation per call. Worth revisiting when T-038's `ChunkCompressor` lands
+  (an upgraded `lz4_flex`, or a small vendored patch exposing a reusable
+  hash table, would close the gap) — low priority since it's a bounded,
+  non-scaling cost, not a leak.
 - **Bloom filter sizing.** `SSTableWriter::new` sizes the bloom filter for a
   fixed 10 000-key default with a "production would resize" note. Make the size
   derive from the actual partition count (builder pattern or post-hoc resize) so
