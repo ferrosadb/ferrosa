@@ -379,6 +379,12 @@ pub fn read_case_from_disk(name: &str, has_compression: bool) -> ComponentBytes 
             None
         },
         statistics: read("Statistics.db"),
+        digest: read("Digest.crc32"),
+        crc: if has_compression {
+            None
+        } else {
+            Some(read("CRC.db"))
+        },
         toc: read("TOC.txt"),
     }
 }

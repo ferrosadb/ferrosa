@@ -48,6 +48,15 @@ pub struct ComponentBytes {
     pub filter: Vec<u8>,
     pub compression_info: Option<Vec<u8>>,
     pub statistics: Vec<u8>,
+    /// `Digest.crc32` content (decimal ASCII CRC32 of the on-disk Data.db
+    /// bytes). Present for every table (T-011). Folded into the golden
+    /// corpus's byte-exact and manifest comparisons (T-038 item 8) so a
+    /// rewrite of how Data.db is produced cannot silently change the
+    /// checksum computed over it without failing the oracle.
+    pub digest: Vec<u8>,
+    /// `CRC.db` content (per-chunk CRC32 table). `Some` only for
+    /// uncompressed tables (T-011).
+    pub crc: Option<Vec<u8>>,
     pub toc: Vec<u8>,
 }
 
@@ -60,6 +69,8 @@ impl From<SSTableOutput> for ComponentBytes {
             filter: output.filter,
             compression_info: output.compression_info,
             statistics: output.statistics,
+            digest: output.digest,
+            crc: output.crc,
             toc: output.toc,
         }
     }
@@ -67,7 +78,8 @@ impl From<SSTableOutput> for ComponentBytes {
 
 impl ComponentBytes {
     /// `(component file name, bytes)` pairs, in TOC order. `CompressionInfo.db`
-    /// is included only when compression produced one.
+    /// is included only when compression produced one; `CRC.db` only when the
+    /// table is uncompressed. `Digest.crc32` is always present (T-011).
     pub fn named_components(&self) -> Vec<(&'static str, &[u8])> {
         let mut named: Vec<(&'static str, &[u8])> = vec![
             ("Data.db", self.data.as_slice()),
@@ -75,10 +87,14 @@ impl ComponentBytes {
             ("Rows.db", self.rows.as_slice()),
             ("Filter.db", self.filter.as_slice()),
             ("Statistics.db", self.statistics.as_slice()),
+            ("Digest.crc32", self.digest.as_slice()),
             ("TOC.txt", self.toc.as_slice()),
         ];
         if let Some(info) = self.compression_info.as_deref() {
             named.push(("CompressionInfo.db", info));
+        }
+        if let Some(crc) = self.crc.as_deref() {
+            named.push(("CRC.db", crc));
         }
         named
     }
