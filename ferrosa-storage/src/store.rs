@@ -10919,9 +10919,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn startup_smoke_test_rejects_out_of_order_data_stream() {
-        let tmp = tempfile::tempdir().unwrap();
+    /// Corrupt a flushed Data.db into an out-of-order token stream, as both
+    /// `startup_smoke_test_rejects_out_of_order_data_stream` and
+    /// `startup_smoke_test_rejects_out_of_order_data_stream_even_with_stale_checksums`
+    /// need to start from: write two partitions, flush, then rewrite Data.db
+    /// with their headers swapped so the on-disk stream violates token order.
+    /// Returns the table dir, the flushed generation, and the corrupted bytes
+    /// (so callers can choose whether to rebuild Digest.crc32/CRC.db to match).
+    fn corrupt_flushed_generation_into_out_of_order_stream(
+        tmp: &tempfile::TempDir,
+    ) -> (TableStore<crate::flush::FileFlushTarget>, u64, Vec<u8>) {
         let store = file_backed_test_store(tmp.path());
         let schema = test_schema();
 
@@ -10946,13 +10953,58 @@ mod tests {
             &header_partitions,
             &second,
         ));
-        std::fs::write(&data_path, unsorted_data).unwrap();
+        std::fs::write(&data_path, &unsorted_data).unwrap();
+
+        (store, gen, unsorted_data)
+    }
+
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, gen, unsorted_data) =
+            corrupt_flushed_generation_into_out_of_order_stream(&tmp);
+
+        // Checksums (T-011, commit b4d16012) were computed over the ORIGINAL,
+        // correctly-ordered Data.db at flush time. Left stale, the CRC.db
+        // chunk covering the rewritten bytes no longer matches them, and that
+        // checksum layer fires before the token-order check ever runs — the
+        // very next test asserts exactly that. This test exists to exercise
+        // the token-order check specifically, so it rebuilds Digest.crc32 and
+        // CRC.db to match the corrupted bytes: same corruption, checksums
+        // that pass, so the failure is unambiguously the order check.
+        let digest = ferrosa_sstable::checksum::format_digest(
+            ferrosa_sstable::checksum::digest_bytes(&unsorted_data),
+        );
+        std::fs::write(tmp.path().join(format!("{gen}-Digest.crc32")), digest).unwrap();
+        let crc = ferrosa_sstable::checksum::compute_chunk_crc(&unsorted_data, 65536);
+        std::fs::write(tmp.path().join(format!("{gen}-CRC.db")), crc).unwrap();
 
         let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
             .expect_err("startup/self-heal smoke test must detect Data.db token-order corruption");
         assert!(
             err.to_string().contains("partition order violation"),
             "error must name the token-order corruption, got: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_smoke_test_rejects_out_of_order_data_stream_even_with_stale_checksums() {
+        // Companion to the test above: the SAME corruption, but WITHOUT
+        // rebuilding Digest.crc32/CRC.db, so the flush-time checksums are
+        // stale against the rewritten Data.db. This must still be rejected —
+        // by the CRC.db layer this time — so both detection layers (checksum
+        // and token-order) are covered by a test that actually exercises them,
+        // rather than one layer silently masking the other forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, gen, _unsorted_data) =
+            corrupt_flushed_generation_into_out_of_order_stream(&tmp);
+
+        let err = crate::engine::StorageEngine::smoke_test_generation(tmp.path(), gen)
+            .expect_err("startup/self-heal smoke test must detect stale-checksum corruption");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CRC") || msg.contains("crc") || msg.contains("checksum"),
+            "error must name the checksum-layer corruption when checksums are left stale, got: {err}"
         );
     }
 

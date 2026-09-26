@@ -399,6 +399,14 @@ pub struct CompactionExecutor {
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
     in_flight_inputs: Arc<Mutex<HashSet<String>>>,
+    /// Count of completed results sitting in `result_rx`, waiting to be
+    /// drained by `poll_results`/`poll_results_bounded`. Incremented by a
+    /// worker thread the instant it enqueues a finished result, decremented
+    /// as each result is popped. This is the deterministic completion signal
+    /// tests use instead of racing the filesystem for compaction output —
+    /// unlike "does a file exist under compaction/", it cannot observe a
+    /// half-written staging artifact as "done".
+    pending_results: Arc<AtomicUsize>,
 }
 
 impl Default for CompactionExecutor {
@@ -441,6 +449,7 @@ impl CompactionExecutor {
         );
         let stop_flag = Arc::new(AtomicBool::new(false));
         let in_flight_inputs = Arc::new(Mutex::new(HashSet::new()));
+        let pending_results = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(CompactionGate::new(max_concurrent));
         // `reader_pool` is already an `Arc`, so each worker gets a cheap clone.
         let mut task_txs = Vec::with_capacity(worker_count);
@@ -454,6 +463,7 @@ impl CompactionExecutor {
             let result_tx = result_tx.clone();
             let stop = Arc::clone(&stop_flag);
             let in_flight_inputs = Arc::clone(&in_flight_inputs);
+            let pending_results = Arc::clone(&pending_results);
             let gate = Arc::clone(&gate);
             let reader_pool = reader_pool.clone();
 
@@ -506,7 +516,10 @@ impl CompactionExecutor {
                                         };
                                         loop {
                                             match result_tx.try_send(completed) {
-                                                Ok(()) => break,
+                                                Ok(()) => {
+                                                    pending_results.fetch_add(1, Ordering::Release);
+                                                    break;
+                                                }
                                                 Err(std::sync::mpsc::TrySendError::Full(result)) => {
                                                     completed = result;
                                                     if stop.load(Ordering::Acquire) {
@@ -568,6 +581,7 @@ impl CompactionExecutor {
             handles: Mutex::new(handles),
             stop_flag,
             in_flight_inputs,
+            pending_results,
         }
     }
 
@@ -644,6 +658,7 @@ impl CompactionExecutor {
             let Ok(result) = rx.try_recv() else {
                 break;
             };
+            self.pending_results.fetch_sub(1, Ordering::Release);
             results.push(result);
         }
         results
@@ -671,6 +686,43 @@ impl CompactionExecutor {
             // Timeout: the worker never finished (or nothing was submitted).
             // Disconnected: the executor is shut down. Neither is a result.
             Err(_) => false,
+        }
+    }
+
+    /// Number of completed compaction results currently sitting in the
+    /// result queue, waiting to be drained by `poll_results`/
+    /// `poll_results_bounded`.
+    ///
+    /// This is the deterministic signal for "the background compaction
+    /// thread is done": incremented the instant a worker enqueues a
+    /// finished result, decremented as each result is popped. Tests that
+    /// need to wait for a submitted task to finish (without consuming the
+    /// result themselves) should poll this rather than probing the
+    /// filesystem for output files, which can observe an in-progress
+    /// staging write as "done".
+    pub fn pending_result_count(&self) -> usize {
+        self.pending_results.load(Ordering::Acquire)
+    }
+
+    /// Blocks (via short polling sleeps) until at least one completed
+    /// compaction result is waiting in the result queue, or `timeout`
+    /// elapses.
+    ///
+    /// Returns `true` once a result is observed, `false` on timeout. Callers
+    /// that require completion should treat a `false` return as fatal (panic
+    /// with context) rather than silently proceeding — see
+    /// `make_engine_with_pending_compaction` in `engine.rs` for the pattern.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_result(&self, timeout: std::time::Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.pending_result_count() > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 

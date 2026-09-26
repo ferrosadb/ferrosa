@@ -21159,10 +21159,22 @@ mod tests {
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Block until the compaction worker has posted its result. This used to poll
-        // the output directory every 50 ms for three seconds, which raced the worker
-        // on a loaded host.
-        wait_for_compaction_result(&engine);
+        // Wait for the compaction executor (background thread) to finish, on
+        // the deterministic signal (a completed result waiting in the result
+        // queue) rather than racing the filesystem: a file can appear under
+        // compaction/ while the executor is still mid-write, which let
+        // dependent tests observe a staging artifact as "done" and run
+        // before finalize under load (T-091).
+        let completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         (engine, store, prefix, tid)
     }
@@ -21449,19 +21461,19 @@ mod tests {
             .write(&tid, &make_key("k3"), make_row(b"v3", 3000), 3000)
             .unwrap();
 
-        // Wait for compaction to finish (up to 15s under heavy CI load).
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..300 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists()
-                && std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false)
-            {
-                break;
-            }
-        }
+        // Wait for compaction to finish, on the deterministic completion
+        // signal rather than racing the filesystem (T-091): a file can
+        // appear under compaction/ while the executor is still mid-write.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         // Flush on a separate task while poll_compactions runs.
         let eng_clone = std::sync::Arc::clone(&engine);
@@ -22371,20 +22383,22 @@ mod tests {
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Wait for executor to finish writing output files.
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // Wait for the executor to finish, on the deterministic completion
+        // signal rather than racing the filesystem (T-091): a file can
+        // appear under compaction/ while the executor is still mid-write,
+        // and this call site polls compactions exactly once afterward with
+        // no retry, so an early wakeup here would fail the upload assertion
+        // below outright rather than merely racing it.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
         engine.poll_compactions().await;
 
         // Verify the output is in S3.
@@ -22687,20 +22701,20 @@ mod tests {
             );
         }
 
-        // Wait for the compaction executor background thread to finish.
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // Wait for the compaction executor background thread to finish, on
+        // the deterministic completion signal rather than racing the
+        // filesystem (T-091): a file can appear under compaction/ while the
+        // executor is still mid-write.
+        let compaction_completed = engine
+            .compaction_executor
+            .wait_for_result(std::time::Duration::from_secs(120))
+            .await;
+        assert!(
+            compaction_completed,
+            "compaction task did not complete within 120s; executor state: \
+             pending_result_count={}",
+            engine.compaction_executor.pending_result_count()
+        );
 
         // ── poll_compactions: upload, manifest update, local eviction ──
         //

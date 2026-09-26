@@ -760,10 +760,17 @@ pub(crate) mod fsync_probe {
         _guard: MutexGuard<'static, ()>,
     }
 
+    /// A prior test that panicked while holding one of these locks poisons
+    /// it for every later probe test — the probe's job is to observe
+    /// durability ordering across *deliberately panicking* test bodies (see
+    /// `compaction_promotion_fail_after_first_component_is_atomic_and_recoverable`-
+    /// style tests elsewhere), so poisoning here is expected, not a sign of
+    /// corrupted data. Recovering the inner value and immediately `reset()`ing
+    /// it is what makes probe state a per-test fixture again instead of a
+    /// permanently poisoned global (T-091: 5 cascading failures traced to
+    /// exactly this).
     pub(crate) fn exclusive() -> ExclusiveGuard {
-        let guard = EXCLUSIVE
-            .lock()
-            .expect("fsync probe exclusive lock poisoned");
+        let guard = EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         ExclusiveGuard { _guard: guard }
     }
@@ -775,42 +782,51 @@ pub(crate) mod fsync_probe {
     }
 
     fn reset() {
-        SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
-        SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
-        RENAMED_FILES.lock().expect("fsync probe poisoned").clear();
-        EVENTS.lock().expect("fsync probe poisoned").clear();
+        SYNCED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        SYNCED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        RENAMED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     pub(crate) fn note_file(path: &Path) {
         SYNCED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
         EVENTS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(Event::FileFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_dir(path: &Path) {
         SYNCED_DIRS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
         EVENTS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(Event::DirFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_rename(path: &Path) {
         RENAMED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(path.to_path_buf());
         EVENTS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(Event::Rename(path.to_path_buf()));
     }
 
@@ -820,14 +836,14 @@ pub(crate) mod fsync_probe {
     pub(crate) fn note_unlink(path: &Path) {
         EVENTS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(Event::Unlink(path.to_path_buf()));
     }
 
     pub(crate) fn synced_files() -> HashSet<PathBuf> {
         SYNCED_FILES
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .collect()
@@ -836,19 +852,22 @@ pub(crate) mod fsync_probe {
     pub(crate) fn synced_dirs() -> HashSet<PathBuf> {
         SYNCED_DIRS
             .lock()
-            .expect("fsync probe poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .cloned()
             .collect()
     }
 
     pub(crate) fn renamed_files() -> Vec<PathBuf> {
-        RENAMED_FILES.lock().expect("fsync probe poisoned").clone()
+        RENAMED_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The full chronological timeline of rename/fsync/unlink events.
     pub(crate) fn events() -> Vec<Event> {
-        EVENTS.lock().expect("fsync probe poisoned").clone()
+        EVENTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
