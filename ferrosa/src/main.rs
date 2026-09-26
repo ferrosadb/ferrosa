@@ -51,8 +51,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///
 /// The `unprefixed_malloc_on_supported_platforms` feature on
 /// `tikv-jemallocator` makes jemalloc read this symbol at process
-/// startup. Override per-deployment with the `MALLOC_CONF` env
-/// var (env wins over the link-time default).
+/// startup. Override per-deployment with `_RJEM_MALLOC_CONF`, the
+/// prefix-qualified environment variable for this jemalloc build.
 #[cfg(not(target_env = "msvc"))]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]

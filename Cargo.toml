@@ -50,6 +50,15 @@ debug = "line-tables-only"
 split-debuginfo = "off"
 strip = "none"
 
+# Profiling artifacts retain full DWARF while keeping release optimizations.
+# Release publishing still strips its binaries explicitly; this profile is for
+# diagnostic images and must never be used for the production release path.
+[profile.profiling]
+inherits = "release"
+debug = 2
+split-debuginfo = "off"
+strip = "none"
+
 [workspace.package]
 version = "0.22.0"
 edition = "2021"

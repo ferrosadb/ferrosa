@@ -101,7 +101,7 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 
 Allocator: on non-MSVC targets the binary links **jemalloc** with
 `dirty_decay_ms:0,muzzy_decay_ms:0` (immediate page return to the OS — keeps RSS
-flat under tight cgroups; override with `MALLOC_CONF`).
+flat under tight cgroups; override at process startup with `_RJEM_MALLOC_CONF`.
 
 ## Key environment variables
 
