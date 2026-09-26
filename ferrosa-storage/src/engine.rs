@@ -5388,6 +5388,29 @@ impl StorageEngine {
         }
     }
 
+    /// Recovers the [`TableId`] a `table_dir` was built for, inverting the
+    /// `data_dir/sstables/<table_id.to_string()>` convention every caller of
+    /// `load_existing_sstables_and_sidecars*` already relies on (e.g.
+    /// `build_table_state`: `config.data_dir.join("sstables").join(table_id.to_string())`).
+    /// Startup reconciliation only has the directory, not the id itself, and
+    /// needs one to key the test-only `cancel_point!` hook the same way
+    /// production compaction does; `TableId`'s `Display` is `"{keyspace}.{table}"`
+    /// with no other `.` expected in either part (CQL identifiers), so
+    /// splitting on the first `.` round-trips it. Production builds never
+    /// read the id `cancel_point!` is keyed by (it compiles to nothing
+    /// outside `cfg(any(test, feature = "test-support"))`), so an
+    /// unparseable name here is harmless, not a correctness risk.
+    fn table_id_from_table_dir(table_dir: &std::path::Path) -> TableId {
+        let dir_name = table_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        match dir_name.split_once('.') {
+            Some((keyspace, table)) => TableId::new(keyspace, table),
+            None => TableId::new(dir_name, ""),
+        }
+    }
+
     /// Reconcile a single `.compaction-*.intent` record. See the module doc
     /// on [`crate::compaction::intent`] and `compaction-cancel-safety.md` C3
     /// for the decision table this implements.
@@ -5519,7 +5542,8 @@ impl StorageEngine {
             .iter()
             .map(|gen| Self::compaction_input_retirement_stub(table_dir, gen))
             .collect();
-        Self::evict_local_input_sstable_files(&stubs);
+        let table_id_for_retire = Self::table_id_from_table_dir(table_dir);
+        Self::evict_local_input_sstable_files(&table_id_for_retire, &stubs);
 
         if let Err(e) =
             crate::compaction::intent::CompactionIntentRecord::delete(table_dir, &record.task_id)
