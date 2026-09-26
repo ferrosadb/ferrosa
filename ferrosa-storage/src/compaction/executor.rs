@@ -226,8 +226,8 @@ enum InputReadMode {
 
 /// Choose the input read mode from the (already-read) environment values.
 ///
-/// Opt-in (`FERROSA_COMPACTION_DIRECT_READ=1`) so it ships dark, matching the
-/// `FERROSA_SSTABLE_DIRECT_IO` writer rollout. `window_env` is
+/// `enabled` comes from the run-time switch (`FERROSA_COMPACTION_DIRECT_READ`,
+/// then `FERROSA_DIRECT_IO`): ON by default, `=0` turns it off. `window_env` is
 /// `FERROSA_COMPACTION_READAHEAD_BYTES`; an invalid value is WARN-logged and the
 /// default window is used, so a typo cannot silently change memory use.
 fn input_read_mode(enabled: bool, window_env: Option<&str>) -> InputReadMode {
@@ -246,8 +246,9 @@ fn input_read_mode(enabled: bool, window_env: Option<&str>) -> InputReadMode {
 }
 
 fn configured_input_read_mode() -> InputReadMode {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     input_read_mode(
-        env_flag_enabled("FERROSA_COMPACTION_DIRECT_READ", false),
+        ferrosa_sstable::direct::direct_wanted("FERROSA_COMPACTION_DIRECT_READ", &WARNED),
         std::env::var("FERROSA_COMPACTION_READAHEAD_BYTES")
             .ok()
             .as_deref(),
@@ -489,6 +490,12 @@ impl CompactionExecutor {
                                 drop(permit);
                                 match result {
                                     Ok(output) => {
+                                        tracing::debug!(
+                                            inputs = task.inputs.len(),
+                                            pool_input_opens = output.pool_input_opens,
+                                            elapsed_ms = task_start.elapsed().as_millis() as u64,
+                                            "compaction: task finished"
+                                        );
                                         let mut completed = CompactionResult {
                                             task,
                                             output: output.metadata,
@@ -789,6 +796,9 @@ impl CompactionExecutor {
         let open_start = Instant::now();
         let mut readers: Vec<Arc<SSTableReader<FileReadAt>>> =
             Vec::with_capacity(task.inputs.len());
+        // This task's own count of inputs opened through the reader pool: a local,
+        // so nothing running beside it can change it.
+        let mut pool_input_opens = 0usize;
         let pool_table_key = task.table_id.to_string();
         for input in &task.inputs {
             let gen = &input.id;
@@ -871,6 +881,7 @@ impl CompactionExecutor {
                         crate::store::SstableDescriptor::gen_num_for(gen),
                     );
                     crate::metrics::inc_compaction_pool_input_opens();
+                    pool_input_opens += 1;
                     // Reader is already validated; the closure runs only on a
                     // cache miss (the just-opened reader is cached), otherwise
                     // the cached reader is returned and this one is dropped.
@@ -1280,6 +1291,7 @@ impl CompactionExecutor {
                 legacy_format: false,
             },
             direct_upload,
+            pool_input_opens,
         })
     }
 }
@@ -1288,6 +1300,11 @@ impl CompactionExecutor {
 pub(crate) struct ExecutedCompaction {
     pub metadata: SSTableMetadata,
     pub direct_upload: Option<CompactionDirectUpload>,
+    /// How many of THIS task's inputs were opened through the engine-wide reader
+    /// pool. The process-global `compaction_pool_input_opens_total` metric counts
+    /// every task in the process, so a test (or anything else) that wants to know
+    /// what one task did cannot read it while other tasks run in parallel.
+    pub pool_input_opens: usize,
 }
 
 /// Build an output `SerializationHeader` from the inputs' own headers
@@ -2045,7 +2062,7 @@ mod tests {
             purge: None,
         };
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
-        CompactionExecutor::execute_task_with_read_mode(
+        let result = CompactionExecutor::execute_task_with_read_mode(
             &task,
             Some(&pool),
             InputReadMode::DirectScan { window: 4096 },
@@ -2054,9 +2071,10 @@ mod tests {
         .expect("compaction");
         // A cache-bypassing reader must never be parked in the shared pool, where
         // the live read path would pick it up and serve point reads through it.
-        // `pool` is this test's own instance, so this holds under parallel tests
-        // (the process-global pool-opens counter does not).
+        // Both facts are this task's own (a per-test pool, a per-task count), so
+        // nothing else running in the process can move them.
         assert_eq!(pool.resident(), 0);
+        assert_eq!(result.pool_input_opens, 0);
     }
 
     const PURGE_OLD_LDT: u32 = 1_000_000_000; // long past any test grace period
@@ -2576,6 +2594,28 @@ mod tests {
         drop(held);
     }
 
+    /// With nothing set, compaction reads its inputs as a direct scan; the
+    /// switch turns it off. Composes the same pieces `configured_input_read_mode`
+    /// does, without the environment, which parallel tests cannot set safely.
+    #[test]
+    fn nothing_set_means_a_direct_scan_and_the_switch_turns_it_off() {
+        use ferrosa_sstable::direct::resolve_switch;
+        let mode = |specific: Option<&str>, master: Option<&str>| {
+            let switch = resolve_switch("FERROSA_COMPACTION_DIRECT_READ", specific, master);
+            input_read_mode(
+                switch.on_platform(true) == ferrosa_sstable::direct::PlatformDecision::Direct,
+                None,
+            )
+        };
+        assert!(matches!(mode(None, None), InputReadMode::DirectScan { .. }));
+        assert_eq!(mode(Some("0"), None), InputReadMode::Cached);
+        assert_eq!(mode(None, Some("0")), InputReadMode::Cached);
+        assert!(matches!(
+            mode(Some("1"), Some("0")),
+            InputReadMode::DirectScan { .. }
+        ));
+    }
+
     /// FMEA #11 fix #1: compaction input readers are obtained through the
     /// engine-wide reader pool. After a pool-routed compaction the input
     /// generations are resident in the pool (shared/evictable with the read
@@ -2614,15 +2654,21 @@ mod tests {
 
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
         assert_eq!(pool.resident(), 0, "pool starts empty");
-        let opens_before = crate::metrics::compaction_pool_input_opens_total();
 
-        let result =
-            CompactionExecutor::execute_task_inner(&task, Some(&pool), |_| {}).expect("compaction");
+        // The cached (pool-routed) mode is what this pins, so ask for it. It used
+        // to be inherited from the default, which is now the direct scan.
+        let result = CompactionExecutor::execute_task_with_read_mode(
+            &task,
+            Some(&pool),
+            InputReadMode::Cached,
+            |_| {},
+        )
+        .expect("compaction");
 
-        // The pool-routed open counter advanced once per input.
+        // This task opened every input through the pool.
         assert_eq!(
-            crate::metrics::compaction_pool_input_opens_total() - opens_before,
-            task.inputs.len() as u64,
+            result.pool_input_opens,
+            task.inputs.len(),
             "every input open must be pool-routed"
         );
 
