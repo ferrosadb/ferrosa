@@ -2887,8 +2887,12 @@ mod tests {
             coordinator.clone(),
         );
 
+        // The invariant is "does not wait on adjacency DDL/reconcile", which the
+        // `coordinator.calls() == 0` assertion below proves deterministically. The
+        // timeout is only a hang guard: a 250 ms bound here measured the scheduler,
+        // not the code, and failed whenever the host was busy.
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(60),
             engine.execute("RETURN 1", "agent_memory", &superuser_auth()),
         )
         .await
