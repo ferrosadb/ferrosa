@@ -20705,22 +20705,27 @@ mod tests {
             engine.compaction_executor.submit(task).unwrap();
         }
 
-        // Wait for the compaction executor (background thread) to finish.
-        let compaction_dir = dir.path().join("compaction");
-        for _ in 0..60 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if compaction_dir.exists() {
-                let has_output = std::fs::read_dir(&compaction_dir)
-                    .ok()
-                    .map(|mut rd| rd.any(|_| true))
-                    .unwrap_or(false);
-                if has_output {
-                    break;
-                }
-            }
-        }
+        // Block until the compaction worker has posted its result. This used to poll
+        // the output directory every 50 ms for three seconds, which raced the worker
+        // on a loaded host.
+        wait_for_compaction_result(&engine);
 
         (engine, store, prefix, tid)
+    }
+
+    /// Bound for "the compaction worker must produce a result". It takes well under a
+    /// second; the bound only turns a worker that never finishes into a failure.
+    const COMPACTION_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Block until the engine's compaction worker has posted a result (without
+    /// consuming it), so the next `poll_compactions` deterministically integrates it.
+    fn wait_for_compaction_result(engine: &StorageEngine) {
+        assert!(
+            engine
+                .compaction_executor
+                .await_result_available(COMPACTION_HANG_GUARD),
+            "the compaction worker produced no result within {COMPACTION_HANG_GUARD:?}"
+        );
     }
 
     #[tokio::test]
@@ -20734,6 +20739,7 @@ mod tests {
         // it sends the result on the channel, so a single poll may race.
         let tid_str = tid.to_string();
         let mut entries = vec![];
+        wait_for_compaction_result(&engine);
         for _ in 0..40 {
             engine.poll_compactions().await;
             let (manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
@@ -20787,8 +20793,9 @@ mod tests {
             "manifest should be empty before poll_compactions"
         );
 
-        // Integrate compaction result. Retry until the channel result is consumed.
+        // Integrate compaction result (the helper already waited for it).
         let mut entries = vec![];
+        wait_for_compaction_result(&engine);
         for _ in 0..40 {
             engine.poll_compactions().await;
             let (after_manifest, _) = crate::manifest::Manifest::load(store.as_ref(), &prefix)
@@ -21270,6 +21277,7 @@ mod tests {
         // channel, so a single poll may miss the result under parallel load.
         let table_compaction_dir = dir.path().join("compaction").join(&tid_str);
         let mut generations_after = vec![];
+        wait_for_compaction_result(&engine);
         for _ in 0..40 {
             engine.poll_compactions().await;
             generations_after = StorageEngine::scan_generations(&sstable_dir);
@@ -21547,6 +21555,7 @@ mod tests {
         // Run compaction: merges 2 SSTables → 1 output, uploads to S3,
         // updates manifest, enqueues 2 input deletions. Retry until the channel
         // result is consumed (compaction thread writes files before channel send).
+        wait_for_compaction_result(&engine);
         for _ in 0..40 {
             engine.poll_compactions().await;
             if engine
@@ -24298,6 +24307,7 @@ mod tests {
         // assert below would pass vacuously (inputs trivially still exist if
         // compaction never ran).
         let mut output_promoted = false;
+        wait_for_compaction_result(&engine);
         for _ in 0..40 {
             engine.poll_compactions().await;
             if StorageEngine::scan_generations(&sstable_dir)
