@@ -75,6 +75,24 @@ fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize)
     (min_threshold, max_threshold)
 }
 
+/// Parse `FERROSA_COMPACTION_PURGE_TOMBSTONES`. Purging expired tombstones
+/// (`gc_grace_seconds`) is on by default; `0`/`false`/`off`/`no` is the kill
+/// switch. Any other value, or none, leaves it on.
+fn parse_purge_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim),
+        Some("0" | "false" | "FALSE" | "off" | "no")
+    )
+}
+
+fn compaction_purge_enabled() -> bool {
+    parse_purge_enabled(
+        std::env::var("FERROSA_COMPACTION_PURGE_TOMBSTONES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// One operation in an atomic batch (spec URS-QEC-X02).
 ///
 /// Both variants lower to a [`Row`] inside a [`Mutation`]; the enum exists so
@@ -9451,11 +9469,13 @@ impl StorageEngine {
             let metadata = self.collect_sstable_metadata(table_id, state);
             tracing::info!(%table_id, count = metadata.len(), "force-compact: table SSTables");
             if metadata.len() >= 2 {
+                let purge = self.purge_policy_for(table_id, state, &metadata);
                 let task = crate::compaction::metadata::CompactionTask {
                     inputs: metadata,
                     output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
                     schema: state.schema.clone(),
                     table_id: table_id.clone(),
+                    purge,
                 };
                 if let Err(e) = self.compaction_executor.submit(task) {
                     tracing::error!(%e, %table_id, "force-compact: submit failed");
@@ -9483,7 +9503,7 @@ impl StorageEngine {
             });
         }
 
-        let (available_sstables, inputs, schema) = {
+        let (available_sstables, inputs, schema, purge) = {
             let tables = self.tables.read();
             let Some(state) = tables.get(table_id) else {
                 return Ok(IncrementalCompactionSchedule::TableNotFound);
@@ -9498,7 +9518,8 @@ impl StorageEngine {
                 max_sstables,
                 max_input_bytes,
             );
-            (available_sstables, inputs, state.schema.clone())
+            let purge = self.purge_policy_for(table_id, state, &inputs);
+            (available_sstables, inputs, state.schema.clone(), purge)
         };
 
         if inputs.len() < 2 {
@@ -9531,6 +9552,7 @@ impl StorageEngine {
             output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
             schema,
             table_id: table_id.clone(),
+            purge,
         };
         let input_sstables = task.inputs.len();
         match self.compaction_executor.try_submit(task)? {
@@ -9578,11 +9600,13 @@ impl StorageEngine {
                 return false;
             }
             let input_bytes = inputs.iter().map(|input| input.size_bytes).sum::<u64>();
+            let purge = self.purge_policy_for(table_id, state, &inputs);
             let task = crate::compaction::metadata::CompactionTask {
                 inputs,
                 output_dir: self.config.compaction.output_dir.join(table_id.to_string()),
                 schema: state.schema.clone(),
                 table_id: table_id.clone(),
+                purge,
             };
             return match self.compaction_executor.try_submit(task) {
                 Ok(accepted) => {
@@ -9644,7 +9668,8 @@ impl StorageEngine {
         }
         tasks.extend(rewrites);
         let mut accepted_any = false;
-        for task in tasks {
+        for mut task in tasks {
+            task.purge = self.purge_policy_for(table_id, state, &task.inputs);
             match self.compaction_executor.try_submit(task) {
                 Ok(accepted) => accepted_any |= accepted,
                 Err(error) => {
@@ -9703,6 +9728,55 @@ impl StorageEngine {
             }
             _ => Box::new(SizeTieredStrategy::new(self.config.compaction.clone())),
         }
+    }
+
+    /// The tombstone-purge policy for a compaction of `inputs`, or `None` when
+    /// deletion markers must all be kept.
+    ///
+    /// `None` when purging is switched off (`FERROSA_COMPACTION_PURGE_TOMBSTONES=0`)
+    /// or the schema carries no `gc_grace_seconds` (an absent value means "do not
+    /// purge", never zero). An unreadable value is logged at ERROR and counted; the
+    /// compaction still runs, without purging, so a bad table option cannot stall
+    /// compaction.
+    ///
+    /// The overlap guard is computed at submission, not execution: data written
+    /// between the two with a timestamp older than a purged tombstone (a replayed
+    /// hint, a client-supplied timestamp) is not seen. That is the `gc_grace_seconds`
+    /// contract (repair within the grace period) and the window is the queue delay.
+    fn purge_policy_for(
+        &self,
+        table_id: &TableId,
+        state: &TableState,
+        inputs: &[crate::compaction::metadata::SSTableMetadata],
+    ) -> Option<crate::compaction::purge::PurgePolicy> {
+        use crate::compaction::purge;
+        if !compaction_purge_enabled() {
+            return None;
+        }
+        let gc_grace = match state.schema.gc_grace_seconds() {
+            Ok(Some(seconds)) => seconds,
+            Ok(None) => return None,
+            Err(reason) => {
+                crate::metrics::inc_compaction_purge_policy_errors();
+                tracing::error!(%table_id, %reason, "compaction: unreadable gc_grace_seconds; not purging tombstones");
+                return None;
+            }
+        };
+        // Memtable minimum first, then the SSTable list: data moves memtable ->
+        // SSTable during a flush, so the other order could miss it in both.
+        let unflushed_min = state.store.unflushed_min_timestamp();
+        let input_ids: std::collections::HashSet<&str> =
+            inputs.iter().map(|input| input.id.as_str()).collect();
+        let others: Vec<_> = self
+            .collect_sstable_metadata(table_id, state)
+            .into_iter()
+            .filter(|sstable| !input_ids.contains(sstable.id.as_str()))
+            .collect();
+        let guard = purge::max_purgeable_timestamp(inputs, &others, unflushed_min);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        Some(purge::policy_for(now, gc_grace, guard))
     }
 
     /// Collects SSTable metadata for compaction strategy evaluation.
@@ -16910,6 +16984,7 @@ mod tests {
                 output_dir: dir.path().join("compaction"),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -17032,6 +17107,7 @@ mod tests {
                 output_dir: dir.path().join("compaction"),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -17130,6 +17206,7 @@ mod tests {
                 output_dir: dir.path().join("compaction"),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -17337,6 +17414,7 @@ mod tests {
                 output_dir: data_dir.join("compaction"),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -19695,6 +19773,121 @@ mod tests {
         );
     }
 
+    /// A partition-level DELETE as the write path receives it: empty clustering, no
+    /// cells, a non-LIVE deletion.
+    fn partition_delete_row(deleted_at: i64, local_deletion_time: u32) -> Row {
+        Row {
+            clustering: vec![],
+            cells: vec![],
+            deletion: DeletionTime::new(deleted_at, local_deletion_time),
+            primary_key_liveness: LivenessInfo::NONE,
+        }
+    }
+
+    /// Two SSTables — live partitions plus `dead`, then a tombstone for `dead` — and
+    /// a compaction of both. Returns the output's partition count.
+    async fn compact_dead_partition_scenario(
+        gc_grace_seconds: &str,
+        tombstone_ldt: u32,
+        unflushed_older_write_ts: Option<i64>,
+    ) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = StorageEngineConfig::test_config(dir.path());
+        // Keep the engine's own automatic compaction out of the way: it would run
+        // after the second flush, before the unflushed write below exists, and
+        // legitimately purge. Only the explicit `force_compact_all` should run.
+        config.compaction.min_threshold = 50;
+        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+        let mut schema = test_schema();
+        schema.extensions.insert(
+            ferrosa_common::schema::GC_GRACE_EXTENSION.to_string(),
+            gc_grace_seconds.to_string(),
+        );
+        engine.register_table(schema).unwrap();
+        let tid = table_id();
+        for name in ["live0", "live1", "live2", "dead"] {
+            engine
+                .write(&tid, &make_key(name), make_row(b"v", 1000), 1000)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        engine
+            .write(
+                &tid,
+                &make_key("dead"),
+                partition_delete_row(2000, tombstone_ldt),
+                2000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        assert_eq!(engine.sstable_count(&tid), 2);
+        if let Some(ts) = unflushed_older_write_ts {
+            // Sits in the memtable, unflushed, older than the tombstone.
+            engine
+                .write(&tid, &make_key("late"), make_row(b"v", ts), ts)
+                .unwrap();
+        }
+
+        engine.force_compact_all();
+        for _ in 0..1500 {
+            engine.poll_compactions().await;
+            if engine.sstable_count(&tid) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.sstable_count(&tid), 1, "compaction must swap in");
+        let tables = engine.tables.read();
+        let state = tables.get(&tid).unwrap();
+        engine.collect_sstable_metadata(&tid, state)[0].partition_count
+    }
+
+    const LONG_AGO_LDT: u32 = 1_000_000_000;
+
+    #[test]
+    fn tombstone_purging_is_on_unless_explicitly_switched_off() {
+        assert!(parse_purge_enabled(None));
+        assert!(parse_purge_enabled(Some("1")));
+        assert!(parse_purge_enabled(Some("garbage")));
+        for off in ["0", "false", "off", "no", " 0 "] {
+            assert!(!parse_purge_enabled(Some(off)), "{off:?} switches it off");
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_purges_a_tombstone_past_gc_grace() {
+        let purged_before = crate::metrics::compaction_purged_markers_total();
+        // live0..2 survive; the `dead` partition and its tombstone are gone.
+        assert_eq!(
+            compact_dead_partition_scenario("0", LONG_AGO_LDT, None).await,
+            3
+        );
+        assert!(crate::metrics::compaction_purged_markers_total() > purged_before);
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_a_tombstone_still_inside_gc_grace() {
+        // Deleted "now": ldt is the current time, well inside a 10-day grace period.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        assert_eq!(
+            compact_dead_partition_scenario("864000", now, None).await,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_a_tombstone_that_unflushed_older_data_could_sit_under() {
+        // A write with ts 500 is still in the memtable. The ts-2000 tombstone may
+        // shadow data like it once that flushes, so it must survive this compaction.
+        assert_eq!(
+            compact_dead_partition_scenario("0", LONG_AGO_LDT, Some(500)).await,
+            4
+        );
+    }
+
     /// t_7ac6b0e3: an index still answers for rows a compaction merged. The
     /// swap used to install the output SSTable with NO sidecars (and the
     /// rebuilt file was written to disk but never installed), so every scalar
@@ -19756,6 +19949,7 @@ mod tests {
                     output_dir: dir.path().join("compaction"),
                     schema: test_schema(),
                     table_id: tid.clone(),
+                    purge: None,
                 })
                 .unwrap();
         }
@@ -20701,6 +20895,7 @@ mod tests {
                 output_dir: compaction_output_dir,
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -20978,6 +21173,7 @@ mod tests {
                 output_dir: dir.path().join("compaction"),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -21718,6 +21914,7 @@ mod tests {
                     extensions: Default::default(),
                 },
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -26213,6 +26410,7 @@ mod tests {
                 output_dir: compaction_output_dir,
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }
@@ -26282,6 +26480,7 @@ mod tests {
                 output_dir: compaction_output_dir.clone(),
                 schema: test_schema(),
                 table_id: tid.clone(),
+                purge: None,
             };
             engine.compaction_executor.submit(task).unwrap();
         }

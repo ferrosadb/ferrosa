@@ -109,6 +109,30 @@ pub fn render_prometheus(out: &mut String) {
         "ferrosa_sstable_direct_write_bytes_total {}\n",
         direct_write_bytes_total()
     ));
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_read_fallbacks_total Compaction input files where O_DIRECT was rejected and the reader fell back to buffered reads; non-zero means the page-cache bypass is INACTIVE for those files and should alert.\n\
+         # TYPE ferrosa_sstable_direct_read_fallbacks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_read_fallbacks_total {}\n",
+        direct_read_fallbacks_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_read_files_total Files opened through the direct reader since start.\n\
+         # TYPE ferrosa_sstable_direct_read_files_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_read_files_total {}\n",
+        direct_read_files_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_direct_read_bytes_total Logical bytes returned by the direct reader since start.\n\
+         # TYPE ferrosa_sstable_direct_read_bytes_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_direct_read_bytes_total {}\n",
+        direct_read_bytes_total()
+    ));
 }
 
 /// How the OS page cache is being bypassed for a given file.
@@ -403,6 +427,184 @@ fn sync_data(file: &File) -> Result<()> {
     Ok(())
 }
 
+static DIRECT_READ_FALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DIRECT_READ_FILES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DIRECT_READ_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Files opened for direct reads where O_DIRECT was rejected and the reader fell
+/// back to buffered I/O + `POSIX_FADV_DONTNEED`. Non-zero means the page-cache
+/// bypass is INACTIVE for those files.
+pub fn direct_read_fallbacks_total() -> u64 {
+    DIRECT_READ_FALLBACKS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Files opened through [`DirectReadFile`] since start.
+pub fn direct_read_files_total() -> u64 {
+    DIRECT_READ_FILES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Logical bytes returned by [`DirectReadFile`] since start.
+pub fn direct_read_bytes_total() -> u64 {
+    DIRECT_READ_BYTES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Bounce-buffer capacity for direct reads (a [`BLOCK`] multiple). One read syscall
+/// moves at most this many bytes.
+const READ_BOUNCE_CAPACITY: usize = STAGING_CAPACITY;
+
+/// A read-only file that keeps its reads out of the OS page cache.
+///
+/// O_DIRECT needs the file offset, byte length and memory address of every read to
+/// be block-aligned, so this reads whole aligned chunks into a private aligned
+/// bounce buffer and copies the requested span out. Callers may use any offset and
+/// length. Reads past EOF return the bytes that exist, like `pread`.
+///
+/// Fallback is loud: if the file system rejects O_DIRECT the file is opened
+/// buffered, WARN-logged, counted in [`direct_read_fallbacks_total`], and each chunk
+/// read is followed by `POSIX_FADV_DONTNEED` so the cache still is not populated.
+#[cfg(unix)]
+pub struct DirectReadFile {
+    file: File,
+    len: u64,
+    mode: DirectMode,
+    bounce: std::sync::Mutex<AlignedBuf>,
+}
+
+#[cfg(unix)]
+impl DirectReadFile {
+    /// Open `path` for cache-bypassing positional reads.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let (file, mode) = open_read_bypassing(path)?;
+        let len = file.metadata()?.len();
+        DIRECT_READ_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            file,
+            len,
+            mode,
+            bounce: std::sync::Mutex::new(AlignedBuf::new(READ_BOUNCE_CAPACITY)),
+        })
+    }
+
+    /// How the page cache is being bypassed for this file.
+    pub fn mode(&self) -> DirectMode {
+        self.mode
+    }
+}
+
+#[cfg(unix)]
+impl crate::io::ReadAt for DirectReadFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        use std::os::unix::fs::FileExt;
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+        let target = buf.len().min((self.len - offset) as usize);
+        let mut bounce = self.bounce.lock().expect("direct read bounce poisoned");
+        let mut copied = 0;
+        while copied < target {
+            let pos = offset + copied as u64;
+            let chunk_start = pos - pos % BLOCK as u64;
+            let head = (pos - chunk_start) as usize;
+            let need = head + (target - copied);
+            let chunk_len = need
+                .div_ceil(BLOCK)
+                .saturating_mul(BLOCK)
+                .min(bounce.capacity());
+            let got = self
+                .file
+                .read_at(&mut bounce.as_mut_slice()[..chunk_len], chunk_start)?;
+            if self.mode == DirectMode::Buffered {
+                fadvise_dontneed_range(&self.file, chunk_start, chunk_len as u64);
+            }
+            let avail = got.saturating_sub(head);
+            if avail == 0 {
+                return Err(ferrosa_common::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "direct read: file ended at {pos} but length is {}",
+                        self.len
+                    ),
+                )));
+            }
+            let n = avail.min(target - copied);
+            buf[copied..copied + n].copy_from_slice(&bounce.as_slice()[head..head + n]);
+            copied += n;
+        }
+        DIRECT_READ_BYTES_TOTAL.fetch_add(copied as u64, Ordering::Relaxed);
+        Ok(copied)
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(self.len)
+    }
+}
+
+/// Open `path` read-only with the page cache bypassed.
+#[cfg(unix)]
+fn open_read_bypassing(path: &Path) -> Result<(File, DirectMode)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+        {
+            Ok(file) => Ok((file, DirectMode::Direct)),
+            // A missing file is not an O_DIRECT problem: do not mask it as a fallback.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(err.into()),
+            Err(err) => {
+                DIRECT_READ_FALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "O_DIRECT read rejected — falling back to buffered reads + \
+                     POSIX_FADV_DONTNEED. The page-cache-bypass for compaction input is \
+                     INACTIVE for this file (see direct_read_fallbacks_total)."
+                );
+                Ok((
+                    OpenOptions::new().read(true).open(path)?,
+                    DirectMode::Buffered,
+                ))
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let file = OpenOptions::new().read(true).open(path)?;
+        set_nocache(&file);
+        Ok((file, DirectMode::NoCache))
+    }
+}
+
+/// Advise the kernel to drop `[offset, offset + len)` of this file from the page
+/// cache (Linux). Used only on the buffered fallback.
+#[cfg(unix)]
+fn fadvise_dontneed_range(file: &File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid fd; the range is advisory and cannot fault.
+        let rc = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        if rc != 0 {
+            tracing::warn!(
+                error = rc,
+                "posix_fadvise(DONTNEED) failed on fallback read"
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +734,103 @@ mod tests {
         w.write_all(&vec![1u8; STAGING_CAPACITY]).expect("write");
         assert_eq!(w.position(), 100 + STAGING_CAPACITY as u64);
         assert_eq!(w.finish().expect("finish"), 100 + STAGING_CAPACITY as u64);
+    }
+
+    #[cfg(unix)]
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|j| (j * 13 % 251) as u8).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_is_byte_exact_at_unaligned_offsets_and_lengths() {
+        use crate::io::ReadAt;
+        let dir = tmp();
+        for &size in &[
+            0usize,
+            1,
+            BLOCK - 1,
+            BLOCK,
+            BLOCK + 1,
+            3 * BLOCK + 7,
+            STAGING_CAPACITY + 123,
+        ] {
+            let path = dir.path().join(format!("r-{size}.db"));
+            let expected = pattern(size);
+            std::fs::write(&path, &expected).expect("write");
+            let f = DirectReadFile::open(&path).expect("open");
+            assert_eq!(f.len().expect("len"), size as u64);
+            for &(off, want) in &[
+                (0u64, 1usize),
+                (0, size),
+                (1, 100),
+                (BLOCK as u64 - 1, 3),
+                (BLOCK as u64, BLOCK),
+                (size as u64 / 2, size),
+                (size as u64, 10),
+                (size as u64 + 500, 10),
+            ] {
+                let mut got = vec![0u8; want];
+                let n = f.read_at(&mut got, off).expect("read");
+                let start = (off as usize).min(size);
+                let end = (start + want).min(size);
+                assert_eq!(n, end - start, "size {size} off {off} want {want}");
+                assert_eq!(&got[..n], &expected[start..end], "size {size} off {off}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_mode_is_a_real_bypass_on_this_platform() {
+        let dir = tmp();
+        let path = dir.path().join("mode-r.db");
+        std::fs::write(&path, pattern(BLOCK)).expect("write");
+        let before = direct_read_files_total();
+        let f = DirectReadFile::open(&path).expect("open");
+        #[cfg(target_os = "macos")]
+        assert_eq!(f.mode(), DirectMode::NoCache);
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            f.mode(),
+            DirectMode::Direct | DirectMode::Buffered
+        ));
+        assert!(direct_read_files_total() > before, "open counter advances");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_counts_the_bytes_it_returns() {
+        use crate::io::ReadAt;
+        let dir = tmp();
+        let path = dir.path().join("bytes-r.db");
+        std::fs::write(&path, pattern(2 * BLOCK)).expect("write");
+        let f = DirectReadFile::open(&path).expect("open");
+        let before = direct_read_bytes_total();
+        let mut buf = vec![0u8; 1000];
+        f.read_at(&mut buf, 10).expect("read");
+        assert!(direct_read_bytes_total() >= before + 1000);
+    }
+
+    #[test]
+    fn prometheus_exposes_the_direct_read_counters() {
+        let mut out = String::new();
+        render_prometheus(&mut out);
+        for name in [
+            "ferrosa_sstable_direct_read_fallbacks_total",
+            "ferrosa_sstable_direct_read_files_total",
+            "ferrosa_sstable_direct_read_bytes_total",
+        ] {
+            assert!(out.contains(&format!("# TYPE {name} counter")), "{name}");
+            assert!(out.contains(&format!("\n{name} ")), "{name} sample");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_of_a_missing_file_is_an_error() {
+        let dir = tmp();
+        assert!(DirectReadFile::open(dir.path().join("nope.db")).is_err());
     }
 
     #[test]

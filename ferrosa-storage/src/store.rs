@@ -2854,8 +2854,13 @@ impl<F: FlushTarget> TableStore<F> {
             )?;
             total_quarantined += n;
         }
-        // Drop partitions that lost all their rows to quarantine.
-        partitions.retain(|p| !p.rows.is_empty() || p.static_row.is_some());
+        // Drop partitions that lost all their rows to quarantine. A partition
+        // holding only a partition-level deletion (a `DELETE` of rows already
+        // flushed) has no rows and no static row by construction; it must be
+        // flushed, or the delete is lost and the older SSTable's rows read back
+        // as live.
+        partitions
+            .retain(|p| !p.rows.is_empty() || p.static_row.is_some() || !p.deletion.is_live());
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::ValidateRows,
             phase_start.elapsed(),
@@ -6855,6 +6860,21 @@ impl<F: FlushTarget> TableStore<F> {
     /// Approximate memory usage of the active memtable in bytes.
     pub fn memtable_size(&self) -> usize {
         self.view.load().active.size_bytes()
+    }
+
+    /// The smallest timestamp of any write not yet in an SSTable: the minimum over
+    /// the active memtable and, during a flush, the memtable being flushed.
+    /// `i64::MAX` when both are empty.
+    ///
+    /// A compaction reads this BEFORE it lists the table's SSTables: data moves
+    /// memtable → SSTable during a flush, so the other order could miss it in both.
+    pub fn unflushed_min_timestamp(&self) -> i64 {
+        let view = self.view.load();
+        let flushing = view
+            .flushing
+            .as_ref()
+            .map_or(i64::MAX, |m| m.min_timestamp());
+        view.active.min_timestamp().min(flushing)
     }
 
     /// Number of partitions in the active memtable.
