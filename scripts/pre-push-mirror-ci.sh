@@ -32,14 +32,13 @@ fi
 # Tests gated by FERROSA_TEST_CONTAINERS / FERROSA_TEST_FIRECRACKER /
 # FERROSA_TEST_CLUSTER_NODES per CLAUDE.md test policy.
 SKIPS=(
-  --skip accord::perf_regression
+  --skip accord::perf
   --skip batch_atomicity
   --skip pause_resume
   --skip recovery_coordinator
   --skip cassandra_reads_compacted
   --skip compaction_end_to_end_pipeline
   --skip dep_wait_ordering
-  --skip disk_fail_no_phantom
   --skip lwt_batch_atomicity_all
   --skip clock_skew_large_preaccept
   --skip binary_

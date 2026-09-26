@@ -42,6 +42,13 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 default = []
+# Wall-clock latency benchmarks for the Accord state machine (accord::perf,
+# accord::perf_regression). They assert ABSOLUTE time bounds, which measure the host
+# as much as the code, so they are not part of the default `cargo test`: a starved CPU
+# fails them with nothing wrong. Run them on a quiet machine with
+# `cargo test -p ferrosa-cluster --features perf-tests --lib accord::perf`; the nightly
+# `perf-regression` job (all features) does. Do not widen a bound that trips.
+perf-tests = []
 # Sprint 3 (ADR-012): the engine-side PreVote wire-up has landed in the openraft
 # fork (commit pinned in the workspace Cargo.toml), so the W3.12 PreVote
 # acceptance tests now run in the default suite — the `sprint-03-engine-prevote`
