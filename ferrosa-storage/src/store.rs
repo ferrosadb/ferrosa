@@ -2854,8 +2854,13 @@ impl<F: FlushTarget> TableStore<F> {
             )?;
             total_quarantined += n;
         }
-        // Drop partitions that lost all their rows to quarantine.
-        partitions.retain(|p| !p.rows.is_empty() || p.static_row.is_some());
+        // Drop partitions that lost all their rows to quarantine. A partition
+        // holding only a partition-level deletion (a `DELETE` of rows already
+        // flushed) has no rows and no static row by construction; it must be
+        // flushed, or the delete is lost and the older SSTable's rows read back
+        // as live.
+        partitions
+            .retain(|p| !p.rows.is_empty() || p.static_row.is_some() || !p.deletion.is_live());
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::ValidateRows,
             phase_start.elapsed(),
