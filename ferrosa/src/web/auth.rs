@@ -255,6 +255,7 @@ mod tests {
             host_id,
             auth_disabled,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         };
 
         let router = Router::new()
@@ -431,6 +432,7 @@ mod tests {
             host_id,
             auth_disabled,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 

@@ -59,6 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+mod listener_status;
 mod log_rotation;
 mod repair_wiring;
 mod runtime;
@@ -447,6 +448,44 @@ fn auth_source_label(env_set: bool, toml_has_auth_key: bool) -> &'static str {
     } else {
         "default"
     }
+}
+
+/// Whether log lines carry ANSI colour escapes.
+///
+/// Colour only when a person is watching. `tracing-subscriber` colours by default
+/// regardless of where the output goes, so a container's stdout (a pipe read by a
+/// log collector) filled with escape codes that break anchored patterns in the log
+/// store. `FERROSA_LOG_ANSI` (`true`/`false`) overrides everything; otherwise
+/// `NO_COLOR` (any non-empty value) turns it off, and the default is "is stdout a
+/// terminal".
+fn log_ansi_enabled(
+    stdout_is_terminal: bool,
+    no_color: Option<&str>,
+    override_value: Option<&str>,
+) -> bool {
+    match override_value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "on" | "yes") => return true,
+        Some("0" | "false" | "off" | "no") => return false,
+        // Unset or unrecognised: fall through to the default rules.
+        _ => {}
+    }
+    if no_color.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    stdout_is_terminal
+}
+
+/// [`log_ansi_enabled`] read from this process's stdout and environment.
+fn log_ansi_from_env() -> bool {
+    use std::io::IsTerminal;
+    log_ansi_enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("FERROSA_LOG_ANSI").ok().as_deref(),
+    )
 }
 
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
@@ -954,7 +993,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(log_ansi_from_env())
+                    .with_writer(non_blocking_writer),
+            )
             .with(telemetry_layer)
             .with(sentry_reporting::layer())
             .init();
@@ -966,7 +1009,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(log_ansi_from_env())
+                    .with_writer(non_blocking_writer),
+            )
             .with(sentry_reporting::layer())
             .init();
     }
@@ -1173,6 +1220,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ferrosa_storage::StorageEngine::new(storage_config, Some(&storage_upload_handle))?;
         (engine, Vec::new())
     };
+    // Verify the S3 bucket is reachable and writable. With FERROSA_S3_REQUIRED an
+    // access failure (bad credentials, wrong bucket, no route) stops startup
+    // instead of surfacing later as upload warnings.
+    let s3_required = ferrosa_storage::upload::config::s3_required_from_env()
+        .map_err(|e| format!("invalid FERROSA_S3_REQUIRED: {e}"))?;
+    storage.validate_object_store_access(s3_required).await?;
     // Probe object store for conditional put support (CAS).
     // RustFS/MinIO may not support etag-based conditional writes — log a
     // warning but continue. The manifest CAS retry loop will still attempt
@@ -1514,7 +1567,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capture num_tokens locally before cluster_config is consumed by
     // ModeController — needed downstream when populating system.local.tokens.
     let num_tokens = cluster_config.num_tokens as usize;
-    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env();
+    // A typo in an internode value stops startup; a seed or broadcast name that may
+    // simply not resolve yet is logged at WARN and startup continues.
+    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env_checked()?;
     // Seed the base from `FERROSA_INTERNODE_*`, then let the config file win:
     // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml override
     // the env-derived defaults (TOML-wins precedence).
@@ -1735,9 +1790,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // points against the advertised local node during session bootstrap;
     // advertising the container-bind port (9042) when the host-reachable
     // port is 19042 hangs session build. See cql_broadcast::parse_cql_broadcast.
-    let (cql_broadcast_addr, cql_broadcast_port) = match std::env::var("FERROSA_CQL_BROADCAST") {
-        Ok(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port()),
-        Err(_) => {
+    // An empty value means "not set" (compose files write `VAR=`); any other value
+    // that does not parse or resolve stops startup instead of advertising loopback.
+    let cql_broadcast_env = std::env::var("FERROSA_CQL_BROADCAST")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (cql_broadcast_addr, cql_broadcast_port) = match cql_broadcast_env {
+        Some(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port())?,
+        None => {
             // Gap 11: when CQL bind is 0.0.0.0 (the normal containerised
             // case), the broadcast address must be the externally reachable
             // IP so cluster peers and drivers can distinguish nodes.  Fall
@@ -2033,6 +2093,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Health of the listeners that start in background tasks (graph HTTP, Bolt,
+    // SPARQL, Postgres). A bind failure used to be one ERROR line while `/readyz`
+    // kept answering 200; each listener now records itself here, and `/readyz` and
+    // `/metrics` report it.
+    let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
+
     // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
         registry: schema.virtual_tables_arc(),
@@ -2042,6 +2108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_id,
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
+        listeners: listener_status.clone(),
     };
     // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
     // default. The resolved address is the one passed to the listener.
@@ -2190,9 +2257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema: schema_for_http,
             auth_disabled,
         };
+        listener_status.mark_up("graph_http");
+        let graph_http_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_http(&http_config, state).await {
                 tracing::error!(%e, "graph HTTP server failed");
+                graph_http_status.mark_failed("graph_http", &e);
             }
         });
 
@@ -2209,6 +2279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bolt_engine = graph_engine;
         let bolt_schema = schema.clone();
         let bolt_shutdown = shutdown_rx.clone();
+        listener_status.mark_up("bolt");
+        let bolt_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::bolt::server::start_bolt_server(
                 bolt_engine,
@@ -2219,6 +2291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             {
                 tracing::error!(%e, "Bolt server failed");
+                bolt_status.mark_failed("bolt", &e);
             }
         });
         tracing::info!(%bolt_bind, "Bolt server starting");
@@ -2228,10 +2301,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a misleading missing-table error), serve a thin endpoint that returns
         // a clear "graph engine disabled" error + remediation on every request.
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
+        listener_status.mark_up("graph_http");
+        let graph_stub_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_disabled_http(&graph_http_config).await
             {
                 tracing::error!(%e, "graph disabled-engine HTTP stub failed");
+                graph_stub_status.mark_failed("graph_http", &e);
             }
         });
     }
@@ -2261,11 +2337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind_addr: sparql_bind,
         };
 
+        listener_status.mark_up("sparql");
+        let sparql_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) =
                 ferrosa_sparql::http::start_sparql_http(&sparql_config, sparql_state).await
             {
                 tracing::error!(%e, "SPARQL HTTP server failed");
+                sparql_status.mark_failed("sparql", &e);
             }
         });
 
@@ -2288,17 +2367,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             default_schema: "public".into(),
             accord_committer: pg_accord_committer,
         });
+        let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
             match tokio::net::TcpListener::bind(pg_bind).await {
                 Ok(listener) => {
+                    pg_status.mark_up("postgres");
                     tracing::info!(%pg_bind, "Postgres server listening");
                     if let Err(e) =
                         ferrosa_postgres::server::serve(listener, pg_store, query_ctx).await
                     {
                         tracing::error!(%e, "Postgres server failed");
+                        pg_status.mark_failed("postgres", &e);
                     }
                 }
-                Err(e) => tracing::error!(%e, %pg_bind, "Postgres bind failed"),
+                Err(e) => {
+                    tracing::error!(%e, %pg_bind, "Postgres bind failed");
+                    pg_status.mark_failed("postgres", format_args!("bind {pg_bind} failed: {e}"));
+                }
             }
         });
     }
@@ -2734,6 +2819,38 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn log_colour_follows_the_terminal_by_default() {
+        assert!(log_ansi_enabled(true, None, None), "a person at a terminal");
+        assert!(
+            !log_ansi_enabled(false, None, None),
+            "a pipe (container stdout) must not receive escape codes"
+        );
+    }
+
+    #[test]
+    fn no_color_turns_colour_off_even_on_a_terminal() {
+        assert!(!log_ansi_enabled(true, Some("1"), None));
+        assert!(!log_ansi_enabled(true, Some("anything"), None));
+        assert!(
+            log_ansi_enabled(true, Some(""), None),
+            "NO_COLOR set but empty does not count (no-color.org)"
+        );
+    }
+
+    #[test]
+    fn ferrosa_log_ansi_overrides_terminal_and_no_color() {
+        for on in ["1", "true", "TRUE", "on", "yes"] {
+            assert!(log_ansi_enabled(false, Some("1"), Some(on)), "{on:?}");
+        }
+        for off in ["0", "false", "off", "no"] {
+            assert!(!log_ansi_enabled(true, None, Some(off)), "{off:?}");
+        }
+        // Unrecognised: ignored, the default rules apply.
+        assert!(log_ansi_enabled(true, None, Some("maybe")));
+        assert!(!log_ansi_enabled(false, None, Some("maybe")));
     }
 
     /// `--version` previously did NOT print a version: the flag was ignored and

@@ -72,6 +72,15 @@ pub struct WebAppState {
     pub auth_disabled: bool,
     /// Debug profiler state (shared mutex for single-session profiling).
     pub debug: Option<debug::DebugState>,
+    /// Health of the background client listeners (Postgres, SPARQL, graph, Bolt).
+    /// A failed listener keeps `/readyz` from reporting ready.
+    pub listeners: Arc<crate::listener_status::ListenerStatus>,
+}
+
+impl FromRef<WebAppState> for Arc<crate::listener_status::ListenerStatus> {
+    fn from_ref(state: &WebAppState) -> Self {
+        Arc::clone(&state.listeners)
+    }
 }
 
 impl FromRef<WebAppState> for Arc<VirtualTableRegistry> {

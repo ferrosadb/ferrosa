@@ -5,10 +5,17 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-08-27
-//! Last changed: Added the immediate consensus-runtime failure gate.
+//! Last revised: 2026-09-26
+//! Last changed: A node that declared `FERROSA_EXPECTED_CLUSTER_SIZE` is not ready
+//!   until that topology is met (a booting Standalone pod and a cluster that fell
+//!   back to Pair used to answer 200 while CQL refused connections).
 //!
 //! ## Readiness criteria
+//!
+//! When `FERROSA_EXPECTED_CLUSTER_SIZE` is set, the mode rules below apply only
+//! after the declared topology is met (the same gate CQL uses); until then the
+//! answer is `503 {"waiting_for":"declared_topology"}`. With no declared size the
+//! table is unchanged.
 //!
 //! | Mode       | Condition                                   |
 //! |------------|---------------------------------------------|
@@ -58,6 +65,18 @@ pub fn readiness_route() -> Router<WebAppState> {
         .route("/health", get(readyz_handler))
 }
 
+/// Stable, lowercase name of a deployment mode for probe bodies.
+fn mode_label(mode: DeploymentMode) -> &'static str {
+    match mode {
+        DeploymentMode::Standalone => "standalone",
+        DeploymentMode::Pair => "pair",
+        DeploymentMode::DegradedPair => "degraded-pair",
+        DeploymentMode::Forming => "forming",
+        DeploymentMode::Cluster => "cluster",
+        DeploymentMode::DegradedCluster => "degraded-cluster",
+    }
+}
+
 /// `GET /readyz` — leader-aware readiness probe.
 ///
 /// # Standalone / Pair / Degraded modes
@@ -66,7 +85,10 @@ pub fn readiness_route() -> Router<WebAppState> {
 /// # Forming / Cluster modes
 /// Returns `200` only if a Raft leader is currently known to this node.
 /// Otherwise returns `503` with `{"ready":false,"waiting_for":"raft_leader"}`.
-pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+pub async fn readyz_handler(
+    State(mc): State<Arc<ModeController>>,
+    State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
+) -> (StatusCode, Json<Value>) {
     if !mc.consensus_is_healthy() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -77,7 +99,47 @@ pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCod
             })),
         );
     }
+    // A background client listener (Postgres, SPARQL, graph HTTP, Bolt) that failed
+    // to bind was only an ERROR log line; the node kept probing ready with a client
+    // port missing. Name the failed listeners instead.
+    let failed_listeners = listeners.failed();
+    if !failed_listeners.is_empty() {
+        let failed: Vec<Value> = failed_listeners
+            .into_iter()
+            .map(|(listener, reason)| json!({"listener": listener, "reason": reason}))
+            .collect();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "listeners",
+                "failed": failed,
+                "detail": "a client listener failed to start; see the reasons and the \
+                    ferrosa_listener_up metric"
+            })),
+        );
+    }
     let mode = mc.mode();
+
+    // A node that declared its cluster size refuses CQL connections until that
+    // topology is met, so it must not probe ready before then: a booting pod is
+    // Standalone, and a cluster that missed its formation timeout falls back to
+    // Pair, and both used to answer 200 below. Undeclared nodes (size 0) and a
+    // degraded cluster (which has its own, more specific answer) are unchanged.
+    let expected = mc.expected_cluster_size();
+    if expected > 0 && mode != DeploymentMode::DegradedCluster && !mc.accepts_cql_connections() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "declared_topology",
+                "expected_cluster_size": expected,
+                "mode": mode_label(mode),
+                "detail": "this node declared an expected cluster size and the \
+                    topology is not formed yet; CQL connections are refused"
+            })),
+        );
+    }
 
     match mode {
         // Standalone always ready: no peers, no Raft.
@@ -163,6 +225,20 @@ mod tests {
     use crate::web::{build_router, WebAppState};
 
     fn make_state() -> WebAppState {
+        make_state_with_cluster_config(ferrosa_cluster::ClusterConfig::default())
+    }
+
+    /// State whose node declared `FERROSA_EXPECTED_CLUSTER_SIZE = expected`.
+    fn make_state_expecting(expected: usize) -> WebAppState {
+        make_state_with_cluster_config(ferrosa_cluster::ClusterConfig {
+            expected_cluster_size: expected,
+            ..ferrosa_cluster::ClusterConfig::default()
+        })
+    }
+
+    fn make_state_with_cluster_config(
+        cluster_config: ferrosa_cluster::ClusterConfig,
+    ) -> WebAppState {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_config = StorageEngineConfig {
             commit_log: CommitLogConfig {
@@ -202,7 +278,7 @@ mod tests {
         );
         let host_id = uuid::Uuid::new_v4();
         let (mc, _handles) = ModeController::new(
-            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            Arc::new(cluster_config),
             Arc::new(ferrosa_net::config::NetConfig::default()),
             host_id,
             storage.clone(),
@@ -217,6 +293,7 @@ mod tests {
             host_id,
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 
@@ -483,6 +560,106 @@ what made this failure invisible"
             parsed["waiting_for"], "raft_leader",
             "response must name 'raft_leader' as the missing condition"
         );
+    }
+
+    async fn probe(state: WebAppState) -> (StatusCode, serde_json::Value) {
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A pod that declared a 3-node cluster and is still Standalone (it has not
+    /// joined anyone) refuses CQL connections, so it must not report ready. Before
+    /// this, `/readyz` answered 200 for a booting pod while its CQL listener still
+    /// refused clients, and an orchestrator that gates on `/readyz` believed it.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_a_declared_cluster_has_not_formed() {
+        let state = make_state_expecting(3);
+        assert_eq!(state.mode_controller.mode(), DeploymentMode::Standalone);
+        let (status, body) = probe(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "declared_topology");
+        assert_eq!(body["expected_cluster_size"], 3);
+        assert_eq!(body["mode"], "standalone");
+    }
+
+    /// A 3-node cluster that fell back to Pair after the formation timeout used to
+    /// probe ready because Pair always returned 200.
+    #[tokio::test]
+    async fn readyz_is_not_ready_when_a_declared_cluster_fell_back_to_pair() {
+        let state = make_state_expecting(3);
+        state
+            .mode_controller
+            .set_mode_for_test(DeploymentMode::Pair);
+        let (status, body) = probe(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["waiting_for"], "declared_topology");
+        assert_eq!(body["mode"], "pair");
+    }
+
+    /// A declared single node is exactly what Standalone is: ready.
+    #[tokio::test]
+    async fn readyz_is_ready_when_the_declared_topology_is_met() {
+        let (status, body) = probe(make_state_expecting(1)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], true);
+    }
+
+    /// No declared size (the default) keeps today's behavior exactly: Standalone
+    /// and Pair answer 200 without consulting a topology.
+    #[tokio::test]
+    async fn readyz_is_unchanged_when_no_cluster_size_is_declared() {
+        let standalone = make_state();
+        assert_eq!(probe(standalone).await.0, StatusCode::OK);
+        let pair = make_state();
+        pair.mode_controller.set_mode_for_test(DeploymentMode::Pair);
+        assert_eq!(probe(pair).await.0, StatusCode::OK);
+    }
+
+    /// A client listener that failed to bind used to be one ERROR log line while the
+    /// node kept answering `/readyz` 200, so an orchestrator saw a healthy node with
+    /// a missing port. The probe now names the failed listener.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_a_client_listener_has_failed() {
+        let state = make_state();
+        state.listeners.mark_up("postgres");
+        state
+            .listeners
+            .mark_failed("sparql", "Address already in use (os error 98)");
+        let (status, body) = probe(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "listeners");
+        assert_eq!(body["failed"][0]["listener"], "sparql");
+        assert_eq!(
+            body["failed"][0]["reason"],
+            "Address already in use (os error 98)"
+        );
+        assert_eq!(
+            body["failed"].as_array().unwrap().len(),
+            1,
+            "only the failed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_recovers_once_the_listener_is_serving_again() {
+        let state = make_state();
+        state.listeners.mark_failed("bolt", "denied");
+        state.listeners.mark_up("bolt");
+        assert_eq!(probe(state).await.0, StatusCode::OK);
     }
 
     /// The Cluster mode (no Raft instance installed yet) must return 503.

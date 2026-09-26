@@ -567,6 +567,7 @@ mod tests {
             host_id: uuid::Uuid::new_v4(),
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 
@@ -643,6 +644,7 @@ mod tests {
             host_id: uuid::Uuid::new_v4(),
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         };
         (state, dir)
     }

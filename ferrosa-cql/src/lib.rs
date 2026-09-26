@@ -34,6 +34,7 @@ pub mod parser;
 pub mod planner;
 pub mod prepared;
 pub mod prometheus;
+pub mod request_metrics;
 pub mod result;
 pub mod router;
 pub mod server;

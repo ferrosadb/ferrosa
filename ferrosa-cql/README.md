@@ -202,6 +202,15 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   the Cassandra-compatible `system.peers_v2` topology table.
 - **Observability** (`observability.rs`, `prometheus.rs`) — per-opcode CQL
   metrics and a Prometheus text renderer.
+- **Request metrics** (`request_metrics.rs`) — client load on `/metrics`:
+  `ferrosa_cql_requests_total{kind,outcome}` (kind = query/prepare/execute/batch,
+  outcome = ok/error/cancelled), a cumulative latency histogram
+  `ferrosa_cql_request_duration_seconds{kind}` (0.5 ms to 10 s + `+Inf`), and
+  `ferrosa_cql_requests_in_flight{kind}`. Recorded at both dispatch points in
+  `connection.rs` (QUERY runs inline; PREPARE/EXECUTE/BATCH run on spawned tasks). A
+  request whose task is dropped before it finishes is counted as `cancelled`, not
+  lost. Every series is rendered before its first sample so dashboards see stable
+  names. `/metrics` had no request-rate or latency series before.
 - **Topology** (`topology.rs`) — public-vs-internal address policy for
   `system.local` / `system.peers_v2`.
 - **Client** (`client.rs`) — a thin CQL client reusing `CqlCodec`, used by

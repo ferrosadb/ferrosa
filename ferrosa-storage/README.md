@@ -148,6 +148,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   PUT (CAS); the startup probe (`probe_conditional_put_support`) detects this and
   manifest saves fall back to unconditional PUT. Last-writer-wins is correct
   because a single node is the only manifest writer.
+  **Strict S3 (`FERROSA_S3_REQUIRED=true`):** without it, a missing
+  `FERROSA_S3_ENDPOINT`/`FERROSA_S3_BUCKET` runs with local-only storage (now
+  logged at WARN; it used to be silent), and a startup bucket check
+  (`validate_object_store_access`: list + put + delete) that fails is a WARN plus a
+  warning. With it, a missing or invalid S3 configuration, a local `file://`
+  backend, or a failed bucket check stops startup with an error naming the switch.
+  A value that is not a boolean is an error, not "off".
 - **Local cache** (`cache.rs`) — LRU eviction with manifest-pinned entries that
   are never evicted. With the local `file://` backend the cache is constructed
   durable (`new_with_durability`): the local disk *is* the store of record, so

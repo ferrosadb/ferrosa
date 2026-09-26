@@ -99,7 +99,15 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 | Handshake | `initiate_handshake`, `accept_handshake`, `compute_auth_token`, `verify_auth_token`, `HandshakePeer` |
 | Pool / lanes | `PriorityPool`, `LaneHandle`, `LaneOutcome`, `LaneStatusReport`, `spawn_lane_actor` |
 | RPC | `RpcServer`, `RpcClient`, `HandlerRegistry`, `RpcHandler`, `PeerId`, `InboundPeerCallback` |
-| Config / errors | `NetConfig`, `NetError`, `bind_failure_diagnostic` |
+| Config / errors | `NetConfig` (`from_lookup` → config + `ConfigIssue`s, `from_env`, `from_env_checked`), `NetError`, `bind_failure_diagnostic` |
+
+`NetConfig` no longer drops a bad `FERROSA_*` value silently. Every rejected value is
+a `ConfigIssue`: a typo (unparseable bind, non-numeric or zero timeout, a
+non-boolean `FERROSA_INTERNODE_REQUIRE_TLS` — which used to read as `false` and
+silently disable the TLS requirement) is **fatal** under `from_env_checked`, which
+`ferrosa` uses at startup; a seed or broadcast hostname that does not resolve yet is
+logged at WARN and startup continues (the binary retries seeds by name). An empty
+value counts as unset.
 | TLS | `tls::build_tls_acceptor`, `tls::build_tls_connector` |
 
 ## Dependencies
