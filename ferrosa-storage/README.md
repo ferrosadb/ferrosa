@@ -62,6 +62,31 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `flush::sweep_stale_flush_staging`; `FileFlushTarget::new`/`new_starting_at`
   call it too, as a safety net for callers outside table startup).
 
+  **Digest verification on published bytes, unconditional (`publication-safety.md`
+  M2 step 4 / M3, T-012, FMEA ST-31):** between the `.tmp` fsync and the
+  structural readback walk above, `flush_files` recomputes `Digest.crc32` by
+  reading the `.tmp` Data.db back from disk (a reused 1 MiB buffer, never a
+  whole-file `Vec`; `POSIX_FADV_DONTNEED` on Linux afterward so the check does
+  not refill the page cache the write pump bypasses) and compares it with the
+  producer's value. A mismatch quarantines under
+  `PublicationRefusedReason::DigestMismatch` and refuses publication, same as
+  every other verify-before-promote failure. This closes the gap the readback
+  walk alone left open: that walk proves the file *decodes*, not that it holds
+  the bytes the producer actually wrote, so a length-preserving corruption (bit
+  flip, swapped block, stale bytes from a segment recycled before its write
+  completed) could pass it. Because compaction promotes through this same
+  `flush_files`, the digest check is unconditional for compaction too —
+  `FERROSA_COMPACTION_VERIFY_OUTPUT` continues to control only compaction's
+  separate row/partition count walk, never this check. Checksum loading
+  (`Digest.crc32`/`CRC.db`) is centralised in
+  `ferrosa_sstable::reader::{load_checksums_if_present, load_checksums_for_generation}`
+  and every production file-backed open path calls it: this crate's flush-open
+  helpers (already did, since T-011), the compaction executor's input open, the
+  local index-build backend, and `ferrosa-ctl`'s `sstable` reader (both
+  previously opened readers with checksums never loaded at all). An SSTable
+  predating T-011 still opens everywhere, treated as "not checked" and logged
+  once per generation, never as an error.
+
   **Automatic-flush admission (t_889b0d9a):** maintenance cadence alone never
   creates a tiny SSTable. The age trigger requires at least 16 MiB (or the
   configured flush threshold when smaller), while the size/backpressure

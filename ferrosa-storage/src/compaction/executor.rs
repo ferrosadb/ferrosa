@@ -279,6 +279,42 @@ fn compaction_verify_output_enabled() -> bool {
     env_flag_enabled("FERROSA_COMPACTION_VERIFY_OUTPUT", true)
 }
 
+// Test-only fault-injection hook for the staged compaction output, called
+// right after `finish_to_directory` returns and before `flush_files`
+// renames/digest-verifies it. See the call site in
+// `execute_task_with_read_mode` and `digest_verify_compaction_output_*`
+// tests (T-012).
+//
+// `execute_task_with_read_mode` runs synchronously on the caller's thread
+// (no internal thread handoff between `finish_to_directory` and the hook
+// call below), so a `thread_local` -- rather than a process-wide `static
+// Mutex` -- confines a test's injected corruption to its own call. `cargo
+// test` runs test functions concurrently across threads; a shared `static`
+// hook was visible to every OTHER compaction test running on a different
+// thread at the same time and corrupted their outputs too.
+// (A `///` doc comment here is a clippy error: rustdoc cannot attach
+// documentation to a macro invocation like `thread_local!`.)
+#[cfg(test)]
+type CompactionOutputHook = dyn Fn(&ferrosa_sstable::writer::SSTableOutputFiles);
+
+#[cfg(test)]
+thread_local! {
+    static COMPACTION_OUTPUT_HOOK: std::cell::RefCell<Option<Box<CompactionOutputHook>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_compaction_output_hook(
+    hook: impl Fn(&ferrosa_sstable::writer::SSTableOutputFiles) + 'static,
+) {
+    COMPACTION_OUTPUT_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_compaction_output_hook() {
+    COMPACTION_OUTPUT_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 fn ensure_compaction_component(
     path: &std::path::Path,
     required: bool,
@@ -939,9 +975,11 @@ impl CompactionExecutor {
                     .unwrap_or(0),
             );
 
+            let is_compressed = compression_info.is_some();
+
             // Strict open: validates and aborts on corruption regardless of
             // whether the pool already has this generation cached.
-            let reader = SSTableReader::open(SSTableComponents {
+            let mut reader = SSTableReader::open(SSTableComponents {
                 data,
                 partitions: partitions_file,
                 rows,
@@ -950,6 +988,18 @@ impl CompactionExecutor {
                 statistics,
             })
             .map_err(|e| format!("aborting compaction: SSTable {gen} corrupt: {e}"))?;
+
+            // Digest.crc32/CRC.db, when present, so per-chunk CRC.db
+            // verification on uncompressed reads (already wired into the read
+            // path) actually runs against merge inputs instead of silently
+            // opting out -- this call site previously never loaded them
+            // (T-012; `publication-safety.md` M1).
+            ferrosa_sstable::reader::load_checksums_for_generation(
+                &mut reader,
+                dir,
+                gen,
+                is_compressed,
+            );
 
             // A DirectScan reader is private to this task: parked in the shared pool
             // it would be handed to the live read path, which does point reads that
@@ -1291,6 +1341,19 @@ impl CompactionExecutor {
             crate::metrics::CompactionPhase::WriterFinish,
             finish_start.elapsed(),
         );
+
+        // Test-only fault injection point: lets a test corrupt the staged
+        // output (still under `staging_dir`, before `flush_files` renames,
+        // fsyncs and digest-verifies it) to prove the digest check in
+        // `flush_files` below is unconditional -- including for compaction,
+        // regardless of `FERROSA_COMPACTION_VERIFY_OUTPUT` (T-012).
+        #[cfg(test)]
+        COMPACTION_OUTPUT_HOOK.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook(&output);
+            }
+        });
+
         let direct_upload = None;
 
         // 4. Promote staged output files via FileFlushTarget.
@@ -2439,6 +2502,90 @@ mod tests {
         );
     }
 
+    /// `publication-safety.md` M3 / T-012: the digest check in `flush_files`
+    /// runs unconditionally for compaction output, regardless of
+    /// `FERROSA_COMPACTION_VERIFY_OUTPUT` -- that variable controls only the
+    /// separate row/partition count walk. A corrupted output must be
+    /// refused, and its inputs must remain live and untouched (F15): nothing
+    /// retires them, because `execute_task` returns `Err` before its caller
+    /// ever gets a chance to swap.
+    #[test]
+    #[serial_test::serial(compaction_verify_output_env)]
+    fn digest_verify_compaction_output_corruption_refused_even_with_verify_output_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+
+        let dir_a = tmp.path().join("sstable_a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let partitions_a: Vec<_> = (0..5)
+            .map(|i| make_test_partition(&format!("key_{i:04}"), "value_a", 1000))
+            .collect();
+        let meta_a = write_sstable_to_dir(&dir_a, &partitions_a, &schema);
+
+        let dir_b = tmp.path().join("sstable_b");
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let partitions_b: Vec<_> = (5..10)
+            .map(|i| make_test_partition(&format!("key_{i:04}"), "value_b", 2000))
+            .collect();
+        let meta_b = write_sstable_to_dir(&dir_b, &partitions_b, &schema);
+
+        let input_a_data = std::fs::read(dir_a.join(format!("{}-Data.db", meta_a.id))).unwrap();
+        let input_b_data = std::fs::read(dir_b.join(format!("{}-Data.db", meta_b.id))).unwrap();
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let task = CompactionTask {
+            inputs: vec![meta_a.clone(), meta_b.clone()],
+            output_dir: output_dir.clone(),
+            schema: schema.clone(),
+            table_id: test_table_id(),
+            purge: None,
+        };
+
+        let prev = std::env::var("FERROSA_COMPACTION_VERIFY_OUTPUT").ok();
+        std::env::set_var("FERROSA_COMPACTION_VERIFY_OUTPUT", "0");
+        set_compaction_output_hook(|output| {
+            let good = std::fs::read(&output.data).unwrap();
+            let mut damaged = good.clone();
+            for b in damaged.iter_mut().skip(good.len() / 4) {
+                *b = 0xff;
+            }
+            std::fs::write(&output.data, &damaged).unwrap();
+        });
+
+        let result = CompactionExecutor::execute_task(&task);
+
+        clear_compaction_output_hook();
+        match prev {
+            Some(v) => std::env::set_var("FERROSA_COMPACTION_VERIFY_OUTPUT", v),
+            None => std::env::remove_var("FERROSA_COMPACTION_VERIFY_OUTPUT"),
+        }
+
+        let msg = match result {
+            Ok(_) => panic!(
+                "a compaction whose output digest does not match must be refused even with \
+                 FERROSA_COMPACTION_VERIFY_OUTPUT=0"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must be reported as a digest mismatch: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(dir_a.join(format!("{}-Data.db", meta_a.id))).unwrap(),
+            input_a_data,
+            "input A must remain untouched after a refused compaction"
+        );
+        assert_eq!(
+            std::fs::read(dir_b.join(format!("{}-Data.db", meta_b.id))).unwrap(),
+            input_b_data,
+            "input B must remain untouched after a refused compaction"
+        );
+    }
+
     #[test]
     fn compaction_streaming_merge_only_holds_one_partition_per_input() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2514,6 +2661,16 @@ mod tests {
             &second,
         ));
         std::fs::write(data_path, unsorted_data).unwrap();
+        // The hand-crafted Data.db above no longer matches the Digest.crc32
+        // / CRC.db that `write_sstable_to_dir` computed for the ORIGINAL
+        // (sorted) bytes. Since T-012 loads them automatically on every
+        // compaction input open, a stale CRC.db would fail chunk
+        // verification on the very first read and mask the token-order
+        // error this test actually exercises. Removing them makes this
+        // generation "not checked" (T-011's old-SSTable tolerance) instead
+        // of "checked against the wrong bytes".
+        let _ = std::fs::remove_file(dir.join(format!("{}-Digest.crc32", meta.id)));
+        let _ = std::fs::remove_file(dir.join(format!("{}-CRC.db", meta.id)));
 
         let output_dir = tmp.path().join("output");
         std::fs::create_dir_all(&output_dir).unwrap();

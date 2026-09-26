@@ -346,7 +346,8 @@ impl IndexBuildBackend for LocalBackend {
         ))
         .ok();
 
-        let reader = SSTableReader::open(SSTableComponents {
+        let is_compressed = compression_info.is_some();
+        let mut reader = SSTableReader::open(SSTableComponents {
             data,
             partitions: partitions_file,
             rows: rows_file,
@@ -355,6 +356,20 @@ impl IndexBuildBackend for LocalBackend {
             statistics,
         })
         .map_err(|e| format!("open sstable: {e}"))?;
+
+        // Digest.crc32/CRC.db, when present, so per-chunk CRC.db verification
+        // on uncompressed reads runs during index building too, instead of
+        // silently opting out (T-012; this call site previously never loaded
+        // them). Tolerant of either being absent -- an SSTable written before
+        // T-011 has neither, and must keep building indexes.
+        let digest_path = sstable_component_path(&self.data_dir, job, "Digest.crc32");
+        let crc_path = sstable_component_path(&self.data_dir, job, "CRC.db");
+        ferrosa_sstable::reader::load_checksums_if_present(
+            &mut reader,
+            &job.sstable_id,
+            Some(&digest_path),
+            if is_compressed { None } else { Some(&crc_path) },
+        );
 
         // Stream partitions one at a time rather than materializing the whole
         // SSTable. A full partition Vec would hold every decoded partition —

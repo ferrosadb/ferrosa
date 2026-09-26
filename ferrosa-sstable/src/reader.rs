@@ -451,6 +451,24 @@ impl<R: ReadAt> SSTableReader<R> {
         Ok(())
     }
 
+    /// Whether `Digest.crc32` has been loaded via [`Self::load_digest`].
+    ///
+    /// Every production path that opens a file-backed reader is supposed to
+    /// load checksums automatically when they exist on disk (T-012,
+    /// `publication-safety.md` M1) — this is the accessor tests use to check
+    /// that a given open path actually did, rather than merely compiling
+    /// against the optional-loading API and silently never calling it.
+    pub fn digest_loaded(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// Whether `CRC.db` has been loaded via [`Self::load_crc_table`],
+    /// enabling per-chunk verification on uncompressed reads. See
+    /// [`Self::digest_loaded`].
+    pub fn crc_table_loaded(&self) -> bool {
+        self.crc_table.is_some()
+    }
+
     /// Verify the whole-file `Digest.crc32` against the on-disk Data.db
     /// bytes (re-read here — this is an occasional/whole-file check, not a
     /// per-read hot path). `Ok(())` if no digest was loaded ("not checked",
@@ -1023,6 +1041,69 @@ impl<R: ReadAt> SSTableReader<R> {
             Err(_) => stats.partitions_failed += 1,
         }
     }
+}
+
+/// Load `Digest.crc32` and (for uncompressed tables) `CRC.db` into `reader`
+/// from whatever paths the caller has already resolved for generation `gen`,
+/// tolerating either being absent or unparseable the same way every other
+/// genuinely-optional SSTable component is tolerated: a generation written
+/// before T-011 has neither, and that must keep opening everywhere, logged
+/// as "not checked" rather than failed (`publication-safety.md` M1).
+///
+/// This is the one place that implements "read the file, parse it, load it,
+/// warn (never silently) on a parse failure" — centralised so every
+/// production file-backed open path gets automatic checksum loading instead
+/// of opting in ad hoc (T-012). Pass `crc_path: None` for compressed tables:
+/// `CRC.db` never applies to them, and [`SSTableReader::load_crc_table`]
+/// would otherwise report a spurious parse failure.
+pub fn load_checksums_if_present<R: ReadAt>(
+    reader: &mut SSTableReader<R>,
+    gen: &str,
+    digest_path: Option<&std::path::Path>,
+    crc_path: Option<&std::path::Path>,
+) {
+    if let Some(path) = digest_path {
+        if let Ok(digest) = std::fs::read(path) {
+            if let Err(e) = reader.load_digest(&digest) {
+                tracing::warn!(
+                    gen, error = %e, path = %path.display(),
+                    "failed to parse Digest.crc32; digest verification disabled for this generation"
+                );
+            }
+        }
+    }
+    if let Some(path) = crc_path {
+        if let Ok(crc) = std::fs::read(path) {
+            if let Err(e) = reader.load_crc_table(&crc) {
+                tracing::warn!(
+                    gen, error = %e, path = %path.display(),
+                    "failed to parse CRC.db; chunk verification disabled for this generation"
+                );
+            }
+        }
+    }
+}
+
+/// Convenience wrapper of [`load_checksums_if_present`] for the common case:
+/// `Digest.crc32`/`CRC.db` sit flat in `dir` as `{gen}-Digest.crc32` /
+/// `{gen}-CRC.db`, exactly like every other component. Callers with a
+/// non-flat layout (a nested per-generation subdirectory, live vs.
+/// quarantine, `.tmp` staging names) resolve their own paths and call
+/// [`load_checksums_if_present`] directly instead.
+pub fn load_checksums_for_generation<R: ReadAt>(
+    reader: &mut SSTableReader<R>,
+    dir: &std::path::Path,
+    gen: &str,
+    is_compressed: bool,
+) {
+    let digest_path = dir.join(format!("{gen}-Digest.crc32"));
+    let crc_path = dir.join(format!("{gen}-CRC.db"));
+    load_checksums_if_present(
+        reader,
+        gen,
+        Some(&digest_path),
+        if is_compressed { None } else { Some(&crc_path) },
+    );
 }
 
 /// One partition recovered (possibly partially) by [`SSTableReader::salvage`].

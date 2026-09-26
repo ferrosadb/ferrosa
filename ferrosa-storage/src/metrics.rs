@@ -277,6 +277,11 @@ pub enum PublicationRefusedReason {
     LengthMismatch,
     /// A staged `.tmp` component could not be fsynced durable before verify.
     Fsync,
+    /// The recomputed `Digest.crc32` over the staged `.tmp` Data.db (read back
+    /// from disk) disagreed with the producer's value (`publication-safety.md`
+    /// M2 step 4 / M3, T-012). Runs unconditionally in flush and compaction —
+    /// there is no environment variable that disables it.
+    DigestMismatch,
     /// The pre-promote readback walk over the `.tmp` component set failed.
     ReadbackFailed,
 }
@@ -286,6 +291,7 @@ impl PublicationRefusedReason {
         match self {
             Self::LengthMismatch => "length_mismatch",
             Self::Fsync => "fsync",
+            Self::DigestMismatch => "digest_mismatch",
             Self::ReadbackFailed => "readback_failed",
         }
     }
@@ -294,14 +300,16 @@ impl PublicationRefusedReason {
         match self {
             Self::LengthMismatch => 0,
             Self::Fsync => 1,
-            Self::ReadbackFailed => 2,
+            Self::DigestMismatch => 2,
+            Self::ReadbackFailed => 3,
         }
     }
 }
 
-const PUBLICATION_REFUSED_REASONS: [PublicationRefusedReason; 3] = [
+const PUBLICATION_REFUSED_REASONS: [PublicationRefusedReason; 4] = [
     PublicationRefusedReason::LengthMismatch,
     PublicationRefusedReason::Fsync,
+    PublicationRefusedReason::DigestMismatch,
     PublicationRefusedReason::ReadbackFailed,
 ];
 
@@ -364,7 +372,7 @@ static WRITE_PHASE_COUNT_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7
 static WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_REASON_TOTAL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-static SSTABLE_PUBLICATION_REFUSED_TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static SSTABLE_PUBLICATION_REFUSED_TOTAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);

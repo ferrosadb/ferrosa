@@ -1348,6 +1348,107 @@ impl FileFlushTarget {
         Ok(())
     }
 
+    /// Recompute `Digest.crc32` from the staged `.tmp` Data.db bytes **read
+    /// back from disk** and compare it with the producer's value
+    /// (`publication-safety.md` M2 step 4 / M3, T-012). Runs unconditionally
+    /// -- there is no environment variable that can turn this off, unlike
+    /// compaction's row/partition count walk -- and runs for compaction too,
+    /// since compaction publishes through this same `flush_files`.
+    ///
+    /// This closes G3/G4: the structural readback walk that follows only
+    /// proves the file decodes, not that it holds the bytes the producer
+    /// actually computed a checksum over. A length-preserving corruption
+    /// (bit flip, swapped block, stale bytes from a recycled buffer) changes
+    /// the CRC32 essentially certainly, so this check catches every case in
+    /// the fault matrix a length comparison and a decode walk both miss.
+    ///
+    /// Reads in bounded chunks through one reused buffer -- never a
+    /// whole-file `Vec` -- and on Linux advises the kernel to drop the pages
+    /// this verification read just forced into cache, so checking the digest
+    /// does not itself refill the cache the write pump bypasses. An advise
+    /// failure is logged, never silent, and never fails the check: the
+    /// digest comparison is the correctness gate, the fadvise call is only a
+    /// cache hint.
+    fn verify_staged_data_digest(
+        gen: u64,
+        paths: &FileComponentPaths,
+    ) -> std::result::Result<(), String> {
+        let tmp = Self::tmp_component_path;
+        let digest_path = tmp(&paths.digest);
+        let data_path = tmp(&paths.data);
+
+        let digest_bytes = std::fs::read(&digest_path).map_err(|e| {
+            format!(
+                "staged Digest.crc32 gen={gen} at {} could not be read: {e}",
+                digest_path.display()
+            )
+        })?;
+        let expected = ferrosa_sstable::checksum::parse_digest(&digest_bytes).map_err(|e| {
+            format!(
+                "staged Digest.crc32 gen={gen} at {} is unreadable: {e}",
+                digest_path.display()
+            )
+        })?;
+
+        let file = std::fs::File::open(&data_path).map_err(|e| {
+            format!(
+                "staged Data.db gen={gen} at {} could not be opened for digest verification: {e}",
+                data_path.display()
+            )
+        })?;
+
+        use std::io::Read;
+        const DIGEST_READ_CHUNK: usize = 1 << 20; // 1 MiB, reused across the read.
+        let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
+        let mut buf = vec![0u8; DIGEST_READ_CHUNK];
+        loop {
+            let n = (&file).read(&mut buf).map_err(|e| {
+                format!("read failed verifying staged Data.db digest gen={gen}: {e}")
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Self::fadvise_dontneed_after_digest_verify(&file, &data_path);
+
+        let actual = hasher.finalize();
+        if actual != expected {
+            return Err(format!(
+                "staged Data.db gen={gen} at {} Digest.crc32 mismatch: producer computed \
+                 {expected:#010x}, re-reading the staged bytes from disk computed {actual:#010x}.",
+                data_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advise the kernel to drop this file's pages from the page cache
+    /// (Linux only). Called right after the digest-verification read above
+    /// so that read does not leave the just-checked bytes resident in cache
+    /// -- see [`Self::verify_staged_data_digest`]. A no-op on other
+    /// platforms: there is no portable equivalent, and this is a cache hint,
+    /// not a correctness requirement.
+    #[cfg(target_os = "linux")]
+    fn fadvise_dontneed_after_digest_verify(file: &std::fs::File, path: &Path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` is a valid, open fd for the duration of this call;
+        // offset/len 0 means "the whole file", and `posix_fadvise` is
+        // advisory -- it cannot fault or invalidate the fd.
+        let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        if rc != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                errno = rc,
+                "posix_fadvise(DONTNEED) failed after digest verification read; the \
+                 verification bytes may remain in the page cache"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn fadvise_dontneed_after_digest_verify(_file: &std::fs::File, _path: &Path) {}
+
     /// Build the `.tmp`-named counterpart of every path in `paths`, for
     /// opening a throwaway reader over staged (not-yet-promoted) bytes.
     fn tmp_component_paths(paths: &FileComponentPaths) -> FileComponentPaths {
@@ -1544,19 +1645,9 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     // written before T-011 has neither, and `SSTableReader` treats an
     // unloaded digest/CRC table as "not checked" rather than an error
     // (logged once per generation — see `checksum` module docs in
-    // ferrosa-sstable).
-    if let Ok(digest) = std::fs::read(dir.join(format!("{gen}-Digest.crc32"))) {
-        if let Err(e) = reader.load_digest(&digest) {
-            tracing::warn!(gen, error = %e, "failed to parse Digest.crc32; digest verification disabled for this generation");
-        }
-    }
-    if !is_compressed {
-        if let Ok(crc) = std::fs::read(dir.join(format!("{gen}-CRC.db"))) {
-            if let Err(e) = reader.load_crc_table(&crc) {
-                tracing::warn!(gen, error = %e, "failed to parse CRC.db; chunk verification disabled for this generation");
-            }
-        }
-    }
+    // ferrosa-sstable). Centralised (T-012) so every other file-backed open
+    // path gets the same automatic loading instead of opting in ad hoc.
+    ferrosa_sstable::reader::load_checksums_for_generation(&mut reader, dir, gen, is_compressed);
 
     Ok(reader)
 }
@@ -1924,6 +2015,22 @@ impl FlushTarget for FileFlushTarget {
                 &format!(
                     "FLUSH CORRUPTION: staged components gen={gen} could not be fsynced: {e}."
                 ),
+            ));
+        }
+
+        // Recompute Digest.crc32 from the now-durable staged bytes and compare
+        // it with the producer's value (`publication-safety.md` M2 step 4 / M3,
+        // T-012). Unconditional -- flush and compaction (which calls this same
+        // function) both get it, and there is no environment variable that can
+        // disable it, unlike the row/partition count walk compaction runs
+        // separately. This runs BEFORE the structural readback walk below: a
+        // length-preserving content corruption changes the CRC32, so this is
+        // the check that actually catches it, not the decode walk.
+        if let Err(detail) = Self::verify_staged_data_digest(gen, &paths) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::DigestMismatch,
+                &format!("FLUSH CORRUPTION: {detail}"),
             ));
         }
 
@@ -3234,6 +3341,13 @@ mod tests {
     /// (`*-Data.db`) would load next to the WAL replay of the same rows. This
     /// test reproduces that corruption and asserts the live name never
     /// existed and the staged output is quarantined instead.
+    ///
+    /// Since T-012, this exact corruption shape is caught by the digest
+    /// check (`DigestMismatch`), which runs before the structural readback
+    /// walk (`ReadbackFailed`) ever gets a chance to fail on it -- any
+    /// length-preserving content change almost certainly changes the CRC32.
+    /// The readback walk remains a second, independent line of defense for
+    /// whatever the digest does not cover.
     #[test]
     fn publication_verify_refused_flush_is_quarantined_not_left_live() {
         let dir = tempfile::tempdir().unwrap();
@@ -3272,7 +3386,7 @@ mod tests {
         std::fs::write(&output.data, &damaged).unwrap();
 
         let metric_before = crate::metrics::sstable_publication_refused_total(
-            crate::metrics::PublicationRefusedReason::ReadbackFailed,
+            crate::metrics::PublicationRefusedReason::DigestMismatch,
         );
 
         let msg = match target.flush_files(output) {
@@ -3303,9 +3417,9 @@ mod tests {
 
         assert!(
             crate::metrics::sstable_publication_refused_total(
-                crate::metrics::PublicationRefusedReason::ReadbackFailed
+                crate::metrics::PublicationRefusedReason::DigestMismatch
             ) > metric_before,
-            "the publication-refused metric must count the readback failure"
+            "the publication-refused metric must count the digest mismatch"
         );
     }
 
@@ -3382,6 +3496,282 @@ mod tests {
             !dir.path().join(format!("{refused_gen}-Data.db")).exists(),
             "the refused generation must still never be live after a later successful flush"
         );
+    }
+
+    /// Build a real staged flush output (not yet promoted) from `partitions`,
+    /// returning the `FileFlushTarget`, the base dir, and the `SSTableOutputFiles`
+    /// ready to hand to `flush_files`. Shared setup for the `digest_verify_`
+    /// tests below, which each damage `output.data` differently before calling
+    /// `flush_files`.
+    fn staged_output_for_digest_tests(
+        dir: &Path,
+        partitions: &[Partition],
+    ) -> (FileFlushTarget, ferrosa_sstable::writer::SSTableOutputFiles) {
+        staged_output_for_digest_tests_with_options(dir, partitions, WriteOptions::default())
+    }
+
+    /// Same as [`staged_output_for_digest_tests`], with the writer's
+    /// `WriteOptions` under the caller's control -- needed by the
+    /// swapped-block test below, which must disable compression to keep a
+    /// guaranteed on-disk size regardless of how compressible its fixture
+    /// values are.
+    fn staged_output_for_digest_tests_with_options(
+        dir: &Path,
+        partitions: &[Partition],
+        options: WriteOptions,
+    ) -> (FileFlushTarget, ferrosa_sstable::writer::SSTableOutputFiles) {
+        let schema = test_schema();
+        let target = FileFlushTarget::new(dir.to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, partitions);
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+        for p in partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        (target, output)
+    }
+
+    /// Enough partitions, with big enough values, that Data.db comfortably
+    /// exceeds two 4 KiB blocks -- needed by the swapped-block test below.
+    /// Each partition's value bytes vary (not a constant fill), so LZ4
+    /// cannot shrink the fixture out from under the size assumption even if
+    /// a caller forgets to disable compression. `SSTableWriter` requires
+    /// partitions in token order, so this sorts by key (matching
+    /// `DecoratedKey`'s `Ord`) before returning, the same way every other
+    /// multi-partition test in this module does.
+    fn partitions_spanning_multiple_blocks() -> Vec<Partition> {
+        let mut partitions: Vec<Partition> = (0..64)
+            .map(|i| {
+                let value: Vec<u8> = (0..512u32).map(|b| (b ^ (i * 37)) as u8).collect();
+                make_partition(&format!("k{i:04}"), &value, 1000 + i as i64)
+            })
+            .collect();
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        partitions
+    }
+
+    /// L4 fault row: a single bit flip in the staged Data.db, at a length
+    /// that keeps every length check green (`publication-safety.md` M2 step
+    /// 4 / M3, T-012). Must be refused, quarantined, and counted under
+    /// `DigestMismatch` -- never left under a live name.
+    #[test]
+    fn digest_verify_bit_flip_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0x01; // single bit flip, length unchanged
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let metric_before = crate::metrics::sstable_publication_refused_total(
+            crate::metrics::PublicationRefusedReason::DigestMismatch,
+        );
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("a bit-flipped Data.db must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        let gen = target.generation();
+
+        assert!(
+            msg.contains("FLUSH CORRUPTION") && msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+        assert!(
+            !dir.path().join(format!("{gen}-Data.db")).exists(),
+            "a bit-flipped flush must never be promoted to a live name"
+        );
+        assert!(
+            dir.path()
+                .join("quarantine")
+                .join(format!("{gen}-Data.db.tmp"))
+                .exists(),
+            "the refused staged Data.db must be quarantined for salvage"
+        );
+        assert!(
+            crate::metrics::sstable_publication_refused_total(
+                crate::metrics::PublicationRefusedReason::DigestMismatch
+            ) > metric_before,
+            "the publication-refused metric must count the digest mismatch"
+        );
+    }
+
+    /// L4 fault row: two 4 KiB blocks of the staged Data.db swapped in place
+    /// (same length, same bytes overall, wrong order). A structural decode
+    /// can plausibly still succeed on shuffled bytes for some encodings; the
+    /// digest must not.
+    #[test]
+    fn digest_verify_swapped_block_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = partitions_spanning_multiple_blocks();
+        let options = WriteOptions {
+            compression: None,
+            ..WriteOptions::default()
+        };
+        let (target, output) =
+            staged_output_for_digest_tests_with_options(dir.path(), &partitions, options);
+
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        assert!(
+            damaged.len() >= 2 * 4096,
+            "fixture must be big enough to hold two distinct 4 KiB blocks: {}",
+            damaged.len()
+        );
+        let (block_a, rest) = damaged.split_at_mut(4096);
+        let block_b = &mut rest[..4096];
+        block_a.swap_with_slice(block_b);
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("a Data.db with swapped 4 KiB blocks must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+    }
+
+    /// L4 fault row: "segment recycled before its write completed" -- stale
+    /// bytes from an unrelated, previously-written Data.db land at the right
+    /// offset with the right length. Simulated by splicing in bytes from a
+    /// second, differently-sized real SSTable's Data.db, truncated/padded to
+    /// match. The length check cannot see this; the digest must.
+    #[test]
+    fn digest_verify_stale_bytes_is_refused_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A second, unrelated SSTable purely as a source of "stale" bytes.
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_partitions = vec![make_partition("stale", b"stale-value-bytes", 9999)];
+        let (_stale_target, stale_output) =
+            staged_output_for_digest_tests(stale_dir.path(), &stale_partitions);
+        let stale_bytes = std::fs::read(&stale_output.data).unwrap();
+
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+
+        let good = std::fs::read(&output.data).unwrap();
+        let mut damaged = good.clone();
+        // Overwrite a middle span with stale bytes (cycled if shorter),
+        // keeping the overall length exactly as recorded.
+        let start = good.len() / 3;
+        let span = (good.len() / 3).max(1);
+        for (i, b) in damaged.iter_mut().skip(start).take(span).enumerate() {
+            *b = stale_bytes[i % stale_bytes.len()];
+        }
+        assert_ne!(damaged, good, "the splice must actually change the bytes");
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("stale spliced-in bytes must fail digest verification"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("Digest.crc32 mismatch"),
+            "refusal must name the digest mismatch: {msg}"
+        );
+    }
+
+    /// Acceptance criterion 3 (`publication-safety.md`): after a digest
+    /// refusal, a later flush against the same target still succeeds, lands
+    /// on a new generation, and the refused generation stays quarantined
+    /// (never live, never retried in place).
+    #[test]
+    fn digest_verify_refused_flush_then_next_flush_succeeds_with_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &bad_partitions);
+        let mut damaged = std::fs::read(&output.data).unwrap();
+        let mid = damaged.len() / 2;
+        damaged[mid] ^= 0xff;
+        std::fs::write(&output.data, &damaged).unwrap();
+        match target.flush_files(output) {
+            Ok(_) => panic!("first flush must be refused on digest mismatch"),
+            Err(e) => assert!(e.to_string().contains("Digest.crc32 mismatch")),
+        }
+        let refused_gen = target.generation();
+
+        // A clean flush against the same target must still succeed, on a new
+        // generation, after the digest-refused attempt above.
+        let good_partitions = vec![make_partition("k2", b"v2", 6000)];
+        let schema = test_schema();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &good_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &good_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let reader = target
+            .flush_files(output)
+            .expect("a clean flush after a digest refusal must still succeed");
+        let new_gen = target.generation();
+
+        assert_ne!(
+            new_gen, refused_gen,
+            "the retried flush must land on a new generation, not reuse the refused one"
+        );
+        let got = reader
+            .get_partition(&good_partitions[0].key)
+            .unwrap()
+            .expect("partition");
+        assert_eq!(got.rows.len(), 1);
+        assert!(
+            !dir.path().join(format!("{refused_gen}-Data.db")).exists(),
+            "the digest-refused generation must still never be live"
+        );
+    }
+
+    /// An SSTable written before T-011 has neither `Digest.crc32` nor
+    /// `CRC.db`. Every file-backed open path must still open it, treating
+    /// the missing components as "not checked" rather than an error
+    /// (`publication-safety.md` M1), and must not report checksums as
+    /// loaded.
+    #[test]
+    fn digest_verify_old_sstable_without_digest_or_crc_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let partitions = vec![make_partition("k1", b"v1", 5000)];
+        let (target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
+        let reader = target.flush_files(output).expect("clean flush succeeds");
+        let gen = target.generation();
+        assert!(
+            reader.digest_loaded(),
+            "a fresh flush must load its own digest"
+        );
+        drop(reader);
+
+        std::fs::remove_file(dir.path().join(format!("{gen}-Digest.crc32"))).unwrap();
+        let crc_path = dir.path().join(format!("{gen}-CRC.db"));
+        let _ = std::fs::remove_file(&crc_path);
+
+        let reader = open_file_sstable(dir.path(), &gen.to_string())
+            .expect("an SSTable without Digest.crc32/CRC.db must still open");
+        assert!(
+            !reader.digest_loaded(),
+            "a generation with no Digest.crc32 file must not report a loaded digest"
+        );
+        assert!(
+            !reader.crc_table_loaded(),
+            "a generation with no CRC.db file must not report a loaded CRC table"
+        );
+        let got = reader.get_partition(&partitions[0].key).unwrap();
+        assert!(got.is_some(), "the SSTable must still read correctly");
     }
 
     /// RED TEST (known bug): Two FileFlushTarget instances on the SAME

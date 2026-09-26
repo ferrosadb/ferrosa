@@ -36,6 +36,11 @@ dashmap = "6"
 hex = "0.4"
 smallvec = "1"
 tracing = "0.1"
+# Unconditional (not just cfg(target_os = "macos")) so `posix_fadvise` is
+# available on Linux too: the flush-publication digest verification (T-012)
+# advises the kernel to drop the pages it re-reads to check Data.db's
+# Digest.crc32, on whichever OS this crate is actually built for.
+libc = "0.2"
 ureq = { version = "3", features = ["json"] }
 proptest = { version = "1", optional = true }
 # Optional normal dep so `self_heal::test_fixtures` (behind `test-support`) can
@@ -43,9 +48,6 @@ proptest = { version = "1", optional = true }
 # crates (their dev-deps don't activate our dev-deps). Also a dev-dep below for
 # this crate's own tests, mirroring how `proptest` is declared.
 tempfile = { version = "3", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
 
 [features]
 # The production write path should avoid the sharded BTree memtable's

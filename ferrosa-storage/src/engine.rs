@@ -9427,23 +9427,22 @@ impl StorageEngine {
         // an error (logged once per generation — see `checksum` module docs
         // in ferrosa-sstable). This is what makes
         // "verify CRC.db on every uncompressed chunk read" apply to reads
-        // that go through this open path.
-        if let Some(digest) = Self::generation_component_path(dir, gen, "Digest.crc32")
-            .and_then(|p| std::fs::read(p).ok())
-        {
-            if let Err(e) = reader.load_digest(&digest) {
-                tracing::warn!(gen, error = %e, "failed to parse Digest.crc32; digest verification disabled for this generation");
-            }
-        }
-        if !is_compressed {
-            if let Some(crc) = Self::generation_component_path(dir, gen, "CRC.db")
-                .and_then(|p| std::fs::read(p).ok())
-            {
-                if let Err(e) = reader.load_crc_table(&crc) {
-                    tracing::warn!(gen, error = %e, "failed to parse CRC.db; chunk verification disabled for this generation");
-                }
-            }
-        }
+        // that go through this open path. Centralised (T-012): this table
+        // dir supports a nested per-generation layout that a plain
+        // `dir.join(...)` join can't resolve, so paths are resolved here via
+        // `generation_component_path` and handed to the shared loader.
+        let digest_path = Self::generation_component_path(dir, gen, "Digest.crc32");
+        let crc_path = if is_compressed {
+            None
+        } else {
+            Self::generation_component_path(dir, gen, "CRC.db")
+        };
+        ferrosa_sstable::reader::load_checksums_if_present(
+            &mut reader,
+            gen,
+            digest_path.as_deref(),
+            crc_path.as_deref(),
+        );
 
         Ok(reader)
     }
