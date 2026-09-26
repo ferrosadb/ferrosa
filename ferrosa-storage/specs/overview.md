@@ -136,6 +136,15 @@ volume or changing query results.
     fixed-capacity, and every poll admits a fixed number of compactions until
     the strategy threshold is met. Automatic flush ticks handle at most eight
     tables before yielding to later maintenance.
+12. **A generation is verified before it can be discovered.** `flush_files`
+    (shared by flush and compaction promotion) never promotes staged `.tmp`
+    output to a live name until length checks, an fsync of the `.tmp`
+    components, and a throwaway-reader readback walk over those same `.tmp`
+    paths all pass. Any failure moves the `.tmp` set to `quarantine/` instead
+    of leaving it under a name the next startup's `*-Data.db` generation scan
+    would load (ST-27). Startup also sweeps stale `.tmp` sets and abandoned
+    flush staging (`.sstable-staging/`, `.merge-spill/`) before that scan
+    runs.
 
 ## Position in the dependency graph
 

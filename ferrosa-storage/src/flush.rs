@@ -852,6 +852,103 @@ pub(crate) mod fsync_probe {
     }
 }
 
+/// Sweep leftover flush/compaction-output staging debris from a component
+/// directory (`publication-safety.md` M2).
+///
+/// A `.tmp` component is left behind only when the process died between
+/// renaming staged output to `.tmp` (`FileFlushTarget::flush_files`) and
+/// either quarantining it (verification failure) or promoting it to a live
+/// name (success) — every other path removes it. `{gen}-Data.db.tmp` never
+/// matches the `{gen}-Data.db` suffix generation discovery scans for, so it
+/// is not a data-loss risk by itself, but leaving it as unlabeled debris hides
+/// exactly the kind of interrupted publish M2 asks to make visible. It is
+/// moved into `quarantine/`, the same destination a failed `flush_files` call
+/// uses, so an operator finds both kinds of refusal in one place.
+///
+/// `.sstable-staging/` and `.merge-spill/` hold pre-rename bytes under their
+/// original component names — nothing in them has been renamed to a `.tmp` or
+/// live name yet. Like the compaction output directory
+/// (`StorageEngine::cleanup_stale_compaction_staging`), they are only ever
+/// live while a flush or merge-read is running in this process; there is
+/// nothing at startup to resume one, so they are pure debris and are removed
+/// outright rather than quarantined.
+///
+/// Called from `StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode`
+/// before generation discovery, and again from `FileFlushTarget::new`/
+/// `new_starting_at` as a safety net for callers that construct a flush
+/// target without going through table startup (tests, the compaction output
+/// directory, the merge-spill ephemeral path).
+pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                dir = %dir.display(),
+                "flush: could not scan dir for stale staging"
+            );
+            return;
+        }
+    };
+
+    let quarantine_dir = dir.join("quarantine");
+    let mut quarantine_ready = false;
+    let mut quarantined = 0usize;
+    let mut removed_staging_dirs = 0usize;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+
+        if is_dir && (name_str == ".sstable-staging" || name_str == ".merge-spill") {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => removed_staging_dirs += 1,
+                Err(e) => tracing::error!(
+                    %e,
+                    dir = %entry.path().display(),
+                    "flush: could not remove stale flush staging dir"
+                ),
+            }
+            continue;
+        }
+
+        if is_dir || !name_str.ends_with(".tmp") {
+            continue;
+        }
+
+        if !quarantine_ready {
+            if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+                tracing::error!(
+                    %e,
+                    dir = %quarantine_dir.display(),
+                    "flush: could not create quarantine dir for stale staged components"
+                );
+                break;
+            }
+            quarantine_ready = true;
+        }
+        let dest = quarantine_dir.join(&name);
+        match std::fs::rename(entry.path(), &dest) {
+            Ok(()) => quarantined += 1,
+            Err(e) => tracing::error!(
+                %e,
+                path = %entry.path().display(),
+                "flush: could not quarantine stale staged component"
+            ),
+        }
+    }
+
+    if quarantined > 0 || removed_staging_dirs > 0 {
+        tracing::warn!(
+            quarantined,
+            removed_staging_dirs,
+            dir = %dir.display(),
+            "flush: swept stale staged output left by an earlier crash"
+        );
+    }
+}
+
 impl FileFlushTarget {
     /// Create a new file flush target writing to the given directory.
     ///
@@ -859,23 +956,11 @@ impl FileFlushTarget {
     /// counter starts at 0; the first flush produces generation 1.
     pub fn new(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
-        Self::cleanup_stale_tmp_files(&base_dir);
+        sweep_stale_flush_staging(&base_dir);
         Ok(Self {
             base_dir,
             generation: AtomicU64::new(0),
         })
-    }
-
-    /// Remove any stale `.tmp` files left behind by a crash during flush.
-    fn cleanup_stale_tmp_files(dir: &Path) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "tmp") {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
     }
 
     /// Returns the current generation counter value (the last generation written).
@@ -892,7 +977,7 @@ impl FileFlushTarget {
     /// gen=1 and their SSTables collide in the S3 manifest.
     pub fn new_starting_at(base_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&base_dir)?;
-        Self::cleanup_stale_tmp_files(&base_dir);
+        sweep_stale_flush_staging(&base_dir);
         let max_gen = Self::scan_max_generation(&base_dir);
         let node_offset = Self::node_generation_offset();
         Ok(Self {
@@ -1194,6 +1279,177 @@ impl FileFlushTarget {
         }
 
         Ok(reader)
+    }
+
+    /// Validate that every staged `.tmp` component landed at its expected
+    /// length. `SSTableOutputFiles` records a length per component; checking
+    /// only `data_len` let five of six components promote unchecked. What a
+    /// length check cannot catch is covered by the readback walk that follows
+    /// it in `flush_files`.
+    ///
+    /// `Rows.db` is legitimately zero-length for small SSTables (see
+    /// `StorageEngine::smoke_test_generation`, which excludes it from its
+    /// zero-byte rule), so the comparison is against the recorded length,
+    /// never against zero.
+    fn check_staged_component_lengths(
+        gen: u64,
+        paths: &FileComponentPaths,
+        output: &SSTableOutputFiles,
+    ) -> std::result::Result<(), String> {
+        let tmp = Self::tmp_component_path;
+        let mut checks: Vec<(&str, &Path, u64)> = vec![
+            ("Data.db", &paths.data, output.data_len),
+            ("Partitions.db", &paths.partitions, output.partitions_len),
+            ("Rows.db", &paths.rows, output.rows_len),
+            ("Filter.db", &paths.filter, output.filter_len),
+            ("Statistics.db", &paths.statistics, output.statistics_len),
+            ("TOC.txt", &paths.toc, output.toc_len),
+            ("Digest.crc32", &paths.digest, output.digest_len),
+        ];
+        if output.compression_info.is_some() {
+            checks.push((
+                "CompressionInfo.db",
+                &paths.compression_info,
+                output.compression_info_len,
+            ));
+        }
+        if output.crc.is_some() {
+            checks.push(("CRC.db", &paths.crc, output.crc_len));
+        }
+
+        for (name, path, expected) in checks {
+            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
+            if actual != expected {
+                return Err(format!(
+                    "FLUSH CORRUPTION: staged {name} gen={gen} expected {expected} bytes, \
+                     got {actual}."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the `.tmp`-named counterpart of every path in `paths`, for
+    /// opening a throwaway reader over staged (not-yet-promoted) bytes.
+    fn tmp_component_paths(paths: &FileComponentPaths) -> FileComponentPaths {
+        let tmp = Self::tmp_component_path;
+        FileComponentPaths {
+            data: tmp(&paths.data),
+            partitions: tmp(&paths.partitions),
+            rows: tmp(&paths.rows),
+            filter: tmp(&paths.filter),
+            statistics: tmp(&paths.statistics),
+            toc: tmp(&paths.toc),
+            compression_info: tmp(&paths.compression_info),
+            digest: tmp(&paths.digest),
+            crc: tmp(&paths.crc),
+        }
+    }
+
+    /// fsync every staged `.tmp` component (concurrently, on the shared flush
+    /// pool, mirroring `fsync_components`'s ordering rationale) WITHOUT
+    /// touching the containing directory -- the `.tmp` names are not renamed
+    /// yet, so there is no new directory entry to make durable here. Called
+    /// before the pre-promote readback walk so a crash right after a
+    /// successful flush_files still has fsynced bytes to read back.
+    fn fsync_tmp_components(
+        &self,
+        paths: &FileComponentPaths,
+        has_compression_info: bool,
+        has_crc: bool,
+    ) -> Result<()> {
+        let tmp = Self::tmp_component_path;
+        let mut tmp_paths: Vec<PathBuf> = vec![
+            tmp(&paths.data),
+            tmp(&paths.partitions),
+            tmp(&paths.rows),
+            tmp(&paths.filter),
+            tmp(&paths.statistics),
+            tmp(&paths.toc),
+            tmp(&paths.digest),
+        ];
+        if has_compression_info {
+            tmp_paths.push(tmp(&paths.compression_info));
+        }
+        if has_crc {
+            tmp_paths.push(tmp(&paths.crc));
+        }
+
+        crate::flush_executor::pool().install(|| {
+            tmp_paths.par_iter().try_for_each(|component| {
+                Self::fsync_path(component).map_err(|e| {
+                    ferrosa_common::Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "fsync of staged component {} failed: {e}",
+                            component.display()
+                        ),
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Move a refused generation's `.tmp` component set into `quarantine/`,
+    /// WARN with the reason, count the refusal
+    /// (`sstable_publication_refused_total{reason}`), and return the `Err`
+    /// the caller should propagate.
+    ///
+    /// Scans for the `{gen}-*.tmp` prefix rather than the fixed component list
+    /// so an unexpected leftover (a partial write outside the six/seven named
+    /// components) is still swept, matching the prefix-scan convention
+    /// `StorageEngine::quarantine_generation` already uses for live names.
+    fn quarantine_staged_components(
+        &self,
+        gen: u64,
+        reason: crate::metrics::PublicationRefusedReason,
+        detail: &str,
+    ) -> ferrosa_common::Error {
+        let quarantine_dir = self.base_dir.join("quarantine");
+        let mut moved = 0usize;
+        match std::fs::create_dir_all(&quarantine_dir) {
+            Ok(()) => {
+                let prefix = format!("{gen}-");
+                for entry in std::fs::read_dir(&self.base_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if !name_str.starts_with(&prefix) || !name_str.ends_with(".tmp") {
+                        continue;
+                    }
+                    let dest = quarantine_dir.join(&name);
+                    match std::fs::rename(entry.path(), &dest) {
+                        Ok(()) => moved += 1,
+                        Err(e) => tracing::error!(
+                            gen, %e, path = %entry.path().display(),
+                            "flush: could not move refused staged component to quarantine"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::error!(
+                gen, %e, dir = %quarantine_dir.display(),
+                "flush: could not create quarantine dir; refused staged output left under .tmp names"
+            ),
+        }
+
+        crate::metrics::inc_sstable_publication_refused(reason);
+        tracing::warn!(
+            gen,
+            reason = reason.label(),
+            detail,
+            moved,
+            dir = %quarantine_dir.display(),
+            "flush: refusing to publish staged SSTable output; quarantined"
+        );
+
+        ferrosa_common::Error::InvalidFormat(format!(
+            "{detail} Refusing to publish it; {moved} staged component(s) quarantined under {}.",
+            quarantine_dir.display()
+        ))
     }
 }
 
@@ -1582,7 +1838,7 @@ impl FlushTarget for FileFlushTarget {
             data_size = output.data_len,
             partitions_size = output.partitions_len,
             dir = %self.base_dir.display(),
-            "flush: promoting staged SSTable"
+            "flush: staging SSTable for verify-before-promote"
         );
 
         let tmp = Self::tmp_component_path;
@@ -1601,82 +1857,58 @@ impl FlushTarget for FileFlushTarget {
             std::fs::rename(crc, tmp(&paths.crc))?;
         }
 
-        // Verify EVERY component's length, not just Data.db's.
-        //
-        // `SSTableOutputFiles` records a length for each component and this
-        // gate compared only `data_len`, so five of six were promoted
-        // unchecked. Cheap hardening -- one `metadata` call each -- but note
-        // what a length check cannot do: see the readback below. A file can be
-        // exactly the length the writer intended and still be unreadable.
-        //
-        // Rows.db is legitimately zero-length for small SSTables (see
-        // `StorageEngine::smoke_test_generation`, which deliberately excludes
-        // it from the zero-byte rule), so the comparison is against the
-        // recorded length rather than against zero.
-        let mut checks: Vec<(&str, &Path, u64)> = vec![
-            ("Data.db", &paths.data, output.data_len),
-            ("Partitions.db", &paths.partitions, output.partitions_len),
-            ("Rows.db", &paths.rows, output.rows_len),
-            ("Filter.db", &paths.filter, output.filter_len),
-            ("Statistics.db", &paths.statistics, output.statistics_len),
-            ("TOC.txt", &paths.toc, output.toc_len),
-            ("Digest.crc32", &paths.digest, output.digest_len),
-        ];
-        if has_compression_info {
-            checks.push((
-                "CompressionInfo.db",
-                &paths.compression_info,
-                output.compression_info_len,
-            ));
+        // The staging dir is empty now regardless of what happens below, so
+        // clean it up eagerly rather than leaving a failure path to forget it.
+        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
+        if let Err(e) = std::fs::remove_dir(&output.staging_dir) {
+            tracing::debug!(
+                gen, %e, dir = %output.staging_dir.display(),
+                "flush: could not remove empty staging dir"
+            );
         }
-        if output.crc.is_some() {
-            checks.push(("CRC.db", &paths.crc, output.crc_len));
-        }
-
-        for (name, path, expected) in checks {
-            let actual = std::fs::metadata(tmp(path)).map(|m| m.len()).unwrap_or(0);
-            if actual != expected {
-                return Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "FLUSH CORRUPTION: staged {name} gen={gen} expected {expected} bytes, \
-                     got {actual}. Refusing to promote a partially written SSTable; the \
-                     staged files are left in place for inspection."
-                )));
+        if let Some(parent) = staging_parent {
+            if let Err(e) = std::fs::remove_dir(&parent) {
+                tracing::debug!(
+                    gen, %e, dir = %parent.display(),
+                    "flush: staging parent not empty or already removed"
+                );
             }
         }
 
-        Self::promote_tmp_components(&paths, has_compression_info)?;
-
-        // Durability barrier: fsync every promoted component, then fsync the
-        // directory once, BEFORE cleaning up staging or returning. This path is
-        // shared by compaction output promotion (compaction/executor.rs), so
-        // compaction inherits the same crash-atomic guarantee: the local output
-        // SSTable is durable before any caller deletes inputs or swaps the
-        // manifest.
-        self.fsync_components(&paths, has_compression_info)?;
-
-        let staging_parent = output.staging_dir.parent().map(Path::to_path_buf);
-        let _ = std::fs::remove_dir(&output.staging_dir);
-        if let Some(parent) = staging_parent {
-            let _ = std::fs::remove_dir(parent);
+        // Verify-before-promote (`publication-safety.md` M2): every check
+        // below runs against the `.tmp` names, BEFORE `promote_tmp_components`
+        // makes anything live. A refusal at any point quarantines the `.tmp`
+        // set instead of returning with output under a name the startup scan
+        // will load. This closes G1: the previous order promoted to live
+        // names first and verified after, so a readback failure left a
+        // corrupt SSTable at a live name next to the WAL replay of the same
+        // rows.
+        if let Err(detail) = Self::check_staged_component_lengths(gen, &paths, &output) {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::LengthMismatch,
+                &detail,
+            ));
         }
 
-        tracing::info!(
-            gen,
-            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
-            path = %paths.data.display(),
-            "flush: staged Data.db promoted and fsynced"
-        );
+        // Durability barrier on the STAGED bytes: fsync every `.tmp` component
+        // before the readback walk trusts what it reads, and before promote
+        // can rename them into place. `fsync_dir` after promote below then
+        // only needs to make the rename entries durable -- the component
+        // bytes underneath are already synced.
+        if let Err(e) =
+            self.fsync_tmp_components(&paths, has_compression_info, output.crc.is_some())
+        {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::Fsync,
+                &format!(
+                    "FLUSH CORRUPTION: staged components gen={gen} could not be fsynced: {e}."
+                ),
+            ));
+        }
 
-        // Verify on a THROWAWAY reader, then hand back a clean one.
-        //
-        // Walking the partitions warms reader state, and the engine keeps the
-        // reader this function returns. Verifying through it would leave that
-        // cached state in place, so a file corrupted after the flush could be
-        // served from memory instead of being detected -- the verification
-        // would mask exactly the failures it exists to catch.
-        let probe = Self::open_reader_from_paths(&paths, has_compression_info)?;
-
-        // Read back the file that was PUBLISHED, not the one that was staged.
+        // Read back the STAGED file, not a promised promotion of it.
         //
         // On 2026-08-20 node2's compaction of agent_memory.session_task_focus_stack
         // verified its output in the compaction staging directory -- "output
@@ -1686,24 +1918,39 @@ impl FlushTarget for FileFlushTarget {
         //
         //     read_exact_at: wanted 17063 bytes, got 818
         //
-        // Nothing checked it. Opening a reader succeeds on a file whose
-        // partition index is wrong, and the length comparison above cannot see
-        // damage that does not change a length. So the SSTable entered the live
-        // view as healthy and was found thirty seconds later by the periodic
-        // self-heal scan -- at which point quarantining it broke every read of
-        // that table on that node.
-        //
-        // Verifying in staging and publishing something else is not
-        // verification. This walks the promoted partitions once, the same work
-        // the compaction path already pays, moved to the file that matters.
-        if let Err(e) = verify_promoted_sstable(&probe) {
-            return Err(ferrosa_common::Error::InvalidFormat(format!(
-                "FLUSH CORRUPTION: promoted SSTable gen={gen} could not be read back: {e}. \
-                 Refusing to publish it; components are left in place at {} for salvage.",
-                paths.data.display()
-            )));
+        // Nothing checked the published file itself. Verifying staged bytes
+        // and then promoting something else was not verification -- this now
+        // walks the exact `.tmp` bytes that promote will rename into place, on
+        // a THROWAWAY reader (the engine keeps the reader this function
+        // returns; verifying through it would leave cached state that a later
+        // corruption could hide behind).
+        let tmp_paths = Self::tmp_component_paths(&paths);
+        let readback =
+            Self::open_reader_from_paths(&tmp_paths, has_compression_info).and_then(|probe| {
+                let result = verify_promoted_sstable(&probe);
+                drop(probe);
+                result
+            });
+        if let Err(e) = readback {
+            return Err(self.quarantine_staged_components(
+                gen,
+                crate::metrics::PublicationRefusedReason::ReadbackFailed,
+                &format!("FLUSH CORRUPTION: staged SSTable gen={gen} could not be read back: {e}."),
+            ));
         }
-        drop(probe);
+
+        Self::promote_tmp_components(&paths, has_compression_info)?;
+
+        // The component bytes are already fsynced (above); only the rename
+        // entries need to become durable now.
+        Self::fsync_dir(&self.base_dir)?;
+
+        tracing::info!(
+            gen,
+            data_bytes = std::fs::metadata(&paths.data).map(|m| m.len()).unwrap_or(0),
+            path = %paths.data.display(),
+            "flush: staged SSTable verified, promoted, and fsynced"
+        );
 
         Self::open_reader_from_paths(&paths, has_compression_info)
     }
@@ -2900,7 +3147,10 @@ mod tests {
     #[test]
     fn flush_files_fsyncs_every_component_and_directory() {
         // The staged-promotion path (used by compaction) must apply the same
-        // durability barrier as flush().
+        // durability barrier as flush() -- but verify-before-promote
+        // (`publication-safety.md` M2) fsyncs the STAGED `.tmp` bytes before
+        // the readback walk trusts them, and promote's rename needs only the
+        // directory fsync afterward (the bytes underneath did not change).
         let _fsync_probe = fsync_probe::exclusive();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2931,26 +3181,187 @@ mod tests {
 
         let synced = fsync_probe::synced_files();
         let mut expected = vec![
-            "Data.db",
-            "Partitions.db",
-            "Rows.db",
-            "Filter.db",
-            "Statistics.db",
-            "TOC.txt",
+            "Data.db.tmp",
+            "Partitions.db.tmp",
+            "Rows.db.tmp",
+            "Filter.db.tmp",
+            "Statistics.db.tmp",
+            "TOC.txt.tmp",
         ];
         if has_ci {
-            expected.push("CompressionInfo.db");
+            expected.push("CompressionInfo.db.tmp");
         }
         for suffix in expected {
             let path = dir.path().join(format!("{gen}-{suffix}"));
             assert!(
                 synced.contains(&path),
-                "component {suffix} was not fsynced; synced={synced:?}"
+                "staged component {suffix} was not fsynced before verify; synced={synced:?}"
             );
         }
         assert!(
             fsync_probe::synced_dirs().contains(&dir.path().to_path_buf()),
-            "containing directory was not fsynced"
+            "containing directory was not fsynced after promote"
+        );
+    }
+
+    /// G1 regression (`publication-safety.md` M2, FMEA F13/ST-30): a refused
+    /// flush must never leave `*-Data.db` under a LIVE name.
+    ///
+    /// Before this fix, `flush_files` promoted staged `.tmp` components to
+    /// live names, fsynced them, and only THEN ran the readback walk. A
+    /// content-only corruption (right length, wrong bytes -- exactly what a
+    /// length check cannot see) failed the walk, but by then `{gen}-Data.db`
+    /// was already a live name the next startup's generation-discovery scan
+    /// (`*-Data.db`) would load next to the WAL replay of the same rows. This
+    /// test reproduces that corruption and asserts the live name never
+    /// existed and the staged output is quarantined instead.
+    #[test]
+    fn publication_verify_refused_flush_is_quarantined_not_left_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![
+            make_partition("k1", b"v1", 5000),
+            make_partition("k2", b"v2", 3000),
+        ];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+
+        // Damage the CONTENT while keeping the length exactly as recorded --
+        // the shape a length comparison cannot see.
+        let good = std::fs::read(&output.data).unwrap();
+        assert_eq!(good.len() as u64, output.data_len);
+        let mut damaged = good.clone();
+        for b in damaged.iter_mut().skip(good.len() / 4) {
+            *b = 0xff;
+        }
+        std::fs::write(&output.data, &damaged).unwrap();
+
+        let metric_before = crate::metrics::sstable_publication_refused_total(
+            crate::metrics::PublicationRefusedReason::ReadbackFailed,
+        );
+
+        let msg = match target.flush_files(output) {
+            Ok(_) => panic!("an SSTable whose contents cannot be read back must not be promoted"),
+            Err(e) => e.to_string(),
+        };
+        let gen = target.generation();
+
+        assert!(
+            msg.contains("FLUSH CORRUPTION"),
+            "the refusal must be reported as flush corruption: {msg}"
+        );
+
+        let live_data = dir.path().join(format!("{gen}-Data.db"));
+        assert!(
+            !live_data.exists(),
+            "a refused flush must never leave *-Data.db under a live name: {live_data:?}"
+        );
+
+        let quarantined_data = dir
+            .path()
+            .join("quarantine")
+            .join(format!("{gen}-Data.db.tmp"));
+        assert!(
+            quarantined_data.exists(),
+            "the refused staged Data.db must be quarantined for salvage: {quarantined_data:?}"
+        );
+
+        assert!(
+            crate::metrics::sstable_publication_refused_total(
+                crate::metrics::PublicationRefusedReason::ReadbackFailed
+            ) > metric_before,
+            "the publication-refused metric must count the readback failure"
+        );
+    }
+
+    /// A refused flush must not block progress: the next flush against the
+    /// same target succeeds and lands under a NEW generation, never reusing
+    /// or resurrecting the quarantined one.
+    #[test]
+    fn publication_verify_refused_flush_then_next_flush_succeeds_with_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        // First flush: corrupt content, so it is refused and quarantined.
+        let bad_partitions = vec![make_partition("k1", b"v1", 5000)];
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &bad_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &bad_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let good = std::fs::read(&output.data).unwrap();
+        let mut damaged = good.clone();
+        for b in damaged.iter_mut().skip(good.len() / 4) {
+            *b = 0xff;
+        }
+        std::fs::write(&output.data, &damaged).unwrap();
+        if target.flush_files(output).is_ok() {
+            panic!("first flush must be refused");
+        }
+        let refused_gen = target.generation();
+
+        // Second flush: clean output must succeed under a new generation.
+        let good_partitions = vec![make_partition("k2", b"v2", 6000)];
+        let staging_dir = target
+            .file_output_staging_dir()
+            .unwrap()
+            .expect("file target staging dir");
+        let header = build_serialization_header(&schema, &good_partitions);
+        let mut writer = SSTableWriter::new_file_backed(
+            WriteOptions::default(),
+            header,
+            staging_dir.join("Data.raw"),
+        )
+        .unwrap();
+        for p in &good_partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+        let reader = target
+            .flush_files(output)
+            .expect("a clean flush after a refusal must still succeed");
+        let new_gen = target.generation();
+
+        assert_ne!(
+            new_gen, refused_gen,
+            "the retried flush must land on a new generation, not reuse the refused one"
+        );
+        let got = reader
+            .get_partition(&good_partitions[0].key)
+            .unwrap()
+            .expect("partition");
+        assert_eq!(got.rows.len(), 1);
+
+        assert!(
+            !dir.path().join(format!("{refused_gen}-Data.db")).exists(),
+            "the refused generation must still never be live after a later successful flush"
         );
     }
 

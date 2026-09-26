@@ -45,6 +45,23 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   concurrency across *all* concurrent flushes, so flush parallelism is a
   capacity-aware knob rather than a per-flush thread count.
 
+  **Publication safety — verify before promote (`publication-safety.md` M2):**
+  `FileFlushTarget::flush_files` (used by both flush and compaction promotion)
+  renames staged output to `.tmp`, checks every component's length, fsyncs the
+  `.tmp` components, then opens a THROWAWAY reader over the `.tmp` paths and
+  walks every partition — only after that succeeds does it promote to live
+  names and fsync the directory. A refusal at any of those steps moves the
+  whole `.tmp` set into `quarantine/` (WARN, `sstable_publication_refused_total{reason}`)
+  instead of returning with output under a name generation discovery would
+  load. Before this ordering, a readback failure was detected only AFTER
+  promoting to a live name, so a corrupt SSTable could enter the live view
+  next to the WAL replay of the same rows (FMEA ST-30). Startup sweeps stale
+  `.tmp` sets and abandoned `.sstable-staging`/`.merge-spill` staging into
+  `quarantine/`/removed, before generation discovery runs
+  (`StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode` calls
+  `flush::sweep_stale_flush_staging`; `FileFlushTarget::new`/`new_starting_at`
+  call it too, as a safety net for callers outside table startup).
+
   **Automatic-flush admission (t_889b0d9a):** maintenance cadence alone never
   creates a tiny SSTable. The age trigger requires at least 16 MiB (or the
   configured flush threshold when smaller), while the size/backpressure

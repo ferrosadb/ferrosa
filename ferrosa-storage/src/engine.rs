@@ -5316,6 +5316,16 @@ impl StorageEngine {
         Vec<SSTableSidecarMap>,
         Vec<(String, std::path::PathBuf)>,
     ) {
+        // Sweep stale `.tmp` component sets and abandoned flush staging
+        // BEFORE generation discovery (`publication-safety.md` M2). A `.tmp`
+        // name never matches the `-Data.db` suffix the scan below looks for,
+        // so this is not a correctness fix for the scan itself -- it is what
+        // makes a crash mid-flush visible (quarantined) instead of silent
+        // disk debris, and it runs here rather than only in
+        // `FileFlushTarget::new_starting_at` because that constructor runs
+        // AFTER this scan today (`StorageEngine::build_table_state`).
+        crate::flush::sweep_stale_flush_staging(table_dir);
+
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = {
             let mut values = std::collections::HashSet::new();
@@ -14517,6 +14527,57 @@ mod tests {
                 "data must survive restart after zero-byte Rows.db"
             );
         }
+    }
+
+    /// `publication-safety.md` M2: a stale `.tmp` component set and leftover
+    /// flush staging left by a crashed process must be swept into
+    /// `quarantine/` BEFORE generation discovery runs, not silently deleted
+    /// and not left as unlabeled debris. `-Data.db.tmp` never matches the
+    /// `-Data.db` suffix discovery looks for either way, so this asserts the
+    /// sweep itself, not a change in which generations get discovered.
+    #[test]
+    fn publication_verify_stale_tmp_and_staging_swept_before_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("test_ks.swept_table");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        // A `.tmp` set left by a process that died between rename-to-.tmp and
+        // either quarantine or promote.
+        std::fs::write(table_dir.join("7-Data.db.tmp"), b"stale staged data").unwrap();
+        std::fs::write(table_dir.join("7-Partitions.db.tmp"), b"stale partitions").unwrap();
+
+        // Leftover pre-rename staging from a crashed flush.
+        let staging = table_dir.join(".sstable-staging").join("12345-1-0");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("Data.raw"), b"never renamed").unwrap();
+
+        let pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> =
+            Arc::new(crate::reader_pool::ReaderPool::new(8));
+        let (descriptors, _sidecars, ids) = StorageEngine::load_existing_sstables_and_sidecars(
+            &table_dir,
+            &pool,
+            "publication-verify-sweep",
+        );
+        assert!(
+            descriptors.is_empty() && ids.is_empty(),
+            "a swept .tmp set must never be discovered as a live generation"
+        );
+
+        assert!(
+            table_dir.join("quarantine").join("7-Data.db.tmp").exists(),
+            "the stale .tmp component set must be quarantined for salvage, not deleted"
+        );
+        assert!(
+            table_dir
+                .join("quarantine")
+                .join("7-Partitions.db.tmp")
+                .exists(),
+            "every component of the stale .tmp set must be quarantined, not only Data.db"
+        );
+        assert!(
+            !table_dir.join(".sstable-staging").exists(),
+            "abandoned pre-rename staging must be removed at startup"
+        );
     }
 
     /// Regression: the default startup smoke test must not quarantine

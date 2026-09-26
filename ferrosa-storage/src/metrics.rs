@@ -266,6 +266,45 @@ const WRITE_FAILURE_REASONS: [WriteFailureReason; 5] = [
     WriteFailureReason::MemtableWrite,
 ];
 
+/// Why `FileFlushTarget::flush_files` refused to publish a staged SSTable
+/// generation (`publication-safety.md` M2). Every reason ends the same way:
+/// the `.tmp` component set is moved to `quarantine/` instead of being
+/// promoted to a live name, so a startup scan never has to reason about it.
+#[derive(Clone, Copy)]
+pub enum PublicationRefusedReason {
+    /// A staged `.tmp` component's on-disk length disagreed with the length
+    /// the writer recorded for it.
+    LengthMismatch,
+    /// A staged `.tmp` component could not be fsynced durable before verify.
+    Fsync,
+    /// The pre-promote readback walk over the `.tmp` component set failed.
+    ReadbackFailed,
+}
+
+impl PublicationRefusedReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LengthMismatch => "length_mismatch",
+            Self::Fsync => "fsync",
+            Self::ReadbackFailed => "readback_failed",
+        }
+    }
+
+    fn idx(self) -> usize {
+        match self {
+            Self::LengthMismatch => 0,
+            Self::Fsync => 1,
+            Self::ReadbackFailed => 2,
+        }
+    }
+}
+
+const PUBLICATION_REFUSED_REASONS: [PublicationRefusedReason; 3] = [
+    PublicationRefusedReason::LengthMismatch,
+    PublicationRefusedReason::Fsync,
+    PublicationRefusedReason::ReadbackFailed,
+];
+
 static FLUSH_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSH_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -325,6 +364,7 @@ static WRITE_PHASE_COUNT_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7
 static WRITE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURE_REASON_TOTAL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static SSTABLE_PUBLICATION_REFUSED_TOTAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static WRITE_INLINE_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_SIZE_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 static MEMTABLE_FLUSH_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -606,6 +646,17 @@ pub fn inc_write_inline_flush() {
     WRITE_INLINE_FLUSH_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A staged SSTable generation was refused publication and quarantined
+/// instead of promoted (`publication-safety.md` M2, FMEA F13/ST-27).
+pub fn inc_sstable_publication_refused(reason: PublicationRefusedReason) {
+    SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn sstable_publication_refused_total(reason: PublicationRefusedReason) -> u64 {
+    SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].load(Ordering::Relaxed)
+}
+
 pub fn set_memtable_thresholds(flush_threshold_bytes: u64, backpressure_bytes: u64) {
     MEMTABLE_FLUSH_THRESHOLD_BYTES.store(flush_threshold_bytes, Ordering::Relaxed);
     MEMTABLE_BACKPRESSURE_BYTES.store(backpressure_bytes, Ordering::Relaxed);
@@ -706,6 +757,15 @@ pub fn render_prometheus() -> String {
             "ferrosa_storage_write_failures_by_reason_total{{reason=\"{}\"}} {}\n",
             reason.label(),
             WRITE_FAILURE_REASON_TOTAL[reason.idx()].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str("# HELP ferrosa_storage_sstable_publication_refused_total Staged SSTable generations refused publication and quarantined instead of promoted.\n");
+    out.push_str("# TYPE ferrosa_storage_sstable_publication_refused_total counter\n");
+    for reason in PUBLICATION_REFUSED_REASONS {
+        out.push_str(&format!(
+            "ferrosa_storage_sstable_publication_refused_total{{reason=\"{}\"}} {}\n",
+            reason.label(),
+            SSTABLE_PUBLICATION_REFUSED_TOTAL[reason.idx()].load(Ordering::Relaxed)
         ));
     }
     out.push_str("# HELP ferrosa_storage_write_inline_flush_total StorageEngine::write calls that synchronously ran a memtable flush.\n");
