@@ -36,13 +36,17 @@ services:
 
   # ── Create the S3 bucket on first run ──
   rustfs-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on:
       rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
-      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
-             mc mb local/ferrosa --ignore-existing &&
+      sh -c "( aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ferrosa ||
+               aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ferrosa ) &&
              echo 'bucket ferrosa ready'"
     restart: "no"
 

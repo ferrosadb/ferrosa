@@ -78,8 +78,10 @@ pull_image() {
 }
 
 pull_image alpine
-pull_image rustfs/rustfs:latest
-pull_image quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+# Ours, pinned by digest: mirrored or built by ferrosa-installer and served from
+# downloads.ferrosa.ai (see https://downloads.ferrosa.ai/images/services/index.json).
+pull_image downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
+pull_image downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
 
 docker compose \
     -f "${COMPOSE_BASE}" \

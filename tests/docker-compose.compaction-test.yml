@@ -22,7 +22,7 @@ services:
   # S3-compatible object store (RustFS)
   # ---------------------------------------------------------------------------
   ct-rustfs:
-    image: rustfs/rustfs:latest
+    image: downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
     ports:
       - "29000:9000"    # S3 API
       - "29001:9001"    # Console
@@ -47,13 +47,17 @@ services:
   # Bucket bootstrap — creates compaction-test bucket
   # ---------------------------------------------------------------------------
   ct-rustfs-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on:
       ct-rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
-      sh -c "mc alias set local http://ct-rustfs:9000 rustfsadmin rustfsadmin &&
-             mc mb local/ferrosa-compaction-test --ignore-existing &&
+      sh -c "( aws --endpoint-url http://ct-rustfs:9000 s3api create-bucket --bucket ferrosa-compaction-test ||
+               aws --endpoint-url http://ct-rustfs:9000 s3api head-bucket --bucket ferrosa-compaction-test ) &&
              echo 'bucket ferrosa-compaction-test ready'"
     restart: "no"
 
