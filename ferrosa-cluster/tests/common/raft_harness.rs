@@ -468,6 +468,9 @@ pub struct TestCluster {
     extra_nodes: Arc<StdMutex<Vec<TestNode>>>,
     /// Default openraft Config used to bring up post-bootstrap voters.
     raft_lib_config: Arc<RaftLibConfig>,
+    /// Set by [`TestCluster::pin_leadership`]; nodes added afterwards start with
+    /// tick-driven elections already stopped.
+    leadership_pinned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Borrowed iterator across bootstrap + extra nodes.  Returned by
@@ -605,6 +608,7 @@ impl TestCluster {
             registry,
             extra_nodes: Arc::new(StdMutex::new(Vec::new())),
             raft_lib_config,
+            leadership_pinned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Hold the slot through the election (the oversubscription-sensitive
@@ -624,6 +628,12 @@ impl TestCluster {
     pub async fn add_pending_node(&self, node_id: u64) {
         let node =
             build_test_node(node_id, self.raft_lib_config.clone(), self.registry.clone()).await;
+        if self
+            .leadership_pinned
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            node.raft.runtime_config().elect(false);
+        }
         self.extra_nodes
             .lock()
             .expect("extra_nodes lock")
@@ -695,6 +705,38 @@ impl TestCluster {
                 "no leader elected within {timeout:?} — Raft election failed to converge \
                  (call require_leader before any leader-dependent step)"
             ),
+        }
+    }
+
+    /// Wait until every bootstrap voter agrees on one leader, then stop tick-driven
+    /// elections on every node so leadership changes only when a test changes it.
+    /// Returns the leader's node id. Fails loud if the voters never agree.
+    ///
+    /// Use it in any test that runs membership changes (or any other leader-bound
+    /// operation) on `leader_node()` and is not itself about elections: without it a
+    /// missed heartbeat on a starved CPU starts an election between "find the leader"
+    /// and "call it", and the call fails with `NotLeader`. Explicit leadership moves
+    /// (a leader transfer, a removed leader) are unaffected. A test that needs a real
+    /// failover calls [`Self::unpin_leadership`] first.
+    pub async fn pin_leadership(&self, timeout: Duration) -> u64 {
+        let leader = self
+            .wait_for_all_voters_leader(timeout)
+            .await
+            .expect("voters did not agree on a leader in time");
+        self.leadership_pinned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for node in self.nodes().iter() {
+            node.raft.runtime_config().elect(false);
+        }
+        leader
+    }
+
+    /// Undo [`Self::pin_leadership`]: tick-driven elections run again on every node.
+    pub fn unpin_leadership(&self) {
+        self.leadership_pinned
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for node in self.nodes().iter() {
+            node.raft.runtime_config().elect(true);
         }
     }
 

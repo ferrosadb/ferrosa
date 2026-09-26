@@ -420,7 +420,9 @@ async fn s_07_decommission_leader_auto_transfers_first() {
 async fn s_08_decommission_concurrent_with_add_serializes() {
     // S-08: concurrent add+remove serialize through `InProgress` retry.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    // Pinned: no election can move leadership between finding the leader and
+    // calling it, or onto the node this test adds.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let h_add = Uuid::new_v4();
     let n_add = uuid_to_node_id(h_add);
     let a: std::net::SocketAddr = "127.0.0.1:9501".parse().unwrap();
@@ -436,11 +438,13 @@ async fn s_08_decommission_concurrent_with_add_serializes() {
         .add_voter(h_rem, a_rem)
         .await
         .unwrap();
-    if cluster.leader_node().node_id == n_rem {
-        // Concurrent remove would hit S-07 — skip.
-        cluster.shutdown().await;
-        return;
-    }
+    // Leadership is pinned, so it cannot have moved to the node just added (which
+    // would put this test in S-07 territory). This used to be a silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n_rem,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     let c1 = MembershipChanger::new(leader_raft.clone(), cluster.membership_network());
     let c2 = MembershipChanger::new(leader_raft, cluster.membership_network());
@@ -455,7 +459,8 @@ async fn s_09_decommission_partitioned_node_succeeds_for_quorum() {
     // S-09: removing a partitioned node still succeeds because the
     // remaining {N1, N2} have quorum.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    // Pinned: leadership cannot move between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Add a 4th node we'll partition+remove (avoids touching the
     // bootstrap voters' identities).
@@ -469,11 +474,13 @@ async fn s_09_decommission_partitioned_node_succeeds_for_quorum() {
         .await
         .unwrap();
 
-    if cluster.leader_node().node_id == n {
-        // Skip S-07 territory.
-        cluster.shutdown().await;
-        return;
-    }
+    // Pinned leadership cannot have moved to the node just added (S-07 territory).
+    // This used to be a silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     // Partition the 4th node — use isolate_by_node_id because partition()
     // indexes into bootstrap voters only.
