@@ -95,10 +95,17 @@ class NightlyRunsEveryIgnoredTest(unittest.TestCase):
         self.assertIn("--ignored", self.count_cmd)
         self.assertIn("--list", self.count_cmd)
 
-    def test_the_job_is_given_time_to_build_the_node_image(self):
-        # test-cluster-up-ci.sh builds ferrosa-test-node itself when none is
-        # preloaded: a full release build inside docker, then the tests.
-        match = re.search(r"timeout-minutes:\s*(\d+)", self.nightly)
+    def test_the_cluster_runs_the_image_the_build_job_produced(self):
+        # The release build lives in its own job (release-shaped, default
+        # features) so the test job can stay --all-features throughout.
+        self.assertIn("build-node-image:", self.nightly)
+        self.assertIn("needs: build-node-image", self.nightly)
+        self.assertIn("docker load", self.nightly)
+        self.assertLess(self.nightly.index("docker load"), self.nightly.index("test-cluster-up-ci.sh"))
+
+    def test_the_test_job_is_given_time_for_the_whole_suite(self):
+        job = self.nightly[self.nightly.index("  slow-tests:"):]
+        match = re.search(r"timeout-minutes:\s*(\d+)", job)
         self.assertIsNotNone(match)
         self.assertGreaterEqual(int(match.group(1)), 120)
 

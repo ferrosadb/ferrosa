@@ -47,6 +47,7 @@ RELEASE_SHAPED_JOBS = {
     ("ci.yml", "aarch64-musl"): "checks release.yml's aarch64 packages and features",
     ("install-smoke.yml", "build"): "stages the real release tarball layout",
     ("nightly-fuzz.yml", "smoke-test"): "musl fallback for the nightly .deb image",
+    ("nightly-slow-tests.yml", "build-node-image"): "release image the nightly's test cluster runs",
 }
 
 # Jobs whose cargo build runs inside a script rather than a `run:` line, and the
