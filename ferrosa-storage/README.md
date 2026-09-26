@@ -131,6 +131,21 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `is_sorted` check for the already-sorted common case), so even a 1-input legacy
   rewrite re-sorts each partition — permanently fixing the on-disk order the
   streaming read path assumes.
+  **Promote directory fsync before input eviction (T-001, FMEA ST-29):**
+  `promote_compaction_output` renames the staged output into
+  `sstables/<table>/<gen>` and then fsyncs `sstables/<table>/` itself, reusing
+  the same barrier `flush.rs` uses for its own promoting renames
+  (`FileFlushTarget::fsync_dir`, now `pub(crate)`). `poll_compactions` only
+  calls `evict_local_input_sstable_files` when promotion returns `Ok`, so a
+  directory-fsync failure structurally prevents input eviction — without this,
+  a crash between the rename and the unlinks could persist the unlinks while
+  losing the rename, destroying both the inputs and the output. On failure the
+  rename is undone when the filesystem allows it; if even that fails, the
+  output is left as a visible orphan (a disk leak, not data loss — swept by a
+  future startup reconciliation, T-023) and the caller still sees `Err`.
+  `evict_local_input_sstable_files` no longer silently discards unlink errors:
+  unexpected failures are WARN-logged (a missing file is not an error). Full
+  atomic, fsynced retirement of the whole input generation is T-024.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes

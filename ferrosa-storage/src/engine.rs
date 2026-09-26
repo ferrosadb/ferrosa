@@ -5073,6 +5073,26 @@ impl StorageEngine {
         }
     }
 
+    /// T-001 fault-injection marker: a file with this name inside a
+    /// compaction output's directory makes the post-rename directory fsync in
+    /// [`Self::promote_compaction_output`] fail, so tests can prove no input
+    /// is ever unlinked when that durability barrier cannot be established.
+    #[cfg(test)]
+    const TEST_FAIL_PROMOTION_DIR_FSYNC: &str = ".test-promotion-fail-dir-fsync";
+
+    fn should_fail_promotion_dir_fsync(_output_dir: &std::path::Path) -> bool {
+        #[cfg(test)]
+        {
+            _output_dir
+                .join(Self::TEST_FAIL_PROMOTION_DIR_FSYNC)
+                .exists()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn temp_promotion_directory(
         target_dir: &std::path::Path,
         promoted_gen: u64,
@@ -11122,6 +11142,24 @@ impl StorageEngine {
             ))
         })?;
 
+        #[cfg(test)]
+        crate::flush::fsync_probe::note_rename(&final_target);
+
+        // Window E' (compaction-cancel-safety.md): the rename above only
+        // updates the directory through the page cache. Without fsyncing
+        // `target_dir`, a crash can persist a later input unlink while losing
+        // this rename -- both copies of the data gone. Every remaining step
+        // (opening the reader, building sidecars, evicting inputs) must not
+        // run until this directory entry is durable, so a failure here is
+        // fatal to the whole promotion.
+        Self::fsync_promoted_directory(
+            &target_dir,
+            &final_target,
+            &staging_dir,
+            &moved,
+            source_dir,
+        )?;
+
         Self::cleanup_promoted_compaction_output(source_dir, &old_prefix);
 
         let size_bytes = Self::generation_component_paths(&final_target, promoted_gen)
@@ -11134,6 +11172,80 @@ impl StorageEngine {
         promoted.path = final_target;
         promoted.size_bytes = size_bytes;
         Ok(promoted)
+    }
+
+    /// After the atomic rename into `final_target`, fsync `target_dir` so the
+    /// rename's directory entry is durable before any caller treats the
+    /// promotion as complete (compaction-cancel-safety.md window E' — T-001).
+    /// Reuses [`crate::flush::FileFlushTarget::fsync_dir`], the same barrier
+    /// `flush.rs` uses after its own promoting renames.
+    ///
+    /// On fsync failure, undo the rename so the promotion leaves no visible
+    /// trace when that is possible. If even the rollback rename fails, the
+    /// output stays visible without a durable directory entry -- a disk leak
+    /// (window B / `.promote-*` debris, already swept at startup, T-023),
+    /// never data loss, because this function still returns `Err` either way
+    /// and the only caller (`poll_compactions`) evicts inputs solely on `Ok`.
+    fn fsync_promoted_directory(
+        target_dir: &std::path::Path,
+        final_target: &std::path::Path,
+        staging_dir: &std::path::Path,
+        moved: &[(std::path::PathBuf, std::path::PathBuf)],
+        fail_injection_source: &std::path::Path,
+    ) -> ferrosa_common::Result<()> {
+        let fsync_result = if Self::should_fail_promotion_dir_fsync(fail_injection_source) {
+            Err(std::io::Error::other(
+                "simulated compaction promote directory fsync failure (test marker present)",
+            ))
+        } else {
+            crate::flush::FileFlushTarget::fsync_dir(target_dir)
+        };
+
+        let Err(e) = fsync_result else {
+            return Ok(());
+        };
+
+        match std::fs::rename(final_target, staging_dir) {
+            Ok(()) => {
+                for (source, target) in moved.iter().rev() {
+                    if !target.exists() {
+                        continue;
+                    }
+                    if let Err(restore_err) = std::fs::rename(target, source) {
+                        tracing::error!(
+                            %restore_err,
+                            from = %target.display(),
+                            to = %source.display(),
+                            "compaction: promote rollback could not restore a staged component; \
+                             it is left in the staging dir for startup cleanup"
+                        );
+                    }
+                }
+                if let Err(cleanup_err) = std::fs::remove_dir_all(staging_dir) {
+                    tracing::warn!(
+                        %cleanup_err,
+                        dir = %staging_dir.display(),
+                        "compaction: promote rollback left its staging dir behind (disk leak, swept at startup)"
+                    );
+                }
+            }
+            Err(rollback_err) => {
+                tracing::error!(
+                    %e,
+                    %rollback_err,
+                    dir = %target_dir.display(),
+                    target = %final_target.display(),
+                    "compaction: promote directory fsync failed and the rename could not be \
+                     undone; output remains visible without a durable directory entry -- \
+                     inputs must not be evicted"
+                );
+            }
+        }
+
+        Err(ferrosa_common::Error::InvalidFormat(format!(
+            "failed to fsync promoted compaction directory {}: {e}",
+            target_dir.display()
+        )))
     }
 
     fn cleanup_promoted_compaction_output(source_dir: &std::path::Path, promoted_prefix: &str) {
@@ -11163,6 +11275,11 @@ impl StorageEngine {
         }
     }
 
+    // T-024 (compaction-cancel-safety.md C4) replaces this with an atomic,
+    // fsynced retirement of the whole generation. Until then this only
+    // reaches a superseded input once `promote_compaction_output` has
+    // returned `Ok` (i.e. the output's directory entry is durable, T-001), so
+    // a crash here can still leak files but never loses both copies.
     fn evict_local_input_sstable_files(inputs: &[crate::compaction::metadata::SSTableMetadata]) {
         let standard_components = [
             "Data.db",
@@ -11177,7 +11294,17 @@ impl StorageEngine {
             for component in &standard_components {
                 let file_path = Self::generation_component_path(&input.path, &input.id, component)
                     .unwrap_or_else(|| input.path.join(format!("{}-{component}", input.id)));
-                let _ = std::fs::remove_file(&file_path);
+                #[cfg(test)]
+                crate::flush::fsync_probe::note_unlink(&file_path);
+                if let Err(e) = std::fs::remove_file(&file_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            %e,
+                            path = %file_path.display(),
+                            "compaction: failed to remove retired input component; left for reconciliation (T-024)"
+                        );
+                    }
+                }
             }
         }
     }
@@ -21634,6 +21761,190 @@ mod tests {
         assert!(
             !result.path.exists(),
             "original compaction output directory should be removed after successful promotion"
+        );
+    }
+
+    // ── T-001: fsync sstables/<table>/ before any input is unlinked ────────
+    //
+    // compaction-cancel-safety.md window E': nothing fsynced the table
+    // directory between the promote rename and the input unlinks, so a crash
+    // could persist the unlinks while losing the rename -- both copies gone.
+    // Both tests below drive the real `poll_compactions` path end to end
+    // (not just `promote_compaction_output` in isolation), so they prove the
+    // durability barrier actually gates eviction rather than merely that the
+    // two functions behave correctly on their own.
+
+    #[tokio::test]
+    async fn promote_dir_fsync_order_is_rename_then_dir_fsync_then_unlink() {
+        use crate::flush::fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        let _probe = crate::flush::fsync_probe::exclusive();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let events = crate::flush::fsync_probe::events();
+        let relevant: Vec<(usize, &Event)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| match event {
+                Event::Rename(p) | Event::Unlink(p) => p.starts_with(&sstable_dir),
+                Event::DirFsync(p) => *p == sstable_dir,
+                Event::FileFsync(_) => false,
+            })
+            .collect();
+
+        let rename_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::Rename(_)).then_some(*i))
+            .expect("promote should rename the staged output into sstables/<table>/");
+        let dir_fsync_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::DirFsync(_)).then_some(*i))
+            .expect("promote should fsync sstables/<table>/ after the rename");
+        let unlink_idx = relevant
+            .iter()
+            .find_map(|(i, e)| matches!(e, Event::Unlink(_)).then_some(*i))
+            .expect("a successful promote should be followed by input eviction");
+
+        assert!(
+            rename_idx < dir_fsync_idx,
+            "the promote rename must be recorded before the directory fsync: {relevant:?}"
+        );
+        assert!(
+            dir_fsync_idx < unlink_idx,
+            "the directory fsync must be recorded before any input is unlinked: {relevant:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_dir_fsync_failure_prevents_input_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        let pre_generations = StorageEngine::scan_generations(&sstable_dir);
+
+        let input_component_paths: Vec<std::path::PathBuf> = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let inputs = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            inputs
+                .iter()
+                .flat_map(|input| {
+                    let path = input.path.clone();
+                    let id = input.id.clone();
+                    [
+                        "Data.db",
+                        "Partitions.db",
+                        "Rows.db",
+                        "Filter.db",
+                        "Statistics.db",
+                    ]
+                    .into_iter()
+                    .map(move |component| {
+                        StorageEngine::generation_component_path(&path, &id, component)
+                            .unwrap_or_else(|| path.join(format!("{id}-{component}")))
+                    })
+                })
+                .collect()
+        };
+        assert!(
+            !input_component_paths.is_empty(),
+            "setup should have produced at least one input component"
+        );
+        for p in &input_component_paths {
+            assert!(
+                p.exists(),
+                "input component {p:?} should exist before compaction"
+            );
+        }
+
+        // Inject the dir-fsync failure marker into the shared compaction
+        // output directory before polling. `output.path` for a real
+        // compaction result is exactly this directory -- it is what
+        // `make_engine_with_pending_compaction` sets as
+        // `CompactionTask::output_dir`, and the sibling
+        // `compaction_promotion_fail_after_first_component_is_atomic_and_recoverable`
+        // test above confirms it by injecting its own marker into
+        // `result.path` the same way.
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        std::fs::write(
+            compaction_output_dir.join(StorageEngine::TEST_FAIL_PROMOTION_DIR_FSYNC),
+            b"1",
+        )
+        .unwrap();
+
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let post_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(
+            pre_generations, post_generations,
+            "a failed directory fsync must never leave a promoted generation visible"
+        );
+        for p in &input_component_paths {
+            assert!(
+                p.exists(),
+                "input component {p:?} must survive a promote whose directory fsync failed"
+            );
+        }
+    }
+
+    /// CS13-style crash test (T-001): after promoting a compaction output,
+    /// drop un-fsynced directory-entry writes for `sstables/<table>/` (as if
+    /// the filesystem crashed before the promote rename's directory entry
+    /// reached disk), then restart. The invariant this proves: with the fix
+    /// in this packet, either the promoted output's directory entry survived
+    /// the simulated crash, or the inputs were never unlinked -- never
+    /// neither.
+    ///
+    /// LazyFS setup (this harness is not implemented yet -- see below):
+    ///   1. Build/install LazyFS: <https://github.com/dsrhaslab/lazyfs>.
+    ///   2. Mount a LazyFS-backed directory with a fault config that can drop
+    ///      un-fsynced writes on trigger (LazyFS's crash-simulation fault).
+    ///   3. Point a `StorageEngine`'s `data_dir` at that mountpoint.
+    ///   4. Run a flush + compact cycle, trigger the LazyFS crash fault right
+    ///      after the directory fsync in `fsync_promoted_directory` but
+    ///      before `evict_local_input_sstable_files`, then remount clean and
+    ///      reopen the engine.
+    ///   5. Assert exactly one of {inputs, promoted output} is discoverable.
+    ///
+    /// Set `FERROSA_TEST_LAZYFS=1` to opt in once that harness exists. It
+    /// does not exist yet: this packet proves the ordering and failure-path
+    /// invariants with the in-process `fsync_probe` seam instead (the two
+    /// tests above). A real crash-consistency proof under LazyFS needs a
+    /// Linux host, which the project plan does not provision until T-070
+    /// (`specs/sstable-write-pump/compiled-project-plan.md`).
+    #[cfg(feature = "live-infra-tests")]
+    #[test]
+    fn promote_dir_fsync_lazyfs_crash_loses_neither_copy() {
+        if std::env::var("FERROSA_TEST_LAZYFS").is_err() {
+            panic!(
+                "FERROSA_TEST_LAZYFS not set -- install LazyFS \
+                 (https://github.com/dsrhaslab/lazyfs), mount a LazyFS-backed \
+                 directory with a fault config that can drop un-fsynced \
+                 writes, point a StorageEngine's data_dir at it, and re-run \
+                 with FERROSA_TEST_LAZYFS=1. See this test's doc comment for \
+                 the mount + fault-injection steps this harness still needs \
+                 (tracked for T-070, the first point with a Linux host)."
+            );
+        }
+        panic!(
+            "FERROSA_TEST_LAZYFS is set but the LazyFS mount / fault-injection \
+             harness is not implemented in this crate yet -- refusing to fake \
+             a pass. Implement the steps in this test's doc comment (T-070) \
+             before removing this panic."
         );
     }
 

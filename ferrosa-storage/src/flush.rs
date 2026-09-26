@@ -739,6 +739,22 @@ pub(crate) mod fsync_probe {
     static SYNCED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     static RENAMED_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+    /// A single durability-relevant event, in the order it happened.
+    ///
+    /// The per-kind vectors above (`SYNCED_FILES` etc.) lose relative order
+    /// between different kinds of events. `EVENTS` is the ordered timeline
+    /// used to prove sequencing invariants such as "rename happens before the
+    /// directory fsync, which happens before any input is unlinked"
+    /// (T-001 / compaction-cancel-safety.md window E').
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Rename(PathBuf),
+        FileFsync(PathBuf),
+        DirFsync(PathBuf),
+        Unlink(PathBuf),
+    }
 
     pub(crate) struct ExclusiveGuard {
         _guard: MutexGuard<'static, ()>,
@@ -762,6 +778,7 @@ pub(crate) mod fsync_probe {
         SYNCED_FILES.lock().expect("fsync probe poisoned").clear();
         SYNCED_DIRS.lock().expect("fsync probe poisoned").clear();
         RENAMED_FILES.lock().expect("fsync probe poisoned").clear();
+        EVENTS.lock().expect("fsync probe poisoned").clear();
     }
 
     pub(crate) fn note_file(path: &Path) {
@@ -769,6 +786,10 @@ pub(crate) mod fsync_probe {
             .lock()
             .expect("fsync probe poisoned")
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(Event::FileFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_dir(path: &Path) {
@@ -776,6 +797,10 @@ pub(crate) mod fsync_probe {
             .lock()
             .expect("fsync probe poisoned")
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(Event::DirFsync(path.to_path_buf()));
     }
 
     pub(crate) fn note_rename(path: &Path) {
@@ -783,6 +808,20 @@ pub(crate) mod fsync_probe {
             .lock()
             .expect("fsync probe poisoned")
             .push(path.to_path_buf());
+        EVENTS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(Event::Rename(path.to_path_buf()));
+    }
+
+    /// Record an attempted unlink (e.g. of a retired compaction input
+    /// component). Recorded regardless of whether the unlink succeeded, since
+    /// what matters for ordering proofs is when the attempt happened.
+    pub(crate) fn note_unlink(path: &Path) {
+        EVENTS
+            .lock()
+            .expect("fsync probe poisoned")
+            .push(Event::Unlink(path.to_path_buf()));
     }
 
     pub(crate) fn synced_files() -> HashSet<PathBuf> {
@@ -805,6 +844,11 @@ pub(crate) mod fsync_probe {
 
     pub(crate) fn renamed_files() -> Vec<PathBuf> {
         RENAMED_FILES.lock().expect("fsync probe poisoned").clone()
+    }
+
+    /// The full chronological timeline of rename/fsync/unlink events.
+    pub(crate) fn events() -> Vec<Event> {
+        EVENTS.lock().expect("fsync probe poisoned").clone()
     }
 }
 
@@ -1007,6 +1051,11 @@ impl FileFlushTarget {
 
     /// fsync the directory `dir` so that rename directory entries are durable.
     ///
+    /// `pub(crate)` so `StorageEngine::promote_compaction_output` (engine.rs,
+    /// T-001) can reuse this exact barrier for `sstables/<table>/` after
+    /// promoting a compaction output, instead of duplicating the open+sync_all
+    /// dance with its own durability semantics.
+    ///
     /// On POSIX a `rename(2)` updates the directory; that update lives in the
     /// page cache until the directory inode is fsynced. Without this, a crash
     /// after rename but before writeback can lose the final-named entry (or,
@@ -1014,7 +1063,7 @@ impl FileFlushTarget {
     /// flushed). Opening the directory and calling `sync_all()` flushes those
     /// entries. This is the single barrier that makes the temp→rename→final
     /// sequence crash-atomic.
-    fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
         let f = std::fs::File::open(dir)?;
         f.sync_all()?;
         #[cfg(test)]
