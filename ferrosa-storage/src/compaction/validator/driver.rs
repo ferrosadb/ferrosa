@@ -175,6 +175,7 @@ pub fn compact_all_to(
         output_dir: output_dir.clone(),
         schema: schema.clone(),
         table_id,
+        purge: None,
     };
     let meta = CompactionExecutor::execute_task(&task)
         .expect("compaction must succeed")
@@ -322,6 +323,7 @@ mod tests {
                 output_dir: out.clone(),
                 schema: schema.clone(),
                 table_id: table_id.clone(),
+                purge: None,
             })
             .expect("compaction must succeed")
             .metadata;
