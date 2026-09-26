@@ -304,6 +304,9 @@ enum FileReadAtInner {
         path: std::path::PathBuf,
         cache: std::sync::Arc<FdCache>,
     },
+    /// Cache-bypassing, read-ahead sequential scan — see [`FileReadAt::open_scan`].
+    #[cfg(unix)]
+    Scan(Box<crate::scan::ReadAheadReader<crate::direct::DirectReadFile>>),
 }
 
 static GLOBAL_FD_CACHE: std::sync::OnceLock<std::sync::Arc<FdCache>> = std::sync::OnceLock::new();
@@ -504,6 +507,37 @@ impl FileReadAt {
     }
 }
 
+impl FileReadAt {
+    /// True when this reader is a cache-bypassing sequential scan
+    /// ([`Self::open_scan`]) rather than a shared, page-cached reader.
+    pub fn is_scan(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self.inner, FileReadAtInner::Scan(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Open `path` for a one-pass sequential scan (compaction input): reads bypass
+    /// the OS page cache ([`crate::direct::DirectReadFile`]) and the next
+    /// `window`-byte span is fetched in the background while the current one is
+    /// consumed ([`crate::scan::ReadAheadReader`]). Holds at most two windows.
+    ///
+    /// Not for point reads: random access defeats the window. The file must already
+    /// be local — callers rehydrate evicted components first, as compaction does.
+    #[cfg(unix)]
+    pub fn open_scan(path: impl AsRef<Path>, window: usize) -> Result<Self> {
+        let direct = crate::direct::DirectReadFile::open(path)?;
+        let reader = crate::scan::ReadAheadReader::with_prefetch(direct, window)?;
+        Ok(Self {
+            inner: FileReadAtInner::Scan(Box::new(reader)),
+        })
+    }
+}
+
 impl Drop for FileReadAt {
     fn drop(&mut self) {
         if let FileReadAtInner::CachedFd { path, cache } = &self.inner {
@@ -525,6 +559,8 @@ impl ReadAt for FileReadAt {
                 Ok(n)
             }
             FileReadAtInner::Empty => Ok(0),
+            #[cfg(unix)]
+            FileReadAtInner::Scan(reader) => reader.read_at(buf, offset),
             FileReadAtInner::CachedFd { path, cache } => {
                 let file = match cache.get_or_open(path) {
                     Ok(file) => file,
@@ -561,6 +597,8 @@ impl ReadAt for FileReadAt {
         match &self.inner {
             FileReadAtInner::Mmap { len, .. } => Ok(*len),
             FileReadAtInner::Empty => Ok(0),
+            #[cfg(unix)]
+            FileReadAtInner::Scan(reader) => reader.len(),
             FileReadAtInner::CachedFd { path, cache } => match std::fs::metadata(path) {
                 Ok(metadata) => Ok(metadata.len()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -682,6 +720,37 @@ mod tests {
             self.len_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.data.len() as u64)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_scan_reads_are_byte_exact_and_prefetched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scan-Data.db");
+        let expected: Vec<u8> = (0..300_000usize).map(|i| (i * 7 % 253) as u8).collect();
+        std::fs::write(&path, &expected).expect("write");
+
+        let f = FileReadAt::open_scan(&path, 64 * 1024).expect("open_scan");
+        assert_eq!(f.len().expect("len"), expected.len() as u64);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 5_000];
+        let mut off = 0u64;
+        loop {
+            let n = f.read_at(&mut buf, off).expect("read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            off += n as u64;
+        }
+        assert_eq!(out, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_scan_of_a_missing_file_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(FileReadAt::open_scan(dir.path().join("gone-Data.db"), 4096).is_err());
     }
 
     #[test]

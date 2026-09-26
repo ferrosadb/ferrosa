@@ -29,6 +29,7 @@ pub mod marshal;
 pub mod partition_index;
 pub mod reader;
 pub mod row_index;
+pub mod scan;
 pub mod statistics;
 pub mod toc;
 pub mod trie;

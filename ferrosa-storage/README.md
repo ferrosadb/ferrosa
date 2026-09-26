@@ -80,6 +80,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   of 2 was over-conservative. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
   `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
   startup.
+  **Direct-read + read-ahead input (opt-in):** `FERROSA_COMPACTION_DIRECT_READ=1`
+  opens each input `Data.db` as a private cache-bypassing scan
+  (`FileReadAt::open_scan`: O_DIRECT / `F_NOCACHE`) with a background read-ahead of
+  `FERROSA_COMPACTION_READAHEAD_BYTES` (default 1 MiB, cap 256 MiB; two windows
+  resident per input), so a compaction pass neither evicts query-hot pages nor
+  issues one small `pread` per compression chunk (CASSANDRA-15452). Scan readers
+  are **not** parked in the shared reader pool (the live read path does point
+  reads a one-pass window cannot serve), so this mode's residency is bounded by
+  `inputs × 2 windows` per task instead of the pool. Off by default, matching the
+  `FERROSA_SSTABLE_DIRECT_IO` writer rollout. Watch
+  `ferrosa_sstable_direct_read_fallbacks_total`: non-zero means the file system
+  rejected O_DIRECT and the bypass is inactive.
   Existing backlogs drain without waiting for another flush: every maintenance
   poll consumes at most eight results and admits at most eight table tasks, then
   schedules another round when work completes. Descriptor-cached, constant-size
