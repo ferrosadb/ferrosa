@@ -11,7 +11,7 @@
 services:
 
   rustfs:
-    image: rustfs/rustfs:latest
+    image: downloads.ferrosa.ai/rustfs@sha256:58c589bedfab28d001fc6176735872ac84323dddc6c5313cc95260600ed1ae8d
     ports:
       - "30000:9000"
       - "30001:9001"
@@ -33,13 +33,17 @@ services:
       start_period: 5s
 
   rustfs-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: downloads.ferrosa.ai/aws-cli@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
     depends_on:
       rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin  # pragma: allowlist secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
-      sh -c "mc alias set local http://rustfs:9000 rustfsadmin rustfsadmin &&
-             mc mb local/ferrosa-cql-test --ignore-existing &&
+      sh -c "( aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket ferrosa-cql-test ||
+               aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket ferrosa-cql-test ) &&
              echo 'bucket ferrosa-cql-test ready'"
     restart: "no"
 
