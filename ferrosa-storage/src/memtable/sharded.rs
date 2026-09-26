@@ -9,7 +9,7 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -68,6 +68,9 @@ pub struct ShardedBTreeMemtable {
     /// Number of times a shard write lock experienced contention
     /// (try_write failed, had to block). Zero contention is the ideal case.
     pub write_contention_count: AtomicUsize,
+    /// Smallest timestamp of anything accepted by `put` (`i64::MAX` when empty).
+    /// Lowered BEFORE the row is stored, so it never reads higher than the data.
+    min_ts: AtomicI64,
 }
 
 impl ShardedBTreeMemtable {
@@ -83,6 +86,7 @@ impl ShardedBTreeMemtable {
             size: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             write_contention_count: AtomicUsize::new(0),
+            min_ts: AtomicI64::new(i64::MAX),
         }
     }
 
@@ -138,6 +142,11 @@ impl Memtable for ShardedBTreeMemtable {
         // would land an 8-byte cell in a 16-byte column, wedging every
         // subsequent flush attempt.
         super::validate_row_against_schema(&row, schema)?;
+        // Record the timestamp before the row becomes visible (SeqCst pairs with
+        // `min_timestamp`), so a compaction that reads the minimum and then sees the
+        // data can never have seen a higher minimum than the data holds.
+        self.min_ts
+            .fetch_min(super::row_min_timestamp(&row), Ordering::SeqCst);
         let idx = self.shard_index(key);
         let mut shard = match self.shards[idx].try_write() {
             Some(guard) => guard,
@@ -304,6 +313,10 @@ impl Memtable for ShardedBTreeMemtable {
 
     fn partition_count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    fn min_timestamp(&self) -> i64 {
+        self.min_ts.load(Ordering::SeqCst)
     }
 }
 
@@ -873,6 +886,34 @@ mod tests {
         let key = make_key("pk1");
         let row = make_row(0, &[0u8; 16], 1000);
         mem.put(&key, row, &schema).unwrap();
+    }
+
+    #[test]
+    fn min_timestamp_is_max_when_empty_then_tracks_the_lowest_write() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = test_schema();
+        assert_eq!(mem.min_timestamp(), i64::MAX, "nothing written yet");
+        mem.put(&make_key("a"), make_row(0, b"x", 5_000), &schema)
+            .unwrap();
+        assert_eq!(mem.min_timestamp(), 5_000);
+        // A later write with an OLDER timestamp (a replayed hint, a client-supplied
+        // timestamp) lowers it; a newer one does not raise it.
+        mem.put(&make_key("b"), make_row(0, b"y", 1_000), &schema)
+            .unwrap();
+        mem.put(&make_key("c"), make_row(0, b"z", 9_000), &schema)
+            .unwrap();
+        assert_eq!(mem.min_timestamp(), 1_000);
+    }
+
+    #[test]
+    fn a_rejected_write_does_not_lower_min_timestamp() {
+        let mem = ShardedBTreeMemtable::new(4);
+        let schema = timeuuid_schema();
+        // 8-byte value in a TimeUUID column is rejected before it is stored.
+        assert!(mem
+            .put(&make_key("a"), make_row(0, &[0u8; 8], 1), &schema)
+            .is_err());
+        assert_eq!(mem.min_timestamp(), i64::MAX);
     }
 
     #[test]

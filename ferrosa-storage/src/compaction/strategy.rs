@@ -164,6 +164,7 @@ impl CompactionStrategy for SizeTieredStrategy {
                                 output_dir: self.config.output_dir.join(table_id.to_string()),
                                 schema: schema.clone(),
                                 table_id: table_id.clone(),
+                                purge: None,
                             });
                         } else {
                             inputs.clear();
@@ -180,6 +181,7 @@ impl CompactionStrategy for SizeTieredStrategy {
                             output_dir: self.config.output_dir.join(table_id.to_string()),
                             schema: schema.clone(),
                             table_id: table_id.clone(),
+                            purge: None,
                         });
                         input_bytes = 0;
                     }
@@ -191,6 +193,7 @@ impl CompactionStrategy for SizeTieredStrategy {
                         output_dir: self.config.output_dir.join(table_id.to_string()),
                         schema: schema.clone(),
                         table_id: table_id.clone(),
+                        purge: None,
                     });
                 }
             }
@@ -241,6 +244,7 @@ pub fn legacy_rewrite_tasks(
         output_dir: output_dir.join(table_id.to_string()),
         schema: schema.clone(),
         table_id: table_id.clone(),
+        purge: None,
     };
     for sst in legacy {
         // Close the current chunk before it would exceed either bound — but

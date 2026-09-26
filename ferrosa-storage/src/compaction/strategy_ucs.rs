@@ -167,6 +167,7 @@ impl CompactionStrategy for UnifiedCompactionStrategy {
                     output_dir: self.config.output_dir.clone(),
                     schema: schema.clone(),
                     table_id: table_id.clone(),
+                    purge: None,
                 });
             }
         }

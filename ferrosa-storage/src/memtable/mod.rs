@@ -332,5 +332,60 @@ pub trait Memtable: Send + Sync {
 
     /// Number of partitions stored. Wait-free (`AtomicUsize`).
     fn partition_count(&self) -> usize;
+
+    /// The smallest timestamp (microseconds) of any cell, liveness or deletion ever
+    /// written to this memtable, or `i64::MAX` when nothing has been written.
+    ///
+    /// Compaction reads it to decide whether a tombstone may be purged: unflushed
+    /// data older than the tombstone would be resurrected. The default is
+    /// `i64::MIN` ("unknown, older than everything") so an implementation that does
+    /// not track timestamps blocks purging instead of enabling it unsafely.
+    fn min_timestamp(&self) -> i64 {
+        i64::MIN
+    }
+}
+
+/// The smallest timestamp a row carries: its cells, primary-key liveness and
+/// deletion marker. `i64::MAX` for a row with none of them.
+pub(crate) fn row_min_timestamp(row: &Row) -> i64 {
+    let cells = row.cells.iter().map(|(_, cell)| cell.timestamp);
+    let liveness = row
+        .primary_key_liveness
+        .has_timestamp()
+        .then_some(row.primary_key_liveness.timestamp);
+    let deletion = (!row.deletion.is_live()).then_some(row.deletion.marked_for_delete_at);
+    cells
+        .chain(liveness)
+        .chain(deletion)
+        .min()
+        .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod min_timestamp_tests {
+    use super::*;
+    use ferrosa_common::CellValue;
+    use ferrosa_sstable::types::LivenessInfo;
+
+    fn row(cells: Vec<i64>, liveness: Option<i64>, deletion: Option<i64>) -> Row {
+        Row {
+            clustering: vec![],
+            cells: cells
+                .into_iter()
+                .map(|ts| (0, CellValue::live(b"v".to_vec(), ts)))
+                .collect(),
+            deletion: deletion.map_or(DeletionTime::LIVE, |ts| DeletionTime::new(ts, 1)),
+            primary_key_liveness: liveness.map_or(LivenessInfo::NONE, LivenessInfo::with_timestamp),
+        }
+    }
+
+    #[test]
+    fn row_min_timestamp_covers_cells_liveness_and_deletion() {
+        assert_eq!(row_min_timestamp(&row(vec![], None, None)), i64::MAX);
+        assert_eq!(row_min_timestamp(&row(vec![50, 30], None, None)), 30);
+        assert_eq!(row_min_timestamp(&row(vec![50], Some(20), None)), 20);
+        assert_eq!(row_min_timestamp(&row(vec![50], Some(20), Some(10))), 10);
+        assert_eq!(row_min_timestamp(&row(vec![], None, Some(7))), 7);
+    }
 }
 pub mod vector_index;
