@@ -295,6 +295,7 @@ mod tests {
             host_id,
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 

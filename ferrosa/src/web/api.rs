@@ -57,6 +57,7 @@ pub fn routes() -> Router<WebAppState> {
 /// credentials.
 pub async fn get_metrics(
     State(registry): State<Arc<VirtualTableRegistry>>,
+    State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
 ) -> (
     StatusCode,
     [(axum::http::header::HeaderName, &'static str); 1],
@@ -76,6 +77,9 @@ pub async fn get_metrics(
     // `_fallbacks_total` MUST stay 0 when FERROSA_SSTABLE_DIRECT_IO=1 — non-zero
     // means the fs rejected O_DIRECT and Data.db is page-cached (mitigation inert).
     ferrosa_sstable::direct::render_prometheus(&mut body);
+    // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
+    // listener failed to bind or exited, and `/readyz` reports not ready.
+    listeners.render_prometheus(&mut body);
     // Raft consensus liveness: ferrosa_raft_current_term / _is_leader /
     // _has_leader (fed by a current_leader() poller) + the election-storm counter
     // (_election_storm_term_jumps_total). The scan-storm regression (t_88223ad0
@@ -877,6 +881,7 @@ mod tests {
             host_id,
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 
@@ -1704,7 +1709,8 @@ mod tests {
         registry.register(Arc::new(table));
 
         let state = Arc::new(registry);
-        let (status, headers, body) = get_metrics(State(state)).await;
+        let listeners = Arc::new(crate::listener_status::ListenerStatus::default());
+        let (status, headers, body) = get_metrics(State(state), State(listeners)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[0].1, "text/plain; charset=utf-8");
         assert!(body.contains("ferrosa_test_table_count"));
@@ -2464,6 +2470,35 @@ mod tests {
         assert!(
             ct.starts_with("text/plain"),
             "content-type must be text/plain even with empty registry, got: {ct}"
+        );
+    }
+
+    /// A background client listener that failed to bind is visible to a scraper as
+    /// `ferrosa_listener_up{listener=...} 0` instead of only as one ERROR log line.
+    #[tokio::test]
+    async fn metrics_export_the_health_of_the_background_listeners() {
+        let state = make_state();
+        state.listeners.mark_up("graph_http");
+        state
+            .listeners
+            .mark_failed("postgres", "Address already in use (os error 98)");
+        let router = crate::web::build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ferrosa_listener_up{listener=\"graph_http\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrosa_listener_up{listener=\"postgres\"} 0"),
+            "{text}"
         );
     }
 }

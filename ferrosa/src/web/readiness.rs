@@ -85,7 +85,10 @@ fn mode_label(mode: DeploymentMode) -> &'static str {
 /// # Forming / Cluster modes
 /// Returns `200` only if a Raft leader is currently known to this node.
 /// Otherwise returns `503` with `{"ready":false,"waiting_for":"raft_leader"}`.
-pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCode, Json<Value>) {
+pub async fn readyz_handler(
+    State(mc): State<Arc<ModeController>>,
+    State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
+) -> (StatusCode, Json<Value>) {
     if !mc.consensus_is_healthy() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -93,6 +96,26 @@ pub async fn readyz_handler(State(mc): State<Arc<ModeController>>) -> (StatusCod
                 "ready": false,
                 "waiting_for": "consensus_runtime",
                 "detail": "consensus runtime failed; retry another node"
+            })),
+        );
+    }
+    // A background client listener (Postgres, SPARQL, graph HTTP, Bolt) that failed
+    // to bind was only an ERROR log line; the node kept probing ready with a client
+    // port missing. Name the failed listeners instead.
+    let failed_listeners = listeners.failed();
+    if !failed_listeners.is_empty() {
+        let failed: Vec<Value> = failed_listeners
+            .into_iter()
+            .map(|(listener, reason)| json!({"listener": listener, "reason": reason}))
+            .collect();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ready": false,
+                "waiting_for": "listeners",
+                "failed": failed,
+                "detail": "a client listener failed to start; see the reasons and the \
+                    ferrosa_listener_up metric"
             })),
         );
     }
@@ -270,6 +293,7 @@ mod tests {
             host_id,
             auth_disabled: true,
             debug: None,
+            listeners: std::sync::Arc::new(crate::listener_status::ListenerStatus::default()),
         }
     }
 
@@ -602,6 +626,40 @@ what made this failure invisible"
         let pair = make_state();
         pair.mode_controller.set_mode_for_test(DeploymentMode::Pair);
         assert_eq!(probe(pair).await.0, StatusCode::OK);
+    }
+
+    /// A client listener that failed to bind used to be one ERROR log line while the
+    /// node kept answering `/readyz` 200, so an orchestrator saw a healthy node with
+    /// a missing port. The probe now names the failed listener.
+    #[tokio::test]
+    async fn readyz_is_not_ready_while_a_client_listener_has_failed() {
+        let state = make_state();
+        state.listeners.mark_up("postgres");
+        state
+            .listeners
+            .mark_failed("sparql", "Address already in use (os error 98)");
+        let (status, body) = probe(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["waiting_for"], "listeners");
+        assert_eq!(body["failed"][0]["listener"], "sparql");
+        assert_eq!(
+            body["failed"][0]["reason"],
+            "Address already in use (os error 98)"
+        );
+        assert_eq!(
+            body["failed"].as_array().unwrap().len(),
+            1,
+            "only the failed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_recovers_once_the_listener_is_serving_again() {
+        let state = make_state();
+        state.listeners.mark_failed("bolt", "denied");
+        state.listeners.mark_up("bolt");
+        assert_eq!(probe(state).await.0, StatusCode::OK);
     }
 
     /// The Cluster mode (no Raft instance installed yet) must return 503.

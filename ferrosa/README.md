@@ -47,7 +47,7 @@ apply when neither source sets the listener.
 | Graph HTTP | `127.0.0.1:7474` | `ferrosa-graph` | only if graph enabled; `FERROSA_GRAPH_BIND` / `[graph].bind` |
 | Bolt v5 | `127.0.0.1:7687` | `ferrosa-graph` | only if graph enabled; `FERROSA_BOLT_PORT` / `[graph].bolt_port`; uses the host resolved for Graph HTTP |
 | SPARQL HTTP | `127.0.0.1:8080` | `ferrosa-sparql` | enabled by default; `FERROSA_SPARQL_BIND` / `[sparql].bind` |
-| Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind`. `/readyz` and `/health`: when `FERROSA_EXPECTED_CLUSTER_SIZE` is set they return 503 `waiting_for: declared_topology` until that topology is met (the same gate CQL uses) |
+| Web console + `/metrics` | `127.0.0.1:9090` | this crate (`web/`) | `FERROSA_WEB_BIND` / `[web].bind`. `/readyz` and `/health`: when `FERROSA_EXPECTED_CLUSTER_SIZE` is set they return 503 `waiting_for: declared_topology` until that topology is met (the same gate CQL uses). They also return 503 `waiting_for: listeners` while a background client listener (graph HTTP, Bolt, SPARQL, Postgres) has failed to bind or exited; `ferrosa_listener_up{listener="…"}` on `/metrics` is 1/0 for each. A bind failure there used to be one ERROR log line while the node kept probing ready |
 
 ## Startup order (`main`)
 

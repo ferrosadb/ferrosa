@@ -59,6 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+mod listener_status;
 mod log_rotation;
 mod repair_wiring;
 mod runtime;
@@ -2092,6 +2093,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Health of the listeners that start in background tasks (graph HTTP, Bolt,
+    // SPARQL, Postgres). A bind failure used to be one ERROR line while `/readyz`
+    // kept answering 200; each listener now records itself here, and `/readyz` and
+    // `/metrics` report it.
+    let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
+
     // 9b. Web observability console — reuse the same registry as the CQL router.
     let web_state = web::WebAppState {
         registry: schema.virtual_tables_arc(),
@@ -2101,6 +2108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_id,
         auth_disabled,
         debug: Some(web::debug::DebugState::new()),
+        listeners: listener_status.clone(),
     };
     // `[web] bind` is authoritative over FERROSA_WEB_BIND, then the loopback
     // default. The resolved address is the one passed to the listener.
@@ -2249,9 +2257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema: schema_for_http,
             auth_disabled,
         };
+        listener_status.mark_up("graph_http");
+        let graph_http_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_http(&http_config, state).await {
                 tracing::error!(%e, "graph HTTP server failed");
+                graph_http_status.mark_failed("graph_http", &e);
             }
         });
 
@@ -2268,6 +2279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bolt_engine = graph_engine;
         let bolt_schema = schema.clone();
         let bolt_shutdown = shutdown_rx.clone();
+        listener_status.mark_up("bolt");
+        let bolt_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::bolt::server::start_bolt_server(
                 bolt_engine,
@@ -2278,6 +2291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             {
                 tracing::error!(%e, "Bolt server failed");
+                bolt_status.mark_failed("bolt", &e);
             }
         });
         tracing::info!(%bolt_bind, "Bolt server starting");
@@ -2287,10 +2301,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a misleading missing-table error), serve a thin endpoint that returns
         // a clear "graph engine disabled" error + remediation on every request.
         tracing::info!("graph engine disabled (set FERROSA_GRAPH_ENABLED=true to enable)");
+        listener_status.mark_up("graph_http");
+        let graph_stub_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) = ferrosa_graph::http::start_graph_disabled_http(&graph_http_config).await
             {
                 tracing::error!(%e, "graph disabled-engine HTTP stub failed");
+                graph_stub_status.mark_failed("graph_http", &e);
             }
         });
     }
@@ -2320,11 +2337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bind_addr: sparql_bind,
         };
 
+        listener_status.mark_up("sparql");
+        let sparql_status = listener_status.clone();
         runtimes.background.spawn(async move {
             if let Err(e) =
                 ferrosa_sparql::http::start_sparql_http(&sparql_config, sparql_state).await
             {
                 tracing::error!(%e, "SPARQL HTTP server failed");
+                sparql_status.mark_failed("sparql", &e);
             }
         });
 
@@ -2347,17 +2367,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             default_schema: "public".into(),
             accord_committer: pg_accord_committer,
         });
+        let pg_status = listener_status.clone();
         runtimes.background.spawn(async move {
             match tokio::net::TcpListener::bind(pg_bind).await {
                 Ok(listener) => {
+                    pg_status.mark_up("postgres");
                     tracing::info!(%pg_bind, "Postgres server listening");
                     if let Err(e) =
                         ferrosa_postgres::server::serve(listener, pg_store, query_ctx).await
                     {
                         tracing::error!(%e, "Postgres server failed");
+                        pg_status.mark_failed("postgres", &e);
                     }
                 }
-                Err(e) => tracing::error!(%e, %pg_bind, "Postgres bind failed"),
+                Err(e) => {
+                    tracing::error!(%e, %pg_bind, "Postgres bind failed");
+                    pg_status.mark_failed("postgres", format_args!("bind {pg_bind} failed: {e}"));
+                }
             }
         });
     }
