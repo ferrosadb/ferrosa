@@ -1,7 +1,7 @@
 # ferrosa-sstable
 
 > The Cassandra-compatible **BTI SSTable** reader/writer — the crate's on-disk
-> data layer. Reads and writes the 7-component BTI (Big Trie-Indexed) format
+> data layer. Reads and writes the 8-component BTI (Big Trie-Indexed) format
 > over backing-store-agnostic positional I/O traits.
 
 ## What this crate is
@@ -22,9 +22,9 @@ resolution beyond the serialization header, or cluster routing.
 ## What's implemented
 
 - **BTI write** — `SSTableWriter` accepts partitions in token order and emits
-  all 7 components (Data.db, Partitions.db, Rows.db, Filter.db,
-  CompressionInfo.db / CRC.db, Statistics.db, TOC.txt) either as in-memory
-  buffers (`SSTableOutput`) or staged files (`SSTableOutputFiles`). A
+  all components (Data.db, Partitions.db, Rows.db, Filter.db,
+  CompressionInfo.db / CRC.db, Statistics.db, Digest.crc32, TOC.txt) either as
+  in-memory buffers (`SSTableOutput`) or staged files (`SSTableOutputFiles`). A
   self-readback verification pass (`WriteOptions::verify_output`, default on)
   reopens the finished table and checks the partition count.
 - **BTI read** — `SSTableReader` opens a table from component handles and serves
@@ -32,6 +32,18 @@ resolution beyond the serialization header, or cluster routing.
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
   token-seek (`seek_to_token`) and projection variants.
+- **Source checksums (T-011)** — `Digest.crc32` (a single CRC32 over the final
+  on-disk Data.db bytes) is written for every table; `CRC.db` (a per-chunk
+  CRC32 table, Cassandra-compatible layout) is written for uncompressed
+  tables. Both are computed while Data.db is written, never by a separate
+  re-read. A caller opts a reader into verification with
+  `SSTableReader::load_digest` / `load_crc_table`; once loaded,
+  `verify_digest()` checks the whole file and every uncompressed chunk read
+  is checked against `CRC.db`, naming the failing chunk's byte offset on
+  mismatch. An SSTable without these components (older than T-011, or opened
+  without loading them) reads exactly as before — "not checked", logged once
+  per generation, never an error. See `checksum` module docs for the exact
+  on-disk formats.
 - **Complex (non-frozen collection) columns** — `list`/`set`/`map` columns
   read and write Cassandra's per-element cell layout: `uvint(cell-count)` then
   one cell per element, each with a length-prefixed cell path (list → TimeUUID,
@@ -81,6 +93,7 @@ resolution beyond the serialization header, or cluster routing.
 
 | Module | Responsibility |
 |--------|----------------|
+| `checksum` | `DigestCrc32` / `ChunkCrc` (writer-side streaming checksums), `ChunkCrcTable` (reader-side CRC.db parse + verify state) — `Digest.crc32` and `CRC.db` formats |
 | `io` | `ReadAt`/`WriteAt` positional traits, `FileReadAt`/`FileWriteAt`, bounded block cache (`CachedReadAt`) |
 | `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`). `AlignedBuf` now takes its alignment at construction (`AlignedBuf::new(capacity, align)`, `align` a power of two `>= MIN_BLOCK`) instead of a fixed `BLOCK` constant, and `full_block_prefix(filled, block)` takes the block as a parameter — the device block probed per file (D4) can exceed 4096. `DirectWriter` itself is unchanged behaviorally: it still runs at a fixed `MIN_BLOCK` (4096) internally |
 | `direct` (read side) | `DirectReadFile` — cache-bypassing positional reader (O_DIRECT / `F_NOCACHE`, aligned bounce buffer, any offset/length). Fallback to buffered reads + `POSIX_FADV_DONTNEED` is WARN-logged and counted in `direct_read_fallbacks_total` |
@@ -117,8 +130,9 @@ constant per-partition memory.
 | Direct I/O | `direct::DirectWriter` (page-cache-bypassing sequential writer: O_DIRECT/`F_NOCACHE`), `direct::DirectReadFile`, `DirectMode`, `direct_write_{fallbacks,files,bytes}_total`, `direct_read_{fallbacks,files,bytes}_total` |
 | Write pump tunables | `pump::PumpConfig` (`from_env`, `effective_segment`), `pump::{SEGMENT_BYTES_ENV, QUEUE_DEPTH_ENV}` |
 | Scan / read-ahead | `scan::ReadAheadReader::{new, with_prefetch}`, `FileReadAt::{open_scan, is_scan}`, `scan::parse_scan_window` |
-| Reader | `SSTableReader::{open, get_partition, get_clustering_row, may_contain_key, partitions_iter, seek_to_token, salvage, validate_data_extent}`, `SSTableComponents` |
+| Reader | `SSTableReader::{open, get_partition, get_clustering_row, may_contain_key, partitions_iter, seek_to_token, salvage, validate_data_extent, load_crc_table, load_digest, verify_digest}`, `SSTableComponents` |
 | Writer | `SSTableWriter::{new, new_file_backed, add_partition, finish, finish_to_directory}`, `WriteOptions`, `SSTableOutput`, `SSTableOutputFiles` |
+| Checksums | `checksum::{DigestCrc32, ChunkCrc, ChunkCrcTable, digest_bytes, format_digest, parse_digest, compute_chunk_crc}` |
 | Types | `Partition`, `Row`, `LivenessInfo`, `DeletionTime`, `Compression` |
 
 ## Dependencies

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sstable
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-09-26
 ---
 
 # ferrosa-sstable — FMEA / Known Issues
@@ -24,6 +24,7 @@ severity — a wrong byte here is silent, durable data loss.
 | ST-9 | Partitions added out of token order to the writer | Corrupt partition trie → wrong/missing lookups | 9 | 2 | 6 | 108 | Documented precondition (`add_partition` requires token order). Not currently asserted at the API boundary — a debug-assert on monotonic keys would lower detection cost. |
 | ST-10 | `seek_to_token` resident index scales with partition count | Repair Merkle scan over a multi-GB table OOMs | 8 | 2 | 3 | 48 | Fixed: `build_token_summary` downsamples to a hard `PARTITION_TOKEN_SUMMARY_MAX_ENTRIES` (65 536) ceiling; small tables keep a full stride-1 index. |
 | ST-11 | Bloom filter false-positive / hash mismatch vs Cassandra | Extra Data.db reads (perf) or, if hashes diverge, missed keys | 7 | 2 | 5 | 70 | Cassandra-compatible double-hashing over Murmur3 `h1`/`h2` from `ferrosa-common`; FP rate tunable via `WriteOptions::bloom_fp_chance`. |
+| ST-12 | Uncompressed Data.db had no checksum at all (stale bytes / hole / bit flip with the right length reads as valid) | Silent bit-rot or stale-segment corruption undetectable until a decode error, or never | 9 | 3 | 8 | 216 | **Fixed (T-011).** `Digest.crc32` (every table) and `CRC.db` (uncompressed tables, per-chunk CRC32) are computed while Data.db is written (`checksum` module). **Residual gap:** verification is opt-in per reader (`load_digest`/`load_crc_table`) — wired into `ferrosa-storage`'s flush-open helpers (`flush.rs::{open_file_sstable, open_reader_from_paths}` and `engine.rs::open_sstable_from_dir`), but a caller that constructs `SSTableReader::open` directly and never calls the loaders (e.g. a future new caller, `ferrosa-ctl`, `ferrosa-sstable-dump`) reads unchecked with no error. Compaction's own content verification (M2/M3 in `publication-safety.md`) and the R5 scrub pass are separate, not-yet-built consumers of these checksums (tracked as T-012/T-038 in `compiled-project-plan.md`). |
 
 ## Top risks to act on
 
@@ -51,3 +52,7 @@ severity — a wrong byte here is silent, durable data loss.
   that rewrite introduces; `oracle_file_backed_matches_in_memory` (1000
   proptest cases) catches the writer's two entry points diverging from each
   other.
+- `checksum_` prefixed tests in `checksum.rs`, `writer.rs`, `reader.rs` (T-011) —
+  digest/CRC.db format proptests, writer↔`crc32fast` cross-checks across chunk
+  boundaries, a flipped-bit-in-Data.db regression naming the failing chunk
+  offset, and an old-SSTable-without-components-still-reads regression.

@@ -1,14 +1,16 @@
 ---
 crate: ferrosa-sstable
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-09-26
 executive_summary: >
   The Cassandra-compatible BTI (Big Trie-Indexed) SSTable reader and writer —
-  the engine's on-disk data layer. Reads and writes the 7-component BTI format
+  the engine's on-disk data layer. Reads and writes the 8-component BTI format
   over synchronous, backing-store-agnostic ReadAt/WriteAt positional I/O traits,
   with trie-indexed partition/row indexes, delta-encoded rows, LZ4/Zstd
-  compression, and a Cassandra-compatible bloom filter. BTI only; legacy
-  Big-format reading, range tombstones, and complex columns are out of scope.
+  compression, a Cassandra-compatible bloom filter, and source checksums
+  (Digest.crc32 for every table, CRC.db for uncompressed tables, T-011). BTI
+  only; legacy Big-format reading, range tombstones, and complex columns are
+  out of scope.
 ---
 
 # ferrosa-sstable — Architecture Overview
@@ -35,19 +37,21 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 
 | Capability | Status |
 |------------|--------|
-| BTI write (all 7 components) | Implemented |
+| BTI write (all 8 components) | Implemented |
 | BTI read (point + streaming) | Implemented |
 | Legacy Big format (`*-big-*`) read | **Out of scope** (deferred, ADR-004) |
 | Range tombstone markers | **Deferred** — writer does not emit, reader skips |
 | Complex columns (collections/UDT/tuple/frozen) | **Deferred** in Data.db codec |
 | Compression | None / LZ4 / Zstd (Snappy/Deflate not supported) |
+| Source checksums (Digest.crc32, CRC.db) | Implemented (T-011) — writer always computes, reader verification is opt-in via `load_digest`/`load_crc_table` |
 
 ## Module map
 
 | Module | LoC (approx) | Responsibility |
 |--------|------|----------------|
-| `reader` (`src/reader.rs`) | ~3130 | `SSTableReader`, `PartitionIter`, point lookup, salvage, bounded token-summary seek index |
-| `writer` (`src/writer.rs`) | ~3650 | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]`, self-readback verify |
+| `reader` (`src/reader.rs`) | ~3450 | `SSTableReader`, `PartitionIter`, point lookup, salvage, bounded token-summary seek index, CRC.db-verified chunk reads |
+| `writer` (`src/writer.rs`) | ~4300 | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]`, self-readback verify, source checksums |
+| `checksum` (`src/checksum.rs`) | ~230 | `DigestCrc32`/`ChunkCrc` (write-time), `ChunkCrcTable` (read-time) — Cassandra-compatible `Digest.crc32`/`CRC.db` formats (T-011) |
 | `data` (`src/data.rs`) | ~2700 | Data.db row/cell codec, delta-decode vs header |
 | `io` (`src/io.rs`) | ~1165 | `ReadAt`/`WriteAt`, `FileReadAt`/`FileWriteAt`, `CachedReadAt` block cache |
 | `trie/{node,builder,walker,mod}` | ~2160 | On-disk trie used by both indexes |
@@ -63,8 +67,8 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 
 ## Component layout
 
-A BTI SSTable is 7 files (compressed variant uses `CompressionInfo.db`;
-uncompressed uses `CRC.db`):
+A BTI SSTable is 8 files (compressed variant uses `CompressionInfo.db`;
+uncompressed additionally uses `CRC.db`; `Digest.crc32` is written for both):
 
 ```mermaid
 graph TB
@@ -78,6 +82,7 @@ graph TB
         Rows[Rows.db &mdash; row trie, wide partitions]
         Filter[Filter.db &mdash; bloom]
         CI[CompressionInfo.db / CRC.db]
+        Digest[Digest.crc32 &mdash; source checksum]
         Stats[Statistics.db &mdash; header]
         TOC[TOC.txt]
     end
@@ -95,6 +100,7 @@ graph TB
     Writer --> Rows
     Writer --> Filter
     Writer --> CI
+    Writer --> Digest
     Writer --> Stats
     Writer --> TOC
     Reader --> ReadAt
@@ -112,16 +118,31 @@ the `SerializationHeader`. The writer builds the bloom filter, the partition
 trie, and — for wide clustered partitions past `ROW_INDEX_MIN_ROWS` — the row
 trie alongside Data.db. `finish()` emits all components; by default
 (`verify_output`) it reopens the result and asserts the partition count
-(self-readback Gate B).
+(self-readback Gate B). `Digest.crc32` (every table) and `CRC.db` (uncompressed
+tables) are accumulated as Data.db bytes are written — never by a separate
+re-read — via `ChecksummedDataDbWriter`/`checksum::ChunkCrc`; for the
+uncompressed file-backed rename path the accumulator lives on `DataBuffer`
+itself, since that path never touches `ChecksummedDataDbWriter`.
 
 **Read path** (disk → engine): `SSTableReader::open` parses the bloom filter,
 compression info, and statistics header, and opens the partition trie.
 `get_partition` checks the bloom filter, walks the trie to a Data.db offset, and
 decodes the partition — decompressing only the needed chunks through a bounded
-LRU (`decompressed_chunks`) when compressed. `partitions_iter` streams in token
-order with constant per-partition memory; `seek_to_token` uses a **bounded,
-downsampled** token summary so a reader's resident seek index is O(max_entries),
-not O(num_partitions) — the fix for a repair-scan OOM.
+LRU (`decompressed_chunks`) when compressed, or verifying against a loaded
+`CRC.db` through the parallel `verified_uncompressed_chunks` LRU when
+uncompressed. `partitions_iter` streams in token order with constant
+per-partition memory; `seek_to_token` uses a **bounded, downsampled** token
+summary so a reader's resident seek index is O(max_entries), not
+O(num_partitions) — the fix for a repair-scan OOM.
+
+**Checksum verification is opt-in, not automatic.** `SSTableReader::open`
+never loads `Digest.crc32`/`CRC.db` on its own — callers that want read-time
+verification call `load_digest`/`load_crc_table` after opening (as
+`ferrosa-storage`'s `flush.rs` open helpers do for every generation they
+control). A reader that never loads them reads exactly as before T-011:
+uncompressed chunks unchecked, `verify_digest()` a no-op — logged once per
+generation, never an error, so an SSTable older than T-011 (or a caller that
+skips the opt-in) keeps working.
 
 ## Key invariants
 
@@ -136,6 +157,11 @@ not O(num_partitions) — the fix for a repair-scan OOM.
    `MAX_VALUE_LEN` (256 MiB) is rejected as corruption before allocating.
 5. **No async dependency.** Positional I/O is synchronous; the S3/runtime
    wrapper lives in `ferrosa-storage`.
+6. **Checksums cover on-disk bytes, not logical content.** `Digest.crc32`
+   covers exactly what is on disk — compressed payload + per-chunk CRC
+   trailers for a compressed table, raw bytes for an uncompressed one —
+   matching Cassandra's contract. `CRC.db`'s chunk size is the table's
+   `WriteOptions.chunk_size`, independent of any compression chunking.
 
 ## Position in the dependency graph
 

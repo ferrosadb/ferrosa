@@ -43,6 +43,7 @@ use rayon::prelude::*;
 
 use crate::bloom::BloomFilter;
 use crate::byte_comparable;
+use crate::checksum::{self, ChunkCrc, DigestCrc32};
 use crate::compression::{Compression, CompressionInfo};
 use crate::io::FileReadAt;
 use crate::reader::{SSTableComponents, SSTableReader};
@@ -168,18 +169,79 @@ fn write_component_file(path: &Path, bytes: &[u8]) -> Result<u64> {
     Ok(bytes.len() as u64)
 }
 
+/// Wraps [`DataDbWriter`] with a streaming [`DigestCrc32`] (and, for
+/// uncompressed tables, a [`ChunkCrc`]) so `Digest.crc32`/`CRC.db` are
+/// computed from the exact bytes as they are written, never by re-reading
+/// Data.db from disk afterward. See `checksum` module docs for the on-disk
+/// formats (Cassandra-compatible; spec: `publication-safety.md` M1).
+struct ChecksummedDataDbWriter {
+    inner: DataDbWriter,
+    digest: DigestCrc32,
+    chunk_crc: Option<ChunkCrc>,
+}
+
+impl ChecksummedDataDbWriter {
+    /// `chunk_crc_size`: `Some(chunk_size)` tracks a `CRC.db` table alongside
+    /// the digest (uncompressed tables only); `None` tracks the digest only
+    /// (compressed tables, which have no `CRC.db`).
+    fn create(path: &Path, direct: bool, chunk_crc_size: Option<usize>) -> Result<Self> {
+        Ok(Self {
+            inner: DataDbWriter::create(path, direct)?,
+            digest: DigestCrc32::new(),
+            chunk_crc: chunk_crc_size.map(ChunkCrc::new),
+        })
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        self.inner.write_all(bytes)?;
+        self.digest.update(bytes);
+        if let Some(chunk_crc) = &mut self.chunk_crc {
+            chunk_crc.update(bytes);
+        }
+        Ok(())
+    }
+
+    fn position(&self) -> u64 {
+        self.inner.position()
+    }
+
+    /// Durably persist Data.db and return the finalized digest and, for
+    /// uncompressed tables, the `CRC.db` bytes.
+    fn finish(self) -> Result<(u32, Option<Vec<u8>>)> {
+        self.inner.finish()?;
+        let crc_db = self.chunk_crc.map(ChunkCrc::into_bytes);
+        Ok((self.digest.finalize(), crc_db))
+    }
+}
+
 enum DataBuffer {
     Memory(Vec<u8>),
     File {
         file: std::fs::File,
         path: PathBuf,
         len: u64,
+        /// Digest and per-chunk CRC accumulated as bytes are written to
+        /// `file`. Tracked unconditionally (cheap, SIMD CRC32) so the
+        /// uncompressed rename path (`build_data_file_to_file`) can use
+        /// them without re-reading the file; discarded when the table
+        /// turns out to be compressed, since that path re-checksums the
+        /// compressed on-disk bytes instead.
+        digest: DigestCrc32,
+        chunk_crc: ChunkCrc,
     },
 }
 
 enum DataSource {
     Memory(Vec<u8>),
-    File { path: PathBuf, len: u64 },
+    File {
+        path: PathBuf,
+        len: u64,
+        /// Digest and CRC.db bytes for the raw (uncompressed) content of
+        /// `path`, accumulated while it was written. Valid only for the
+        /// uncompressed case — see `DataBuffer::File`'s doc comment.
+        digest: u32,
+        crc_db: Vec<u8>,
+    },
 }
 
 impl DataBuffer {
@@ -187,7 +249,7 @@ impl DataBuffer {
         Self::Memory(Vec::new())
     }
 
-    fn file(path: PathBuf) -> Result<Self> {
+    fn file(path: PathBuf, chunk_size: usize) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -195,6 +257,8 @@ impl DataBuffer {
             file: std::fs::File::create(&path)?,
             path,
             len: 0,
+            digest: DigestCrc32::new(),
+            chunk_crc: ChunkCrc::new(chunk_size),
         })
     }
 
@@ -215,9 +279,17 @@ impl DataBuffer {
                 buf.extend_from_slice(bytes);
                 Ok(())
             }
-            Self::File { file, len, .. } => {
+            Self::File {
+                file,
+                len,
+                digest,
+                chunk_crc,
+                ..
+            } => {
                 file.write_all(bytes)?;
                 *len += bytes.len() as u64;
+                digest.update(bytes);
+                chunk_crc.update(bytes);
                 Ok(())
             }
         }
@@ -230,11 +302,18 @@ impl DataBuffer {
                 mut file,
                 path,
                 len,
+                digest,
+                chunk_crc,
             } => {
                 file.flush()?;
                 file.sync_data()?;
                 drop(file);
-                Ok(DataSource::File { path, len })
+                Ok(DataSource::File {
+                    path,
+                    len,
+                    digest: digest.finalize(),
+                    crc_db: chunk_crc.into_bytes(),
+                })
             }
         }
     }
@@ -316,6 +395,12 @@ pub struct SSTableOutput {
     pub filter: Vec<u8>,
     pub compression_info: Option<Vec<u8>>,
     pub statistics: Vec<u8>,
+    /// `Digest.crc32` content: decimal ASCII CRC32 of the on-disk Data.db
+    /// bytes, no trailing newline. Written for every table.
+    pub digest: Vec<u8>,
+    /// `CRC.db` content: per-chunk CRC32 table over uncompressed Data.db.
+    /// `None` for compressed tables. See `checksum` module docs.
+    pub crc: Option<Vec<u8>>,
     pub toc: Vec<u8>,
 }
 
@@ -327,6 +412,8 @@ pub struct SSTableOutputFiles {
     pub filter: PathBuf,
     pub compression_info: Option<PathBuf>,
     pub statistics: PathBuf,
+    pub digest: PathBuf,
+    pub crc: Option<PathBuf>,
     pub toc: PathBuf,
     pub data_len: u64,
     pub partitions_len: u64,
@@ -334,6 +421,8 @@ pub struct SSTableOutputFiles {
     pub filter_len: u64,
     pub compression_info_len: u64,
     pub statistics_len: u64,
+    pub digest_len: u64,
+    pub crc_len: u64,
     pub toc_len: u64,
     pub staging_dir: PathBuf,
 }
@@ -346,6 +435,8 @@ impl SSTableOutputFiles {
             + self.filter_len
             + self.compression_info_len
             + self.statistics_len
+            + self.digest_len
+            + self.crc_len
             + self.toc_len
     }
 
@@ -360,9 +451,20 @@ impl SSTableOutputFiles {
                 None => None,
             },
             statistics: std::fs::read(&self.statistics)?,
+            digest: std::fs::read(&self.digest)?,
+            crc: match &self.crc {
+                Some(path) => Some(std::fs::read(path)?),
+                None => None,
+            },
             toc: std::fs::read(&self.toc)?,
         };
-        let _ = std::fs::remove_dir_all(&self.staging_dir);
+        if let Err(e) = std::fs::remove_dir_all(&self.staging_dir) {
+            tracing::warn!(
+                dir = %self.staging_dir.display(),
+                error = %e,
+                "failed to remove SSTable staging directory after reading its components into memory"
+            );
+        }
         Ok(output)
     }
 }
@@ -427,10 +529,11 @@ impl SSTableWriter {
         raw_data_path: impl Into<PathBuf>,
     ) -> Result<Self> {
         let bloom = BloomFilter::new(10_000, options.bloom_fp_chance);
+        let chunk_size = options.chunk_size;
         Ok(SSTableWriter {
             options,
             header,
-            data_buf: DataBuffer::file(raw_data_path.into())?,
+            data_buf: DataBuffer::file(raw_data_path.into(), chunk_size)?,
             rows_buf: Vec::new(),
             bloom,
             trie_builder: TrieBuilder::new(),
@@ -562,9 +665,27 @@ impl SSTableWriter {
             DataSource::Memory(data_buf) => Self::build_data_db(data_buf, &self.options)?,
             DataSource::File { path, .. } => {
                 let data_buf = std::fs::read(&path)?;
-                let _ = std::fs::remove_file(path);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove raw Data.db staging file after reading it back"
+                    );
+                }
                 Self::build_data_db(data_buf, &self.options)?
             }
+        };
+
+        // 4b. Source checksums, computed over the final on-disk Data.db
+        // bytes already resident in `data` (no re-read needed here — this
+        // is the in-memory path). `Digest.crc32` for every table; `CRC.db`
+        // (per-chunk CRC32) for uncompressed tables only. See `checksum`
+        // module docs and `publication-safety.md` M1.
+        let digest = checksum::format_digest(checksum::digest_bytes(&data));
+        let crc = if has_compression {
+            None
+        } else {
+            Some(checksum::compute_chunk_crc(&data, self.options.chunk_size))
         };
 
         // 5. Rows.db: empty for simple partitions, indexed for wide clustered
@@ -581,6 +702,8 @@ impl SSTableWriter {
             filter,
             compression_info,
             statistics,
+            digest,
+            crc,
             toc: toc_bytes,
         };
 
@@ -627,6 +750,8 @@ impl SSTableWriter {
         let statistics_path = staging_dir.join("Statistics.db");
         let toc_path = staging_dir.join("TOC.txt");
         let compression_info_path = staging_dir.join("CompressionInfo.db");
+        let digest_path = staging_dir.join(toc::DIGEST);
+        let crc_path = staging_dir.join(toc::CRC);
 
         let partitions = Self::build_partitions_db(
             self.trie_builder,
@@ -651,10 +776,22 @@ impl SSTableWriter {
         let statistics_len = write_component_file(&statistics_path, &statistics)?;
 
         let data_source = self.data_buf.into_source()?;
-        let compression_info =
-            Self::build_data_source_to_file(data_source, &self.options, &data_path)?;
+        let artifacts = Self::build_data_source_to_file(data_source, &self.options, &data_path)?;
+        let compression_info = artifacts.compression_info;
         let compression_info_len = if let Some(info) = compression_info.as_ref() {
             write_component_file(&compression_info_path, info)?
+        } else {
+            0
+        };
+
+        // Source checksums, computed while Data.db was written (never by
+        // re-reading it). `Digest.crc32` for every table; `CRC.db` only for
+        // uncompressed tables. See `checksum` module docs and
+        // `publication-safety.md` M1.
+        let digest_bytes = checksum::format_digest(artifacts.digest);
+        let digest_len = write_component_file(&digest_path, &digest_bytes)?;
+        let crc_len = if let Some(crc_db) = artifacts.crc_db.as_ref() {
+            write_component_file(&crc_path, crc_db)?
         } else {
             0
         };
@@ -672,6 +809,8 @@ impl SSTableWriter {
             filter: filter_path,
             compression_info: compression_info.as_ref().map(|_| compression_info_path),
             statistics: statistics_path,
+            digest: digest_path,
+            crc: artifacts.crc_db.as_ref().map(|_| crc_path),
             toc: toc_path,
             data_len,
             partitions_len,
@@ -679,6 +818,8 @@ impl SSTableWriter {
             filter_len,
             compression_info_len,
             statistics_len,
+            digest_len,
+            crc_len,
             toc_len,
             staging_dir,
         };
@@ -1381,15 +1522,17 @@ impl SSTableWriter {
         }
     }
 
-    /// Build Data.db directly on disk and return optional CompressionInfo.db
-    /// bytes. The compressed path writes each bounded batch to `data_path`
-    /// before compressing the next batch, so peak heap does not include the
-    /// full compressed Data.db.
+    /// Build Data.db directly on disk and return `CompressionInfo.db` bytes
+    /// (compressed tables) plus the source checksums. The compressed path
+    /// writes each bounded batch to `data_path` before compressing the next
+    /// batch, so peak heap does not include the full compressed Data.db.
+    /// Checksums are accumulated by [`ChecksummedDataDbWriter`] as bytes are
+    /// written — never by re-reading `data_path` afterward.
     fn build_data_db_to_file(
         data_buf: Vec<u8>,
         options: &WriteOptions,
         data_path: &Path,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<DataDbArtifacts> {
         match &options.compression {
             Some(compression) if !matches!(compression, Compression::None) => {
                 struct CompressedChunk {
@@ -1405,10 +1548,11 @@ impl SSTableWriter {
                 let mut max_compressed_size: usize = 0;
                 let batch_chunks = compression_batch_chunks();
                 let mut batch: Vec<&[u8]> = Vec::with_capacity(batch_chunks);
-                let mut file = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
+                let mut file =
+                    ChecksummedDataDbWriter::create(data_path, sstable_direct_io_enabled(), None)?;
 
                 let flush_batch = |batch: &mut Vec<&[u8]>,
-                                   file: &mut DataDbWriter,
+                                   file: &mut ChecksummedDataDbWriter,
                                    chunk_offsets: &mut Vec<u64>,
                                    max_compressed_size: &mut usize|
                  -> Result<()> {
@@ -1459,7 +1603,7 @@ impl SSTableWriter {
                     &mut chunk_offsets,
                     &mut max_compressed_size,
                 )?;
-                file.finish()?;
+                let (digest, _) = file.finish()?;
 
                 let info = CompressionInfo {
                     compression: compression.clone(),
@@ -1468,13 +1612,25 @@ impl SSTableWriter {
                     data_length,
                     chunk_offsets,
                 };
-                info.write().map(Some)
+                Ok(DataDbArtifacts {
+                    compression_info: Some(info.write()?),
+                    digest,
+                    crc_db: None,
+                })
             }
             _ => {
-                let mut file = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
+                let mut file = ChecksummedDataDbWriter::create(
+                    data_path,
+                    sstable_direct_io_enabled(),
+                    Some(options.chunk_size),
+                )?;
                 file.write_all(&data_buf)?;
-                file.finish()?;
-                Ok(None)
+                let (digest, crc_db) = file.finish()?;
+                Ok(DataDbArtifacts {
+                    compression_info: None,
+                    digest,
+                    crc_db,
+                })
             }
         }
     }
@@ -1483,27 +1639,49 @@ impl SSTableWriter {
         data_source: DataSource,
         options: &WriteOptions,
         data_path: &Path,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<DataDbArtifacts> {
         match data_source {
             DataSource::Memory(data_buf) => {
                 Self::build_data_db_to_file(data_buf, options, data_path)
             }
-            DataSource::File { path, len } => {
-                let result = Self::build_data_file_to_file(&path, len, options, data_path);
+            DataSource::File {
+                path,
+                len,
+                digest,
+                crc_db,
+            } => {
+                let result =
+                    Self::build_data_file_to_file(&path, len, options, data_path, digest, crc_db);
                 if result.is_ok() {
-                    let _ = std::fs::remove_file(&path);
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to remove raw Data.db staging file after building the final Data.db"
+                        );
+                    }
                 }
                 result
             }
         }
     }
 
+    /// `raw_digest`/`raw_crc_db` are the checksums [`DataBuffer::File`]
+    /// accumulated while `raw_path` was written, covering its raw
+    /// (uncompressed) bytes. The uncompressed branch below uses them
+    /// directly — `raw_path` becomes `data_path` verbatim via rename, so
+    /// those bytes are already the final Data.db content and re-reading the
+    /// file to recompute a checksum would be pure waste. The compressed
+    /// branch discards them and checksums the compressed on-disk bytes as
+    /// it writes them instead, since compression changes what is on disk.
     fn build_data_file_to_file(
         raw_path: &Path,
         data_length: u64,
         options: &WriteOptions,
         data_path: &Path,
-    ) -> Result<Option<Vec<u8>>> {
+        raw_digest: u32,
+        raw_crc_db: Vec<u8>,
+    ) -> Result<DataDbArtifacts> {
         match &options.compression {
             Some(compression) if !matches!(compression, Compression::None) => {
                 struct CompressedChunk {
@@ -1518,7 +1696,8 @@ impl SSTableWriter {
                 let mut max_compressed_size: usize = 0;
                 let batch_chunks = compression_batch_chunks();
                 let mut raw = std::fs::File::open(raw_path)?;
-                let mut out = DataDbWriter::create(data_path, sstable_direct_io_enabled())?;
+                let mut out =
+                    ChecksummedDataDbWriter::create(data_path, sstable_direct_io_enabled(), None)?;
 
                 loop {
                     let mut batch = Vec::with_capacity(batch_chunks);
@@ -1566,7 +1745,7 @@ impl SSTableWriter {
                         out.write_all(&chunk.crc)?;
                     }
                 }
-                out.finish()?;
+                let (digest, _) = out.finish()?;
 
                 let info = CompressionInfo {
                     compression: compression.clone(),
@@ -1575,21 +1754,33 @@ impl SSTableWriter {
                     data_length,
                     chunk_offsets,
                 };
-                info.write().map(Some)
+                Ok(DataDbArtifacts {
+                    compression_info: Some(info.write()?),
+                    digest,
+                    crc_db: None,
+                })
             }
             _ => {
                 std::fs::rename(raw_path, data_path)?;
-                Ok(None)
+                Ok(DataDbArtifacts {
+                    compression_info: None,
+                    digest: raw_digest,
+                    crc_db: Some(raw_crc_db),
+                })
             }
         }
     }
 
-    /// Build TOC.txt.
+    /// Build TOC.txt. `Digest.crc32` is listed for every table; `CRC.db` is
+    /// listed only for uncompressed tables (compressed tables have no
+    /// `CRC.db` — their chunks already carry a CRC trailer, verified in
+    /// `reader.rs`).
     fn build_toc(has_compression: bool) -> Vec<u8> {
         if has_compression {
             toc::write_toc(&[
                 toc::COMPRESSION_INFO,
                 toc::DATA,
+                toc::DIGEST,
                 toc::FILTER,
                 toc::PARTITIONS,
                 toc::ROWS,
@@ -1597,11 +1788,10 @@ impl SSTableWriter {
                 toc::TOC,
             ])
         } else {
-            // Omit CRC.db for uncompressed SSTables — Cassandra treats it as
-            // optional; listing it in TOC without writing the file causes
-            // CorruptSSTableException on import.
             toc::write_toc(&[
+                toc::CRC,
                 toc::DATA,
+                toc::DIGEST,
                 toc::FILTER,
                 toc::PARTITIONS,
                 toc::ROWS,
@@ -1610,6 +1800,14 @@ impl SSTableWriter {
             ])
         }
     }
+}
+
+/// Bundle of source-checksum outputs from the `build_data_*_to_file` family,
+/// alongside the pre-existing `CompressionInfo.db` bytes.
+struct DataDbArtifacts {
+    compression_info: Option<Vec<u8>>,
+    digest: u32,
+    crc_db: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +2021,7 @@ mod tests {
     use crate::data::DataReader;
     use crate::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+    use proptest::prelude::*;
 
     /// The load-bearing wiring invariant: writing the same byte stream through a
     /// direct (O_DIRECT/F_NOCACHE) Data.db writer and the buffered writer yields
@@ -2512,9 +2711,17 @@ mod tests {
         // Verify TOC
         let toc_entries = crate::toc::read_toc(&output.toc).unwrap();
         assert!(!toc_entries.is_empty());
-        // No compression — CRC.db is omitted from TOC (listing it without
-        // writing the file causes CorruptSSTableException on Cassandra import).
-        assert!(!toc_entries.iter().any(|e| e == toc::CRC));
+        // Uncompressed table — CRC.db and Digest.crc32 are both written and
+        // both listed in the TOC (T-011).
+        assert!(toc_entries.iter().any(|e| e == toc::CRC));
+        assert!(toc_entries.iter().any(|e| e == toc::DIGEST));
+        assert_eq!(
+            crate::checksum::parse_digest(&output.digest).unwrap(),
+            crate::checksum::digest_bytes(&output.data)
+        );
+        let crc = output.crc.as_ref().expect("uncompressed table has CRC.db");
+        let table = crate::checksum::ChunkCrcTable::parse(crc).unwrap();
+        assert_eq!(table.crcs, vec![crc32fast::hash(&output.data)]);
 
         // Verify Partitions.db can be opened as a PartitionIndex
         let pi = crate::partition_index::PartitionIndex::open(output.partitions).unwrap();
@@ -2542,6 +2749,159 @@ mod tests {
 
         // Verify compression_info is None (no compression)
         assert!(output.compression_info.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // T-011: source checksums (Digest.crc32, CRC.db)
+    // -----------------------------------------------------------------------
+
+    /// `ChecksummedDataDbWriter` is the exact wiring point named in the T-011
+    /// packet (`DataDbWriter::write_all`). Exercise it directly across sizes
+    /// that land on either side of a chunk boundary — the classic
+    /// off-by-one zone for chunked checksums — feeding bytes through
+    /// irregular `write_all` calls (never one call per chunk) so a bug that
+    /// only shows up when a write straddles a chunk boundary is caught.
+    #[test]
+    fn checksum_data_db_writer_digest_and_crc_db_match_crc32fast_across_chunk_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunk = 16usize;
+        for &total in &[0usize, chunk - 1, chunk, chunk + 1, 3 * chunk] {
+            let data: Vec<u8> = (0..total).map(|i| (i % 256) as u8).collect();
+            let path = dir.path().join(format!("data-{total}.db"));
+            let mut writer = ChecksummedDataDbWriter::create(&path, false, Some(chunk)).unwrap();
+            for piece in data.chunks(3) {
+                writer.write_all(piece).unwrap();
+            }
+            let (digest, crc_db) = writer.finish().unwrap();
+
+            assert_eq!(
+                digest,
+                crc32fast::hash(&data),
+                "digest mismatch for len={total}"
+            );
+            let on_disk = std::fs::read(&path).unwrap();
+            assert_eq!(on_disk, data, "on-disk bytes mismatch for len={total}");
+
+            let crc_db = crc_db.expect("uncompressed writer must produce CRC.db bytes");
+            let table = checksum::ChunkCrcTable::parse(&crc_db).unwrap();
+            let expected: Vec<u32> = data.chunks(chunk).map(crc32fast::hash).collect();
+            assert_eq!(
+                table.crcs, expected,
+                "CRC.db chunk table mismatch for len={total}"
+            );
+        }
+    }
+
+    proptest! {
+        /// Same property as above, generalized over arbitrary chunk sizes and
+        /// data lengths clustered around chunk-relative boundaries (spec:
+        /// "sizes around 0, chunk-1, chunk, chunk+1, 3*chunk").
+        #[test]
+        fn checksum_data_db_writer_matches_crc32fast_proptest(
+            chunk in 1usize..64,
+            multiplier in 0i64..=3,
+            delta in -1i64..=1,
+        ) {
+            let total = ((chunk as i64) * multiplier + delta).max(0) as usize;
+            let data: Vec<u8> = (0..total).map(|i| (i % 256) as u8).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data.db");
+            let mut writer = ChecksummedDataDbWriter::create(&path, false, Some(chunk)).unwrap();
+            writer.write_all(&data).unwrap();
+            let (digest, crc_db) = writer.finish().unwrap();
+
+            prop_assert_eq!(digest, crc32fast::hash(&data));
+            let crc_db = crc_db.unwrap();
+            let table = checksum::ChunkCrcTable::parse(&crc_db).unwrap();
+            let expected: Vec<u32> = data.chunks(chunk).map(crc32fast::hash).collect();
+            prop_assert_eq!(table.crcs, expected);
+        }
+    }
+
+    /// The compressed path checksums the *compressed* on-disk bytes (payload
+    /// and per-chunk CRC trailers), not the logical uncompressed content,
+    /// and carries no `CRC.db` at all.
+    #[test]
+    fn checksum_compressed_writer_digest_matches_final_on_disk_bytes() {
+        let header = test_header();
+        let options = WriteOptions {
+            compression: Some(Compression::Lz4),
+            bloom_fp_chance: 0.01,
+            chunk_size: 4096,
+            verify_output: true,
+        };
+        let partition = make_partition(
+            b"compressed-checksum",
+            &[0x00, 0x00, 0x00, 0x01],
+            b"compressed-value",
+            1_000_050,
+        );
+
+        let mut writer = SSTableWriter::new(options, header);
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+
+        assert!(output.compression_info.is_some());
+        assert!(
+            output.crc.is_none(),
+            "compressed tables must not carry CRC.db"
+        );
+        assert_eq!(
+            checksum::parse_digest(&output.digest).unwrap(),
+            checksum::digest_bytes(&output.data),
+            "Digest.crc32 must cover the compressed on-disk Data.db bytes"
+        );
+    }
+
+    /// The uncompressed, file-backed rename path (`build_data_file_to_file`'s
+    /// `_ =>` branch, `writer.rs` around the `Data.raw` → `Data.db` rename)
+    /// must use the digest/CRC.db accumulated while `Data.raw` was written
+    /// (`DataBuffer::File::extend_from_slice`) rather than re-reading the
+    /// final file. Cross-check against an independent re-read here proves
+    /// the accumulated values are correct, not merely present.
+    #[test]
+    fn checksum_file_backed_uncompressed_rename_path_matches_independent_reread() {
+        let header = test_header();
+        let chunk_size = 32usize;
+        let options = WriteOptions {
+            compression: None,
+            bloom_fp_chance: 0.01,
+            chunk_size,
+            verify_output: true,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw_path = dir.path().join("Data.raw");
+        let mut writer = SSTableWriter::new_file_backed(options, header, raw_path).unwrap();
+        // One wide partition (many rows), not many partitions -- partitions
+        // must be added in token order, and this test only needs enough
+        // Data.db bytes to span several CRC.db chunks.
+        let partition = make_wide_partition(b"file-backed-rename-path", 200);
+        writer.add_partition(&partition).unwrap();
+        let staging_dir = dir.path().join("staged");
+        let output = writer.finish_to_directory(&staging_dir).unwrap();
+
+        let final_bytes = std::fs::read(&output.data).unwrap();
+        assert!(
+            final_bytes.len() > 3 * chunk_size,
+            "test needs several CRC.db chunks, got {} bytes",
+            final_bytes.len()
+        );
+
+        let digest_bytes = std::fs::read(&output.digest).unwrap();
+        assert_eq!(
+            checksum::parse_digest(&digest_bytes).unwrap(),
+            crc32fast::hash(&final_bytes)
+        );
+
+        let crc_path = output.crc.clone().expect("uncompressed table has CRC.db");
+        let crc_bytes = std::fs::read(&crc_path).unwrap();
+        let table = checksum::ChunkCrcTable::parse(&crc_bytes).unwrap();
+        let expected: Vec<u32> = final_bytes
+            .chunks(chunk_size)
+            .map(crc32fast::hash)
+            .collect();
+        assert_eq!(table.crcs, expected);
     }
 
     #[test]

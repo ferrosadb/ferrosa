@@ -25,8 +25,12 @@ pub const COMPRESSION_INFO: &str = "CompressionInfo.db";
 pub const STATISTICS: &str = "Statistics.db";
 /// Table-of-contents suffix.
 pub const TOC: &str = "TOC.txt";
-/// CRC suffix (present when compression is disabled).
+/// CRC suffix (present when compression is disabled) — per-chunk CRC32 table
+/// over uncompressed Data.db. See `checksum` module docs for the layout.
 pub const CRC: &str = "CRC.db";
+/// Source digest suffix (present for every table) — a single CRC32 over the
+/// on-disk Data.db bytes. See `checksum` module docs for the format.
+pub const DIGEST: &str = "Digest.crc32";
 
 // ---------------------------------------------------------------------------
 // Read / Write
@@ -64,12 +68,13 @@ pub fn write_toc(components: &[&str]) -> Vec<u8> {
 // Standard component lists
 // ---------------------------------------------------------------------------
 
-/// All suffixes used in a BTI SSTable.
-const COMMON_SUFFIXES: &[&str] = &[DATA, PARTITIONS, ROWS, FILTER, STATISTICS, TOC];
+/// Suffixes common to every BTI SSTable, compressed or not — includes
+/// `Digest.crc32`, written unconditionally (T-011).
+const COMMON_SUFFIXES: &[&str] = &[DATA, DIGEST, PARTITIONS, ROWS, FILTER, STATISTICS, TOC];
 
-/// Return the 7 standard component filenames for a **compressed** BTI SSTable.
+/// Return the 8 standard component filenames for a **compressed** BTI SSTable.
 ///
-/// Includes `CompressionInfo.db`, excludes `CRC.db`.
+/// Includes `CompressionInfo.db` and `Digest.crc32`, excludes `CRC.db`.
 pub fn standard_compressed_components(prefix: &str) -> Vec<String> {
     let mut out: Vec<String> = COMMON_SUFFIXES
         .iter()
@@ -80,9 +85,9 @@ pub fn standard_compressed_components(prefix: &str) -> Vec<String> {
     out
 }
 
-/// Return the 7 standard component filenames for an **uncompressed** BTI SSTable.
+/// Return the 8 standard component filenames for an **uncompressed** BTI SSTable.
 ///
-/// Includes `CRC.db`, excludes `CompressionInfo.db`.
+/// Includes `CRC.db` and `Digest.crc32`, excludes `CompressionInfo.db`.
 pub fn standard_uncompressed_components(prefix: &str) -> Vec<String> {
     let mut out: Vec<String> = COMMON_SUFFIXES
         .iter()
@@ -129,10 +134,14 @@ mod tests {
     #[test]
     fn standard_components_compressed() {
         let comps = standard_compressed_components("nb-1-big");
-        assert_eq!(comps.len(), 7);
+        assert_eq!(comps.len(), 8);
         assert!(
             comps.iter().any(|c| c.ends_with("CompressionInfo.db")),
             "compressed components must include CompressionInfo.db"
+        );
+        assert!(
+            comps.iter().any(|c| c.ends_with("Digest.crc32")),
+            "compressed components must include Digest.crc32"
         );
         assert!(
             !comps.iter().any(|c| c.ends_with("CRC.db")),
@@ -143,10 +152,14 @@ mod tests {
     #[test]
     fn standard_components_uncompressed() {
         let comps = standard_uncompressed_components("nb-1-big");
-        assert_eq!(comps.len(), 7);
+        assert_eq!(comps.len(), 8);
         assert!(
             comps.iter().any(|c| c.ends_with("CRC.db")),
             "uncompressed components must include CRC.db"
+        );
+        assert!(
+            comps.iter().any(|c| c.ends_with("Digest.crc32")),
+            "uncompressed components must include Digest.crc32"
         );
         assert!(
             !comps.iter().any(|c| c.ends_with("CompressionInfo.db")),

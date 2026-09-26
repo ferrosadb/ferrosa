@@ -7,6 +7,7 @@
 use ferrosa_common::{DecoratedKey, Result};
 
 use crate::bloom::BloomFilter;
+use crate::checksum::{self, ChunkCrcTable};
 use crate::compression::CompressionInfo;
 use crate::data::DataReader;
 use crate::io::{CachedReadAt, ReadAt};
@@ -15,6 +16,7 @@ use crate::row_index::{lookup_clustering_in_entry, RowIndex};
 use crate::statistics::{read_statistics, SerializationHeader};
 use crate::types::Partition;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES: usize = 128;
@@ -166,6 +168,140 @@ impl<R: ReadAt> ReadAt for ChunkedCompressedData<'_, R> {
     }
 }
 
+/// Wraps the raw (uncompressed) Data.db reader with per-chunk `CRC.db`
+/// verification. Mirrors [`ChunkedCompressedData`]'s cache-on-miss shape,
+/// but validates a chunk against its stored CRC32 instead of decompressing
+/// it — a mismatch names the chunk's byte offset in Data.db (spec:
+/// `publication-safety.md` M1; see `checksum` module docs for the layout).
+struct ChunkedUncompressedData<'a, R: ReadAt> {
+    data: &'a R,
+    table: &'a ChunkCrcTable,
+    data_len: u64,
+    cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+}
+
+impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
+    fn new(
+        data: &'a R,
+        table: &'a ChunkCrcTable,
+        cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    ) -> Result<Self> {
+        let data_len = data.len()?;
+        let expected = table.expected_chunk_count(data_len);
+        if expected != table.crcs.len() as u64 {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "CRC.db chunk count {} does not match Data.db length {data_len} bytes \
+                 (expected {expected} chunks of {} bytes)",
+                table.crcs.len(),
+                table.chunk_size
+            )));
+        }
+        Ok(Self {
+            data,
+            table,
+            data_len,
+            cache,
+        })
+    }
+
+    fn chunk(&self, chunk_index: usize) -> Result<Arc<Vec<u8>>> {
+        {
+            let mut guard = self
+                .cache
+                .lock()
+                .expect("sstable uncompressed chunk cache poisoned");
+            if let Some(chunk) = guard.get(&chunk_index) {
+                return Ok(Arc::clone(chunk));
+            }
+        }
+
+        let Some(&expected_crc) = self.table.crcs.get(chunk_index) else {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "uncompressed chunk index {chunk_index} out of bounds"
+            )));
+        };
+        let chunk_size = self.table.chunk_size as u64;
+        let chunk_offset = chunk_index as u64 * chunk_size;
+        let this_chunk_len = (self.data_len - chunk_offset).min(chunk_size) as usize;
+        let mut bytes = vec![0u8; this_chunk_len];
+        self.data.read_exact_at(&mut bytes, chunk_offset)?;
+        let actual_crc = crc32fast::hash(&bytes);
+        if actual_crc != expected_crc {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "CRC.db mismatch at Data.db chunk offset {chunk_offset}: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+            )));
+        }
+
+        let chunk = Arc::new(bytes);
+        let mut guard = self
+            .cache
+            .lock()
+            .expect("sstable uncompressed chunk cache poisoned");
+        if let Some(existing) = guard.get(&chunk_index) {
+            return Ok(Arc::clone(existing));
+        }
+        guard.put(chunk_index, Arc::clone(&chunk));
+        Ok(chunk)
+    }
+}
+
+impl<R: ReadAt> ReadAt for ChunkedUncompressedData<'_, R> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.data_len {
+            return Ok(0);
+        }
+        let available = (self.data_len - offset) as usize;
+        let target = buf.len().min(available);
+        let mut copied = 0usize;
+        while copied < target {
+            let pos = offset + copied as u64;
+            let chunk_index = (pos / self.table.chunk_size as u64) as usize;
+            let chunk_offset = (pos % self.table.chunk_size as u64) as usize;
+            let chunk = self.chunk(chunk_index)?;
+            if chunk_offset >= chunk.len() {
+                break;
+            }
+            let n = (target - copied).min(chunk.len() - chunk_offset);
+            buf[copied..copied + n].copy_from_slice(&chunk[chunk_offset..chunk_offset + n]);
+            copied += n;
+        }
+        Ok(copied)
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(self.data_len)
+    }
+}
+
+/// Selects how [`SSTableReader`]/[`PartitionIter`] read Data.db bytes:
+/// through per-chunk decompression (compressed tables), through per-chunk
+/// `CRC.db` verification (uncompressed tables that carry the checksum
+/// components), or directly (uncompressed tables without them — logged once
+/// as "not checked", never an error). See [`SSTableReader::data_source`].
+enum ReadSource<'a, R: ReadAt> {
+    Compressed(ChunkedCompressedData<'a, R>),
+    Verified(ChunkedUncompressedData<'a, R>),
+    Raw(&'a R),
+}
+
+impl<R: ReadAt> ReadAt for ReadSource<'_, R> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        match self {
+            Self::Compressed(d) => d.read_at(buf, offset),
+            Self::Verified(d) => d.read_at(buf, offset),
+            Self::Raw(d) => d.read_at(buf, offset),
+        }
+    }
+
+    fn len(&self) -> Result<u64> {
+        match self {
+            Self::Compressed(d) => d.len(),
+            Self::Verified(d) => d.len(),
+            Self::Raw(d) => d.len(),
+        }
+    }
+}
+
 /// Handles to all component files for an SSTable.
 pub struct SSTableComponents<R> {
     /// Data.db file handle.
@@ -200,6 +336,23 @@ pub struct SSTableReader<R: ReadAt> {
     /// Bounded cache of decompressed compressed Data.db chunks. Point reads use
     /// this to avoid decompressing the whole SSTable for one partition/row.
     decompressed_chunks: Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    /// Parsed `CRC.db` (uncompressed tables only), loaded via
+    /// [`Self::load_crc_table`]. `None` for compressed tables and for
+    /// uncompressed tables whose `CRC.db` has not been (or cannot be)
+    /// loaded — old SSTables predating T-011 keep working, "not checked".
+    crc_table: Option<ChunkCrcTable>,
+    /// Bounded cache of CRC-verified raw Data.db chunks, mirroring
+    /// `decompressed_chunks` for the uncompressed+CRC.db path.
+    verified_uncompressed_chunks: Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    /// Parsed `Digest.crc32`, loaded via [`Self::load_digest`]. `None` when
+    /// not loaded — [`Self::verify_digest`] then logs once and returns `Ok`.
+    digest: Option<u32>,
+    /// Logs the "no CRC.db, chunk reads unchecked" warning once per
+    /// generation rather than once per read.
+    crc_missing_warned: AtomicBool,
+    /// Logs the "no Digest.crc32, digest unchecked" warning once per
+    /// generation rather than once per call to `verify_digest`.
+    digest_missing_warned: AtomicBool,
     #[allow(dead_code)]
     rows: CachedReadAt<R>,
     /// Lazily-populated sorted list of partition start offsets in
@@ -253,10 +406,112 @@ impl<R: ReadAt> SSTableReader<R> {
             decompressed_chunks: Mutex::new(
                 lru::LruCache::new(decompressed_chunk_cache_capacity()),
             ),
+            crc_table: None,
+            verified_uncompressed_chunks: Mutex::new(lru::LruCache::new(
+                decompressed_chunk_cache_capacity(),
+            )),
+            digest: None,
+            crc_missing_warned: AtomicBool::new(false),
+            digest_missing_warned: AtomicBool::new(false),
             rows,
             partition_offsets: std::sync::OnceLock::new(),
             partition_token_offsets: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Load and parse `CRC.db` bytes, enabling per-chunk verification of
+    /// uncompressed Data.db reads. A no-op capability until called — old
+    /// SSTables (or callers that skip this) read unchecked, logged once.
+    /// Errors if the table is compressed (no `CRC.db` should exist) or if
+    /// the parsed chunk table doesn't match Data.db's length.
+    pub fn load_crc_table(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.compression_info.is_some() {
+            return Err(ferrosa_common::Error::InvalidData(
+                "CRC.db does not apply to a compressed SSTable".into(),
+            ));
+        }
+        let table = ChunkCrcTable::parse(bytes)?;
+        let data_len = self.data.len()?;
+        let expected = table.expected_chunk_count(data_len);
+        if expected != table.crcs.len() as u64 {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "CRC.db chunk count {} does not match Data.db length {data_len} bytes \
+                 (expected {expected} chunks of {} bytes)",
+                table.crcs.len(),
+                table.chunk_size
+            )));
+        }
+        self.crc_table = Some(table);
+        Ok(())
+    }
+
+    /// Load and parse `Digest.crc32` bytes, enabling [`Self::verify_digest`].
+    pub fn load_digest(&mut self, bytes: &[u8]) -> Result<()> {
+        self.digest = Some(checksum::parse_digest(bytes)?);
+        Ok(())
+    }
+
+    /// Verify the whole-file `Digest.crc32` against the on-disk Data.db
+    /// bytes (re-read here — this is an occasional/whole-file check, not a
+    /// per-read hot path). `Ok(())` if no digest was loaded ("not checked",
+    /// logged once); `Err` naming the expected/actual CRC32 on mismatch.
+    pub fn verify_digest(&self) -> Result<()> {
+        let Some(expected) = self.digest else {
+            if !self.digest_missing_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "SSTable has no Digest.crc32 loaded; verify_digest is not checked \
+                     (old SSTable predating T-011, or Digest.crc32 not loaded)"
+                );
+            }
+            return Ok(());
+        };
+        let len = self.data.len()?;
+        let mut hasher = checksum::DigestCrc32::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut offset = 0u64;
+        while offset < len {
+            let want = ((len - offset) as usize).min(buf.len());
+            self.data.read_exact_at(&mut buf[..want], offset)?;
+            hasher.update(&buf[..want]);
+            offset += want as u64;
+        }
+        let actual = hasher.finalize();
+        if actual != expected {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "Digest.crc32 mismatch: expected {expected:#010x}, computed {actual:#010x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Select how to read Data.db for this call: chunked decompression for
+    /// compressed tables, chunked `CRC.db` verification for uncompressed
+    /// tables that have one loaded, or a direct (unchecked) read otherwise.
+    /// The unchecked case logs once per generation, never errors — an old
+    /// SSTable predating T-011, or one opened without
+    /// [`Self::load_crc_table`], must keep working.
+    fn data_source(&self) -> Result<ReadSource<'_, R>> {
+        if let Some(ref ci) = self.compression_info {
+            Ok(ReadSource::Compressed(ChunkedCompressedData::new(
+                &self.data,
+                ci,
+                &self.decompressed_chunks,
+            )?))
+        } else if let Some(ref table) = self.crc_table {
+            Ok(ReadSource::Verified(ChunkedUncompressedData::new(
+                &self.data,
+                table,
+                &self.verified_uncompressed_chunks,
+            )?))
+        } else {
+            if !self.crc_missing_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "SSTable has no CRC.db loaded; uncompressed chunk reads are not \
+                     checksum-verified (old SSTable predating T-011, or CRC.db not loaded)"
+                );
+            }
+            Ok(ReadSource::Raw(&self.data))
+        }
     }
 
     /// Sorted list of partition start offsets in this SSTable's
@@ -413,22 +668,15 @@ impl<R: ReadAt> SSTableReader<R> {
         };
 
         // Step 3: read partition from Data.db. For compressed tables, expose
-        // an uncompressed-offset view that decompresses only addressed chunks.
-        if let Some(ref ci) = self.compression_info {
-            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-            let mut data_reader = DataReader::new(&chunked, &self.header, data_position);
-            if row_limit > 0 {
-                data_reader.read_partition_prefix_rows(row_limit)
-            } else {
-                data_reader.read_partition_limited_rows(0)
-            }
+        // an uncompressed-offset view that decompresses only addressed
+        // chunks; for uncompressed tables with a loaded CRC.db, verify each
+        // chunk as it is read.
+        let source = self.data_source()?;
+        let mut data_reader = DataReader::new(&source, &self.header, data_position);
+        if row_limit > 0 {
+            data_reader.read_partition_prefix_rows(row_limit)
         } else {
-            let mut data_reader = DataReader::new(&self.data, &self.header, data_position);
-            if row_limit > 0 {
-                data_reader.read_partition_prefix_rows(row_limit)
-            } else {
-                data_reader.read_partition_limited_rows(0)
-            }
+            data_reader.read_partition_limited_rows(0)
         }
     }
 
@@ -451,14 +699,9 @@ impl<R: ReadAt> SSTableReader<R> {
             PartitionLookup::DataDirect { position } => position,
             PartitionLookup::NotFound => return Ok(None),
         };
-        if let Some(ref ci) = self.compression_info {
-            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-            DataReader::new(&chunked, &self.header, data_position)
-                .read_partition_suffix_rows(start_clustering, row_limit)
-        } else {
-            DataReader::new(&self.data, &self.header, data_position)
-                .read_partition_suffix_rows(start_clustering, row_limit)
-        }
+        let source = self.data_source()?;
+        DataReader::new(&source, &self.header, data_position)
+            .read_partition_suffix_rows(start_clustering, row_limit)
     }
 
     /// Return whether a point read should probe this SSTable for `key`.
@@ -517,37 +760,17 @@ impl<R: ReadAt> SSTableReader<R> {
         };
 
         if let Some(entry) = row_index_position {
-            let (partition_key, deletion, static_row, row) =
-                if let Some(ref ci) = self.compression_info {
-                    let chunked =
-                        ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-                    let mut header_reader =
-                        DataReader::new(&chunked, &self.header, entry.data_position);
-                    let Some((partition_key, deletion, static_row)) =
-                        header_reader.read_partition_header_only()?
-                    else {
-                        return Ok(None);
-                    };
-                    let mut row_reader = DataReader::new(&chunked, &self.header, data_position);
-                    let Some(row) = row_reader.read_next_clustered_row()? else {
-                        return Ok(None);
-                    };
-                    (partition_key, deletion, static_row, row)
-                } else {
-                    let mut header_reader =
-                        DataReader::new(&self.data, &self.header, entry.data_position);
-                    let Some((partition_key, deletion, static_row)) =
-                        header_reader.read_partition_header_only()?
-                    else {
-                        return Ok(None);
-                    };
-
-                    let mut row_reader = DataReader::new(&self.data, &self.header, data_position);
-                    let Some(row) = row_reader.read_next_clustered_row()? else {
-                        return Ok(None);
-                    };
-                    (partition_key, deletion, static_row, row)
-                };
+            let source = self.data_source()?;
+            let mut header_reader = DataReader::new(&source, &self.header, entry.data_position);
+            let Some((partition_key, deletion, static_row)) =
+                header_reader.read_partition_header_only()?
+            else {
+                return Ok(None);
+            };
+            let mut row_reader = DataReader::new(&source, &self.header, data_position);
+            let Some(row) = row_reader.read_next_clustered_row()? else {
+                return Ok(None);
+            };
             if row.clustering != clustering {
                 return Ok(None);
             }
@@ -559,12 +782,8 @@ impl<R: ReadAt> SSTableReader<R> {
             }));
         }
 
-        if let Some(ref ci) = self.compression_info {
-            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-            return self.get_clustering_row_by_scan(&chunked, data_position, clustering);
-        }
-
-        self.get_clustering_row_by_scan(&self.data, data_position, clustering)
+        let source = self.data_source()?;
+        self.get_clustering_row_by_scan(&source, data_position, clustering)
     }
 
     fn get_clustering_row_by_scan(
@@ -728,35 +947,19 @@ impl<R: ReadAt> SSTableReader<R> {
         if limit == 0 {
             return Ok(partitions);
         }
-        if let Some(ref ci) = self.compression_info {
-            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-            let mut reader = crate::data::DataReader::new(&chunked, &self.header, 0);
-            while partitions.len() < limit {
-                let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
-                let partition = if is_final_requested_partition {
-                    reader.read_partition_prefix_rows(row_limit)?
-                } else {
-                    reader.read_partition_limited_rows(row_limit)?
-                };
-                let Some(partition) = partition else {
-                    break;
-                };
-                partitions.push(partition);
-            }
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.data, &self.header, 0);
-            while partitions.len() < limit {
-                let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
-                let partition = if is_final_requested_partition {
-                    reader.read_partition_prefix_rows(row_limit)?
-                } else {
-                    reader.read_partition_limited_rows(row_limit)?
-                };
-                let Some(partition) = partition else {
-                    break;
-                };
-                partitions.push(partition);
-            }
+        let source = self.data_source()?;
+        let mut reader = crate::data::DataReader::new(&source, &self.header, 0);
+        while partitions.len() < limit {
+            let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
+            let partition = if is_final_requested_partition {
+                reader.read_partition_prefix_rows(row_limit)?
+            } else {
+                reader.read_partition_limited_rows(row_limit)?
+            };
+            let Some(partition) = partition else {
+                break;
+            };
+            partitions.push(partition);
         }
         Ok(partitions)
     }
@@ -778,15 +981,9 @@ impl<R: ReadAt> SSTableReader<R> {
     {
         let offsets = self.partition_offsets();
         let mut stats = SalvageStats::default();
-        if let Some(ref ci) = self.compression_info {
-            let chunked = ChunkedCompressedData::new(&self.data, ci, &self.decompressed_chunks)?;
-            for &off in offsets.iter() {
-                Self::salvage_one(&chunked, &self.header, off, &mut stats, &mut on_partition);
-            }
-        } else {
-            for &off in offsets.iter() {
-                Self::salvage_one(&self.data, &self.header, off, &mut stats, &mut on_partition);
-            }
+        let source = self.data_source()?;
+        for &off in offsets.iter() {
+            Self::salvage_one(&source, &self.header, off, &mut stats, &mut on_partition);
         }
         Ok(stats)
     }
@@ -868,25 +1065,20 @@ pub struct SalvageStats {
 pub struct PartitionIter<'a, R: ReadAt> {
     sst: &'a SSTableReader<R>,
     pos: u64,
-    /// Chunked decompression view for compressed SSTables. `None` for
-    /// uncompressed, where the iterator reads directly from `sst.data`.
-    compressed: Option<ChunkedCompressedData<'a, R>>,
+    /// How this iterator reads Data.db — decompressed chunks (compressed
+    /// tables), CRC-verified chunks (uncompressed tables with a loaded
+    /// `CRC.db`), or directly (uncompressed, unchecked). Selected once at
+    /// construction; see [`SSTableReader::data_source`].
+    source: ReadSource<'a, R>,
 }
 
 impl<'a, R: ReadAt> PartitionIter<'a, R> {
     fn new(sst: &'a SSTableReader<R>) -> Result<Self> {
-        let compressed = match &sst.compression_info {
-            Some(ci) => Some(ChunkedCompressedData::new(
-                &sst.data,
-                ci,
-                &sst.decompressed_chunks,
-            )?),
-            None => None,
-        };
+        let source = sst.data_source()?;
         Ok(Self {
             sst,
             pos: 0,
-            compressed,
+            source,
         })
     }
 
@@ -911,17 +1103,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         )>,
     > {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition_header_only()?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition_header_only()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_header_only()?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// One-row-at-a-time companion to [`Self::stream_clustered_rows`].
@@ -938,17 +1123,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// one row per source in flight at any moment.
     pub fn next_clustered_row(&mut self) -> Result<Option<crate::types::Row>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_next_clustered_row()?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_next_clustered_row()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_next_clustered_row()?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Projection-aware companion to [`Self::next_clustered_row`].
@@ -960,17 +1138,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         wanted: &[u16],
     ) -> Result<Option<crate::types::Row>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_next_clustered_row_projected(wanted)?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_next_clustered_row_projected(wanted)?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_next_clustered_row_projected(wanted)?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Bounded-batch companion to [`Self::next_clustered_row`]. Pulls
@@ -1013,17 +1184,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            reader.stream_clustered_rows(on_row)?;
-            self.pos = reader.position();
-            Ok(())
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            reader.stream_clustered_rows(on_row)?;
-            self.pos = reader.position();
-            Ok(())
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        reader.stream_clustered_rows(on_row)?;
+        self.pos = reader.position();
+        Ok(())
     }
 
     /// Yield the next partition's header (key, deletion, static
@@ -1051,32 +1215,18 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         F: FnMut(&crate::types::Row) -> Result<()>,
     {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition_streaming(on_row)?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition_streaming(on_row)?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_streaming(on_row)?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     pub fn next_partition(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition()?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition()?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Yield `(partition_key, row_count)` for the next partition without
@@ -1088,17 +1238,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         &mut self,
     ) -> Result<Option<(ferrosa_common::key::DecoratedKey, u64)>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition_count()?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition_count()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_count()?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Yield the next partition decoding only the cells whose
@@ -1119,17 +1262,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         wanted: &[u16],
     ) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition_projected(wanted)?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition_projected(wanted)?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_projected(wanted)?;
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Advance past the partition currently at `self.pos` WITHOUT
@@ -1248,18 +1384,11 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// Returns `Ok(None)` at EOF.
     pub fn peek_partition_key(&mut self) -> Result<Option<ferrosa_common::key::DecoratedKey>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.peek_partition_key()?;
-            // peek does not advance pos
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.peek_partition_key()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.peek_partition_key()?;
+        // peek does not advance pos
+        self.pos = reader.position();
+        Ok(result)
     }
 
     /// Yield the next partition with full row metadata (clustering
@@ -1270,17 +1399,10 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// data. Returns `Ok(None)` at EOF.
     pub fn next_partition_metadata(&mut self) -> Result<Option<crate::types::Partition>> {
         let header = &self.sst.header;
-        if let Some(ref data) = self.compressed {
-            let mut reader = crate::data::DataReader::new(data, header, self.pos);
-            let result = reader.read_partition_metadata()?;
-            self.pos = reader.position();
-            Ok(result)
-        } else {
-            let mut reader = crate::data::DataReader::new(&self.sst.data, header, self.pos);
-            let result = reader.read_partition_metadata()?;
-            self.pos = reader.position();
-            Ok(result)
-        }
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_metadata()?;
+        self.pos = reader.position();
+        Ok(result)
     }
 }
 
@@ -3172,5 +3294,172 @@ mod tests {
             got.iter().map(|p| p.rows.len()).sum::<usize>() as u64,
             "stats agree with delivered partitions"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T-011: source checksums (Digest.crc32, CRC.db)
+    // -----------------------------------------------------------------------
+
+    /// Build an uncompressed SSTable with one wide partition, wide enough
+    /// (with a small `chunk_size`) to span several CRC.db chunks.
+    fn build_wide_uncompressed_output(
+        chunk_size: usize,
+    ) -> (DecoratedKey, crate::writer::SSTableOutput) {
+        use crate::types::{DeletionTime, LivenessInfo, Row};
+        use crate::writer::{SSTableWriter, WriteOptions};
+        use ferrosa_common::CellValue;
+
+        let header = test_header();
+        let dk = DecoratedKey::new(PartitionKey::from(b"checksum-target".as_slice()));
+        let rows = (0_i32..200)
+            .map(|idx| {
+                let timestamp = 1_000_000 + i64::from(idx);
+                Row {
+                    clustering: (idx + 1).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("checksum-value-{idx:04}").into_bytes(), timestamp),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+                }
+            })
+            .collect();
+        let partition = Partition {
+            key: dk.clone(),
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows,
+        };
+        let mut writer = SSTableWriter::new(
+            WriteOptions {
+                compression: None,
+                bloom_fp_chance: 0.01,
+                chunk_size,
+                verify_output: true,
+            },
+            header,
+        );
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish().unwrap();
+        (dk, output)
+    }
+
+    fn open_reader_from_output(output: crate::writer::SSTableOutput) -> SSTableReader<Vec<u8>> {
+        let components = SSTableComponents {
+            data: output.data,
+            partitions: output.partitions,
+            rows: output.rows,
+            filter: output.filter,
+            compression_info: output.compression_info,
+            statistics: output.statistics,
+        };
+        SSTableReader::open(components).unwrap()
+    }
+
+    #[test]
+    fn checksum_verify_digest_ok_when_loaded_and_matching() {
+        let (_dk, output) = build_wide_uncompressed_output(64);
+        let digest_bytes = output.digest.clone();
+        let mut reader = open_reader_from_output(output);
+        reader.load_digest(&digest_bytes).unwrap();
+        reader.verify_digest().unwrap();
+    }
+
+    #[test]
+    fn checksum_verify_digest_ok_and_warns_once_when_not_loaded() {
+        let (_dk, output) = build_wide_uncompressed_output(64);
+        let reader = open_reader_from_output(output);
+        assert!(!reader.digest_missing_warned.load(Ordering::Relaxed));
+        reader.verify_digest().unwrap();
+        assert!(reader.digest_missing_warned.load(Ordering::Relaxed));
+        // A second call must still be Ok -- "not checked", never an error.
+        reader.verify_digest().unwrap();
+    }
+
+    #[test]
+    fn checksum_verify_digest_detects_mismatch() {
+        let (_dk, output) = build_wide_uncompressed_output(64);
+        let mut reader = open_reader_from_output(output);
+        reader.load_digest(b"1").unwrap();
+        let err = reader.verify_digest().unwrap_err();
+        assert!(
+            err.to_string().contains("Digest.crc32 mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checksum_read_verifies_uncompressed_chunks_when_crc_table_loaded() {
+        let (dk, output) = build_wide_uncompressed_output(64);
+        let crc_bytes = output.crc.clone().expect("uncompressed table has CRC.db");
+        let mut reader = open_reader_from_output(output);
+        reader.load_crc_table(&crc_bytes).unwrap();
+        let partition = reader.get_partition(&dk).unwrap().expect("partition");
+        assert_eq!(partition.rows.len(), 200);
+    }
+
+    #[test]
+    fn checksum_flipped_bit_in_data_db_returns_chunk_offset_error() {
+        let (dk, output) = build_wide_uncompressed_output(64);
+        let crc_bytes = output.crc.clone().expect("uncompressed table has CRC.db");
+        assert!(
+            output.data.len() > 128,
+            "test needs several CRC.db chunks, got {} bytes",
+            output.data.len()
+        );
+
+        let flip_offset = 100usize;
+        let mut flipped = output;
+        flipped.data[flip_offset] ^= 0x01;
+
+        let mut reader = open_reader_from_output(flipped);
+        reader.load_crc_table(&crc_bytes).unwrap();
+
+        let err = reader
+            .get_partition(&dk)
+            .expect_err("a flipped byte must fail CRC.db verification");
+        let msg = err.to_string();
+        let expected_chunk_offset = (flip_offset / 64) * 64;
+        assert!(
+            msg.contains(&format!("offset {expected_chunk_offset}:")),
+            "error must name the failing chunk's byte offset ({expected_chunk_offset}): {msg}"
+        );
+    }
+
+    #[test]
+    fn checksum_missing_crc_table_reads_unchecked_and_warns_once() {
+        let (dk, output) = build_wide_uncompressed_output(64);
+        let reader = open_reader_from_output(output);
+        assert!(!reader.crc_missing_warned.load(Ordering::Relaxed));
+        let partition = reader
+            .get_partition(&dk)
+            .unwrap()
+            .expect("old SSTable without CRC.db must still read");
+        assert_eq!(partition.rows.len(), 200);
+        assert!(reader.crc_missing_warned.load(Ordering::Relaxed));
+        // A second read must stay Ok -- logged once, not once per read.
+        reader.get_partition(&dk).unwrap();
+    }
+
+    #[test]
+    fn checksum_load_crc_table_rejects_compressed_table() {
+        use crate::compression::Compression;
+        use crate::writer::{SSTableWriter, WriteOptions};
+
+        let header = test_header();
+        let writer = SSTableWriter::new(
+            WriteOptions {
+                compression: Some(Compression::Lz4),
+                bloom_fp_chance: 0.01,
+                chunk_size: 4096,
+                verify_output: true,
+            },
+            header,
+        );
+        let output = writer.finish().unwrap();
+        assert!(output.crc.is_none(), "compressed tables have no CRC.db");
+        let mut reader = open_reader_from_output(output);
+        assert!(reader.load_crc_table(&[0, 0, 0, 1]).is_err());
     }
 }
