@@ -1566,7 +1566,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capture num_tokens locally before cluster_config is consumed by
     // ModeController — needed downstream when populating system.local.tokens.
     let num_tokens = cluster_config.num_tokens as usize;
-    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env();
+    // A typo in an internode value stops startup; a seed or broadcast name that may
+    // simply not resolve yet is logged at WARN and startup continues.
+    let mut net_config_mut = ferrosa_net::config::NetConfig::from_env_checked()?;
     // Seed the base from `FERROSA_INTERNODE_*`, then let the config file win:
     // `internode.bind`, `internode.broadcast`, etc. in ferrosa.toml override
     // the env-derived defaults (TOML-wins precedence).
@@ -1787,9 +1789,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // points against the advertised local node during session bootstrap;
     // advertising the container-bind port (9042) when the host-reachable
     // port is 19042 hangs session build. See cql_broadcast::parse_cql_broadcast.
-    let (cql_broadcast_addr, cql_broadcast_port) = match std::env::var("FERROSA_CQL_BROADCAST") {
-        Ok(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port()),
-        Err(_) => {
+    // An empty value means "not set" (compose files write `VAR=`); any other value
+    // that does not parse or resolve stops startup instead of advertising loopback.
+    let cql_broadcast_env = std::env::var("FERROSA_CQL_BROADCAST")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (cql_broadcast_addr, cql_broadcast_port) = match cql_broadcast_env {
+        Some(addr_str) => cql_broadcast::parse_cql_broadcast(&addr_str, cql_bind.port())?,
+        None => {
             // Gap 11: when CQL bind is 0.0.0.0 (the normal containerised
             // case), the broadcast address must be the externally reachable
             // IP so cluster peers and drivers can distinguish nodes.  Fall
