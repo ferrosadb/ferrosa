@@ -685,6 +685,12 @@ impl ModeController {
         self.accepts_cql_connections()
     }
 
+    /// The cluster size this node was told to expect (`FERROSA_EXPECTED_CLUSTER_SIZE`),
+    /// or 0 when none was declared.
+    pub fn expected_cluster_size(&self) -> usize {
+        self.config.expected_cluster_size
+    }
+
     /// Whether declared deployment state permits a native-protocol connection.
     /// Consensus health is intentionally excluded: a failed node must still
     /// answer OPTIONS/STARTUP and return typed errors for data opcodes.
