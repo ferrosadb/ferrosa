@@ -2,7 +2,7 @@
 # COPY-only: the musl static binaries are built upstream (release.yml) and
 # downloaded into dist/<arch>/ before this build. No compilation happens here,
 # so the multi-arch build needs no QEMU emulation.
-FROM alpine:3.20
+FROM downloads.ferrosa.ai/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 # ca-certificates: required for TLS to S3. tzdata: correct timestamps/logs.
 RUN apk add --no-cache ca-certificates tzdata \

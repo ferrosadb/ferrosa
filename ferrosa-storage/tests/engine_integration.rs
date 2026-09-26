@@ -536,3 +536,54 @@ fn concurrent_writes_with_flushes_no_data_loss() {
 
     engine.shutdown().unwrap();
 }
+
+/// A partition-level DELETE of rows that were already flushed reaches the next
+/// flush as a partition holding only a deletion (no rows, no static row). Flush
+/// used to drop such a partition as "empty", losing the delete: the older
+/// SSTable's rows read back as live again.
+#[test]
+fn a_partition_delete_survives_its_own_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(test_engine_config(dir.path()), None).unwrap();
+    engine.register_table(test_schema("ks", "deletes")).unwrap();
+    let tid = TableId::new("ks", "deletes");
+    let key = make_key("k");
+
+    engine
+        .write(&tid, &key, make_row(b"v", 1000), 1000)
+        .unwrap();
+    engine.flush(&tid).unwrap();
+
+    let delete = Row {
+        clustering: vec![],
+        cells: vec![],
+        deletion: DeletionTime::new(2000, 1_000_000_000),
+        primary_key_liveness: LivenessInfo::NONE,
+    };
+    engine.write(&tid, &key, delete, 2000).unwrap();
+    let live_rows = |engine: &StorageEngine| {
+        engine
+            .read(&tid, &key)
+            .unwrap()
+            .map_or(0, |partition| partition.rows.len())
+    };
+    assert_eq!(
+        live_rows(&engine),
+        0,
+        "precondition: the memtable delete suppresses the row"
+    );
+
+    engine.flush(&tid).unwrap();
+    assert_eq!(
+        live_rows(&engine),
+        0,
+        "the delete must still suppress the row once it is flushed"
+    );
+    assert_eq!(
+        engine.sstable_count(&tid),
+        2,
+        "the delete is flushed to its own SSTable"
+    );
+
+    engine.shutdown().unwrap();
+}
