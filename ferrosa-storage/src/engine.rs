@@ -8830,6 +8830,47 @@ impl StorageEngine {
                 );
                 continue;
             }
+            // ── T-022: durable replacement record, written and fsynced BEFORE
+            // promotion. This is the commit point (compaction-cancel-safety.md
+            // C2): once it lands, startup reconciliation (T-023) can always
+            // finish the job, so every step from here on rolls forward on
+            // success or rolls back explicitly on failure -- it never leaves
+            // an orphan the way the old bare `continue`s did (window C).
+            let table_dir = self
+                .config
+                .data_dir
+                .join("sstables")
+                .join(table_id.to_string());
+            if let Err(e) = std::fs::create_dir_all(&table_dir) {
+                tracing::error!(%e, %table_id, dir = %table_dir.display(), "compaction: failed to create table dir for replacement record; preserving inputs");
+                continue;
+            }
+            let task_id = result.output.id.clone();
+            let output_digest = match Self::read_generation_digest(
+                &result.output.path,
+                &result.output.id,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, %task_id, "compaction: failed to read staged output Digest.crc32; preserving inputs");
+                    continue;
+                }
+            };
+            let mut intent = crate::compaction::intent::CompactionIntentRecord {
+                task_id: task_id.clone(),
+                // Corrected below once `promote_compaction_output` decides the
+                // final generation id -- it may differ from the staged id to
+                // avoid colliding with a concurrently-allocated flush gen.
+                output_gen: task_id.clone(),
+                output_digest,
+                inputs: result.task.inputs.iter().map(|m| m.id.clone()).collect(),
+                phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+            };
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(%e, %table_id, %task_id, "compaction: failed to write replacement record; preserving inputs");
+                continue;
+            }
+
             let promote_start = Instant::now();
             let output = match self.promote_compaction_output(table_id, &result.output) {
                 Ok(output) => {
@@ -8845,11 +8886,32 @@ impl StorageEngine {
                         promote_start.elapsed(),
                     );
                     tracing::error!(%e, %table_id, "compaction: failed to promote output SSTable");
+                    Self::rollback_compaction_intent(
+                        table_id,
+                        &table_dir,
+                        &task_id,
+                        None,
+                        "promote failed",
+                    );
                     continue;
                 }
             };
 
             cancel_point!(&table_id.to_string(), CancelPoint::AfterPromote);
+            // The commit's `output_gen` was a placeholder until promotion
+            // decided the real generation id. Correct and re-fsync it now,
+            // before any further step, so a crash from here on always finds
+            // the record pointing at the generation that actually exists.
+            intent.output_gen = output.id.clone();
+            if let Err(e) = intent.write(&table_dir) {
+                tracing::error!(
+                    %e, %table_id, %task_id, output_gen = %output.id,
+                    "compaction: failed to record the promoted generation id; \
+                     the promoted output may become an unrecovered orphan if a \
+                     crash follows -- inputs are untouched, so no data is at risk"
+                );
+            }
+
             // Open the promoted compacted output SSTable.
             let gen = &output.id;
             let dir = &output.path;
@@ -8857,6 +8919,13 @@ impl StorageEngine {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
                     tracing::error!(%e, "compaction: failed to open output SSTable");
+                    Self::rollback_compaction_intent(
+                        table_id,
+                        &table_dir,
+                        &task_id,
+                        Some(&output.path),
+                        "output reader open failed",
+                    );
                     continue;
                 }
             };
@@ -8915,6 +8984,14 @@ impl StorageEngine {
                         Ok(sidecars) => sidecars,
                         Err(e) => {
                             tracing::error!(%e, %table_id, "compaction: output sidecars could not be built; keeping the inputs");
+                            drop(tables);
+                            Self::rollback_compaction_intent(
+                                table_id,
+                                &table_dir,
+                                &task_id,
+                                Some(&output.path),
+                                "output sidecar merge failed",
+                            );
                             continue;
                         }
                     };
@@ -8927,6 +9004,14 @@ impl StorageEngine {
                         output_sidecars,
                     ) {
                         tracing::error!(%e, "compaction: swap failed");
+                        drop(tables);
+                        Self::rollback_compaction_intent(
+                            table_id,
+                            &table_dir,
+                            &task_id,
+                            Some(&output.path),
+                            "swap failed",
+                        );
                         continue;
                     }
                     cancel_point!(&table_id.to_string(), CancelPoint::AfterSwap);
@@ -8938,6 +9023,10 @@ impl StorageEngine {
                         removed = input_id_paths.len(),
                         "compaction: swap complete"
                     );
+                    intent.phase = crate::compaction::intent::CompactionIntentPhase::Swapped;
+                    if let Err(e) = intent.write(&table_dir) {
+                        tracing::error!(%e, %table_id, %task_id, "compaction: failed to advance replacement record to Swapped; startup reconciliation will still roll it forward from Promoting");
+                    }
 
                     // Eager index build: submit high-priority rebuild for compacted output.
                     // Same as flush — keeps MemtableIndex bounded in steady state.
@@ -9028,13 +9117,32 @@ impl StorageEngine {
             // Register in local cache.
             self.local_cache
                 .register(&output.id, output.path.clone(), output.size_bytes);
-            let cleanup_inputs = || {
+            // Retires every input, then advances the replacement record to
+            // `Retired` and deletes it. Once every listed input is off disk
+            // (or was already gone) and that phase write is fsynced, the
+            // local half of the invariant already holds regardless of S3
+            // status (I2: exactly one of {inputs, output} discoverable), so
+            // the record has nothing left to protect. S3 convergence (I6)
+            // is independently guaranteed by `upload::PendingUploadsLog`,
+            // which `poll_compactions` still writes further down on the S3
+            // path exactly as before -- deleting this record early does not
+            // touch that separate mechanism.
+            let mut cleanup_inputs = || {
                 let cleanup_start = Instant::now();
                 Self::evict_local_input_sstable_files(table_id, &result.task.inputs);
                 crate::metrics::observe_compaction_phase(
                     crate::metrics::CompactionPhase::InputCleanup,
                     cleanup_start.elapsed(),
                 );
+                intent.phase = crate::compaction::intent::CompactionIntentPhase::Retired;
+                if let Err(e) = intent.write(&table_dir) {
+                    tracing::error!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to advance replacement record to Retired; startup reconciliation will retry retirement (idempotent)");
+                } else if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                    &table_dir,
+                    &intent.task_id,
+                ) {
+                    tracing::warn!(%e, %table_id, task_id = %intent.task_id, "compaction: failed to delete replacement record after retirement; harmless leak, startup reconciliation cleans it up");
+                }
             };
 
             // ── Skip S3 upload for pinned tables ────────────────────────────
@@ -11412,12 +11520,68 @@ impl StorageEngine {
                         tracing::warn!(
                             %e,
                             path = %file_path.display(),
-                            "compaction: failed to remove retired input component; left for reconciliation (T-024)"
+                            "compaction: failed to remove retired input component; left for reconciliation (T-023)"
                         );
                     }
                 }
             }
         }
+    }
+
+    /// Read and parse a generation's `Digest.crc32` component (T-011 format).
+    /// Used both when committing a compaction's replacement record (read from
+    /// the staged output, before promotion) and during startup reconciliation
+    /// (read from the promoted output, to verify it against the record).
+    fn read_generation_digest(dir: &std::path::Path, gen: &str) -> std::io::Result<u32> {
+        let path = Self::generation_component_path(dir, gen, "Digest.crc32")
+            .unwrap_or_else(|| dir.join(format!("{gen}-Digest.crc32")));
+        let bytes = std::fs::read(&path)?;
+        ferrosa_sstable::checksum::parse_digest(&bytes)
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))
+    }
+
+    /// Roll back a compaction after its replacement record committed but
+    /// before input retirement started (T-022, compaction-cancel-safety.md
+    /// C2): remove the promoted output directory when one exists, fsync
+    /// `table_dir` so the removal is durable, and delete the record. The
+    /// inputs are never touched by this function, so it is safe to call from
+    /// any failure point between the commit and the start of retirement.
+    fn rollback_compaction_intent(
+        table_id: &TableId,
+        table_dir: &std::path::Path,
+        task_id: &str,
+        promoted_output_dir: Option<&std::path::Path>,
+        reason: &str,
+    ) {
+        if let Some(output_dir) = promoted_output_dir {
+            match std::fs::remove_dir_all(output_dir) {
+                Ok(()) => {
+                    if let Err(e) = crate::flush::FileFlushTarget::fsync_dir(table_dir) {
+                        tracing::error!(
+                            %e, %table_id, task_id, dir = %table_dir.display(),
+                            "compaction: rollback removed the promoted output but could not \
+                             fsync the table dir; left for startup reconciliation"
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::error!(
+                        %e, %table_id, task_id, dir = %output_dir.display(),
+                        "compaction: rollback could not remove the promoted output directory; \
+                         left for startup reconciliation (an orphan, not data loss -- inputs \
+                         are untouched)"
+                    );
+                }
+            }
+        }
+        if let Err(e) =
+            crate::compaction::intent::CompactionIntentRecord::delete(table_dir, task_id)
+        {
+            tracing::error!(%e, %table_id, task_id, "compaction: rollback could not delete the replacement record; startup reconciliation will retry");
+        }
+        crate::metrics::inc_compaction_intent_rollback();
+        tracing::warn!(%table_id, task_id, reason, "compaction: rolled back after the replacement record committed; inputs are untouched");
     }
 
     /// Collect local component file paths for an SSTable generation.
@@ -21937,6 +22101,224 @@ mod tests {
                 "input component {p:?} must survive a promote whose directory fsync failed"
             );
         }
+    }
+
+    /// CS13-style crash test (T-001): after promoting a compaction output,
+    /// drop un-fsynced directory-entry writes for `sstables/<table>/` (as if
+    /// the filesystem crashed before the promote rename's directory entry
+    /// reached disk), then restart. The invariant this proves: with the fix
+    /// in this packet, either the promoted output's directory entry survived
+    /// the simulated crash, or the inputs were never unlinked -- never
+    /// neither.
+    ///
+    /// LazyFS setup (this harness is not implemented yet -- see below):
+    ///   1. Build/install LazyFS: <https://github.com/dsrhaslab/lazyfs>.
+    ///   2. Mount a LazyFS-backed directory with a fault config that can drop
+    ///      un-fsynced writes on trigger (LazyFS's crash-simulation fault).
+    ///   3. Point a `StorageEngine`'s `data_dir` at that mountpoint.
+    ///   4. Run a flush + compact cycle, trigger the LazyFS crash fault right
+    ///      after the directory fsync in `fsync_promoted_directory` but
+    ///      before `evict_local_input_sstable_files`, then remount clean and
+    ///      reopen the engine.
+    ///   5. Assert exactly one of {inputs, promoted output} is discoverable.
+    ///
+    /// Set `FERROSA_TEST_LAZYFS=1` to opt in once that harness exists. It
+    /// does not exist yet: this packet proves the ordering and failure-path
+    /// invariants with the in-process `fsync_probe` seam instead (the two
+    /// tests above). A real crash-consistency proof under LazyFS needs a
+    /// Linux host, which the project plan does not provision until T-070
+    /// (`specs/sstable-write-pump/compiled-project-plan.md`).
+    #[cfg(feature = "live-infra-tests")]
+    #[test]
+    fn promote_dir_fsync_lazyfs_crash_loses_neither_copy() {
+        if std::env::var("FERROSA_TEST_LAZYFS").is_err() {
+            panic!(
+                "FERROSA_TEST_LAZYFS not set -- install LazyFS \
+                 (https://github.com/dsrhaslab/lazyfs), mount a LazyFS-backed \
+                 directory with a fault config that can drop un-fsynced \
+                 writes, point a StorageEngine's data_dir at it, and re-run \
+                 with FERROSA_TEST_LAZYFS=1. See this test's doc comment for \
+                 the mount + fault-injection steps this harness still needs \
+                 (tracked for T-070, the first point with a Linux host)."
+            );
+        }
+        panic!(
+            "FERROSA_TEST_LAZYFS is set but the LazyFS mount / fault-injection \
+             harness is not implemented in this crate yet -- refusing to fake \
+             a pass. Implement the steps in this test's doc comment (T-070) \
+             before removing this panic."
+        );
+    }
+
+    // ── T-022 / T-023: durable replacement record, commit/rollback, and
+    // startup reconciliation (compaction-cancel-safety.md C2/C3, forge
+    // t_fca66994) ──────────────────────────────────────────────────────
+
+    fn leftover_intent_records(table_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(table_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(crate::compaction::intent::CompactionIntentRecord::is_record_name)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_record_written_and_fsynced_before_promote() {
+        use crate::flush::fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        let _probe = crate::flush::fsync_probe::exclusive();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let events = crate::flush::fsync_probe::events();
+        let is_intent = |p: &std::path::PathBuf| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::compaction::intent::CompactionIntentRecord::is_record_name)
+        };
+        let intent_rename_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::Rename(p) if is_intent(p)))
+            .expect("the replacement record must be renamed into place before anything else");
+        let intent_dir_fsync_idx = events
+            .iter()
+            .position(|e| matches!(e, Event::DirFsync(p) if *p == sstable_dir))
+            .expect("writing the replacement record must fsync the table dir");
+        let output_rename_idx = events
+            .iter()
+            .position(
+                |e| matches!(e, Event::Rename(p) if p.starts_with(&sstable_dir) && !is_intent(p)),
+            )
+            .expect("promote must rename the output into sstables/<table>/");
+
+        assert!(
+            intent_rename_idx < output_rename_idx,
+            "the replacement record must be committed (renamed + fsynced) before promotion: {events:?}"
+        );
+        assert!(
+            intent_dir_fsync_idx < output_rename_idx,
+            "the record's directory fsync must also precede promotion: {events:?}"
+        );
+
+        assert!(
+            leftover_intent_records(&sstable_dir).is_empty(),
+            "the replacement record must be deleted once the compaction fully completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_promote_failure_rolls_back_and_preserves_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        let pre_generations = StorageEngine::scan_generations(&sstable_dir);
+
+        let input_component_paths: Vec<std::path::PathBuf> = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let inputs = engine.collect_sstable_metadata(&tid, state);
+            drop(tables);
+            inputs
+                .iter()
+                .flat_map(|input| {
+                    let path = input.path.clone();
+                    let id = input.id.clone();
+                    ["Data.db", "Partitions.db", "Rows.db"]
+                        .into_iter()
+                        .map(move |component| {
+                            StorageEngine::generation_component_path(&path, &id, component)
+                                .unwrap_or_else(|| path.join(format!("{id}-{component}")))
+                        })
+                })
+                .collect()
+        };
+        assert!(!input_component_paths.is_empty());
+
+        // Same fault-injection marker T-001's own tests use: makes the
+        // post-rename directory fsync inside `promote_compaction_output` fail,
+        // so promotion itself never completes.
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        std::fs::write(
+            compaction_output_dir.join(StorageEngine::TEST_FAIL_PROMOTION_DIR_FSYNC),
+            b"1",
+        )
+        .unwrap();
+
+        let rollback_before = crate::metrics::compaction_intent_rollback_total();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let post_generations = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(
+            pre_generations, post_generations,
+            "a failed promote must never leave a new generation visible"
+        );
+        for p in &input_component_paths {
+            assert!(p.exists(), "inputs must survive a promote failure: {p:?}");
+        }
+        assert!(
+            leftover_intent_records(&sstable_dir).is_empty(),
+            "the replacement record must be deleted after a rolled-back promote failure"
+        );
+        assert!(
+            crate::metrics::compaction_intent_rollback_total() > rollback_before,
+            "the rollback must be observable via the intent-rollback counter"
+        );
+    }
+
+    #[test]
+    fn compaction_commit_rollback_removes_promoted_output_dir_and_deletes_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let output_dir = table_dir.join("9");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("9-Data.db"), b"promoted").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "9".to_string(),
+            output_gen: "9".to_string(),
+            output_digest: 1,
+            inputs: vec!["1".to_string(), "2".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_intent_rollback_total();
+        StorageEngine::rollback_compaction_intent(
+            &table_id(),
+            &table_dir,
+            "9",
+            Some(&output_dir),
+            "test rollback",
+        );
+
+        assert!(
+            !output_dir.exists(),
+            "the promoted output directory must be removed on rollback"
+        );
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "the record must be deleted on rollback"
+        );
+        assert!(crate::metrics::compaction_intent_rollback_total() > before);
     }
 
     #[test]

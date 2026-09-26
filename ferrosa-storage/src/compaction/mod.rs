@@ -30,6 +30,7 @@ pub mod cancel_oracle;
 mod cancel_token_tests;
 pub mod executor;
 pub mod finalize;
+pub mod intent;
 pub mod metadata;
 pub mod purge;
 pub mod strategy;

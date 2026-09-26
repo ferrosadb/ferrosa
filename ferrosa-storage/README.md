@@ -211,6 +211,22 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   by table-id scope, so a test's cancel-point hook can call
   `cancel_harness::cancel_now` to actually cancel — not merely record having
   reached — a `CancelPoint`.
+  **Durable replacement record + commit protocol (T-022):**
+  `compaction::intent::CompactionIntentRecord` is a JSON file at
+  `sstables/<table>/.compaction-<id>.intent` — `{task_id, output_gen,
+  output_digest, inputs, phase}`, `phase` one of `Promoting → Swapped →
+  Retired`. `poll_compactions` writes it (fsynced file + fsynced table dir)
+  **before** promoting the staged output; that write is the commit point. A
+  failure after commit but before retirement (reader-open, sidecar-merge, or
+  swap) rolls back under the record — removes the promoted output directory,
+  fsyncs, deletes the record — via `StorageEngine::rollback_compaction_intent`,
+  leaving the inputs untouched (`compaction_intent_rollback_total`). Startup
+  reconciliation from this record (T-023) is the next step; until it lands,
+  the record's job stops at retirement time, matching today's behavior. This
+  does not replace `upload::PendingUploadsLog`: that log still separately
+  drives S3 upload/manifest/delete recovery on the same path as before; the
+  replacement record is the source of truth only for the local
+  promote/swap/retire sequence.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes

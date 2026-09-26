@@ -374,6 +374,9 @@ static COMPACTION_PURGE_HELD_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions that ran without purging because the table's `gc_grace_seconds`
 /// could not be read. Non-zero means a table option is corrupt; alert on it.
 static COMPACTION_PURGE_POLICY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Compactions rolled back after their replacement record committed but before
+/// retirement (reader-open, sidecar-merge, or swap failure) -- T-022.
+static COMPACTION_INTENT_ROLLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -575,6 +578,18 @@ pub fn inc_compaction_purge_held_back() {
 /// Times a compaction wrote a fully-purged partition because nothing else survived.
 pub fn compaction_purge_held_back_total() -> u64 {
     COMPACTION_PURGE_HELD_BACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a compaction rolled back after its replacement record committed
+/// (T-022): the promoted directory was removed, the record deleted, and the
+/// inputs left untouched.
+pub fn inc_compaction_intent_rollback() {
+    COMPACTION_INTENT_ROLLBACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total post-commit compaction rollbacks since startup.
+pub fn compaction_intent_rollback_total() -> u64 {
+    COMPACTION_INTENT_ROLLBACK_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total compaction input readers obtained via the reader pool since startup.
