@@ -11,6 +11,7 @@
 //! Wire-format encoding/decoding for CQL values remains in `ferrosa-cql`.
 
 pub mod accord;
+pub mod cancel;
 pub mod cell;
 /// Cluster formation lifecycle. Lives here, not in ferrosa-cluster, because
 /// ferrosa-sim needs the same state machine and deliberately cannot depend on
@@ -36,6 +37,7 @@ pub use accord::{
     AcceptedBallot, BallotGenerator, BallotNumber, HybridLogicalClock, PromisedBallot,
     Timestamp as AccordTimestamp, TxnId, TxnPhase, TxnState,
 };
+pub use cancel::{CancelReason, CancelToken, Cancelled};
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
 pub use complex_cell::{
     accord_list_cell_path, list_path_element_seq, reconcile, CellPath, ComplexColumn, CounterCell,

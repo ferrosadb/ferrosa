@@ -23,6 +23,11 @@ mod cancel_harness_integration;
 /// [`cancel_harness`]. See `test-specification.md` L10.
 #[cfg(any(test, feature = "test-support"))]
 pub mod cancel_oracle;
+/// `cancel_token_*` tests (T-021): real cancellation. CS1 (rollback at every
+/// honoured checkpoint), CS3 (latency), CS4 (shutdown), CS14 (re-compaction
+/// after cancel), CD1 (a parked worker exits shutdown immediately).
+#[cfg(test)]
+mod cancel_token_tests;
 pub mod executor;
 pub mod finalize;
 pub mod metadata;

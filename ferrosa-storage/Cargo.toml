@@ -17,6 +17,10 @@ ferrosa-sstable = { path = "../ferrosa-sstable" }
 arc-swap = "1.7"
 parking_lot = "0.12"
 crc32fast = "1"
+# CancelToken's closed channel and the compaction executor's task/result
+# queues (T-021, decisions.md D7): crossbeam bounded channels + blocking
+# select!, no polling.
+crossbeam-channel = "0.5"
 # Scalar index sidecars are read through a memory map (t_7ac6b0e3); same
 # version ferrosa-sstable maps its Partitions/Rows components with.
 memmap2 = "0.9"

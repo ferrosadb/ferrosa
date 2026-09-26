@@ -10,10 +10,18 @@
 //! - [`CancelPoint`]: every named step in the lifecycle table and the C1
 //!   check-point list.
 //! - [`record_cancel_point`]: the hook production code calls at each step.
-//!   In this packet it only invokes a test-installed callback (record or
-//!   crash) — no cancellation exists yet, that is T-021.
+//!   Fires a test-installed callback (record or crash).
 //! - [`set_cancel_hook`] / [`clear_cancel_hook`]: install/remove the
 //!   callback for one **scope** (a table id string).
+//! - [`register_cancel_token`] / [`cancel_now`]: T-021's real-cancellation
+//!   wiring. `execute_task_with_read_mode` registers the live
+//!   [`ferrosa_common::CancelToken`] for the task it is running under the
+//!   same scope `record_cancel_point` uses, so a test's cancel-point hook can
+//!   call `cancel_now(scope, reason)` from inside the hook to actually
+//!   cancel the task at that exact point — not just record having reached
+//!   it. Production's own checkpoints (`token.check()`, always compiled,
+//!   unlike the record-only `cancel_point!` macro) then observe the
+//!   cancellation and return `Err(Cancelled)`.
 //!
 //! Hooks are keyed by scope, not a single process-wide slot: `cargo test`
 //! runs many unrelated tests concurrently in one process, and essentially
@@ -39,6 +47,8 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
+
+use ferrosa_common::{CancelReason, CancelToken};
 
 /// Every step in the compaction lifecycle a cancel (T-021) or a crash can
 /// land on. Ordering follows `compaction-cancel-safety.md`'s lifecycle
@@ -203,6 +213,67 @@ impl Drop for CancelHookGuard {
     }
 }
 
+static TOKENS: OnceLock<RwLock<HashMap<String, CancelToken>>> = OnceLock::new();
+
+fn tokens() -> &'static RwLock<HashMap<String, CancelToken>> {
+    TOKENS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Registers the live [`CancelToken`] a running compaction task is checking,
+/// under `scope` (same convention as [`set_cancel_hook`]: a table id
+/// string). Called by `execute_task_with_read_mode` for the duration of one
+/// task. As with the hooks map, this is scoped by table rather than by task:
+/// two tasks concurrently in flight for the same table would clobber each
+/// other's registration, which is fine for a test harness that gives each
+/// case its own table.
+pub fn register_cancel_token(scope: impl Into<String>, token: CancelToken) {
+    tokens().write().insert(scope.into(), token);
+}
+
+/// Removes the token registered for `scope`.
+pub fn unregister_cancel_token(scope: &str) {
+    tokens().write().remove(scope);
+}
+
+/// Returns a clone of the live token registered for `scope`, if any.
+pub fn cancel_token_for_scope(scope: &str) -> Option<CancelToken> {
+    tokens().read().get(scope).cloned()
+}
+
+/// Cancels the live token registered for `scope` with `reason`, if one is
+/// registered. Returns whether a token was found. This is the mechanism a
+/// test's cancel-point hook uses to actually CANCEL — not merely record
+/// having reached — a `CancelPoint` (T-021).
+pub fn cancel_now(scope: &str, reason: CancelReason) -> bool {
+    match cancel_token_for_scope(scope) {
+        Some(token) => {
+            token.cancel(reason);
+            true
+        }
+        None => false,
+    }
+}
+
+/// RAII guard that unregisters its scope's token on drop, including on an
+/// early return or a panic unwind, mirroring [`CancelHookGuard`].
+pub struct CancelTokenGuard {
+    scope: String,
+}
+
+impl CancelTokenGuard {
+    pub fn install(scope: impl Into<String>, token: CancelToken) -> Self {
+        let scope = scope.into();
+        register_cancel_token(scope.clone(), token);
+        CancelTokenGuard { scope }
+    }
+}
+
+impl Drop for CancelTokenGuard {
+    fn drop(&mut self) {
+        unregister_cancel_token(&self.scope);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +354,53 @@ mod tests {
             "cancel_harness_unit_test::no_hook_installed",
             CancelPoint::S3Delete,
         );
+    }
+
+    #[test]
+    fn cancel_now_cancels_the_registered_token_and_guard_clears_it() {
+        let scope = "cancel_harness_unit_test::cancel_now";
+        let token = CancelToken::new();
+        {
+            let _guard = CancelTokenGuard::install(scope, token.clone());
+            assert!(!token.is_cancelled());
+            assert!(cancel_now(scope, CancelReason::Operator));
+            assert!(token.is_cancelled());
+            assert_eq!(token.reason(), Some(CancelReason::Operator));
+        }
+        // Guard dropped: no token registered for this scope any more.
+        assert!(cancel_token_for_scope(scope).is_none());
+    }
+
+    #[test]
+    fn cancel_now_on_an_unregistered_scope_returns_false() {
+        assert!(!cancel_now(
+            "cancel_harness_unit_test::no_token_registered",
+            CancelReason::Shutdown
+        ));
+    }
+
+    #[test]
+    fn a_hook_can_cancel_the_token_registered_for_its_scope() {
+        // Proves the actual mechanism T-021 wires up: a cancel-point hook,
+        // given only the scope string (as production call sites pass it),
+        // can reach into the registry and cancel the real token — not just
+        // record having been called.
+        let scope = "cancel_harness_unit_test::hook_cancels";
+        let token = CancelToken::new();
+        let _token_guard = CancelTokenGuard::install(scope, token.clone());
+        let _hook_guard = CancelHookGuard::install(
+            scope,
+            Arc::new(move |p| {
+                if p == CancelPoint::MergePartitionFirst {
+                    cancel_now(scope, CancelReason::Operator);
+                }
+            }),
+        );
+        assert!(!token.is_cancelled());
+        record_cancel_point(scope, CancelPoint::InputOpen);
+        assert!(!token.is_cancelled(), "hook should not fire for InputOpen");
+        record_cancel_point(scope, CancelPoint::MergePartitionFirst);
+        assert!(token.is_cancelled());
+        assert_eq!(token.reason(), Some(CancelReason::Operator));
     }
 }

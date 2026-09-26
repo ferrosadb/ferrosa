@@ -188,6 +188,29 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `evict_local_input_sstable_files` no longer silently discards unlink errors:
   unexpected failures are WARN-logged (a missing file is not an error). Full
   atomic, fsynced retirement of the whole input generation is T-024.
+  **Cancellable compaction (T-021, `compaction-cancel-safety.md` C1):**
+  `try_submit` creates one `ferrosa_common::CancelToken` per task, checked
+  (unconditionally — in every build, not only tests) at every input open, the
+  top of each merge-loop partition, before `finish_to_directory`, before
+  `flush_files`, once per readback-verify partition, and once more in
+  `poll_compactions` immediately before promoting — the last point at which
+  cancelling is free (nothing has been promoted, opened, or observed yet); a
+  cancelled checkpoint removes whatever this task staged so far (loud errors,
+  never `let _`) and releases the input claim through the existing paths.
+  **After promotion, cancellation is recorded but not honoured** — T-022 owns
+  that commit point. `CompactionExecutor::shutdown` cancels every live token
+  *before* joining workers (reaching both actively-merging tasks and
+  completed-but-not-yet-promoted results still sitting in the result queue),
+  so shutdown waits out one checkpoint interval rather than a whole merge.
+  The executor's task and result queues, and the worker loop's own wait, are
+  `crossbeam_channel::bounded` with a blocking `select!` against a shutdown
+  channel — no `recv_timeout` poll interval, so an idle worker exits shutdown
+  immediately. Metric: `compaction_cancel_latency_seconds` (cancel-call to
+  observed-`Err`). The T-020 cancel-point harness
+  (`compaction/cancel_harness.rs`) now also registers each task's live token
+  by table-id scope, so a test's cancel-point hook can call
+  `cancel_harness::cancel_now` to actually cancel — not merely record having
+  reached — a `CancelPoint`.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes
@@ -478,7 +501,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   BTI format I/O.
 
 External: `object_store` (aws), `tokio`, `arc-swap`, `parking_lot`,
-`crossbeam-skiplist`, `crc32fast`, `sha2`, `dashmap`, `serde`, `bytes`, `fs2`.
+`crossbeam-skiplist`, `crossbeam-channel` (T-021: `CancelToken`'s channel, the
+compaction executor's task/result queues), `crc32fast`, `sha2`, `dashmap`,
+`serde`, `bytes`, `fs2`.
 
 **Called by** (crates that depend on this):
 
@@ -489,7 +514,7 @@ External: `object_store` (aws), `tokio`, `arc-swap`, `parking_lot`,
 
 ## Tests
 
-~1010 test functions across in-module `#[test]`/`#[tokio::test]` and 17
+~1024 test functions across in-module `#[test]`/`#[tokio::test]` and 17
 integration files (`tests/`), including proptest property suites
 (`engine_property`, `compaction_property`, `commitlog_property`,
 `property_tests`) and the repair fuzz harness (`repair_fuzz.rs`, gated behind
@@ -519,7 +544,7 @@ cargo test -p ferrosa-storage --features race-stress --release \
 
 Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
-### Compaction cancel-safety harness (T-020)
+### Compaction cancel-safety harness (T-020) and real cancellation (T-021)
 
 `src/compaction/cancel_harness.rs` names every step in the compaction
 lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`
@@ -532,36 +557,57 @@ which has no reconciliation yet), I3 (every discoverable generation opens
 and walks), and I4 (no `.promote-*`/`.retired-*`/stale-`.tmp`/staging leaks).
 See `specs/sstable-write-pump/compaction-cancel-safety.md`.
 
-No cancellation exists yet (T-021); this packet only records or, in the
-crash-twin harness, crashes:
+**T-021 makes cancellation real**, unconditionally (in every build, not only
+tests): `try_submit` creates a `CancelToken`, and every merge-time
+`cancel_point!` call site is now paired with a real `token.check()` that
+returns `Err` and rolls back whatever this task staged so far; `engine.rs`'s
+`poll_compactions` adds one more real check immediately before promoting (the
+last free cancel point). The harness now also registers each task's live
+token by table-id scope (`cancel_harness::register_cancel_token` /
+`cancel_now`), so a test's cancel-point hook can genuinely cancel — not
+merely record having reached — a `CancelPoint`:
 
 - `cancel_harness_*` (`cancel_harness_integration.rs`): the hook fires at
   every point during a real, uncancelled compaction, and the oracle +
   invariant checker agree on a clean flushed table.
+- `cancel_token_*` (`cancel_token_tests.rs`, T-021): CS1 — cancelling at
+  every honoured checkpoint (`InputOpen` through `BeforePromote`) rolls
+  back with no restart needed, and I1-I4 still hold after one; CS3 — the
+  cancel-to-`Err` latency is small and `compaction_cancel_latency_seconds`
+  records it; CS4 — `CompactionExecutor::shutdown()` cancels a task stuck
+  mid-merge promptly instead of waiting for it to finish; CS14 (folded into
+  each CS1 case) — the same inputs compact again afterward with identical
+  content; CD1 — a worker parked on an empty task channel exits shutdown
+  immediately (crossbeam `select!`, no `recv_timeout` poll interval).
 - `cancel_crash_sweep_*` (`cancel_crash_sweep_tests.rs`, CS2 in
-  `test-specification.md` L10): a crash-twin subprocess harness. Each test
-  re-execs the same test binary filtered to itself, the child installs a
-  hook that `std::process::abort()`s (SIGABRT) at one `CancelPoint`, drives
-  a real compaction into it (compressed and uncompressed), and the parent
-  asserts the child died by signal, reopens a fresh engine on the same data
-  dir, and checks I1-I4.
+  `test-specification.md` L10): a crash-twin subprocess harness, unrelated to
+  T-021's live-process cancellation. Each test re-execs the same test binary
+  filtered to itself, the child installs a hook that `std::process::abort()`s
+  (SIGABRT) at one `CancelPoint`, drives a real compaction into it
+  (compressed and uncompressed), and the parent asserts the child died by
+  signal, reopens a fresh engine on the same data dir, and checks I1-I4.
 
 Points strictly before the C2 commit point (input open through
-`BeforePromote`) roll back cleanly today, because `compaction/<table>/`
-staging is unconditionally wiped at every engine open — these run by
-default. Points from `AfterPromote` (window C), `AfterSwap` (window D), and
-input retirement (window E) leave a duplicate/orphan generation today
-(no reconciliation exists until T-022/T-023/T-024); those cases are gated
-behind the `known-open-window` feature (off by default, so `cargo test`
-stays green) and assert the documented I2 violation instead of a clean pass:
+`BeforePromote`) roll back cleanly today, both for a live cancel (T-021) and
+for a crash (because `compaction/<table>/` staging is unconditionally wiped
+at every engine open) — these run by default. Points from `AfterPromote`
+(window C), `AfterSwap` (window D), and input retirement (window E) leave a
+duplicate/orphan generation today (no reconciliation exists until
+T-022/T-023/T-024) and are not yet real cancel points; those crash-sweep
+cases are gated behind the `known-open-window` feature (off by default, so
+`cargo test` stays green) and assert the documented I2 violation instead of a
+clean pass:
 
 ```bash
 cargo test -p ferrosa-storage cancel_harness_
+cargo test -p ferrosa-storage cancel_token_
 cargo test -p ferrosa-storage cancel_crash_sweep_
 cargo test -p ferrosa-storage --features known-open-window cancel_crash_sweep_
+cargo test -p ferrosa-common cancel
 ```
 
-Unix-only (signal-based crash detection). The `RetireInput` `CancelPoint`
+The crash-sweep harness is Unix-only (signal-based crash detection);
+`cancel_token_*` has no such restriction. The `RetireInput` `CancelPoint`
 fires once per whole input generation; it does not reach the finer-grained
 "one generation half-deleted mid-component-loop" shape window E's own
 description also covers — a follow-up needs a per-component hook alongside

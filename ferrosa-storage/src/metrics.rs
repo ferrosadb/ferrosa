@@ -339,6 +339,15 @@ static COMPACTION_SKIPPED_OVERLAP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Compaction tasks that returned `Err` because their `CancelToken` was
+/// cancelled (T-021), as distinct from an ordinary failure.
+static COMPACTION_CANCELLED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Sum, count and max of the latency from `CancelToken::cancel()` to the
+/// checkpoint that observed it and returned `Err` (T-021,
+/// `compaction_cancel_latency_seconds`).
+static COMPACTION_CANCEL_LATENCY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CANCEL_LATENCY_MICROS_MAX: AtomicU64 = AtomicU64::new(0);
+static COMPACTION_CANCEL_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
 static COMPACTION_RUNNING: AtomicU64 = AtomicU64::new(0);
@@ -508,6 +517,30 @@ pub fn inc_compaction_failed() {
 /// Record a compaction input reader obtained through the engine-wide reader
 /// pool (FMEA #11). Called once per input SSTable per task when the executor is
 /// pool-routed.
+/// Records a compaction task cancelled rather than failed (T-021).
+pub fn inc_compaction_cancelled() {
+    COMPACTION_CANCELLED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records the latency from `CancelToken::cancel()` to the checkpoint that
+/// observed it (`compaction_cancel_latency_seconds`).
+pub fn observe_compaction_cancel_latency(duration: Duration) {
+    let micros = duration_micros(duration);
+    COMPACTION_CANCEL_LATENCY_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    COMPACTION_CANCEL_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
+    update_max_u64(&COMPACTION_CANCEL_LATENCY_MICROS_MAX, micros);
+}
+
+#[cfg(test)]
+pub fn compaction_cancelled_total() -> u64 {
+    COMPACTION_CANCELLED_TOTAL.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn compaction_cancel_latency_count() -> u64 {
+    COMPACTION_CANCEL_LATENCY_COUNT.load(Ordering::Relaxed)
+}
+
 pub fn inc_compaction_pool_input_opens() {
     COMPACTION_POOL_INPUT_OPENS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -968,6 +1001,30 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_failed_total {}\n",
         COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancelled_total Compaction tasks that returned Err because their CancelToken was cancelled.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancelled_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancelled_total {}\n",
+        COMPACTION_CANCELLED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_sum Total latency from CancelToken::cancel() to the checkpoint that observed it.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_sum counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_sum {}\n",
+        COMPACTION_CANCEL_LATENCY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_count Observations of compaction cancel latency.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_count counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_count {}\n",
+        COMPACTION_CANCEL_LATENCY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_cancel_latency_seconds_max Maximum observed compaction cancel latency.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_cancel_latency_seconds_max gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_cancel_latency_seconds_max {}\n",
+        COMPACTION_CANCEL_LATENCY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
     ));
     out.push_str(
         "# HELP ferrosa_storage_compaction_queue_depth Compaction tasks waiting in executor queues.\n",

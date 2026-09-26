@@ -52,6 +52,15 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 - **Task spawning** — `TaskPool`: an explicit spawn target wrapping an optional
   dedicated `tokio::runtime::Runtime`, with a documented `current()` fallback to
   ambient `tokio::spawn`.
+- **Cancellation** — `CancelToken`: a cheap, cloneable cancellation flag
+  (`is_cancelled`/`check`, one `Relaxed` atomic load) plus a `closed()`
+  crossbeam `Receiver<()>` a blocking `select!` can wait on alongside a data
+  channel, waking immediately on `cancel(reason)` instead of on a poll
+  interval. `CancelReason` (`Shutdown`/`TableDropped`/`Truncated`/`Operator`/
+  `DiskReserve`/`Superseded`) and the `Cancelled` error it produces. Lives
+  here (not `ferrosa-storage`) so a future `ferrosa-sstable` write pump can
+  share the exact same token `ferrosa-storage`'s compaction executor uses
+  (T-021, `compaction-cancel-safety.md`).
 - **Test generators** — behind the `test-generators` feature: proptest
   strategies (`arb_cell_value`, `arb_cell`, `arb_partition_key`,
   `arb_decorated_key`) shared across crates.
@@ -61,6 +70,10 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 One module per concern; all are pure data + small methods with no I/O except the
 HLC reading the system clock:
 
+- **`cancel`** — `CancelToken`/`CancelReason`/`Cancelled`, the shared
+  cancellation primitive (a single shared `Arc<Inner>`; `cancel()` is
+  idempotent and records the first reason plus the cancellation instant for
+  latency measurement).
 - **`token`** / **`murmur3`** — the ring position and the hash that produces it.
 - **`key`** — `PartitionKey` and `DecoratedKey` (token cached at construction).
 - **`cell`** — `CellValue` state machine (live / expiring / tombstone).
@@ -89,6 +102,7 @@ into modules.
 | Schema | `TableSchema`, `ColumnDefinition`, `PinConfig`, `fixed_width_for_marshal_type`, `validate_cell_bytes`, `validate_clustering_shape` |
 | Geometry | `Geometry`, `marshal_wkb`, `parse_wkb` |
 | Spawning | `TaskPool` |
+| Cancellation | `CancelToken`, `CancelReason`, `Cancelled` |
 
 ## Dependencies
 
@@ -98,7 +112,8 @@ into modules.
   Ferrosa crate, by design: it sits at the bottom of the graph so the cycle-prone
   shared types (`CqlType`/`CqlValue`, `TableSchema`) can be reused without
   pulling in `ferrosa-cql`. External deps only: `num-bigint`, `serde`, `uuid`,
-  `tokio` (rt), and `proptest` (optional, `test-generators`).
+  `tokio` (rt), `crossbeam-channel` (T-021, `CancelToken`'s `closed()` channel),
+  and `proptest` (optional, `test-generators`).
 
 **Called by** (crates that depend on this — essentially every crate):
 
@@ -121,15 +136,16 @@ into modules.
 - **`ferrosa-sstable`** — reads/writes `CellValue` and `DecoratedKey`; uses
   `Error::CorruptSstable`.
 - **`ferrosa-storage`** — memtable/compaction keyed on `DecoratedKey`; raises
-  `CorruptSstable`; spawns via `TaskPool`.
+  `CorruptSstable`; spawns via `TaskPool`; the compaction executor's
+  `CancelToken` (T-021).
 - **`ferrosa-udf`** — `CqlType`/`CqlValue` without a `ferrosa-cql` dependency.
 - **`ferrosa-worker`** — background tasks via `TaskPool`.
 
 ## Tests
 
-In-crate unit tests are healthy and co-located with each module: **95 `#[test]`
+In-crate unit tests are healthy and co-located with each module: **103 `#[test]`
 functions** across the crate (accord 28, schema 18, geometry 17, murmur3 7, key
-6, token 5, cql_type 5, cell 4, error 3, data_type 2). Murmur3 is covered by
+6, token 5, cql_type 5, cancel 8, cell 4, error 3, data_type 2). Murmur3 is covered by
 characterization vectors generated from Cassandra source for bit-exact
 compatibility. Gaps and the highest-risk areas (HLC clock `expect`, geometry
 subset) are tracked in [specs/fmea.md](specs/fmea.md) and

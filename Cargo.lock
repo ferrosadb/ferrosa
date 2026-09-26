@@ -2338,6 +2338,7 @@ dependencies = [
 name = "ferrosa-common"
 version = "0.22.0"
 dependencies = [
+ "crossbeam-channel",
  "num-bigint",
  "proptest",
  "serde",
@@ -2770,6 +2771,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32fast",
+ "crossbeam-channel",
  "crossbeam-skiplist",
  "dashmap",
  "ferrosa-cdc",

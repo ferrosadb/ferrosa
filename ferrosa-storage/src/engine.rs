@@ -8673,6 +8673,16 @@ impl StorageEngine {
         self.tables.read().contains_key(table_id)
     }
 
+    /// Test accessor for the engine's own [`CompactionExecutor`] (T-021 CS4):
+    /// lets a cancellation test call `shutdown()` directly, without going
+    /// through the heavier `StorageEngine::shutdown()` (which also flushes
+    /// every table and drains the index scheduler first), so the timing
+    /// assertion measures only what T-021 changed.
+    #[cfg(test)]
+    pub(crate) fn compaction_executor_for_test(&self) -> &CompactionExecutor {
+        &self.compaction_executor
+    }
+
     #[cfg(test)]
     pub(crate) fn deferred_replay_mutation_count_for_test(&self) -> usize {
         self.deferred_replay_mutations.lock().len()
@@ -8797,6 +8807,29 @@ impl StorageEngine {
             let table_id = &result.task.table_id;
 
             cancel_point!(&table_id.to_string(), CancelPoint::BeforePromote);
+            // T-021, compaction-cancel-safety.md C2: this is the last free
+            // cancel point. Cancelling here costs nothing — the output has
+            // been verified but never promoted, opened, or observed by
+            // anything else — so roll back by discarding the staged output.
+            // Inputs are untouched and the claim is released as usual (the
+            // `_input_claim` guard above, on scope exit via `continue`).
+            // AFTER promotion, cancellation is recorded but not honoured;
+            // T-022 owns that commit point.
+            if let Err(c) = result.cancel.check() {
+                crate::compaction::executor::remove_staged_output_components(
+                    &result.output.path,
+                    &result.output.id,
+                );
+                crate::metrics::inc_compaction_cancelled();
+                if let Some(cancelled_at) = result.cancel.cancelled_at() {
+                    crate::metrics::observe_compaction_cancel_latency(cancelled_at.elapsed());
+                }
+                tracing::info!(
+                    %table_id, reason = %c.0,
+                    "compaction: cancelled before promote; output discarded, inputs untouched"
+                );
+                continue;
+            }
             let promote_start = Instant::now();
             let output = match self.promote_compaction_output(table_id, &result.output) {
                 Ok(output) => {
