@@ -183,7 +183,7 @@ async fn s_01_late_join_via_membership_changer_lands_in_openraft_voter_set() {
     // node.  Pre-Sprint-1 the raw client_write path could leave the
     // openraft side out of sync; the changer closes that gap.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let new_host = Uuid::new_v4();
     let new_addr: std::net::SocketAddr = "127.0.0.1:9201".parse().unwrap();
@@ -220,7 +220,7 @@ async fn s_02_concurrent_late_joins_serialize_via_inprogress_retry() {
     // succeed; the second hits `InProgress` and the changer's
     // backoff retries.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let h1 = Uuid::new_v4();
     let h2 = Uuid::new_v4();
@@ -313,7 +313,7 @@ async fn s_05_approve_node_replicates_through_raft() {
     // here we re-run the smoke shape so the matrix has direct
     // attribution.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let pending = Uuid::new_v4();
     let changer = MembershipChanger::new(
         cluster.leader_node().raft.clone(),
@@ -349,7 +349,7 @@ async fn s_05_approve_node_replicates_through_raft() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s_06_decommission_follower_removes_from_openraft_voter_set() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9401".parse().unwrap();
     let n = uuid_to_node_id(h);
@@ -360,14 +360,14 @@ async fn s_06_decommission_follower_removes_from_openraft_voter_set() {
         cluster.membership_network(),
     );
     changer.add_voter(h, a).await.unwrap();
-    // We must remove a non-leader node — pick the just-added one, which
-    // is unlikely to be leader.
-    let leader_id = cluster.leader_node().node_id;
-    if leader_id == n {
-        // Skip — covered by S-07.
-        cluster.shutdown().await;
-        return;
-    }
+    // We must remove a non-leader node — the just-added one. Leadership is pinned,
+    // so it cannot have moved there (that case is S-07). This used to be a silent
+    // early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
     changer.remove_voter(h).await.unwrap();
     let pred = || {
         for node in &cluster.nodes() {
@@ -501,7 +501,7 @@ async fn s_10_readd_previously_decommissioned_node() {
     // pre-flight checks treat the existing-but-removed entry as a
     // fresh add.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9701".parse().unwrap();
@@ -516,10 +516,13 @@ async fn s_10_readd_previously_decommissioned_node() {
         )
         .await
     );
-    if cluster.leader_node().node_id == n {
-        cluster.shutdown().await;
-        return;
-    }
+    // Pinned leadership cannot have moved to the node just added. This used to be a
+    // silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     remove_voter_on_current_leader(&cluster, h).await.unwrap();
     assert!(
