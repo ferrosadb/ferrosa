@@ -24,6 +24,7 @@ pub mod byte_comparable;
 pub mod checksum;
 pub mod compression;
 pub mod data;
+pub mod dio_align;
 pub mod direct;
 pub mod io;
 pub mod marshal;

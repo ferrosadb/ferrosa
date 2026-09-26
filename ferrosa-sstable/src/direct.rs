@@ -208,10 +208,10 @@ pub fn direct_wanted(specific_name: &str, warned: &AtomicBool) -> bool {
 /// aligned to 4096 satisfies any O_DIRECT alignment a real device imposes.
 ///
 /// This is a floor, not "the" block size: [`AlignedBuf`] and [`DirectWriter`]
-/// carry their own runtime alignment (probed per file — see `pump.rs` and
-/// `decisions.md` D4), which is always `>= MIN_BLOCK`. Code that needs "the"
-/// block for a specific buffer or writer reads it from that value, not from
-/// this constant.
+/// carry their own runtime alignment (probed per file — see `dio_align.rs`
+/// and `decisions.md` D4), which is always `>= MIN_BLOCK`. Code that needs
+/// "the" block for a specific buffer or writer reads it from that value, not
+/// from this constant.
 pub const MIN_BLOCK: usize = 4096;
 
 /// Staging-buffer capacity (a multiple of [`MIN_BLOCK`]). 1 MiB amortizes
@@ -294,6 +294,14 @@ pub fn render_prometheus(out: &mut String) {
     out.push_str(&format!(
         "ferrosa_sstable_direct_read_bytes_total {}\n",
         direct_read_bytes_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_dio_align_probe_fallbacks_total Files where the STATX_DIOALIGN probe (T-031) could not report an alignment and MIN_BLOCK was used instead; non-zero is expected on old kernels/filesystems and is not itself an error.\n\
+         # TYPE ferrosa_sstable_dio_align_probe_fallbacks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_dio_align_probe_fallbacks_total {}\n",
+        crate::dio_align::dio_align_probe_fallbacks_total()
     ));
 }
 
@@ -405,8 +413,9 @@ pub struct DirectWriter {
     /// Physical bytes already written to the device (always a `block` multiple).
     physical: u64,
     /// This writer's block size. Fixed at [`MIN_BLOCK`] for now — `DirectWriter`
-    /// does not yet consume the D4 alignment probe; that wiring is `pump.rs`'s
-    /// job (T-031/T-032). Kept as a field, not a bare constant reference, so the
+    /// does not yet consume the D4 alignment probe (`dio_align::block_for`,
+    /// T-031); wiring that into `AlignedPump`'s block choice is `pump.rs`'s
+    /// job (T-032). Kept as a field, not a bare constant reference, so the
     /// block value is always "the value carried by this writer."
     block: usize,
     mode: DirectMode,

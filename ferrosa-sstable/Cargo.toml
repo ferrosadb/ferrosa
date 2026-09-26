@@ -17,6 +17,13 @@ rayon = "1"
 tracing = "0.1"
 zstd = "0.13"
 
+[features]
+# Live infrastructure tests are intentionally absent from the default test
+# target. Opt in with `--features live-infra-tests` on a Linux host so a
+# missing environment prerequisite (e.g. STATX_DIOALIGN support) cannot be
+# reported as a passing test body.
+live-infra-tests = []
+
 [dev-dependencies]
 # Enables `ferrosa_common::test_generators` (shared CellValue/DecoratedKey
 # proptest strategies) for the T-035 writer oracle's Partition/Row
