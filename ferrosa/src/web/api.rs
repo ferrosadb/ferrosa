@@ -80,6 +80,9 @@ pub async fn get_metrics(
     // Background client listeners (Postgres, SPARQL, graph HTTP, Bolt): 0 means the
     // listener failed to bind or exited, and `/readyz` reports not ready.
     listeners.render_prometheus(&mut body);
+    // Client request rate, outcome and latency (ferrosa_cql_requests_total,
+    // ferrosa_cql_request_duration_seconds, ferrosa_cql_requests_in_flight).
+    ferrosa_cql::request_metrics::render_prometheus(&mut body);
     // Raft consensus liveness: ferrosa_raft_current_term / _is_leader /
     // _has_leader (fed by a current_leader() poller) + the election-storm counter
     // (_election_storm_term_jumps_total). The scan-storm regression (t_88223ad0
@@ -2471,6 +2474,29 @@ mod tests {
             ct.starts_with("text/plain"),
             "content-type must be text/plain even with empty registry, got: {ct}"
         );
+    }
+
+    /// Client request rate, outcome and latency are on `/metrics`: a dashboard had no
+    /// series for client load or tail latency before.
+    #[tokio::test]
+    async fn metrics_export_client_request_rate_and_latency() {
+        let router = crate::web::build_router(make_state());
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        for series in [
+            "ferrosa_cql_requests_total{kind=\"query\",outcome=\"ok\"}",
+            "ferrosa_cql_request_duration_seconds_bucket{kind=\"execute\",le=\"+Inf\"}",
+            "ferrosa_cql_requests_in_flight{kind=\"batch\"}",
+        ] {
+            assert!(text.contains(series), "missing {series}");
+        }
     }
 
     /// A background client listener that failed to bind is visible to a scraper as

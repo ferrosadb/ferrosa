@@ -39,6 +39,7 @@ use crate::frame::{
 };
 use crate::parser;
 use crate::prepared::{PreparedCache, PreparedPlan};
+use crate::request_metrics::{self, RequestKind};
 use crate::result;
 use crate::router::{RequestContext, RouteResult, SharedState};
 use crate::subscribe::SubscriptionState;
@@ -586,6 +587,10 @@ pub(crate) async fn handle_connection<S>(
                     let conn_txn_for_handler = conn_txn.clone();
                     request_task_pool.spawn(async move {
                         let request_span = cql_request_span(opcode, peer_addr);
+                        // Dropped before `finish` (the task is aborted, the client
+                        // goes away) it records the request as cancelled.
+                        let request_timer =
+                            RequestKind::from_opcode(opcode).map(request_metrics::start);
                         let result = (async {
                             match opcode {
                                 Opcode::Query => {
@@ -639,6 +644,9 @@ pub(crate) async fn handle_connection<S>(
                         })
                         .instrument(request_span)
                         .await;
+                        if let Some(timer) = request_timer {
+                            timer.finish(request_outcome(&result));
+                        }
                         let _ = resp_tx
                             .send(SpawnedResponse {
                                 result,
@@ -670,7 +678,11 @@ pub(crate) async fn handle_connection<S>(
 
                 let request_span = cql_request_span(maybe_frame.header.opcode, peer);
 
-                match (async {
+                // Time data requests on this path (QUERY runs here; handshake and
+                // control opcodes have no kind and are not counted).
+                let request_timer =
+                    RequestKind::from_opcode(maybe_frame.header.opcode).map(request_metrics::start);
+                let handled = (async {
                     handle_frame(
                         &mut phase,
                         &mut auth_context,
@@ -686,8 +698,11 @@ pub(crate) async fn handle_connection<S>(
                     .await
                 })
                 .instrument(request_span)
-                .await
-                {
+                .await;
+                if let Some(timer) = request_timer {
+                    timer.finish(request_outcome(&handled));
+                }
+                match handled {
                     HandleResult::Reply(opcode, body) => {
                         debug!(
                             "replying {:?} to {peer} stream={} phase={:?}",
@@ -1178,6 +1193,17 @@ pub(crate) enum HandleResult {
     },
     /// Unsubscribe — cancel one or all subscriptions.
     CancelSubscription { stream_id: Option<u16> },
+}
+
+/// How a handled request ended, for the request metrics: a reply that carries an
+/// ERROR opcode is an error, anything else answered the client.
+fn request_outcome(result: &HandleResult) -> request_metrics::Outcome {
+    match result {
+        HandleResult::Reply(Opcode::Error, _) | HandleResult::Close(Opcode::Error, _) => {
+            request_metrics::Outcome::Error
+        }
+        _ => request_metrics::Outcome::Ok,
+    }
 }
 
 /// Dispatch a single frame based on the current connection phase.
@@ -3310,6 +3336,25 @@ fn extract_keyspace_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_carrying_an_error_opcode_is_an_error_outcome_and_anything_else_is_ok() {
+        use request_metrics::Outcome;
+        let empty = || BytesMut::new();
+        assert_eq!(
+            request_outcome(&HandleResult::Reply(Opcode::Error, empty())),
+            Outcome::Error
+        );
+        assert_eq!(
+            request_outcome(&HandleResult::Close(Opcode::Error, empty())),
+            Outcome::Error
+        );
+        assert_eq!(
+            request_outcome(&HandleResult::Reply(Opcode::Result, empty())),
+            Outcome::Ok
+        );
+        assert_eq!(request_outcome(&HandleResult::CloseNow), Outcome::Ok);
+    }
 
     #[test]
     fn consensus_failure_gates_data_opcodes_but_keeps_protocol_responsive() {

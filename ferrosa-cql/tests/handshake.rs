@@ -588,6 +588,82 @@ async fn cdrs_tokio_session_bootstrap_queries_return_well_formed_results() {
     }
 }
 
+/// One sample of the process-wide request metrics, by exact series text.
+fn request_metric(series: &str) -> f64 {
+    let mut text = String::new();
+    ferrosa_cql::request_metrics::render_prometheus(&mut text);
+    text.lines()
+        .find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("series {series} not rendered:\n{text}"))
+}
+
+/// Client requests are counted and timed on the real request path. `/metrics` had no
+/// request-rate or latency series, so a dashboard could not show client load. The
+/// metrics are process-wide and other tests run in parallel, so this asserts a lower
+/// bound on how far each series moved, never an exact value.
+#[tokio::test]
+async fn client_requests_are_counted_and_timed() {
+    let ok = |k: &str| format!("ferrosa_cql_requests_total{{kind=\"{k}\",outcome=\"ok\"}}");
+    let err = |k: &str| format!("ferrosa_cql_requests_total{{kind=\"{k}\",outcome=\"error\"}}");
+    let count = |k: &str| format!("ferrosa_cql_request_duration_seconds_count{{kind=\"{k}\"}}");
+    let (query_ok, query_err, query_count, prepare_ok) = (
+        request_metric(&ok("query")),
+        request_metric(&err("query")),
+        request_metric(&count("query")),
+        request_metric(&ok("prepare")),
+    );
+
+    let (state, _dir) = setup_state_with_seeded_roles();
+    let server = CqlServer::new(test_config(false), state);
+    let addr = server.start_background().await.unwrap();
+    let mut stream = connect_and_authenticate(addr).await;
+
+    send_raw_frame(
+        &mut stream,
+        Opcode::Query,
+        &encode_query_body("SELECT * FROM system.local"),
+    )
+    .await;
+    assert_eq!(read_frame(&mut stream).await.opcode, Opcode::Result);
+    send_raw_frame(
+        &mut stream,
+        Opcode::Query,
+        &encode_query_body("SELECT * FROM no_such_keyspace.no_such_table"),
+    )
+    .await;
+    assert_eq!(read_frame(&mut stream).await.opcode, Opcode::Error);
+    send_raw_frame(
+        &mut stream,
+        Opcode::Prepare,
+        &encode_prepare_body("SELECT * FROM system.local"),
+    )
+    .await;
+    assert_eq!(read_frame(&mut stream).await.opcode, Opcode::Result);
+
+    assert!(
+        request_metric(&ok("query")) >= query_ok + 1.0,
+        "an answered QUERY is counted ok"
+    );
+    assert!(
+        request_metric(&err("query")) >= query_err + 1.0,
+        "a QUERY answered with an error is counted error"
+    );
+    assert!(
+        request_metric(&count("query")) >= query_count + 2.0,
+        "both QUERYs were timed"
+    );
+    assert!(
+        request_metric(&ok("prepare")) >= prepare_ok + 1.0,
+        "PREPARE is counted"
+    );
+}
+
 /// Reproduce cdrs-tokio's actual handshake: OPTIONS first, THEN
 /// STARTUP. If SUPPORTED or AUTHENTICATE is mis-encoded, cdrs-tokio's
 /// transport logs `IO error: failed to fill whole buffer` and the
