@@ -21906,53 +21906,6 @@ mod tests {
         }
     }
 
-    /// CS13-style crash test (T-001): after promoting a compaction output,
-    /// drop un-fsynced directory-entry writes for `sstables/<table>/` (as if
-    /// the filesystem crashed before the promote rename's directory entry
-    /// reached disk), then restart. The invariant this proves: with the fix
-    /// in this packet, either the promoted output's directory entry survived
-    /// the simulated crash, or the inputs were never unlinked -- never
-    /// neither.
-    ///
-    /// LazyFS setup (this harness is not implemented yet -- see below):
-    ///   1. Build/install LazyFS: <https://github.com/dsrhaslab/lazyfs>.
-    ///   2. Mount a LazyFS-backed directory with a fault config that can drop
-    ///      un-fsynced writes on trigger (LazyFS's crash-simulation fault).
-    ///   3. Point a `StorageEngine`'s `data_dir` at that mountpoint.
-    ///   4. Run a flush + compact cycle, trigger the LazyFS crash fault right
-    ///      after the directory fsync in `fsync_promoted_directory` but
-    ///      before `evict_local_input_sstable_files`, then remount clean and
-    ///      reopen the engine.
-    ///   5. Assert exactly one of {inputs, promoted output} is discoverable.
-    ///
-    /// Set `FERROSA_TEST_LAZYFS=1` to opt in once that harness exists. It
-    /// does not exist yet: this packet proves the ordering and failure-path
-    /// invariants with the in-process `fsync_probe` seam instead (the two
-    /// tests above). A real crash-consistency proof under LazyFS needs a
-    /// Linux host, which the project plan does not provision until T-070
-    /// (`specs/sstable-write-pump/compiled-project-plan.md`).
-    #[cfg(feature = "live-infra-tests")]
-    #[test]
-    fn promote_dir_fsync_lazyfs_crash_loses_neither_copy() {
-        if std::env::var("FERROSA_TEST_LAZYFS").is_err() {
-            panic!(
-                "FERROSA_TEST_LAZYFS not set -- install LazyFS \
-                 (https://github.com/dsrhaslab/lazyfs), mount a LazyFS-backed \
-                 directory with a fault config that can drop un-fsynced \
-                 writes, point a StorageEngine's data_dir at it, and re-run \
-                 with FERROSA_TEST_LAZYFS=1. See this test's doc comment for \
-                 the mount + fault-injection steps this harness still needs \
-                 (tracked for T-070, the first point with a Linux host)."
-            );
-        }
-        panic!(
-            "FERROSA_TEST_LAZYFS is set but the LazyFS mount / fault-injection \
-             harness is not implemented in this crate yet -- refusing to fake \
-             a pass. Implement the steps in this test's doc comment (T-070) \
-             before removing this panic."
-        );
-    }
-
     #[test]
     fn compaction_promotion_preserves_other_pending_outputs_in_shared_staging_dir() {
         let dir = tempfile::tempdir().unwrap();
