@@ -55,7 +55,7 @@ COPY . .
 RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
 RUN cargo build --release -p ferrosa
 
-FROM debian:trixie-slim
+FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 # gdb + procps available in the runtime image so crashes produce readable backtraces
 # (paired with `[profile.release] debug = "line-tables-only"` in the workspace Cargo.toml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
