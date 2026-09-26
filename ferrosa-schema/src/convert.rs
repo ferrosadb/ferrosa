@@ -244,6 +244,23 @@ impl TableMetadata {
         for (k, v) in &self.params.compression {
             extensions.insert(format!("compression.{k}"), v.clone());
         }
+        // gc_grace_seconds lets compaction purge expired tombstones. A negative
+        // value is meaningless and is NOT carried: the storage layer reads an
+        // absent value as "do not purge", the safe direction (carrying it as 0
+        // would purge immediately).
+        if self.params.gc_grace_seconds >= 0 {
+            extensions.insert(
+                ferrosa_common::schema::GC_GRACE_EXTENSION.to_string(),
+                self.params.gc_grace_seconds.to_string(),
+            );
+        } else {
+            tracing::warn!(
+                keyspace = %self.keyspace,
+                table = %self.name,
+                gc_grace_seconds = self.params.gc_grace_seconds,
+                "negative gc_grace_seconds ignored; tombstones for this table will not be purged"
+            );
+        }
 
         TableSchema {
             keyspace: self.keyspace.clone(),
@@ -472,6 +489,54 @@ mod tests {
             schema.extensions.get("compression.chunk_length_kb"),
             Some(&"32".to_string())
         );
+    }
+
+    fn table_with_gc_grace(gc_grace_seconds: i32) -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "id".to_string(),
+            ColumnMetadata {
+                name: "id".to_string(),
+                kind: ColumnKind::PartitionKey,
+                position: 0,
+                column_type: "text".to_string(),
+                clustering_order: ClusteringOrder::None,
+                mask: None,
+            },
+        );
+        let params = TableParams {
+            gc_grace_seconds,
+            ..TableParams::default()
+        };
+        TableMetadata {
+            keyspace: "ks1".to_string(),
+            name: "gc".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params,
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        }
+    }
+
+    #[test]
+    fn to_storage_schema_carries_gc_grace_seconds() {
+        let schema = table_with_gc_grace(3_600).to_storage_schema();
+        assert_eq!(schema.gc_grace_seconds(), Ok(Some(3_600)));
+        let default = TableParams::default().gc_grace_seconds;
+        let schema = table_with_gc_grace(default).to_storage_schema();
+        assert_eq!(schema.gc_grace_seconds(), Ok(Some(default as u32)));
+    }
+
+    #[test]
+    fn a_negative_gc_grace_is_not_carried_so_nothing_is_purged() {
+        // A negative value is meaningless; carrying it as 0 would purge tombstones
+        // immediately, the unsafe direction. Absent means "do not purge".
+        let schema = table_with_gc_grace(-5).to_storage_schema();
+        assert_eq!(schema.gc_grace_seconds(), Ok(None));
     }
 
     #[test]

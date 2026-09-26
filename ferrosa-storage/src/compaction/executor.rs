@@ -756,6 +756,7 @@ impl CompactionExecutor {
     where
         F: FnMut(usize),
     {
+        use crate::compaction::purge;
         use crate::flush::{FileFlushTarget, FlushTarget};
         use crate::merge;
         use crate::range_merger::ColumnOrdinalMapping;
@@ -1003,12 +1004,13 @@ impl CompactionExecutor {
         }
 
         let mut total_input_rows: usize = 0;
-        let mut merged_partition_count: u64 = 0;
-        let mut merged_row_count: usize = 0;
-        // Track min/max token across all merged output partitions so the
+        // Counts and min/max token across all merged output partitions so the
         // emitted SSTableMetadata can be filled without a second scan.
-        let mut min_token: i64 = i64::MAX;
-        let mut max_token: i64 = i64::MIN;
+        let mut tally = OutputTally::default();
+        // First partition that purged down to nothing, kept (unpurged) in case
+        // every partition does: an empty output cannot be swapped in.
+        let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
+        let mut purged_markers: u64 = 0;
 
         while let Some(top) = heap.pop() {
             // Drain all heap entries that share this key (multiple inputs
@@ -1093,30 +1095,47 @@ impl CompactionExecutor {
                 crate::metrics::CompactionPhase::MergePartition,
                 merge_start.elapsed(),
             );
-            merged_row_count += merged.rows.len();
-            merged_partition_count += 1;
-            let token = merged.key.token.0;
-            if token < min_token {
-                min_token = token;
+            if let Some(policy) = task.purge.as_ref() {
+                if purge::has_purgeable_marker(&merged, policy) {
+                    let original = held_back.is_none().then(|| merged.clone());
+                    purged_markers += purge::purge_partition(&mut merged, policy).markers();
+                    if purge::is_empty_partition(&merged) {
+                        if held_back.is_none() {
+                            held_back = original;
+                        }
+                        continue;
+                    }
+                }
             }
-            if token > max_token {
-                max_token = token;
-            }
-            let write_start = Instant::now();
-            validate_partition_writable(&merged, &output_header)
-                .map_err(|e| format!("write partition: {e}"))?;
-            writer
-                .add_partition(&merged)
-                .map_err(|e| format!("write partition: {e}"))?;
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::WriterAddPartition,
-                write_start.elapsed(),
-            );
+            emit_partition(&mut writer, &output_header, &merged, &mut tally)?;
         }
 
-        if merged_partition_count == 0 {
-            return Err("no partitions to compact".into());
+        if tally.partitions == 0 {
+            // Every partition purged away. Write the first one back unpurged so the
+            // output is non-empty (the swap needs an output); it is dropped by the
+            // next compaction that has other data. Counted so it is visible.
+            let Some(kept) = held_back.take() else {
+                return Err("no partitions to compact".into());
+            };
+            crate::metrics::inc_compaction_purge_held_back();
+            tracing::warn!(
+                table_id = %task.table_id,
+                "compaction: every partition purged away; writing one unpurged partition \
+                 so the output is not empty"
+            );
+            emit_partition(&mut writer, &output_header, &kept, &mut tally)?;
         }
+        if purged_markers > 0 {
+            crate::metrics::add_compaction_purged_markers(purged_markers);
+            tracing::info!(
+                table_id = %task.table_id,
+                purged_markers,
+                "compaction: dropped deletion markers past gc_grace_seconds"
+            );
+        }
+        let merged_partition_count = tally.partitions;
+        let merged_row_count = tally.rows;
+        let (min_token, max_token) = (tally.min_token, tally.max_token);
 
         tracing::info!(
             partitions = merged_partition_count,
@@ -1337,6 +1356,49 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
     }
 }
 
+/// Counts and token span of the partitions written to the compaction output.
+struct OutputTally {
+    partitions: u64,
+    rows: usize,
+    min_token: i64,
+    max_token: i64,
+}
+
+impl Default for OutputTally {
+    fn default() -> Self {
+        Self {
+            partitions: 0,
+            rows: 0,
+            min_token: i64::MAX,
+            max_token: i64::MIN,
+        }
+    }
+}
+
+/// Validate and write one merged partition, recording it in `tally`.
+fn emit_partition(
+    writer: &mut ferrosa_sstable::writer::SSTableWriter,
+    header: &ferrosa_sstable::statistics::SerializationHeader,
+    merged: &ferrosa_sstable::types::Partition,
+    tally: &mut OutputTally,
+) -> std::result::Result<(), String> {
+    let write_start = Instant::now();
+    validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
+    writer
+        .add_partition(merged)
+        .map_err(|e| format!("write partition: {e}"))?;
+    let token = merged.key.token.0;
+    tally.rows += merged.rows.len();
+    tally.partitions += 1;
+    tally.min_token = tally.min_token.min(token);
+    tally.max_token = tally.max_token.max(token);
+    crate::metrics::observe_compaction_phase(
+        crate::metrics::CompactionPhase::WriterAddPartition,
+        write_start.elapsed(),
+    );
+    Ok(())
+}
+
 fn validate_partition_writable(
     partition: &ferrosa_sstable::types::Partition,
     header: &ferrosa_sstable::statistics::SerializationHeader,
@@ -1541,6 +1603,7 @@ mod tests {
             output_dir: output_dir.clone(),
             schema: schema.clone(),
             table_id: test_table_id(),
+            purge: None,
         };
         let out_meta = CompactionExecutor::execute_task(&task)
             .expect("single-input legacy compaction must succeed")
@@ -1565,6 +1628,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp/output"),
             schema: test_table_schema(),
             table_id: test_table_id(),
+            purge: None,
         };
 
         executor.submit(task).unwrap();
@@ -1595,6 +1659,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp/output"),
             schema: test_table_schema(),
             table_id: test_table_id(),
+            purge: None,
         };
 
         assert!(CompactionExecutor::try_claim_in_flight_inputs(
@@ -1806,6 +1871,7 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         };
 
         // This MUST return Err — compaction must not succeed with partial data
@@ -1855,6 +1921,7 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         };
 
         let result = CompactionExecutor::execute_task(&task);
@@ -1928,6 +1995,7 @@ mod tests {
                 output_dir: output_dir.clone(),
                 schema: schema.clone(),
                 table_id: test_table_id(),
+                purge: None,
             };
             let done = CompactionExecutor::execute_task_with_read_mode(&task, None, mode, |_| {})
                 .expect("compaction");
@@ -1974,9 +2042,9 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         };
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
-        let opens_before = crate::metrics::compaction_pool_input_opens_total();
         CompactionExecutor::execute_task_with_read_mode(
             &task,
             Some(&pool),
@@ -1986,11 +2054,129 @@ mod tests {
         .expect("compaction");
         // A cache-bypassing reader must never be parked in the shared pool, where
         // the live read path would pick it up and serve point reads through it.
+        // `pool` is this test's own instance, so this holds under parallel tests
+        // (the process-global pool-opens counter does not).
         assert_eq!(pool.resident(), 0);
-        assert_eq!(
-            crate::metrics::compaction_pool_input_opens_total(),
-            opens_before
-        );
+    }
+
+    const PURGE_OLD_LDT: u32 = 1_000_000_000; // long past any test grace period
+
+    fn partition_tombstone(key: &str, ts: i64, ldt: u32) -> ferrosa_sstable::types::Partition {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        ferrosa_sstable::types::Partition {
+            key: DecoratedKey::new(PartitionKey::new(key.as_bytes().to_vec())),
+            deletion: ferrosa_sstable::types::DeletionTime::new(ts, ldt),
+            static_row: None,
+            rows: vec![],
+        }
+    }
+
+    /// Compact the given per-input partition sets and return the output partitions.
+    fn compact_with_purge(
+        inputs: Vec<Vec<ferrosa_sstable::types::Partition>>,
+        purge: Option<super::super::purge::PurgePolicy>,
+    ) -> (ExecutedCompaction, Vec<ferrosa_sstable::types::Partition>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let metas: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, partitions)| {
+                let dir = tmp.path().join(format!("in_{i}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                write_sstable_to_dir(&dir, partitions, &schema)
+            })
+            .collect();
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: metas,
+            output_dir: output_dir.clone(),
+            schema,
+            table_id: test_table_id(),
+            purge,
+        };
+        let done = CompactionExecutor::execute_task(&task).expect("compaction");
+        let out = read_output_partitions(&output_dir, &done.metadata.id);
+        // Keep the tempdir alive only as long as needed: outputs were read above.
+        (done, out)
+    }
+
+    /// Partition keys, sorted: output order is token order, not lexical.
+    fn keys_of(partitions: &[ferrosa_sstable::types::Partition]) -> Vec<String> {
+        let mut keys: Vec<String> = partitions
+            .iter()
+            .map(|p| String::from_utf8(p.key.key.as_bytes().to_vec()).unwrap())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn live_and_dead_inputs() -> Vec<Vec<ferrosa_sstable::types::Partition>> {
+        let live: Vec<_> = (0..5)
+            .map(|i| make_test_partition(&format!("k{i}"), "v", 1000))
+            .collect();
+        vec![live, vec![partition_tombstone("k2", 2000, PURGE_OLD_LDT)]]
+    }
+
+    fn open_policy() -> super::super::purge::PurgePolicy {
+        super::super::purge::PurgePolicy {
+            gc_before: i64::from(PURGE_OLD_LDT) + 1,
+            max_purgeable_timestamp: i64::MAX,
+        }
+    }
+
+    #[test]
+    fn without_a_purge_policy_the_partition_tombstone_is_kept() {
+        let (_, out) = compact_with_purge(live_and_dead_inputs(), None);
+        assert_eq!(keys_of(&out), ["k0", "k1", "k2", "k3", "k4"]);
+        let k2 = out.iter().find(|p| p.key.key.as_bytes() == b"k2").unwrap();
+        assert!(!k2.deletion.is_live(), "the marker persists forever today");
+    }
+
+    #[test]
+    fn an_expired_partition_tombstone_is_purged_and_its_partition_dropped() {
+        let purged_before = crate::metrics::compaction_purged_markers_total();
+        let (done, out) = compact_with_purge(live_and_dead_inputs(), Some(open_policy()));
+        assert_eq!(keys_of(&out), ["k0", "k1", "k3", "k4"]);
+        assert_eq!(done.metadata.partition_count, 4);
+        assert!(crate::metrics::compaction_purged_markers_total() > purged_before);
+    }
+
+    #[test]
+    fn a_tombstone_at_or_above_the_overlap_guard_is_kept() {
+        // Data outside this compaction as old as ts 1500 might be shadowed by the
+        // ts-2000 tombstone, so dropping it could resurrect that data.
+        let policy = super::super::purge::PurgePolicy {
+            max_purgeable_timestamp: 1500,
+            ..open_policy()
+        };
+        let (_, out) = compact_with_purge(live_and_dead_inputs(), Some(policy));
+        assert_eq!(keys_of(&out), ["k0", "k1", "k2", "k3", "k4"]);
+    }
+
+    #[test]
+    fn a_tombstone_still_inside_gc_grace_is_kept() {
+        let policy = super::super::purge::PurgePolicy {
+            gc_before: i64::from(PURGE_OLD_LDT) - 1,
+            ..open_policy()
+        };
+        let (_, out) = compact_with_purge(live_and_dead_inputs(), Some(policy));
+        assert_eq!(keys_of(&out), ["k0", "k1", "k2", "k3", "k4"]);
+    }
+
+    #[test]
+    fn purging_every_partition_still_produces_a_non_empty_output() {
+        // An all-tombstone compaction would otherwise fail with "no partitions to
+        // compact" and be retried forever. One held-back partition keeps it
+        // terminating; it is dropped by the next compaction that has other data.
+        let inputs = vec![
+            vec![partition_tombstone("a", 500, PURGE_OLD_LDT)],
+            vec![partition_tombstone("b", 600, PURGE_OLD_LDT)],
+        ];
+        let (done, out) = compact_with_purge(inputs, Some(open_policy()));
+        assert_eq!(out.len(), 1, "exactly one held-back partition");
+        assert_eq!(done.metadata.partition_count, 1);
     }
 
     /// GREEN TEST: compaction succeeds and preserves all data when all
@@ -2024,6 +2210,7 @@ mod tests {
             output_dir: output_dir.clone(),
             schema: schema.clone(),
             table_id: test_table_id(),
+            purge: None,
         };
 
         let result = CompactionExecutor::execute_task(&task);
@@ -2101,6 +2288,7 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         };
 
         let mut max_group_width = 0;
@@ -2151,6 +2339,7 @@ mod tests {
             output_dir,
             schema,
             table_id: test_table_id(),
+            purge: None,
         };
 
         let err = CompactionExecutor::execute_task(&task)
@@ -2225,6 +2414,7 @@ mod tests {
             output_dir: output_dir.clone(),
             schema: current_schema,
             table_id: crate::TableId::new("test_ks", "column_order"),
+            purge: None,
         };
 
         let meta = CompactionExecutor::execute_task(&task)
@@ -2419,6 +2609,7 @@ mod tests {
             output_dir,
             schema,
             table_id: table_id.clone(),
+            purge: None,
         };
 
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));

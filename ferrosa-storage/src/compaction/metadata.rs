@@ -46,4 +46,8 @@ pub struct CompactionTask {
     /// Identifies which table this compaction is for, so `poll_compactions()`
     /// can route the result to the correct `TableStore`.
     pub table_id: TableId,
+    /// When set, deletion markers past their grace period that are provably not
+    /// shadowing data outside this compaction are dropped from the output
+    /// (`gc_grace_seconds`). `None` keeps every marker (the historical behavior).
+    pub purge: Option<super::purge::PurgePolicy>,
 }

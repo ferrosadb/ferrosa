@@ -92,6 +92,21 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `FERROSA_SSTABLE_DIRECT_IO` writer rollout. Watch
   `ferrosa_sstable_direct_read_fallbacks_total`: non-zero means the file system
   rejected O_DIRECT and the bypass is inactive.
+  **Tombstone purge (`gc_grace_seconds`):** compaction drops a deletion marker
+  (partition deletion, row deletion, cell tombstone) only when BOTH hold: its
+  `local_deletion_time` is older than `now - gc_grace_seconds`, and its timestamp is
+  below the minimum timestamp of any data outside the compaction that could overlap
+  (SSTables not in the task whose token range overlaps the inputs, plus the active
+  and flushing memtables, via `Memtable::min_timestamp`). Otherwise dropping it would
+  resurrect older data. `CompactionTask::purge` carries the policy, computed by
+  `StorageEngine::purge_policy_for` at submission; a schema with no `gc_grace_seconds`
+  means no purge. Kill switch: `FERROSA_COMPACTION_PURGE_TOMBSTONES=0`. A pathless
+  collection tombstone is kept while element cells it shadows remain. If every
+  partition purges away, one is written unpurged (an empty output cannot be swapped
+  in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
+  `..._purge_held_back_total`, `..._purge_policy_errors_total`.
+  **Flush fix:** a partition holding only a partition-level delete (no rows, no static
+  row) is now flushed; it used to be dropped as empty, losing the delete.
   Existing backlogs drain without waiting for another flush: every maintenance
   poll consumes at most eight results and admits at most eight table tasks, then
   schedules another round when work completes. Descriptor-cached, constant-size

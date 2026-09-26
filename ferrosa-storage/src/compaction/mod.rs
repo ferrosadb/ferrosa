@@ -8,6 +8,7 @@
 pub mod executor;
 pub mod finalize;
 pub mod metadata;
+pub mod purge;
 pub mod strategy;
 pub mod strategy_ucs;
 

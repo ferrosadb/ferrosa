@@ -6862,6 +6862,21 @@ impl<F: FlushTarget> TableStore<F> {
         self.view.load().active.size_bytes()
     }
 
+    /// The smallest timestamp of any write not yet in an SSTable: the minimum over
+    /// the active memtable and, during a flush, the memtable being flushed.
+    /// `i64::MAX` when both are empty.
+    ///
+    /// A compaction reads this BEFORE it lists the table's SSTables: data moves
+    /// memtable → SSTable during a flush, so the other order could miss it in both.
+    pub fn unflushed_min_timestamp(&self) -> i64 {
+        let view = self.view.load();
+        let flushing = view
+            .flushing
+            .as_ref()
+            .map_or(i64::MAX, |m| m.min_timestamp());
+        view.active.min_timestamp().min(flushing)
+    }
+
     /// Number of partitions in the active memtable.
     pub fn memtable_partition_count(&self) -> usize {
         self.view.load().active.partition_count()

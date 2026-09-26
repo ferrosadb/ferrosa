@@ -26,7 +26,9 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
 
 - **Metadata model** ([`metadata/`](src/metadata)) — `KeyspaceMetadata`,
   `TableMetadata` (with `TableParams`, `TableFlag`, `CachingParams`, graph
-  `extensions`, `is_system`), `ColumnMetadata` (`ColumnKind`,
+  `extensions`, `is_system`; `to_storage_schema` also carries the table's
+  `gc_grace_seconds` into the storage schema's `extensions` — a negative value is
+  not carried, so the storage layer purges nothing for that table), `ColumnMetadata` (`ColumnKind`,
   `ClusteringOrder`, `ColumnMask` for dynamic data masking), `IndexMetadata`,
   `UserTypeMetadata`, `UserFunctionMetadata`, `UserAggregateMetadata`.
 - **Schema registry** ([`registry.rs`](src/registry.rs), ~3.9k LoC) — the

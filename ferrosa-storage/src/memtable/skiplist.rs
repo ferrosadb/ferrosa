@@ -12,7 +12,7 @@
 //! This eliminates all lock contention — different partitions never interact,
 //! and same-partition contention is handled by the non-blocking CAS loop.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -30,6 +30,8 @@ pub struct SkipListMemtable {
     map: SkipMap<DecoratedKey, ArcSwap<Partition>>,
     size: AtomicUsize,
     count: AtomicUsize,
+    /// Smallest timestamp of anything accepted by `put` (`i64::MAX` when empty).
+    min_ts: AtomicI64,
 }
 
 impl SkipListMemtable {
@@ -38,6 +40,7 @@ impl SkipListMemtable {
             map: SkipMap::new(),
             size: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
+            min_ts: AtomicI64::new(i64::MAX),
         }
     }
 }
@@ -53,6 +56,9 @@ impl Memtable for SkipListMemtable {
         // Fail-loud guard: reject mis-sized cells before they reach the
         // memtable (mirrors the check in `ShardedBTreeMemtable::put`).
         super::validate_row_against_schema(&row, schema)?;
+        // Lowered before the row is visible; see `ShardedBTreeMemtable::put`.
+        self.min_ts
+            .fetch_min(super::row_min_timestamp(&row), Ordering::SeqCst);
         // Atomically insert an empty partition if the key is new.
         // No side effects in the closure — count is tracked via was_empty
         // inside the CAS loop, which serializes concurrent writers.
@@ -163,6 +169,10 @@ impl Memtable for SkipListMemtable {
 
     fn partition_count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    fn min_timestamp(&self) -> i64 {
+        self.min_ts.load(Ordering::SeqCst)
     }
 }
 
