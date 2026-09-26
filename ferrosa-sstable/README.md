@@ -241,6 +241,58 @@ test binary with its own counting `#[global_allocator]`
 proves `None`/`Zstd` allocate nothing after their first call and documents
 `Lz4`'s one-allocation-per-call floor (see "What's implemented" above).
 
+### Row encoding tests (T-037)
+
+`row_encode_*` tests: `tests/row_encode.rs` has
+`row_encode_size_counter_matches_written` (1000-case proptest: the size
+computed by `SizeCounter` always equals the bytes the write pass actually
+produces — enforced live by `encode_row_body`'s `debug_assert_eq!`) and
+`row_encode_out_of_order_complex_cells_match_sorted_output` (shuffled
+complex-column cell input still serializes identically to already-sorted
+input). `tests/row_encode_alloc.rs` uses a counting `#[global_allocator]`
+to assert zero allocations serializing rows into an already-warm writer, for
+single-column clustering, multi-column clustering, and a complex column —
+driven through `SSTableWriter::serialize_rows_for_test` (`#[doc(hidden)]`),
+which isolates row-body encoding from `add_partition`'s Partitions.db
+key-trie/bloom-filter insert (real, but not this packet's scope, and not a
+constant cost per call — see the module doc for the measurement it took to
+rule that path out).
+
+### Row encoding: size-then-write, no per-row allocation (T-037)
+
+`SSTableWriter::serialize_row` no longer builds a `row_body: Vec<u8>` scratch
+buffer per row. The row-body serializers (`push_unsigned_vint_to`,
+`write_columns_subset`, `write_complex_deletion`, `serialize_cell`) are
+generic over a `RowSink` trait (`put`/`put_byte`); `encode_row_body` runs
+once against a `SizeCounter` (counts bytes, allocates nothing) to learn the
+row body's length, writes the size vints, then runs the identical function
+again against the real `DataBuffer`. A `debug_assert_eq!` catches any
+divergence between the two passes. `split_u16_prefixed` (multi-column
+clustering) is an iterator, not a `Vec<&[u8]>`.
+
+**Complex-column element order.** Cassandra requires a complex column's
+element cells in cell-path order. Two of ferrosa-storage's cell-producing
+paths already guarantee this — `merge.rs::merge_rows` (cross-source/
+compaction merge) explicitly re-sorts by `(col_idx, path)`, and
+`memtable/sharded.rs::merge_row_into_partition` (read-modify-write) inserts
+via a `(col_idx, path)`-keyed binary search — but a **freshly inserted**
+row's cells come from `ferrosa-row-bridge::collection::build_collection_cells`,
+which emits elements in the CQL value's wire order (relying on the driver to
+have pre-sorted a `Set`, and doing no path-order sort at all for a `Map` or
+`List`) and can reach a brand-new partition (`rows: vec![row]`) without going
+through either merge path. So `encode_row_body` does not trust the input:
+it clears and refills the writer's reusable `complex_order_scratch: Vec<usize>`
+(indices into `row.cells`, sorted by path) for each complex-column run instead
+of assuming order and `debug_assert`-ing it — the scratch is allocated once
+and reused across rows and runs, never per row.
+
+This work also fixed a real allocation bug it exposed: `crate::marshal::
+collection_value_type` built a throwaway `Vec<&str>` (via `top_level_args`)
+on every call; since `encode_row_body` runs twice per row, that doubled an
+existing per-row allocation into two. `top_level_args` is now an
+allocation-free iterator (`ferrosa-sstable/tests/row_encode_alloc.rs`
+`RE3` caught this via a counting `#[global_allocator]`).
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, data flow, invariants

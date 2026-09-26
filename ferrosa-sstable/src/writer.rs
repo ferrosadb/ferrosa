@@ -319,6 +319,46 @@ impl DataBuffer {
     }
 }
 
+/// A destination for row-body bytes. The row-body serializers
+/// (`push_unsigned_vint_to`, `write_columns_subset`, `write_complex_deletion`,
+/// `serialize_cell`) are generic over this trait so the same encoder function
+/// can run twice per row: once into a [`SizeCounter`] to learn the body's
+/// encoded length, then again into the real [`DataBuffer`] to write it. See
+/// `architecture.md` § "Row encoding without a scratch buffer".
+trait RowSink {
+    fn put(&mut self, bytes: &[u8]) -> Result<()>;
+
+    fn put_byte(&mut self, b: u8) -> Result<()> {
+        self.put(std::slice::from_ref(&b))
+    }
+}
+
+/// Counts the bytes a row body would occupy without writing or allocating
+/// anything. `put`/`put_byte` cannot fail — there is nothing to fail at.
+struct SizeCounter(u64);
+
+impl RowSink for SizeCounter {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self.0 += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn put_byte(&mut self, _byte: u8) -> Result<()> {
+        self.0 += 1;
+        Ok(())
+    }
+}
+
+impl RowSink for DataBuffer {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes)
+    }
+
+    fn put_byte(&mut self, b: u8) -> Result<()> {
+        self.push(b)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Row / cell flag constants (matching data.rs reader)
 // Reference: UnfilteredSerializer.java, Cell.java
@@ -496,6 +536,14 @@ pub struct SSTableWriter {
     total_rows: u64,
     /// Number of regular/static cells written to Data.db.
     total_columns_set: u64,
+    /// Reusable scratch for a row's distinct present-column indices. Cleared
+    /// and refilled per row instead of allocating a fresh `Vec` each time.
+    present_columns_scratch: Vec<usize>,
+    /// Reusable scratch holding, for one complex (collection) column run at a
+    /// time, the indices into `row.cells` of its element cells in cell-path
+    /// order. Cleared and refilled per complex-column run instead of
+    /// allocating a fresh `Vec<&CellValue>` + sort per row.
+    complex_order_scratch: Vec<usize>,
 }
 
 impl SSTableWriter {
@@ -518,6 +566,8 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
+            present_columns_scratch: Vec::new(),
+            complex_order_scratch: Vec::new(),
         }
     }
 
@@ -544,6 +594,8 @@ impl SSTableWriter {
             last_index_key: None,
             total_rows: 0,
             total_columns_set: 0,
+            present_columns_scratch: Vec::new(),
+            complex_order_scratch: Vec::new(),
         })
     }
 
@@ -619,6 +671,21 @@ impl SSTableWriter {
             .map(|row| row.cells.len() as u64)
             .sum::<u64>();
 
+        Ok(())
+    }
+
+    /// Serializes a partition's rows exactly as [`add_partition`](Self::add_partition)
+    /// would, but WITHOUT the Partitions.db key-trie insert, the bloom-filter
+    /// add, or the partition-count/key bookkeeping. Those are unrelated to
+    /// row-body encoding (T-037) and have their own, non-constant-per-call
+    /// allocation cost that would otherwise swamp the signal a zero-allocation
+    /// row-encoding test is trying to measure. `#[doc(hidden)]`: an internal
+    /// test seam for `ferrosa-sstable/tests/row_encode_alloc.rs`, not a
+    /// supported public API.
+    #[doc(hidden)]
+    pub fn serialize_rows_for_test(&mut self, partition: &Partition) -> Result<()> {
+        let data_pos = self.data_buf.len();
+        self.serialize_partition(partition, data_pos)?;
         Ok(())
     }
 
@@ -1130,8 +1197,10 @@ impl SSTableWriter {
             flags |= HAS_DELETION;
         }
 
-        // Determine which columns are present
-        let column_defs = if is_static {
+        // Determine which columns are present. Explicit `&[(Vec<u8>, String)]`
+        // annotation so the borrow coerces from `&Vec<_>` once here, not at
+        // every later use.
+        let column_defs: &[(Vec<u8>, String)] = if is_static {
             &self.header.static_columns
         } else {
             &self.header.regular_columns
@@ -1194,14 +1263,19 @@ impl SSTableWriter {
         }
 
         // Distinct present columns (cells are grouped by col_idx, so dedup runs).
-        let mut present_columns: Vec<usize> = Vec::new();
+        // Reused across rows instead of allocating a fresh `Vec` each time.
+        self.present_columns_scratch.clear();
         for (idx, _) in &row.cells {
-            if present_columns.last() != Some(&(*idx as usize)) {
-                present_columns.push(*idx as usize);
+            if self.present_columns_scratch.last() != Some(&(*idx as usize)) {
+                self.present_columns_scratch.push(*idx as usize);
             }
         }
-        let all_present = present_columns.len() == num_columns
-            && present_columns.iter().enumerate().all(|(i, c)| *c == i);
+        let all_present = self.present_columns_scratch.len() == num_columns
+            && self
+                .present_columns_scratch
+                .iter()
+                .enumerate()
+                .all(|(i, c)| *c == i);
         if all_present {
             flags |= HAS_ALL_COLUMNS;
         }
@@ -1232,136 +1306,199 @@ impl SSTableWriter {
         // We must extract each component and write it in BTI format.
         let num_ck = self.header.clustering_types.len();
         if !is_static && num_ck > 0 {
-            push_unsigned_vint_to_data(&mut self.data_buf, 0)?; // header: all non-null, non-empty
+            push_unsigned_vint_to(&mut self.data_buf, 0)?; // header: all non-null, non-empty
 
             if num_ck == 1 {
                 // Single CK column: raw bytes (no u16 prefix).
                 let type_name = &self.header.clustering_types[0];
                 if crate::marshal::value_length_if_fixed(type_name).is_none() {
-                    push_unsigned_vint_to_data(&mut self.data_buf, row.clustering.len() as u64)?;
+                    push_unsigned_vint_to(&mut self.data_buf, row.clustering.len() as u64)?;
                 }
                 self.data_buf.extend_from_slice(&row.clustering)?;
             } else if num_ck > 1 {
                 // Multi-column CK: extract components from u16-prefixed
                 // encoding, then write each in BTI per-component format.
-                let components = split_u16_prefixed(&row.clustering, num_ck);
-                for (i, component) in components.iter().enumerate() {
+                for (i, component) in split_u16_prefixed(&row.clustering, num_ck).enumerate() {
                     let type_name = &self.header.clustering_types[i];
                     if crate::marshal::value_length_if_fixed(type_name).is_none() {
-                        push_unsigned_vint_to_data(&mut self.data_buf, component.len() as u64)?;
+                        push_unsigned_vint_to(&mut self.data_buf, component.len() as u64)?;
                     }
                     self.data_buf.extend_from_slice(component)?;
                 }
             }
         }
 
-        // Serialize the row body to a temporary buffer to compute its size.
-        let mut row_body = Vec::new();
+        // Row body: size, then write — no scratch `Vec` (`architecture.md` §
+        // "Row encoding without a scratch buffer"). `encode_row_body` runs
+        // twice against the identical `plan`: once into a `SizeCounter` to
+        // learn the encoded length, then again into the real data buffer.
+        // Because both passes are the SAME function, the counted size and
+        // the written bytes cannot drift apart the way a hand-written
+        // `serialized_size` could — `debug_assert_eq!` below catches any
+        // non-determinism (e.g. iteration order that isn't stable).
+        let plan = RowBodyPlan {
+            header: &self.header,
+            flags,
+            present_columns: &self.present_columns_scratch,
+            num_columns,
+            has_complex_deletion,
+            column_defs,
+        };
 
-        // Liveness info (unsigned varint deltas)
-        if flags & HAS_TIMESTAMP != 0 {
-            let ts_delta = (row.primary_key_liveness.timestamp - self.header.min_timestamp) as u64;
-            push_unsigned_vint_to(&mut row_body, ts_delta);
+        let mut counter = SizeCounter(0);
+        encode_row_body(&mut counter, row, &plan, &mut self.complex_order_scratch)?;
+        let counted = counter.0;
 
-            if flags & HAS_TTL != 0 {
-                let ttl_delta = (row.primary_key_liveness.ttl - self.header.min_ttl) as u64;
-                push_unsigned_vint_to(&mut row_body, ttl_delta);
-
-                let ldt_delta = (row.primary_key_liveness.local_deletion_time
-                    - self.header.min_local_deletion_time) as u64;
-                push_unsigned_vint_to(&mut row_body, ldt_delta);
-            }
-        }
-
-        // Row-level deletion (unsigned varint deltas)
-        if flags & HAS_DELETION != 0 {
-            assert!(
-                row.deletion.marked_for_delete_at >= self.header.min_timestamp,
-                "SSTable writer: row deletion timestamp {} < header min_timestamp {} — \
-                 delta would underflow and corrupt the SSTable",
-                row.deletion.marked_for_delete_at,
-                self.header.min_timestamp
-            );
-            let ts_delta = (row.deletion.marked_for_delete_at - self.header.min_timestamp) as u64;
-            push_unsigned_vint_to(&mut row_body, ts_delta);
-            let ldt_delta = (row.deletion.local_deletion_time as i64
-                - self.header.min_local_deletion_time as i64) as u64;
-            push_unsigned_vint_to(&mut row_body, ldt_delta);
-        }
-
-        // Missing-column subset (only if not HAS_ALL_COLUMNS). Cassandra's
-        // Columns.Serializer writes an unsigned vint, not a raw MSB-first
-        // bitmap: for <64 columns, bit i set means column i is missing.
-        if flags & HAS_ALL_COLUMNS == 0 {
-            write_columns_subset(&mut row_body, &present_columns, num_columns);
-        }
-
-        // Cells. A simple column writes one cell; a complex (non-frozen
-        // collection) column writes `uvint(cell-count)` then one element cell
-        // per element, each with a cell-path. Ferrosa never emits a complex
-        // DeletionTime on its own writes (its collection ops are element
-        // add/remove, not whole-collection clears), so HAS_COMPLEX_DELETION is
-        // never set here and no complex deletion precedes the cell count.
-        let mut i = 0;
-        while i < row.cells.len() {
-            let col_idx = row.cells[i].0;
-            let column_type = &column_defs[col_idx as usize].1;
-            if self.header.complex_collections && crate::marshal::is_multicell(column_type) {
-                let mut j = i;
-                while j < row.cells.len() && row.cells[j].0 == col_idx {
-                    j += 1;
-                }
-                // Split the collection-deletion sentinel (path=None tombstone)
-                // from the element cells (path present).
-                let sentinel = row.cells[i..j].iter().find(|(_, c)| c.path.is_none());
-                let mut elements: Vec<&CellValue> = row.cells[i..j]
-                    .iter()
-                    .filter(|(_, c)| c.path.is_some())
-                    .map(|(_, c)| c)
-                    .collect();
-                // Element cells are stored in cell-path order.
-                elements.sort_by(|a, b| a.path.cmp(&b.path));
-                // When the row flag is set, EVERY complex column writes a
-                // DeletionTime — its sentinel's, or LIVE if it has none.
-                if has_complex_deletion {
-                    let dt = match sentinel {
-                        Some((_, c)) => crate::types::DeletionTime::new(
-                            c.timestamp,
-                            c.local_deletion_time as u32,
-                        ),
-                        None => crate::types::DeletionTime::LIVE,
-                    };
-                    write_complex_deletion(&mut row_body, dt, &self.header);
-                }
-                push_unsigned_vint_to(&mut row_body, elements.len() as u64);
-                let value_type =
-                    crate::marshal::collection_value_type(column_type).unwrap_or(column_type);
-                for cell in elements {
-                    serialize_cell(&mut row_body, cell, row, &self.header, value_type, true);
-                }
-                i = j;
-            } else {
-                serialize_cell(
-                    &mut row_body,
-                    &row.cells[i].1,
-                    row,
-                    &self.header,
-                    column_type,
-                    false,
-                );
-                i += 1;
-            }
-        }
-
-        // Write row body size + previous unfiltered size + row body
-        let row_body_len = row_body.len() as u64;
-        push_unsigned_vint_to_data(&mut self.data_buf, row_body_len)?;
+        push_unsigned_vint_to(&mut self.data_buf, counted)?;
         // Previous unfiltered size (0 for simplicity)
-        push_unsigned_vint_to_data(&mut self.data_buf, 0)?;
-        self.data_buf.extend_from_slice(&row_body)?;
+        push_unsigned_vint_to(&mut self.data_buf, 0)?;
+
+        let before = self.data_buf.len();
+        encode_row_body(
+            &mut self.data_buf,
+            row,
+            &plan,
+            &mut self.complex_order_scratch,
+        )?;
+        let written = self.data_buf.len() - before;
+        debug_assert_eq!(
+            written, counted,
+            "row body size mismatch: SizeCounter counted {counted} bytes but the write pass \
+             produced {written} — the two encode_row_body passes must be byte-for-byte identical"
+        );
+
         Ok(())
     }
+}
 
+/// Everything `encode_row_body` needs to know about one row's shape,
+/// computed once by `serialize_row` and reused for both the counting and
+/// writing passes so the two passes can never disagree about what to write.
+struct RowBodyPlan<'a> {
+    header: &'a SerializationHeader,
+    flags: u8,
+    present_columns: &'a [usize],
+    num_columns: usize,
+    has_complex_deletion: bool,
+    column_defs: &'a [(Vec<u8>, String)],
+}
+
+/// Encode one row's body — liveness, row-level deletion, missing-column
+/// subset, and cells — into `sink`. Called twice per row against the same
+/// `plan`: once with a [`SizeCounter`], once with the real `DataBuffer`.
+///
+/// `complex_order` is the writer's reusable index scratch. For each complex
+/// (collection) column run it is cleared, filled with the run's element
+/// indices into `row.cells`, and sorted by cell path, replacing a per-row
+/// `Vec<&CellValue>` + `sort_by` with one `Vec<usize>` reused across rows and
+/// runs. A fresh single-mutation row is not guaranteed to already be in
+/// cell-path order: `ferrosa-row-bridge::collection::build_collection_cells`
+/// emits element cells in the CQL value's wire order (relying on the driver
+/// to have pre-sorted a `Set`, and doing no path-order sort at all for a
+/// `Map` or `List`), and that row can reach a fresh partition's `rows: vec![row]`
+/// untouched by either of ferrosa-storage's two path-sorting merges
+/// (`ferrosa-storage/src/merge.rs::merge_rows` and
+/// `ferrosa-storage/src/memtable/sharded.rs::merge_row_into_partition`) — see
+/// `ferrosa-sstable/README.md` "Row encoding" for the full evidence trail.
+/// So this sorts unconditionally rather than trusting the input and
+/// `debug_assert`-ing it.
+fn encode_row_body<S: RowSink>(
+    sink: &mut S,
+    row: &crate::types::Row,
+    plan: &RowBodyPlan<'_>,
+    complex_order: &mut Vec<usize>,
+) -> Result<()> {
+    let header = plan.header;
+
+    // Liveness info (unsigned varint deltas)
+    if plan.flags & HAS_TIMESTAMP != 0 {
+        let ts_delta = (row.primary_key_liveness.timestamp - header.min_timestamp) as u64;
+        push_unsigned_vint_to(sink, ts_delta)?;
+
+        if plan.flags & HAS_TTL != 0 {
+            let ttl_delta = (row.primary_key_liveness.ttl - header.min_ttl) as u64;
+            push_unsigned_vint_to(sink, ttl_delta)?;
+
+            let ldt_delta = (row.primary_key_liveness.local_deletion_time
+                - header.min_local_deletion_time) as u64;
+            push_unsigned_vint_to(sink, ldt_delta)?;
+        }
+    }
+
+    // Row-level deletion (unsigned varint deltas)
+    if plan.flags & HAS_DELETION != 0 {
+        assert!(
+            row.deletion.marked_for_delete_at >= header.min_timestamp,
+            "SSTable writer: row deletion timestamp {} < header min_timestamp {} — \
+             delta would underflow and corrupt the SSTable",
+            row.deletion.marked_for_delete_at,
+            header.min_timestamp
+        );
+        let ts_delta = (row.deletion.marked_for_delete_at - header.min_timestamp) as u64;
+        push_unsigned_vint_to(sink, ts_delta)?;
+        let ldt_delta = (row.deletion.local_deletion_time as i64
+            - header.min_local_deletion_time as i64) as u64;
+        push_unsigned_vint_to(sink, ldt_delta)?;
+    }
+
+    // Missing-column subset (only if not HAS_ALL_COLUMNS). Cassandra's
+    // Columns.Serializer writes an unsigned vint, not a raw MSB-first
+    // bitmap: for <64 columns, bit i set means column i is missing.
+    if plan.flags & HAS_ALL_COLUMNS == 0 {
+        write_columns_subset(sink, plan.present_columns, plan.num_columns)?;
+    }
+
+    // Cells. A simple column writes one cell; a complex (non-frozen
+    // collection) column writes `uvint(cell-count)` then one element cell
+    // per element, each with a cell-path.
+    let mut i = 0;
+    while i < row.cells.len() {
+        let col_idx = row.cells[i].0;
+        let column_type = &plan.column_defs[col_idx as usize].1;
+        if header.complex_collections && crate::marshal::is_multicell(column_type) {
+            let mut j = i;
+            while j < row.cells.len() && row.cells[j].0 == col_idx {
+                j += 1;
+            }
+            // Split the collection-deletion sentinel (path=None tombstone)
+            // from the element cells (path present).
+            let sentinel = row.cells[i..j].iter().find(|(_, c)| c.path.is_none());
+
+            // Element cells must be written in cell-path order. Rebuild the
+            // writer's reusable scratch for this run instead of a fresh
+            // `Vec<&CellValue>` + sort.
+            complex_order.clear();
+            complex_order.extend((i..j).filter(|&k| row.cells[k].1.path.is_some()));
+            complex_order.sort_by(|&a, &b| row.cells[a].1.path.cmp(&row.cells[b].1.path));
+
+            // When the row flag is set, EVERY complex column writes a
+            // DeletionTime — its sentinel's, or LIVE if it has none.
+            if plan.has_complex_deletion {
+                let dt = match sentinel {
+                    Some((_, c)) => {
+                        crate::types::DeletionTime::new(c.timestamp, c.local_deletion_time as u32)
+                    }
+                    None => crate::types::DeletionTime::LIVE,
+                };
+                write_complex_deletion(sink, dt, header)?;
+            }
+            push_unsigned_vint_to(sink, complex_order.len() as u64)?;
+            let value_type =
+                crate::marshal::collection_value_type(column_type).unwrap_or(column_type);
+            for &k in complex_order.iter() {
+                serialize_cell(sink, &row.cells[k].1, row, header, value_type, true)?;
+            }
+            i = j;
+        } else {
+            serialize_cell(sink, &row.cells[i].1, row, header, column_type, false)?;
+            i += 1;
+        }
+    }
+
+    Ok(())
+}
+
+impl SSTableWriter {
     // -----------------------------------------------------------------------
     // Internal: component builders
     // -----------------------------------------------------------------------
@@ -1815,14 +1952,14 @@ struct DataDbArtifacts {
 // ---------------------------------------------------------------------------
 
 /// Serialize a single cell to the given buffer.
-fn serialize_cell(
-    buf: &mut Vec<u8>,
+fn serialize_cell<S: RowSink>(
+    buf: &mut S,
     cell: &CellValue,
     row: &crate::types::Row,
     header: &SerializationHeader,
     value_type: &str,
     is_complex: bool,
-) {
+) -> Result<()> {
     let is_tombstone = cell.is_tombstone();
     let is_expiring = !is_tombstone
         && cell.ttl != ferrosa_common::NO_TTL
@@ -1854,7 +1991,7 @@ fn serialize_cell(
     if use_row_ttl {
         cell_flags |= CELL_USE_ROW_TTL;
     }
-    buf.push(cell_flags);
+    buf.put_byte(cell_flags)?;
 
     // Timestamp (unsigned varint delta, if not using row timestamp)
     if !use_row_timestamp {
@@ -1871,20 +2008,20 @@ fn serialize_cell(
             header.min_timestamp
         );
         let ts_delta = (cell.timestamp - header.min_timestamp) as u64;
-        push_unsigned_vint_to(buf, ts_delta);
+        push_unsigned_vint_to(buf, ts_delta)?;
     }
 
     // Local deletion time (unsigned varint delta, for tombstones and expiring cells)
     if !use_row_ttl && (is_tombstone || is_expiring) {
         let ldt_delta =
             (cell.local_deletion_time as i64 - header.min_local_deletion_time as i64) as u64;
-        push_unsigned_vint_to(buf, ldt_delta);
+        push_unsigned_vint_to(buf, ldt_delta)?;
     }
 
     // TTL (unsigned varint delta, for expiring cells only)
     if is_expiring && !use_row_ttl {
         let ttl_delta = (cell.ttl - header.min_ttl) as u64;
-        push_unsigned_vint_to(buf, ttl_delta);
+        push_unsigned_vint_to(buf, ttl_delta)?;
     }
 
     // Cell path (complex/collection columns only): `uvint(len) + bytes`, written
@@ -1893,8 +2030,8 @@ fn serialize_cell(
     // no cell-flag bit for it (matching Cassandra's CollectionType path serializer).
     if is_complex {
         let path = cell.path.as_deref().unwrap_or(&[]);
-        push_unsigned_vint_to(buf, path.len() as u64);
-        buf.extend_from_slice(path);
+        push_unsigned_vint_to(buf, path.len() as u64)?;
+        buf.put(path)?;
     }
 
     // Value (absent if HAS_EMPTY_VALUE). `value_type` is the element/value type
@@ -1916,7 +2053,7 @@ fn serialize_cell(
             // `map<k,int>` values with a uvint length). The fixed-width raw-bytes
             // optimization applies only to simple (scalar) columns.
             if is_complex {
-                push_unsigned_vint_to(buf, value.len() as u64);
+                push_unsigned_vint_to(buf, value.len() as u64)?;
             } else if let Some(fixed_len) = crate::marshal::value_length_if_fixed(value_type) {
                 assert!(
                     value.len() == fixed_len,
@@ -1924,43 +2061,44 @@ fn serialize_cell(
                     value.len()
                 );
             } else {
-                push_unsigned_vint_to(buf, value.len() as u64);
+                push_unsigned_vint_to(buf, value.len() as u64)?;
             }
-            buf.extend_from_slice(value);
+            buf.put(value)?;
         }
     }
+    Ok(())
 }
 
 /// Write a complex-column `DeletionTime` as two unsigned-vint deltas against the
 /// header mins (`markedForDeleteAt - minTimestamp`, `localDeletionTime -
 /// minLocalDeletionTime`). Wrapping arithmetic is used so a `LIVE` deletion
 /// (`i64::MIN` / `u32::MAX`) round-trips through the reader's wrapping add.
-fn write_complex_deletion(
-    buf: &mut Vec<u8>,
+fn write_complex_deletion<S: RowSink>(
+    buf: &mut S,
     dt: crate::types::DeletionTime,
     header: &SerializationHeader,
-) {
+) -> Result<()> {
     let ts_delta = dt.marked_for_delete_at.wrapping_sub(header.min_timestamp) as u64;
-    push_unsigned_vint_to(buf, ts_delta);
+    push_unsigned_vint_to(buf, ts_delta)?;
     let ldt_delta =
         (dt.local_deletion_time as i64).wrapping_sub(header.min_local_deletion_time as i64) as u64;
-    push_unsigned_vint_to(buf, ldt_delta);
+    push_unsigned_vint_to(buf, ldt_delta)
 }
 
-/// Write an unsigned varint to a Vec buffer.
-fn push_unsigned_vint_to(buf: &mut Vec<u8>, value: u64) {
+/// Write an unsigned varint to any [`RowSink`] — the row-body destination,
+/// generic so the same call site works for a [`SizeCounter`] or a real
+/// [`DataBuffer`].
+fn push_unsigned_vint_to<S: RowSink>(buf: &mut S, value: u64) -> Result<()> {
     let mut vbuf = [0u8; 9];
     let n = varint::write_unsigned_vint(&mut vbuf, value);
-    buf.extend_from_slice(&vbuf[..n]);
+    buf.put(&vbuf[..n])
 }
 
-fn push_unsigned_vint_to_data(buf: &mut DataBuffer, value: u64) -> Result<()> {
-    let mut vbuf = [0u8; 9];
-    let n = varint::write_unsigned_vint(&mut vbuf, value);
-    buf.extend_from_slice(&vbuf[..n])
-}
-
-fn write_columns_subset(buf: &mut Vec<u8>, present_columns: &[usize], num_columns: usize) {
+fn write_columns_subset<S: RowSink>(
+    buf: &mut S,
+    present_columns: &[usize],
+    num_columns: usize,
+) -> Result<()> {
     if num_columns < 64 {
         let mut missing_bitmap = 0u64;
         let mut present_iter = present_columns.iter().copied().peekable();
@@ -1971,15 +2109,14 @@ fn write_columns_subset(buf: &mut Vec<u8>, present_columns: &[usize], num_column
                 missing_bitmap |= 1u64 << idx;
             }
         }
-        push_unsigned_vint_to(buf, missing_bitmap);
-        return;
+        return push_unsigned_vint_to(buf, missing_bitmap);
     }
 
     let missing_count = num_columns.saturating_sub(present_columns.len());
-    push_unsigned_vint_to(buf, missing_count as u64);
+    push_unsigned_vint_to(buf, missing_count as u64)?;
     if present_columns.len() < num_columns / 2 {
         for &idx in present_columns {
-            push_unsigned_vint_to(buf, idx as u64);
+            push_unsigned_vint_to(buf, idx as u64)?;
         }
     } else {
         let mut present_iter = present_columns.iter().copied().peekable();
@@ -1987,32 +2124,52 @@ fn write_columns_subset(buf: &mut Vec<u8>, present_columns: &[usize], num_column
             if present_iter.peek() == Some(&idx) {
                 present_iter.next();
             } else {
-                push_unsigned_vint_to(buf, idx as u64);
+                push_unsigned_vint_to(buf, idx as u64)?;
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Extract components from a u16-BE-length-prefixed byte sequence.
+/// Iterates the components of a u16-BE-length-prefixed byte sequence without
+/// allocating a `Vec` of slices.
 ///
 /// The CQL bridge encodes multi-column clustering keys as:
 ///   `[u16 len][component bytes][u16 len][component bytes]...`
-/// This function splits them back into individual byte slices.
-fn split_u16_prefixed(bytes: &[u8], expected: usize) -> Vec<&[u8]> {
-    let mut components = Vec::with_capacity(expected);
-    let mut pos = 0;
-    while pos + 2 <= bytes.len() && components.len() < expected {
-        let len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        pos += 2;
-        let end = (pos + len).min(bytes.len());
-        components.push(&bytes[pos..end]);
-        pos = end;
+/// This splits them back into individual byte slices, one at a time.
+struct SplitU16Prefixed<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for SplitU16Prefixed<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.remaining == 0 || self.pos + 2 > self.bytes.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]) as usize;
+        self.pos += 2;
+        let end = (self.pos + len).min(self.bytes.len());
+        let component = &self.bytes[self.pos..end];
+        self.pos = end;
+        self.remaining -= 1;
+        Some(component)
     }
-    components
+}
+
+fn split_u16_prefixed(bytes: &[u8], expected: usize) -> SplitU16Prefixed<'_> {
+    SplitU16Prefixed {
+        bytes,
+        pos: 0,
+        remaining: expected,
+    }
 }
 
 #[cfg(test)]

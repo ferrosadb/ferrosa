@@ -24,14 +24,14 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 ## Next
 
 - **Wire the aligned write pump (sstable-write-pump plan, T-032 onward).**
-  `pump::PumpConfig` (T-030) and `dio_align::{resolve_block, probe, block_for}`
-  (T-031) exist but nothing reads either yet: `direct::AlignedBuf` takes a
-  runtime alignment and `DirectWriter` still hardcodes `MIN_BLOCK` (4096)
-  instead of consuming `dio_align::block_for`. The `SegmentSink`/flusher-thread
-  pump (T-032/T-033) and `DataSink` (removing `Data.raw`, T-038) are separate,
-  larger packets — see `ferrosa-suite/specs/sstable-write-pump/`. `dio_align`'s
-  probe runs on gnu and musl alike (a raw `SYS_statx` syscall against a
-  hand-rolled kernel-UAPI struct, not `libc::statx` — FMEA ST-13).
+  Done so far: `pump::PumpConfig` (T-030), `dio_align::{resolve_block, probe,
+  block_for}` (T-031; gnu and musl alike via a raw `SYS_statx` syscall against a
+  hand-rolled kernel-UAPI struct, FMEA ST-13), `Compression::compress_into`
+  (T-036) and allocation-free size-then-write row encoding over a generic
+  `RowSink` (T-037). Still to do: the `SegmentSink`/flusher-thread pump
+  (T-032/T-033) and `DataSink` (removing `Data.raw`, T-038), which replaces the
+  `DataBuffer` that row encoding still writes through. See
+  `ferrosa-suite/specs/sstable-write-pump/`.
 - **Complex-column support (FMEA ST-3).** Implement collections / UDT / tuple /
   frozen cell encode+decode in the Data.db codec, or surface unsupported complex
   columns as an explicit error to any consuming crate that needs them.
