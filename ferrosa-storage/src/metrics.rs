@@ -377,6 +377,19 @@ static COMPACTION_PURGE_POLICY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions rolled back after their replacement record committed but before
 /// retirement (reader-open, sidecar-merge, or swap failure) -- T-022.
 static COMPACTION_INTENT_ROLLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that rolled a `Promoting` record back because its
+/// output was never promoted -- T-023.
+static COMPACTION_RECONCILE_ROLLED_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that rolled a record forward, retiring whichever of
+/// its listed inputs a crash had left live -- T-023 (the resurrection fix).
+static COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that found a promoted output whose `Digest.crc32`
+/// did not match the record and quarantined it. Non-zero means promoted bytes
+/// were corrupted after the fact; alert on it.
+static COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Startup reconciliations that found a `.compaction-*.intent` file present
+/// but unparseable. Left in place for operator inspection; alert on it.
+static COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -590,6 +603,51 @@ pub fn inc_compaction_intent_rollback() {
 /// Total post-commit compaction rollbacks since startup.
 pub fn compaction_intent_rollback_total() -> u64 {
     COMPACTION_INTENT_ROLLBACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that rolled a `Promoting` record back
+/// (T-023): its output was never promoted, so the record was deleted and its
+/// inputs left live.
+pub fn inc_compaction_reconcile_rolled_back() {
+    COMPACTION_RECONCILE_ROLLED_BACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total startup roll-backs since startup.
+pub fn compaction_reconcile_rolled_back_total() -> u64 {
+    COMPACTION_RECONCILE_ROLLED_BACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that rolled a record forward: the output
+/// matched its digest, so every input still on disk was retired.
+pub fn inc_compaction_reconcile_rolled_forward() {
+    COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total startup roll-forwards since startup -- the resurrection fix firing.
+pub fn compaction_reconcile_rolled_forward_total() -> u64 {
+    COMPACTION_RECONCILE_ROLLED_FORWARD_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that quarantined a promoted output whose
+/// `Digest.crc32` did not match its record.
+pub fn inc_compaction_reconcile_digest_mismatch() {
+    COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total digest-mismatch quarantines found by startup reconciliation.
+pub fn compaction_reconcile_digest_mismatch_total() -> u64 {
+    COMPACTION_RECONCILE_DIGEST_MISMATCH_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a startup reconciliation that found an unparseable
+/// `.compaction-*.intent` file and left it in place for operator inspection.
+pub fn inc_compaction_reconcile_unreadable_record() {
+    COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total unreadable compaction intent records found by startup reconciliation.
+pub fn compaction_reconcile_unreadable_record_total() -> u64 {
+    COMPACTION_RECONCILE_UNREADABLE_RECORD_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total compaction input readers obtained via the reader pool since startup.

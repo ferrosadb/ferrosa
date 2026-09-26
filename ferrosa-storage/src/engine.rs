@@ -72,6 +72,15 @@ const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
 const MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
 
+/// T-023 fault-injection seam: makes `StorageEngine::evict_local_input_sstable_files`
+/// stop after retiring exactly this many inputs, simulating a process crash
+/// mid-retirement, so tests can prove startup reconciliation finishes the job
+/// (forge `t_fca66994`). `usize::MAX` (the default) never triggers it. Set
+/// via `StorageEngine::set_test_crash_after_input_retirements`.
+#[cfg(test)]
+static TEST_CRASH_AFTER_N_INPUT_RETIREMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 fn effective_compaction_input_bounds(min_threshold: usize, max_threshold: usize) -> (usize, usize) {
     let max_threshold = max_threshold.clamp(2, MAX_COMPACTION_INPUTS_PER_TASK);
     let min_threshold = min_threshold.clamp(2, max_threshold);
@@ -5098,6 +5107,21 @@ impl StorageEngine {
         }
     }
 
+    /// Set the [`TEST_CRASH_AFTER_N_INPUT_RETIREMENTS`] fault-injection seam
+    /// (T-023): [`Self::evict_local_input_sstable_files`] stops after
+    /// retiring exactly `n` inputs, simulating a process crash mid-retirement.
+    /// Tests must call [`Self::clear_test_crash_after_input_retirements`]
+    /// before returning, since it is a single process-wide static.
+    #[cfg(test)]
+    pub(crate) fn set_test_crash_after_input_retirements(n: usize) {
+        TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_test_crash_after_input_retirements() {
+        TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn temp_promotion_directory(
         target_dir: &std::path::Path,
         promoted_gen: u64,
@@ -5309,6 +5333,237 @@ impl StorageEngine {
         )
     }
 
+    /// T-023: reconcile every compaction replacement record found directly
+    /// under `table_dir`, and sweep leftover `.promote-*` staging debris
+    /// (window B) and `.compaction-*.intent.tmp` write-staging debris while
+    /// already scanning the directory. See
+    /// `compaction-cancel-safety.md` C3 and [`crate::compaction::intent`].
+    fn reconcile_compaction_intents(table_dir: &std::path::Path) {
+        let entries = match std::fs::read_dir(table_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::error!(
+                    %e, dir = %table_dir.display(),
+                    "storage-engine: could not scan table dir for compaction replacement \
+                     records; any crash-interrupted compaction here will not be reconciled \
+                     this startup"
+                );
+                return;
+            }
+        };
+
+        let mut record_paths = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".promote-") {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            %e, path = %entry.path().display(),
+                            "storage-engine: failed to remove stale compaction promote-staging debris"
+                        );
+                    }
+                }
+                continue;
+            }
+            if name.ends_with(".intent.tmp") {
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            %e, path = %entry.path().display(),
+                            "storage-engine: failed to remove stale compaction intent write-staging file"
+                        );
+                    }
+                }
+                continue;
+            }
+            if crate::compaction::intent::CompactionIntentRecord::is_record_name(&name) {
+                record_paths.push(entry.path());
+            }
+        }
+
+        for path in record_paths {
+            Self::reconcile_one_compaction_intent(table_dir, &path);
+        }
+    }
+
+    /// Reconcile a single `.compaction-*.intent` record. See the module doc
+    /// on [`crate::compaction::intent`] and `compaction-cancel-safety.md` C3
+    /// for the decision table this implements.
+    fn reconcile_one_compaction_intent(table_dir: &std::path::Path, record_path: &std::path::Path) {
+        let record = match crate::compaction::intent::CompactionIntentRecord::read_at(record_path) {
+            Ok(Some(record)) => record,
+            // Vanished between the directory listing and this read -- another
+            // path (or a previous run of this same function) already handled
+            // it. Nothing to do.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    %e, path = %record_path.display(),
+                    "storage-engine: unreadable compaction replacement record; leaving it in \
+                     place for operator inspection rather than guessing at its intent"
+                );
+                crate::metrics::inc_compaction_reconcile_unreadable_record();
+                return;
+            }
+        };
+
+        let output_present =
+            Self::generation_component_path(table_dir, &record.output_gen, "Data.db").is_some();
+
+        if !output_present {
+            // The output was never promoted (phase Promoting), or is missing
+            // at a later phase, which should never happen because promotion
+            // fsyncs the directory (T-001) before any later phase is ever
+            // written. Either way the only safe action left is to delete the
+            // record and leave whatever inputs remain exactly as they are --
+            // there is nothing here to roll forward onto.
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                table_dir,
+                &record.task_id,
+            ) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: failed to delete a rolled-back compaction replacement record"
+                );
+            }
+            crate::metrics::inc_compaction_reconcile_rolled_back();
+            tracing::warn!(
+                task_id = %record.task_id,
+                output_gen = %record.output_gen,
+                phase = ?record.phase,
+                dir = %table_dir.display(),
+                "storage-engine: rolled back an incomplete compaction found at startup \
+                 (its output does not exist); inputs are untouched"
+            );
+            return;
+        }
+
+        let digest_matches = match Self::read_generation_digest(table_dir, &record.output_gen) {
+            Ok(digest) => digest == record.output_digest,
+            Err(e) => {
+                tracing::error!(
+                    %e, task_id = %record.task_id, output_gen = %record.output_gen,
+                    "storage-engine: could not read the promoted compaction output's \
+                     Digest.crc32 during startup reconciliation; treating it as a digest \
+                     mismatch rather than trusting an unverifiable generation"
+                );
+                false
+            }
+        };
+
+        if !digest_matches {
+            let quarantine_dir = table_dir.join("quarantine");
+            if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+                tracing::error!(
+                    %e, dir = %quarantine_dir.display(), task_id = %record.task_id,
+                    "storage-engine: could not create the quarantine dir for a \
+                     digest-mismatched compaction output; leaving the output and the record \
+                     in place for the next startup to retry"
+                );
+                return;
+            }
+            let quarantined = record
+                .output_gen
+                .parse::<u64>()
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "compaction replacement record output_gen {:?} is not a u64: {e}",
+                        record.output_gen
+                    ))
+                })
+                .and_then(|gen| Self::quarantine_generation(table_dir, gen, &quarantine_dir));
+            if let Err(e) = quarantined {
+                tracing::error!(
+                    %e, task_id = %record.task_id, output_gen = %record.output_gen,
+                    "storage-engine: failed to quarantine a digest-mismatched compaction \
+                     output; leaving it live is not an option, leaving the record in place \
+                     for the next startup to retry"
+                );
+                return;
+            }
+            if let Err(e) = crate::compaction::intent::CompactionIntentRecord::delete(
+                table_dir,
+                &record.task_id,
+            ) {
+                tracing::error!(
+                    %e, task_id = %record.task_id,
+                    "storage-engine: quarantined a digest-mismatched compaction output but \
+                     failed to delete its replacement record"
+                );
+            }
+            crate::metrics::inc_compaction_reconcile_digest_mismatch();
+            tracing::error!(
+                task_id = %record.task_id,
+                output_gen = %record.output_gen,
+                dir = %table_dir.display(),
+                "storage-engine: quarantined a compaction output whose Digest.crc32 did not \
+                 match its replacement record; its inputs were kept live"
+            );
+            return;
+        }
+
+        // Output present and its digest matches the record: roll forward.
+        // Retire every input the record lists that is still on disk --
+        // `evict_local_input_sstable_files` already treats a missing
+        // component as a no-op, so this is correct and idempotent whether
+        // zero, some, or all of them survived a crash (including the
+        // already-fully-retired case, i.e. a `Retired`-phase record that
+        // never reached its own deletion). THIS is the fix for the
+        // resurrection window: without it, an input left live after a crash
+        // could still hold a row that the output's tombstone purge already
+        // dropped, and nothing would ever finish retiring it.
+        let stubs: Vec<crate::compaction::metadata::SSTableMetadata> = record
+            .inputs
+            .iter()
+            .map(|gen| Self::compaction_input_retirement_stub(table_dir, gen))
+            .collect();
+        Self::evict_local_input_sstable_files(&stubs);
+
+        if let Err(e) =
+            crate::compaction::intent::CompactionIntentRecord::delete(table_dir, &record.task_id)
+        {
+            tracing::warn!(
+                %e, task_id = %record.task_id,
+                "storage-engine: rolled a compaction forward but failed to delete its \
+                 replacement record; harmless, the next startup retries the same idempotent \
+                 retirement"
+            );
+        }
+        crate::metrics::inc_compaction_reconcile_rolled_forward();
+        tracing::warn!(
+            task_id = %record.task_id,
+            output_gen = %record.output_gen,
+            inputs = ?record.inputs,
+            dir = %table_dir.display(),
+            "storage-engine: rolled a compaction forward at startup, finishing retirement of \
+             inputs a crash left live (forge t_fca66994)"
+        );
+    }
+
+    /// A minimal [`crate::compaction::metadata::SSTableMetadata`] sufficient
+    /// for [`Self::evict_local_input_sstable_files`], which reads only `.id`
+    /// and `.path`. Startup reconciliation has an input's generation id from
+    /// the replacement record but not its token/timestamp bounds, which
+    /// retirement never inspects.
+    fn compaction_input_retirement_stub(
+        table_dir: &std::path::Path,
+        gen: &str,
+    ) -> crate::compaction::metadata::SSTableMetadata {
+        crate::compaction::metadata::SSTableMetadata {
+            id: gen.to_string(),
+            path: table_dir.to_path_buf(),
+            size_bytes: 0,
+            min_token: 0,
+            max_token: 0,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            partition_count: 0,
+            legacy_format: false,
+        }
+    }
+
     fn load_existing_sstables_and_sidecars_with_repair_mode(
         table_dir: &std::path::Path,
         reader_pool: &crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt>,
@@ -5328,6 +5583,14 @@ impl StorageEngine {
         // `FileFlushTarget::new_starting_at` because that constructor runs
         // AFTER this scan today (`StorageEngine::build_table_state`).
         crate::flush::sweep_stale_flush_staging(table_dir);
+
+        // T-023 (compaction-cancel-safety.md C3, forge t_fca66994): reconcile
+        // every compaction replacement record BEFORE generation discovery, so
+        // a crash that left a purged tombstone's shadowed row live in an
+        // un-retired input can never be read back. Must run after the flush
+        // staging sweep (debris there is unrelated) and before the scan below
+        // (which does not know how to interpret a `.compaction-*.intent` file).
+        Self::reconcile_compaction_intents(table_dir);
 
         // Collect all generation numbers by looking for Data.db files.
         let mut generations: Vec<u64> = {
@@ -11524,6 +11787,25 @@ impl StorageEngine {
                         );
                     }
                 }
+            }
+            // T-023 regression seam: simulate a process crash after exactly N
+            // inputs have been retired, so tests can prove startup
+            // reconciliation finishes retiring the rest instead of
+            // resurrecting whatever the survivors were shadowing (forge
+            // t_fca66994). `usize::MAX` (the default) never triggers this.
+            // A panic (not a plain `return`) is deliberate: a real crash lets
+            // no further code run -- no phase advance, no record deletion --
+            // and only a panic reproduces that when the caller is run inside
+            // `tokio::spawn` and its `JoinError` is discarded by the test.
+            #[cfg(test)]
+            if idx + 1
+                == TEST_CRASH_AFTER_N_INPUT_RETIREMENTS.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!(
+                    "T-023 test seam: simulated crash after retiring {} of {} compaction inputs",
+                    idx + 1,
+                    inputs.len()
+                );
             }
         }
     }
@@ -22319,6 +22601,346 @@ mod tests {
             "the record must be deleted on rollback"
         );
         assert!(crate::metrics::compaction_intent_rollback_total() > before);
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_phase_reaches_swapped_before_retirement_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let engine = Arc::new(engine);
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        // The compaction executor runs on a background thread and may not
+        // have pushed its result onto the channel yet (the same race
+        // `compaction_output_uploaded_to_s3` documents), so a no-op poll must
+        // not be mistaken for the seam failing to fire.
+        let mut crashed = false;
+        for _ in 0..40 {
+            StorageEngine::set_test_crash_after_input_retirements(1);
+            let poll_engine = Arc::clone(&engine);
+            let joined = tokio::spawn(async move { poll_engine.poll_compactions().await }).await;
+            StorageEngine::clear_test_crash_after_input_retirements();
+            if joined.is_err() {
+                crashed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            crashed,
+            "the T-023 crash seam must panic inside poll_compactions once the compaction \
+             result is available, to simulate a crash"
+        );
+
+        let mut records = leftover_intent_records(&sstable_dir);
+        assert_eq!(
+            records.len(),
+            1,
+            "the interrupted compaction must leave exactly one replacement record"
+        );
+        let record = crate::compaction::intent::CompactionIntentRecord::read_at(&records.remove(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.phase,
+            crate::compaction::intent::CompactionIntentPhase::Swapped,
+            "the record must have advanced Promoting -> Swapped before retirement -- and \
+             therefore Retired -- ever started"
+        );
+    }
+
+    /// `test_schema()` plus `gc_grace_seconds = 0`, so a tombstone with an
+    /// ancient `local_deletion_time` (see `LONG_AGO_LDT` further below, used
+    /// by the pre-existing purge tests) is genuinely purgeable under
+    /// purge.rs's real rules rather than test-rigged.
+    fn dead_partition_schema() -> TableSchema {
+        let mut schema = test_schema();
+        schema.extensions.insert(
+            ferrosa_common::schema::GC_GRACE_EXTENSION.to_string(),
+            "0".to_string(),
+        );
+        schema
+    }
+
+    /// THE resurrection regression (forge `t_fca66994`): two inputs, A with a
+    /// live row and B with a tombstone that purges it, compacted together and
+    /// then crashed after retiring only B. Without T-023, restart discovers
+    /// the purged-tombstone output alongside the still-live A and the row
+    /// comes back. With it, startup finishes retiring A and the row stays
+    /// dead.
+    #[tokio::test]
+    async fn compaction_reconcile_resurrection_regression_row_stays_dead_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let rt = tokio::runtime::Handle::current();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let engine = Arc::new(
+            StorageEngine::new_with_upload_store(
+                config,
+                Arc::clone(&store),
+                "test-node".to_string(),
+                &rt,
+            )
+            .unwrap(),
+        );
+        let tid = table_id();
+        engine.register_table(dead_partition_schema()).unwrap();
+
+        // Input A (flush 1): "dead" holds a live row, plus an unrelated live
+        // partition so the compaction's output is not entirely purged away
+        // (which would make the executor keep one unpurged partition instead
+        // -- `compaction_purge_held_back_total`).
+        engine
+            .write(&tid, &make_key("live"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine
+            .write(&tid, &make_key("dead"), make_row(b"v", 1000), 1000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        // Input B (flush 2): a partition tombstone for "dead", using purge.rs's
+        // real rules via `gc_grace_seconds = 0` and an ancient local deletion
+        // time, so it is genuinely purgeable rather than test-rigged.
+        engine
+            .write(
+                &tid,
+                &make_key("dead"),
+                partition_delete_row(2000, LONG_AGO_LDT),
+                2000,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let (input_a, input_b) = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            let mut metadata = engine.collect_sstable_metadata(&tid, state);
+            metadata.sort_by_key(|m| m.id.parse::<u64>().unwrap());
+            (metadata[0].clone(), metadata[1].clone())
+        };
+
+        // B first: the crash seam below retires whichever input is first.
+        let inputs = vec![input_b.clone(), input_a.clone()];
+        let purge = {
+            let tables = engine.tables.read();
+            let state = tables.get(&tid).unwrap();
+            engine.purge_policy_for(&tid, state, &inputs)
+        };
+        assert!(purge.is_some(), "gc_grace_seconds=0 must enable purging");
+
+        let compaction_output_dir = dir.path().join("compaction").join(tid.to_string());
+        let task = crate::compaction::metadata::CompactionTask {
+            inputs,
+            output_dir: compaction_output_dir,
+            schema: dead_partition_schema(),
+            table_id: tid.clone(),
+            purge,
+        };
+        engine.compaction_executor.submit(task).unwrap();
+
+        let compaction_dir = dir.path().join("compaction");
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if compaction_dir.exists()
+                && std::fs::read_dir(&compaction_dir)
+                    .ok()
+                    .map(|mut rd| rd.any(|_| true))
+                    .unwrap_or(false)
+            {
+                break;
+            }
+        }
+
+        // Simulate a crash after retiring only B (the tombstone holder): the
+        // real `poll_compactions` runs inside a spawned task, so the panic the
+        // seam raises is caught by `tokio::spawn` as a `JoinError` instead of
+        // failing this test -- exactly what a process crash looks like, since
+        // no code past the panic point ever runs (no phase=Retired write, no
+        // record deletion).
+        let mut crashed = false;
+        for _ in 0..40 {
+            StorageEngine::set_test_crash_after_input_retirements(1);
+            let poll_engine = Arc::clone(&engine);
+            let joined = tokio::spawn(async move { poll_engine.poll_compactions().await }).await;
+            StorageEngine::clear_test_crash_after_input_retirements();
+            if joined.is_err() {
+                crashed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            crashed,
+            "the crash seam must panic once the compaction result is available, to simulate a crash"
+        );
+
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_b.id, "Data.db")
+                .is_none(),
+            "B (the tombstone holder) must be retired before the simulated crash"
+        );
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_a.id, "Data.db")
+                .is_some(),
+            "A (the row holder) must survive the simulated crash"
+        );
+
+        // Restart: drop the crashed engine first so a fresh instance can open
+        // the same data dir, then rediscover from disk exactly as a real
+        // restart would.
+        drop(engine);
+        let rt2 = tokio::runtime::Handle::current();
+        let config2 = StorageEngineConfig::test_config(dir.path());
+        let engine2 =
+            StorageEngine::new_with_upload_store(config2, store, "test-node".to_string(), &rt2)
+                .unwrap();
+        engine2.register_table(dead_partition_schema()).unwrap();
+
+        let partition = engine2.read(&tid, &make_key("dead")).unwrap();
+        let resurrected = partition
+            .map(|p| !p.rows.is_empty() || p.static_row.is_some())
+            .unwrap_or(false);
+        assert!(
+            !resurrected,
+            "dead's row must NOT resurrect after the crash and restart (forge t_fca66994)"
+        );
+
+        let live_partition = engine2.read(&tid, &make_key("live")).unwrap();
+        assert!(
+            live_partition.is_some_and(|p| !p.rows.is_empty()),
+            "unrelated live data must survive reconciliation"
+        );
+
+        assert!(
+            StorageEngine::generation_component_path(&sstable_dir, &input_a.id, "Data.db")
+                .is_none(),
+            "startup reconciliation must finish retiring A"
+        );
+        assert!(
+            leftover_intent_records(&sstable_dir).is_empty(),
+            "reconciliation must delete the replacement record once retirement is complete"
+        );
+    }
+
+    #[test]
+    fn compaction_reconcile_rolls_back_when_output_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        // An input that is still live -- rollback must leave it exactly alone.
+        std::fs::write(table_dir.join("3-Data.db"), b"still here").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "50".to_string(),
+            output_gen: "51".to_string(), // never promoted; no such generation exists
+            output_digest: 123,
+            inputs: vec!["3".to_string(), "4".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_reconcile_rolled_back_total();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "a record whose output was never promoted must be deleted"
+        );
+        assert!(
+            table_dir.join("3-Data.db").exists(),
+            "rollback must leave a still-live input untouched"
+        );
+        assert!(crate::metrics::compaction_reconcile_rolled_back_total() > before);
+    }
+
+    #[test]
+    fn compaction_reconcile_quarantines_digest_mismatch_and_keeps_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let gen_dir = table_dir.join("5");
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join("5-Data.db"), b"promoted but corrupted").unwrap();
+        std::fs::write(
+            gen_dir.join("5-Digest.crc32"),
+            ferrosa_sstable::checksum::format_digest(12345),
+        )
+        .unwrap();
+        std::fs::write(table_dir.join("3-Data.db"), b"an input").unwrap();
+
+        let record = crate::compaction::intent::CompactionIntentRecord {
+            task_id: "99".to_string(),
+            output_gen: "5".to_string(),
+            output_digest: 999, // does not match the 12345 written above
+            inputs: vec!["3".to_string(), "4".to_string()],
+            phase: crate::compaction::intent::CompactionIntentPhase::Swapped,
+        };
+        record.write(&table_dir).unwrap();
+
+        let before = crate::metrics::compaction_reconcile_digest_mismatch_total();
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            !gen_dir.exists(),
+            "a digest-mismatched output must never be left live"
+        );
+        assert!(
+            table_dir.join("quarantine").join("5-Data.db").exists(),
+            "the quarantined component must land in quarantine/"
+        );
+        assert!(
+            leftover_intent_records(&table_dir).is_empty(),
+            "the record must be deleted after quarantining its output"
+        );
+        assert!(
+            table_dir.join("3-Data.db").exists(),
+            "inputs must be kept live on a digest mismatch"
+        );
+        assert!(crate::metrics::compaction_reconcile_digest_mismatch_total() > before);
+    }
+
+    #[test]
+    fn compaction_reconcile_sweeps_promote_star_debris_and_stale_intent_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        let promote_debris = table_dir.join(".promote-1234-abcd");
+        std::fs::create_dir_all(&promote_debris).unwrap();
+        std::fs::write(promote_debris.join("1234-Data.db"), b"partial").unwrap();
+
+        let tmp_intent = table_dir.join(".compaction-77.intent.tmp");
+        std::fs::write(&tmp_intent, b"{}").unwrap();
+
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            !promote_debris.exists(),
+            "leftover .promote-* staging must be swept at startup (window B)"
+        );
+        assert!(
+            !tmp_intent.exists(),
+            "a stale .intent.tmp left by an interrupted record write must be swept too"
+        );
+    }
+
+    #[test]
+    fn compaction_reconcile_no_records_is_a_noop_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("sstables").join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("7-Data.db"), b"an ordinary live generation").unwrap();
+
+        StorageEngine::reconcile_compaction_intents(&table_dir);
+
+        assert!(
+            table_dir.join("7-Data.db").exists(),
+            "a table dir with no replacement records must be left untouched"
+        );
     }
 
     #[test]

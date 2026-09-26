@@ -211,7 +211,7 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   by table-id scope, so a test's cancel-point hook can call
   `cancel_harness::cancel_now` to actually cancel — not merely record having
   reached — a `CancelPoint`.
-  **Durable replacement record + commit protocol (T-022):**
+  **Durable replacement record + startup reconciliation (T-022/T-023, FMEA ST-34):**
   `compaction::intent::CompactionIntentRecord` is a JSON file at
   `sstables/<table>/.compaction-<id>.intent` — `{task_id, output_gen,
   output_digest, inputs, phase}`, `phase` one of `Promoting → Swapped →
@@ -220,13 +220,26 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   failure after commit but before retirement (reader-open, sidecar-merge, or
   swap) rolls back under the record — removes the promoted output directory,
   fsyncs, deletes the record — via `StorageEngine::rollback_compaction_intent`,
-  leaving the inputs untouched (`compaction_intent_rollback_total`). Startup
-  reconciliation from this record (T-023) is the next step; until it lands,
-  the record's job stops at retirement time, matching today's behavior. This
-  does not replace `upload::PendingUploadsLog`: that log still separately
-  drives S3 upload/manifest/delete recovery on the same path as before; the
-  replacement record is the source of truth only for the local
-  promote/swap/retire sequence.
+  leaving the inputs untouched (`compaction_intent_rollback_total`). This
+  closes the gap ST-27's tombstone purge opened: retiring inputs one at a time
+  with no cross-input atomicity meant a crash between two retirements could
+  delete the input holding a purged tombstone while the input holding the row
+  it shadowed survived, resurrecting that row. Startup reconciliation
+  (`StorageEngine::reconcile_compaction_intents`, run per table before
+  generation discovery, alongside the existing `.promote-*` staging sweep)
+  rolls an incomplete record back if its output was never promoted,
+  quarantines the output on a `Digest.crc32` mismatch (T-011 format) while
+  keeping the inputs live, and otherwise rolls forward: retires every listed
+  input still on disk — idempotent, since a missing component is a no-op — so
+  a crash mid-retirement always finishes. This does not replace
+  `upload::PendingUploadsLog`: that log still separately drives S3
+  upload/manifest/delete recovery on the same path as before; the replacement
+  record is the source of truth only for the local promote/swap/retire
+  sequence. Metrics: `compaction_intent_rollback_total`,
+  `compaction_reconcile_rolled_back_total`,
+  `compaction_reconcile_rolled_forward_total`,
+  `compaction_reconcile_digest_mismatch_total`,
+  `compaction_reconcile_unreadable_record_total`.
 - **S3 write-behind** (`upload/`) — `UploadManager` tokio task + bounded mpsc;
   SHA-256 integrity metadata; pending-upload log + replay for crash safety;
   separate flush vs. compaction upload managers. Pending-upload replay recognizes
