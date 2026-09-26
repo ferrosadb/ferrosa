@@ -18,5 +18,10 @@ tracing = "0.1"
 zstd = "0.13"
 
 [dev-dependencies]
+# Enables `ferrosa_common::test_generators` (shared CellValue/DecoratedKey
+# proptest strategies) for the T-035 writer oracle's Partition/Row
+# generators (ferrosa-sstable/tests/support/generators.rs).
+ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
 proptest = "1"
+sha2 = "0.10"
 tempfile = "3"

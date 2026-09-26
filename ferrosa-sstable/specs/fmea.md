@@ -44,3 +44,10 @@ severity — a wrong byte here is silent, durable data loss.
 - `tests/p0_production_disk_replay.rs` — real on-disk replay regression.
 - `validate_data_extent` + `WriteOptions::verify_output` — truncation/partial-write guards.
 - `salvage` / `SalvageStats` — best-effort recovery + observability on corrupt tables.
+- `tests/oracle.rs` + `tests/golden/` (T-035) — a checked-in golden corpus
+  froze today's writer output byte-for-byte, ahead of the write-pump rewrite
+  (`ferrosa-suite/specs/sstable-write-pump/`) that changes how `writer.rs`
+  produces `Data.db`. `oracle_golden_reproduction` catches any byte drift
+  that rewrite introduces; `oracle_file_backed_matches_in_memory` (1000
+  proptest cases) catches the writer's two entry points diverging from each
+  other.

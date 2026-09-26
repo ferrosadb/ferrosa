@@ -148,6 +148,50 @@ byte-comparable, statistics, reader/writer round-trips) plus integration suites:
 `tests/property_tests.rs` (proptest round-trips), and
 `tests/p0_production_disk_replay.rs` (real on-disk replay regression).
 
+### Writer test oracle (T-035) and the golden SSTable corpus
+
+`tests/oracle.rs` freezes today's `SSTableWriter` output as a byte-exact
+oracle, ahead of later write-pump packets (T-030-series,
+`ferrosa-suite/specs/sstable-write-pump/`) rewriting how `writer.rs` produces
+`Data.db`. It drives the writer's existing public API (`SSTableWriter::new` +
+`finish`, and `new_file_backed` + `finish_to_directory`) rather than a copied
+implementation — see the module doc in
+`tests/support/legacy_writer.rs` for why a verbatim internals copy wasn't
+worth it at this commit.
+
+- `tests/support/generators.rs` — proptest generators for synthetic
+  `(schema, WriteOptions, partitions)` inputs: 0-5 clustering columns (fixed-
+  and variable-length CQL types), static rows, row/partition deletions,
+  TTL/expiring cells, simple and complex (non-frozen collection) columns,
+  empty values, and row bodies from 0 B up to ~256 KiB. Reuses
+  `ferrosa_common::test_generators::arb_decorated_key` (the `test-generators`
+  feature) for partition keys rather than hand-rolling one.
+- `tests/support/legacy_writer.rs` — `ComponentBytes`, `legacy_write`/
+  `legacy_write_file_backed` (the two writer entry points, captured into one
+  shape), and `assert_components_identical` (names the first differing
+  component and byte offset).
+- `tests/support/golden.rs` — the `CASES` table (~20 small SSTables:
+  uncompressed and every supported codec, chunk sizes 4K/16K/64K, file-backed
+  and in-memory, plus deliberate large-row and chunk-straddling cases) and
+  the read/write helpers for `tests/golden/<case name>/`.
+- `tests/golden/` — the checked-in corpus: one directory per case
+  (`Data.db`, `Partitions.db`, `Rows.db`, `Filter.db`, `Statistics.db`,
+  `CompressionInfo.db` when compressed, `TOC.txt`) plus `manifest.txt`
+  (seed, options, and a SHA-256 per component).
+- `tests/golden_regen.rs` — regenerates the corpus. **Never runs
+  destructively in normal `cargo test`/CI**: only
+  `FERROSA_REGEN_GOLDEN=1 cargo test -p ferrosa-sstable --test golden_regen
+  -- --nocapture` rewrites `tests/golden/`. Without the env var it still
+  checks the manifest matches `CASES`, so it's a real assertion either way,
+  never a silent no-op.
+
+`oracle_*` tests (`tests/oracle.rs`): `oracle_golden_reproduction` (today's
+writer reproduces every golden file byte-for-byte),
+`oracle_file_backed_matches_in_memory` (the two writer entry points agree,
+1000 proptest cases), and `oracle_golden_reads_back_through_reader` (golden
+files read back through `SSTableReader` with the expected partition/row
+counts).
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, data flow, invariants
