@@ -10,8 +10,8 @@
 //! panicking, timing out, or completing normally — any of those would mean
 //! the point was never reached, which is a harness bug, not a pass). The
 //! parent then reopens a fresh [`StorageEngine`] on the same data dir
-//! (today's only form of "restart" — the reconciliation in
-//! `compaction-cancel-safety.md` C3 does not exist until T-023) and checks
+//! (today's only form of "restart"; startup now runs the T-023 startup
+//! reconciliation described in `compaction-cancel-safety.md` C3) and checks
 //! I1-I4 with [`assert_cancel_invariants`].
 //!
 //! Unix-only: signal-based crash detection has no Windows equivalent, and
@@ -21,6 +21,7 @@
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -159,22 +160,42 @@ mod tests {
         );
     }
 
+    /// What a crash-twin case must observe once the driver reopens the
+    /// engine (i.e. after T-023 startup reconciliation has had a chance to
+    /// run).
+    #[derive(Clone, Copy)]
+    enum ExpectedOutcome {
+        /// Crashed strictly before the T-022 commit point
+        /// (`compaction-cancel-safety.md` C2): reconciliation finds no
+        /// output to roll forward onto, so the inputs are always left
+        /// untouched. `assert_all()` covers this fully — there is only one
+        /// possible outcome, so the report's generic "exactly one" check
+        /// already pins it down.
+        CleanRollback,
+        /// Crashed at or after the T-022 commit, at a point where the
+        /// output is already promoted and digest-verified on disk. T-023's
+        /// C3 table (`Promoting`/`Swapped`, output present, digest matches)
+        /// always rolls forward from here, so this asserts that specific
+        /// outcome instead of "one of the two": every input generation must
+        /// be gone and a disjoint, non-empty output generation must be the
+        /// only thing left. Closes windows C and D (T-022/T-023).
+        RolledForward,
+        /// A documented, `known-open-window`-gated case where I2 is
+        /// expected to still fail: window E (T-024, not yet fixed) or the
+        /// `AfterPromote` sub-window of C (a gap in T-022's own commit
+        /// protocol, also not yet fixed -- see that test's comment).
+        KnownOpenWindow,
+    }
+
     /// Drives one crash-twin case. `test_name` must be this test's own
     /// (unique, crate-wide) function name — the crash-twin child re-execs
     /// the same test binary filtered by this name (substring match; unique
     /// names never collide with `--exact` semantics needed).
-    ///
-    /// `expect_known_open_window`: `false` asserts every invariant holds
-    /// (today's code has no bug at this point); `true` is a documented,
-    /// `known-open-window`-gated case where I2 is expected to still fail.
-    /// A plain `bool` rather than a two-variant enum: the enum's
-    /// always-defined-but-gated-callers-only variant triggered `dead_code`
-    /// whenever `known-open-window` is off (i.e. every default build).
     fn run_crash_sweep_case(
         test_name: &str,
         point: CancelPoint,
         compressed: bool,
-        expect_known_open_window: bool,
+        expected: ExpectedOutcome,
     ) {
         if std::env::var("FERROSA_CANCEL_CRASH_ROLE").as_deref() == Ok("child") {
             let dir = PathBuf::from(
@@ -213,18 +234,43 @@ mod tests {
             .expect("register table after crash-twin");
         let report = assert_cancel_invariants(&engine, &tid, &oracle, &input_gens);
 
-        if expect_known_open_window {
-            report.assert_i1_content_matches_oracle();
-            report.assert_i3_no_corrupt_generation();
-            assert!(
-                report.duplicate_or_missing_generations.is_some(),
-                "{point} was gated as a known-open-window case (today's startup has no \
-                 reconciliation) but I2 held anyway -- the fixing packet may already be in, \
-                 in which case remove this gate and this test's `known-open-window` feature \
-                 guard"
-            );
-        } else {
-            report.assert_all();
+        match expected {
+            ExpectedOutcome::CleanRollback => report.assert_all(),
+            ExpectedOutcome::RolledForward => {
+                report.assert_i1_content_matches_oracle();
+                report.assert_i3_no_corrupt_generation();
+                report.assert_i4_no_leaks();
+                let observed: HashSet<u64> =
+                    StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid))
+                        .into_iter()
+                        .collect();
+                let inputs: HashSet<u64> = input_gens.iter().copied().collect();
+                assert!(
+                    observed.is_disjoint(&inputs) && !observed.is_empty(),
+                    "{point}: expected startup reconciliation to roll FORWARD onto the \
+                     promoted output (compaction-cancel-safety.md C3: output present, digest \
+                     matches at this point) -- inputs {inputs:?} should all have been \
+                     retired and a disjoint, non-empty output generation should be the only \
+                     thing left; observed {observed:?}"
+                );
+            }
+            ExpectedOutcome::KnownOpenWindow => {
+                report.assert_i1_content_matches_oracle();
+                report.assert_i3_no_corrupt_generation();
+                let observed: HashSet<u64> =
+                    StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid))
+                        .into_iter()
+                        .collect();
+                let inputs: HashSet<u64> = input_gens.iter().copied().collect();
+                assert!(
+                    report.duplicate_or_missing_generations.is_some(),
+                    "{point} was gated as a known-open-window case (see this test's comment \
+                     for which gap -- window E/T-024, or the AfterPromote sub-window of C) \
+                     but I2 held anyway (inputs {inputs:?}, observed {observed:?}) -- the \
+                     fixing packet may already be in, in which case remove this gate and \
+                     this test's `known-open-window` feature guard"
+                );
+            }
         }
         let _ = engine.shutdown();
     }
@@ -238,14 +284,35 @@ mod tests {
         ($name:ident, $point:expr, $compressed:expr, clean) => {
             #[test]
             fn $name() {
-                run_crash_sweep_case(stringify!($name), $point, $compressed, false);
+                run_crash_sweep_case(
+                    stringify!($name),
+                    $point,
+                    $compressed,
+                    ExpectedOutcome::CleanRollback,
+                );
+            }
+        };
+        ($name:ident, $point:expr, $compressed:expr, rolled_forward) => {
+            #[test]
+            fn $name() {
+                run_crash_sweep_case(
+                    stringify!($name),
+                    $point,
+                    $compressed,
+                    ExpectedOutcome::RolledForward,
+                );
             }
         };
         ($name:ident, $point:expr, $compressed:expr, known_open_window) => {
             #[cfg(feature = "known-open-window")]
             #[test]
             fn $name() {
-                run_crash_sweep_case(stringify!($name), $point, $compressed, true);
+                run_crash_sweep_case(
+                    stringify!($name),
+                    $point,
+                    $compressed,
+                    ExpectedOutcome::KnownOpenWindow,
+                );
             }
         };
     }
@@ -353,13 +420,32 @@ mod tests {
         clean
     );
 
-    // ---- Gated behind `known-open-window`: today's known windows. Each
-    // fixing packet removes its case's gate. ----
+    // ---- Window D and most of window C are closed by T-022/T-023 and run
+    // unconditionally below, asserting the specific roll-forward outcome
+    // those packets guarantee. `AfterPromote` (part of window C) and window
+    // E remain gated behind `known-open-window` -- see each section's
+    // comment for why. ----
 
     // Window C (compaction-cancel-safety.md): the output is promoted (live
-    // under sstables/<table>/) but the view has not swapped yet, so restart
-    // discovers both the output and the untouched inputs. Fixed by T-022
-    // (C2/C3: a durable replacement record + startup reconciliation).
+    // under sstables/<table>/) but the view has not swapped yet.
+    //
+    // `AfterPromote` itself is a narrower window T-022/T-023 do NOT close,
+    // found by running this case with the fix in place: `poll_compactions`
+    // fires this cancel point BEFORE it corrects the intent record's
+    // `output_gen` from its pre-promotion placeholder (the staged output's
+    // own id) to the actual promoted generation id -- `promote_compaction_output`
+    // is free to pick a different id to avoid colliding with a concurrent
+    // flush, and routinely does in this scenario. A crash in that gap
+    // leaves a durable, fsynced record whose `output_gen` names a
+    // generation that no longer exists (it was renamed away), so
+    // `reconcile_one_compaction_intent` finds "output missing" and rolls
+    // BACK -- deleting the record and leaving both inputs untouched --
+    // while the real promoted output sits live on disk under its true id,
+    // now an orphan no record points to. Both inputs and the output are
+    // then discoverable after restart: I2 violated, the original window C
+    // shape. This is a gap in T-022's own commit protocol (the two-step
+    // intent write around promotion), not something T-024 covers, and needs
+    // its own fix packet. Kept `known-open-window`-gated pending that fix.
     crash_sweep_test!(
         cancel_crash_sweep_after_promote_compressed,
         CancelPoint::AfterPromote,
@@ -372,54 +458,65 @@ mod tests {
         false,
         known_open_window
     );
+
+    // SidecarBuild and BeforeSwap: by these points `poll_compactions` has
+    // already corrected the intent record's `output_gen` to the real
+    // promoted id and re-fsynced it (immediately after `AfterPromote` fires,
+    // see above), so T-023's C3 reconciliation finds the promoted output
+    // under the recorded id and rolls forward. Closed by T-022 (C2) + T-023
+    // (C3).
     crash_sweep_test!(
         cancel_crash_sweep_sidecar_build_compressed,
         CancelPoint::SidecarBuild,
         true,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_sidecar_build_uncompressed,
         CancelPoint::SidecarBuild,
         false,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_before_swap_compressed,
         CancelPoint::BeforeSwap,
         true,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_before_swap_uncompressed,
         CancelPoint::BeforeSwap,
         false,
-        known_open_window
+        rolled_forward
     );
 
     // Window D ("same as C" per compaction-cancel-safety.md): swapped in
-    // memory, inputs not yet deleted. Fixed by T-023 (paired with window B).
+    // memory, inputs not yet deleted. Before T-023, restart discovered both
+    // the output and the untouched inputs (I2 violated). Closed by T-023's
+    // C3 reconciliation, which rolls forward here for the same reason as
+    // window C: the record's output is present and digest-verified.
     crash_sweep_test!(
         cancel_crash_sweep_after_swap_compressed,
         CancelPoint::AfterSwap,
         true,
-        known_open_window
+        rolled_forward
     );
     crash_sweep_test!(
         cancel_crash_sweep_after_swap_uncompressed,
         CancelPoint::AfterSwap,
         false,
-        known_open_window
+        rolled_forward
     );
 
     // Window E: input retirement stops after zero inputs are removed (the
-    // output is already live, both inputs still are too). Fixed by T-024
-    // (C4: atomic, fsynced per-generation retirement). This packet's
-    // `CancelPoint` granularity is per whole input generation, not per
-    // component file, so it does not reach the finer-grained "one input
-    // half-deleted" shape the design doc also describes under window E —
-    // that needs a per-component hook a later packet can add alongside its
-    // fix.
+    // output is already live, both inputs still are too). NOT YET fixed —
+    // T-024 (C4: atomic, fsynced per-generation retirement) is the only
+    // remaining `known-open-window` case now that windows C and D are
+    // closed by T-022/T-023 above. This packet's `CancelPoint` granularity
+    // is per whole input generation, not per component file, so it does not
+    // reach the finer-grained "one input half-deleted" shape the design doc
+    // also describes under window E — that needs a per-component hook a
+    // later packet can add alongside its fix.
     crash_sweep_test!(
         cancel_crash_sweep_retire_input_0_compressed,
         CancelPoint::RetireInput(0),

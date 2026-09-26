@@ -109,11 +109,18 @@ repair-fuzz-known-failures = ["test-generators"]
 # RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
 race-stress = []
 # Compaction cancel-safety crash sweep (T-020, `compaction-cancel-safety.md`):
-# gates the `cancel_crash_sweep_*` cases that hit a window today's code does
-# not yet close (C: promoted-but-not-swapped duplicate, T-022; D: swapped but
-# inputs not deleted, T-023; E: input retirement stops partway through the
-# input list, T-024). Off by default so `cargo test` stays green; each fixing
-# packet removes its case's gate instead of widening this feature.
+# gates the `cancel_crash_sweep_*` cases for the two windows today's code
+# does not yet close: E, input retirement stops partway through the input
+# list (T-024); and the `AfterPromote` sub-window of C, where a crash lands
+# between promotion and the intent record's post-promotion `output_gen`
+# correction, so reconciliation looks for the output under the wrong
+# generation id, finds nothing, and rolls back while the real (differently
+# numbered) output sits live and orphaned -- a gap in T-022's own commit
+# protocol, not yet fixed. The rest of window C and all of window D ARE
+# closed by T-022 (durable replacement record) + T-023 (startup
+# reconciliation) and now run unconditionally, asserting the roll-forward
+# outcome those packets guarantee. Off by default so `cargo test` stays
+# green; each fix removes its case's gate from this feature.
 known-open-window = []
 # slow tests; run nightly by nightly-slow-tests.yml; PR CI skips `::slow::`
 slow-tests = []

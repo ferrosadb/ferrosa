@@ -17,12 +17,13 @@
 //! *not* catch a wholly unexpected extra key appearing under a name the test
 //! never wrote, which only a genuine range scan proves absent.
 //!
-//! I2 ("exactly one of {inputs, output}") is checked against **today's**
-//! startup behavior, which has no reconciliation (that is T-023's C3): it
-//! simply reports whether the input generations, the output generation, or a
-//! mixture of both are discoverable after a (re)open. Known windows where
-//! today's code leaves a mixture are documented at each crash-sweep call
-//! site and gated behind the `known-open-window` feature.
+//! I2 ("exactly one of {inputs, output}") reports whether the input
+//! generations, the output generation, or a mixture of both are discoverable
+//! after a (re)open. Startup now runs T-023's C3 reconciliation, so this
+//! only reports a mixture for the two windows that remain open -- window E
+//! (T-024) and the `AfterPromote` sub-window of C (a gap in T-022's own
+//! commit protocol) -- each documented at its crash-sweep call site and
+//! gated behind the `known-open-window` feature.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
