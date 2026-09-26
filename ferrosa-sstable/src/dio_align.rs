@@ -2,29 +2,59 @@
 //! Correctness: `resolve_block` is pure and total: for any mask/alignment
 //!   input it returns exactly one of `Probed`, `Unsupported`, or `TooLarge`,
 //!   and a `Probed`/`TooLarge` block is always a power of two `>= MIN_BLOCK`.
-//!   `probe` never panics on a failing `statx(2)` call — a failure degrades to
-//!   `Unsupported` and is logged once, never silently.
+//!   `KernelStatx`'s layout is asserted at compile time (size 256 bytes, and
+//!   the offsets of `stx_mask`/`stx_dio_mem_align`/`stx_dio_offset_align`)
+//!   against the kernel UAPI, so a bad field order fails the build rather
+//!   than misreading kernel-written bytes. `probe` never panics on a failing
+//!   `statx(2)` syscall — a failure degrades to `Unsupported` and is logged
+//!   once, never silently.
 //! Last revised: 2026-09-26
-//! Last changed: New module (T-031, sstable-write-pump). `decisions.md` D4:
-//!   probe the true device alignment instead of assuming [`crate::direct::MIN_BLOCK`]
-//!   is always sufficient. Nothing consumes this yet — `pump.rs` wires it into
+//! Last changed: T-031 fix round. The first version called `libc::statx`,
+//!   which only compiles for `target_env = "gnu"` in libc 0.2.186 (see below)
+//!   — inert on ferrosa's actual production Linux binary, the static musl
+//!   build (`make build-musl`). Replaced with a raw `SYS_statx` syscall
+//!   against our own kernel-UAPI-shaped struct, gated on `target_os =
+//!   "linux"` for every `target_env`. `decisions.md` D4: probe the true
+//!   device alignment instead of assuming [`crate::direct::MIN_BLOCK`] is
+//!   always sufficient. Nothing consumes this yet — `pump.rs` wires it into
 //!   `AlignedPump`'s block choice in T-032.
 //!
-//! # Why gnu-only on Linux
+//! # Why a hand-rolled `statx` struct and a raw syscall, not `libc::statx`
 //!
 //! `libc` 0.2.186 (pinned in `Cargo.lock`) only defines the `statx` struct's
 //! `stx_dio_mem_align` / `stx_dio_offset_align` fields, the `statx(2)` FFI
 //! declaration, and `STATX_DIOALIGN` itself behind
 //! `cfg(any(target_env = "gnu", target_os = "android", all(target_env =
 //! "musl", musl_v1_2_3)))` (`libc-0.2.186/src/unix/linux_like/mod.rs:257-298,
-//! 1615, 2177-2180`). `musl_v1_2_3` is a cfg the crate's build script sets
+//! 1615, 2177-2180`). `musl_v1_2_3` is a cfg `libc`'s own build script sets
 //! only when it detects musl >= 1.2.3 on the machine that *builds* the musl
 //! target — not something guaranteed by targeting `*-unknown-linux-musl`
-//! alone (an older musl toolchain, or a build environment where the probe
-//! script cannot run, leaves it unset). Rather than depend on that detection
-//! succeeding, [`probe`] compiles for `target_env = "gnu"` only; every other
-//! target (musl, macOS, Windows, …) gets the `Unsupported`-returning stub, so
-//! `cargo check --target x86_64-unknown-linux-musl` succeeds unconditionally.
+//! alone, and **ferrosa's shipped Linux binary is exactly that target**
+//! (`make build-musl`). Gating our probe on `target_env = "gnu"` would make
+//! it inert in production: every file would silently take the
+//! [`MIN_BLOCK`] floor forever, with no wrong answer but no real probing
+//! either.
+//!
+//! What `libc` 0.2.186 defines **unconditionally** for every Linux target
+//! (gnu and musl alike), independent of `musl_v1_2_3`:
+//! - `libc::syscall` (`unix/linux_like/linux/mod.rs:4227`, inside the shared
+//!   `extern` block both `gnu` and `musl` build on).
+//! - `libc::AT_EMPTY_PATH` (`unix/linux_like/mod.rs:1195`, not inside any
+//!   `cfg_if` gate).
+//! - `libc::SYS_statx`, per architecture, defined directly in each musl arch
+//!   module, e.g. `unix/linux_like/linux/musl/b64/x86_64/mod.rs:507` (332)
+//!   and `unix/linux_like/linux/musl/b64/aarch64/mod.rs:578` (291) — the
+//!   same values as the corresponding `gnu` modules
+//!   (`unix/linux_like/linux/gnu/b64/x86_64/not_x32.rs:405`,
+//!   `unix/linux_like/linux/gnu/b64/aarch64/mod.rs:917`).
+//!
+//! So the syscall number and the raw `syscall()` trampoline are available on
+//! every Linux target this crate ships for; only the *typed* `statx`
+//! struct/fn/const are gnu-only. [`KernelStatx`] below is our own
+//! `#[repr(C)]` mirror of the kernel UAPI `struct statx`
+//! (`include/uapi/linux/stat.h`), which the kernel documents as a fixed,
+//! stable 256-byte ABI regardless of libc — so defining it ourselves and
+//! calling `SYS_statx` directly sidesteps `libc`'s musl gating entirely.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +65,76 @@ use crate::direct::MIN_BLOCK;
 /// is not "a bigger block to use" — it means direct I/O is not usable for
 /// this file at all, and the caller must fall back to buffered I/O.
 pub const MAX_BLOCK: usize = 65536;
+
+/// The `STATX_DIOALIGN` bit, cited directly from the kernel UAPI
+/// (`include/uapi/linux/stat.h`) rather than depending on `libc::STATX_DIOALIGN`,
+/// which does not compile on every Linux target (see the module docs). Used
+/// only by the Linux `probe`; the non-Linux stub never needs it.
+#[cfg(target_os = "linux")]
+const STATX_DIOALIGN_MASK: u32 = 0x2000;
+
+/// Mirrors the kernel UAPI `struct statx_timestamp`
+/// (`include/uapi/linux/stat.h`): 16 bytes, `i64` alignment.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelStatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+/// Mirrors the kernel UAPI `struct statx` (`include/uapi/linux/stat.h`)
+/// field-for-field, including its reserved padding, so `#[repr(C)]` lays it
+/// out identically to what the kernel writes via `SYS_statx` — independent
+/// of whatever `libc` does or does not expose for this target. The kernel
+/// documents this as a stable, fixed-size (256-byte) ABI; the compile-time
+/// asserts below hold the port to that contract.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelStatx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: [u16; 1],
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: KernelStatxTimestamp,
+    stx_btime: KernelStatxTimestamp,
+    stx_ctime: KernelStatxTimestamp,
+    stx_mtime: KernelStatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
+}
+
+#[cfg(target_os = "linux")]
+impl KernelStatx {
+    /// A zeroed buffer for the syscall to fill. Every field the kernel does
+    /// not touch (because it wasn't requested in the mask) stays zero, which
+    /// [`resolve_block`] already treats as "no usable alignment." Used only
+    /// by the Linux `probe`.
+    const fn zeroed() -> Self {
+        // SAFETY: an all-zero bit pattern is valid for every field here (all
+        // plain integers), so zeroing the bytes is a valid `KernelStatx`.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<KernelStatx>() == 256);
+const _: () = assert!(std::mem::offset_of!(KernelStatx, stx_mask) == 0);
+const _: () = assert!(std::mem::offset_of!(KernelStatx, stx_dio_mem_align) == 152);
+const _: () = assert!(std::mem::offset_of!(KernelStatx, stx_dio_offset_align) == 156);
 
 /// The outcome of resolving a probed (or absent) alignment to a block size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +178,12 @@ pub fn resolve_block(mask_has_dioalign: bool, mem_align: u32, offset_align: u32)
     }
 }
 
-// Everything below is used only by the real gnu-Linux `probe` (the stub on
-// every other target never calls it), so it is cfg-gated the same way —
-// otherwise `-D warnings` turns "not reachable on this platform" into a
-// dead-code build failure on macOS/musl/etc.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-mod linux_gnu_probe {
+// Everything below is used only by the real Linux `probe` (the stub on every
+// other OS never calls it), so it is cfg-gated the same way — otherwise
+// `-D warnings` turns "not reachable on this platform" into a dead-code
+// build failure on macOS.
+#[cfg(target_os = "linux")]
+mod linux_probe {
     use super::{ProbeResult, MIN_BLOCK};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -139,47 +239,49 @@ mod linux_gnu_probe {
         );
     }
 }
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-use linux_gnu_probe::{device_id, log_once_per_device, STATX_FAILURE_WARNED};
+#[cfg(target_os = "linux")]
+use linux_probe::{device_id, log_once_per_device, STATX_FAILURE_WARNED};
 
-/// Probe `file`'s device for its true O_DIRECT alignment requirement via
-/// `statx(2)` + `STATX_DIOALIGN` (Linux glibc only — see the module docs for
-/// why musl is excluded). Never panics: a failing `statx` call is WARN-logged
-/// once per process and resolved as [`ProbeResult::Unsupported`].
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Probe `file`'s device for its true O_DIRECT alignment requirement via a
+/// raw `SYS_statx` syscall with `STATX_DIOALIGN` (works on gnu **and** musl —
+/// see the module docs for why this bypasses `libc::statx`). Never panics: a
+/// failing syscall (`ENOSYS` on kernel < 4.11, or any other errno) is
+/// WARN-logged once per process and resolved as [`ProbeResult::Unsupported`].
+#[cfg(target_os = "linux")]
 pub fn probe(file: &File) -> ProbeResult {
     use std::os::fd::AsRawFd;
 
-    let mut stx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mut stx = KernelStatx::zeroed();
     // SAFETY: `file.as_raw_fd()` is a valid, open fd for the duration of this
     // call. The pathname is an empty C string used only with AT_EMPTY_PATH,
     // which makes the kernel stat the fd itself rather than resolve a path.
-    // `stx.as_mut_ptr()` points at a live, appropriately sized allocation the
-    // kernel is permitted to write into.
+    // `&mut stx` points at a live, exactly-256-byte allocation (asserted at
+    // compile time above) matching the kernel's `struct statx` ABI, which
+    // the kernel is permitted to write into. `libc::syscall`'s variadic
+    // arguments are read by the kernel/libc trampoline as register-width
+    // values, so every scalar argument is passed as `c_long` to match.
     let rc = unsafe {
-        libc::statx(
-            file.as_raw_fd(),
+        libc::syscall(
+            libc::SYS_statx,
+            file.as_raw_fd() as libc::c_long,
             c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_DIOALIGN,
-            stx.as_mut_ptr(),
+            libc::AT_EMPTY_PATH as libc::c_long,
+            STATX_DIOALIGN_MASK as libc::c_long,
+            &mut stx as *mut KernelStatx,
         )
     };
     if rc != 0 {
         if !STATX_FAILURE_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 error = %std::io::Error::last_os_error(),
-                "statx(STATX_DIOALIGN) failed; assuming O_DIRECT alignment is unsupported"
+                "statx(STATX_DIOALIGN) syscall failed (ENOSYS on kernel < 4.11, \
+                 or another errno); assuming O_DIRECT alignment is unsupported"
             );
         }
         return ProbeResult::Unsupported;
     }
-    // SAFETY: rc == 0 means the kernel filled every field of `stx` (statx(2)
-    // always fills the whole struct on success, using zero for anything not
-    // covered by the requested mask), so reading it as initialized is sound.
-    let stx = unsafe { stx.assume_init() };
     let result = resolve_block(
-        stx.stx_mask & libc::STATX_DIOALIGN != 0,
+        stx.stx_mask & STATX_DIOALIGN_MASK != 0,
         stx.stx_dio_mem_align,
         stx.stx_dio_offset_align,
     );
@@ -192,10 +294,9 @@ pub fn probe(file: &File) -> ProbeResult {
     result
 }
 
-/// Non-gnu-Linux and non-Linux platforms: `STATX_DIOALIGN` is either not in
-/// `libc` for this target (musl without a detected `musl_v1_2_3`, see the
-/// module docs) or does not exist on this OS at all. Always `Unsupported`.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+/// Non-Linux platforms: `STATX_DIOALIGN` does not exist on this OS. Always
+/// `Unsupported`.
+#[cfg(not(target_os = "linux"))]
 pub fn probe(_file: &File) -> ProbeResult {
     ProbeResult::Unsupported
 }
@@ -247,6 +348,17 @@ pub fn block_for(file: &File) -> Result<usize, TooLarge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dio_align_kernel_statx_layout_matches_the_kernel_uapi() {
+        // Runtime mirror of the compile-time asserts above: kept as an
+        // explicit, named test so a layout regression shows up in the test
+        // report, not only as a build failure with no test attribution.
+        assert_eq!(std::mem::size_of::<KernelStatx>(), 256);
+        assert_eq!(std::mem::offset_of!(KernelStatx, stx_mask), 0);
+        assert_eq!(std::mem::offset_of!(KernelStatx, stx_dio_mem_align), 152);
+        assert_eq!(std::mem::offset_of!(KernelStatx, stx_dio_offset_align), 156);
+    }
 
     #[test]
     fn dio_align_resolve_block_missing_mask_is_unsupported() {
@@ -302,8 +414,9 @@ mod tests {
 
     #[test]
     fn dio_align_block_for_never_panics_on_a_plain_file() {
-        // Non-Linux-gnu builds always take the Unsupported stub; on Linux gnu
-        // this exercises the real probe against an ordinary tempdir file.
+        // Non-Linux builds always take the Unsupported stub; on Linux (gnu
+        // or musl) this exercises the real probe against an ordinary tempdir
+        // file.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("plain.db");
         let file = File::create(&path).expect("create");
@@ -340,7 +453,7 @@ mod tests {
             "dio_align_probe_runs_on_a_real_linux_file requires a Linux host: \
              STATX_DIOALIGN is a Linux-only statx(2) extension. Run with \
              `--features live-infra-tests` on a Linux box (e.g. fmem-dev or a \
-             Linux CI job), not on macOS."
+             Linux CI job, gnu or musl), not on macOS."
         );
     }
 }

@@ -30,8 +30,8 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
   instead of consuming `dio_align::block_for`. The `SegmentSink`/flusher-thread
   pump (T-032/T-033) and `DataSink` (removing `Data.raw`, T-038) are separate,
   larger packets — see `ferrosa-suite/specs/sstable-write-pump/`. `dio_align`'s
-  real probe is gnu-Linux only (FMEA ST-12); musl always takes the safe
-  `MIN_BLOCK` fallback.
+  probe runs on gnu and musl alike (a raw `SYS_statx` syscall against a
+  hand-rolled kernel-UAPI struct, not `libc::statx` — FMEA ST-13).
 - **Complex-column support (FMEA ST-3).** Implement collections / UDT / tuple /
   frozen cell encode+decode in the Data.db codec, or surface unsupported complex
   columns as an explicit error to any consuming crate that needs them.

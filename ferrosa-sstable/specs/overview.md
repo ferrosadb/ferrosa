@@ -64,7 +64,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
 | `types` | ~237 | `Partition`, `Row`, `LivenessInfo`, `DeletionTime` |
 | `pump` | ~150 | `PumpConfig` — aligned-write-pump runtime tunables (segment size, queue depth), env parsing + block-rounding. Primitives only (T-030); no writer wiring yet |
-| `dio_align` | ~200 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via `statx(2)` + `STATX_DIOALIGN` (D4). `probe`'s real implementation compiles for `target_env = "gnu"` on Linux only (see FMEA); every other target is the `Unsupported` stub. Primitives only (T-031); no writer wiring yet |
+| `dio_align` | ~250 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via a raw `SYS_statx` syscall + `STATX_DIOALIGN` against a hand-rolled kernel-UAPI `KernelStatx` (not `libc::statx`, which is gnu-only in libc 0.2.186 — see FMEA ST-13). Runs on gnu and musl Linux alike; non-Linux is the `Unsupported` stub. Primitives only (T-031); no writer wiring yet |
 
 ## Component layout
 
