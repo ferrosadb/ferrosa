@@ -23,10 +23,9 @@ use ferrosa_cluster::raft::uuid_to_node_id;
 async fn add_voter_updates_all_four_maps() {
     // 3-voter cluster + a 4th node we'll add via add_voter.
     let cluster = TestCluster::with_voters(3).await;
-    let _leader = cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .expect("3-voter cluster should elect a leader");
+    // Pinned: all voters agree on one leader and no election can start between
+    // finding it and calling it (see `TestCluster::pin_leadership`).
+    let _leader = cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // The 4th node — pre-create its dispatcher loop in the harness so
     // that when add_voter calls add_learner + change_membership the
@@ -96,10 +95,8 @@ async fn approve_node_replicates_to_followers() {
     // controller-only cache is a regression footgun (auto_join=false
     // clusters split-brain on approvals).
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    // Pinned: no election can move leadership between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let pending_host = Uuid::new_v4();
 
@@ -143,10 +140,8 @@ async fn update_metadata_propagates_addr() {
     // 3-voter cluster.  We update node 2's addr and expect every node's
     // state.members to reflect the new value.
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    // Pinned: no election can move leadership between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Pick a voter to refresh.  Use node 2 — we need its host_id.
     // The harness assigns NodeIds 1..=N but does not retain the original
@@ -229,10 +224,8 @@ async fn update_metadata_propagates_addr() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_voter_idempotent() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    // Pinned: no election can move leadership between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let new_host_id = Uuid::new_v4();
     let new_addr: std::net::SocketAddr = "127.0.0.1:9998".parse().unwrap();
@@ -268,10 +261,8 @@ async fn add_voter_idempotent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_voter_concurrent_serializes() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    // Pinned: no election can move leadership between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Two distinct candidates; we'll add them simultaneously.
     let h1 = Uuid::new_v4();
@@ -316,10 +307,8 @@ async fn add_voter_concurrent_serializes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remove_voter_clears_all_four_maps() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    // Pinned: no election can move leadership between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Add a 4th, then remove it.  We avoid testing leader-self removal
     // (that's the W1.4 caveat needing transfer_leader).
