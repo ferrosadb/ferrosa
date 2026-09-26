@@ -91,22 +91,15 @@ fn compression_batch_chunks() -> usize {
 /// [`DirectWriter`](crate::direct::DirectWriter) (O_DIRECT on Linux, `F_NOCACHE`
 /// on macOS).
 ///
-/// Opt-in (`FERROSA_SSTABLE_DIRECT_IO=1`) for a **safe rollout** of a
-/// durability-critical I/O change (Phase 3, epic `t_29f6b948`): the default OFF
-/// preserves the existing buffered path byte-for-byte, so the change ships dark
-/// and can be A/B'd on a real Linux file system — where the actual O_DIRECT
-/// syscall path (never exercised on the macOS dev host) runs — to confirm the
-/// disk-saturation tail shrinks before the default is flipped.
+/// ON by default. Turn it off with `FERROSA_SSTABLE_DIRECT_IO=0`, or for every
+/// direct-I/O path at once with `FERROSA_DIRECT_IO=0`; the specific switch wins.
+/// The switch is read at run time, not compile time, so an operator can flip it
+/// without a rebuild. A file system that rejects O_DIRECT does not fail the write:
+/// it falls back to buffered I/O, WARN-logged and counted in
+/// `direct_write_fallbacks_total`. See [`crate::direct::resolve_switch`].
 fn sstable_direct_io_enabled() -> bool {
-    parse_direct_io_flag(std::env::var("FERROSA_SSTABLE_DIRECT_IO").ok())
-}
-
-/// Parse the `FERROSA_SSTABLE_DIRECT_IO` value (pure, so it is tested without the
-/// `set_var` parallel-test race). Absent/unrecognized ⇒ `false` (safe default).
-fn parse_direct_io_flag(value: Option<String>) -> bool {
-    value
-        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "on"))
-        .unwrap_or(false)
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::direct::direct_wanted("FERROSA_SSTABLE_DIRECT_IO", &WARNED)
 }
 
 /// A Data.db sink that is either the cache-bypassing
@@ -1830,17 +1823,6 @@ mod tests {
     use crate::data::DataReader;
     use crate::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
-
-    #[test]
-    fn parse_direct_io_flag_defaults_off_and_accepts_truthy() {
-        assert!(!parse_direct_io_flag(None), "absent ⇒ off (safe default)");
-        assert!(!parse_direct_io_flag(Some("0".into())));
-        assert!(!parse_direct_io_flag(Some("no".into())));
-        assert!(!parse_direct_io_flag(Some(String::new())));
-        for truthy in ["1", "true", "TRUE", "on", " 1 "] {
-            assert!(parse_direct_io_flag(Some(truthy.into())), "{truthy} ⇒ on");
-        }
-    }
 
     /// The load-bearing wiring invariant: writing the same byte stream through a
     /// direct (O_DIRECT/F_NOCACHE) Data.db writer and the buffered writer yields

@@ -82,7 +82,7 @@ resolution beyond the serialization header, or cluster routing.
 | Module | Responsibility |
 |--------|----------------|
 | `io` | `ReadAt`/`WriteAt` positional traits, `FileReadAt`/`FileWriteAt`, bounded block cache (`CachedReadAt`) |
-| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. Gated into `writer.rs` by `FERROSA_SSTABLE_DIRECT_IO` (default off, buffered); byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`) |
+| `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`) |
 | `direct` (read side) | `DirectReadFile` — cache-bypassing positional reader (O_DIRECT / `F_NOCACHE`, aligned bounce buffer, any offset/length). Fallback to buffered reads + `POSIX_FADV_DONTNEED` is WARN-logged and counted in `direct_read_fallbacks_total` |
 | `scan` | `ReadAheadReader<R>` — one bounded window plus a background prefetch of the next window (≤ 2 windows resident, ≤ 1 read in flight). `FileReadAt::open_scan` composes it over `DirectReadFile` for compaction input; `parse_scan_window` validates `FERROSA_COMPACTION_READAHEAD_BYTES` |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |

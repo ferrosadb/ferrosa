@@ -43,9 +43,165 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ferrosa_common::Result;
+
+/// The master switch for every direct-I/O path (writer and compaction reads).
+pub const DIRECT_IO_MASTER_ENV: &str = "FERROSA_DIRECT_IO";
+
+/// Where a resolved direct-I/O decision came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchSource {
+    /// Nothing was set: the built-in default (on).
+    Default,
+    /// `FERROSA_DIRECT_IO`.
+    Master,
+    /// The feature's own switch, which beats the master.
+    Specific,
+}
+
+/// What to do on this platform for a resolved switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformDecision {
+    Direct,
+    Buffered,
+    /// Direct I/O was asked for by name and this platform cannot do it.
+    Unsupported,
+}
+
+/// A resolved direct-I/O switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectIoSwitch {
+    pub enabled: bool,
+    pub source: SwitchSource,
+    /// Values that were set but are not booleans, as `NAME="value"`. The default
+    /// applies for them, and the caller must log them: a mistyped "off" would
+    /// otherwise leave direct I/O on without a word.
+    pub rejected: Vec<String>,
+}
+
+/// One env value: unset (absent, empty or blank), a boolean, or neither.
+enum Setting {
+    Unset,
+    Value(bool),
+    Rejected,
+}
+
+fn parse_setting(value: Option<&str>) -> Setting {
+    let Some(text) = value.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Setting::Unset;
+    };
+    match text.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Setting::Value(true),
+        "0" | "false" | "off" | "no" => Setting::Value(false),
+        _ => Setting::Rejected,
+    }
+}
+
+/// Decide whether a direct-I/O path is on.
+///
+/// The feature's own switch wins, then `FERROSA_DIRECT_IO`, then the built-in
+/// default, which is ON. A value that is set but is not a boolean does not
+/// change the outcome and is returned in `rejected`: with the default on, a
+/// mistyped "off" (`disable`, `none`) would otherwise leave direct I/O running
+/// with no sign that the operator's intent was ignored.
+pub fn resolve_switch(
+    specific_name: &str,
+    specific: Option<&str>,
+    master: Option<&str>,
+) -> DirectIoSwitch {
+    let mut rejected = Vec::new();
+    let mut note = |name: &str, value: Option<&str>| {
+        rejected.push(format!("{name}={:?}", value.unwrap_or_default().trim()));
+    };
+    match parse_setting(specific) {
+        Setting::Value(enabled) => {
+            return DirectIoSwitch {
+                enabled,
+                source: SwitchSource::Specific,
+                rejected,
+            };
+        }
+        Setting::Rejected => note(specific_name, specific),
+        Setting::Unset => {}
+    }
+    match parse_setting(master) {
+        Setting::Value(enabled) => {
+            return DirectIoSwitch {
+                enabled,
+                source: SwitchSource::Master,
+                rejected,
+            };
+        }
+        Setting::Rejected => note(DIRECT_IO_MASTER_ENV, master),
+        Setting::Unset => {}
+    }
+    DirectIoSwitch {
+        enabled: true,
+        source: SwitchSource::Default,
+        rejected,
+    }
+}
+
+impl DirectIoSwitch {
+    /// What to do here. Turning it off is always honoured. On a platform
+    /// without direct I/O the default and the master switch degrade to buffered
+    /// I/O, which is the point of a default; only a request by the feature's own
+    /// name is refused, because that one asked for something impossible.
+    pub fn on_platform(&self, supports_direct: bool) -> PlatformDecision {
+        match (self.enabled, supports_direct, self.source) {
+            (false, _, _) => PlatformDecision::Buffered,
+            (true, true, _) => PlatformDecision::Direct,
+            (true, false, SwitchSource::Specific) => PlatformDecision::Unsupported,
+            (true, false, _) => PlatformDecision::Buffered,
+        }
+    }
+}
+
+/// Read `specific_name` and `FERROSA_DIRECT_IO` from the environment and resolve
+/// them, logging once (per `warned` flag) any value that is not a boolean.
+///
+/// `warned` is one static per call site: the writer asks for every Data.db it
+/// creates, and a line per file would bury the one that mattered.
+pub fn configured(specific_name: &str, warned: &AtomicBool) -> DirectIoSwitch {
+    let switch = resolve_switch(
+        specific_name,
+        std::env::var(specific_name).ok().as_deref(),
+        std::env::var(DIRECT_IO_MASTER_ENV).ok().as_deref(),
+    );
+    if !switch.rejected.is_empty() && !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            rejected = ?switch.rejected,
+            enabled = switch.enabled,
+            "direct I/O switch is not a boolean (use 1/true/on/yes or 0/false/off/no); \
+             it is ignored and direct I/O is {}",
+            if switch.enabled { "ON (the default)" } else { "OFF" }
+        );
+    }
+    switch
+}
+
+/// Whether direct I/O can run on this platform at all: `O_DIRECT` on Linux and
+/// `F_NOCACHE` on macOS, both reached through unix syscalls.
+pub const PLATFORM_SUPPORTS_DIRECT: bool = cfg!(unix);
+
+/// Resolve to a plain yes/no for a caller that cannot return an error, warning
+/// once when it was asked for by name on a platform that cannot do it.
+pub fn direct_wanted(specific_name: &str, warned: &AtomicBool) -> bool {
+    let switch = configured(specific_name, warned);
+    match switch.on_platform(PLATFORM_SUPPORTS_DIRECT) {
+        PlatformDecision::Direct => true,
+        PlatformDecision::Buffered => false,
+        PlatformDecision::Unsupported => {
+            tracing::warn!(
+                switch = specific_name,
+                "direct I/O was requested but this platform does not support it; using buffered I/O"
+            );
+            false
+        }
+    }
+}
 
 /// Alignment / write granularity. 4096 is the near-universal page/fs block size
 /// and a safe superset of 512-byte device sectors: a buffer aligned to 4096
@@ -851,5 +1007,131 @@ mod tests {
             direct_write_files_total() > before_files,
             "completion counter advances"
         );
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+
+    const NAME: &str = "FERROSA_SSTABLE_DIRECT_IO";
+
+    fn resolve(specific: Option<&str>, master: Option<&str>) -> DirectIoSwitch {
+        resolve_switch(NAME, specific, master)
+    }
+
+    #[test]
+    fn direct_io_is_on_when_nothing_is_set() {
+        let switch = resolve(None, None);
+        assert!(switch.enabled);
+        assert_eq!(switch.source, SwitchSource::Default);
+        assert!(switch.rejected.is_empty());
+    }
+
+    #[test]
+    fn the_master_switch_turns_it_off() {
+        for off in ["0", "false", "off", "no", "OFF", "False", " 0 "] {
+            let switch = resolve(None, Some(off));
+            assert!(!switch.enabled, "{off:?}");
+            assert_eq!(switch.source, SwitchSource::Master, "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_master_switch_can_say_on_explicitly() {
+        for on in ["1", "true", "on", "yes", "ON", " 1"] {
+            let switch = resolve(None, Some(on));
+            assert!(switch.enabled, "{on:?}");
+            assert_eq!(switch.source, SwitchSource::Master);
+        }
+    }
+
+    #[test]
+    fn a_feature_switch_beats_the_master_in_both_directions() {
+        let off = resolve(Some("0"), Some("1"));
+        assert!(!off.enabled);
+        assert_eq!(off.source, SwitchSource::Specific);
+        let on = resolve(Some("1"), Some("0"));
+        assert!(on.enabled);
+        assert_eq!(on.source, SwitchSource::Specific);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_boolean_keeps_the_default_and_is_reported() {
+        let switch = resolve(Some("disable"), None);
+        assert!(
+            switch.enabled,
+            "an unreadable value must not change behaviour"
+        );
+        assert_eq!(switch.source, SwitchSource::Default);
+        assert_eq!(switch.rejected, vec![format!("{NAME}=\"disable\"")]);
+    }
+
+    #[test]
+    fn a_bad_feature_value_falls_through_to_a_good_master() {
+        let switch = resolve(Some("nope"), Some("0"));
+        assert!(!switch.enabled);
+        assert_eq!(switch.source, SwitchSource::Master);
+        assert_eq!(switch.rejected.len(), 1);
+    }
+
+    #[test]
+    fn both_bad_values_are_reported() {
+        let switch = resolve(Some("x"), Some("y"));
+        assert!(switch.enabled);
+        assert_eq!(switch.rejected.len(), 2);
+        assert!(switch
+            .rejected
+            .iter()
+            .any(|r| r.starts_with(DIRECT_IO_MASTER_ENV)));
+    }
+
+    #[test]
+    fn an_empty_value_counts_as_unset() {
+        let switch = resolve(Some(""), Some("  "));
+        assert!(switch.enabled);
+        assert_eq!(switch.source, SwitchSource::Default);
+        assert!(
+            switch.rejected.is_empty(),
+            "compose files leave `VAR=` behind"
+        );
+    }
+
+    #[test]
+    fn a_platform_without_direct_io_falls_back_unless_it_was_asked_for_by_name() {
+        assert_eq!(
+            resolve(None, None).on_platform(true),
+            PlatformDecision::Direct
+        );
+        assert_eq!(
+            resolve(None, None).on_platform(false),
+            PlatformDecision::Buffered
+        );
+        assert_eq!(
+            resolve(None, Some("1")).on_platform(false),
+            PlatformDecision::Buffered
+        );
+        assert_eq!(
+            resolve(Some("1"), None).on_platform(false),
+            PlatformDecision::Unsupported
+        );
+        assert_eq!(
+            resolve(Some("1"), None).on_platform(true),
+            PlatformDecision::Direct
+        );
+    }
+
+    #[test]
+    fn off_is_buffered_on_every_platform() {
+        for supports in [true, false] {
+            assert_eq!(
+                resolve(Some("0"), None).on_platform(supports),
+                PlatformDecision::Buffered
+            );
+            assert_eq!(
+                resolve(None, Some("0")).on_platform(supports),
+                PlatformDecision::Buffered
+            );
+        }
     }
 }
