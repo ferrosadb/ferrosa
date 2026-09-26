@@ -310,6 +310,14 @@ static COMPACTION_LAST_OUTPUT_PARTITIONS: AtomicU64 = AtomicU64::new(0);
 /// reader pool (FMEA #11). Non-zero confirms compaction input opens are routed
 /// through the bounded pool rather than opening unbounded readers directly.
 static COMPACTION_POOL_INPUT_OPENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Deletion markers (partition / row / cell tombstones) compaction dropped because
+/// they were past `gc_grace_seconds` and provably shadowed nothing outside it.
+static COMPACTION_PURGED_MARKERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Compactions whose every partition purged away; one was written anyway.
+static COMPACTION_PURGE_HELD_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Compactions that ran without purging because the table's `gc_grace_seconds`
+/// could not be read. Non-zero means a table option is corrupt; alert on it.
+static COMPACTION_PURGE_POLICY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static WRITE_PHASE_MICROS_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 static WRITE_PHASE_MICROS_MAX: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -454,6 +462,38 @@ pub fn inc_compaction_failed() {
 /// pool-routed.
 pub fn inc_compaction_pool_input_opens() {
     COMPACTION_POOL_INPUT_OPENS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record deletion markers dropped from a compaction's output under
+/// `gc_grace_seconds`.
+pub fn add_compaction_purged_markers(n: u64) {
+    COMPACTION_PURGED_MARKERS_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Record a compaction that skipped purging because `gc_grace_seconds` was unreadable.
+pub fn inc_compaction_purge_policy_errors() {
+    COMPACTION_PURGE_POLICY_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Compactions that skipped purging on an unreadable `gc_grace_seconds`.
+pub fn compaction_purge_policy_errors_total() -> u64 {
+    COMPACTION_PURGE_POLICY_ERRORS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Total deletion markers dropped by compaction since startup.
+pub fn compaction_purged_markers_total() -> u64 {
+    COMPACTION_PURGED_MARKERS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a fully-purged partition written anyway because it was the only thing
+/// the compaction had left (an empty output cannot be swapped in).
+pub fn inc_compaction_purge_held_back() {
+    COMPACTION_PURGE_HELD_BACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Times a compaction wrote a fully-purged partition because nothing else survived.
+pub fn compaction_purge_held_back_total() -> u64 {
+    COMPACTION_PURGE_HELD_BACK_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total compaction input readers obtained via the reader pool since startup.
@@ -894,6 +934,24 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_compaction_pool_input_opens_total {}\n",
         COMPACTION_POOL_INPUT_OPENS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_purged_markers_total Deletion markers dropped by compaction after gc_grace_seconds.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_purged_markers_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_purged_markers_total {}\n",
+        COMPACTION_PURGED_MARKERS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_purge_held_back_total Compactions that purged every partition and wrote one anyway so the output was non-empty.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_purge_held_back_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_purge_held_back_total {}\n",
+        COMPACTION_PURGE_HELD_BACK_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_compaction_purge_policy_errors_total Compactions that skipped tombstone purging because a table's gc_grace_seconds was unreadable; non-zero means a corrupt table option.\n");
+    out.push_str("# TYPE ferrosa_storage_compaction_purge_policy_errors_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_compaction_purge_policy_errors_total {}\n",
+        COMPACTION_PURGE_POLICY_ERRORS_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_input_bytes_total Input bytes read by completed compactions.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_input_bytes_total counter\n");

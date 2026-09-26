@@ -263,10 +263,29 @@ pub fn validate_clustering_shape(
     Ok(())
 }
 
+/// `TableSchema::extensions` key holding the table's `gc_grace_seconds`.
+pub const GC_GRACE_EXTENSION: &str = "gc_grace_seconds";
+
 impl TableSchema {
     /// Derives the `PinConfig` for this table from its extensions.
     pub fn pin_config(&self) -> PinConfig {
         PinConfig::from_extensions(&self.extensions)
+    }
+
+    /// The table's `gc_grace_seconds`, carried in `extensions` under
+    /// [`GC_GRACE_EXTENSION`]. `Ok(None)` when the schema does not carry one (an
+    /// older schema, or a test fixture): callers must treat that as "do not purge
+    /// tombstones", never as zero. An unparseable value is an error, not a default.
+    pub fn gc_grace_seconds(&self) -> Result<Option<u32>, String> {
+        let Some(raw) = self.extensions.get(GC_GRACE_EXTENSION) else {
+            return Ok(None);
+        };
+        raw.trim().parse::<u32>().map(Some).map_err(|e| {
+            format!(
+                "{}.{}: invalid {GC_GRACE_EXTENSION} {raw:?}: {e}",
+                self.keyspace, self.table
+            )
+        })
     }
 
     /// Returns the type names of all clustering columns, in order.
@@ -351,6 +370,43 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema_with_extensions(pairs: &[(&str, &str)]) -> TableSchema {
+        TableSchema {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![],
+            extensions: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn gc_grace_is_absent_valid_or_an_error_never_a_silent_default() {
+        assert_eq!(schema_with_extensions(&[]).gc_grace_seconds(), Ok(None));
+        assert_eq!(
+            schema_with_extensions(&[(GC_GRACE_EXTENSION, "864000")]).gc_grace_seconds(),
+            Ok(Some(864_000))
+        );
+        assert_eq!(
+            schema_with_extensions(&[(GC_GRACE_EXTENSION, "0")]).gc_grace_seconds(),
+            Ok(Some(0)),
+            "zero is a real setting: purge as soon as it is safe"
+        );
+        for bad in ["abc", "-1", "", "1.5", "99999999999"] {
+            assert!(
+                schema_with_extensions(&[(GC_GRACE_EXTENSION, bad)])
+                    .gc_grace_seconds()
+                    .is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
 
     /// The same column is spelled two ways depending on which side asks, and
     /// one parser must answer for both.
