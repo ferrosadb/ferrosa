@@ -214,6 +214,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Profiling
+
+See [PROFILE.md](PROFILE.md) for optimized profiling builds, runtime allocator
+settings, CPU profiling, and how to test or tune a profiling image.
+
 ## Project Status
 
 Ferrosa is a developer-preview workspace with 18 Rust crates. Core single-node
