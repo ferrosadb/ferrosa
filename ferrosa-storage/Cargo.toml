@@ -109,6 +109,8 @@ race-stress = []
 # input list, T-024). Off by default so `cargo test` stays green; each fixing
 # packet removes its case's gate instead of widening this feature.
 known-open-window = []
+# slow tests; run nightly by nightly-slow-tests.yml; PR CI skips `::slow::`
+slow-tests = []
 
 [dev-dependencies]
 async-trait = "0.1"

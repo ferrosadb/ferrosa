@@ -471,6 +471,16 @@ integration files (`tests/`), including proptest property suites
 `test-generators`/`fuzz-fileio`). Live-infra tests are behind the
 `live-infra-tests` feature + `FERROSA_TEST_*` env vars. No `#[ignore]`.
 
+Slow tests (compaction soak across many seeds, high-volume ingest, concurrent
+write+flush, the 2k-mutation commit-log replay PITR case) live in a `mod slow`
+gated behind the `slow-tests` feature instead of `#[ignore]`. PR CI compiles
+them (`--all-features`) but skips running them (`--skip ::slow::`);
+`nightly-slow-tests.yml` is where they run. Run one locally with:
+
+```bash
+cargo test -p ferrosa-storage --features slow-tests -- ::slow::e4_slow_pitr_commit_log_replay_1k_plus_1k
+```
+
 The read-vs-compaction race stress (`race-stress` feature,
 `read_compaction_race_stress`) has **no CI job**. It ran nightly on a throwaway
 shared-cpu Fly machine until that job was removed for leaking a Fly app per run

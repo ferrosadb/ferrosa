@@ -32,6 +32,7 @@ fi
 # Tests gated by FERROSA_TEST_CONTAINERS / FERROSA_TEST_FIRECRACKER /
 # FERROSA_TEST_CLUSTER_NODES per CLAUDE.md test policy.
 SKIPS=(
+  --skip ::slow::
   --skip accord::perf
   --skip batch_atomicity
   --skip pause_resume

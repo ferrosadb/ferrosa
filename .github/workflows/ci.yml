@@ -137,9 +137,12 @@ jobs:
           # nightly, in nightly-fuzz.yml's `perf-regression` job where the
           # machine is not competing with the rest of the PR gate. Keep the two
           # in sync: a new perf assertion added here must run there.
+          # `--skip ::slow::` excludes the tests under the `slow-tests` feature
+          # (compiled here under --all-features, but too slow for per-PR CI);
+          # they run nightly in nightly-slow-tests.yml.
           cargo test --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -- --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+            -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering \
                --skip lwt_batch_atomicity_all \

@@ -55,6 +55,8 @@ asc-udf = ["ferrosa-udf/asc-udf"]
 live-infra-tests = []
 # Exposes test_util::standalone_for_test for downstream crates' integration tests.
 test-util = []
+# slow tests; run nightly by nightly-slow-tests.yml; PR CI skips `::slow::`
+slow-tests = []
 
 [dev-dependencies]
 criterion = "0.5"

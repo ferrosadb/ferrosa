@@ -14175,124 +14175,6 @@ mod tests {
         );
     }
 
-    /// CI-sized regression for production high-volume ingest: many rows to the
-    /// same partition key with flush_if_needed triggering automatically based on
-    /// size. Keep this below the bounded-read/materialization cap; full
-    /// production-volume verification belongs on streaming/paged paths.
-    #[test]
-    #[ignore = "slow (high-volume ingest driving repeated auto-flush); runs in the nightly --ignored job"]
-    fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig {
-            flush_threshold_bytes: 4096, // 4KB — will trigger every ~50-100 rows
-            flush_max_age_secs: 1,
-            ..StorageEngineConfig::test_config(dir.path())
-        };
-        let engine = StorageEngine::new(config, None).unwrap();
-        let tid = table_id();
-        engine.register_table(test_schema()).unwrap();
-
-        let pk = make_key("tenant_session"); // same partition for all rows
-        let total = 2_000;
-
-        for i in 0..total {
-            let row = Row {
-                clustering: (i as i32).to_be_bytes().to_vec(),
-                cells: vec![(
-                    0,
-                    CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
-                )],
-                deletion: DeletionTime::LIVE,
-                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
-            };
-            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
-
-            // Simulate the background flush loop calling flush_if_needed
-            // every 100 writes (production runs on a timer)
-            if (i + 1) % 100 == 0 {
-                engine.flush_if_needed().unwrap();
-            }
-        }
-
-        // Final flush
-        engine.flush(&tid).unwrap();
-
-        // ALL 11,000 rows MUST be present
-        let result = engine.read(&tid, &pk).unwrap();
-        assert!(result.is_some(), "partition must exist");
-        let actual = result.unwrap().rows.len();
-        assert_eq!(
-            actual,
-            total,
-            "DATA LOSS: expected {total} rows after high-volume ingest, got {actual}. \
-             {} rows lost during flush_if_needed cycles.",
-            total - actual
-        );
-    }
-
-    /// Concurrent writes + flush from separate thread.
-    #[test]
-    #[ignore = "slow (many threads writing while flushes run); runs in the nightly --ignored job"]
-    fn concurrent_write_and_flush_threads_preserve_all_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig {
-            flush_threshold_bytes: 2048,
-            flush_max_age_secs: 1,
-            ..StorageEngineConfig::test_config(dir.path())
-        };
-        let engine = Arc::new(StorageEngine::new(config, None).unwrap());
-        let tid = table_id();
-        engine.register_table(test_schema()).unwrap();
-
-        let pk = make_key("concurrent_pk");
-        let total = 5_000usize;
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Background flush thread
-        let flush_engine = Arc::clone(&engine);
-        let flush_tid = tid.clone();
-        let flush_stop = Arc::clone(&stop);
-        let flush_handle = std::thread::spawn(move || {
-            let mut count = 0u64;
-            while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = flush_engine.flush_if_needed();
-                count += 1;
-                std::thread::sleep(std::time::Duration::from_micros(100));
-            }
-            let _ = flush_engine.flush(&flush_tid);
-            count
-        });
-
-        // Writer
-        for i in 0..total {
-            let row = Row {
-                clustering: (i as i32).to_be_bytes().to_vec(),
-                cells: vec![(
-                    0,
-                    CellValue::live(format!("r{i}").into_bytes(), (i + 1) as i64),
-                )],
-                deletion: DeletionTime::LIVE,
-                primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
-            };
-            engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
-        }
-
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let flush_count = flush_handle.join().unwrap();
-        engine.flush(&tid).unwrap();
-
-        let result = engine.read(&tid, &pk).unwrap();
-        assert!(result.is_some(), "partition must exist");
-        let actual = result.unwrap().rows.len();
-        assert_eq!(
-            actual,
-            total,
-            "DATA LOSS: {total} rows written with {flush_count} concurrent flushes, \
-             got {actual}. {} lost.",
-            total - actual
-        );
-    }
-
     /// SSTable roundtrip: 1000 rows with varying value sizes, flush, read
     /// back, verify every row and value is intact (no corruption).
     #[test]
@@ -18942,7 +18824,8 @@ mod tests {
     /// without the runtime overhead of the full 1 000+1 000 spec requirement.
     ///
     /// For the spec-mandated 1 000+1 000 test see
-    /// [`e4_slow_pitr_commit_log_replay_1k_plus_1k`].
+    /// `slow::e4_slow_pitr_commit_log_replay_1k_plus_1k` (behind the
+    /// `slow-tests` feature).
     #[test]
     fn e4_pitr_commit_log_replay_to_point_in_time() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -19145,29 +19028,6 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(restore_via_intent_e2e());
-    }
-
-    /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
-    /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
-    ///
-    /// Gated with `#[ignore]` because the archiver poll loop and 2 000
-    /// individual commit-log writes with a 256-byte segment size take ~60–90 s
-    /// on a typical CI runner.  Run explicitly with:
-    ///
-    /// ```sh
-    /// cargo test -p ferrosa-storage -- --ignored e4_slow_pitr_commit_log_replay_1k_plus_1k
-    /// ```
-    ///
-    /// Uses the identical code path as the fast 100-row variant; only the row
-    /// count differs.
-    #[test]
-    #[ignore = "slow (2k-mutation commit-log replay with a 256-byte segment size); runs in the nightly --ignored job"]
-    fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(run_pitr_replay_e2e(1_000));
     }
 
     /// FM1/FM8: Archiver SHA-256 verification — archived segment data in S3
@@ -27030,5 +26890,151 @@ mod tests {
              behind blocked uploads and the strategy kept queuing the same \
              inputs)"
         );
+    }
+
+    /// Slow tests: excluded from PR CI (`--skip ::slow::`), compiled under
+    /// `--all-features` but only run by `nightly-slow-tests.yml`. See the
+    /// `slow-tests` feature in Cargo.toml.
+    #[cfg(feature = "slow-tests")]
+    mod slow {
+        use super::*;
+
+        /// CI-sized regression for production high-volume ingest: many rows to the
+        /// same partition key with flush_if_needed triggering automatically based on
+        /// size. Keep this below the bounded-read/materialization cap; full
+        /// production-volume verification belongs on streaming/paged paths.
+        #[test]
+        fn high_volume_ingest_with_auto_flush_preserves_all_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = StorageEngineConfig {
+                flush_threshold_bytes: 4096, // 4KB — will trigger every ~50-100 rows
+                flush_max_age_secs: 1,
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = StorageEngine::new(config, None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+
+            let pk = make_key("tenant_session"); // same partition for all rows
+            let total = 2_000;
+
+            for i in 0..total {
+                let row = Row {
+                    clustering: (i as i32).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("entity_{i}").into_bytes(), (i + 1) as i64),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+
+                // Simulate the background flush loop calling flush_if_needed
+                // every 100 writes (production runs on a timer)
+                if (i + 1) % 100 == 0 {
+                    engine.flush_if_needed().unwrap();
+                }
+            }
+
+            // Final flush
+            engine.flush(&tid).unwrap();
+
+            // ALL 11,000 rows MUST be present
+            let result = engine.read(&tid, &pk).unwrap();
+            assert!(result.is_some(), "partition must exist");
+            let actual = result.unwrap().rows.len();
+            assert_eq!(
+                actual,
+                total,
+                "DATA LOSS: expected {total} rows after high-volume ingest, got {actual}. \
+                 {} rows lost during flush_if_needed cycles.",
+                total - actual
+            );
+        }
+
+        /// Concurrent writes + flush from separate thread.
+        #[test]
+        fn concurrent_write_and_flush_threads_preserve_all_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = StorageEngineConfig {
+                flush_threshold_bytes: 2048,
+                flush_max_age_secs: 1,
+                ..StorageEngineConfig::test_config(dir.path())
+            };
+            let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+
+            let pk = make_key("concurrent_pk");
+            let total = 5_000usize;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Background flush thread
+            let flush_engine = Arc::clone(&engine);
+            let flush_tid = tid.clone();
+            let flush_stop = Arc::clone(&stop);
+            let flush_handle = std::thread::spawn(move || {
+                let mut count = 0u64;
+                while !flush_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = flush_engine.flush_if_needed();
+                    count += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                let _ = flush_engine.flush(&flush_tid);
+                count
+            });
+
+            // Writer
+            for i in 0..total {
+                let row = Row {
+                    clustering: (i as i32).to_be_bytes().to_vec(),
+                    cells: vec![(
+                        0,
+                        CellValue::live(format!("r{i}").into_bytes(), (i + 1) as i64),
+                    )],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp((i + 1) as i64),
+                };
+                engine.write(&tid, &pk, row, (i + 1) as i64).unwrap();
+            }
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let flush_count = flush_handle.join().unwrap();
+            engine.flush(&tid).unwrap();
+
+            let result = engine.read(&tid, &pk).unwrap();
+            assert!(result.is_some(), "partition must exist");
+            let actual = result.unwrap().rows.len();
+            assert_eq!(
+                actual,
+                total,
+                "DATA LOSS: {total} rows written with {flush_count} concurrent flushes, \
+                 got {actual}. {} lost.",
+                total - actual
+            );
+        }
+
+        /// E4 (slow): Commit-log replay PITR — spec acceptance criterion #2
+        /// mandates exactly 1 000 pre-snapshot rows and 1 000 post-snapshot rows.
+        ///
+        /// Behind the `slow-tests` feature because the archiver poll loop and
+        /// 2 000 individual commit-log writes with a 256-byte segment size take
+        /// ~60-90s on a typical CI runner. Run explicitly with:
+        ///
+        /// ```sh
+        /// cargo test -p ferrosa-storage --features slow-tests -- ::slow::e4_slow_pitr_commit_log_replay_1k_plus_1k
+        /// ```
+        ///
+        /// Uses the identical code path as the fast 100-row variant; only the row
+        /// count differs.
+        #[test]
+        fn e4_slow_pitr_commit_log_replay_1k_plus_1k() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_pitr_replay_e2e(1_000));
+        }
     }
 }
