@@ -27,13 +27,20 @@ pub struct RestoreManager {
 
 impl RestoreManager {
     const REQUIRED_SSTABLE_COMPONENTS: [&'static str; 3] = ["Data.db", "Partitions.db", "Rows.db"];
-    const OPTIONAL_SSTABLE_COMPONENTS: [&'static str; 4] = [
+    // Digest.crc32 (all tables) and CRC.db (uncompressed tables only) are
+    // optional here for the same reason CompressionInfo.db is: a restored
+    // snapshot may predate T-011, and a table missing them must still
+    // restore -- `SSTableReader` treats their absence as "not checked",
+    // never an error (see `checksum` module docs in ferrosa-sstable).
+    const OPTIONAL_SSTABLE_COMPONENTS: [&'static str; 6] = [
         "Filter.db",
         "Statistics.db",
         "TOC.txt",
         "CompressionInfo.db",
+        "Digest.crc32",
+        "CRC.db",
     ];
-    const ALL_SSTABLE_COMPONENTS: [&'static str; 7] = [
+    const ALL_SSTABLE_COMPONENTS: [&'static str; 9] = [
         "Data.db",
         "Partitions.db",
         "Rows.db",
@@ -41,6 +48,8 @@ impl RestoreManager {
         "Statistics.db",
         "TOC.txt",
         "CompressionInfo.db",
+        "Digest.crc32",
+        "CRC.db",
     ];
 
     /// Creates a new manager backed by `store` with the given key prefix.

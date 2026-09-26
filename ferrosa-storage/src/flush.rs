@@ -996,6 +996,8 @@ impl FileFlushTarget {
             statistics: base.join(format!("{gen}-Statistics.db")),
             toc: base.join(format!("{gen}-TOC.txt")),
             compression_info: base.join(format!("{gen}-CompressionInfo.db")),
+            digest: base.join(format!("{gen}-Digest.crc32")),
+            crc: base.join(format!("{gen}-CRC.db")),
         }
     }
 
@@ -1027,8 +1029,11 @@ impl FileFlushTarget {
         Self::rename_path(tmp(&paths.filter), &paths.filter)?;
         Self::rename_path(tmp(&paths.statistics), &paths.statistics)?;
         Self::rename_path(tmp(&paths.toc), &paths.toc)?;
+        Self::rename_path(tmp(&paths.digest), &paths.digest)?;
         if has_compression_info {
             Self::rename_path(tmp(&paths.compression_info), &paths.compression_info)?;
+        } else {
+            Self::rename_path(tmp(&paths.crc), &paths.crc)?;
         }
         Self::rename_path(tmp(&paths.data), &paths.data)?;
         Ok(())
@@ -1093,9 +1098,12 @@ impl FileFlushTarget {
             &paths.filter,
             &paths.statistics,
             &paths.toc,
+            &paths.digest,
         ];
         if has_compression_info {
             components.push(&paths.compression_info);
+        } else {
+            components.push(&paths.crc);
         }
 
         // Issue every component fsync CONCURRENTLY so their device flushes fill
@@ -1166,14 +1174,26 @@ impl FileFlushTarget {
             None
         };
 
-        SSTableReader::open(SSTableComponents {
+        let mut reader = SSTableReader::open(SSTableComponents {
             data,
             partitions,
             rows,
             filter,
             compression_info,
             statistics,
-        })
+        })?;
+
+        // This helper only ever opens a generation this process just
+        // promoted (see call sites), so Digest.crc32 (and CRC.db for
+        // uncompressed tables) are always present here -- `?`, not `.ok()`.
+        let digest = std::fs::read(&paths.digest)?;
+        reader.load_digest(&digest)?;
+        if !has_compression_info {
+            let crc = std::fs::read(&paths.crc)?;
+            reader.load_crc_table(&crc)?;
+        }
+
+        Ok(reader)
     }
 }
 
@@ -1185,6 +1205,10 @@ struct FileComponentPaths {
     statistics: PathBuf,
     toc: PathBuf,
     compression_info: PathBuf,
+    /// `Digest.crc32` — written for every table (T-011).
+    digest: PathBuf,
+    /// `CRC.db` — written for uncompressed tables only (T-011).
+    crc: PathBuf,
 }
 
 /// Open a file-backed SSTable reader from component files for generation `gen`
@@ -1229,15 +1253,37 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     let filter = std::fs::read(required(filter_component)?)?;
     let statistics = std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap_or_default();
     let compression_info = std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok();
+    let is_compressed = compression_info.is_some();
 
-    SSTableReader::open(SSTableComponents {
+    let mut reader = SSTableReader::open(SSTableComponents {
         data,
         partitions,
         rows,
         filter,
         compression_info,
         statistics,
-    })
+    })?;
+
+    // Digest.crc32 (all tables) and CRC.db (uncompressed tables only) are
+    // genuinely optional, same as CompressionInfo.db above: a generation
+    // written before T-011 has neither, and `SSTableReader` treats an
+    // unloaded digest/CRC table as "not checked" rather than an error
+    // (logged once per generation — see `checksum` module docs in
+    // ferrosa-sstable).
+    if let Ok(digest) = std::fs::read(dir.join(format!("{gen}-Digest.crc32"))) {
+        if let Err(e) = reader.load_digest(&digest) {
+            tracing::warn!(gen, error = %e, "failed to parse Digest.crc32; digest verification disabled for this generation");
+        }
+    }
+    if !is_compressed {
+        if let Ok(crc) = std::fs::read(dir.join(format!("{gen}-CRC.db"))) {
+            if let Err(e) = reader.load_crc_table(&crc) {
+                tracing::warn!(gen, error = %e, "failed to parse CRC.db; chunk verification disabled for this generation");
+            }
+        }
+    }
+
+    Ok(reader)
 }
 
 /// Process-wide SSTable generation allocator.
@@ -1276,6 +1322,7 @@ fn component_expectations<'a>(
             output.statistics.len() as u64,
         ),
         ("TOC.txt", &paths.toc, output.toc.len() as u64),
+        ("Digest.crc32", &paths.digest, output.digest.len() as u64),
     ];
     if let Some(ci) = output.compression_info.as_ref() {
         v.push((
@@ -1283,6 +1330,9 @@ fn component_expectations<'a>(
             &paths.compression_info,
             ci.len() as u64,
         ));
+    }
+    if let Some(crc) = output.crc.as_ref() {
+        v.push(("CRC.db", &paths.crc, crc.len() as u64));
     }
     v
 }
@@ -1350,6 +1400,8 @@ impl FlushTarget for FileFlushTarget {
             statistics: run_dir.join("0-Statistics.db"),
             toc: run_dir.join("0-TOC.txt"),
             compression_info: run_dir.join("0-CompressionInfo.db"),
+            digest: run_dir.join("0-Digest.crc32"),
+            crc: run_dir.join("0-CRC.db"),
         };
         // Write components; on any failure remove the run dir so we never leak.
         let write_all = || -> Result<()> {
@@ -1359,8 +1411,12 @@ impl FlushTarget for FileFlushTarget {
             std::fs::write(&paths.filter, &output.filter)?;
             std::fs::write(&paths.statistics, &output.statistics)?;
             std::fs::write(&paths.toc, &output.toc)?;
+            std::fs::write(&paths.digest, &output.digest)?;
             if let Some(ref ci) = output.compression_info {
                 std::fs::write(&paths.compression_info, ci)?;
+            }
+            if let Some(ref crc) = output.crc {
+                std::fs::write(&paths.crc, crc)?;
             }
             Ok(())
         };
@@ -1430,6 +1486,9 @@ impl FlushTarget for FileFlushTarget {
         if let Some(ref ci) = output.compression_info {
             std::fs::write(tmp(&paths.compression_info), ci)?;
         }
+        if let Some(ref crc) = output.crc {
+            std::fs::write(tmp(&paths.crc), crc)?;
+        }
 
         std::thread::scope(|s| {
             let handles: Vec<_> = [
@@ -1439,6 +1498,7 @@ impl FlushTarget for FileFlushTarget {
                 s.spawn(|| std::fs::write(tmp(&paths.filter), &output.filter)),
                 s.spawn(|| std::fs::write(tmp(&paths.statistics), &output.statistics)),
                 s.spawn(|| std::fs::write(&toc_tmp, &output.toc)),
+                s.spawn(|| std::fs::write(tmp(&paths.digest), &output.digest)),
             ]
             .into_iter()
             .collect();
@@ -1533,8 +1593,12 @@ impl FlushTarget for FileFlushTarget {
         std::fs::rename(&output.filter, tmp(&paths.filter))?;
         std::fs::rename(&output.statistics, tmp(&paths.statistics))?;
         std::fs::rename(&output.toc, tmp(&paths.toc))?;
+        std::fs::rename(&output.digest, tmp(&paths.digest))?;
         if let Some(compression_info) = output.compression_info.as_ref() {
             std::fs::rename(compression_info, tmp(&paths.compression_info))?;
+        }
+        if let Some(crc) = output.crc.as_ref() {
+            std::fs::rename(crc, tmp(&paths.crc))?;
         }
 
         // Verify EVERY component's length, not just Data.db's.
@@ -1556,6 +1620,7 @@ impl FlushTarget for FileFlushTarget {
             ("Filter.db", &paths.filter, output.filter_len),
             ("Statistics.db", &paths.statistics, output.statistics_len),
             ("TOC.txt", &paths.toc, output.toc_len),
+            ("Digest.crc32", &paths.digest, output.digest_len),
         ];
         if has_compression_info {
             checks.push((
@@ -1563,6 +1628,9 @@ impl FlushTarget for FileFlushTarget {
                 &paths.compression_info,
                 output.compression_info_len,
             ));
+        }
+        if output.crc.is_some() {
+            checks.push(("CRC.db", &paths.crc, output.crc_len));
         }
 
         for (name, path, expected) in checks {
@@ -2813,6 +2881,8 @@ mod tests {
             statistics: base.join("9-Statistics.db"), // intentionally NOT created
             toc: touch("9-TOC.txt"),
             compression_info: base.join("9-CompressionInfo.db"),
+            digest: touch("9-Digest.crc32"),
+            crc: touch("9-CRC.db"),
         };
 
         let result = target.fsync_components(&paths, /* has_compression_info */ false);

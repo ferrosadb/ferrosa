@@ -1738,6 +1738,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
 
         let rehydration_locks: Arc<DashMap<String, Arc<std::sync::Mutex<()>>>> =
@@ -5188,6 +5190,8 @@ impl StorageEngine {
                 "Statistics.db",
                 "TOC.txt",
                 "CompressionInfo.db",
+                "Digest.crc32",
+                "CRC.db",
             ] {
                 let path = dir.join(format!("{}-{component}", gen));
                 if path.exists() {
@@ -9222,6 +9226,8 @@ impl StorageEngine {
                         "Statistics.db",
                         "TOC.txt",
                         "CompressionInfo.db",
+                        "Digest.crc32",
+                        "CRC.db",
                     ];
                     result
                         .task
@@ -9381,15 +9387,43 @@ impl StorageEngine {
 
         let compression_info = Self::generation_component_path(dir, gen, "CompressionInfo.db")
             .and_then(|p| std::fs::read(p).ok());
+        let is_compressed = compression_info.is_some();
 
-        ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
+        let mut reader = ferrosa_sstable::reader::SSTableReader::open(SSTableComponents {
             data,
             partitions,
             rows,
             filter,
             compression_info,
             statistics,
-        })
+        })?;
+
+        // Digest.crc32 (all tables) and CRC.db (uncompressed tables only) are
+        // genuinely optional here, same as CompressionInfo.db above: a
+        // generation written before T-011 has neither, and `SSTableReader`
+        // treats an unloaded digest/CRC table as "not checked" rather than
+        // an error (logged once per generation — see `checksum` module docs
+        // in ferrosa-sstable). This is what makes
+        // "verify CRC.db on every uncompressed chunk read" apply to reads
+        // that go through this open path.
+        if let Some(digest) = Self::generation_component_path(dir, gen, "Digest.crc32")
+            .and_then(|p| std::fs::read(p).ok())
+        {
+            if let Err(e) = reader.load_digest(&digest) {
+                tracing::warn!(gen, error = %e, "failed to parse Digest.crc32; digest verification disabled for this generation");
+            }
+        }
+        if !is_compressed {
+            if let Some(crc) = Self::generation_component_path(dir, gen, "CRC.db")
+                .and_then(|p| std::fs::read(p).ok())
+            {
+                if let Err(e) = reader.load_crc_table(&crc) {
+                    tracing::warn!(gen, error = %e, "failed to parse CRC.db; chunk verification disabled for this generation");
+                }
+            }
+        }
+
+        Ok(reader)
     }
 
     /// Returns the number of SSTables for a table.
@@ -9863,6 +9897,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
         suffixes
             .iter()
@@ -9883,6 +9919,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
         let mut reclaimed = 0u64;
 
@@ -10638,6 +10676,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
 
         'entry_loop: for entry in entries {
@@ -11289,6 +11329,8 @@ impl StorageEngine {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ];
         for input in inputs {
             for component in &standard_components {
@@ -11551,6 +11593,8 @@ impl StorageEngine {
                     "Statistics.db",
                     "TOC.txt",
                     "CompressionInfo.db",
+                    "Digest.crc32",
+                    "CRC.db",
                 ];
                 for component in &components {
                     let local_path = table_dir.join(format!("{gen}-{component}"));
@@ -17710,6 +17754,8 @@ mod tests {
             "Statistics.db",
             "TOC.txt",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
         ] {
             let p = gen2_dir.join(format!("{gen2}-{comp}"));
             if let Ok(bytes) = std::fs::read(&p) {

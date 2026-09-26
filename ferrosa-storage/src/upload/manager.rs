@@ -633,6 +633,8 @@ impl UploadManager {
             "Filter.db",
             "Statistics.db",
             "CompressionInfo.db",
+            "Digest.crc32",
+            "CRC.db",
             "TOC.txt",
         ];
         let mut delete_err: Option<String> = None;
@@ -1463,6 +1465,8 @@ mod tests {
                 "Statistics.db",
                 "TOC.txt",
                 "CompressionInfo.db",
+                "Digest.crc32",
+                "CRC.db",
             ];
 
             for component in components {

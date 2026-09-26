@@ -7259,6 +7259,12 @@ fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> O
     if let Ok(meta) = std::fs::metadata(compression_info) {
         total = total.saturating_add(meta.len());
     }
+    for suffix in ["Digest.crc32", "CRC.db"] {
+        let path = table_dir.join(format!("{id}-{suffix}"));
+        if let Ok(meta) = std::fs::metadata(path) {
+            total = total.saturating_add(meta.len());
+        }
+    }
     Some(total)
 }
 
