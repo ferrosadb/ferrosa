@@ -9117,21 +9117,17 @@ impl StorageEngine {
                 );
                 continue;
             }
-            // ── T-022: durable replacement record, written and fsynced BEFORE
-            // promotion. This is the commit point (compaction-cancel-safety.md
-            // C2): once it lands, startup reconciliation (T-023) can always
-            // finish the job, so every step from here on rolls forward on
-            // success or rolls back explicitly on failure -- it never leaves
-            // an orphan the way the old bare `continue`s did (window C).
-            let table_dir = self
-                .config
-                .data_dir
-                .join("sstables")
-                .join(table_id.to_string());
-            if let Err(e) = std::fs::create_dir_all(&table_dir) {
-                tracing::error!(%e, %table_id, dir = %table_dir.display(), "compaction: failed to create table dir for replacement record; preserving inputs");
-                continue;
-            }
+            // ── T-022 (forge t_cb6fa288): durable replacement record, written
+            // and fsynced BEFORE promotion, with the REAL output generation id
+            // already decided. This is the commit point
+            // (compaction-cancel-safety.md C2): once it lands, startup
+            // reconciliation (T-023) can always finish the job, so every step
+            // from here on rolls forward on success or rolls back explicitly
+            // on failure -- it never leaves an orphan the way the old bare
+            // `continue`s did (window C). The generation choice happens
+            // BEFORE this write (not after promotion, as a previous version
+            // of this code did) so there is never a durable record pointing
+            // at a placeholder id promotion is free to abandon.
             let task_id = result.output.id.clone();
             let output_digest = match Self::read_generation_digest(
                 &result.output.path,
@@ -9143,12 +9139,18 @@ impl StorageEngine {
                     continue;
                 }
             };
+            let (promoted_gen, table_dir, final_target) = match self
+                .reserve_compaction_promotion_target(table_id, &result.output)
+            {
+                Ok(reserved) => reserved,
+                Err(e) => {
+                    tracing::error!(%e, %table_id, %task_id, "compaction: failed to reserve a promotion target; preserving inputs");
+                    continue;
+                }
+            };
             let mut intent = crate::compaction::intent::CompactionIntentRecord {
                 task_id: task_id.clone(),
-                // Corrected below once `promote_compaction_output` decides the
-                // final generation id -- it may differ from the staged id to
-                // avoid colliding with a concurrently-allocated flush gen.
-                output_gen: task_id.clone(),
+                output_gen: promoted_gen.to_string(),
                 output_digest,
                 inputs: result.task.inputs.iter().map(|m| m.id.clone()).collect(),
                 phase: crate::compaction::intent::CompactionIntentPhase::Promoting,
@@ -9159,7 +9161,12 @@ impl StorageEngine {
             }
 
             let promote_start = Instant::now();
-            let output = match self.promote_compaction_output(table_id, &result.output) {
+            let output = match self.promote_compaction_output(
+                &result.output,
+                promoted_gen,
+                &table_dir,
+                &final_target,
+            ) {
                 Ok(output) => {
                     crate::metrics::observe_compaction_phase(
                         crate::metrics::CompactionPhase::PromoteOutput,
@@ -9185,19 +9192,11 @@ impl StorageEngine {
             };
 
             cancel_point!(&table_id.to_string(), CancelPoint::AfterPromote);
-            // The commit's `output_gen` was a placeholder until promotion
-            // decided the real generation id. Correct and re-fsync it now,
-            // before any further step, so a crash from here on always finds
-            // the record pointing at the generation that actually exists.
-            intent.output_gen = output.id.clone();
-            if let Err(e) = intent.write(&table_dir) {
-                tracing::error!(
-                    %e, %table_id, %task_id, output_gen = %output.id,
-                    "compaction: failed to record the promoted generation id; \
-                     the promoted output may become an unrecovered orphan if a \
-                     crash follows -- inputs are untouched, so no data is at risk"
-                );
-            }
+            // output_gen was decided and durably recorded BEFORE promotion ran
+            // (above), so unlike the previous design there is nothing to
+            // correct here: a crash at this exact point already finds a
+            // record whose output_gen names the generation promotion just
+            // produced (forge t_cb6fa288).
 
             // Open the promoted compacted output SSTable.
             let gen = &output.id;
@@ -11483,12 +11482,41 @@ impl StorageEngine {
         generations
     }
 
-    fn promote_compaction_output(
+    /// Chooses and reserves the generation id + directory a compaction
+    /// output will be promoted into, WITHOUT moving any data.
+    /// `compaction-cancel-safety.md` C2 / forge t_cb6fa288: the durable
+    /// replacement record must be written with the real `output_gen` before
+    /// promotion runs, not with a placeholder corrected afterward -- the
+    /// previous design wrote the record with the compaction's pre-promotion
+    /// staged id, called `promote_compaction_output` (which was free to pick
+    /// a different id to dodge a collision), and only then rewrote the
+    /// record with the real id. A crash between those two writes left a
+    /// durable, fsynced record pointing at a generation that had already
+    /// been renamed away, so startup reconciliation found "output missing"
+    /// and rolled back -- while the real output sat live on disk, orphaned,
+    /// under its true id. Splitting the choice out and reserving it here
+    /// closes that window: by the time the intent record is written, the
+    /// id it names is the one promotion will actually use.
+    ///
+    /// The reservation itself is [`crate::store::TableStore::advance_gen_past`]
+    /// on this table's store, called BEFORE returning -- the same mechanism
+    /// `poll_compactions` already relies on post-swap to keep a later flush
+    /// from reusing a compaction's output generation, just invoked earlier
+    /// so the choice is binding before it is committed to disk. It narrows,
+    /// rather than eliminates, the underlying race between two independently
+    /// seeded generation counters described in `flush.rs`'s
+    /// `two_flush_targets_never_issue_the_same_generation` (a live
+    /// theoretical collision between this table's flush target and the
+    /// compaction executor's own staging flush target, unrelated to this
+    /// packet) -- that race is guarded today by the `final_target.exists()`
+    /// check in [`Self::promote_compaction_output`], which fails the
+    /// promotion loudly (rolled back via the intent record) rather than
+    /// silently overwriting anything.
+    fn reserve_compaction_promotion_target(
         &self,
         table_id: &TableId,
         output: &crate::compaction::metadata::SSTableMetadata,
-    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
-        let source_dir = &output.path;
+    ) -> ferrosa_common::Result<(u64, std::path::PathBuf, std::path::PathBuf)> {
         let target_dir = self
             .config
             .data_dir
@@ -11510,10 +11538,7 @@ impl StorageEngine {
             .max()
             .unwrap_or(0);
         let promoted_gen = table_max_gen.max(output_gen).saturating_add(1);
-        let promoted_id = promoted_gen.to_string();
-        let old_prefix = format!("{}-", output.id);
-        let final_target = target_dir.join(&promoted_id);
-        let fail_after_first = Self::should_fail_promotion_after_first_component(&output.path);
+        let final_target = target_dir.join(promoted_gen.to_string());
 
         if final_target.exists() {
             return Err(ferrosa_common::Error::InvalidFormat(format!(
@@ -11522,7 +11547,33 @@ impl StorageEngine {
             )));
         }
 
-        let staging_dir = Self::temp_promotion_directory(&target_dir, promoted_gen);
+        // Binding from here: a flush of this table that starts after this
+        // point is guaranteed a generation past `promoted_gen`.
+        if let Some(state) = self.tables.read().get(table_id) {
+            state.store.advance_gen_past(promoted_gen);
+        }
+
+        Ok((promoted_gen, target_dir, final_target))
+    }
+
+    /// Promotes a compaction output into `final_target`, which
+    /// [`Self::reserve_compaction_promotion_target`] has already chosen and
+    /// reserved -- this function only moves data, it never decides the
+    /// generation id. See that function's doc comment for why the choice and
+    /// the move are separate calls.
+    fn promote_compaction_output(
+        &self,
+        output: &crate::compaction::metadata::SSTableMetadata,
+        promoted_gen: u64,
+        target_dir: &std::path::Path,
+        final_target: &std::path::Path,
+    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
+        let source_dir = &output.path;
+        let promoted_id = promoted_gen.to_string();
+        let old_prefix = format!("{}-", output.id);
+        let fail_after_first = Self::should_fail_promotion_after_first_component(&output.path);
+
+        let staging_dir = Self::temp_promotion_directory(target_dir, promoted_gen);
         let mut moves = Vec::new();
         for entry in std::fs::read_dir(source_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
@@ -11623,7 +11674,7 @@ impl StorageEngine {
             )));
         }
 
-        std::fs::rename(&staging_dir, &final_target).map_err(|e| {
+        std::fs::rename(&staging_dir, final_target).map_err(|e| {
             rollback_moved(&moved);
             ferrosa_common::Error::InvalidFormat(format!(
                 "failed to atomically promote compaction output to {}: {e}",
@@ -11632,7 +11683,7 @@ impl StorageEngine {
         })?;
 
         #[cfg(test)]
-        crate::flush::fsync_probe::note_rename(&final_target);
+        crate::flush::fsync_probe::note_rename(final_target);
 
         // Window E' (compaction-cancel-safety.md): the rename above only
         // updates the directory through the page cache. Without fsyncing
@@ -11641,24 +11692,18 @@ impl StorageEngine {
         // (opening the reader, building sidecars, evicting inputs) must not
         // run until this directory entry is durable, so a failure here is
         // fatal to the whole promotion.
-        Self::fsync_promoted_directory(
-            &target_dir,
-            &final_target,
-            &staging_dir,
-            &moved,
-            source_dir,
-        )?;
+        Self::fsync_promoted_directory(target_dir, final_target, &staging_dir, &moved, source_dir)?;
 
         Self::cleanup_promoted_compaction_output(source_dir, &old_prefix);
 
-        let size_bytes = Self::generation_component_paths(&final_target, promoted_gen)
+        let size_bytes = Self::generation_component_paths(final_target, promoted_gen)
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
 
         let mut promoted = output.clone();
         promoted.id = promoted_id;
-        promoted.path = final_target;
+        promoted.path = final_target.to_path_buf();
         promoted.size_bytes = size_bytes;
         Ok(promoted)
     }
@@ -22189,6 +22234,21 @@ mod tests {
         );
     }
 
+    /// Drives the split reserve-then-promote sequence
+    /// (`reserve_compaction_promotion_target` then `promote_compaction_output`)
+    /// exactly as `poll_compactions` does since t_cb6fa288's fix, so these
+    /// unit tests exercise the same two-call sequence production code uses
+    /// rather than a single-call API that no longer exists.
+    fn promote_via_reserve(
+        engine: &StorageEngine,
+        tid: &TableId,
+        output: &crate::compaction::metadata::SSTableMetadata,
+    ) -> ferrosa_common::Result<crate::compaction::metadata::SSTableMetadata> {
+        let (promoted_gen, target_dir, final_target) =
+            engine.reserve_compaction_promotion_target(tid, output)?;
+        engine.promote_compaction_output(output, promoted_gen, &target_dir, &final_target)
+    }
+
     #[tokio::test]
     async fn compaction_promotion_fail_after_first_component_is_atomic_and_recoverable() {
         let dir = tempfile::tempdir().unwrap();
@@ -22222,7 +22282,7 @@ mod tests {
             .join(StorageEngine::TEST_FAIL_PROMOTION_AFTER_FIRST_COMPONENT);
         std::fs::write(&marker_path, b"1").unwrap();
 
-        let failed = engine.promote_compaction_output(&tid, &result);
+        let failed = promote_via_reserve(&engine, &tid, &result);
         assert!(
             failed.is_err(),
             "promotion should fail with test marker present"
@@ -22248,7 +22308,7 @@ mod tests {
         );
 
         std::fs::remove_file(&marker_path).unwrap();
-        let recovered = engine.promote_compaction_output(&tid, &result);
+        let recovered = promote_via_reserve(&engine, &tid, &result);
         assert!(
             recovered.is_ok(),
             "promotion should recover from marker-cleared output: {:?}",
@@ -22980,8 +23040,7 @@ mod tests {
         let output_a = write_fake_compaction_output(&compaction_dir, "101");
         let output_b = write_fake_compaction_output(&compaction_dir, "202");
 
-        let promoted_a = engine
-            .promote_compaction_output(&tid, &output_a)
+        let promoted_a = promote_via_reserve(&engine, &tid, &output_a)
             .expect("first compaction output should promote");
         assert!(
             promoted_a
@@ -23007,8 +23066,7 @@ mod tests {
             );
         }
 
-        let promoted_b = engine
-            .promote_compaction_output(&tid, &output_b)
+        let promoted_b = promote_via_reserve(&engine, &tid, &output_b)
             .expect("second output should still promote after the first output");
         assert!(
             promoted_b
