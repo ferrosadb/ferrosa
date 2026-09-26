@@ -63,8 +63,8 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
 | `types` | ~237 | `Partition`, `Row`, `LivenessInfo`, `DeletionTime` |
-| `pump` | ~150 | `PumpConfig` — aligned-write-pump runtime tunables (segment size, queue depth), env parsing + block-rounding. Primitives only (T-030); no writer wiring yet |
-| `dio_align` | ~250 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via a raw `SYS_statx` syscall + `STATX_DIOALIGN` against a hand-rolled kernel-UAPI `KernelStatx` (not `libc::statx`, which is gnu-only in libc 0.2.186 — see FMEA ST-13). Runs on gnu and musl Linux alike; non-Linux is the `Unsupported` stub. Primitives only (T-031); no writer wiring yet |
+| `pump` | ~1000 | `PumpConfig` (T-030) plus, from T-032: `SegmentSink` seam, `FileSink` (production `SegmentSink`, wires the `dio_align` probe), `AlignedPump` (synchronous, `depth = 0`, the sole implementation behind `direct::DirectWriter`), and `test-support`-gated fault-injection sinks (`RecordingSink`/`FaultySink`/`GateSink`). `depth >= 1` (background flusher) is T-033 |
+| `dio_align` | ~250 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via a raw `SYS_statx` syscall + `STATX_DIOALIGN` against a hand-rolled kernel-UAPI `KernelStatx` (not `libc::statx`, which is gnu-only in libc 0.2.186 — see FMEA ST-13). Runs on gnu and musl Linux alike; non-Linux is the `Unsupported` stub. Wired into the write path by `pump::FileSink` (T-032) |
 
 ## Component layout
 

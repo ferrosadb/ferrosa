@@ -117,6 +117,12 @@ slow-tests = []
 [dev-dependencies]
 async-trait = "0.1"
 ferrosa-common = { path = "../ferrosa-common", features = ["test-generators"] }
+# Plumbing for T-033/T-038 (sstable-write-pump): the write-pump fault-injection
+# sinks (RecordingSink, FaultySink, GateSink) are `pub(crate)` in
+# ferrosa-sstable today, so this feature does not yet expose anything this
+# crate's tests can call — it just keeps the dev-dependency wiring ready for
+# when a later packet adds the cross-crate seam.
+ferrosa-sstable = { path = "../ferrosa-sstable", features = ["test-support"] }
 # Self-reference enables the `test-generators` feature for this crate's own
 # `tests/` integration harness (`repair_fuzz.rs`) without exporting the
 # generators into the production build.

@@ -240,6 +240,22 @@ pub fn direct_write_bytes_total() -> u64 {
     DIRECT_WRITE_BYTES_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Record that a file which asked for direct I/O ended up buffered instead —
+/// shared by [`open_bypassing`]'s own O_DIRECT-open rejection and
+/// `pump::FileSink`'s `dio_align::TooLarge` fallback (T-032), so both land in
+/// the same counter operators already watch.
+pub(crate) fn record_write_fallback() {
+    DIRECT_WRITE_FALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one completed [`AlignedPump`](crate::pump::AlignedPump) (or
+/// [`DirectWriter`]) file: one file, `logical` bytes. The single call site for
+/// both counters, so `finish()` cannot update one and forget the other.
+pub(crate) fn record_write_completion(logical: u64) {
+    DIRECT_WRITE_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    DIRECT_WRITE_BYTES_TOTAL.fetch_add(logical, Ordering::Relaxed);
+}
+
 /// Render the direct-writer metrics (Prometheus text exposition). Concatenated
 /// into `/metrics` by the web layer. `direct_write_fallbacks_total` is the
 /// load-bearing signal: it MUST stay 0 when `FERROSA_SSTABLE_DIRECT_IO=1` — a
@@ -401,24 +417,18 @@ impl Drop for AlignedBuf {
 ///
 /// Use like an ordinary writer: [`create`](Self::create), one or more
 /// [`write_all`](Self::write_all), then [`finish`](Self::finish) (which syncs and
-/// returns the exact logical length). Dropping without `finish` discards any
-/// buffered residual and does NOT sync — always call `finish`, mirroring the
-/// existing `write_all` + `sync_data` shape in the SSTable writer.
+/// returns the exact logical length). Dropping without `finish` logs a WARN
+/// naming the path if any bytes had already reached the device — always call
+/// `finish`.
+///
+/// A thin wrapper (T-032) over [`crate::pump::AlignedPump`] at `depth = 0`:
+/// every byte, alignment, and fallback rule described above now lives in
+/// `pump.rs`, behind the [`crate::pump::SegmentSink`] seam — `AlignedPump`'s
+/// production sink (`crate::pump::FileSink`) opens with exactly the flags this
+/// type used to open with itself, plus the T-031 `dio_align` block probe this
+/// writer did not yet consume.
 pub struct DirectWriter {
-    file: File,
-    buf: AlignedBuf,
-    /// Bytes staged in `buf` not yet flushed to the device (always `< block`
-    /// after any flush; `<= capacity` transiently while filling).
-    filled: usize,
-    /// Physical bytes already written to the device (always a `block` multiple).
-    physical: u64,
-    /// This writer's block size. Fixed at [`MIN_BLOCK`] for now — `DirectWriter`
-    /// does not yet consume the D4 alignment probe (`dio_align::block_for`,
-    /// T-031); wiring that into `AlignedPump`'s block choice is `pump.rs`'s
-    /// job (T-032). Kept as a field, not a bare constant reference, so the
-    /// block value is always "the value carried by this writer."
-    block: usize,
-    mode: DirectMode,
+    pump: crate::pump::AlignedPump,
 }
 
 impl DirectWriter {
@@ -428,21 +438,20 @@ impl DirectWriter {
     /// back to buffered I/O (WARN-logged + counted). The parent directory must
     /// exist.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let (file, mode) = open_bypassing(path)?;
-        Ok(Self {
-            file,
-            buf: AlignedBuf::new(STAGING_CAPACITY, MIN_BLOCK),
-            filled: 0,
-            physical: 0,
-            block: MIN_BLOCK,
-            mode,
-        })
+        let path = path.as_ref().to_path_buf();
+        let (sink, block) = crate::pump::FileSink::create(&path)?;
+        let segment = crate::pump::PumpConfig {
+            segment_bytes: STAGING_CAPACITY,
+            queue_depth: 0,
+        }
+        .effective_segment(block);
+        let pump = crate::pump::AlignedPump::open(Box::new(sink), block, segment, path);
+        Ok(Self { pump })
     }
 
     /// How the page cache is being bypassed for this file (observability/tests).
     pub fn mode(&self) -> DirectMode {
-        self.mode
+        self.pump.mode()
     }
 
     /// The current logical write offset — bytes accepted by [`Self::write_all`] so far
@@ -450,96 +459,25 @@ impl DirectWriter {
     /// the finished file, so it substitutes exactly for `Seek::stream_position`
     /// when recording chunk offsets.
     pub fn position(&self) -> u64 {
-        self.physical + self.filled as u64
+        self.pump.position()
     }
 
-    /// Stage `data`, flushing full aligned blocks to the device as the buffer
+    /// Stage `data`, flushing full aligned segments to the device as the buffer
     /// fills. Bounded per call by `data.len()` (Power-of-10 rule 2).
-    pub fn write_all(&mut self, mut data: &[u8]) -> Result<()> {
-        while !data.is_empty() {
-            let space = self.buf.capacity() - self.filled;
-            let n = space.min(data.len());
-            let start = self.filled;
-            self.buf.as_mut_slice()[start..start + n].copy_from_slice(&data[..n]);
-            self.filled += n;
-            data = &data[n..];
-            if self.filled == self.buf.capacity() {
-                self.flush_full_blocks()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Write the largest block-multiple prefix of the staged bytes to the device
-    /// and shift any sub-block remainder to the front of the buffer.
-    fn flush_full_blocks(&mut self) -> Result<()> {
-        let flush_len = full_block_prefix(self.filled, self.block);
-        if flush_len == 0 {
-            return Ok(());
-        }
-        write_at_offset(
-            &mut self.file,
-            &self.buf.as_slice()[..flush_len],
-            self.block,
-        )?;
-        let remainder = self.filled - flush_len;
-        if remainder > 0 {
-            self.buf
-                .as_mut_slice()
-                .copy_within(flush_len..self.filled, 0);
-        }
-        self.filled = remainder;
-        self.physical += flush_len as u64;
-        Ok(())
+    pub fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        self.pump.write_all(data)
     }
 
     /// Flush the final partial block, sync durably, trim any padding, and return
     /// the exact logical length. Consumes the writer.
-    pub fn finish(mut self) -> Result<u64> {
-        self.flush_full_blocks()?;
-        let tail = self.filled; // < self.block
-        let logical = self.physical + tail as u64;
-        if tail > 0 {
-            // Zero-pad the partial block to a full aligned block, write it, then
-            // truncate the padding off — the standard O_DIRECT tail technique.
-            let block = self.block;
-            self.buf.as_mut_slice()[tail..block].fill(0);
-            write_at_offset(&mut self.file, &self.buf.as_slice()[..block], block)?;
-            self.physical += block as u64;
-        }
-        sync_data(&self.file)?;
-        if tail > 0 {
-            self.file.set_len(logical)?; // ftruncate off the zero padding
-            sync_data(&self.file)?; // persist the new length
-        }
-        if self.mode == DirectMode::Buffered {
-            // Degraded path used the page cache — drop the pages we just wrote so
-            // they cannot drive the writeback storm this writer exists to avoid.
-            fadvise_dontneed(&self.file);
-        }
-        DIRECT_WRITE_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        DIRECT_WRITE_BYTES_TOTAL.fetch_add(logical, Ordering::Relaxed);
-        Ok(logical)
+    pub fn finish(self) -> Result<u64> {
+        self.pump.finish()
     }
 }
 
-/// `write_all` at the file's current (sequential, block-aligned) offset. Split
-/// out so the O_DIRECT invariant — buffer pointer + length + offset all aligned —
-/// lives in one place. `std::io::Write::write_all` retries partial writes with a
-/// suffix slice; because both the offset served and any partial count are block
-/// multiples, the retried buffer pointer and length stay aligned.
-fn write_at_offset(file: &mut File, block_aligned: &[u8], block: usize) -> Result<()> {
-    use std::io::Write;
-    debug_assert!(
-        block_aligned.len().is_multiple_of(block),
-        "device writes must be block-aligned"
-    );
-    file.write_all(block_aligned)?;
-    Ok(())
-}
-
-/// Open `path` (create + truncate) with the page cache bypassed.
-fn open_bypassing(path: &Path) -> Result<(File, DirectMode)> {
+/// Open `path` (create + truncate) with the page cache bypassed. `pub(crate)`
+/// so `pump::FileSink` (T-032) opens with exactly these flags.
+pub(crate) fn open_bypassing(path: &Path) -> Result<(File, DirectMode)> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -603,8 +541,9 @@ fn set_nocache(file: &File) {
 
 /// Advise the kernel to drop this file's pages from the page cache (Linux). Used
 /// only on the buffered fallback, after the durable sync, so the just-written
-/// bytes cannot pollute the cache or feed the writeback storm.
-fn fadvise_dontneed(file: &File) {
+/// bytes cannot pollute the cache or feed the writeback storm. `pub(crate)` so
+/// `pump::FileSink` (T-032) can call it from its own `fadvise_dontneed`.
+pub(crate) fn fadvise_dontneed(file: &File) {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -625,7 +564,8 @@ fn fadvise_dontneed(file: &File) {
 /// `set_len`). Kept simple — the platform `F_FULLFSYNC` nuance already lives in
 /// the commit-log path; SSTable output is fsynced then published, and a lost
 /// just-written SSTable is re-derivable from the memtable/commit log.
-fn sync_data(file: &File) -> Result<()> {
+/// `pub(crate)` so `pump::FileSink` (T-032) can call it from its own `sync_data`.
+pub(crate) fn sync_data(file: &File) -> Result<()> {
     file.sync_data()?;
     Ok(())
 }
