@@ -294,7 +294,7 @@ jobs:
           mkdir -p node-bin
           cp target/release/ferrosa target/release/ferrosa-ctl node-bin/
           cat > node-bin/Dockerfile <<'DEOF'
-          FROM debian:trixie-slim
+          FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
           RUN apt-get update && apt-get install -y --no-install-recommends \
                   ca-certificates gdb procps \
               && rm -rf /var/lib/apt/lists/*
@@ -418,7 +418,7 @@ jobs:
         run: |
           chmod +x /tmp/ferrosa-bin/ferrosa
           cat > /tmp/Dockerfile.ci <<'DEOF'
-          FROM debian:trixie-slim
+          FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
           RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
           COPY ferrosa /usr/local/bin/
           EXPOSE 9042 17000 9090
