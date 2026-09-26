@@ -449,6 +449,44 @@ fn auth_source_label(env_set: bool, toml_has_auth_key: bool) -> &'static str {
     }
 }
 
+/// Whether log lines carry ANSI colour escapes.
+///
+/// Colour only when a person is watching. `tracing-subscriber` colours by default
+/// regardless of where the output goes, so a container's stdout (a pipe read by a
+/// log collector) filled with escape codes that break anchored patterns in the log
+/// store. `FERROSA_LOG_ANSI` (`true`/`false`) overrides everything; otherwise
+/// `NO_COLOR` (any non-empty value) turns it off, and the default is "is stdout a
+/// terminal".
+fn log_ansi_enabled(
+    stdout_is_terminal: bool,
+    no_color: Option<&str>,
+    override_value: Option<&str>,
+) -> bool {
+    match override_value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "on" | "yes") => return true,
+        Some("0" | "false" | "off" | "no") => return false,
+        // Unset or unrecognised: fall through to the default rules.
+        _ => {}
+    }
+    if no_color.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    stdout_is_terminal
+}
+
+/// [`log_ansi_enabled`] read from this process's stdout and environment.
+fn log_ansi_from_env() -> bool {
+    use std::io::IsTerminal;
+    log_ansi_enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("FERROSA_LOG_ANSI").ok().as_deref(),
+    )
+}
+
 /// Load TOML configuration from disk. Returns an empty table if the file does not exist.
 fn load_config(path: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     if std::path::Path::new(path).exists() {
@@ -954,7 +992,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(log_ansi_from_env())
+                    .with_writer(non_blocking_writer),
+            )
             .with(telemetry_layer)
             .with(sentry_reporting::layer())
             .init();
@@ -966,7 +1008,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_writer))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(log_ansi_from_env())
+                    .with_writer(non_blocking_writer),
+            )
             .with(sentry_reporting::layer())
             .init();
     }
@@ -2740,6 +2786,38 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn log_colour_follows_the_terminal_by_default() {
+        assert!(log_ansi_enabled(true, None, None), "a person at a terminal");
+        assert!(
+            !log_ansi_enabled(false, None, None),
+            "a pipe (container stdout) must not receive escape codes"
+        );
+    }
+
+    #[test]
+    fn no_color_turns_colour_off_even_on_a_terminal() {
+        assert!(!log_ansi_enabled(true, Some("1"), None));
+        assert!(!log_ansi_enabled(true, Some("anything"), None));
+        assert!(
+            log_ansi_enabled(true, Some(""), None),
+            "NO_COLOR set but empty does not count (no-color.org)"
+        );
+    }
+
+    #[test]
+    fn ferrosa_log_ansi_overrides_terminal_and_no_color() {
+        for on in ["1", "true", "TRUE", "on", "yes"] {
+            assert!(log_ansi_enabled(false, Some("1"), Some(on)), "{on:?}");
+        }
+        for off in ["0", "false", "off", "no"] {
+            assert!(!log_ansi_enabled(true, None, Some(off)), "{off:?}");
+        }
+        // Unrecognised: ignored, the default rules apply.
+        assert!(log_ansi_enabled(true, None, Some("maybe")));
+        assert!(!log_ansi_enabled(false, None, Some("maybe")));
     }
 
     /// `--version` previously did NOT print a version: the flag was ignored and
