@@ -111,7 +111,11 @@ fn sstable_direct_io_enabled() -> bool {
 /// the logical write offset (substituting for `Seek::stream_position`, which
 /// O_DIRECT's staging buffer cannot answer from the OS file offset).
 enum DataDbWriter {
-    Direct(crate::direct::DirectWriter),
+    // Boxed: T-033 grew `AlignedPump` (which `DirectWriter` now wraps) with
+    // the `depth >= 1` async backend's channels/join-handle/abort-signal
+    // fields, tripping clippy's `large_enum_variant` against the much
+    // smaller `Buffered` variant.
+    Direct(Box<crate::direct::DirectWriter>),
     Buffered { file: std::fs::File, written: u64 },
 }
 
@@ -121,7 +125,9 @@ impl DataDbWriter {
     /// both modes are unit-testable without the `set_var` parallel-test race.
     fn create(path: &Path, direct: bool) -> Result<Self> {
         if direct {
-            Ok(Self::Direct(crate::direct::DirectWriter::create(path)?))
+            Ok(Self::Direct(Box::new(crate::direct::DirectWriter::create(
+                path,
+            )?)))
         } else {
             Ok(Self::Buffered {
                 file: std::fs::File::create(path)?,

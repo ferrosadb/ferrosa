@@ -23,16 +23,20 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 
 ## Next
 
-- **Wire the aligned write pump (sstable-write-pump plan, T-033 onward).**
+- **Wire the aligned write pump (sstable-write-pump plan, T-038 onward).**
   Done so far: `pump::PumpConfig` (T-030), `dio_align::{resolve_block, probe,
   block_for}` (T-031; gnu and musl alike via a raw `SYS_statx` syscall against a
-  hand-rolled kernel-UAPI struct, FMEA ST-13), the synchronous `AlignedPump`
-  behind the `SegmentSink` seam with `DirectWriter` as a thin wrapper (T-032,
-  FMEA ST-14), `Compression::compress_into` (T-036) and allocation-free
-  size-then-write row encoding over a generic `RowSink` (T-037). Still to do:
-  the background flusher (T-033) and `DataSink` (removing `Data.raw`, T-038),
-  which replaces the `DataBuffer` that row encoding still writes through. The
-  pump API stays `pub(crate)` until T-038 needs it from `ferrosa-storage`. See
+  hand-rolled kernel-UAPI struct, FMEA ST-13), the `AlignedPump` behind the
+  `SegmentSink` seam with `DirectWriter` as a thin wrapper (T-032, FMEA ST-14),
+  the background flusher over pre-filled crossbeam channels with `pwritev`
+  batching and an abort signal (T-033, FMEA ST-15/ST-16),
+  `Compression::compress_into` (T-036) and allocation-free size-then-write
+  row encoding over a generic `RowSink` (T-037). Still to do: `DataSink`
+  (removing `Data.raw`, T-038), which replaces the `DataBuffer` that row
+  encoding still writes through, then wiring flush and compaction onto it
+  (T-039/T-040). The pump's `AbortSignal` shim is swapped for
+  `ferrosa_common::CancelToken` when T-021 lands. The pump API stays
+  `pub(crate)` until T-038 needs it from `ferrosa-storage`. See
   `ferrosa-suite/specs/sstable-write-pump/`.
 - **Complex-column support (FMEA ST-3).** Implement collections / UDT / tuple /
   frozen cell encode+decode in the Data.db codec, or surface unsupported complex

@@ -63,7 +63,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
 | `types` | ~237 | `Partition`, `Row`, `LivenessInfo`, `DeletionTime` |
-| `pump` | ~1000 | `PumpConfig` (T-030) plus, from T-032: `SegmentSink` seam, `FileSink` (production `SegmentSink`, wires the `dio_align` probe), `AlignedPump` (synchronous, `depth = 0`, the sole implementation behind `direct::DirectWriter`), and `test-support`-gated fault-injection sinks (`RecordingSink`/`FaultySink`/`GateSink`). `depth >= 1` (background flusher) is T-033 |
+| `pump` | ~2900 | `PumpConfig` (T-030); `SegmentSink` seam + `FileSink` (T-032, now also `pwritev`); `AlignedPump` — `depth = 0` synchronous (T-032, behind `direct::DirectWriter`) **and, from T-033, `depth >= 1`**: a dedicated flusher OS thread over pre-filled `crossbeam_channel::bounded` `full`/`free`/error channels, thread-local batching, coalesced `pwritev`, a non-blocking-then-watchdog-`select!` producer wait (`after()` armed only on a genuine block), and `write_pump_*` Prometheus metrics. `AbortSignal`/`NeverAbort` (T-021 `CancelToken` shim, T-033). `test_support` (`RecordingSink`/`FaultySink`/`GateSink`, now `pub`) |
 | `dio_align` | ~250 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via a raw `SYS_statx` syscall + `STATX_DIOALIGN` against a hand-rolled kernel-UAPI `KernelStatx` (not `libc::statx`, which is gnu-only in libc 0.2.186 — see FMEA ST-13). Runs on gnu and musl Linux alike; non-Linux is the `Unsupported` stub. Wired into the write path by `pump::FileSink` (T-032) |
 
 ## Component layout

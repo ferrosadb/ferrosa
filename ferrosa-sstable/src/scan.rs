@@ -71,6 +71,12 @@ struct Worker {
 }
 
 impl Worker {
+    // Pre-dates T-033's D7 channel discipline (crossbeam-only, blocking
+    // select!/recv(), decisions.md). This is the separate B1 read-ahead
+    // worker; T-033 only scopes ferrosa-sstable's pump.rs, so converting this
+    // std::sync::mpsc usage to crossbeam belongs to whichever packet lands
+    // B1's D7 alignment, not this one.
+    #[allow(clippy::disallowed_methods)]
     fn spawn<R: ReadAt + Send + Sync + 'static>(
         inner: Arc<R>,
         len: u64,

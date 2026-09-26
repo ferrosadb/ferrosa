@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 crc32fast = "1"
+crossbeam-channel = "0.5"
 ferrosa-common = { path = "../ferrosa-common" }
 libc = "0.2"
 lru = "0.12"
@@ -26,12 +27,12 @@ live-infra-tests = []
 # Compiles `pump::test_support` (RecordingSink, FaultySink, GateSink — T-032)
 # outside `cfg(test)`, so it is part of the crate's compiled dev-support
 # surface rather than only its unit-test binary. Always available to this
-# crate's own tests regardless of this feature. The types are `pub(crate)`
-# today (no cross-crate entry point exists yet — `AlignedPump`/`SegmentSink`
-# are crate-internal); this feature is plumbing for T-033/T-038, which add
-# both a `pub` seam and the visibility bump sibling crates (e.g.
-# `ferrosa-storage`) need to actually inject faults through their
-# dev-dependency on this crate.
+# crate's own tests regardless of this feature. T-033 bumps `AlignedPump`,
+# `SegmentSink`, `FileSink`, `AbortSignal`/`NeverAbort` and this module to
+# `pub` (still gated by this feature outside `cfg(test)`), the "pub seam"
+# this comment used to say T-033/T-038 would add — used by this crate's own
+# `tests/pump_async_*` integration binaries and, later, sibling crates like
+# `ferrosa-storage` through a `test-support`-featured dev-dependency.
 test-support = []
 
 [dev-dependencies]

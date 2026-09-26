@@ -1,0 +1,12 @@
+# T-033 (decisions.md D7 point 2; test-specification.md CD5): the async
+# write pump's channel discipline is crossbeam-only with blocking
+# `select!`/`recv()` waits, never `std::sync::mpsc` and never a
+# `thread::sleep` poll loop. Listed here so a new call site fails CI instead
+# of silently reintroducing either. A legitimate exception gets
+# `#[allow(clippy::disallowed_methods)]` with a comment explaining why, not a
+# change to this file.
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "use crossbeam_channel::bounded/unbounded (decisions.md D7): std mpsc has no select!/after() support the pump's blocking waits need" },
+    { path = "std::sync::mpsc::sync_channel", reason = "use crossbeam_channel::bounded (decisions.md D7)" },
+    { path = "std::thread::sleep", reason = "no polling on the write pump's waits (decisions.md D7): every wait is a blocking recv()/select!, never a sleep loop" },
+]

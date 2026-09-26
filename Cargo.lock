@@ -2750,6 +2750,7 @@ name = "ferrosa-sstable"
 version = "0.22.0"
 dependencies = [
  "crc32fast",
+ "crossbeam-channel",
  "ferrosa-common",
  "libc",
  "lru",

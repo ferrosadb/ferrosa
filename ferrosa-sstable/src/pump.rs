@@ -4,23 +4,41 @@
 //!   exactly once per process, the same rule `direct::configured` uses for
 //!   the O_DIRECT switch. `effective_segment` always returns a positive
 //!   multiple of the caller's block that is at least as large as the
-//!   configured request. `AlignedPump` (depth 0 in this packet) issues one
-//!   `SegmentSink::pwrite` per full, block-aligned segment and never a
-//!   remainder shuffle (D5); `finish` always reports the exact logical
-//!   length regardless of tail padding.
+//!   configured request. `AlignedPump` issues one `SegmentSink::pwrite` (or,
+//!   at `depth >= 1`, one coalesced `SegmentSink::pwritev`) per full,
+//!   block-aligned segment and never a remainder shuffle (D5); `finish`
+//!   always reports the exact logical length regardless of tail padding. No
+//!   segment is ever reachable from two threads at once: at `depth >= 1` a
+//!   segment moves from the producer to the flusher only by being sent, by
+//!   value, on the `full` channel, and back only by being sent on `free` —
+//!   there is no `Mutex`, no shared `VecDeque`, and no `Arc<Mutex<_>>`
+//!   anywhere on the write path (decisions.md D2/D7).
 //! Last revised: 2026-09-26
-//! Last changed: T-032. Adds the `SegmentSink` seam (`FileSink` as the
-//!   production implementation, opening with the same flags
-//!   `direct::open_bypassing` always used, now also consuming the T-031
-//!   `dio_align` block probe), the synchronous (`depth = 0`) `AlignedPump`,
-//!   and `test-support`-gated fault-injection sinks (`RecordingSink`,
-//!   `FaultySink`, `GateSink`). `direct::DirectWriter` is now a thin wrapper
-//!   over `AlignedPump` — see `ferrosa-suite/specs/sstable-write-pump/
-//!   architecture.md` § `AlignedPump`.
+//! Last changed: T-033. Adds the `depth >= 1` background flusher: a
+//!   dedicated OS thread owning the `SegmentSink`, two pre-filled
+//!   `crossbeam_channel::bounded` channels moving segments by ownership
+//!   (`full`/`free`), a one-slot error channel, thread-local batching with
+//!   coalesced `pwritev` on the flusher side, an abortable/stall-watchdogged
+//!   blocking `select!` on the producer side, and the pump metrics
+//!   (`write_pump_*`). `T-021`'s `ferrosa_common::CancelToken` has not landed
+//!   on this branch, so `AbortSignal`/`NeverAbort` are a minimal local shim —
+//!   see the doc comment on `AbortSignal` for what must happen at merge. Also
+//!   bumps `AlignedPump`, `SegmentSink`, `FileSink`, `AbortSignal`/
+//!   `NeverAbort` and `test_support` to `pub` (still `test-support`-feature
+//!   gated outside `cfg(test)`) — the "pub seam" the T-032 comment on this
+//!   module anticipated, needed by `tests/pump_async_*` and, later, sibling
+//!   crates. See `ferrosa-suite/specs/sstable-write-pump/architecture.md` §
+//!   `AlignedPump`, Flusher, Finish, Backpressure chain.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 
 use ferrosa_common::{Error, Result};
 
@@ -46,6 +64,15 @@ const MAX_QUEUE_DEPTH: usize = 16;
 static SEGMENT_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
 static QUEUE_DEPTH_WARNED: AtomicBool = AtomicBool::new(false);
 static ROUNDING_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// How long the producer waits for a returned segment before logging the
+/// "flusher stalled" WARN edge (decisions.md D2/D7). Shrunk under `cfg(test)`
+/// so the watchdog tests run in milliseconds instead of real seconds; nothing
+/// about the *logic* differs, only the threshold.
+#[cfg(not(test))]
+const STALL_THRESHOLD: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STALL_THRESHOLD: Duration = Duration::from_millis(50);
 
 /// Runtime tunables for the aligned write pump (`decisions.md` § Runtime
 /// tunables). Read once when a writer opens; no restart is needed to pick up
@@ -179,7 +206,7 @@ fn resolve_env(
 /// stores something other than what it was asked to is a bug the caller
 /// cannot see except by checking the producer-side digest against what
 /// actually landed (see the `FaultySink` tests below).
-pub(crate) trait SegmentSink: Send {
+pub trait SegmentSink: Send {
     /// Write the whole of `buf` at `offset`, retrying any short device write
     /// internally. Never returns having written only part of `buf`.
     fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()>;
@@ -192,6 +219,19 @@ pub(crate) trait SegmentSink: Send {
     fn fadvise_dontneed(&mut self) -> Result<()>;
     /// How this sink bypasses (or does not bypass) the page cache.
     fn mode(&self) -> DirectMode;
+    /// Write several buffers as one coalesced device operation, at
+    /// contiguous, increasing offsets starting at `offset` (T-033 D7 §3
+    /// "Flusher batching"). The default loops [`Self::pwrite`] one buffer at
+    /// a time — correct but not actually coalesced; [`FileSink`] overrides it
+    /// with a real `pwritev(2)` on unix. `bufs` may be empty (a no-op).
+    fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+        let mut off = offset;
+        for buf in bufs {
+            self.pwrite(buf, off)?;
+            off += buf.len() as u64;
+        }
+        Ok(())
+    }
 }
 
 /// Whether a short write of `n` bytes, made while more of `buf` remains,
@@ -245,11 +285,30 @@ fn write_all_at(
 /// The production [`SegmentSink`]: an ordinary file, opened with exactly the
 /// flags [`crate::direct::open_bypassing`] always used, plus the T-031
 /// `dio_align` block probe `DirectWriter` did not yet consume before T-032.
-pub(crate) struct FileSink {
+pub struct FileSink {
     file: std::fs::File,
     mode: DirectMode,
     block: usize,
+    /// Reused `pwritev(2)` iovec scratch (bounded-ring rule: allocated once,
+    /// at the process-wide maximum possible batch size, and only ever
+    /// `clear()`ed — never grown per call). Unused (empty) on any pump that
+    /// never calls [`SegmentSink::pwritev`] (every `depth = 0` pump).
+    #[cfg(unix)]
+    iov_scratch: Vec<libc::iovec>,
 }
+
+// SAFETY: `libc::iovec`'s raw `iov_base` pointer is what makes `FileSink` not
+// `Send` by default. Every pointer ever stored in `iov_scratch` borrows from
+// a `SegmentSink::pwritev` caller's stack for the exact duration of one
+// syscall and is never read outside that call (the vec is `clear()`ed
+// immediately after, per `pwritev_unix`'s doc comment); no thread ever reads
+// or writes through it concurrently with another, and moving `FileSink`
+// itself between threads (as `AlignedPump::open_with_depth` does exactly
+// once, handing it to the dedicated flusher thread before any write happens)
+// moves the `Vec`'s own allocation, not the data the stale pointers pointed
+// to, which is never dereferenced after the move without being overwritten
+// first.
+unsafe impl Send for FileSink {}
 
 impl FileSink {
     /// Open `path` for cache-bypassing sequential writes and resolve the
@@ -259,11 +318,20 @@ impl FileSink {
     /// `direct_write_fallbacks_total` counter `open_bypassing`'s own
     /// O_DIRECT-rejection fallback uses. Returns the resolved block alongside
     /// the sink so the caller can size its segment.
-    pub(crate) fn create(path: &Path) -> Result<(Self, usize)> {
+    pub fn create(path: &Path) -> Result<(Self, usize)> {
         let (file, mode) = crate::direct::open_bypassing(path)?;
         match mode {
             DirectMode::Direct => match crate::dio_align::block_for(&file) {
-                Ok(block) => Ok((Self { file, mode, block }, block)),
+                Ok(block) => Ok((
+                    Self {
+                        file,
+                        mode,
+                        block,
+                        #[cfg(unix)]
+                        iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
+                    },
+                    block,
+                )),
                 Err(crate::dio_align::TooLarge(probed)) => {
                     crate::direct::record_write_fallback();
                     tracing::warn!(
@@ -283,6 +351,8 @@ impl FileSink {
                             file: buffered,
                             mode: DirectMode::Buffered,
                             block: MIN_BLOCK,
+                            #[cfg(unix)]
+                            iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
                         },
                         MIN_BLOCK,
                     ))
@@ -293,10 +363,91 @@ impl FileSink {
                     file,
                     mode,
                     block: MIN_BLOCK,
+                    #[cfg(unix)]
+                    iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
                 },
                 MIN_BLOCK,
             )),
         }
+    }
+
+    /// Coalesced write of several already-contiguous segments in one
+    /// `pwritev(2)`. Every buffer the flusher ever coalesces is already a
+    /// whole multiple of `self.block` (D5; the tail segment T-033's `finish`
+    /// sends is itself padded to a full block first), so a short count in
+    /// direct mode is only safe to resume from when it, too, lands on a
+    /// block boundary — checked with the same
+    /// [`short_write_violates_alignment`] rule `pwrite` uses.
+    ///
+    /// The happy path (a full-count `pwritev`, which is what every local
+    /// disk write of a few small buffers does in practice) builds the iovec
+    /// list into `self.iov_scratch` — reused, never reallocated, capacity
+    /// fixed at open (bounded-ring rule). A genuine short count is rare
+    /// enough on a local device that it is handled as a cold, allocating
+    /// fallback (one `Vec<u8>` copy, then an ordinary retried `pwrite`)
+    /// rather than complicating the hot path to stay allocation-free there
+    /// too; `tests/pump_async_alloc.rs` measures the happy path only.
+    #[cfg(unix)]
+    fn pwritev_unix(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        self.iov_scratch.clear();
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            self.iov_scratch.push(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            });
+        }
+        if self.iov_scratch.is_empty() {
+            return Ok(());
+        }
+        let total: usize = self.iov_scratch.iter().map(|v| v.iov_len).sum();
+        // SAFETY: each `iovec` points at a live `&[u8]` borrowed from `bufs`
+        // for the duration of this syscall only; the fd is open for writing
+        // for the life of `self`.
+        let n = unsafe {
+            libc::pwritev(
+                self.file.as_raw_fd(),
+                self.iov_scratch.as_ptr(),
+                self.iov_scratch.len() as libc::c_int,
+                offset as libc::off_t,
+            )
+        };
+        if n < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        let written = n as usize;
+        if written == total {
+            return Ok(());
+        }
+        if written == 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("pwritev returned 0 bytes at offset {offset}"),
+            )));
+        }
+        if short_write_violates_alignment(self.mode, written, self.block) {
+            return Err(Error::Io(io::Error::other(format!(
+                "O_DIRECT short pwritev of {written} bytes at offset {offset} is not a \
+                 multiple of the block ({}); cannot retry at an aligned offset",
+                self.block
+            ))));
+        }
+        // Cold path: reconstruct the unwritten tail and retry through the
+        // ordinary (also-retrying) single-buffer `pwrite`.
+        let mut tail: Vec<u8> = Vec::new();
+        let mut skip = written;
+        for buf in bufs {
+            if skip >= buf.len() {
+                skip -= buf.len();
+                continue;
+            }
+            tail.extend_from_slice(&buf[skip..]);
+            skip = 0;
+        }
+        self.pwrite(&tail, offset + written as u64)
     }
 }
 
@@ -322,6 +473,22 @@ impl SegmentSink for FileSink {
     fn mode(&self) -> DirectMode {
         self.mode
     }
+
+    fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.pwritev_unix(bufs, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut off = offset;
+            for buf in bufs {
+                self.pwrite(buf, off)?;
+                off += buf.len() as u64;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Wrap a [`SegmentSink`] error with the pump's path and the offset the
@@ -334,54 +501,432 @@ fn wrap_sink_error(path: &Path, offset: u64, err: Error) -> Error {
     )))
 }
 
-/// A synchronous (`depth = 0`) aligned SSTable-component writer: one
-/// [`AlignedBuf`] segment, allocated once at [`open`](Self::open), filled by
+fn disconnected_error(path: &Path) -> Error {
+    Error::Io(io::Error::other(format!(
+        "write pump: channel disconnected for {} (the flusher thread exited)",
+        path.display()
+    )))
+}
+
+fn aborted_error(path: &Path) -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("write pump aborted for {}", path.display()),
+    ))
+}
+
+/// Something an async [`AlignedPump`] (`depth >= 1`) can be told to stop for.
+///
+/// `T-021` (`ferrosa_common::CancelToken`, `decisions.md` D7) is meant to
+/// fill this role across the whole compaction/pump write path, sharing one
+/// type between `ferrosa-sstable` and `ferrosa-storage`. It has not landed on
+/// this branch yet (T-033 depends only on T-032), so this crate defines the
+/// minimal shape the pump needs and a no-op implementation
+/// ([`NeverAbort`]) for callers with nothing to cancel on. **Whichever packet
+/// rebases this work onto a branch where `CancelToken` exists must delete
+/// this trait, implement it for (or replace every use site with)
+/// `CancelToken`, and keep `NeverAbort`-equivalent behavior only where a
+/// caller genuinely has no cancellation source (e.g. today's `DirectWriter`,
+/// depth 0, which does not use this trait at all).**
+pub trait AbortSignal: Send + Sync {
+    /// A hot-loop-safe, non-blocking check. The pump's own blocking waits use
+    /// [`Self::closed`] via `select!` instead (D7: no polling); this exists
+    /// for parity with `CancelToken`'s shape and any future hot-loop caller.
+    fn is_aborted(&self) -> bool;
+    /// A channel whose lone `Sender` is dropped exactly when this signal is
+    /// tripped, so a blocking `select!` on it wakes immediately rather than
+    /// on the next poll slice.
+    fn closed(&self) -> &Receiver<()>;
+}
+
+/// An [`AbortSignal`] that never fires: every blocking wait's cancel arm is
+/// simply never selected. Holds its own [`Sender`] for its entire lifetime so
+/// [`Self::closed`]'s receiver never disconnects.
+pub struct NeverAbort {
+    _keep_open: Sender<()>,
+    closed: Receiver<()>,
+}
+
+impl NeverAbort {
+    pub fn new() -> Self {
+        let (tx, rx) = bounded(0);
+        Self {
+            _keep_open: tx,
+            closed: rx,
+        }
+    }
+}
+
+impl Default for NeverAbort {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AbortSignal for NeverAbort {
+    fn is_aborted(&self) -> bool {
+        false
+    }
+
+    fn closed(&self) -> &Receiver<()> {
+        &self.closed
+    }
+}
+
+/// One segment handed from the producer to the flusher by ownership
+/// (decisions.md D2): the buffer, how many of its bytes are valid, and the
+/// logical offset those bytes start at.
+struct Filled {
+    buf: AlignedBuf,
+    len: usize,
+    offset: u64,
+}
+
+/// The flusher's one allowed report to the producer: at most one is ever
+/// sent, then the flusher drops its channel ends and exits
+/// (architecture.md § Flusher).
+#[derive(Debug, Clone)]
+struct PumpError {
+    offset: u64,
+    message: String,
+}
+
+/// What the flusher thread returns from `JoinHandle::join`. On a clean exit
+/// (the `full` channel disconnected with no I/O error) it hands the
+/// `SegmentSink` itself back, so `finish` can run `sync_data`/`set_len`/
+/// `fadvise_dontneed` against the exact device state the flusher left behind,
+/// without ever letting two threads touch the sink at once.
+enum FlusherOutcome {
+    Ok(Box<dyn SegmentSink>),
+    Err(PumpError),
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// The dedicated flusher thread body (architecture.md § Flusher). Blocks in
+/// `full_rx.recv()`; a disconnected channel is its only normal exit. On each
+/// wake it drains whatever is already queued with `try_iter()` into a
+/// thread-local batch (D7 §3), then groups it into runs of contiguous
+/// `Filled` segments and writes each run as one `SegmentSink::pwritev`,
+/// returning every buffer to `free` on success — so a backlog costs one
+/// write per contiguous run instead of one per segment.
+///
+/// Bounded-ring rule (architecture.md): `batch` is allocated once, at
+/// `depth + 1` capacity, before the loop starts, and only ever shrinks within
+/// an iteration of the inner loop (Power-of-10 rule 2). The per-batch iovec
+/// list is a fixed-size **stack array** (`MAX_BATCH = MAX_QUEUE_DEPTH + 1`,
+/// the process-wide ceiling — never `depth`-sized, since this function has no
+/// per-call heap budget to size it from), declared fresh each inner-loop
+/// pass: a stack array costs nothing to "allocate" (no heap traffic — verified
+/// by `tests/pump_async_alloc.rs`) and, redeclared each pass, its borrows of
+/// `batch` never outlive the single `pwritev` call that uses them, so the
+/// following `batch.pop_front()` never conflicts with it.
+const MAX_BATCH: usize = MAX_QUEUE_DEPTH + 1;
+
+fn run_flusher(
+    mut sink: Box<dyn SegmentSink>,
+    full_rx: Receiver<Filled>,
+    free_tx: Sender<AlignedBuf>,
+    err_tx: Sender<PumpError>,
+    depth: usize,
+) -> FlusherOutcome {
+    let mut batch: VecDeque<Filled> = VecDeque::with_capacity(depth + 1);
+    loop {
+        let first = match full_rx.recv() {
+            Ok(f) => f,
+            Err(_) => return FlusherOutcome::Ok(sink),
+        };
+        batch.push_back(first);
+        for extra in full_rx.try_iter() {
+            batch.push_back(extra);
+        }
+        while !batch.is_empty() {
+            let mut run_len = 1;
+            let mut expect = batch[0].offset + batch[0].len as u64;
+            while run_len < batch.len() && batch[run_len].offset == expect {
+                expect += batch[run_len].len as u64;
+                run_len += 1;
+            }
+            debug_assert!(
+                run_len <= MAX_BATCH,
+                "write pump: a contiguous run of {run_len} segments exceeds the \
+                 process-wide max depth+1 ({MAX_BATCH})"
+            );
+            let mut iov_bufs: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
+            for (slot, f) in iov_bufs.iter_mut().zip(batch.iter().take(run_len)) {
+                *slot = &f.buf.as_slice()[..f.len];
+            }
+            let offset = batch[0].offset;
+            let result = sink.pwritev(&iov_bufs[..run_len], offset);
+            match result {
+                Ok(()) => {
+                    for _ in 0..run_len {
+                        let f = batch
+                            .pop_front()
+                            .expect("run_len was computed from batch.len()");
+                        // Best-effort: a disconnected `free` means the pump
+                        // was dropped without `finish` while we were
+                        // mid-batch. There is no one left to return the
+                        // buffer to; it is simply freed here instead (its
+                        // `Drop` still runs), the same "nothing more to do"
+                        // case `finish`'s own `Drop`-without-finish path
+                        // documents.
+                        let _ = free_tx.send(f.buf);
+                    }
+                }
+                Err(e) => {
+                    let err = PumpError {
+                        offset,
+                        message: e.to_string(),
+                    };
+                    // Best-effort: if the producer already gave up (dropped
+                    // its `err_rx`), there is no receiver left, but the
+                    // thread's own return value — read via
+                    // `JoinHandle::join()` in `AsyncBackend::shutdown` — is
+                    // the fallback path for that case, so the error is never
+                    // silently lost.
+                    let _ = err_tx.send(err.clone());
+                    return FlusherOutcome::Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// Producer-side state that exists only when `depth >= 1`: the two bounded
+/// channels the ring is made of, the one-slot error channel, the flusher's
+/// join handle, and the thread-local batch of segments already known to be
+/// free (D7 §3 "Producer": one channel crossing per batch, not per segment).
+struct AsyncBackend {
+    /// `None` after `shutdown()` — dropping it is what disconnects the
+    /// flusher's blocking `recv()`.
+    full_tx: Option<Sender<Filled>>,
+    free_rx: Receiver<AlignedBuf>,
+    err_rx: Receiver<PumpError>,
+    flusher: Option<JoinHandle<FlusherOutcome>>,
+    local_free: VecDeque<AlignedBuf>,
+    abort: Arc<dyn AbortSignal>,
+    depth: usize,
+}
+
+/// The outcome of disconnecting and joining the flusher, once.
+enum ShutdownResult {
+    /// `shutdown()` had already run (a prior call, from `finish` or `Drop`).
+    AlreadyShutdown,
+    Clean(Box<dyn SegmentSink>),
+    Failed(PumpError),
+    Panicked(String),
+}
+
+impl AsyncBackend {
+    /// Disconnect the flusher (drop the `full` sender, so its blocking
+    /// `recv()` sees the channel close) and join its thread. Idempotent:
+    /// `finish` always calls this, so a later `Drop` sees `flusher` already
+    /// `None` and does nothing further.
+    fn shutdown(&mut self) -> ShutdownResult {
+        self.full_tx.take();
+        let Some(handle) = self.flusher.take() else {
+            return ShutdownResult::AlreadyShutdown;
+        };
+        match handle.join() {
+            Ok(FlusherOutcome::Ok(sink)) => ShutdownResult::Clean(sink),
+            Ok(FlusherOutcome::Err(err)) => ShutdownResult::Failed(err),
+            Err(panic) => ShutdownResult::Panicked(panic_message(&panic)),
+        }
+    }
+}
+
+enum PumpBackend {
+    Sync { sink: Box<dyn SegmentSink> },
+    Async(AsyncBackend),
+}
+
+impl PumpBackend {
+    fn as_async_mut(&mut self) -> Option<&mut AsyncBackend> {
+        match self {
+            PumpBackend::Async(b) => Some(b),
+            PumpBackend::Sync { .. } => None,
+        }
+    }
+}
+
+static PUMP_STALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PUMP_ABORTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PUMP_SYNC_FALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PUMP_INFLIGHT_SEGMENTS: AtomicU64 = AtomicU64::new(0);
+static PUMP_BLOCKED_FREE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+// L6 contention budget: how many times the CALLING THREAD has actually
+// parked in `wait_for_free_segment_blocking` (as opposed to getting a
+// segment from its already-primed thread-local batch). Test-only, and
+// deliberately a `thread_local!`, not a process-wide atomic: `cargo test`'s
+// default harness runs each `#[test]` fn on its own thread, so this stays
+// isolated from unrelated `pump_async_*` tests parking concurrently — a
+// process-wide counter would be noisy under `--test-threads` > 1 (this is
+// unlike the `write_pump_*` Prometheus gauges above, which are legitimately
+// meant to sum across every concurrent pump in the real process).
+#[cfg(test)]
+thread_local! {
+    static PUMP_PARK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn pump_park_count() -> u64 {
+    PUMP_PARK_COUNT.with(std::cell::Cell::get)
+}
+
+fn record_blocked_free(elapsed: Duration) {
+    PUMP_BLOCKED_FREE_NANOS.fetch_add(
+        elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// A segment the producer previously handed off has come back via `free` —
+/// the counterpart to the increment in `send_filled_low_level`.
+fn record_segment_returned() {
+    PUMP_INFLIGHT_SEGMENTS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Segments the producer has handed to a flusher but not yet gotten back —
+/// the live value of `write_pump_inflight_segments`. Bounded by `depth`
+/// (architecture.md § Backpressure chain, `write_pump_inflight_segments`).
+pub fn write_pump_inflight_segments() -> u64 {
+    PUMP_INFLIGHT_SEGMENTS.load(Ordering::Relaxed)
+}
+
+/// "flusher stalled" WARN edges logged since start (one per stall, not one
+/// per second stalled — the standing order on reporting edges, not events).
+pub fn write_pump_stalls_total() -> u64 {
+    PUMP_STALLS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Aborted pump waits (`Err(Aborted)`) since start.
+pub fn write_pump_aborts_total() -> u64 {
+    PUMP_ABORTS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Pumps that asked for `depth >= 1` but fell back to the synchronous
+/// (`depth = 0`) pump because the flusher's `std::thread::Builder::spawn`
+/// failed (resource exhaustion). Non-zero in steady state means the process
+/// is thread-starved and should alert.
+pub fn write_pump_sync_fallbacks_total() -> u64 {
+    PUMP_SYNC_FALLBACKS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Total seconds producers have spent blocked waiting for a free segment
+/// back from the flusher (`write_pump_blocked_seconds_total{stage="free"}`).
+pub fn write_pump_blocked_seconds_total_free() -> f64 {
+    PUMP_BLOCKED_FREE_NANOS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+}
+
+/// Render the write-pump metrics (Prometheus text exposition), appended to
+/// the same block [`crate::direct::render_prometheus`] assembles.
+pub(crate) fn render_prometheus(out: &mut String) {
+    out.push_str(
+        "# HELP ferrosa_sstable_write_pump_blocked_seconds_total Seconds producers spent blocked waiting for a resource, by stage.\n\
+         # TYPE ferrosa_sstable_write_pump_blocked_seconds_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_write_pump_blocked_seconds_total{{stage=\"free\"}} {}\n",
+        write_pump_blocked_seconds_total_free()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_write_pump_inflight_segments Segments currently handed to a flusher and not yet returned; bounded by the pump's configured depth.\n\
+         # TYPE ferrosa_sstable_write_pump_inflight_segments gauge\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_write_pump_inflight_segments {}\n",
+        write_pump_inflight_segments()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_write_pump_stalls_total \"flusher stalled\" WARN edges logged since start (one per stall, not one per second).\n\
+         # TYPE ferrosa_sstable_write_pump_stalls_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_write_pump_stalls_total {}\n",
+        write_pump_stalls_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_write_pump_aborts_total Pump waits that returned Err(Aborted) since start.\n\
+         # TYPE ferrosa_sstable_write_pump_aborts_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_write_pump_aborts_total {}\n",
+        write_pump_aborts_total()
+    ));
+    out.push_str(
+        "# HELP ferrosa_sstable_write_pump_sync_fallbacks_total Pumps that asked for depth >= 1 but fell back to synchronous (depth 0) because the flusher thread failed to spawn; non-zero means the process is thread-starved.\n\
+         # TYPE ferrosa_sstable_write_pump_sync_fallbacks_total counter\n",
+    );
+    out.push_str(&format!(
+        "ferrosa_sstable_write_pump_sync_fallbacks_total {}\n",
+        write_pump_sync_fallbacks_total()
+    ));
+}
+
+/// An aligned SSTable-component writer. At `depth = 0` ([`Self::open`]) it is
+/// synchronous: one [`AlignedBuf`] segment, filled by
 /// [`write_all`](Self::write_all) and drained with exactly one
 /// [`SegmentSink::pwrite`] per full segment (D5 — never a remainder
-/// shuffle). [`finish`](Self::finish) pads and writes the final partial
-/// block, syncs, trims the padding, and returns the exact logical length.
-/// `depth >= 1` (a background flusher over bounded channels) is T-033.
-pub(crate) struct AlignedPump {
-    sink: Box<dyn SegmentSink>,
-    current: AlignedBuf,
-    /// Bytes staged in `current`, not yet handed to the sink. Only ever
-    /// reaches `current.capacity()` transiently — that exact equality
-    /// triggers an immediate flush back to 0 (`write_all`).
+/// shuffle). At `depth >= 1` ([`Self::open_with_depth`]) segments move by
+/// ownership to a dedicated flusher thread over two bounded channels
+/// (decisions.md D2/D7); the producer never blocks except waiting for a
+/// returned segment, and that wait is a `select!` over the channel, an
+/// abort signal, and a stall watchdog — never a poll loop.
+/// [`finish`](Self::finish) pads and writes/sends the final partial block,
+/// syncs, trims the padding, and returns the exact logical length.
+pub struct AlignedPump {
+    /// The segment currently being filled. `Some` throughout a `depth = 0`
+    /// pump's life; at `depth >= 1` it is briefly `None` right after a full
+    /// segment is handed off, until [`Self::write_all`] (or [`Self::finish`])
+    /// next needs one.
+    current: Option<AlignedBuf>,
+    /// Bytes staged in `current`, not yet handed off. Only ever reaches
+    /// `current.capacity()` transiently — that exact equality triggers an
+    /// immediate hand-off (`write_all`).
     filled: usize,
-    /// Physical bytes already handed to `sink.pwrite`; always a multiple of
-    /// `block`.
+    /// Bytes already handed to the sink (directly) or to the flusher (by
+    /// ownership); always a multiple of `block`.
     physical: u64,
     /// `Digest.crc32`, fed on the producer side as bytes are accepted — never
-    /// from what the sink reports back, so a sink that lies about what it
-    /// stored cannot also lie about the digest (T-011 `checksum.rs`).
+    /// from what the sink reports back, so a sink (or flusher) that lies
+    /// about what it stored cannot also lie about the digest (T-011
+    /// `checksum.rs`).
     digest: DigestCrc32,
     block: usize,
     mode: DirectMode,
     path: PathBuf,
     finished: bool,
     wrote_anything: bool,
+    backend: PumpBackend,
 }
 
 impl AlignedPump {
-    /// Open a synchronous pump over `sink`, staging into one `segment`-byte
-    /// aligned buffer. `segment` must already be a positive multiple of
-    /// `block` — callers pass it through
-    /// [`PumpConfig::effective_segment`](super::PumpConfig::effective_segment),
-    /// which guarantees this (D5).
-    pub(crate) fn open(
-        sink: Box<dyn SegmentSink>,
-        block: usize,
-        segment: usize,
-        path: PathBuf,
-    ) -> Self {
+    /// Open a synchronous (`depth = 0`) pump over `sink`, staging into one
+    /// `segment`-byte aligned buffer. `segment` must already be a positive
+    /// multiple of `block` — callers pass it through
+    /// [`PumpConfig::effective_segment`], which guarantees this (D5).
+    pub fn open(sink: Box<dyn SegmentSink>, block: usize, segment: usize, path: PathBuf) -> Self {
+        Self::open_sync(sink, block, segment, path)
+    }
+
+    fn open_sync(sink: Box<dyn SegmentSink>, block: usize, segment: usize, path: PathBuf) -> Self {
         debug_assert!(
             segment > 0 && segment.is_multiple_of(block),
             "segment must be a positive multiple of block"
         );
         let mode = sink.mode();
         Self {
-            sink,
-            current: AlignedBuf::new(segment, block),
+            current: Some(AlignedBuf::new(segment, block)),
             filled: 0,
             physical: 0,
             digest: DigestCrc32::new(),
@@ -390,74 +935,400 @@ impl AlignedPump {
             path,
             finished: false,
             wrote_anything: false,
+            backend: PumpBackend::Sync { sink },
+        }
+    }
+
+    /// Open a pump at the given `depth`. `depth == 0` is exactly
+    /// [`Self::open`] (synchronous, no channels, no thread). `depth >= 1`
+    /// pre-allocates `depth + 1` segments, sends all of them into a
+    /// pre-filled `free` channel, and spawns a dedicated OS thread (never
+    /// rayon or tokio — decisions.md D2) that owns `sink` and drains `full`.
+    /// If the thread fails to spawn (resource exhaustion), falls back to the
+    /// synchronous pump: logged at WARN and counted in
+    /// [`write_pump_sync_fallbacks_total`], never a silent depth change.
+    pub fn open_with_depth(
+        sink: Box<dyn SegmentSink>,
+        block: usize,
+        segment: usize,
+        path: PathBuf,
+        depth: usize,
+        abort: Arc<dyn AbortSignal>,
+    ) -> Self {
+        if depth == 0 {
+            return Self::open_sync(sink, block, segment, path);
+        }
+        debug_assert!(
+            depth <= MAX_QUEUE_DEPTH,
+            "depth must not exceed MAX_QUEUE_DEPTH ({MAX_QUEUE_DEPTH}); the flusher's \
+             per-batch iovec array is sized to this ceiling"
+        );
+        debug_assert!(
+            segment > 0 && segment.is_multiple_of(block),
+            "segment must be a positive multiple of block"
+        );
+        let mode = sink.mode();
+        let cap = depth + 1;
+        let (full_tx, full_rx) = bounded::<Filled>(cap);
+        let (free_tx, free_rx) = bounded::<AlignedBuf>(cap);
+        let (err_tx, err_rx) = bounded::<PumpError>(1);
+        for _ in 0..cap {
+            // Pre-fill `free` with every segment this pump will ever own
+            // (decisions.md D2): the ring IS the two channels — there is no
+            // separate `VecDeque` spare pool.
+            free_tx
+                .send(AlignedBuf::new(segment, block))
+                .expect("free has capacity for `depth + 1` sends before any receiver exists");
+        }
+        // A failed `spawn` drops its closure (and whatever it captured)
+        // without running it, so `sink` cannot be moved directly into the
+        // closure if we want it back on failure. Route it through an
+        // `Arc<Mutex<Option<_>>>` instead: on success the thread `take()`s it
+        // once; on failure the closure (and the thread's clone of the `Arc`)
+        // is dropped, `strong_count` returns to 1, and `Arc::try_unwrap`
+        // hands the sink straight back to the caller.
+        let carrier: Arc<Mutex<Option<Box<dyn SegmentSink>>>> = Arc::new(Mutex::new(Some(sink)));
+        let thread_carrier = Arc::clone(&carrier);
+        let spawned = std::thread::Builder::new()
+            .name("sstable-write-pump-flusher".into())
+            .spawn(move || -> FlusherOutcome {
+                let sink = thread_carrier
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take()
+                    .expect("the flusher thread takes the sink exactly once, on its only run");
+                run_flusher(sink, full_rx, free_tx, err_tx, depth)
+            });
+        match spawned {
+            Ok(handle) => Self {
+                current: None,
+                filled: 0,
+                physical: 0,
+                digest: DigestCrc32::new(),
+                block,
+                mode,
+                path,
+                finished: false,
+                wrote_anything: false,
+                backend: PumpBackend::Async(AsyncBackend {
+                    full_tx: Some(full_tx),
+                    free_rx,
+                    err_rx,
+                    flusher: Some(handle),
+                    local_free: VecDeque::with_capacity(cap),
+                    abort,
+                    depth,
+                }),
+            },
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    depth,
+                    "write pump flusher thread failed to spawn; falling back to the \
+                     synchronous (depth 0) pump"
+                );
+                PUMP_SYNC_FALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let sink = Arc::try_unwrap(carrier)
+                    .unwrap_or_else(|_| {
+                        panic!("no other Arc strong ref can survive a spawn that never ran")
+                    })
+                    .into_inner()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .expect("the failed spawn's closure never ran, so nothing took the sink");
+                Self::open_sync(sink, block, segment, path)
+            }
         }
     }
 
     /// How the page cache is being bypassed for this file.
-    pub(crate) fn mode(&self) -> DirectMode {
+    pub fn mode(&self) -> DirectMode {
         self.mode
     }
 
     /// The current logical write offset — bytes accepted by
-    /// [`Self::write_all`] so far (flushed + still staged).
-    pub(crate) fn position(&self) -> u64 {
+    /// [`Self::write_all`] so far (handed off + still staged).
+    pub fn position(&self) -> u64 {
         self.physical + self.filled as u64
     }
 
     /// The `Digest.crc32` of every byte accepted by [`Self::write_all`] so
-    /// far — the producer-side checksum, independent of what the sink
-    /// actually stored. Call before [`Self::finish`] consumes the pump.
-    ///
-    /// Only this packet's tests call it today (proving the fault-detection
-    /// property `pump_sync_faulty_sink_silent_corruption_is_only_caught_by_digest_comparison`
-    /// relies on); `DataSink` (T-038) is what wires it into the real
-    /// publication-verification path (`publication-safety.md` M2/M3).
+    /// far — the producer-side checksum, independent of what the sink (or
+    /// flusher) actually stored. Call before [`Self::finish`] consumes the
+    /// pump.
     #[allow(dead_code)]
-    pub(crate) fn digest(&self) -> u32 {
+    pub fn digest(&self) -> u32 {
         self.digest.clone().finalize()
     }
 
-    /// Stage `data`, handing whole aligned segments to the sink as the buffer
-    /// fills. Bounded per call by `data.len()` (Power-of-10 rule 2).
-    pub(crate) fn write_all(&mut self, mut data: &[u8]) -> Result<()> {
+    /// Stage `data`, handing whole aligned segments off as the buffer fills —
+    /// directly to the sink at `depth = 0`, or by ownership to the flusher at
+    /// `depth >= 1`. Bounded per call by `data.len()` (Power-of-10 rule 2).
+    pub fn write_all(&mut self, mut data: &[u8]) -> Result<()> {
         while !data.is_empty() {
-            let space = self.current.capacity() - self.filled;
+            self.ensure_current_present()?;
+            let cur = self
+                .current
+                .as_mut()
+                .expect("ensure_current_present leaves current Some");
+            let space = cur.capacity() - self.filled;
             let n = space.min(data.len());
             let start = self.filled;
-            self.current.as_mut_slice()[start..start + n].copy_from_slice(&data[..n]);
+            cur.as_mut_slice()[start..start + n].copy_from_slice(&data[..n]);
             self.digest.update(&data[..n]);
             self.filled += n;
             data = &data[n..];
-            if self.filled == self.current.capacity() {
-                self.flush_segment()?;
+            if self.filled == cur.capacity() {
+                self.hand_off_full_segment()?;
             }
         }
         Ok(())
     }
 
+    fn ensure_current_present(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            return Ok(());
+        }
+        // Only the async backend ever leaves `current` empty between calls.
+        let buf = self.take_or_wait_for_segment()?;
+        self.current = Some(buf);
+        Ok(())
+    }
+
+    fn hand_off_full_segment(&mut self) -> Result<()> {
+        match &self.backend {
+            PumpBackend::Sync { .. } => self.flush_segment_sync(),
+            PumpBackend::Async(_) => self.send_full_segment_async(),
+        }
+    }
+
     /// Hand the full, already-block-aligned segment to the sink in one
-    /// `pwrite` and reset the buffer.
-    fn flush_segment(&mut self) -> Result<()> {
+    /// `pwrite` and reset the buffer (`depth = 0`).
+    fn flush_segment_sync(&mut self) -> Result<()> {
         let offset = self.physical;
-        self.sink
-            .pwrite(self.current.as_slice(), offset)
+        let filled = self.filled;
+        let PumpBackend::Sync { sink } = &mut self.backend else {
+            unreachable!("flush_segment_sync only runs on the sync backend")
+        };
+        let cur = self
+            .current
+            .as_ref()
+            .expect("sync current is always present");
+        sink.pwrite(&cur.as_slice()[..filled], offset)
             .map_err(|e| wrap_sink_error(&self.path, offset, e))?;
         self.wrote_anything = true;
-        self.physical += self.filled as u64;
+        self.physical += filled as u64;
         self.filled = 0;
         Ok(())
     }
 
-    /// Flush the final block-aligned prefix, zero-pad and write the last
+    /// Take ownership of the full segment and send it to the flusher
+    /// (`depth >= 1`), leaving `current` empty until the next byte is staged.
+    fn send_full_segment_async(&mut self) -> Result<()> {
+        self.check_error_async()?;
+        let buf = self
+            .current
+            .take()
+            .expect("current is Some whenever a segment is exactly full");
+        let offset = self.physical;
+        let len = self.filled;
+        self.filled = 0;
+        self.physical += len as u64;
+        self.wrote_anything = true;
+        self.send_filled_low_level(Filled { buf, len, offset })
+    }
+
+    /// The one place a `Filled` is actually sent on `full` (decisions.md D2
+    /// step 2), used by both the ordinary write path and `finish`'s tail.
+    fn send_filled_low_level(&mut self, filled: Filled) -> Result<()> {
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("send_filled_low_level only runs on the async backend");
+        let send_result = backend
+            .full_tx
+            .as_ref()
+            .expect("full_tx is present until shutdown")
+            .send(filled);
+        // `self.path` is only ever touched to format the (rare/never, in
+        // steady state) disconnection error — never cloned on the hot path
+        // (that would be a `PathBuf` allocation per segment).
+        send_result.map_err(|_| disconnected_error(&self.path))?;
+        // `PUMP_INFLIGHT_SEGMENTS` is process-global (one gauge feeds
+        // Prometheus for every pump this process ever opens), so it cannot
+        // be asserted `<= this pump's depth` in general — concurrently open
+        // pumps each contribute to the same gauge. Invariant 1's per-pump
+        // "at most depth+1 segments exist, each owned by exactly one side at
+        // a time" is instead structural here: `full`/`free` are each sized
+        // `depth + 1` and pre-filled exactly once at open, so no send can
+        // ever create a segment that did not already exist.
+        PUMP_INFLIGHT_SEGMENTS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Check the flusher's one-slot error channel before every send
+    /// (decisions.md D2 step 1): `try_recv`, never blocking.
+    fn check_error_async(&mut self) -> Result<()> {
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("check_error_async only runs on the async backend");
+        let pending = backend.err_rx.try_recv();
+        // `self.path` is only touched when an error was actually pending —
+        // never cloned on the hot (no-pending-error) path.
+        match pending {
+            Ok(err) => Err(wrap_sink_error(
+                &self.path,
+                err.offset,
+                Error::Io(io::Error::other(err.message)),
+            )),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Get the next segment to fill: from the thread-local batch if one is
+    /// already known free, otherwise block for one (D7 §3 "Producer": one
+    /// channel crossing per batch, not per segment).
+    fn take_or_wait_for_segment(&mut self) -> Result<AlignedBuf> {
+        {
+            let backend = self
+                .backend
+                .as_async_mut()
+                .expect("take_or_wait_for_segment only runs on the async backend");
+            if let Some(buf) = backend.local_free.pop_front() {
+                // No `record_segment_returned()` here: that accounting
+                // happens once, when a segment actually arrives via `free`
+                // (below, or in the drain loop) — popping it back out of the
+                // already-primed local batch later is reuse, not a second
+                // return, and double-counting would eventually underflow the
+                // (unsigned) gauge.
+                return Ok(buf);
+            }
+        }
+        let started = Instant::now();
+        let buf = self.wait_for_free_segment_blocking()?;
+        record_blocked_free(started.elapsed());
+        record_segment_returned();
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("take_or_wait_for_segment only runs on the async backend");
+        // Opportunistically drain whatever else is already ready without
+        // blocking again (D7 §3): one channel crossing services this whole
+        // batch, not one per segment (CD4).
+        for extra in backend.free_rx.try_iter() {
+            backend.local_free.push_back(extra);
+            record_segment_returned();
+        }
+        Ok(buf)
+    }
+
+    /// Block for a free segment: a `select!` over the `free` channel, the
+    /// abort signal's `closed()`, and a one-shot stall watchdog timer (D7 —
+    /// never a `recv_timeout` loop). On the first `after(STALL_THRESHOLD)`
+    /// fire it logs the WARN edge once and counts it, then goes back to a
+    /// plain (untimed) blocking `select!` on data and abort, logging one INFO
+    /// on recovery — never a periodic wake-up (CD2).
+    ///
+    /// `crossbeam_channel::after()` allocates its one-shot timer channel on
+    /// every call (measured directly: 1 allocation per `after()` call,
+    /// independent of `select!` itself, which is allocation-free for a
+    /// same-typed or heterogeneous small arm count). Arming that watchdog is
+    /// only actually needed when this call is genuinely going to block, so a
+    /// non-blocking `select! { ..., default => ... }` attempt runs first —
+    /// itself a single, immediate, allocation-free check, never a retry loop
+    /// (D7's "no polling" bars a *repeated* non-blocking check, not one). On
+    /// an unthrottled sink (the flusher keeps up) this is the only branch
+    /// steady-state traffic ever takes, so the hot path stays allocation-free
+    /// (L6 contention budget, `tests/pump_async_alloc.rs`); only a genuine,
+    /// real wait pays `after()`'s one-time allocation, which is immaterial
+    /// next to the blocking wait itself.
+    fn wait_for_free_segment_blocking(&mut self) -> Result<AlignedBuf> {
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("wait_for_free_segment_blocking only runs on the async backend");
+        let quick = select! {
+            recv(backend.free_rx) -> seg => Some(seg.map_err(|_| disconnected_error(&self.path))),
+            recv(backend.abort.closed()) -> _ => {
+                PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Some(Err(aborted_error(&self.path)))
+            },
+            default => None,
+        };
+        if let Some(result) = quick {
+            return result;
+        }
+        #[cfg(test)]
+        PUMP_PARK_COUNT.with(|c| c.set(c.get() + 1));
+        // No `Receiver::clone()` here (that would allocate on what can be the
+        // hot path whenever the flusher is the bottleneck): `backend` and
+        // `self.path` are disjoint fields, so both can be borrowed at once,
+        // and `select!` takes the channels by reference.
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("wait_for_free_segment_blocking only runs on the async backend");
+        select! {
+            recv(backend.free_rx) -> seg => return seg.map_err(|_| disconnected_error(&self.path)),
+            recv(backend.abort.closed()) -> _ => {
+                PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return Err(aborted_error(&self.path));
+            },
+            recv(after(STALL_THRESHOLD)) -> _ => {},
+        };
+        let depth = self
+            .backend
+            .as_async_mut()
+            .expect("wait_for_free_segment_blocking only runs on the async backend")
+            .depth;
+        tracing::warn!(
+            path = %self.path.display(),
+            stall_seconds = STALL_THRESHOLD.as_secs_f64(),
+            depth,
+            "flusher stalled: producer has waited past the stall threshold for a free segment"
+        );
+        PUMP_STALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("wait_for_free_segment_blocking only runs on the async backend");
+        let result = select! {
+            recv(backend.free_rx) -> seg => seg.map_err(|_| disconnected_error(&self.path)),
+            recv(backend.abort.closed()) -> _ => {
+                PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                Err(aborted_error(&self.path))
+            },
+        };
+        if result.is_ok() {
+            tracing::info!(path = %self.path.display(), "flusher recovered: a free segment arrived");
+        }
+        result
+    }
+
+    /// Flush the final block-aligned prefix, zero-pad and write/send the last
     /// partial block, sync durably, trim any padding, and return the exact
     /// logical length. Consumes the pump.
-    pub(crate) fn finish(mut self) -> Result<u64> {
+    pub fn finish(self) -> Result<u64> {
+        match &self.backend {
+            PumpBackend::Sync { .. } => self.finish_sync(),
+            PumpBackend::Async(_) => self.finish_async(),
+        }
+    }
+
+    fn finish_sync(mut self) -> Result<u64> {
         self.finished = true;
         let flush_len = full_block_prefix(self.filled, self.block);
+        let PumpBackend::Sync { sink } = &mut self.backend else {
+            unreachable!("finish_sync only runs on the sync backend")
+        };
+        let cur = self
+            .current
+            .as_mut()
+            .expect("sync current is always present");
         if flush_len > 0 {
             let offset = self.physical;
-            self.sink
-                .pwrite(&self.current.as_slice()[..flush_len], offset)
+            sink.pwrite(&cur.as_slice()[..flush_len], offset)
                 .map_err(|e| wrap_sink_error(&self.path, offset, e))?;
             self.wrote_anything = true;
             self.physical += flush_len as u64;
@@ -465,52 +1336,144 @@ impl AlignedPump {
         let tail = self.filled - flush_len;
         let logical = self.physical + tail as u64;
         if tail > 0 {
-            // Zero-pad the partial block to a full aligned block, write it, then
-            // truncate the padding off — the standard O_DIRECT tail technique.
+            // Zero-pad the partial block to a full aligned block, write it,
+            // then truncate the padding off — the standard O_DIRECT tail
+            // technique.
             let block = self.block;
-            self.current.as_mut_slice()[flush_len + tail..flush_len + block].fill(0);
+            cur.as_mut_slice()[flush_len + tail..flush_len + block].fill(0);
             let offset = self.physical;
-            self.sink
-                .pwrite(
-                    &self.current.as_slice()[flush_len..flush_len + block],
-                    offset,
-                )
+            sink.pwrite(&cur.as_slice()[flush_len..flush_len + block], offset)
                 .map_err(|e| wrap_sink_error(&self.path, offset, e))?;
             self.wrote_anything = true;
             self.physical += block as u64;
         }
-        self.sink
-            .sync_data()
+        sink.sync_data()
             .map_err(|e| wrap_sink_error(&self.path, self.physical, e))?;
         if tail > 0 {
-            self.sink
-                .set_len(logical)
+            sink.set_len(logical)
                 .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
-            self.sink
-                .sync_data()
+            sink.sync_data()
                 .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
         }
         if self.mode == DirectMode::Buffered {
-            // Degraded path used the page cache — drop the pages we just wrote
-            // so they cannot drive the writeback storm this pump exists to avoid.
-            self.sink
-                .fadvise_dontneed()
+            // Degraded path used the page cache — drop the pages we just
+            // wrote so they cannot drive the writeback storm this pump
+            // exists to avoid.
+            sink.fadvise_dontneed()
                 .map_err(|e| wrap_sink_error(&self.path, logical, e))?;
         }
         crate::direct::record_write_completion(logical);
         Ok(logical)
     }
+
+    fn finish_async(mut self) -> Result<u64> {
+        self.finished = true;
+        let mut logical = self.physical;
+        let mut tail_padded = false;
+        if let Some(mut buf) = self.current.take() {
+            if self.filled > 0 {
+                let block = self.block;
+                let flush_len = full_block_prefix(self.filled, block);
+                let tail = self.filled - flush_len;
+                logical = self.physical + flush_len as u64 + tail as u64;
+                let send_len = if tail > 0 {
+                    tail_padded = true;
+                    buf.as_mut_slice()[flush_len + tail..flush_len + block].fill(0);
+                    flush_len + block
+                } else {
+                    flush_len
+                };
+                let offset = self.physical;
+                self.physical += send_len as u64;
+                self.wrote_anything = true;
+                self.check_error_async()?;
+                self.send_filled_low_level(Filled {
+                    buf,
+                    len: send_len,
+                    offset,
+                })?;
+            }
+            // else: nothing was staged; `buf` (a still-untouched spare
+            // segment) is simply dropped/freed here — never sent, never
+            // written, exactly like the depth-0 path writing nothing when
+            // `filled == 0`.
+        }
+        let path = self.path.clone();
+        let mode = self.mode;
+        let backend = self
+            .backend
+            .as_async_mut()
+            .expect("finish_async only runs on the async backend");
+        match backend.shutdown() {
+            ShutdownResult::AlreadyShutdown => {
+                unreachable!("finish shuts the flusher down exactly once")
+            }
+            ShutdownResult::Panicked(msg) => Err(wrap_sink_error(
+                &path,
+                self.physical,
+                Error::Io(io::Error::other(format!(
+                    "write pump flusher thread panicked: {msg}"
+                ))),
+            )),
+            ShutdownResult::Failed(err) => Err(wrap_sink_error(
+                &path,
+                err.offset,
+                Error::Io(io::Error::other(err.message)),
+            )),
+            ShutdownResult::Clean(mut sink) => {
+                sink.sync_data()
+                    .map_err(|e| wrap_sink_error(&path, self.physical, e))?;
+                if tail_padded {
+                    sink.set_len(logical)
+                        .map_err(|e| wrap_sink_error(&path, logical, e))?;
+                    sink.sync_data()
+                        .map_err(|e| wrap_sink_error(&path, logical, e))?;
+                }
+                if mode == DirectMode::Buffered {
+                    sink.fadvise_dontneed()
+                        .map_err(|e| wrap_sink_error(&path, logical, e))?;
+                }
+                crate::direct::record_write_completion(logical);
+                Ok(logical)
+            }
+        }
+    }
 }
 
 impl Drop for AlignedPump {
-    /// Mirrors the flusher's own drop contract (`architecture.md` § Drop
-    /// without finish): if the pump is dropped without `finish` ever running,
-    /// and it had already handed at least one segment to the sink, that is a
-    /// caller bug worth a WARN naming the path — the file is left for the
-    /// caller's own staging cleanup, exactly as `DirectWriter` always
-    /// documented.
+    /// Mirrors `finish`'s own shutdown contract (architecture.md § Drop
+    /// without finish): if the pump is dropped without `finish` ever
+    /// running, disconnect and join the flusher (if any — L6: no thread may
+    /// outlive its pump) and, if anything had already been written or handed
+    /// off, WARN naming the path. The file is left for the caller's own
+    /// staging cleanup, exactly as `DirectWriter` always documented.
     fn drop(&mut self) {
-        if !self.finished && self.wrote_anything {
+        if self.finished {
+            return;
+        }
+        if let PumpBackend::Async(backend) = &mut self.backend {
+            match backend.shutdown() {
+                ShutdownResult::AlreadyShutdown => {}
+                ShutdownResult::Panicked(msg) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = msg,
+                        "AlignedPump dropped without finish(); the flusher thread also panicked"
+                    );
+                    return;
+                }
+                ShutdownResult::Failed(err) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        error = err.message,
+                        "AlignedPump dropped without finish(); the flusher also reported an error"
+                    );
+                    return;
+                }
+                ShutdownResult::Clean(_sink) => {}
+            }
+        }
+        if self.wrote_anything {
             tracing::warn!(
                 path = %self.path.display(),
                 "AlignedPump dropped without finish(); on-disk content for this \
@@ -520,40 +1483,34 @@ impl Drop for AlignedPump {
     }
 }
 
-/// Test-only [`SegmentSink`] doubles (T-032). Compiled for this crate's own
-/// unit/integration tests (`cfg(test)`) and, behind the `test-support`
-/// feature, as part of the crate's compiled dev-support surface generally.
-/// Everything here is `pub(crate)` — there is no cross-crate entry point yet,
-/// since [`AlignedPump`] and [`SegmentSink`] are themselves crate-internal.
-/// T-033/T-038 add the `pub` seam sibling crates (e.g. `ferrosa-storage`,
-/// already wired with a `test-support`-featured dev-dependency on this crate)
-/// need to inject faults through.
-// The `test-support` feature compiles this module outside `cfg(test)` too
-// (so it is part of the crate's compiled dev-support surface, matching
-// `tests/support/mod.rs`'s `#[allow(dead_code)]` pattern for the same
-// reason), but every item here is `pub(crate)`: with the feature on and
-// `cfg(test)` off, nothing in the crate's own non-test code calls any of
-// it — there is no cross-crate entry point until T-033/T-038 add one. That
-// is a real, temporary gap in reachability, not a mistake to silence away
-// with dead code the compiler should have caught; the crate's own
-// `pump_sync_*` tests (`cfg(test)`) exercise every item here today.
+/// Test-only [`SegmentSink`] doubles (T-032/T-033). Compiled for this crate's
+/// own unit/integration tests (`cfg(test)`) and, behind the `test-support`
+/// feature, as part of the crate's compiled dev-support surface generally —
+/// `pub` (T-033) so `tests/pump_async_*` and, later, sibling crates such as
+/// `ferrosa-storage` can inject faults through a `test-support`-featured
+/// dev-dependency.
 #[cfg_attr(not(test), allow(dead_code))]
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::{DirectMode, Error, Result, SegmentSink};
     use std::collections::HashMap;
     use std::io;
-    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// One recorded [`SegmentSink::pwrite`] call: its offset, length, and the
-    /// buffer's address — the raw material for the alignment assertions (L3).
+    use crossbeam_channel::{Receiver, Sender};
+
+    /// One recorded [`SegmentSink::pwrite`]/[`SegmentSink::pwritev`] call:
+    /// its offset, total length, the address of its first buffer, and how
+    /// many segments it coalesced (`1` for a plain `pwrite`; `>1` proves a
+    /// batched `pwritev` — CD3) — the raw material for the alignment
+    /// assertions (L3) and the batching assertions (CD3).
     #[derive(Debug, Clone, Copy)]
-    pub(crate) struct RecordedWrite {
+    pub struct RecordedWrite {
         pub offset: u64,
         pub len: usize,
         pub addr: usize,
+        pub batch: usize,
     }
 
     #[derive(Default)]
@@ -567,53 +1524,54 @@ pub(crate) mod test_support {
 
     /// A cloneable handle onto a [`RecordingSink`]'s (or a sink built on one,
     /// like [`FaultySink`]/[`GateSink`]) recorded state. Needed because
-    /// `AlignedPump::open` takes the sink by `Box<dyn SegmentSink>`, so once a
-    /// sink is handed to a pump the concrete type — and any inherent
-    /// introspection method on it — is gone; this is the only way tests can
-    /// still see what actually landed after `write_all`/`finish`.
+    /// `AlignedPump::open`/`open_with_depth` take the sink by
+    /// `Box<dyn SegmentSink>`, so once a sink is handed to a pump the
+    /// concrete type — and any inherent introspection method on it — is
+    /// gone; this is the only way tests can still see what actually landed
+    /// after `write_all`/`finish`.
     #[derive(Clone)]
-    pub(crate) struct RecordingHandle(Arc<Mutex<RecordingInner>>);
+    pub struct RecordingHandle(Arc<Mutex<RecordingInner>>);
 
     impl RecordingHandle {
         fn lock(&self) -> std::sync::MutexGuard<'_, RecordingInner> {
             self.0.lock().unwrap_or_else(|poison| poison.into_inner())
         }
 
-        pub(crate) fn writes(&self) -> Vec<RecordedWrite> {
+        pub fn writes(&self) -> Vec<RecordedWrite> {
             self.lock().writes.clone()
         }
 
         /// The bytes actually stored — what a real disk would hold after
         /// every call, faulted or not.
-        pub(crate) fn bytes(&self) -> Vec<u8> {
+        pub fn bytes(&self) -> Vec<u8> {
             self.lock().bytes.clone()
         }
 
-        pub(crate) fn sync_data_calls(&self) -> usize {
+        pub fn sync_data_calls(&self) -> usize {
             self.lock().sync_data_calls
         }
 
-        pub(crate) fn set_len_calls(&self) -> Vec<u64> {
+        pub fn set_len_calls(&self) -> Vec<u64> {
             self.lock().set_len_calls.clone()
         }
 
-        pub(crate) fn fadvise_calls(&self) -> usize {
+        pub fn fadvise_calls(&self) -> usize {
             self.lock().fadvise_calls
         }
     }
 
     /// An in-memory [`SegmentSink`] that reconstructs the file it would have
     /// produced and records every call for direct assertion — alignment,
-    /// offset contiguity, and call counts — without touching disk. Returns a
-    /// [`RecordingHandle`] alongside itself so tests can inspect state after
-    /// the sink is boxed into an `AlignedPump`.
-    pub(crate) struct RecordingSink {
+    /// offset contiguity, call counts, and batching — without touching disk.
+    /// Returns a [`RecordingHandle`] alongside itself so tests can inspect
+    /// state after the sink is boxed into an `AlignedPump`.
+    pub struct RecordingSink {
         state: Arc<Mutex<RecordingInner>>,
         mode: DirectMode,
     }
 
     impl RecordingSink {
-        pub(crate) fn new(mode: DirectMode) -> (Self, RecordingHandle) {
+        pub fn new(mode: DirectMode) -> (Self, RecordingHandle) {
             let state = Arc::new(Mutex::new(RecordingInner::default()));
             (
                 Self {
@@ -629,22 +1587,37 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
         }
+
+        fn record_write(&mut self, bufs: &[&[u8]], offset: u64, batch: usize) -> Result<()> {
+            let total: usize = bufs.iter().map(|b| b.len()).sum();
+            let addr = bufs.first().map(|b| b.as_ptr() as usize).unwrap_or(0);
+            let mut inner = self.lock();
+            inner.writes.push(RecordedWrite {
+                offset,
+                len: total,
+                addr,
+                batch,
+            });
+            let end = offset as usize + total;
+            if inner.bytes.len() < end {
+                inner.bytes.resize(end, 0);
+            }
+            let mut pos = offset as usize;
+            for buf in bufs {
+                inner.bytes[pos..pos + buf.len()].copy_from_slice(buf);
+                pos += buf.len();
+            }
+            Ok(())
+        }
     }
 
     impl SegmentSink for RecordingSink {
         fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
-            let mut inner = self.lock();
-            inner.writes.push(RecordedWrite {
-                offset,
-                len: buf.len(),
-                addr: buf.as_ptr() as usize,
-            });
-            let end = offset as usize + buf.len();
-            if inner.bytes.len() < end {
-                inner.bytes.resize(end, 0);
-            }
-            inner.bytes[offset as usize..end].copy_from_slice(buf);
-            Ok(())
+            self.record_write(&[buf], offset, 1)
+        }
+
+        fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+            self.record_write(bufs, offset, bufs.len().max(1))
         }
 
         fn sync_data(&mut self) -> Result<()> {
@@ -677,7 +1650,7 @@ pub(crate) mod test_support {
     /// asked for, and only a digest comparison against the producer-side
     /// `AlignedPump::digest()` can catch them.
     #[derive(Debug, Clone)]
-    pub(crate) enum Fault {
+    pub enum Fault {
         Eio,
         Enospc,
         ShortWrite(usize),
@@ -698,16 +1671,17 @@ pub(crate) mod test_support {
     }
 
     /// A [`SegmentSink`] that plays back one [`Fault`] per scripted call
-    /// index (a single counter shared across every method, in call order),
-    /// otherwise delegating to an inner [`RecordingSink`].
-    pub(crate) struct FaultySink {
+    /// index (a single counter shared across every method, in call order —
+    /// `pwritev` counts as one call, whatever it coalesces), otherwise
+    /// delegating to an inner [`RecordingSink`].
+    pub struct FaultySink {
         inner: RecordingSink,
         script: HashMap<usize, Fault>,
         call_index: usize,
     }
 
     impl FaultySink {
-        pub(crate) fn new(mode: DirectMode) -> (Self, RecordingHandle) {
+        pub fn new(mode: DirectMode) -> (Self, RecordingHandle) {
             let (inner, handle) = RecordingSink::new(mode);
             (
                 Self {
@@ -721,7 +1695,7 @@ pub(crate) mod test_support {
 
         /// Play `fault` back on the call (0-based, across every trait method
         /// in call order) at `call_index`.
-        pub(crate) fn at(mut self, call_index: usize, fault: Fault) -> Self {
+        pub fn at(mut self, call_index: usize, fault: Fault) -> Self {
             self.script.insert(call_index, fault);
             self
         }
@@ -731,61 +1705,88 @@ pub(crate) mod test_support {
             self.call_index += 1;
             self.script.get(&idx).cloned()
         }
-    }
 
-    impl SegmentSink for FaultySink {
-        fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
+        fn apply(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
             match self.next_fault() {
                 Some(Fault::Eio) => Err(injected_error("EIO", offset)),
                 Some(Fault::Enospc) => Err(injected_error("ENOSPC", offset)),
                 Some(Fault::Panic) => {
-                    panic!("FaultySink: injected panic at pwrite offset {offset}")
+                    panic!("FaultySink: injected panic at pwrite/pwritev offset {offset}")
                 }
                 Some(Fault::ShortWrite(n)) => {
                     // A defective sink that silently accepts fewer bytes than
                     // asked for while still reporting success — a real
                     // `SegmentSink` must never do this (FileSink retries
                     // internally instead); this exercises the digest check
-                    // that catches a sink which does.
-                    let n = n.min(buf.len());
-                    self.inner.pwrite(&buf[..n], offset)
+                    // that catches a sink which does. Truncates the whole
+                    // coalesced write to its first `n` bytes.
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let n = n.min(total);
+                    let mut remaining = n;
+                    let mut truncated: Vec<u8> = Vec::with_capacity(n);
+                    for buf in bufs {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(buf.len());
+                        truncated.extend_from_slice(&buf[..take]);
+                        remaining -= take;
+                    }
+                    self.inner.record_write(&[&truncated], offset, bufs.len())
                 }
                 Some(Fault::DropSilently) => {
                     // Pretend success without storing the real bytes. The
                     // sentinel can never equal legitimate corpus data, so the
                     // digest mismatch is guaranteed, not probabilistic.
-                    let sentinel = vec![0x5Au8; buf.len()];
-                    self.inner.pwrite(&sentinel, offset)
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let sentinel = vec![0x5Au8; total];
+                    self.inner.record_write(&[&sentinel], offset, bufs.len())
                 }
                 Some(Fault::WrongOffset(delta)) => {
                     let bad_offset = (offset as i64 + delta).max(0) as u64;
-                    self.inner.pwrite(buf, bad_offset)
+                    self.inner.record_write(bufs, bad_offset, bufs.len())
                 }
                 Some(Fault::Duplicate) => {
-                    // Store this segment correctly, then stomp on the
-                    // immediately preceding segment's slot with it too —
+                    // Store this write correctly, then stomp on the
+                    // immediately preceding equal-sized slot with it too —
                     // simulating a re-sent write landing at the wrong place.
-                    self.inner.pwrite(buf, offset)?;
-                    if let Some(prev_offset) = offset.checked_sub(buf.len() as u64) {
-                        self.inner.pwrite(buf, prev_offset)?;
+                    self.inner.record_write(bufs, offset, bufs.len())?;
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    if let Some(prev_offset) = offset.checked_sub(total as u64) {
+                        self.inner.record_write(bufs, prev_offset, bufs.len())?;
                     }
                     Ok(())
                 }
                 Some(Fault::StaleBytes) => {
-                    let stale = vec![0xEEu8; buf.len()];
-                    self.inner.pwrite(&stale, offset)
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let stale = vec![0xEEu8; total];
+                    self.inner.record_write(&[&stale], offset, bufs.len())
                 }
                 Some(Fault::BitFlip(byte, bit)) => {
-                    let mut corrupted = buf.to_vec();
+                    let total: usize = bufs.iter().map(|b| b.len()).sum();
+                    let mut corrupted: Vec<u8> = Vec::with_capacity(total);
+                    for buf in bufs {
+                        corrupted.extend_from_slice(buf);
+                    }
                     if let Some(b) = corrupted.get_mut(byte) {
                         *b ^= 1 << (bit % 8);
                     }
-                    self.inner.pwrite(&corrupted, offset)
+                    self.inner.record_write(&[&corrupted], offset, bufs.len())
                 }
                 Some(Fault::FsyncFail) | Some(Fault::SetLenFail) | None => {
-                    self.inner.pwrite(buf, offset)
+                    self.inner.record_write(bufs, offset, bufs.len())
                 }
             }
+        }
+    }
+
+    impl SegmentSink for FaultySink {
+        fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
+            self.apply(&[buf], offset)
+        }
+
+        fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+            self.apply(bufs, offset)
         }
 
         fn sync_data(&mut self) -> Result<()> {
@@ -815,10 +1816,11 @@ pub(crate) mod test_support {
     }
 
     /// A permit-gated [`SegmentSink`]: every call blocks until the test sends
-    /// a permit, so multi-thread pump tests (T-033 onward) can pin exact
+    /// a permit, so multi-thread pump tests (T-033) can pin exact
     /// interleavings. Every wait has a timeout (default 2s) that fails the
-    /// test instead of hanging it — no wait here is ever unbounded.
-    pub(crate) struct GateSink {
+    /// test instead of hanging it — no wait here is ever unbounded. Built on
+    /// `crossbeam_channel` (D7/CD5), not `std::sync::mpsc`.
+    pub struct GateSink {
         inner: RecordingSink,
         permits: Receiver<()>,
         timeout: Duration,
@@ -827,12 +1829,9 @@ pub(crate) mod test_support {
     impl GateSink {
         /// Build a gated sink, the [`Sender`] tests use to release it (one
         /// permit per blocked call), and a [`RecordingHandle`] onto its state.
-        pub(crate) fn new(
-            mode: DirectMode,
-            timeout: Duration,
-        ) -> (Self, Sender<()>, RecordingHandle) {
+        pub fn new(mode: DirectMode, timeout: Duration) -> (Self, Sender<()>, RecordingHandle) {
             let (inner, handle) = RecordingSink::new(mode);
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = crossbeam_channel::unbounded();
             (
                 Self {
                     inner,
@@ -862,6 +1861,11 @@ pub(crate) mod test_support {
         fn pwrite(&mut self, buf: &[u8], offset: u64) -> Result<()> {
             self.wait_for_permit()?;
             self.inner.pwrite(buf, offset)
+        }
+
+        fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
+            self.wait_for_permit()?;
+            self.inner.pwritev(bufs, offset)
         }
 
         fn sync_data(&mut self) -> Result<()> {
@@ -1355,5 +2359,509 @@ mod pump_sync_tests {
         pump.write_all(&vec![9u8; 4096])
             .expect("write_all must proceed once a permit is granted");
         assert_eq!(handle.bytes().len(), 4096);
+    }
+}
+
+/// T-033: the `depth >= 1` background flusher (crossbeam channels, thread-local
+/// batching, coalesced `pwritev`, abort, stall watchdog, metrics).
+#[cfg(test)]
+mod pump_async_tests {
+    use super::test_support::*;
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn never_abort() -> Arc<dyn AbortSignal> {
+        Arc::new(NeverAbort::new())
+    }
+
+    fn open_recording_async(
+        block: usize,
+        segment: usize,
+        depth: usize,
+    ) -> (AlignedPump, RecordingHandle) {
+        let (sink, handle) = RecordingSink::new(DirectMode::Direct);
+        let pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("async.db"),
+            depth,
+            never_abort(),
+        );
+        (pump, handle)
+    }
+
+    fn write_pattern(pump: &mut AlignedPump, len: usize, chunk: usize) -> Vec<u8> {
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        for c in data.chunks(chunk.max(1)) {
+            pump.write_all(c).expect("write_all");
+        }
+        data
+    }
+
+    /// Mode/depth parity: for every depth 0..=4, streaming the same bytes
+    /// through the pump produces byte-identical output to depth 0.
+    #[test]
+    fn pump_async_depth_parity_matches_depth_zero_byte_for_byte() {
+        let block = 4096usize;
+        let segment = 2 * block;
+        for &len in &[0usize, 1, block - 1, block, segment + 1, 3 * segment + 37] {
+            let (mut baseline, baseline_handle) = open_recording_async(block, segment, 0);
+            let data = write_pattern(&mut baseline, len, 577);
+            let baseline_logical = baseline.finish().expect("depth0 finish");
+
+            for depth in 1..=4usize {
+                let (mut pump, handle) = open_recording_async(block, segment, depth);
+                for chunk in data.chunks(577) {
+                    pump.write_all(chunk).expect("write_all");
+                }
+                let logical = pump.finish().expect("finish");
+                assert_eq!(logical, baseline_logical, "depth={depth} len={len}");
+                assert_eq!(
+                    handle.bytes(),
+                    baseline_handle.bytes(),
+                    "depth={depth} len={len}: byte-identical to depth 0"
+                );
+            }
+        }
+    }
+
+    /// L4: the full `FaultySink` matrix, at depths 1..=4, for both hard
+    /// failures (surface as `Err`) and silent corruptions (undetectable
+    /// except via the producer-side digest — the real device write now
+    /// happens on the flusher thread, so this also proves the digest is
+    /// still computed purely from what `write_all` was given).
+    #[test]
+    fn pump_async_faulty_sink_hard_failures_surface_as_err() {
+        let block = 4096usize;
+        let segment = 3 * block;
+        for depth in 1..=4usize {
+            for fault in [Fault::Eio, Fault::Enospc] {
+                let (sink, _handle) = FaultySink::new(DirectMode::Direct);
+                let sink = sink.at(0, fault.clone());
+                let mut pump = AlignedPump::open_with_depth(
+                    Box::new(sink),
+                    block,
+                    segment,
+                    PathBuf::from("fault-async.db"),
+                    depth,
+                    never_abort(),
+                );
+                // One full segment guarantees a send to `full`; the error
+                // surfaces either from that `write_all` (if the flusher is
+                // fast) or from `finish` (if it hasn't processed it yet) —
+                // both are "the next channel operation", never silently.
+                let write_result = pump.write_all(&vec![7u8; 4 * segment]);
+                let result = match write_result {
+                    Err(e) => Err(e),
+                    Ok(()) => pump.finish().map(|_| ()),
+                };
+                assert!(result.is_err(), "depth={depth} fault={fault:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pump_async_faulty_sink_silent_corruption_is_only_caught_by_digest_comparison() {
+        let block = 4096usize;
+        let segment = 2 * block;
+        let data: Vec<u8> = (0..(4 * segment + 17)).map(|i| (i % 251) as u8).collect();
+
+        let faults: &[(&str, Fault)] = &[
+            ("short_write", Fault::ShortWrite(block)),
+            ("drop_silently", Fault::DropSilently),
+            ("stale_bytes", Fault::StaleBytes),
+            ("bit_flip", Fault::BitFlip(3, 2)),
+        ];
+
+        for depth in 1..=4usize {
+            for (name, fault) in faults {
+                let (sink, handle) = FaultySink::new(DirectMode::Direct);
+                let sink = sink.at(0, fault.clone());
+                let mut pump = AlignedPump::open_with_depth(
+                    Box::new(sink),
+                    block,
+                    segment,
+                    PathBuf::from("corrupt-async.db"),
+                    depth,
+                    never_abort(),
+                );
+                for chunk in data.chunks(577) {
+                    pump.write_all(chunk)
+                        .unwrap_or_else(|e| panic!("depth={depth} {name}: write_all: {e}"));
+                }
+                let reported_digest = pump.digest();
+                let logical = pump.finish().unwrap_or_else(|e| {
+                    panic!("depth={depth} {name}: a silent fault must not surface as Err: {e}")
+                });
+                assert_eq!(logical, data.len() as u64, "depth={depth} {name}");
+                let actual_digest = crc32fast::hash(&handle.bytes());
+                assert_ne!(
+                    reported_digest, actual_digest,
+                    "depth={depth} {name}: fault must be undetectable except via digest"
+                );
+            }
+        }
+    }
+
+    /// BP1/BP2: with the sink gated closed, the producer makes progress until
+    /// `depth + 1` segments exist (current + `depth` pre-filled spares), then
+    /// blocks — proven directly by timing (does the next full write finish
+    /// without a permit?), not by the process-global inflight gauge, which
+    /// is shared across every concurrently open pump in this test binary and
+    /// so cannot be bounded by any *one* pump's `depth`.
+    #[test]
+    fn pump_async_bounded_in_flight_then_blocks() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 2usize;
+        let (sink, tx, _handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(5));
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("bp1.db"),
+            depth,
+            never_abort(),
+        );
+        // `depth + 1` full segments — every buffer this pump owns — can be
+        // written without the gate ever opening (decisions.md D2: all
+        // `depth + 1` segments are pre-filled into `free` at open).
+        for _ in 0..=depth {
+            pump.write_all(&vec![1u8; segment]).expect("write_all");
+        }
+        // The next (`depth + 2`-th) full segment needs a buffer back from
+        // the flusher, which needs a permit that has not been sent yet — it
+        // must block.
+        let writer = std::thread::spawn(move || {
+            pump.write_all(&vec![1u8; segment]).expect("write_all");
+            pump
+        });
+        // Test-thread scaffolding only (D7's "no polling" bars the PUMP's own
+        // waits from sleeping, not a test giving a spawned thread a moment to
+        // reach its blocking point before asserting on it).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !writer.is_finished(),
+            "the (depth + 1)-th full segment must block without a free segment"
+        );
+        // Releasing one permit lets exactly the pending pwrite through, which
+        // frees a segment and unblocks the write.
+        tx.send(()).expect("release one permit");
+        let pump = writer.join().expect("writer thread must not panic");
+        drop(tx);
+        drop(pump);
+    }
+
+    /// BP4/CD1: releasing permits one at a time moves the producer exactly
+    /// one segment per permit, and a randomized set of open/close schedules
+    /// all produce byte-identical output to an unthrottled run (no lost
+    /// wakeup).
+    #[test]
+    fn pump_async_resume_one_permit_at_a_time_is_byte_identical() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 2usize;
+        let total_segments = 6usize;
+        let data: Vec<u8> = (0..(total_segments * segment))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        // Baseline: unthrottled RecordingSink.
+        let (baseline_sink, baseline_handle) = RecordingSink::new(DirectMode::Direct);
+        let mut baseline = AlignedPump::open_with_depth(
+            Box::new(baseline_sink),
+            block,
+            segment,
+            PathBuf::from("bp4-baseline.db"),
+            depth,
+            never_abort(),
+        );
+        baseline.write_all(&data).expect("write_all");
+        baseline.finish().expect("finish");
+
+        // Gated: run the producer on its own thread, releasing one permit at
+        // a time from this thread, and confirm no schedule ever loses or
+        // duplicates a byte.
+        for schedule_seed in 0..25u64 {
+            let (sink, tx, handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(2));
+            let mut pump = AlignedPump::open_with_depth(
+                Box::new(sink),
+                block,
+                segment,
+                PathBuf::from(format!("bp4-{schedule_seed}.db")),
+                depth,
+                never_abort(),
+            );
+            let data_clone = data.clone();
+            let writer = std::thread::spawn(move || -> Result<u64> {
+                pump.write_all(&data_clone)?;
+                pump.finish()
+            });
+            // A pseudo-random release order derived from the seed: mostly
+            // one at a time, occasionally a small burst, always eventually
+            // releasing enough permits to finish (there are at most
+            // `total_segments + 1` `SegmentSink` calls: pwrite(v)s plus
+            // sync_data/set_len).
+            let mut sent = 0usize;
+            let max_calls = total_segments + 4;
+            let mut state = schedule_seed.wrapping_mul(2654435761).wrapping_add(1);
+            while sent < max_calls {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let burst = 1 + (state >> 60) as usize % 2;
+                for _ in 0..burst {
+                    if sent >= max_calls {
+                        break;
+                    }
+                    tx.send(()).expect("send permit");
+                    sent += 1;
+                }
+            }
+            let logical = writer
+                .join()
+                .expect("writer thread must not panic")
+                .unwrap_or_else(|e| panic!("seed {schedule_seed}: {e}"));
+            assert_eq!(logical, data.len() as u64, "seed {schedule_seed}");
+            assert_eq!(
+                handle.bytes(),
+                baseline_handle.bytes(),
+                "seed {schedule_seed}: byte-identical regardless of release schedule"
+            );
+        }
+    }
+
+    /// BP5: failing the downstream (a hard error) while the producer is
+    /// parked waiting for a free segment returns `Err` promptly, and no
+    /// thread is left running.
+    #[test]
+    fn pump_async_failure_while_parked_returns_err_promptly_no_leaked_thread() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 1usize;
+        let (sink, _handle) = FaultySink::new(DirectMode::Direct);
+        // Fault the very first pwrite the flusher issues, so it fails and
+        // exits before ever releasing a segment back to `free` — the
+        // producer's second full segment then has nothing to wait for but a
+        // disconnected channel.
+        let sink = sink.at(0, Fault::Eio);
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("bp5.db"),
+            depth,
+            never_abort(),
+        );
+        // Fill and hand off `depth + 1` segments so the flusher has
+        // something to fail on and the producer must wait for a free one.
+        for _ in 0..(depth + 2) {
+            pump.write_all(&vec![9u8; segment]).ok();
+        }
+        let result = pump.write_all(&vec![9u8; segment]);
+        assert!(
+            result.is_err() || pump.finish().is_err(),
+            "a flusher failure must surface as Err from the next channel operation"
+        );
+    }
+
+    /// BP6/CD1: aborting while the producer is parked waiting for a free
+    /// segment returns `Err(Aborted)` promptly (well under the stall
+    /// threshold, since the abort channel closing wakes the `select!`
+    /// immediately rather than waiting for the timer arm).
+    #[test]
+    fn pump_async_abort_while_parked_returns_err_aborted_promptly() {
+        struct DirectAbort {
+            rx: Receiver<()>,
+        }
+        impl AbortSignal for DirectAbort {
+            fn is_aborted(&self) -> bool {
+                self.rx.try_recv() != Err(crossbeam_channel::TryRecvError::Empty)
+            }
+            fn closed(&self) -> &Receiver<()> {
+                &self.rx
+            }
+        }
+        let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(0);
+        let abort_signal: Arc<dyn AbortSignal> = Arc::new(DirectAbort { rx: cancel_rx });
+
+        let block = 4096usize;
+        let segment = block;
+        let depth = 1usize;
+        let (sink, tx_permit, _handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(5));
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("bp6.db"),
+            depth,
+            abort_signal,
+        );
+        // Saturate the ring so the next write must park on `free`.
+        for _ in 0..(depth + 1) {
+            let _ = pump.write_all(&vec![9u8; segment]);
+        }
+        let before_aborts = write_pump_aborts_total();
+        // `write_all`'s own elapsed time is measured and returned from
+        // INSIDE the thread, before `pump` (moved into the closure) drops:
+        // dropping a pump whose flusher is itself still parked on a gated
+        // device write (as it is here — no permit was ever sent) makes
+        // `Drop`'s own join wait out that unrelated wait, which would
+        // otherwise pollute this measurement of the producer-side abort
+        // latency the test actually cares about (BP6/CD1).
+        let handle = std::thread::spawn(move || {
+            let write_started = Instant::now();
+            let result = pump.write_all(&vec![9u8; segment]);
+            let write_elapsed = write_started.elapsed();
+            (result, write_elapsed, pump)
+        });
+        drop(cancel_tx); // trip the abort signal
+        let (result, write_elapsed, pump) = handle.join().expect("writer thread must not panic");
+        assert!(
+            write_elapsed < Duration::from_millis(500),
+            "abort must wake a parked wait promptly ({write_elapsed:?}), not wait for the \
+             stall timer"
+        );
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(write_pump_aborts_total() > before_aborts);
+        // Unblock the flusher's own gated call before dropping `pump`, so its
+        // `Drop` shutdown join does not itself wait out the GateSink's
+        // separate 5 s timeout — that would only be measuring an unrelated
+        // property (how long a stuck device write takes to give up).
+        drop(tx_permit);
+        drop(pump);
+    }
+
+    /// CD2/BP8: a gate held closed past the stall threshold logs exactly one
+    /// stall (counted in the metric) and the producer eventually proceeds
+    /// once released — proving the wait is `select!`-based (an immediate
+    /// resume, not bound to the next poll slice).
+    #[test]
+    fn pump_async_stall_past_threshold_counts_one_stall_then_recovers() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 1usize;
+        let (sink, tx, _handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(5));
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("stall.db"),
+            depth,
+            never_abort(),
+        );
+        for _ in 0..(depth + 1) {
+            pump.write_all(&vec![9u8; segment]).expect("write_all");
+        }
+        let before = write_pump_stalls_total();
+        let handle = std::thread::spawn(move || {
+            pump.write_all(&vec![9u8; segment]).expect("write_all");
+            pump
+        });
+        // Sleeping in the TEST thread (not the pump's own wait path) to let
+        // the stall threshold elapse before releasing — this is test
+        // scaffolding timing, not a pump poll loop.
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(STALL_THRESHOLD * 3);
+        tx.send(())
+            .expect("release the permit that unblocks the pwrite");
+        // The write itself already went through by the time we release the
+        // *next* permit set for finish; release generously.
+        for _ in 0..8 {
+            let _ = tx.send(());
+        }
+        let pump = handle.join().expect("writer thread must not panic");
+        pump.finish().ok();
+        assert!(
+            write_pump_stalls_total() > before,
+            "a gate held past the stall threshold must log exactly one stall edge"
+        );
+    }
+
+    /// CD3: several queued contiguous segments, all produced before any
+    /// permit is released, are written as one coalesced `pwritev`, with
+    /// output identical to the unbatched run. Deterministic, not
+    /// sleep-based: `write_all` for `segments` full writes never blocks
+    /// (`depth >= segments`, so every buffer comes from the initial `free`
+    /// pre-fill — decisions.md D2), so by the time it returns every segment
+    /// is already queued, before this test sends a single permit. The
+    /// flusher's first `pwritev` then blocks on that missing permit no
+    /// matter how many segments its first `try_iter()` sweep happened to
+    /// scoop up (1..=segments, whichever way OS scheduling split it); once
+    /// released, its second sweep drains everything left in one shot. Five
+    /// segments split any way between (at most) two sweeps always leaves the
+    /// larger sweep >= 3 (`ceil(5/2)`), so one of the (at most two) writes
+    /// always coalesces at least 3 segments, regardless of the split.
+    #[test]
+    fn pump_async_coalesces_contiguous_segments_into_one_pwritev() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 5usize;
+        let segments = 5usize;
+        let (sink, tx, handle) = GateSink::new(DirectMode::Direct, Duration::from_secs(5));
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("cd3.db"),
+            depth,
+            never_abort(),
+        );
+        let data: Vec<u8> = (0..(segments * segment)).map(|i| (i % 251) as u8).collect();
+        pump.write_all(&data).expect("write_all");
+        // Generous and pre-supplied: an unbounded channel buffers these
+        // regardless of when the flusher gets around to consuming them for
+        // its (at most two) gated `pwritev` calls plus `finish`'s `sync_data`.
+        for _ in 0..8 {
+            let _ = tx.send(());
+        }
+        let logical = pump.finish().expect("finish");
+        assert_eq!(logical, data.len() as u64);
+        assert_eq!(handle.bytes(), data);
+        let writes = handle.writes();
+        let batched = writes.iter().find(|w| w.batch >= 3);
+        assert!(
+            batched.is_some(),
+            "expected one write call coalescing >= 3 segments, got {writes:?}"
+        );
+    }
+
+    /// L6 contention budget / CD4: with an unthrottled sink, the flusher
+    /// keeps `free` topped up, so the producer's thread-local batch usually
+    /// already has a spare segment and it should almost never need to
+    /// actually park in `wait_for_free_segment_blocking` — certainly not
+    /// once per segment. `pump_park_count()` is itself a `thread_local!`
+    /// (see its doc comment), isolated from other tests' pumps parking on
+    /// other threads, so this bound is tight: at most a handful of parks
+    /// (the very first few segments, before the flusher has returned
+    /// anything) out of 20 segments streamed.
+    #[test]
+    fn pump_async_local_batch_costs_at_most_one_channel_receive_per_segment() {
+        let block = 4096usize;
+        let segment = block;
+        let depth = 3usize;
+        let (sink, handle) = RecordingSink::new(DirectMode::Direct);
+        let mut pump = AlignedPump::open_with_depth(
+            Box::new(sink),
+            block,
+            segment,
+            PathBuf::from("cd4.db"),
+            depth,
+            never_abort(),
+        );
+        let segments = 20usize;
+        let data: Vec<u8> = (0..(segments * segment)).map(|i| (i % 251) as u8).collect();
+        let parks_before = pump_park_count();
+        pump.write_all(&data).expect("write_all");
+        pump.finish().expect("finish");
+        let parks_delta = pump_park_count() - parks_before;
+        assert_eq!(handle.bytes(), data);
+        assert!(
+            parks_delta <= 10,
+            "unthrottled sink: expected only a handful of parks across {segments} \
+             segments (depth {depth}), saw {parks_delta}"
+        );
     }
 }

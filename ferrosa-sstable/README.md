@@ -118,7 +118,7 @@ resolution beyond the serialization header, or cluster routing.
 | `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`). **T-032: `DirectWriter` is now a thin wrapper over `pump::AlignedPump` at `depth = 0`.** Its public API (`create`/`mode`/`position`/`write_all`/`finish`) and on-disk behavior are unchanged — same tests pass unchanged — but the block it aligns to now comes from the real T-031 `dio_align` probe instead of a hardcoded `MIN_BLOCK` (4096), so Linux hosts whose true device alignment exceeds 4096 now write to it correctly instead of silently over-aligning |
 | `direct` (read side) | `DirectReadFile` — cache-bypassing positional reader (O_DIRECT / `F_NOCACHE`, aligned bounce buffer, any offset/length). Fallback to buffered reads + `POSIX_FADV_DONTNEED` is WARN-logged and counted in `direct_read_fallbacks_total` |
 | `dio_align` | `resolve_block`/`probe`/`block_for` — probes the true O_DIRECT alignment for a file via a raw `SYS_statx` syscall with `STATX_DIOALIGN` (D4), floor `MIN_BLOCK` (4096), ceiling `MAX_BLOCK` (64 KiB). Works on **gnu and musl** (the shipped `make build-musl` binary included): rather than call `libc::statx` — which `libc` 0.2.186 only compiles for `target_env = "gnu"` (the `stx_dio_*` fields, the FFI decl, and `STATX_DIOALIGN` are gated on a build-script-detected `musl_v1_2_3` cfg the crate doesn't control) — `probe` defines its own `#[repr(C)]` `KernelStatx` mirroring the stable kernel UAPI struct (compile-time size/offset asserts) and calls it through `libc::syscall(libc::SYS_statx, …)`, using only `libc::syscall`/`SYS_statx`/`AT_EMPTY_PATH`, which compile unconditionally on every Linux target. An `Unsupported` probe (old kernel, `ENOSYS`, or a filesystem reporting nothing usable) counts in `dio_align_probe_fallbacks_total` (rendered by `direct::render_prometheus`) and falls back to `MIN_BLOCK`; a probed value above `MAX_BLOCK` is `block_for`'s `Err(TooLarge)`, meaning the caller must not open that file with O_DIRECT at all. Logged once per device (`st_dev`) at INFO, bounded to 64 devices. **T-032 consumes this**: `pump::FileSink::create` calls `block_for` and, on `TooLarge`, falls back to buffered I/O (loud + counted in `direct_write_fallbacks_total`, the same counter `direct::open_bypassing`'s own O_DIRECT-rejection fallback uses) |
-| `pump` | `PumpConfig` — runtime tunables for the aligned write pump (`FERROSA_SSTABLE_WRITE_SEGMENT_BYTES`, `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH`), from T-030. **T-032 adds**: `SegmentSink` (`pwrite`/`sync_data`/`set_len`/`fadvise_dontneed`/`mode`, `pub(crate)`) — the seam every SSTable component write will go through; `FileSink`, the production implementation (opens with `direct::open_bypassing`'s flags plus the `dio_align` block probe); and `AlignedPump`, a synchronous (`depth = 0`) writer — one `AlignedBuf` segment allocated at `open`, one `SegmentSink::pwrite` per full segment (never a remainder shuffle, D5), `finish` pads/syncs/trims and returns the exact logical length, `digest()` exposes the producer-side `Digest.crc32` (T-011's `DigestCrc32`), and `Drop` without `finish` WARNs if anything was written. `direct::DirectWriter` is now a thin wrapper over it. Behind the `test-support` feature (and always under `cfg(test)`): `RecordingSink`, `FaultySink` (11 scripted fault kinds), `GateSink` (permit-gated, timeout-bounded) — all `pub(crate)` today; no cross-crate entry point exists until a later packet (T-033/T-038) makes `AlignedPump`/`SegmentSink` reachable from outside this crate. `depth >= 1` (a background flusher thread over bounded channels) is T-033 |
+| `pump` | `PumpConfig` — runtime tunables for the aligned write pump (`FERROSA_SSTABLE_WRITE_SEGMENT_BYTES`, `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH`), from T-030. `SegmentSink` (`pwrite`/`pwritev`/`sync_data`/`set_len`/`fadvise_dontneed`/`mode`) is the seam every SSTable component write goes through; `FileSink` is the production implementation (opens with `direct::open_bypassing`'s flags plus the `dio_align` block probe). **T-033 adds the `depth >= 1` background flusher**: `AlignedPump::open_with_depth` pre-fills `depth + 1` segments into a `crossbeam_channel::bounded` `free` channel and spawns a dedicated OS thread (never rayon/tokio) that owns the `SegmentSink` and drains a `full` channel of the same capacity, coalescing whatever it finds queued (`try_iter`) into one `SegmentSink::pwritev` per contiguous run (`FileSink`'s real `pwritev(2)`, reusing a `depth`-capacity iovec scratch buffer — allocation-free on its happy path). The producer's only wait is for a returned segment: a `select!` over `free`, the abort signal's `closed()`, and — only once a non-blocking `select!` attempt finds nothing ready (never a `recv_timeout` loop) — a one-shot `crossbeam_channel::after(10s)` stall watchdog (WARN + `write_pump_stalls_total` on fire, one INFO on recovery). A disconnected channel is always `Err`; the flusher sends at most one `PumpError` before exiting, and also returns its `Box<dyn SegmentSink>` (on a clean exit) or the error/panic (via `JoinHandle::join`) so `finish`/`Drop` can run the final `sync_data`/`set_len`/`fadvise_dontneed` against the exact state the flusher left behind. Thread-spawn failure falls back to the synchronous (`depth = 0`) pump, WARN + `write_pump_sync_fallbacks_total`. `T-021`'s `ferrosa_common::CancelToken` has not landed on this branch, so `AbortSignal`/`NeverAbort` are a local shim to be replaced at merge (see the doc comment on `AbortSignal`). `AlignedPump`, `SegmentSink`, `FileSink`, `AbortSignal`/`NeverAbort`, and `test_support` (`RecordingSink`, `FaultySink` — 11 scripted fault kinds, now also exercised through `pwritev` — and `GateSink`, rebuilt on `crossbeam_channel` instead of `std::sync::mpsc`) are all `pub` now (still `test-support`-feature-gated outside `cfg(test)`) — the cross-crate seam a later packet (T-038) and sibling crates like `ferrosa-storage` need. `clippy.toml` disallows `std::sync::mpsc::{channel,sync_channel}` and `std::thread::sleep` in this crate (D7/CD5) |
 | `scan` | `ReadAheadReader<R>` — one bounded window plus a background prefetch of the next window (≤ 2 windows resident, ≤ 1 read in flight). `FileReadAt::open_scan` composes it over `DirectReadFile` for compaction input; `parse_scan_window` validates `FERROSA_COMPACTION_READAHEAD_BYTES` |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |
 | `writer` | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]` |
@@ -150,7 +150,7 @@ constant per-partition memory.
 | I/O traits | `ReadAt`, `WriteAt`, `FileReadAt`, `FileWriteAt` |
 | Direct I/O | `direct::DirectWriter` (page-cache-bypassing sequential writer: O_DIRECT/`F_NOCACHE`), `direct::DirectReadFile`, `DirectMode`, `direct_write_{fallbacks,files,bytes}_total`, `direct_read_{fallbacks,files,bytes}_total` |
 | DIO alignment probe | `dio_align::{resolve_block, probe, block_for, ProbeResult, TooLarge, MAX_BLOCK}`, `dio_align::dio_align_probe_fallbacks_total` |
-| Write pump tunables | `pump::PumpConfig` (`from_env`, `effective_segment`), `pump::{SEGMENT_BYTES_ENV, QUEUE_DEPTH_ENV}` |
+| Write pump | `pump::PumpConfig` (`from_env`, `effective_segment`), `pump::{SEGMENT_BYTES_ENV, QUEUE_DEPTH_ENV}`; `pump::{AlignedPump, SegmentSink, FileSink, AbortSignal, NeverAbort}` (T-033, `pub`); metrics `pump::write_pump_{blocked_seconds_total_free, inflight_segments, stalls_total, aborts_total, sync_fallbacks_total}` |
 | Scan / read-ahead | `scan::ReadAheadReader::{new, with_prefetch}`, `FileReadAt::{open_scan, is_scan}`, `scan::parse_scan_window` |
 | Reader | `SSTableReader::{open, get_partition, get_clustering_row, may_contain_key, partitions_iter, seek_to_token, salvage, validate_data_extent, load_crc_table, load_digest, verify_digest}`, `SSTableComponents` |
 | Writer | `SSTableWriter::{new, new_file_backed, add_partition, finish, finish_to_directory}`, `WriteOptions`, `SSTableOutput`, `SSTableOutputFiles` |
@@ -164,9 +164,11 @@ constant per-partition memory.
 - **`ferrosa-common`** — `Token`, `DecoratedKey`, `PartitionKey`, `CellValue`,
   Murmur3 hashing, `Error`/`Result` (the shared types the format encodes).
 
-External: `crc32fast`, `libc` (O_DIRECT/`F_NOCACHE`/`posix_fadvise` for
-`direct::DirectWriter`), `lru`, `lz4_flex`, `memmap2`, `rayon`, `tracing`
-(loud fallback logging), `zstd`. **No async runtime** — positional I/O is
+External: `crc32fast`, `crossbeam-channel` (the `depth >= 1` write pump's
+`full`/`free`/error channels and stall-watchdog `select!`, T-033 — D7), `libc`
+(O_DIRECT/`F_NOCACHE`/`posix_fadvise`/`pwritev` for `direct::DirectWriter` and
+`pump::FileSink`), `lru`, `lz4_flex`, `memmap2`, `rayon`, `tracing` (loud
+fallback logging), `zstd`. **No async runtime** — positional I/O is
 synchronous; S3 wrappers live in `ferrosa-storage`.
 
 **Called by** (crates that depend on this):
@@ -183,6 +185,31 @@ byte-comparable, statistics, reader/writer round-trips) plus integration suites:
 `tests/cassandra_compat.rs` (binary-exact oracle vs Cassandra fixtures),
 `tests/property_tests.rs` (proptest round-trips), and
 `tests/p0_production_disk_replay.rs` (real on-disk replay regression).
+
+### Write pump tests (`pump_sync_`, `pump_async_`)
+
+`pump_sync_*` (depth 0, T-032) and `pump_async_*` (depth ≥ 1, T-033) live in
+`src/pump.rs` under `#[cfg(test)]`, plus `tests/pump_sync_alloc.rs` and
+`tests/pump_async_alloc.rs` (both require `--features test-support`) for the
+counting-allocator zero/near-zero-allocation regressions. The `pump_async_`
+suite covers: the full `FaultySink` matrix (hard failures and the six silent
+corruptions) at depth 1–4; mode/depth parity (0..=4 byte-identical to the same
+`RecordingSink`); bounded-in-flight-then-blocks and one-permit-at-a-time
+resume with 25 randomized gate schedules, all byte-identical (BP1/BP2/BP4);
+failure and abort while parked, both returning promptly with no leaked thread
+(BP5/BP6/CD1); the stall watchdog firing exactly once past
+`STALL_THRESHOLD` (shrunk to 50 ms under `cfg(test)`) with one WARN and one
+recovery INFO (CD2/BP8); `pwritev` coalescing ≥ 3 contiguous segments into one
+call, deterministically (5 segments split any way between at most two
+flusher sweeps always leaves the larger sweep ≥ 3 — CD3); and an L6 park-count
+contention budget via a `thread_local!` counter (CD4). `pump_async_alloc.rs`
+separates a fully deterministic zero-allocation proof (writing exactly
+`depth` more never-recycled segments after a one-segment channel warm-up)
+from a real, concurrently-running sustained-streaming measurement that
+tolerates the small, scheduler-jitter-bounded allocation `crossbeam_channel`'s
+`select!`/`after()`/blocking-`recv()` internals can cost on a genuine — as
+opposed to merely checked-and-found-empty — park; see that file's module doc
+for the isolated `crossbeam_channel` measurements behind the bound.
 
 ### Writer test oracle (T-035) and the golden SSTable corpus
 

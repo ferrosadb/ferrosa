@@ -319,6 +319,7 @@ pub fn render_prometheus(out: &mut String) {
         "ferrosa_sstable_dio_align_probe_fallbacks_total {}\n",
         crate::dio_align::dio_align_probe_fallbacks_total()
     ));
+    crate::pump::render_prometheus(out);
 }
 
 /// How the OS page cache is being bypassed for a given file.
