@@ -26,6 +26,19 @@ open work lives in specs and the items below.
 
 ## Next
 
+- **Compaction cancel safety — commit point + reconciliation (T-021 through
+  T-024, `compaction-cancel-safety.md`).** Compaction cannot be cancelled
+  today and has no durable record of which output replaces which inputs.
+  The T-020 test harness (`cancel_harness_*`/`cancel_crash_sweep_*`) proves
+  three windows are still open, each gated behind the `known-open-window`
+  feature until its packet lands: promoted-but-not-swapped leaves a
+  duplicate generation discoverable at restart (window C, T-022); swapped
+  but inputs not yet deleted, same shape (window D, T-023, paired with the
+  `.promote-*` staging debris of window B); and input retirement stopping
+  partway through the input list leaves an orphan input alongside the new
+  output (window E, T-024). None of these lose data — tombstones are never
+  purged today, so a duplicate generation is a disk leak, not corruption —
+  but that safety margin goes away once tombstone purging is added (CS12).
 - **Remove index artifacts with the generation they index (FMEA ST-24).**
   `evict_local_input_sstable_files` and `delete_sstable_files` remove only the
   seven SSTable components, so every compacted or evicted generation leaves its
@@ -74,6 +87,16 @@ open work lives in specs and the items below.
   needs pagination instead of a cap.
 
 ## Recently landed
+
+- **Compaction cancel-safety test harness (T-020, 2026-09-26).** Test
+  infrastructure only, no behavior change: `CancelPoint` names every step in
+  the compaction lifecycle table (`compaction-cancel-safety.md`), a
+  `cancel_point!` hook (compiled to nothing outside
+  `cfg(any(test, feature = "test-support"))`) is wired into the executor and
+  `poll_compactions`, and `assert_cancel_invariants` checks I1-I4 against a
+  `WriteOracle` model. First real use: a crash-twin subprocess sweep (CS2)
+  that SIGABRTs a child process at each point and asserts the invariants
+  after reopening — see `README.md` § Compaction cancel-safety harness.
 
 - **Vector CREATE INDEX live-row backfill (2026-09-17).** Dynamic HNSW and HVQ
   registration now indexes rows in the active and flushing memtables before the

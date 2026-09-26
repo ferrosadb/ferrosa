@@ -41,6 +41,9 @@ use crate::commitlog::cdc::{CdcPageLimit, CdcReader, CdcReplayError, DurableCdcP
 use crate::commitlog::config::{CommitLogConfig, CommitLogPosition, TableId};
 use crate::commitlog::mutation::Mutation;
 use crate::commitlog::CommitLog;
+#[cfg(any(test, feature = "test-support"))]
+use crate::compaction::cancel_harness::CancelPoint;
+use crate::compaction::cancel_point;
 use crate::compaction::executor::CompactionExecutor;
 use crate::compaction::strategy::{CompactionConfig, SizeTieredStrategy};
 use crate::compaction::CompactionStrategy;
@@ -8793,6 +8796,7 @@ impl StorageEngine {
                 .collect();
             let table_id = &result.task.table_id;
 
+            cancel_point!(&table_id.to_string(), CancelPoint::BeforePromote);
             let promote_start = Instant::now();
             let output = match self.promote_compaction_output(table_id, &result.output) {
                 Ok(output) => {
@@ -8812,6 +8816,7 @@ impl StorageEngine {
                 }
             };
 
+            cancel_point!(&table_id.to_string(), CancelPoint::AfterPromote);
             // Open the promoted compacted output SSTable.
             let gen = &output.id;
             let dir = &output.path;
@@ -8823,6 +8828,7 @@ impl StorageEngine {
                 }
             };
 
+            cancel_point!(&table_id.to_string(), CancelPoint::SidecarBuild);
             // Full-text sidecars for the output, built BEFORE the swap and with
             // the table lock released. Compaction used to write none, so every
             // compacted SSTable was re-tokenized in full by every fts_match
@@ -8879,6 +8885,7 @@ impl StorageEngine {
                             continue;
                         }
                     };
+                    cancel_point!(&table_id.to_string(), CancelPoint::BeforeSwap);
                     if let Err(e) = state.store.swap_compacted_sstables(
                         &input_id_paths,
                         output_id,
@@ -8889,6 +8896,7 @@ impl StorageEngine {
                         tracing::error!(%e, "compaction: swap failed");
                         continue;
                     }
+                    cancel_point!(&table_id.to_string(), CancelPoint::AfterSwap);
                     let post_swap_count = state.store.sstable_count();
                     tracing::info!(
                         %table_id,
@@ -8989,7 +8997,7 @@ impl StorageEngine {
                 .register(&output.id, output.path.clone(), output.size_bytes);
             let cleanup_inputs = || {
                 let cleanup_start = Instant::now();
-                Self::evict_local_input_sstable_files(&result.task.inputs);
+                Self::evict_local_input_sstable_files(table_id, &result.task.inputs);
                 crate::metrics::observe_compaction_phase(
                     crate::metrics::CompactionPhase::InputCleanup,
                     cleanup_start.elapsed(),
@@ -9084,6 +9092,7 @@ impl StorageEngine {
                 total_size,
             );
 
+            cancel_point!(&table_id_str, CancelPoint::S3PendingLog);
             // Step 1: record the pending upload before deleting any input.
             // Without this fsynced marker, a crash can strand the local-only
             // output after its inputs are reclaimed (#235).
@@ -9154,6 +9163,7 @@ impl StorageEngine {
                     on_complete: Some(tx),
                 }
             };
+            cancel_point!(&table_id_str, CancelPoint::S3Upload);
             if let Err(e) = upload_mgr.try_submit(task) {
                 tracing::warn!(
                     %e,
@@ -9265,6 +9275,7 @@ impl StorageEngine {
                     // Pass removals explicitly so CAS retry re-applies them
                     // after merging with the latest manifest. Without this,
                     // merge_into re-introduces the entries we removed.
+                    cancel_point!(&table_id_str, CancelPoint::S3ManifestCas);
                     let save_result = if self.cas_supported() {
                         manifest
                             .save_with_retry_and_removals(
@@ -9328,6 +9339,7 @@ impl StorageEngine {
                 std::time::Duration::from_secs(3600),
             );
             for task_plan in deletion_plan.tasks {
+                cancel_point!(&table_id_str, CancelPoint::S3Delete);
                 let (del_tx, del_rx) = tokio::sync::oneshot::channel();
                 let _ = upload_mgr
                     .submit(crate::upload::UploadTask::DeleteSSTable {
@@ -11330,7 +11342,10 @@ impl StorageEngine {
     // reaches a superseded input once `promote_compaction_output` has
     // returned `Ok` (i.e. the output's directory entry is durable, T-001), so
     // a crash here can still leak files but never loses both copies.
-    fn evict_local_input_sstable_files(inputs: &[crate::compaction::metadata::SSTableMetadata]) {
+    fn evict_local_input_sstable_files(
+        _table_id: &TableId,
+        inputs: &[crate::compaction::metadata::SSTableMetadata],
+    ) {
         let standard_components = [
             "Data.db",
             "Partitions.db",
@@ -11342,7 +11357,19 @@ impl StorageEngine {
             "Digest.crc32",
             "CRC.db",
         ];
-        for input in inputs {
+        // `idx` feeds `CancelPoint::RetireInput` (test/test-support only:
+        // `cancel_point!` compiles to nothing otherwise). In a production
+        // build that makes the index genuinely unused; a manual counter
+        // would then trip clippy's `explicit_counter_loop` in the test
+        // build (since `idx` *is* read there), so this narrowly silences
+        // the resulting unused-index/unused-variable lints only for the
+        // build where discarding `idx` is correct.
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            allow(unused_variables, clippy::unused_enumerate_index)
+        )]
+        for (idx, input) in inputs.iter().enumerate() {
+            cancel_point!(&_table_id.to_string(), CancelPoint::RetireInput(idx));
             for component in &standard_components {
                 let file_path = Self::generation_component_path(&input.path, &input.id, component)
                     .unwrap_or_else(|| input.path.join(format!("{}-{component}", input.id)));

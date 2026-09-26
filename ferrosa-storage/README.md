@@ -484,6 +484,54 @@ cargo test -p ferrosa-storage --features race-stress --release \
 
 Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 
+### Compaction cancel-safety harness (T-020)
+
+`src/compaction/cancel_harness.rs` names every step in the compaction
+lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`
+hook to call at each one, behind `cfg(any(test, feature = "test-support"))`
+(a no-op, compiled to nothing, otherwise). `src/compaction/cancel_oracle.rs`
+is a plain model of every acknowledged write (`WriteOracle`) plus
+`assert_cancel_invariants`, which checks I1 (content matches the oracle), I2
+(exactly one of {inputs, output} discoverable — against **today's** startup,
+which has no reconciliation yet), I3 (every discoverable generation opens
+and walks), and I4 (no `.promote-*`/`.retired-*`/stale-`.tmp`/staging leaks).
+See `specs/sstable-write-pump/compaction-cancel-safety.md`.
+
+No cancellation exists yet (T-021); this packet only records or, in the
+crash-twin harness, crashes:
+
+- `cancel_harness_*` (`cancel_harness_integration.rs`): the hook fires at
+  every point during a real, uncancelled compaction, and the oracle +
+  invariant checker agree on a clean flushed table.
+- `cancel_crash_sweep_*` (`cancel_crash_sweep_tests.rs`, CS2 in
+  `test-specification.md` L10): a crash-twin subprocess harness. Each test
+  re-execs the same test binary filtered to itself, the child installs a
+  hook that `std::process::abort()`s (SIGABRT) at one `CancelPoint`, drives
+  a real compaction into it (compressed and uncompressed), and the parent
+  asserts the child died by signal, reopens a fresh engine on the same data
+  dir, and checks I1-I4.
+
+Points strictly before the C2 commit point (input open through
+`BeforePromote`) roll back cleanly today, because `compaction/<table>/`
+staging is unconditionally wiped at every engine open — these run by
+default. Points from `AfterPromote` (window C), `AfterSwap` (window D), and
+input retirement (window E) leave a duplicate/orphan generation today
+(no reconciliation exists until T-022/T-023/T-024); those cases are gated
+behind the `known-open-window` feature (off by default, so `cargo test`
+stays green) and assert the documented I2 violation instead of a clean pass:
+
+```bash
+cargo test -p ferrosa-storage cancel_harness_
+cargo test -p ferrosa-storage cancel_crash_sweep_
+cargo test -p ferrosa-storage --features known-open-window cancel_crash_sweep_
+```
+
+Unix-only (signal-based crash detection). The `RetireInput` `CancelPoint`
+fires once per whole input generation; it does not reach the finer-grained
+"one generation half-deleted mid-component-loop" shape window E's own
+description also covers — a follow-up needs a per-component hook alongside
+its fix.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position

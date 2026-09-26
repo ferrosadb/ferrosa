@@ -18,6 +18,9 @@ use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex};
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::compaction::cancel_harness::CancelPoint;
+use crate::compaction::cancel_point;
 use crate::store::SharedReaderPool;
 use crate::upload::manager::SstableComponentBytes;
 
@@ -886,6 +889,7 @@ impl CompactionExecutor {
         let mut pool_input_opens = 0usize;
         let pool_table_key = task.table_id.to_string();
         for input in &task.inputs {
+            cancel_point!(&pool_table_key, CancelPoint::InputOpen);
             let gen = &input.id;
             let dir = &input.path;
 
@@ -1107,8 +1111,24 @@ impl CompactionExecutor {
         // every partition does: an empty output cannot be swapped in.
         let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
         let mut purged_markers: u64 = 0;
+        // Test-only: which merge-loop iteration this is, so the cancel harness
+        // can distinguish the first partition from every later one.
+        #[cfg(any(test, feature = "test-support"))]
+        let mut merge_loop_iteration: u64 = 0;
 
         while let Some(top) = heap.pop() {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                cancel_point!(
+                    &pool_table_key,
+                    if merge_loop_iteration == 0 {
+                        CancelPoint::MergePartitionFirst
+                    } else {
+                        CancelPoint::MergePartitionMiddle
+                    }
+                );
+                merge_loop_iteration += 1;
+            }
             // Drain all heap entries that share this key (multiple inputs
             // wrote the same partition).
             let HeapEntry {
@@ -1232,6 +1252,7 @@ impl CompactionExecutor {
         let merged_partition_count = tally.partitions;
         let merged_row_count = tally.rows;
         let (min_token, max_token) = (tally.min_token, tally.max_token);
+        cancel_point!(&pool_table_key, CancelPoint::MergePartitionLast);
 
         tracing::info!(
             partitions = merged_partition_count,
@@ -1261,6 +1282,7 @@ impl CompactionExecutor {
             );
         }
 
+        cancel_point!(&pool_table_key, CancelPoint::BeforeFinish);
         let finish_start = Instant::now();
         let output = writer
             .finish_to_directory(staging_dir)
@@ -1272,6 +1294,7 @@ impl CompactionExecutor {
         let direct_upload = None;
 
         // 4. Promote staged output files via FileFlushTarget.
+        cancel_point!(&pool_table_key, CancelPoint::BeforeFlushFiles);
         let local_write_start = Instant::now();
         let reader = flush_target
             .flush_files(output)
@@ -1297,6 +1320,7 @@ impl CompactionExecutor {
                     .next_partition()
                     .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
                 {
+                    cancel_point!(&pool_table_key, CancelPoint::VerifyPartition);
                     readback_partitions += 1;
                     readback_rows += p.rows.len();
                 }

@@ -102,6 +102,13 @@ repair-fuzz-known-failures = ["test-generators"]
 # a Fly app per run. Run it by hand on a CPU-starved host, env-scaled via
 # RACE_KEYS / RACE_READERS / RACE_SECS / RACE_FLUSH_EVERY.
 race-stress = []
+# Compaction cancel-safety crash sweep (T-020, `compaction-cancel-safety.md`):
+# gates the `cancel_crash_sweep_*` cases that hit a window today's code does
+# not yet close (C: promoted-but-not-swapped duplicate, T-022; D: swapped but
+# inputs not deleted, T-023; E: input retirement stops partway through the
+# input list, T-024). Off by default so `cargo test` stays green; each fixing
+# packet removes its case's gate instead of widening this feature.
+known-open-window = []
 
 [dev-dependencies]
 async-trait = "0.1"
