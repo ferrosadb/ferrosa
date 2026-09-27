@@ -69,6 +69,10 @@ pub enum SmResponse {
     SnapshotStale,
     /// No response (fire-and-forget: Commit, Apply).
     None,
+    /// An empty Apply finalized a txn that was never registered on this replica.
+    /// Its absence is terminal for dependency ordering, so parked dependents were
+    /// released and the handler may acknowledge this no-write finalize.
+    NoWriteFinalized,
 }
 
 // ---------------------------------------------------------------------------
@@ -741,6 +745,7 @@ impl AccordStateMachine {
     /// is advanced to `Applied` and fsyncs its protocol-log marker exactly once
     /// (N markers per txn would corrupt the log).
     pub fn handle_apply_writeset(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> SmResponse {
+        let no_write = writes.iter().all(Vec::is_empty);
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
         // so each mutation we hand to storage carries the real `(t, deps)`.
         let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
@@ -752,7 +757,18 @@ impl AccordStateMachine {
                 (state.t, state.deps.iter().copied().collect())
             }
             // No state for this txn: nothing to apply.
-            None => return SmResponse::None,
+            None if !no_write => return SmResponse::None,
+            // A coordinator can finalize a transaction on replicas that did not
+            // register it (for example, when another replica rejected its stale
+            // PostgreSQL snapshot). The missing txn still may be a dependency in
+            // a committed transaction's merged dependency set. Treat the explicit
+            // no-write Apply as terminal and cascade its waiters so they can apply.
+            None => {
+                self.conflict_index.remove(&txn_id);
+                let woken = self.apply_engine.notify_applied(txn_id);
+                self.bookkeep_applied_dedup(woken);
+                return SmResponse::NoWriteFinalized;
+            }
         };
 
         // Drop no-write entries (empty payloads): a key the replica owns but for
@@ -1346,6 +1362,50 @@ mod tests {
                 .all(|(id, _, t)| *id == txn_id && *t == ts(1001)),
             "every write carries the txn id and the agreed execution timestamp"
         );
+    }
+
+    #[test]
+    fn absent_no_write_dependency_releases_parked_apply() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, capturing.clone());
+
+        let absent_dependency = txn(2, 1000);
+        let waiting_txn = txn(1, 1001);
+        let t0 = ts(1001);
+        let mutation = b"dependent-write".to_vec();
+        sm.handle_preaccept(waiting_txn, t0, b"key", BallotNumber(0), 0);
+        sm.handle_commit(waiting_txn, t0, ts(1002), vec![absent_dependency]);
+
+        sm.handle_apply_writeset(waiting_txn, vec![mutation.clone()]);
+        assert_eq!(
+            sm.get_state(&waiting_txn).unwrap().phase,
+            TxnPhase::Committed,
+            "the dependent write must stay parked before its dependency resolves"
+        );
+        assert!(capturing.captured().is_empty());
+
+        assert!(matches!(
+            sm.handle_apply_writeset(absent_dependency, vec![b"unexpected-write".to_vec()]),
+            SmResponse::None
+        ));
+        assert_eq!(
+            sm.get_state(&waiting_txn).unwrap().phase,
+            TxnPhase::Committed,
+            "a missing dependency with mutation bytes must not be treated as a no-write"
+        );
+
+        assert!(matches!(
+            sm.handle_apply_writeset(absent_dependency, Vec::new()),
+            SmResponse::NoWriteFinalized
+        ));
+
+        assert_eq!(
+            sm.get_state(&waiting_txn).unwrap().phase,
+            TxnPhase::Applied,
+            "an absent dependency finalized as no-write must release dependent writes"
+        );
+        assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
     }
 
     #[test]

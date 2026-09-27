@@ -149,6 +149,10 @@ dependency/apply check, without remote read-vote fanout. See
    secondary-index, and full-text scatter-gathers fail the request when a
    required replica errors; streaming paths propagate the replica error through
    their bounded result stream.
+9. **No-write finalization releases merged dependencies.** If a replica never
+   registered a txn that appears in a committed dependency set, its explicit
+   empty Apply resolves that dependency and cascades parked writes. Non-empty
+   Apply to an absent txn remains a failure and is never acknowledged.
 
 ## Correctness evidence (be honest)
 
