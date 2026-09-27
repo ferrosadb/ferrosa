@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{DirectMode, PumpConfig, SegmentSink, MAX_QUEUE_DEPTH};
+use super::{max_queue_depth_from_env, DirectMode, PumpConfig, SegmentSink};
 
 /// Optional per-root scheduling overrides; component pumps retain depth zero.
 #[derive(Clone, Copy, Debug, Default)]
@@ -54,7 +54,9 @@ pub fn install_sink_hook(
     overrides: PumpOverrides,
     hook: Arc<SinkHook>,
 ) -> SinkHookGuard {
-    assert!(overrides.queue_depth.is_none_or(|n| n <= MAX_QUEUE_DEPTH));
+    assert!(overrides
+        .queue_depth
+        .is_none_or(|n| n <= max_queue_depth_from_env()));
     assert!(overrides.segment_bytes.is_none_or(|n| n > 0));
     let mut registered = registrations().lock().unwrap_or_else(|p| p.into_inner());
     assert!(

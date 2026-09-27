@@ -277,7 +277,7 @@ fn open_pump(depth: usize, segment: usize) -> AlignedPump {
 #[test]
 fn pump_async_alloc_no_recycling_needed_is_alloc_free() {
     let _guard = ALLOC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let depth = 16usize; // MAX_QUEUE_DEPTH — the largest ring this pump supports
+    let depth = 17usize; // Exercise a ring beyond the historical fixed ceiling.
     let segment = 64 * 1024;
     let mut pump = open_pump(depth, segment);
     let chunk = vec![0xABu8; segment];

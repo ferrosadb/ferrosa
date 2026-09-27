@@ -36,7 +36,8 @@ resolution beyond the serialization header, or cluster routing.
   `AlignedPump`, including metadata and buffered Data.db output from the memory
   writer. Metadata uses depth 0: one aligned segment, exact logical-length
   truncation and sync before completion. Direct mode follows the same runtime
-  switch as Data.db; the streaming CompressionInfo header retains its existing
+  switch as Data.db; `DirectWriter` honors the configured segment size while
+  remaining synchronous. The streaming CompressionInfo header retains its existing
   buffered depth-0 path. `finish()` still returns owned component bytes for
   memory callers. T-081 streams completed partition/row trie nodes and CRC
   words directly to component pumps, reuses the row trie across partitions,
@@ -98,6 +99,71 @@ resolution beyond the serialization header, or cluster routing.
   they drive a pathological allocation.
 - **Tooling binaries** — `ferrosa-sstable-dump` and `ferrosa-sstable-import`.
 
+## Runtime tuning
+
+Writer and reader settings are read when the component opens. Compression pool
+settings are read once per process. Invalid or unreadable values log `ERROR`
+and use the documented default. Maximum settings default to the historical
+ceilings and can be raised after budgeting the added memory.
+
+### Write pump
+
+| Setting | Default | Behavior |
+|---|---:|---|
+| `FERROSA_SSTABLE_WRITE_SEGMENT_BYTES` | 1 MiB | 1 byte to configured maximum; rounds up to a direct-I/O block multiple with a one-time `WARN`. |
+| `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` | 16 MiB | Minimum accepted maximum is 1 MiB; upper bound is representable aligned-allocation size. |
+| `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH` | 3 | 0 to configured maximum; 0 selects synchronous writes. |
+| `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH` | 16 | Minimum accepted maximum is 3; upper bound is representable queue storage. |
+
+An asynchronous pump holds up to `queue_depth + 1` aligned segments, or about
+`(queue_depth + 1) * rounded_segment_bytes` per active component writer. It
+also creates reusable segment-descriptor and iovec vectors once when the pump
+opens. These two metadata allocations replace the former fixed stack iovec;
+the allocation regression test checks that they do not grow per batch, segment,
+or write. Larger batches are split at the OS `pwritev` vector limit. The
+`DirectWriter` honors the segment setting but always uses queue depth zero.
+
+### Compression and row index
+
+| Setting | Default | Accepted range |
+|---|---:|---|
+| `FERROSA_SSTABLE_COMPRESSION_THREADS` | Available parallelism capped at 4 | 1 to configured maximum |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_THREADS` | 4 | 4 to `usize::MAX` |
+| `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | 16 | 1 to configured maximum |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_BATCH_CHUNKS` | 64 | 16 to `usize::MAX` |
+| `FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES` | 16 KiB | 1 KiB to configured maximum |
+| `FERROSA_SSTABLE_MAX_COMPRESSION_CHUNK_BYTES` | 1 MiB | 16 KiB to `usize::MAX` |
+| `FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS` | 32 | 1 to configured maximum |
+| `FERROSA_SSTABLE_MAX_ROW_INDEX_MIN_ROWS` | 4096 | 4096 to `usize::MAX` |
+
+Increasing compression chunk and batch sizes increases working memory. Each
+batch uses input buffers of about `batch_chunks * chunk_bytes`, plus output
+buffers up to `batch_chunks * compress_bound(chunk_bytes)`. Thread count adds
+concurrent work and codec state. `WriteOptions::chunk_size` defaults to 16 KiB;
+the chunk-bytes environment setting supplies that default when using
+`WriteOptions::default()`. An explicitly constructed value is preserved.
+
+### Reader chunk cache
+
+| Setting | Default | Accepted range |
+|---|---:|---|
+| `FERROSA_SSTABLE_CHUNK_CACHE_ENTRIES` | 128 | Any positive integer; no eager reservation |
+| `FERROSA_SSTABLE_CHUNK_CACHE_BYTES` | 2,105,344 bytes (about 2.01 MiB) | Any positive integer; no eager reservation |
+
+The byte default is `128 * (16 KiB + 64 bytes)`, preserving approximately the
+old 128-entry behavior for 16 KiB chunks and charging an estimated 64 bytes for
+each key, handle, and LRU/hash entry. The non-preallocating LRU evicts least
+recently used entries until both limits are met. A chunk larger than the entire
+byte budget is returned but not cached. Both limits apply to decompressed and
+CRC-verified uncompressed chunks. Allocator overhead and `Arc`s retained by
+callers are outside resident cache accounting.
+
+These maximum settings externalize performance ceilings, not format limits.
+On-disk validation limits and the DIO alignment ceiling remain correctness or
+platform safety checks. Queue storage and aligned allocation representability
+are the remaining pump maxima; the kernel vector limit is handled by splitting
+batches across syscalls.
+
 ## What is NOT implemented (honest scope)
 
 - **Big-format (legacy `*-big-*`) reading** — out of scope; the crate targets
@@ -132,7 +198,7 @@ resolution beyond the serialization header, or cluster routing.
 | `direct` | `DirectWriter` — page-cache-bypassing sequential writer (O_DIRECT/`F_NOCACHE`) for immutable Data.db output. On by default; `FERROSA_SSTABLE_DIRECT_IO=0` (or the master `FERROSA_DIRECT_IO=0`, which the specific switch overrides) selects the buffered writer, read at run time. A file system that rejects O_DIRECT falls back to buffered, WARN-logged and counted; byte-identical to the buffered path (see `data_db_writer_direct_matches_buffered_bytes_and_offsets`). **T-032: `DirectWriter` is now a thin wrapper over `pump::AlignedPump` at `depth = 0`.** Its public API (`create`/`mode`/`position`/`write_all`/`finish`) and on-disk behavior are unchanged — same tests pass unchanged — but the block it aligns to now comes from the real T-031 `dio_align` probe instead of a hardcoded `MIN_BLOCK` (4096), so Linux hosts whose true device alignment exceeds 4096 now write to it correctly instead of silently over-aligning |
 | `direct` (read side) | `DirectReadFile` — cache-bypassing positional reader (O_DIRECT / `F_NOCACHE`, aligned bounce buffer, any offset/length). Fallback to buffered reads + `POSIX_FADV_DONTNEED` is WARN-logged and counted in `direct_read_fallbacks_total` |
 | `dio_align` | `resolve_block`/`probe`/`block_for` — probes the true O_DIRECT alignment for a file via a raw `SYS_statx` syscall with `STATX_DIOALIGN` (D4), floor `MIN_BLOCK` (4096), ceiling `MAX_BLOCK` (64 KiB). Works on **gnu and musl** (the shipped `make build-musl` binary included): rather than call `libc::statx` — which `libc` 0.2.186 only compiles for `target_env = "gnu"` (the `stx_dio_*` fields, the FFI decl, and `STATX_DIOALIGN` are gated on a build-script-detected `musl_v1_2_3` cfg the crate doesn't control) — `probe` defines its own `#[repr(C)]` `KernelStatx` mirroring the stable kernel UAPI struct (compile-time size/offset asserts) and calls it through `libc::syscall(libc::SYS_statx, …)`, using only `libc::syscall`/`SYS_statx`/`AT_EMPTY_PATH`, which compile unconditionally on every Linux target. An `Unsupported` probe (old kernel, `ENOSYS`, or a filesystem reporting nothing usable) counts in `dio_align_probe_fallbacks_total` (rendered by `direct::render_prometheus`) and falls back to `MIN_BLOCK`; a probed value above `MAX_BLOCK` is `block_for`'s `Err(TooLarge)`, meaning the caller must not open that file with O_DIRECT at all. Logged once per device (`st_dev`) at INFO, bounded to 64 devices. **T-032 consumes this**: `pump::FileSink::create` calls `block_for` and, on `TooLarge`, falls back to buffered I/O (loud + counted in `direct_write_fallbacks_total`, the same counter `direct::open_bypassing`'s own O_DIRECT-rejection fallback uses) |
-| `pump` | `PumpConfig` is read when each writer opens. `FERROSA_SSTABLE_WRITE_SEGMENT_BYTES` defaults to 1 MiB (accepted 1 B–16 MiB); `FERROSA_SSTABLE_WRITE_QUEUE_DEPTH` defaults to 3 (accepted 0–16; 0 is synchronous). Invalid values log ERROR once per process and use defaults; the effective segment is rounded up to a block multiple with a WARN. `SegmentSink` is the seam every SSTable component write uses; `FileSink` is the production implementation. For depth ≥1, `AlignedPump::open_with_depth` starts a dedicated OS flusher thread and coalesces queued segments into `pwritev` calls. On backpressure, a nonblocking select runs first; a genuine wait uses `select!`'s deadline-based `default(duration)` arm for a one-time 10s stall watchdog. Once it fires, the pump blocks on data or abort without periodic wakeups. A stall logs WARN and increments `write_pump_stalls_total`, then logs once on recovery. Flusher errors and panics reach the producer; `finish` and `Drop` join the flusher. Thread-spawn failure falls back to synchronous mode and increments `write_pump_sync_fallbacks_total`. The pump still uses its local `AbortSignal`/`NeverAbort` shim; it does not yet consume `ferrosa_common::CancelToken` on this branch (T-021). `AlignedPump`, `SegmentSink` and `FileSink` are wired into file-backed writer, flush and compaction output (T-038–T-045).
+| `pump` | `PumpConfig` is read when each writer opens. Segment size defaults to 1 MiB and queue depth to 3 (0 is synchronous). Their default maximums are 16 MiB and depth 16; operators can raise them with `FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES` and `FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH`. Invalid settings log ERROR once per process and use defaults; segment size rounds up to a block multiple with a WARN. An async pump holds approximately `(depth + 1) * rounded segment bytes` of aligned buffers per component writer and allocates reusable iovec metadata once per pump. Larger batches split at the OS `pwritev` vector limit. `DirectWriter` uses the configured segment size at depth zero. `SegmentSink` is the seam every SSTable component write uses; `FileSink` is the production implementation. For depth ≥1, `AlignedPump::open_with_depth` starts a dedicated OS flusher thread and coalesces queued segments into `pwritev` calls. On backpressure, a nonblocking select runs first; a genuine wait uses `select!`'s deadline-based `default(duration)` arm for a one-time 10s stall watchdog. Once it fires, the pump blocks on data or abort without periodic wakeups. A stall logs WARN and increments `write_pump_stalls_total`, then logs once on recovery. Flusher errors and panics reach the producer; `finish` and `Drop` join the flusher. Thread-spawn failure falls back to synchronous mode and increments `write_pump_sync_fallbacks_total`. The pump still uses its local `AbortSignal`/`NeverAbort` shim; it does not yet consume `ferrosa_common::CancelToken` on this branch (T-021). `AlignedPump`, `SegmentSink` and `FileSink` are wired into file-backed writer, flush and compaction output (T-038–T-045). |
 | `scan` | `ReadAheadReader<R>` — one bounded window plus a background prefetch of the next window (≤ 2 windows resident, ≤ 1 read in flight). `FileReadAt::open_scan` composes it over `DirectReadFile` for compaction input; `parse_scan_window` validates `FERROSA_COMPACTION_READAHEAD_BYTES` |
 | `reader` | `SSTableReader`, `PartitionIter`, point lookup, salvage, token-summary seek index |
 | `writer` | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]` |

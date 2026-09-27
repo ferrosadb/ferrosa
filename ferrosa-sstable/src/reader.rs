@@ -3,6 +3,8 @@
 //! Opens a BTI SSTable from component file handles and provides:
 //! - Partition lookup by DecoratedKey
 //! - Full partition iteration in token order
+//!   Last revised: 2026-09-27
+//!   Last changed: Bound chunk-cache residency by configured entry and byte budgets.
 
 use ferrosa_common::{DecoratedKey, Result};
 
@@ -15,19 +17,129 @@ use crate::partition_index::{PartitionIndex, PartitionLookup};
 use crate::row_index::{lookup_clustering_in_entry, RowIndex};
 use crate::statistics::{read_statistics, SerializationHeader};
 use crate::types::Partition;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES: usize = 128;
+const CHUNK_CACHE_ENTRY_OVERHEAD_BYTES: usize = 64;
+const DEFAULT_CHUNK_CACHE_BUDGET_BYTES: usize =
+    DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES * (16 * 1024 + CHUNK_CACHE_ENTRY_OVERHEAD_BYTES);
+static CHUNK_CACHE_ENTRIES_WARNED: AtomicBool = AtomicBool::new(false);
+static CHUNK_CACHE_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
 
-fn decompressed_chunk_cache_capacity() -> NonZeroUsize {
-    let requested = std::env::var("FERROSA_SSTABLE_CHUNK_CACHE_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES);
-    NonZeroUsize::new(requested).expect("decompressed chunk cache capacity is non-zero")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkCacheConfig {
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl ChunkCacheConfig {
+    fn from_env() -> Self {
+        Self {
+            max_entries: configured_cache_value(
+                "FERROSA_SSTABLE_CHUNK_CACHE_ENTRIES",
+                DEFAULT_DECOMPRESSED_CHUNK_CACHE_ENTRIES,
+                &CHUNK_CACHE_ENTRIES_WARNED,
+            ),
+            max_bytes: configured_cache_value(
+                "FERROSA_SSTABLE_CHUNK_CACHE_BYTES",
+                DEFAULT_CHUNK_CACHE_BUDGET_BYTES,
+                &CHUNK_CACHE_BYTES_WARNED,
+            ),
+        }
+    }
+}
+
+fn configured_cache_value(name: &'static str, default: usize, warned: &AtomicBool) -> usize {
+    match std::env::var(name) {
+        Ok(value) => {
+            let (resolved, rejected) = resolve_cache_value(Some(&value), default);
+            if rejected && !warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    name,
+                    value,
+                    default,
+                    "invalid SSTable chunk-cache setting; using default"
+                );
+            }
+            resolved
+        }
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            if !warned.swap(true, Ordering::Relaxed) {
+                tracing::error!(name, %error, default, "could not read SSTable chunk-cache setting; using default");
+            }
+            default
+        }
+    }
+}
+
+fn resolve_cache_value(value: Option<&str>, default: usize) -> (usize, bool) {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => (default, false),
+        Some(value) => match value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => (parsed, false),
+            _ => (default, true),
+        },
+    }
+}
+
+/// LRU cache with both a count cap and an estimated resident-byte cap. The
+/// 64-byte per-entry charge covers key/value handles and hash/LRU metadata;
+/// allocator overhead and Arcs held by callers are outside this cache budget.
+struct ChunkCache {
+    entries: lru::LruCache<usize, Arc<Vec<u8>>>,
+    max_entries: usize,
+    max_bytes: usize,
+    resident_bytes: usize,
+}
+
+impl ChunkCache {
+    fn new(config: ChunkCacheConfig) -> Self {
+        Self {
+            entries: lru::LruCache::unbounded(),
+            max_entries: config.max_entries,
+            max_bytes: config.max_bytes,
+            resident_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &usize) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: usize, chunk: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+        if let Some(existing) = self.entries.get(&key) {
+            return Arc::clone(existing);
+        }
+
+        let charge = chunk_cache_charge(chunk.len());
+        if charge > self.max_bytes {
+            return chunk;
+        }
+
+        while self.entries.len() >= self.max_entries
+            || self
+                .resident_bytes
+                .checked_add(charge)
+                .is_none_or(|resident| resident > self.max_bytes)
+        {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(chunk_cache_charge(evicted.len()));
+        }
+
+        self.resident_bytes += charge;
+        self.entries.put(key, Arc::clone(&chunk));
+        chunk
+    }
+}
+
+fn chunk_cache_charge(payload_bytes: usize) -> usize {
+    payload_bytes.saturating_add(CHUNK_CACHE_ENTRY_OVERHEAD_BYTES)
 }
 
 fn read_compressed_chunk<R: ReadAt>(
@@ -143,15 +255,11 @@ struct ChunkedCompressedData<'a, R: ReadAt> {
     data: &'a R,
     ci: &'a CompressionInfo,
     compressed_file_len: u64,
-    cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    cache: &'a Mutex<ChunkCache>,
 }
 
 impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
-    fn new(
-        data: &'a R,
-        ci: &'a CompressionInfo,
-        cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
-    ) -> Result<Self> {
+    fn new(data: &'a R, ci: &'a CompressionInfo, cache: &'a Mutex<ChunkCache>) -> Result<Self> {
         if ci.chunk_length == 0 {
             return Err(ferrosa_common::Error::InvalidFormat(
                 "compressed SSTable has zero chunk length".into(),
@@ -169,7 +277,7 @@ impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
         {
             let mut guard = self.cache.lock().expect("sstable chunk cache poisoned");
             if let Some(chunk) = guard.get(&chunk_index) {
-                return Ok(Arc::clone(chunk));
+                return Ok(chunk);
             }
         }
 
@@ -181,11 +289,7 @@ impl<'a, R: ReadAt> ChunkedCompressedData<'a, R> {
         )?);
 
         let mut guard = self.cache.lock().expect("sstable chunk cache poisoned");
-        if let Some(existing) = guard.get(&chunk_index) {
-            return Ok(Arc::clone(existing));
-        }
-        guard.put(chunk_index, Arc::clone(&chunk));
-        Ok(chunk)
+        Ok(guard.insert(chunk_index, chunk))
     }
 }
 
@@ -227,15 +331,11 @@ struct ChunkedUncompressedData<'a, R: ReadAt> {
     data: &'a R,
     table: &'a ChunkCrcTable,
     data_len: u64,
-    cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    cache: &'a Mutex<ChunkCache>,
 }
 
 impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
-    fn new(
-        data: &'a R,
-        table: &'a ChunkCrcTable,
-        cache: &'a Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
-    ) -> Result<Self> {
+    fn new(data: &'a R, table: &'a ChunkCrcTable, cache: &'a Mutex<ChunkCache>) -> Result<Self> {
         let data_len = data.len()?;
         let expected = table.expected_chunk_count(data_len);
         if expected != table.crcs.len() as u64 {
@@ -261,7 +361,7 @@ impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
                 .lock()
                 .expect("sstable uncompressed chunk cache poisoned");
             if let Some(chunk) = guard.get(&chunk_index) {
-                return Ok(Arc::clone(chunk));
+                return Ok(chunk);
             }
         }
 
@@ -287,11 +387,7 @@ impl<'a, R: ReadAt> ChunkedUncompressedData<'a, R> {
             .cache
             .lock()
             .expect("sstable uncompressed chunk cache poisoned");
-        if let Some(existing) = guard.get(&chunk_index) {
-            return Ok(Arc::clone(existing));
-        }
-        guard.put(chunk_index, Arc::clone(&chunk));
-        Ok(chunk)
+        Ok(guard.insert(chunk_index, chunk))
     }
 }
 
@@ -385,7 +481,7 @@ pub struct SSTableReader<R: ReadAt> {
     data: R,
     /// Bounded cache of decompressed compressed Data.db chunks. Point reads use
     /// this to avoid decompressing the whole SSTable for one partition/row.
-    decompressed_chunks: Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    decompressed_chunks: Mutex<ChunkCache>,
     /// Parsed `CRC.db` (uncompressed tables only), loaded via
     /// [`Self::load_crc_table`]. `None` for compressed tables and for
     /// uncompressed tables whose `CRC.db` has not been (or cannot be)
@@ -393,7 +489,7 @@ pub struct SSTableReader<R: ReadAt> {
     crc_table: Option<ChunkCrcTable>,
     /// Bounded cache of CRC-verified raw Data.db chunks, mirroring
     /// `decompressed_chunks` for the uncompressed+CRC.db path.
-    verified_uncompressed_chunks: Mutex<lru::LruCache<usize, Arc<Vec<u8>>>>,
+    verified_uncompressed_chunks: Mutex<ChunkCache>,
     /// Parsed `Digest.crc32`, loaded via [`Self::load_digest`]. `None` when
     /// not loaded — [`Self::verify_digest`] then logs once and returns `Ok`.
     digest: Option<u32>,
@@ -446,6 +542,7 @@ impl<R: ReadAt> SSTableReader<R> {
                 && crate::byte_comparable::decode(partition_index.largest_key()).is_ok();
         let rows = CachedReadAt::new(components.rows)?;
 
+        let cache_config = ChunkCacheConfig::from_env();
         Ok(SSTableReader {
             partition_index,
             index_bounds_are_byte_comparable,
@@ -453,13 +550,9 @@ impl<R: ReadAt> SSTableReader<R> {
             compression_info,
             header,
             data: components.data,
-            decompressed_chunks: Mutex::new(
-                lru::LruCache::new(decompressed_chunk_cache_capacity()),
-            ),
+            decompressed_chunks: Mutex::new(ChunkCache::new(cache_config)),
             crc_table: None,
-            verified_uncompressed_chunks: Mutex::new(lru::LruCache::new(
-                decompressed_chunk_cache_capacity(),
-            )),
+            verified_uncompressed_chunks: Mutex::new(ChunkCache::new(cache_config)),
             digest: None,
             crc_missing_warned: AtomicBool::new(false),
             digest_missing_warned: AtomicBool::new(false),
@@ -1548,6 +1641,54 @@ mod tests {
     use crate::trie::builder::{TrieBuilder, TriePayload};
     use crate::{byte_comparable, varint};
     use ferrosa_common::PartitionKey;
+
+    #[test]
+    fn chunk_cache_settings_default_and_reject_non_positive_values() {
+        assert_eq!(resolve_cache_value(None, 128), (128, false));
+        assert_eq!(resolve_cache_value(Some(""), 128), (128, false));
+        assert_eq!(resolve_cache_value(Some("256"), 128), (256, false));
+        assert_eq!(resolve_cache_value(Some("0"), 128), (128, true));
+        assert_eq!(resolve_cache_value(Some("-1"), 128), (128, true));
+        assert_eq!(resolve_cache_value(Some("huge"), 128), (128, true));
+    }
+
+    #[test]
+    fn chunk_cache_evicts_to_obey_entry_and_byte_budgets() {
+        let mut cache = ChunkCache::new(ChunkCacheConfig {
+            max_entries: 8,
+            max_bytes: 200,
+        });
+        cache.insert(1, Arc::new(vec![1; 80]));
+        cache.insert(2, Arc::new(vec![2; 80]));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_some());
+        assert!(cache.resident_bytes <= cache.max_bytes);
+
+        let mut cache = ChunkCache::new(ChunkCacheConfig {
+            max_entries: 2,
+            max_bytes: 10_000,
+        });
+        cache.insert(1, Arc::new(vec![1; 1]));
+        cache.insert(2, Arc::new(vec![2; 1]));
+        cache.insert(3, Arc::new(vec![3; 1]));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_some());
+        assert!(cache.get(&3).is_some());
+    }
+
+    #[test]
+    fn chunk_cache_skips_single_chunks_larger_than_its_budget() {
+        let mut cache = ChunkCache::new(ChunkCacheConfig {
+            max_entries: 4,
+            max_bytes: 100,
+        });
+        let chunk = Arc::new(vec![0; 100]);
+        assert!(Arc::ptr_eq(&cache.insert(1, Arc::clone(&chunk)), &chunk));
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.resident_bytes, 0);
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers

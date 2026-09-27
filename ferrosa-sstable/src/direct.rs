@@ -3,8 +3,10 @@
 //!   written stream for every length (aligned or not), every device write is
 //!   block-aligned in offset/length/buffer, the physical padding of a partial
 //!   tail is truncated away, and a fallback to buffered I/O is loud and counted.
-//! Last revised: 2026-07-22
-//! Last changed: New module — Phase 3 (O_DIRECT + I/O, epic t_29f6b948). The
+//! Last revised: 2026-09-27
+//! Last changed: DirectWriter now uses the configured pump segment size while
+//!   preserving depth-zero synchronous writes. Originally introduced in Phase
+//!   3 (O_DIRECT + I/O, epic t_29f6b948). The
 //!   2026-07-22 Fly A/B root-caused the ~3s p100 tail to memtable-flush /
 //!   compaction output flooding the OS page cache: the dirty pages drive a
 //!   block-layer writeback storm (`rq_qos_wait`, `folio_wait_bit_common`) that
@@ -442,11 +444,14 @@ impl DirectWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let (sink, block) = crate::pump::FileSink::create(&path)?;
+        let segment_bytes = crate::pump::PumpConfig::segment_bytes_from_env();
         let segment = crate::pump::PumpConfig {
-            segment_bytes: STAGING_CAPACITY,
+            segment_bytes,
             queue_depth: 0,
         }
         .effective_segment(block);
+        // This compatibility wrapper stays synchronous regardless of the
+        // configured queue depth. Only its segment-size setting is honored.
         let pump = crate::pump::AlignedPump::open(Box::new(sink), block, segment, path);
         Ok(Self { pump })
     }

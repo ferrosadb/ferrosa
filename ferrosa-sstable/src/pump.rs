@@ -13,12 +13,13 @@
 //!   value, on the `full` channel, and back only by being sent on `free` —
 //!   there is no `Mutex`, no shared `VecDeque`, and no `Arc<Mutex<_>>`
 //!   anywhere on the write path (decisions.md D2/D7).
-//! Last revised: 2026-09-26
-//! Last changed: T-081. Open primes Crossbeam's cached TLS Context and selector
-//!   capacity before accepting writes. Built-in abort channels have one fixed
-//!   slot and only disconnect, avoiding zero-channel select packet allocations.
-//!   The watchdog still uses `select!`'s own deadline, with no timer channel.
-//!   Existing allocation bounds and cancellation tests remain unchanged. The
+//! Last revised: 2026-09-27
+//! Last changed: The write segment and queue maxima are operator-configurable;
+//!   vectored-write metadata is allocated once at the accepted queue depth.
+//!   Open still primes Crossbeam's cached TLS Context and selector capacity
+//!   before accepting writes. Built-in abort channels have one fixed slot and
+//!   only disconnect, avoiding zero-channel select packet allocations. The
+//!   watchdog still uses `select!`'s own deadline, with no timer channel. The
 //!   producer/flusher protocol also has a `loom` model
 //!   (`tests/pump_loom.rs`, gated by this crate's own `loom` Cargo feature —
 //!   not `RUSTFLAGS="--cfg loom"`, which breaks `tokio`'s own `cfg(loom)`
@@ -69,17 +70,26 @@ pub const SEGMENT_BYTES_ENV: &str = "FERROSA_SSTABLE_WRITE_SEGMENT_BYTES";
 /// Env var for the number of segments that may be in flight to the flusher.
 /// `0` selects the synchronous (depth-0) pump. See [`PumpConfig::from_env`].
 pub const QUEUE_DEPTH_ENV: &str = "FERROSA_SSTABLE_WRITE_QUEUE_DEPTH";
+/// Environment variable for the accepted maximum segment size. The default is
+/// the historical safety ceiling; operators may raise it to match their
+/// per-writer memory budget.
+pub const MAX_SEGMENT_BYTES_ENV: &str = "FERROSA_SSTABLE_MAX_WRITE_SEGMENT_BYTES";
+/// Environment variable for the accepted maximum async queue depth. Raising
+/// it increases aligned-buffer memory per active component writer.
+pub const MAX_QUEUE_DEPTH_ENV: &str = "FERROSA_SSTABLE_MAX_WRITE_QUEUE_DEPTH";
 
 const DEFAULT_SEGMENT_BYTES: usize = 1024 * 1024; // 1 MiB
 const MIN_SEGMENT_BYTES: usize = 1;
-const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+const DEFAULT_MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 const DEFAULT_QUEUE_DEPTH: usize = 3;
 const MIN_QUEUE_DEPTH: usize = 0; // 0 = synchronous
-const MAX_QUEUE_DEPTH: usize = 16;
+const DEFAULT_MAX_QUEUE_DEPTH: usize = 16;
 
 static SEGMENT_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
 static QUEUE_DEPTH_WARNED: AtomicBool = AtomicBool::new(false);
+static MAX_SEGMENT_BYTES_WARNED: AtomicBool = AtomicBool::new(false);
+static MAX_QUEUE_DEPTH_WARNED: AtomicBool = AtomicBool::new(false);
 static ROUNDING_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// How long the producer waits for a returned segment before logging the
@@ -118,23 +128,35 @@ impl PumpConfig {
     /// silently, per the standing order on silent failures).
     pub fn from_env() -> Self {
         Self {
-            segment_bytes: resolve_env(
-                SEGMENT_BYTES_ENV,
-                std::env::var(SEGMENT_BYTES_ENV).ok().as_deref(),
-                DEFAULT_SEGMENT_BYTES,
-                MIN_SEGMENT_BYTES,
-                MAX_SEGMENT_BYTES,
-                &SEGMENT_BYTES_WARNED,
-            ),
+            segment_bytes: Self::segment_bytes_from_env(),
             queue_depth: resolve_env(
                 QUEUE_DEPTH_ENV,
                 std::env::var(QUEUE_DEPTH_ENV).ok().as_deref(),
                 DEFAULT_QUEUE_DEPTH,
                 MIN_QUEUE_DEPTH,
-                MAX_QUEUE_DEPTH,
+                max_queue_depth_from_env(),
                 &QUEUE_DEPTH_WARNED,
             ),
         }
+    }
+
+    pub(crate) fn segment_bytes_from_env() -> usize {
+        let max = resolve_max_env(
+            MAX_SEGMENT_BYTES_ENV,
+            std::env::var(MAX_SEGMENT_BYTES_ENV).ok().as_deref(),
+            DEFAULT_MAX_SEGMENT_BYTES,
+            DEFAULT_SEGMENT_BYTES,
+            (isize::MAX as usize).saturating_sub(crate::dio_align::MAX_BLOCK),
+            &MAX_SEGMENT_BYTES_WARNED,
+        );
+        resolve_env(
+            SEGMENT_BYTES_ENV,
+            std::env::var(SEGMENT_BYTES_ENV).ok().as_deref(),
+            DEFAULT_SEGMENT_BYTES,
+            MIN_SEGMENT_BYTES,
+            max,
+            &SEGMENT_BYTES_WARNED,
+        )
     }
 
     /// Round `segment_bytes` up to a multiple of `block`, with a minimum of
@@ -219,6 +241,38 @@ fn resolve_env(
     resolved
 }
 
+fn resolve_max_env(
+    name: &str,
+    value: Option<&str>,
+    default: usize,
+    min: usize,
+    max: usize,
+    warned: &AtomicBool,
+) -> usize {
+    let (resolved, rejected) = resolve_bounded(value, default, min, max);
+    if rejected && !warned.swap(true, Ordering::Relaxed) {
+        tracing::error!(
+            var = name,
+            value = ?value,
+            default,
+            min,
+            "invalid write pump maximum; using the default"
+        );
+    }
+    resolved
+}
+
+pub(super) fn max_queue_depth_from_env() -> usize {
+    resolve_max_env(
+        MAX_QUEUE_DEPTH_ENV,
+        std::env::var(MAX_QUEUE_DEPTH_ENV).ok().as_deref(),
+        DEFAULT_MAX_QUEUE_DEPTH,
+        DEFAULT_QUEUE_DEPTH,
+        isize::MAX as usize / std::mem::size_of::<Filled>() - 1,
+        &MAX_QUEUE_DEPTH_WARNED,
+    )
+}
+
 /// A destination for one aligned SSTable component's device writes, seamed out
 /// so `AlignedPump` can be driven by the real filesystem ([`FileSink`]) or, in
 /// tests, by a recording/fault-injecting/permit-gated double
@@ -252,6 +306,58 @@ pub trait SegmentSink: Send {
             off += buf.len() as u64;
         }
         Ok(())
+    }
+    /// Reserve per-sink vectored-write metadata once the pump has resolved its
+    /// maximum batch size. Non-vectored sinks can keep the default no-op.
+    fn prepare_batch(&mut self, _segments: usize) {}
+    /// Write a set of buffers from the pump's owned segment ring. This hidden
+    /// descriptor API lets the flusher reuse metadata without retaining Rust
+    /// borrows into the ring across a drain cycle. Implementations may keep the
+    /// default single-buffer path; production `FileSink` supplies `pwritev`.
+    #[doc(hidden)]
+    fn pwrite_buffers(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+        let mut next_offset = offset;
+        for buffer in buffers {
+            let bytes = buffer.as_slice();
+            self.pwrite(bytes, next_offset)?;
+            next_offset += bytes.len() as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Non-owning byte span used only for the duration of a `SegmentSink` call.
+/// Instances can only be created inside this module; the caller must keep the
+/// originating `AlignedBuf` alive and unmoved until the sink call returns.
+#[doc(hidden)]
+pub struct PumpBuffer {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl PumpBuffer {
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: construction is private and only used while the owning
+        // `Filled` remains in the pump's batch. `pwrite_buffers` completes
+        // before those entries are removed or moved.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -314,10 +420,9 @@ pub struct FileSink {
     file: std::fs::File,
     mode: DirectMode,
     block: usize,
-    /// Reused `pwritev(2)` iovec scratch (bounded-ring rule: allocated once,
-    /// at the process-wide maximum possible batch size, and only ever
-    /// `clear()`ed — never grown per call). Unused (empty) on any pump that
-    /// never calls [`SegmentSink::pwritev`] (every `depth = 0` pump).
+    /// Reused `pwritev(2)` iovec scratch (bounded-ring rule: reserved once at
+    /// the accepted queue depth by [`SegmentSink::prepare_batch`] and only
+    /// `clear()`ed — never grown per call). Unused on any depth-zero pump.
     #[cfg(unix)]
     iov_scratch: Vec<libc::iovec>,
 }
@@ -354,7 +459,7 @@ impl FileSink {
                         mode,
                         block,
                         #[cfg(unix)]
-                        iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
+                        iov_scratch: Vec::new(),
                     },
                     block,
                 )),
@@ -379,7 +484,7 @@ impl FileSink {
                             mode: DirectMode::Buffered,
                             block: MIN_BLOCK,
                             #[cfg(unix)]
-                            iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
+                            iov_scratch: Vec::new(),
                         },
                         MIN_BLOCK,
                     ))
@@ -392,7 +497,7 @@ impl FileSink {
                     mode,
                     block: MIN_BLOCK,
                     #[cfg(unix)]
-                    iov_scratch: Vec::with_capacity(MAX_QUEUE_DEPTH + 1),
+                    iov_scratch: Vec::new(),
                 },
                 MIN_BLOCK,
             )),
@@ -477,6 +582,95 @@ impl FileSink {
         }
         self.pwrite(&tail, offset + written as u64)
     }
+
+    #[cfg(unix)]
+    fn pwrite_buffers_unix(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        self.iov_scratch.clear();
+        for buffer in buffers {
+            if buffer.len == 0 {
+                continue;
+            }
+            self.iov_scratch.push(libc::iovec {
+                iov_base: buffer.ptr as *mut libc::c_void,
+                iov_len: buffer.len,
+            });
+        }
+        if self.iov_scratch.is_empty() {
+            return Ok(());
+        }
+        // Respect the host's pwritev vector limit while permitting larger
+        // operator-configured queues. POSIX guarantees at least 16 vectors.
+        let host_iov_max = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        let iov_max = if host_iov_max > 0 {
+            host_iov_max as usize
+        } else {
+            16
+        };
+        let mut vector_start = 0;
+        let mut bytes_written = 0usize;
+        while vector_start < self.iov_scratch.len() {
+            let vector_end = (vector_start + iov_max).min(self.iov_scratch.len());
+            let vectors = &self.iov_scratch[vector_start..vector_end];
+            let expected: usize = vectors.iter().map(|v| v.iov_len).sum();
+            // SAFETY: every pointer originates in a live `Filled` owned by the
+            // flusher batch; that batch is not mutated until this call returns.
+            let n = unsafe {
+                libc::pwritev(
+                    self.file.as_raw_fd(),
+                    vectors.as_ptr(),
+                    vectors.len() as libc::c_int,
+                    (offset + bytes_written as u64) as libc::off_t,
+                )
+            };
+            if n < 0 {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            let written = n as usize;
+            if written == 0 {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "pwritev returned 0 bytes at offset {}",
+                        offset + bytes_written as u64
+                    ),
+                )));
+            }
+            if written != expected {
+                if short_write_violates_alignment(self.mode, written, self.block) {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "O_DIRECT short pwritev of {written} bytes at offset {} is not a \
+                         multiple of the block ({}); cannot retry at an aligned offset",
+                        offset + bytes_written as u64,
+                        self.block
+                    ))));
+                }
+                // Short writes are exceptional; reassemble the remainder and
+                // retry through the established aligned write path.
+                let mut tail = Vec::new();
+                let mut skip = bytes_written + written;
+                for buffer in buffers {
+                    let bytes = buffer.as_slice();
+                    if skip >= bytes.len() {
+                        skip -= bytes.len();
+                        continue;
+                    }
+                    tail.extend_from_slice(&bytes[skip..]);
+                    skip = 0;
+                }
+                return write_all_at(
+                    &mut self.file,
+                    &tail,
+                    offset + bytes_written as u64 + written as u64,
+                    self.mode,
+                    self.block,
+                );
+            }
+            bytes_written += written;
+            vector_start = vector_end;
+        }
+        Ok(())
+    }
 }
 
 impl SegmentSink for FileSink {
@@ -504,10 +698,19 @@ impl SegmentSink for FileSink {
         self.mode
     }
 
+    fn prepare_batch(&mut self, segments: usize) {
+        #[cfg(unix)]
+        self.iov_scratch.reserve(segments);
+        #[cfg(not(unix))]
+        let _ = segments;
+    }
+
     fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
         #[cfg(unix)]
         {
-            self.pwritev_unix(bufs, offset)?;
+            let result = self.pwritev_unix(bufs, offset);
+            self.iov_scratch.clear();
+            result?;
             self.counters
                 .written(bufs.iter().map(|buf| buf.len()).sum());
             Ok(())
@@ -518,6 +721,30 @@ impl SegmentSink for FileSink {
             for buf in bufs {
                 self.pwrite(buf, off)?;
                 off += buf.len() as u64;
+            }
+            Ok(())
+        }
+    }
+
+    fn pwrite_buffers(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let result = self.pwrite_buffers_unix(buffers, offset);
+            // Drop the borrowed pointer values on both success and failure;
+            // only the Vec allocation/capacity is retained for the next batch.
+            self.iov_scratch.clear();
+            result?;
+            self.counters
+                .written(buffers.iter().map(|buffer| buffer.len).sum());
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let mut next_offset = offset;
+            for buffer in buffers {
+                let bytes = buffer.as_slice();
+                self.pwrite(bytes, next_offset)?;
+                next_offset += bytes.len() as u64;
             }
             Ok(())
         }
@@ -729,25 +956,18 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// The dedicated flusher thread body (architecture.md § Flusher). Blocks in
-/// `full_rx.recv()`; a disconnected channel is its only normal exit. On each
-/// wake it drains whatever is already queued with `try_iter()` into a
-/// thread-local batch (D7 §3), then groups it into runs of contiguous
-/// `Filled` segments and writes each run as one `SegmentSink::pwritev`,
-/// returning every buffer to `free` on success — so a backlog costs one
-/// write per contiguous run instead of one per segment.
-///
-/// Bounded-ring rule (architecture.md): `batch` is allocated once, at
-/// `depth + 1` capacity, before the loop starts, and only ever shrinks within
-/// an iteration of the inner loop (Power-of-10 rule 2). The per-batch iovec
-/// list is a fixed-size **stack array** (`MAX_BATCH = MAX_QUEUE_DEPTH + 1`,
-/// the process-wide ceiling — never `depth`-sized, since this function has no
-/// per-call heap budget to size it from), declared fresh each inner-loop
-/// pass: a stack array costs nothing to "allocate" (no heap traffic — verified
-/// by `tests/pump_async_alloc.rs`) and, redeclared each pass, its borrows of
-/// `batch` never outlive the single `pwritev` call that uses them, so the
-/// following `batch.pop_front()` never conflicts with it.
-const MAX_BATCH: usize = MAX_QUEUE_DEPTH + 1;
+// The dedicated flusher thread body (architecture.md § Flusher). Blocks in
+// `full_rx.recv()`; a disconnected channel is its only normal exit. On each
+// wake it drains whatever is already queued with `try_iter()` into a
+// thread-local batch (D7 §3), then groups it into runs of contiguous
+// `Filled` segments and writes each run as one `SegmentSink::pwritev`,
+// returning every buffer to `free` on success — so a backlog costs one
+// write per contiguous run instead of one per segment.
+//
+// Bounded-ring rule (architecture.md): both metadata vectors are allocated
+// once, at `depth + 1` capacity, before the loop starts, then cleared and
+// reused for every batch. Queue limits therefore remain operator-tunable
+// without adding per-write allocations.
 
 // The flusher queues its I/O failure before dropping free_tx. Once a free
 // receive observes disconnection, the error is already available; this remains
@@ -788,6 +1008,7 @@ fn run_flusher(
     ready: Sender<()>,
 ) -> FlusherOutcome {
     let mut batch: VecDeque<Filled> = VecDeque::with_capacity(depth + 1);
+    let mut iov_bufs: Vec<PumpBuffer> = Vec::with_capacity(depth + 1);
     prime_receiver_waiter(&full_rx);
     ready
         .send(())
@@ -808,17 +1029,14 @@ fn run_flusher(
                 expect += batch[run_len].len as u64;
                 run_len += 1;
             }
-            debug_assert!(
-                run_len <= MAX_BATCH,
-                "write pump: a contiguous run of {run_len} segments exceeds the \
-                 process-wide max depth+1 ({MAX_BATCH})"
-            );
-            let mut iov_bufs: [&[u8]; MAX_BATCH] = [&[]; MAX_BATCH];
-            for (slot, f) in iov_bufs.iter_mut().zip(batch.iter().take(run_len)) {
-                *slot = &f.buf.as_slice()[..f.len];
+            debug_assert!(run_len <= depth + 1);
+            iov_bufs.clear();
+            for f in batch.iter().take(run_len) {
+                iov_bufs.push(PumpBuffer::new(&f.buf.as_slice()[..f.len]));
             }
             let offset = batch[0].offset;
-            let result = sink.pwritev(&iov_bufs[..run_len], offset);
+            let result = sink.pwrite_buffers(&iov_bufs, offset);
+            iov_bufs.clear();
             match result {
                 Ok(()) => {
                     for _ in 0..run_len {
@@ -1152,22 +1370,21 @@ impl AlignedPump {
         abort: Arc<dyn AbortSignal>,
     ) -> Self {
         component_metrics::opened(&path, sink.mode());
+        #[cfg(not(any(test, feature = "test-support")))]
+        let mut sink = sink;
         #[cfg(any(test, feature = "test-support"))]
-        let (sink, segment, depth) = hooks::prepare(sink, &path, block, segment, depth, true);
+        let (mut sink, segment, depth) = hooks::prepare(sink, &path, block, segment, depth, true);
         if depth == 0 {
             return Self::open_sync(sink, block, segment, path);
         }
-        debug_assert!(
-            depth <= MAX_QUEUE_DEPTH,
-            "depth must not exceed MAX_QUEUE_DEPTH ({MAX_QUEUE_DEPTH}); the flusher's \
-             per-batch iovec array is sized to this ceiling"
-        );
+        debug_assert!(depth < usize::MAX, "depth + 1 must not overflow");
         debug_assert!(
             segment > 0 && segment.is_multiple_of(block),
             "segment must be a positive multiple of block"
         );
         let mode = sink.mode();
         let cap = depth + 1;
+        sink.prepare_batch(cap);
         let (full_tx, full_rx) = bounded::<Filled>(cap);
         let (free_tx, free_rx) = bounded::<AlignedBuf>(cap);
         let (err_tx, err_rx) = bounded::<PumpError>(1);
@@ -1822,7 +2039,7 @@ pub mod test_support {
         SinkHookGuard,
     };
 
-    use super::{DirectMode, Error, Result, SegmentSink};
+    use super::{DirectMode, Error, PumpBuffer, Result, SegmentSink};
     use std::collections::HashMap;
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -1948,6 +2165,11 @@ pub mod test_support {
 
         fn pwritev(&mut self, bufs: &[&[u8]], offset: u64) -> Result<()> {
             self.record_write(bufs, offset, bufs.len().max(1))
+        }
+
+        fn pwrite_buffers(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+            let bufs: Vec<&[u8]> = buffers.iter().map(PumpBuffer::as_slice).collect();
+            self.record_write(&bufs, offset, bufs.len().max(1))
         }
 
         fn sync_data(&mut self) -> Result<()> {
@@ -2119,6 +2341,11 @@ pub mod test_support {
             self.apply(bufs, offset)
         }
 
+        fn pwrite_buffers(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+            let bufs: Vec<&[u8]> = buffers.iter().map(PumpBuffer::as_slice).collect();
+            self.apply(&bufs, offset)
+        }
+
         fn sync_data(&mut self) -> Result<()> {
             match self.next_fault() {
                 Some(Fault::FsyncFail) => Err(injected_error("fsync failure", 0)),
@@ -2198,6 +2425,12 @@ pub mod test_support {
             self.inner.pwritev(bufs, offset)
         }
 
+        fn pwrite_buffers(&mut self, buffers: &[PumpBuffer], offset: u64) -> Result<()> {
+            self.wait_for_permit()?;
+            let bufs: Vec<&[u8]> = buffers.iter().map(PumpBuffer::as_slice).collect();
+            self.inner.pwritev(&bufs, offset)
+        }
+
         fn sync_data(&mut self) -> Result<()> {
             self.wait_for_permit()?;
             self.inner.sync_data()
@@ -2249,13 +2482,13 @@ mod tests {
                     "FERROSA_SSTABLE_WRITE_SEGMENT_BYTES",
                     DEFAULT_SEGMENT_BYTES,
                     MIN_SEGMENT_BYTES,
-                    MAX_SEGMENT_BYTES,
+                    DEFAULT_MAX_SEGMENT_BYTES,
                 ),
                 (
                     "FERROSA_SSTABLE_WRITE_QUEUE_DEPTH",
                     DEFAULT_QUEUE_DEPTH,
                     0,
-                    MAX_QUEUE_DEPTH,
+                    DEFAULT_MAX_QUEUE_DEPTH,
                 ),
             ] {
                 let logged = AtomicBool::new(false);
@@ -2319,7 +2552,7 @@ mod tests {
             (Some("999999999999"), ParsedBound::Invalid),
         ];
         for (input, expected) in cases {
-            let got = parse_usize_bounded(*input, MIN_SEGMENT_BYTES, MAX_SEGMENT_BYTES);
+            let got = parse_usize_bounded(*input, MIN_SEGMENT_BYTES, DEFAULT_MAX_SEGMENT_BYTES);
             assert_eq!(got, *expected, "input {input:?}");
         }
     }
@@ -2342,7 +2575,7 @@ mod tests {
             (Some("17"), ParsedBound::Invalid),
         ];
         for (input, expected) in cases {
-            let got = parse_usize_bounded(*input, MIN_QUEUE_DEPTH, MAX_QUEUE_DEPTH);
+            let got = parse_usize_bounded(*input, MIN_QUEUE_DEPTH, DEFAULT_MAX_QUEUE_DEPTH);
             assert_eq!(got, *expected, "input {input:?}");
         }
     }
@@ -2360,6 +2593,34 @@ mod tests {
         let (value, rejected) = resolve_bounded(Some("2048"), 1024, 1, 16 * 1024 * 1024);
         assert_eq!(value, 2048);
         assert!(!rejected);
+    }
+
+    #[test]
+    fn operator_maxima_accept_raised_limits_and_reject_values_below_defaults() {
+        let warned = AtomicBool::new(false);
+        assert_eq!(
+            resolve_max_env(
+                MAX_QUEUE_DEPTH_ENV,
+                Some("32"),
+                DEFAULT_MAX_QUEUE_DEPTH,
+                DEFAULT_QUEUE_DEPTH,
+                usize::MAX / std::mem::size_of::<Filled>() - 1,
+                &warned,
+            ),
+            32
+        );
+        let warned = AtomicBool::new(false);
+        assert_eq!(
+            resolve_max_env(
+                MAX_QUEUE_DEPTH_ENV,
+                Some("2"),
+                DEFAULT_MAX_QUEUE_DEPTH,
+                DEFAULT_QUEUE_DEPTH,
+                usize::MAX / std::mem::size_of::<Filled>() - 1,
+                &warned,
+            ),
+            DEFAULT_MAX_QUEUE_DEPTH
+        );
     }
 
     #[test]

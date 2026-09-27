@@ -157,6 +157,13 @@ impl SegmentSink for GatedSink {
             .completed(bufs.iter().map(|buf| buf.len()).sum());
         Ok(())
     }
+    fn pwrite_buffers(&mut self, buffers: &[crate::pump::PumpBuffer], offset: u64) -> Result<()> {
+        self.shared.admit()?;
+        self.inner.pwrite_buffers(buffers, offset)?;
+        self.shared
+            .completed(buffers.iter().map(crate::pump::PumpBuffer::len).sum());
+        Ok(())
+    }
     fn sync_data(&mut self) -> Result<()> {
         self.inner.sync_data()
     }

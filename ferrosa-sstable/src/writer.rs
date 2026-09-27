@@ -5,6 +5,8 @@
 //! Statistics.db, TOC.txt) either as in-memory byte buffers in an
 //! [`SSTableOutput`] or as staged component files in an
 //! [`SSTableOutputFiles`].
+//! Last revised: 2026-09-27
+//! Last changed: Compression and row-index maximum ranges now have operator settings.
 //!
 //! # Usage
 //!
@@ -63,13 +65,17 @@ use crate::varint;
 const ROW_INDEX_MIN_ROWS: usize = 32;
 const DEFAULT_COMPRESSION_BATCH_CHUNKS: usize = 16;
 const MIN_COMPRESSION_BATCH_CHUNKS: usize = 1;
-const MAX_COMPRESSION_BATCH_CHUNKS: usize = 64;
+const DEFAULT_MAX_COMPRESSION_BATCH_CHUNKS: usize = 64;
 const MIN_COMPRESSION_THREADS: usize = 1;
-const MAX_COMPRESSION_THREADS: usize = 4;
+const DEFAULT_MAX_COMPRESSION_THREADS: usize = 4;
 const MIN_COMPRESSION_CHUNK_BYTES: usize = 1024;
-const MAX_COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_ROW_INDEX_MIN_ROWS: usize = ROW_INDEX_MIN_ROWS;
-const MAX_ROW_INDEX_MIN_ROWS: usize = 4096;
+const DEFAULT_MAX_ROW_INDEX_MIN_ROWS: usize = 4096;
+const MAX_COMPRESSION_THREADS_ENV: &str = "FERROSA_SSTABLE_MAX_COMPRESSION_THREADS";
+const MAX_COMPRESSION_BATCH_CHUNKS_ENV: &str = "FERROSA_SSTABLE_MAX_COMPRESSION_BATCH_CHUNKS";
+const MAX_COMPRESSION_CHUNK_BYTES_ENV: &str = "FERROSA_SSTABLE_MAX_COMPRESSION_CHUNK_BYTES";
+const MAX_ROW_INDEX_MIN_ROWS_ENV: &str = "FERROSA_SSTABLE_MAX_ROW_INDEX_MIN_ROWS";
 
 fn parse_bounded_usize(
     value: &str,
@@ -115,18 +121,48 @@ fn configured_usize(name: &'static str, default: usize, min: usize, max: usize) 
     }
 }
 
+fn configured_max(name: &'static str, default: usize, absolute_max: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match parse_bounded_usize(&value, default, absolute_max) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                tracing::error!(
+                    name,
+                    value,
+                    reason,
+                    default,
+                    absolute_max,
+                    "invalid SSTable tuning maximum; using default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::error!(name, %error, default, "could not read SSTable tuning maximum; using default");
+            default
+        }
+    }
+}
+
 fn compression_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
+        let max_threads = configured_max(
+            MAX_COMPRESSION_THREADS_ENV,
+            DEFAULT_MAX_COMPRESSION_THREADS,
+            usize::MAX,
+        );
         let default_threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(2)
-            .clamp(MIN_COMPRESSION_THREADS, MAX_COMPRESSION_THREADS);
+            .max(MIN_COMPRESSION_THREADS)
+            .min(max_threads);
         let thread_count = configured_usize(
             "FERROSA_SSTABLE_COMPRESSION_THREADS",
             default_threads,
             MIN_COMPRESSION_THREADS,
-            MAX_COMPRESSION_THREADS,
+            max_threads,
         );
         match rayon::ThreadPoolBuilder::new()
             .num_threads(thread_count)
@@ -146,11 +182,16 @@ fn compression_pool() -> Option<&'static rayon::ThreadPool> {
 fn compression_batch_chunks() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
+        let max = configured_max(
+            MAX_COMPRESSION_BATCH_CHUNKS_ENV,
+            DEFAULT_MAX_COMPRESSION_BATCH_CHUNKS,
+            usize::MAX,
+        );
         configured_usize(
             "FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS",
             DEFAULT_COMPRESSION_BATCH_CHUNKS,
             MIN_COMPRESSION_BATCH_CHUNKS,
-            MAX_COMPRESSION_BATCH_CHUNKS,
+            max,
         )
     })
 }
@@ -158,11 +199,16 @@ fn compression_batch_chunks() -> usize {
 fn row_index_min_rows() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
+        let max = configured_max(
+            MAX_ROW_INDEX_MIN_ROWS_ENV,
+            DEFAULT_MAX_ROW_INDEX_MIN_ROWS,
+            usize::MAX,
+        );
         configured_usize(
             "FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS",
             DEFAULT_ROW_INDEX_MIN_ROWS,
             1,
-            MAX_ROW_INDEX_MIN_ROWS,
+            max,
         )
     })
 }
@@ -170,11 +216,16 @@ fn row_index_min_rows() -> usize {
 fn default_compression_chunk_bytes() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
+        let max = configured_max(
+            MAX_COMPRESSION_CHUNK_BYTES_ENV,
+            DEFAULT_MAX_COMPRESSION_CHUNK_BYTES,
+            usize::MAX,
+        );
         configured_usize(
             "FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES",
             Compression::DEFAULT_CHUNK_SIZE,
             MIN_COMPRESSION_CHUNK_BYTES,
-            MAX_COMPRESSION_CHUNK_BYTES,
+            max,
         )
     })
 }
@@ -860,7 +911,8 @@ pub struct WriteOptions {
     pub compression: Option<Compression>,
     /// Target Bloom filter false positive rate.
     pub bloom_fp_chance: f64,
-    /// Chunk size for compression (default 65536).
+    /// Chunk size for compression (default 16 KiB; overridable by the writer's
+    /// compression chunk-size setting when using `Default`).
     pub chunk_size: usize,
     /// Reopen the finished SSTable and verify its partition count matches
     /// what was written (Gate B). Default `true`. Flush orchestrators can
@@ -2712,18 +2764,28 @@ mod tests {
         assert_eq!(value_or_default(Some("65"), 16, 1, 64), 16);
         assert_eq!(value_or_default(Some("invalid"), 16, 1, 64), 16);
         assert_eq!(value_or_default(None, 16, 1, 64), 16);
+        assert_eq!(parse_bounded_usize("4", 4, usize::MAX), Ok(4));
+        assert_eq!(
+            parse_bounded_usize("3", 4, usize::MAX),
+            Err("outside the supported range")
+        );
     }
 
     #[test]
     fn write_options_default_uses_cassandra_chunk_default() {
         let configured = std::env::var("FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES").ok();
+        let max = configured_max(
+            MAX_COMPRESSION_CHUNK_BYTES_ENV,
+            DEFAULT_MAX_COMPRESSION_CHUNK_BYTES,
+            usize::MAX,
+        );
         assert_eq!(
             WriteOptions::default().chunk_size,
             value_or_default(
                 configured.as_deref(),
                 Compression::DEFAULT_CHUNK_SIZE,
                 MIN_COMPRESSION_CHUNK_BYTES,
-                MAX_COMPRESSION_CHUNK_BYTES,
+                max,
             )
         );
     }
