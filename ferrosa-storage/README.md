@@ -670,3 +670,18 @@ hook. See [Roadmap](specs/roadmap.md).
 File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
 
 Shard workers collect moved component manifests directly into the fallible output vector; there is no intermediate vector of per-shard results.
+
+### Backpressure verification (T-041)
+
+Real engine tests gate flush/compaction output and digest readback by unique
+temporary directory. They assert active-memtable admission reaches a plateau,
+rejections do not grow it, accepted rows remain readable, a released flush can
+complete while compaction stays gated, and WAL/input retirement waits for digest
+verification. Shutdown cancellation is observed before releasing the controlled
+device call; no cancelled output replaces the live inputs. This explicitly
+accounts for the fact that cancellation cannot interrupt an arbitrary syscall.
+
+`FERROSA_COMPACTION_READAHEAD_BYTES` defaults to 1 MiB, accepts 1 byte through
+256 MiB, and rounds to a 4096-byte block. Invalid values log ERROR and use the
+default; changed alignment logs configured/effective values at WARN. No startup
+failure is introduced for a malformed value.

@@ -264,3 +264,24 @@ Production builds do not include the hook registry or its locks.
 ### Pump wiring acceptance (T-045)
 
 Fixed component labels count pump opens by I/O mode, successful physical bytes (including padding), and sink write requests. The counters use atomics and resolve labels once per file; no per-write allocation or registry lock is added. Scoped test traces preserve real file I/O and detect known legacy component-write routes.
+
+## Backpressure evidence (T-041)
+
+`backpressure_test_support::WriteGate` is compiled only for tests/test-support.
+It wraps real sinks, has fixed state, uses explicit permits and timeout-bounded
+condition-variable waits, and releases on controller drop. It introduces no
+production synchronization. Writer tests use the T-045 path-scoped open hook;
+the codec checkpoint is `cfg(test)` and runs once before a full batch.
+
+The ring contains `depth + 1` segments; one device permit admits one syscall,
+which can coalesce multiple segments. Read-ahead holds one current and one
+prefetched window; the producer may additionally hold its current input slice
+while the pump owns its ring. Tests account for these separately.
+
+
+Read-ahead now preallocates two payload windows (one without prefetch), each
+bounded by the smaller of file length and configured window. The old current
+buffer moves through the existing request channel as the next spare; the worker
+returns that same buffer on success or error. No new lock, payload copy or
+per-window payload allocation is added. Random access, failed request sends and
+cancelled in-flight input reads have explicit ownership regression tests.

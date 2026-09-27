@@ -28197,4 +28197,5 @@ mod tests {
             rt.block_on(run_pitr_replay_e2e(1_000));
         }
     }
+    include!("engine_backpressure_tests.rs");
 }

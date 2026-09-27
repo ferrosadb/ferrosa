@@ -127,3 +127,20 @@ Production builds do not include the hook registry or its locks.
 ### Pump wiring acceptance (T-045)
 
 Fixed component labels count pump opens by I/O mode, successful physical bytes (including padding), and sink write requests. The counters use atomics and resolve labels once per file; no per-write allocation or registry lock is added. Scoped test traces preserve real file I/O and detect known legacy component-write routes.
+
+T-041 adds deterministic closed-gate evidence across writer components and
+codec/pump/read-ahead boundaries, device-error wakeup and final-header ordering.
+A disconnected free channel consults the already-published one-slot error
+channel so a device failure keeps its original cause. Producer cancellation
+still cannot interrupt a kernel/device call; flusher join waits for its return.
+The minute-stall test checks progress and byte identity, not a throughput SLA.
+
+T-041 also resolves the per-prefetch payload allocation: current and spare
+windows are allocated at open, each at most `min(file_length, window)` bytes.
+Requests move the spare Vec to the worker; responses move it back even on read
+failure, and refill moves the former current Vec into the next request. Random
+seeks drain/reuse the irrelevant prefetch; failed sends return the owned spare.
+A controlled cancelled input proves reader drop joins and releases ownership.
+Two buffers allow one current window and one asynchronous prefetch. There is no
+third payload allocation or payload copy in this hand-back. Existing transport
+channel and underlying direct-I/O scratch allocations are separate surfaces.

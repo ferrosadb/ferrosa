@@ -1415,7 +1415,13 @@ impl FileFlushTarget {
         const DIGEST_READ_CHUNK: usize = 1 << 20; // 1 MiB, reused across the read.
         let mut hasher = ferrosa_sstable::checksum::DigestCrc32::new();
         let mut buf = vec![0u8; DIGEST_READ_CHUNK];
+        #[cfg(test)]
+        let readback_hook = readback_test_support::for_path(&data_path);
         loop {
+            #[cfg(test)]
+            if let Some(hook) = &readback_hook {
+                hook().map_err(|e| format!("gated digest readback failed: {e}"))?;
+            }
             let n = (&file).read(&mut buf).map_err(|e| {
                 format!("read failed verifying staged Data.db digest gen={gen}: {e}")
             })?;
@@ -3924,3 +3930,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "flush_readback_test_support.rs"]
+pub(crate) mod readback_test_support;

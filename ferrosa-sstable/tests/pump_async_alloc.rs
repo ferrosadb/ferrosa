@@ -1,3 +1,8 @@
+//! T-041 update: the historical per-park allocation discussion below predates
+//! T-081's TLS/selector initialization and fixed-capacity abort channel. The
+//! additional strict repeated-wait gate now measures zero allocations/bytes on
+//! the built-in NeverAbort path; the old permissive gates remain regressions.
+//!
 //! T-033/T-034: the `depth >= 1` (async, background-flusher) write pump must
 //! not allocate in steady state either — same property `pump_sync_alloc.rs`
 //! proves for `depth = 0`, extended across the producer *and* flusher
@@ -198,10 +203,12 @@ impl SegmentSink for GatedNullSink {
 struct CountingAllocator;
 
 static ALLOC_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
 
@@ -211,11 +218,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.alloc_zeroed(layout) }
     }
 }
@@ -441,4 +450,95 @@ fn pump_async_alloc_sustained_backpressure_is_alloc_free() {
         logical,
         ((warmup_iterations + steady_iterations) * segment) as u64
     );
+}
+
+/// T-041: deterministic permit protocol and strict allocation accounting over
+/// repeated free-segment waits. A permit is withheld until the controller has
+/// observed that the submitted write cannot finish while the device is gated.
+#[test]
+fn backpressure_repeated_waits_allocate_zero_bytes_after_open() {
+    use ferrosa_sstable::backpressure_test_support::WriteGate;
+    let _guard = ALLOC_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    const ITERATIONS: usize = 32;
+    let gate = Arc::new(WriteGate::new(Duration::from_secs(5)));
+    let mut pump = AlignedPump::open_with_depth(
+        gate.wrap(Box::new(NullSink)),
+        4096,
+        4096,
+        std::path::PathBuf::from("repeated-park.db"),
+        1,
+        Arc::new(NeverAbort::new()),
+    );
+    let chunk = [11u8; 4096];
+    // Fill both owned segments. The next call cannot succeed before a permit.
+    pump.write_all(&chunk).unwrap();
+    pump.write_all(&chunk).unwrap();
+    gate.wait_for_attempts(1);
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+    let (phase_tx, phase_rx) = crossbeam_channel::bounded(1);
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let controller_gate = Arc::clone(&gate);
+    let controller = std::thread::spawn(move || {
+        // Initialize controller-side channel wait storage before measurement.
+        let mut selection = crossbeam_channel::Select::new();
+        selection.recv(&phase_rx);
+        selection.recv(&done_rx);
+        assert!(selection.try_select().is_err());
+        drop(selection);
+        ready_tx.send(()).unwrap();
+        for _ in 0..ITERATIONS {
+            phase_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_millis(5)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            );
+            let mut finished = false;
+            for _ in 0..3 {
+                controller_gate.release(1);
+                match done_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(()) => {
+                        finished = true;
+                        break;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(error) => panic!("producer disconnected: {error}"),
+                }
+            }
+            assert!(
+                finished,
+                "three permits must complete three staged segments"
+            );
+        }
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let before_events = alloc_events();
+    let before_bytes = ALLOC_BYTES.load(Ordering::Relaxed);
+    let before_waits = ferrosa_sstable::pump::pump_park_count();
+    for _ in 0..ITERATIONS {
+        phase_tx.send(()).unwrap();
+        // Three segments exceed the complete two-segment ring, even if a
+        // previous coalesced call returned every buffer before this operation.
+        pump.write_all(&[11u8; 4096 * 3]).unwrap();
+        done_tx.send(()).unwrap();
+    }
+    let events = alloc_events() - before_events;
+    let bytes = ALLOC_BYTES.load(Ordering::Relaxed) - before_bytes;
+    let waits = ferrosa_sstable::pump::pump_park_count() - before_waits;
+    assert!(
+        waits >= ITERATIONS as u64,
+        "each operation must exercise a blocking wait: {waits}"
+    );
+    assert_eq!(
+        (events, bytes),
+        (0, 0),
+        "{waits} repeated waits allocated {events} times / {bytes} bytes"
+    );
+    controller.join().unwrap();
+    gate.open();
+    pump.finish().unwrap();
+    std::fs::write(
+        std::env::temp_dir().join("ferrosa-repeated-pump-waits.txt"),
+        format!("iterations={ITERATIONS} waits={waits} allocations={events} bytes={bytes}\n"),
+    )
+    .unwrap();
 }

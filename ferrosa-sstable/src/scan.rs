@@ -3,7 +3,7 @@
 //!   reader would (any offset, any length, EOF included), the number of inner reads
 //!   for a sequential scan is bounded by `ceil(len / window)`, at most one inner read
 //!   is ever in flight per reader, memory held is bounded by two windows (current +
-//!   one prefetch), and an inner failure — foreground or on the prefetch thread —
+//!   one prefetch), with payload buffers moved back for reuse, and an inner failure — foreground or on the prefetch thread —
 //!   reaches the caller as an error.
 //! Last revised: 2026-09-26
 //! Last changed: New module — compaction input reads were one small `pread` per
@@ -31,19 +31,26 @@ fn read_window<R: ReadAt + ?Sized>(
     len: u64,
     window: usize,
     pos: u64,
-    mut buf: Vec<u8>,
-) -> Result<Vec<u8>> {
+    buf: &mut Vec<u8>,
+) -> Result<()> {
     let want = (len - pos).min(window as u64) as usize;
     buf.resize(want, 0);
     let mut filled = 0;
     while filled < want {
-        let n = inner.read_at(&mut buf[filled..], pos + filled as u64)?;
+        let n = match inner.read_at(&mut buf[filled..], pos + filled as u64) {
+            Ok(n) => n,
+            Err(error) => {
+                buf.clear();
+                return Err(error);
+            }
+        };
         if n == 0 {
+            buf.clear();
             return Err(eof_error(pos + filled as u64, len));
         }
         filled += n;
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// The bytes currently buffered: `data` holds file bytes `[start, start + data.len())`.
@@ -59,13 +66,13 @@ impl Window {
     }
 }
 
-type Fetched = (u64, Result<Vec<u8>>);
+type Fetched = (u64, Vec<u8>, Result<()>);
 
 /// One background thread that reads a requested window and sends it back. It runs
 /// one request at a time, and the reader issues one request at a time, so at most
 /// one prefetch is ever outstanding.
 struct Worker {
-    requests: Option<Sender<u64>>,
+    requests: Option<Sender<(u64, Vec<u8>)>>,
     responses: Receiver<Fetched>,
     handle: Option<JoinHandle<()>>,
 }
@@ -82,14 +89,16 @@ impl Worker {
         len: u64,
         window: usize,
     ) -> Result<Self> {
-        let (req_tx, req_rx) = channel::<u64>();
+        let (req_tx, req_rx) = channel::<(u64, Vec<u8>)>();
         let (resp_tx, resp_rx) = channel::<Fetched>();
         let handle = std::thread::Builder::new()
             .name("sstable-readahead".into())
             .spawn(move || {
-                while let Ok(pos) = req_rx.recv() {
-                    let fetched = read_window(&*inner, len, window, pos, Vec::new());
-                    if resp_tx.send((pos, fetched)).is_err() {
+                while let Ok((pos, mut buffer)) = req_rx.recv() {
+                    let result = read_window(&*inner, len, window, pos, &mut buffer);
+                    // Return the same allocation on success or failure. If the
+                    // reader has gone away, SendError drops it deliberately.
+                    if resp_tx.send((pos, buffer, result)).is_err() {
                         break;
                     }
                 }
@@ -101,12 +110,16 @@ impl Worker {
         })
     }
 
-    fn request(&self, pos: u64) -> Result<()> {
+    fn request(
+        &self,
+        pos: u64,
+        buffer: Vec<u8>,
+    ) -> std::result::Result<(), (ferrosa_common::Error, Vec<u8>)> {
         self.requests
             .as_ref()
             .expect("requests sender present until drop")
-            .send(pos)
-            .map_err(|_| worker_gone())
+            .send((pos, buffer))
+            .map_err(|error| (worker_gone(), error.0 .1))
     }
 
     fn take_response(&self) -> Result<Fetched> {
@@ -136,6 +149,8 @@ struct State {
     window: Window,
     /// Start offset of the window the worker is currently reading, if any.
     pending: Option<u64>,
+    /// The second payload buffer, moved into each prefetch request.
+    spare: Option<Vec<u8>>,
     worker: Option<Worker>,
 }
 
@@ -172,6 +187,8 @@ impl<R: ReadAt> ReadAheadReader<R> {
         let len = inner.len()?;
         let inner = Arc::new(inner);
         let worker = make_worker(&inner, len, window)?;
+        let capacity = len.min(window as u64) as usize;
+        let spare = worker.as_ref().map(|_| Vec::with_capacity(capacity));
         Ok(Self {
             inner,
             len,
@@ -179,9 +196,10 @@ impl<R: ReadAt> ReadAheadReader<R> {
             state: Mutex::new(State {
                 window: Window {
                     start: 0,
-                    data: Vec::new(),
+                    data: Vec::with_capacity(capacity),
                 },
                 pending: None,
+                spare,
                 worker,
             }),
             prefetch_hits: AtomicU64::new(0),
@@ -197,25 +215,43 @@ impl<R: ReadAt> ReadAheadReader<R> {
     /// prefetch when it is for `pos`, otherwise with a foreground read; then start
     /// prefetching the window after it.
     fn refill(&self, state: &mut State, pos: u64) -> Result<()> {
-        let reusable = std::mem::take(&mut state.window.data);
-        let data = match (state.pending.take(), state.worker.as_ref()) {
-            (Some(p), Some(worker)) if p == pos => {
-                self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
-                worker.take_response()?.1?
-            }
-            (Some(_), Some(worker)) => {
-                // Non-sequential access: the prefetch is for a different window.
-                // Drain it so at most one read is ever in flight, then read here.
-                let _discarded = worker.take_response()?;
-                read_window(&*self.inner, self.len, self.window, pos, reusable)?
-            }
-            _ => read_window(&*self.inner, self.len, self.window, pos, reusable)?,
+        let prefetched = match (state.pending.take(), state.worker.as_ref()) {
+            (Some(expected), Some(worker)) => Some((expected, worker.take_response()?)),
+            _ => None,
         };
-        let next = pos + data.len() as u64;
-        state.window = Window { start: pos, data };
+        match prefetched {
+            Some((expected, (_, buffer, result))) if expected == pos => {
+                if let Err(error) = result {
+                    state.spare = Some(buffer);
+                    return Err(error);
+                }
+                self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
+                state.spare = Some(std::mem::replace(&mut state.window.data, buffer));
+            }
+            other => {
+                if let Some((_, (_, buffer, _))) = other {
+                    // A random seek drains its irrelevant prefetch, including
+                    // any error, but retains the payload allocation for reuse.
+                    state.spare = Some(buffer);
+                }
+                read_window(
+                    &*self.inner,
+                    self.len,
+                    self.window,
+                    pos,
+                    &mut state.window.data,
+                )?;
+            }
+        }
+        state.window.start = pos;
+        let next = pos + state.window.data.len() as u64;
         if let Some(worker) = state.worker.as_ref() {
             if next < self.len {
-                worker.request(next)?;
+                let spare = state.spare.take().ok_or_else(worker_gone)?;
+                if let Err((error, spare)) = worker.request(next, spare) {
+                    state.spare = Some(spare);
+                    return Err(error);
+                }
                 state.pending = Some(next);
             }
         }
@@ -546,4 +582,5 @@ mod tests {
             }
         }
     }
+    include!("scan_backpressure_tests.rs");
 }

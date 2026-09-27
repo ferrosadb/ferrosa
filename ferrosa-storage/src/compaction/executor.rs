@@ -250,20 +250,33 @@ enum InputReadMode {
 ///
 /// `enabled` comes from the run-time switch (`FERROSA_COMPACTION_DIRECT_READ`,
 /// then `FERROSA_DIRECT_IO`): ON by default, `=0` turns it off. `window_env` is
-/// `FERROSA_COMPACTION_READAHEAD_BYTES`; an invalid value is WARN-logged and the
+/// `FERROSA_COMPACTION_READAHEAD_BYTES`; an invalid value is ERROR-logged and the
 /// default window is used, so a typo cannot silently change memory use.
 fn input_read_mode(enabled: bool, window_env: Option<&str>) -> InputReadMode {
     if !enabled {
         return InputReadMode::Cached;
     }
     let window = ferrosa_sstable::scan::parse_scan_window(window_env).unwrap_or_else(|why| {
-        tracing::warn!(
+        tracing::error!(
             error = %why,
             default = ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW,
             "compaction: invalid FERROSA_COMPACTION_READAHEAD_BYTES, using the default window"
         );
         ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
     });
+    if let Some(raw) = window_env {
+        if raw.trim().parse::<usize>().is_ok_and(|requested| {
+            requested != window
+                && requested > 0
+                && requested <= ferrosa_sstable::scan::MAX_SCAN_WINDOW
+        }) {
+            tracing::warn!(
+                configured = raw,
+                effective = window,
+                "compaction read-ahead window rounded up to a block multiple"
+            );
+        }
+    }
     InputReadMode::DirectScan { window }
 }
 
@@ -2498,6 +2511,62 @@ mod tests {
     }
 
     #[test]
+    fn backpressure_read_ahead_config_logs_error_defaults_and_normalization() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Capture(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for bad in ["junk", "0", "-1", "268435457"] {
+                assert_eq!(
+                    input_read_mode(true, Some(bad)),
+                    InputReadMode::DirectScan {
+                        window: ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
+                    }
+                );
+            }
+            assert_eq!(
+                input_read_mode(true, Some("4097")),
+                InputReadMode::DirectScan { window: 8192 }
+            );
+            assert_eq!(
+                input_read_mode(true, None),
+                InputReadMode::DirectScan {
+                    window: ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW
+                }
+            );
+            assert_eq!(
+                input_read_mode(true, Some("268435456")),
+                InputReadMode::DirectScan {
+                    window: ferrosa_sstable::scan::MAX_SCAN_WINDOW
+                }
+            );
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("ERROR").count(), 4, "{logs}");
+        assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+        assert!(logs.contains("effective=8192"), "{logs}");
+        assert!(
+            logs.contains("configured=\"4097\"") || logs.contains("configured=4097"),
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn input_read_mode_selection() {
         use ferrosa_sstable::scan::DEFAULT_SCAN_WINDOW;
         assert_eq!(input_read_mode(false, None), InputReadMode::Cached);
@@ -2512,7 +2581,7 @@ mod tests {
             input_read_mode(true, Some("8192")),
             InputReadMode::DirectScan { window: 8192 }
         );
-        // A bad window is reported (WARN) and the default is used — never silent.
+        // A bad window is reported (ERROR) and the default is used — never silent.
         assert_eq!(
             input_read_mode(true, Some("junk")),
             InputReadMode::DirectScan {

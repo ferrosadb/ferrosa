@@ -575,6 +575,8 @@ impl StreamSink {
 /// (architecture.md § Bounded-ring rule) — and its header is patched at
 /// `finish` via [`AlignedPump::finish_with_patched_header`].
 struct ChunkCompressor {
+    #[cfg(test)]
+    before_first_batch: Option<Box<dyn FnOnce() + Send>>,
     compression: Compression,
     /// Reusable input buffers, `batch_chunks` of them, each `chunk_size`
     /// bytes. `lens.len()` of them (starting at index 0) hold live data.
@@ -649,6 +651,8 @@ impl ChunkCompressor {
         info_pump.write_all(&placeholder)?;
 
         Ok(Self {
+            #[cfg(test)]
+            before_first_batch: None,
             compression,
             inputs,
             outputs,
@@ -690,6 +694,10 @@ impl ChunkCompressor {
         let n = self.lens.len();
         if n == 0 {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(before_batch) = self.before_first_batch.take() {
+            before_batch();
         }
         let compression = &self.compression;
         let inputs = &self.inputs;
@@ -5035,4 +5043,5 @@ mod tests {
             "add_partition must reject empty clustering when schema declares fixed-length clustering"
         );
     }
+    include!("writer_backpressure_tests.rs");
 }

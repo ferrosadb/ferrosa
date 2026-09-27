@@ -139,22 +139,11 @@ impl PumpConfig {
 
     /// Round `segment_bytes` up to a multiple of `block`, with a minimum of
     /// one block (`decisions.md` D5): `round_up(max(segment_bytes, block),
-    /// block)`. Logs once per process, at INFO, when rounding changes the
+    /// block)`. Logs once per process, at WARN, when rounding changes the
     /// configured value — never at every open, or the one line that mattered
     /// would drown in identical repeats.
     pub fn effective_segment(&self, block: usize) -> usize {
-        debug_assert!(block > 0, "block must be positive");
-        let wanted = self.segment_bytes.max(block);
-        let rounded = wanted.div_ceil(block) * block;
-        if rounded != self.segment_bytes && !ROUNDING_WARNED.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                configured = self.segment_bytes,
-                effective = rounded,
-                block,
-                "write pump segment size rounded up to a block multiple"
-            );
-        }
-        rounded
+        effective_segment_with_notice(self.segment_bytes, block, &ROUNDING_WARNED)
     }
 }
 
@@ -190,7 +179,22 @@ fn resolve_bounded(value: Option<&str>, default: usize, min: usize, max: usize) 
     }
 }
 
-/// `resolve_bounded` plus the once-per-process WARN, matching the pattern
+fn effective_segment_with_notice(configured: usize, block: usize, logged: &AtomicBool) -> usize {
+    debug_assert!(block > 0, "block must be positive");
+    let wanted = configured.max(block);
+    let rounded = wanted.div_ceil(block) * block;
+    if rounded != configured && !logged.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            configured = configured,
+            effective = rounded,
+            block,
+            "write pump segment size rounded up to a block multiple"
+        );
+    }
+    rounded
+}
+
+/// `resolve_bounded` plus the once-per-process ERROR, matching the pattern
 /// `direct::configured` uses for the O_DIRECT switch: the writer opens a
 /// pump per SSTable, so a line per file would bury the one that mattered.
 fn resolve_env(
@@ -203,7 +207,7 @@ fn resolve_env(
 ) -> usize {
     let (resolved, rejected) = resolve_bounded(value, default, min, max);
     if rejected && !warned.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
+        tracing::error!(
             var = name,
             value = ?value,
             default,
@@ -745,6 +749,20 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// following `batch.pop_front()` never conflicts with it.
 const MAX_BATCH: usize = MAX_QUEUE_DEPTH + 1;
 
+// The flusher queues its I/O failure before dropping free_tx. Once a free
+// receive observes disconnection, the error is already available; this remains
+// a single nonblocking receive and preserves the original device cause.
+fn flusher_disconnect_error(backend: &AsyncBackend, path: &Path) -> Error {
+    match backend.err_rx.try_recv() {
+        Ok(error) => wrap_sink_error(
+            path,
+            error.offset,
+            Error::Io(io::Error::other(error.message)),
+        ),
+        Err(_) => disconnected_error(path),
+    }
+}
+
 // Crossbeam 0.5 caches Context in TLS and retains each channel's selector
 // Vec capacity. Dynamic try_select registers even on an empty channel, unlike
 // recv/try_recv fast paths. Initialize that storage at open without payload I/O.
@@ -908,13 +926,13 @@ static PUMP_BLOCKED_FREE_NANOS: AtomicU64 = AtomicU64::new(0);
 // process-wide counter would be noisy under `--test-threads` > 1 (this is
 // unlike the `write_pump_*` Prometheus gauges above, which are legitimately
 // meant to sum across every concurrent pump in the real process).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static PUMP_PARK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-fn pump_park_count() -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn pump_park_count() -> u64 {
     PUMP_PARK_COUNT.with(std::cell::Cell::get)
 }
 
@@ -1454,7 +1472,7 @@ impl AlignedPump {
             .as_async_mut()
             .expect("wait_for_free_segment_blocking only runs on the async backend");
         let quick = select! {
-            recv(backend.free_rx) -> seg => Some(seg.map_err(|_| disconnected_error(&self.path))),
+            recv(backend.free_rx) -> seg => Some(seg.map_err(|_| flusher_disconnect_error(backend, &self.path))),
             recv(backend.abort.closed()) -> _ => {
                 PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 Some(Err(aborted_error(&self.path)))
@@ -1464,7 +1482,7 @@ impl AlignedPump {
         if let Some(result) = quick {
             return result;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         PUMP_PARK_COUNT.with(|c| c.set(c.get() + 1));
         // No `Receiver::clone()` here (that would allocate on what can be the
         // hot path whenever the flusher is the bottleneck): `backend` and
@@ -1480,7 +1498,7 @@ impl AlignedPump {
         // `free_rx` nor `abort` became ready in that time — no `after()`
         // call, no allocation, on this or any subsequent park.
         select! {
-            recv(backend.free_rx) -> seg => return seg.map_err(|_| disconnected_error(&self.path)),
+            recv(backend.free_rx) -> seg => return seg.map_err(|_| flusher_disconnect_error(backend, &self.path)),
             recv(backend.abort.closed()) -> _ => {
                 PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 return Err(aborted_error(&self.path));
@@ -1504,7 +1522,7 @@ impl AlignedPump {
             .as_async_mut()
             .expect("wait_for_free_segment_blocking only runs on the async backend");
         let result = select! {
-            recv(backend.free_rx) -> seg => seg.map_err(|_| disconnected_error(&self.path)),
+            recv(backend.free_rx) -> seg => seg.map_err(|_| flusher_disconnect_error(backend, &self.path)),
             recv(backend.abort.closed()) -> _ => {
                 PUMP_ABORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 Err(aborted_error(&self.path))
@@ -2175,6 +2193,75 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backpressure_invalid_tunables_log_error_once_and_continue_with_defaults() {
+        #[derive(Clone)]
+        struct Events(Arc<Mutex<Vec<tracing::Level>>>);
+        impl tracing::Subscriber for Events {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Events(Arc::clone(&events)), || {
+            for (name, default, min, max) in [
+                (
+                    "FERROSA_SSTABLE_WRITE_SEGMENT_BYTES",
+                    DEFAULT_SEGMENT_BYTES,
+                    MIN_SEGMENT_BYTES,
+                    MAX_SEGMENT_BYTES,
+                ),
+                (
+                    "FERROSA_SSTABLE_WRITE_QUEUE_DEPTH",
+                    DEFAULT_QUEUE_DEPTH,
+                    0,
+                    MAX_QUEUE_DEPTH,
+                ),
+            ] {
+                let logged = AtomicBool::new(false);
+                assert_eq!(resolve_env(name, None, default, min, max, &logged), default);
+                assert_eq!(
+                    resolve_env(name, Some("invalid"), default, min, max, &logged),
+                    default
+                );
+                assert_eq!(
+                    resolve_env(name, Some("-1"), default, min, max, &logged),
+                    default
+                );
+                assert_eq!(
+                    resolve_env(name, Some(&max.to_string()), default, min, max, &logged),
+                    max
+                );
+                assert_eq!(
+                    resolve_env(name, Some(&min.to_string()), default, min, max, &logged),
+                    min
+                );
+            }
+            let normalized = AtomicBool::new(false);
+            assert_eq!(effective_segment_with_notice(4097, 4096, &normalized), 8192);
+            assert_eq!(effective_segment_with_notice(1, 4096, &normalized), 4096);
+        });
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                tracing::Level::ERROR,
+                tracing::Level::ERROR,
+                tracing::Level::WARN
+            ]
+        );
+    }
+
     use proptest::prelude::*;
 
     #[test]

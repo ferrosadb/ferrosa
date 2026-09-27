@@ -74,3 +74,17 @@ the top of the scale: a defect here is silent data loss or corruption.
 ### Pump wiring acceptance (T-045)
 
 File-backed sharded flushes stream each shard through the aligned pump into an owned staging directory, retain only component manifests, and publish the complete reader set in one view update. Guards remove unfinished staging after workers join. Wiring acceptance covers compressed/plain flush, compaction, restart, runtime pump settings, exact component bytes, and digest readback.
+
+T-041 tests exercise actual engine flush/compaction stalls and scoped digest
+readback checkpoints. Publication, WAL discard and compaction input retirement
+wait for readback; a released flush completes with compaction still gated.
+Admission bounds the active memtable; the separately retained flushing memtable
+must be included in total memory accounting. These counters do not prove flat
+process RSS. The isolated pump benchmark reports its own heap/RSS/throughput;
+engine-level E1/E2/E3 RSS and Linux dirty-page/cgroup measurements remain live
+acceptance evidence to collect, not inferred passes.
+
+Read-ahead config: `FERROSA_COMPACTION_READAHEAD_BYTES`, default 1 MiB,
+range 1..=256 MiB, rounded up to 4096 bytes. Invalid values emit ERROR and fall back;
+valid normalization emits WARN with configured/effective sizes. Shutdown can
+cancel a parked producer, then joins once the outstanding device call returns.

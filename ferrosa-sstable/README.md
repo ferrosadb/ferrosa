@@ -438,3 +438,34 @@ Production builds do not include the hook registry or its locks.
 ### Pump wiring acceptance (T-045)
 
 Fixed component labels count pump opens by I/O mode, successful physical bytes (including padding), and sink write requests. The counters use atomics and resolve labels once per file; no per-write allocation or registry lock is added. Scoped test traces preserve real file I/O and detect known legacy component-write routes.
+
+## Backpressure coverage (T-041)
+
+A path-scoped test sink wraps the actual file writer. The bounded `WriteGate`
+fixture retains counters and permits, never payload bytes. Tests gate each
+component for all three codecs and compare all output bytes against the
+ungated writer, gate compression independently of Data.db, pin the ring at
+`depth + 1` owned segments, and check the final CompressionInfo header patch.
+A gated file source through the real `ReadAheadReader` proves a blocked
+producer stops pulling after its current window plus one prefetch. A deliberate
+60-second stall is in `::slow::`; release resumes progress without loss/reorder.
+
+Invalid pump environment settings log ERROR once and retain safe defaults.
+Valid alignment normalization logs configured/effective sizes at WARN. A
+flusher I/O failure observed through a disconnected free channel now preserves
+the original device cause. Cancellation cannot interrupt an arbitrary device
+syscall: shutdown joins after that call returns or the controlled gate releases.
+
+The isolated `backpressure_memory` integration binary measures live heap, RSS,
+and ungated/resumed real-file throughput. Its measurements apply to the pump;
+queue/memtable counters alone are not evidence of engine-wide RSS or throughput.
+
+Read-ahead payload buffers are now reused by moving the old window through the
+existing request channel. Two buffers support current data plus one prefetch;
+both are bounded at open, including random-seek/error/cancel paths.
+
+The strict repeated-backpressure gate measured 96 free-segment waits across 32
+three-segment submissions into a two-segment ring: zero allocation events and
+zero allocated bytes (0 bytes/wait). This supersedes the earlier T-034 residual
+park-allocation claim for the measured built-in `NeverAbort` path. Custom abort
+implementations and transport/read-ahead allocation surfaces remain separate.
