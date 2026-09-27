@@ -19,7 +19,7 @@ use ferrosa_jepsen::checker::strict_serializable::{
 use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_postgres::{Client, NoTls};
@@ -27,9 +27,8 @@ use uuid::Uuid;
 
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
-// Keep multirow transfer writes sequential so the fault schedule tests their
-// atomic effects without making every actor contend on the same two rows.
-const TRANSFER_WRITERS: usize = 1;
+// Bound retries so an unavailable cluster cannot hold a test actor indefinitely.
+const TRANSFER_SERIALIZATION_RETRIES: usize = 8;
 const WRITE_SKEW_WRITERS: usize = 2;
 const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
@@ -121,7 +120,10 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     }
 
     let event_clock = Arc::new(AtomicU64::new(1));
-    let history = Arc::new(Mutex::new(Vec::with_capacity(expected_history_length())));
+    let transfer_retry_count = Arc::new(AtomicUsize::new(0));
+    let history = Arc::new(Mutex::new(Vec::with_capacity(
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
+    )));
     let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
@@ -129,6 +131,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     for (actor, actor_client) in actor_clients.iter().enumerate() {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
+        let transfer_retry_count = Arc::clone(&transfer_retry_count);
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
         let write_skew_barrier = Arc::clone(&write_skew_barrier);
@@ -139,14 +142,14 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             let result = async {
                 for iteration in 0..TRANSACTIONS_PER_ACTOR {
                     let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                    if is_transfer_writer(actor) {
-                        let transfer =
-                            transfer_once(&client, &table, operation_id, &event_clock).await?;
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(transfer);
-                    }
+                    let transfers =
+                        transfer_once(&client, &table, operation_id, &event_clock).await?;
+                    transfer_retry_count
+                        .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
+                    history
+                        .lock()
+                        .expect("history mutex poisoned")
+                        .extend(transfers);
                     let register =
                         register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
                     history
@@ -221,7 +224,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        expected_history_length(),
+        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2) + transfer_retry_count.load(Ordering::Relaxed),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -436,6 +439,15 @@ async fn transfer_once(
     table: &str,
     id: u64,
     event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| transfer_attempt(client, table, id, event_clock)).await
+}
+
+async fn transfer_attempt(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
     let mut operations = Vec::with_capacity(4);
@@ -505,7 +517,6 @@ async fn transfer_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transfer,
@@ -518,7 +529,7 @@ async fn transfer_once(
 async fn register_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -556,7 +567,6 @@ async fn register_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -569,7 +579,7 @@ async fn register_once(
 async fn observe_predicate_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -587,7 +597,6 @@ async fn observe_predicate_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -600,7 +609,7 @@ async fn observe_predicate_once(
 async fn insert_phantom_once(
     client: &Client,
     table: &str,
-    id: u64,
+    _id: u64,
     event_clock: &AtomicU64,
 ) -> Result<RecordedTransaction> {
     let invoked = event_clock.fetch_add(1, Ordering::SeqCst);
@@ -629,7 +638,6 @@ async fn insert_phantom_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -679,7 +687,6 @@ async fn write_skew_once(
 
     finish_recorded_transaction(
         client,
-        id,
         invoked,
         operations,
         transaction,
@@ -709,7 +716,6 @@ async fn read_predicate_values(
 
 async fn finish_recorded_transaction(
     client: &Client,
-    id: u64,
     invoked: u64,
     operations: Vec<TransactionOperation>,
     result: Result<(), tokio_postgres::Error>,
@@ -729,12 +735,30 @@ async fn finish_recorded_transaction(
     };
     let completed = event_clock.fetch_add(1, Ordering::SeqCst);
     Ok(RecordedTransaction {
-        id,
+        id: invoked,
         invoked,
         completed,
         committed,
         operations,
     })
+}
+
+async fn retry_serializable_transactions<F, Fut>(mut attempt: F) -> Result<Vec<RecordedTransaction>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<RecordedTransaction>>,
+{
+    let mut history = Vec::with_capacity(TRANSFER_SERIALIZATION_RETRIES + 1);
+    for _ in 0..=TRANSFER_SERIALIZATION_RETRIES {
+        let transaction = attempt().await?;
+        let committed = transaction.committed;
+        history.push(transaction);
+        if committed {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(history)
 }
 
 async fn wait_for_phase(
@@ -814,14 +838,6 @@ fn is_write_skew_writer(actor: usize) -> bool {
     actor < WRITE_SKEW_WRITERS
 }
 
-fn is_transfer_writer(actor: usize) -> bool {
-    actor < TRANSFER_WRITERS
-}
-
-fn expected_history_length() -> usize {
-    ACTORS * (TRANSACTIONS_PER_ACTOR + 2) + TRANSFER_WRITERS * TRANSACTIONS_PER_ACTOR
-}
-
 fn convergence_node_count(total_nodes: usize, active_nodes: usize, fault_scheduled: bool) -> usize {
     if fault_scheduled {
         active_nodes
@@ -899,11 +915,65 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_client_count, actor_client_urls, convergence_node_count, expected_history_length,
-        initial_workload_statements, is_retryable_serialization_state, is_transfer_writer,
-        is_write_skew_writer, predicate_observations, wait_for_phase, FaultSchedule,
-        TransactionOperation, ACTORS,
+        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
+        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
+        retry_serializable_transactions, wait_for_phase, FaultSchedule, RecordedTransaction,
+        TransactionOperation, ACTORS, TRANSFER_SERIALIZATION_RETRIES,
     };
+
+    #[tokio::test]
+    async fn serialization_retries_keep_aborted_attempts_and_stop_after_commit() {
+        let mut outcomes = [false, false, true].into_iter();
+        let history = retry_serializable_transactions(|| {
+            let committed = outcomes.next().expect("only three attempts expected");
+            async move {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("serialization failures are recorded, not returned as errors");
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert!(
+            outcomes.next().is_none(),
+            "successful commit must stop retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn serialization_retries_are_bounded_and_keep_every_abort() {
+        let attempts = std::cell::Cell::new(0);
+        let history = retry_serializable_transactions(|| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed: false,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("serialization failures are retained as aborted attempts");
+
+        assert_eq!(attempts.get(), TRANSFER_SERIALIZATION_RETRIES + 1);
+        assert_eq!(history.len(), TRANSFER_SERIALIZATION_RETRIES + 1);
+        assert!(history.iter().all(|transaction| !transaction.committed));
+    }
 
     #[test]
     fn workload_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
@@ -943,17 +1013,6 @@ mod tests {
 
         assert_eq!(writers, [0, 1]);
         assert!(!is_write_skew_writer(ACTORS));
-    }
-
-    #[test]
-    fn fault_workload_keeps_multirow_transfers_on_one_actor() {
-        let writers = (0..ACTORS)
-            .filter(|actor| is_transfer_writer(*actor))
-            .collect::<Vec<_>>();
-
-        assert_eq!(writers, [0]);
-        assert!(!is_transfer_writer(ACTORS));
-        assert_eq!(expected_history_length(), 22);
     }
 
     #[test]
