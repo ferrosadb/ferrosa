@@ -146,9 +146,10 @@ checks the full history and final balances on every node with the bounded
 strict-serializability checker. At least three reachable PostgreSQL URLs using
 the same CQL-backed role are required. The test fails loudly when the feature is
 enabled without its cluster variable. It currently checks concurrent histories
-without node-failure injection. The PR workflow
-`.github/workflows/postgres-jepsen-fault.yml` runs the same native-driver
-history against the bundled three-node cluster while pausing node 3. It
+without node-failure injection. The `postgres-jepsen-fault` job in
+`.github/workflows/ci.yml` runs the same native-driver history against the
+bundled three-node cluster while pausing node 3. It reuses the node image
+artifact built earlier in CI. It
 coordinates the pause through marker files, directs transactions through nodes
 1 and 2 while the replica is unavailable, resumes node 3 after the workload,
 then requires every node to expose the same committed state. This covers one
