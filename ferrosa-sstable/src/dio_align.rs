@@ -50,7 +50,7 @@
 //!
 //! So the syscall number and the raw `syscall()` trampoline are available on
 //! every Linux target this crate ships for; only the *typed* `statx`
-//! struct/fn/const are gnu-only. [`KernelStatx`] below is our own
+//! struct/fn/const are gnu-only. `KernelStatx` below is our own
 //! `#[repr(C)]` mirror of the kernel UAPI `struct statx`
 //! (`include/uapi/linux/stat.h`), which the kernel documents as a fixed,
 //! stable 256-byte ABI regardless of libc — so defining it ourselves and
@@ -185,7 +185,7 @@ pub fn resolve_block(mask_has_dioalign: bool, mem_align: u32, offset_align: u32)
 #[cfg(target_os = "linux")]
 mod linux_probe {
     use super::{ProbeResult, MIN_BLOCK};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
     /// The block [`ProbeResult`] chose, or the value that will be logged in

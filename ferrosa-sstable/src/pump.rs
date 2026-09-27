@@ -498,7 +498,7 @@ fn write_all_at(
 pub mod component_metrics;
 
 /// The production [`SegmentSink`]: an ordinary file, opened with exactly the
-/// flags [`crate::direct::open_bypassing`] always used, plus the T-031
+/// flags `crate::direct::open_bypassing` always used, plus the T-031
 /// `dio_align` block probe `DirectWriter` did not yet consume before T-032.
 pub struct FileSink {
     counters: component_metrics::Counter,
@@ -1251,7 +1251,7 @@ pub fn pump_park_count() -> u64 {
 #[cfg(any(test, feature = "test-support"))]
 static LIVE_FLUSHER_THREADS: AtomicU64 = AtomicU64::new(0);
 
-/// Live flusher-thread count, process-wide. See [`LIVE_FLUSHER_THREADS`].
+/// Live flusher-thread count, process-wide. See `LIVE_FLUSHER_THREADS`.
 #[cfg(feature = "test-support")]
 pub fn live_flusher_threads() -> u64 {
     LIVE_FLUSHER_THREADS.load(Ordering::SeqCst)
@@ -1370,7 +1370,7 @@ pub(crate) fn render_prometheus(out: &mut String) {
 }
 
 /// An aligned SSTable-component writer. At `depth = 0` ([`Self::open`]) it is
-/// synchronous: one [`AlignedBuf`] segment, filled by
+/// synchronous: one `AlignedBuf` segment, filled by
 /// [`write_all`](Self::write_all) and drained with exactly one
 /// [`SegmentSink::pwrite`] per full segment (D5 — never a remainder
 /// shuffle). At `depth >= 1` ([`Self::open_with_depth`]) segments move by

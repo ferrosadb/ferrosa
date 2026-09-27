@@ -210,7 +210,7 @@ pub fn direct_wanted(specific_name: &str, warned: &AtomicBool) -> bool {
 /// block size and a safe superset of 512-byte device sectors: a buffer
 /// aligned to 4096 satisfies any O_DIRECT alignment a real device imposes.
 ///
-/// This is a floor, not "the" block size: [`AlignedBuf`] and [`DirectWriter`]
+/// This is a floor, not "the" block size: `AlignedBuf` and [`DirectWriter`]
 /// carry their own runtime alignment (probed per file — see `dio_align.rs`
 /// and `decisions.md` D4), which is always `>= MIN_BLOCK`. Code that needs
 /// "the" block for a specific buffer or writer reads it from that value, not
