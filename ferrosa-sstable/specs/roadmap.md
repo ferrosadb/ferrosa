@@ -84,6 +84,16 @@ Sourced from in-code deferral notes (`data.rs`, `writer.rs`), the FMEA gaps
 
 All component file writes now use the pump, including metadata and buffered
 output from a memory writer. Byte parity is checked for every component across
-both output modes and all supported compression codecs. T-081 remains required
-to bound the metadata builders (trie, Rows and CRC) and remove duplicate Bloom
-serialization; pump routing alone does not make those builders allocation-free.
+both output modes and all supported compression codecs. T-081 now streams
+partition/row trie nodes and CRC words, reuses row-trie scratch and emits Bloom
+words without a duplicate serialized bitset. Remaining strict allocation work:
+Rayon external-job injection. T-081 initializes cached Crossbeam wait storage
+at open and uses one-slot abort channels solely for disconnection; unchanged
+RE5 and pump allocation gates pass. No allocation allowances were added.
+
+T-081 allocator attribution: the unchanged LZ4 and Zstd strict gates each
+observe one 1,520-byte allocation across 1,000 measured partitions after 64
+warm-up partitions. The allocation stack is `crossbeam_deque::Injector<JobRef>`
+through `rayon_core::ThreadPool::install` from `ChunkCompressor::flush_batch`.
+It belongs to external job injection, not component serialization. Scheduling
+is a separate follow-up; neither strict gate is relaxed in T-081.

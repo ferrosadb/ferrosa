@@ -38,8 +38,9 @@ resolution beyond the serialization header, or cluster routing.
   truncation and sync before completion. Direct mode follows the same runtime
   switch as Data.db; the streaming CompressionInfo header retains its existing
   buffered depth-0 path. `finish()` still returns owned component bytes for
-  memory callers. Trie/Rows/CRC construction remains in memory (T-081); this
-  change routes output and removes the second whole-trie copy.
+  memory callers. T-081 streams completed partition/row trie nodes and CRC
+  words directly to component pumps, reuses the row trie across partitions,
+  and emits Bloom words from its existing bitset without a serialized copy.
 - **Source checksums (T-011)** — `Digest.crc32` (a single CRC32 over the final
   on-disk Data.db bytes) is written for every table; `CRC.db` (a per-chunk
   CRC32 table, Cassandra-compatible layout) is written for uncompressed
@@ -383,3 +384,25 @@ allocation-free iterator (`ferrosa-sstable/tests/row_encode_alloc.rs`
 - [Architecture overview](specs/overview.md) — module map, data flow, invariants
 - [FMEA / known issues](specs/fmea.md) — failure modes + scope gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## Metadata allocation bounds (T-081)
+
+File-backed writers retain one aligned segment for each Partitions.db, Rows.db
+and uncompressed CRC.db output. They never accumulate complete encoded indexes
+or CRC tables. The trie keeps only its active key frontier: branch descriptors,
+completed sibling pointers, the previous key, and at most one page of encoded
+node scratch. The initial frontier covers 64-byte keys (65 descriptors and
+16,640 child slots); longer keys can grow depth/key storage, and unusually deep
+branching can grow the child arena. These allocations depend on live key shape,
+not completed table output, and remain reusable. Key bounds and row-column
+scratch similarly retain their largest observed shape. Bloom's existing fixed
+10,000-key estimate allocates its bitset once; this packet changes serialization,
+not Bloom sizing or false-positive semantics.
+
+Open primes Crossbeam's cached Context and selector capacity on both pump
+threads. Built-in abort signals only disconnect a one-slot channel, avoiding
+rendezvous select packets while preserving wakeups for every receiver. The
+unchanged 64 MiB row test measures zero allocations; existing pump allocation
+and cancellation gates remain unchanged. The compressed steady-state gate
+still detects one Rayon external-job injection allocation per measured run;
+that scheduling issue remains separate from metadata serialization.

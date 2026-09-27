@@ -46,7 +46,7 @@ use crate::byte_comparable;
 use crate::checksum::{self, ChunkCrc, DigestCrc32};
 use crate::compression::{Compression, CompressionInfo};
 use crate::direct::MIN_BLOCK;
-use crate::io::FileReadAt;
+use crate::io::{AppendSink, FileReadAt};
 use crate::pump::{
     AbortSignal, AlignedPump, BufferedFileSink, FileSink, NeverAbort, PumpConfig, SegmentSink,
 };
@@ -108,7 +108,7 @@ fn sstable_direct_io_enabled() -> bool {
 }
 
 fn replace_owned_bytes(slot: &mut Option<Vec<u8>>, bytes: &[u8]) {
-    let target = slot.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
+    let target = slot.get_or_insert_with(|| Vec::with_capacity(bytes.len().max(64)));
     target.clear();
     target.extend_from_slice(bytes);
 }
@@ -174,6 +174,75 @@ fn pump_component(path: &Path, bytes: &[u8]) -> Result<u64> {
     let mut writer = ComponentWriter::create(path, sstable_direct_io_enabled())?;
     writer.write_all(bytes)?;
     writer.finish()
+}
+
+/// Component destination shared by memory compatibility and production files.
+/// File mode retains one pump segment, regardless of encoded component size.
+enum ComponentSink {
+    Memory(Vec<u8>),
+    File(Box<ComponentFile>),
+}
+
+struct ComponentFile {
+    writer: ComponentWriter,
+    path: PathBuf,
+}
+
+impl ComponentSink {
+    fn memory() -> Self {
+        Self::Memory(Vec::new())
+    }
+
+    fn file(path: PathBuf) -> Result<Self> {
+        let writer = ComponentWriter::create(&path, sstable_direct_io_enabled())?;
+        Ok(Self::File(Box::new(ComponentFile { writer, path })))
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::File(file) => file.writer.position(),
+        }
+    }
+
+    fn finish_file(self, path: &Path) -> Result<u64> {
+        match self {
+            Self::Memory(bytes) => pump_component(path, &bytes),
+            Self::File(file) => {
+                if file.path != path {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "component opened at {} but finalized at {}",
+                        file.path.display(),
+                        path.display()
+                    )));
+                }
+                file.writer.finish()
+            }
+        }
+    }
+
+    // Explicit owned-byte compatibility API; production finish_to_directory
+    // never calls this or reads the streamed component back into memory.
+    fn into_memory(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Memory(bytes) => Ok(bytes),
+            Self::File(file) => {
+                file.writer.finish()?;
+                let bytes = std::fs::read(&file.path)?;
+                std::fs::remove_file(file.path)?;
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+impl AppendSink for ComponentSink {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Memory(buf) => AppendSink::append(buf, bytes),
+            Self::File(file) => file.writer.write_all(bytes),
+        }
+    }
 }
 
 /// Wraps [`ComponentWriter`] with a streaming [`DigestCrc32`] (and, for
@@ -299,7 +368,7 @@ struct StreamFinish {
     /// re-reading `data_path` afterward (D6).
     digest: u32,
     /// `CRC.db`: `Some` only for uncompressed tables.
-    crc_db: Option<Vec<u8>>,
+    crc_db: Option<ComponentSink>,
     compression_info: Option<CompressionInfoFinish>,
 }
 
@@ -319,7 +388,7 @@ struct StreamSink {
     uncompressed_len: u64,
     /// `Some` only when `compressor` is `None`: `CRC.db` is a property of the
     /// uncompressed Data.db, which a compressed table doesn't have (T-011).
-    chunk_crc: Option<ChunkCrc>,
+    chunk_crc: Option<ChunkCrc<ComponentSink>>,
     data_path: PathBuf,
 }
 
@@ -358,7 +427,11 @@ impl StreamSink {
                 )?;
                 (Some(compressor), None)
             }
-            _ => (None, Some(ChunkCrc::new(options.chunk_size))),
+            _ => {
+                let path = data_path.with_file_name(toc::CRC);
+                let crc = ChunkCrc::with_sink(options.chunk_size, ComponentSink::file(path)?)?;
+                (None, Some(crc))
+            }
         };
 
         Ok(Self {
@@ -377,7 +450,7 @@ impl StreamSink {
             None => {
                 self.pump.write_all(bytes)?;
                 if let Some(chunk_crc) = &mut self.chunk_crc {
-                    chunk_crc.update(bytes);
+                    chunk_crc.update_sink(bytes)?;
                 }
                 Ok(())
             }
@@ -392,7 +465,7 @@ impl StreamSink {
         // Captured before `finish()` consumes the pump.
         let digest = self.pump.digest();
         let data_len = self.pump.finish()?;
-        let crc_db = self.chunk_crc.map(ChunkCrc::into_bytes);
+        let crc_db = self.chunk_crc.map(ChunkCrc::finish_sink).transpose()?;
         Ok(StreamFinish {
             data_path: self.data_path,
             data_len,
@@ -787,13 +860,12 @@ pub struct SSTableWriter {
     header: SerializationHeader,
     /// Raw (uncompressed) data buffer — the Data.db content.
     data_buf: DataSink,
-    /// Raw Rows.db buffer containing per-partition clustering row indexes for
-    /// wide clustered partitions.
-    rows_buf: Vec<u8>,
+    /// Reusable row trie; production nodes go straight to the Rows.db pump.
+    row_trie: TrieBuilder<ComponentSink>,
     /// Bloom filter for partition keys.
     bloom: BloomFilter,
     /// Trie builder for the partition index (Partitions.db).
-    trie_builder: TrieBuilder,
+    trie_builder: TrieBuilder<ComponentSink>,
     /// Number of partitions written so far.
     partition_count: u64,
     /// First raw partition key bytes (for Statistics.db).
@@ -833,15 +905,15 @@ impl SSTableWriter {
             options,
             header,
             data_buf: DataSink::memory(),
-            rows_buf: Vec::new(),
+            row_trie: TrieBuilder::with_sink(ComponentSink::memory()),
             bloom,
-            trie_builder: TrieBuilder::new(),
+            trie_builder: TrieBuilder::with_sink(ComponentSink::memory()),
             partition_count: 0,
             first_key: None,
             last_key: None,
             first_index_key: None,
             last_index_key: None,
-            encoded_key_scratch: Vec::new(),
+            encoded_key_scratch: Vec::with_capacity(128),
             cancel: None,
             total_rows: 0,
             total_columns_set: 0,
@@ -917,15 +989,17 @@ impl SSTableWriter {
             options,
             header,
             data_buf,
-            rows_buf: Vec::new(),
+            row_trie: TrieBuilder::with_sink(ComponentSink::file(staging_dir.join("Rows.db"))?),
             bloom,
-            trie_builder: TrieBuilder::new(),
+            trie_builder: TrieBuilder::with_sink(ComponentSink::file(
+                staging_dir.join("Partitions.db"),
+            )?),
             partition_count: 0,
             first_key: None,
             last_key: None,
             first_index_key: None,
             last_index_key: None,
-            encoded_key_scratch: Vec::new(),
+            encoded_key_scratch: Vec::with_capacity(128),
             cancel: None,
             total_rows: 0,
             total_columns_set: 0,
@@ -1051,7 +1125,8 @@ impl SSTableWriter {
             &first_index_key,
             &last_index_key,
             partition_count,
-        )?;
+        )?
+        .into_memory()?;
 
         // 2. Build bloom filter -> Filter.db
         let filter = self.bloom.write();
@@ -1117,13 +1192,21 @@ impl SSTableWriter {
                     None => None,
                 };
                 let digest = checksum::format_digest(artifacts.digest);
-                (data, compression_info, digest, artifacts.crc_db)
+                (
+                    data,
+                    compression_info,
+                    digest,
+                    artifacts
+                        .crc_db
+                        .map(ComponentSink::into_memory)
+                        .transpose()?,
+                )
             }
         };
 
         // 5. Rows.db: empty for simple partitions, indexed for wide clustered
         // partitions.
-        let rows = self.rows_buf;
+        let rows = self.row_trie.into_sink().into_memory()?;
 
         // 6. Build TOC -> TOC.txt
         let toc_bytes = Self::build_toc(has_compression);
@@ -1192,10 +1275,11 @@ impl SSTableWriter {
             &last_index_key,
             partition_count,
         )?;
-        let partitions_len = pump_component(&partitions_path, &partitions)?;
+        let partitions_len = partitions.finish_file(&partitions_path)?;
 
-        let filter = self.bloom.write();
-        let filter_len = pump_component(&filter_path, &filter)?;
+        let mut filter = ComponentSink::file(filter_path.clone())?;
+        self.bloom.write_to(&mut filter)?;
+        let filter_len = filter.finish_file(&filter_path)?;
 
         let statistics = Self::build_statistics_db(
             &header,
@@ -1231,7 +1315,7 @@ impl SSTableWriter {
                         .map(|_| compression_info_path.clone()),
                     compression_info_len,
                     artifacts.digest,
-                    artifacts.crc_db,
+                    artifacts.crc_db.map(ComponentSink::Memory),
                     data_len,
                 )
             }
@@ -1262,13 +1346,14 @@ impl SSTableWriter {
         // `CRC.db` only for uncompressed tables.
         let digest_bytes = checksum::format_digest(digest);
         let digest_len = pump_component(&digest_path, &digest_bytes)?;
-        let crc_len = if let Some(crc_db) = crc_db.as_ref() {
-            pump_component(&crc_path, crc_db)?
+        let has_crc = crc_db.is_some();
+        let crc_len = if let Some(crc_db) = crc_db {
+            crc_db.finish_file(&crc_path)?
         } else {
             0
         };
 
-        let rows_len = pump_component(&rows_path, &self.rows_buf)?;
+        let rows_len = self.row_trie.into_sink().finish_file(&rows_path)?;
 
         let toc = Self::build_toc(has_compression);
         let toc_len = pump_component(&toc_path, &toc)?;
@@ -1281,7 +1366,7 @@ impl SSTableWriter {
             compression_info,
             statistics: statistics_path,
             digest: digest_path,
-            crc: crc_db.as_ref().map(|_| crc_path),
+            crc: has_crc.then_some(crc_path),
             toc: toc_path,
             data_len,
             partitions_len,
@@ -1517,9 +1602,9 @@ impl SSTableWriter {
 
     /// Serialize a single partition to the data buffer.
     fn serialize_partition(&mut self, partition: &Partition, data_pos: u64) -> Result<Option<u64>> {
+        let row_index_start = self.row_trie.sink_mut().len();
         let build_row_index =
             !self.header.clustering_types.is_empty() && partition.rows.len() >= ROW_INDEX_MIN_ROWS;
-        let mut row_trie = build_row_index.then(TrieBuilder::new);
 
         // Key: u16 BE length + key bytes
         let key_bytes = partition.key.key.as_bytes();
@@ -1545,9 +1630,9 @@ impl SSTableWriter {
 
         // Clustered rows
         for row in &partition.rows {
-            if let Some(trie) = row_trie.as_mut() {
+            if build_row_index {
                 let row_offset = self.data_buf.len() - data_pos;
-                trie.add(
+                self.row_trie.add(
                     &row.clustering,
                     TriePayload {
                         hash: None,
@@ -1561,21 +1646,17 @@ impl SSTableWriter {
         // END_OF_PARTITION marker
         self.data_buf.push(END_OF_PARTITION)?;
 
-        if let Some(trie) = row_trie {
-            let rows_start = self.rows_buf.len() as u64;
-            let (trie_data, root_pos) = trie.finish()?;
-            self.rows_buf.extend_from_slice(&trie_data);
-            let footer_offset = self.rows_buf.len() as u64;
-            let entry = crate::row_index::RowIndexEntry {
-                partition_key: key_bytes.to_vec(),
-                data_position: data_pos,
-                trie_root: rows_start + root_pos,
-                block_count: partition.rows.len() as u32,
-                local_deletion_time: partition.deletion.local_deletion_time as i32,
-                marked_for_delete_at: partition.deletion.marked_for_delete_at,
-            };
-            self.rows_buf
-                .extend_from_slice(&crate::row_index::serialize_entry(&entry));
+        if build_row_index {
+            let root_pos = self.row_trie.finish_trie()?;
+            let sink = self.row_trie.sink_mut();
+            let footer_offset = sink.len();
+            sink.append(&(key_bytes.len() as u16).to_be_bytes())?;
+            sink.append(key_bytes)?;
+            sink.append(&(data_pos as i64).to_be_bytes())?;
+            sink.append(&((row_index_start + root_pos) as i64).to_be_bytes())?;
+            sink.append(&(partition.rows.len() as i32).to_be_bytes())?;
+            sink.append(&(partition.deletion.local_deletion_time as i32).to_be_bytes())?;
+            sink.append(&partition.deletion.marked_for_delete_at.to_be_bytes())?;
             Ok(Some(footer_offset))
         } else {
             Ok(None)
@@ -1909,28 +1990,28 @@ impl SSTableWriter {
 
     /// Build Partitions.db: trie bytes + byte-comparable key bounds + footer.
     fn build_partitions_db(
-        trie_builder: TrieBuilder,
+        trie_builder: TrieBuilder<ComponentSink>,
         first_index_key: &[u8],
         last_index_key: &[u8],
         partition_count: u64,
-    ) -> Result<Vec<u8>> {
-        // Reuse the builder's allocation; appending the footer does not require
-        // a second full copy of the encoded trie.
-        let (mut buf, root_pos) = trie_builder.finish()?;
+    ) -> Result<ComponentSink> {
+        // Completed nodes are already in the destination. Append bounds and
+        // footer in place; production never materializes the complete trie.
+        let (mut buf, root_pos) = trie_builder.finish_into()?;
 
         // Key bounds section
         let key_bounds_offset = buf.len() as i64;
         // smallest key: u16 len + bytes
-        buf.extend_from_slice(&(first_index_key.len() as u16).to_be_bytes());
-        buf.extend_from_slice(first_index_key);
+        buf.append(&(first_index_key.len() as u16).to_be_bytes())?;
+        buf.append(first_index_key)?;
         // largest key: u16 len + bytes
-        buf.extend_from_slice(&(last_index_key.len() as u16).to_be_bytes());
-        buf.extend_from_slice(last_index_key);
+        buf.append(&(last_index_key.len() as u16).to_be_bytes())?;
+        buf.append(last_index_key)?;
 
         // Footer: 3 big-endian i64s
-        buf.extend_from_slice(&key_bounds_offset.to_be_bytes());
-        buf.extend_from_slice(&(partition_count as i64).to_be_bytes());
-        buf.extend_from_slice(&(root_pos as i64).to_be_bytes());
+        buf.append(&key_bounds_offset.to_be_bytes())?;
+        buf.append(&(partition_count as i64).to_be_bytes())?;
+        buf.append(&(root_pos as i64).to_be_bytes())?;
 
         Ok(buf)
     }
@@ -2529,6 +2610,48 @@ mod tests {
         let mut component = ComponentWriter { pump };
         component.write_all(b"filter").unwrap();
         assert!(component.finish().is_err());
+    }
+
+    #[test]
+    fn metadata_stream_clustered_components_match_memory() {
+        let mut partitions: Vec<_> = (0..12)
+            .map(|i| make_wide_partition(format!("stream-{i:03}").as_bytes(), 1300))
+            .collect();
+        partitions.sort_by_key(|p| p.key.token);
+        for compression in [
+            None,
+            Some(Compression::Lz4),
+            Some(Compression::Zstd { level: 1 }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = WriteOptions {
+                compression,
+                ..WriteOptions::default()
+            };
+            let mut memory = SSTableWriter::new(options.clone(), test_header());
+            let mut stream =
+                SSTableWriter::new_file_backed(options, test_header(), dir.path().join("Data.db"))
+                    .unwrap();
+            for partition in &partitions {
+                memory.add_partition(partition).unwrap();
+                stream.add_partition(partition).unwrap();
+            }
+            let expected = memory.finish().unwrap();
+            let actual = stream
+                .finish_to_directory(dir.path())
+                .unwrap()
+                .read_to_memory()
+                .unwrap();
+            assert_eq!(actual.data, expected.data);
+            assert_eq!(actual.partitions, expected.partitions);
+            assert_eq!(actual.rows, expected.rows);
+            assert_eq!(actual.filter, expected.filter);
+            assert_eq!(actual.statistics, expected.statistics);
+            assert_eq!(actual.crc, expected.crc);
+            assert_eq!(actual.digest, expected.digest);
+            assert_eq!(actual.compression_info, expected.compression_info);
+            assert_eq!(actual.toc, expected.toc);
+        }
     }
 
     /// The load-bearing wiring invariant: writing the same byte stream through a

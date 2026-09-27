@@ -156,3 +156,7 @@ subset) are tracked in [specs/fmea.md](specs/fmea.md) and
 - [Architecture overview](specs/overview.md) — module map, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — failure modes + gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+The cancellation channel has one fixed slot but carries no messages. Dropping
+its sole sender wakes every current and future receiver; the fixed capacity
+avoids Crossbeam rendezvous select packets during waits (T-081).

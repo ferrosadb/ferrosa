@@ -105,3 +105,8 @@ The bottom. Depends on no Ferrosa crate (external only: `num-bigint`, `serde`,
 `uuid`, `tokio`, `crossbeam-channel` (T-021), optional `proptest`). Depended on by essentially every other
 crate in the workspace — see the [README dependency list](../README.md#dependencies)
 and the [root crate index](../../specs/crates.md) for the full graph.
+
+Cancellation uses a one-slot Crossbeam channel solely for disconnection. No
+payload is sent or consumed; every cloned receiver observes closure, including
+clones created after cancellation. Fixed capacity avoids zero-channel select
+packet allocations in storage pump waits (T-081).

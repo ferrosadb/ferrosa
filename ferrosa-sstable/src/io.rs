@@ -12,6 +12,20 @@
 //! its offset). This matches SSTable access patterns where multiple index
 //! lookups happen concurrently.
 
+/// Sequential bytes accepted by an encoder. File implementations apply
+/// backpressure; the Vec implementation preserves owned-byte compatibility.
+pub trait AppendSink {
+    /// Append bytes in order, propagating sink failures.
+    fn append(&mut self, bytes: &[u8]) -> ferrosa_common::Result<()>;
+}
+
+impl AppendSink for Vec<u8> {
+    fn append(&mut self, bytes: &[u8]) -> ferrosa_common::Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 use ferrosa_common::Result;
 use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};

@@ -63,7 +63,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `bloom` | ~293 | Cassandra-compatible double-hashing bloom filter |
 | `toc` | ~156 | TOC.txt read/write, standard component lists |
 | `types` | ~237 | `Partition`, `Row`, `LivenessInfo`, `DeletionTime` |
-| `pump` | ~3000 | `PumpConfig` (T-030); `SegmentSink` seam + `FileSink` (T-032, now also `pwritev`); `AlignedPump` — `depth = 0` synchronous (T-032, behind `direct::DirectWriter`) **and, from T-033, `depth >= 1`**: a dedicated flusher OS thread over pre-filled `crossbeam_channel::bounded` `full`/`free`/error channels, thread-local batching, coalesced `pwritev`, a non-blocking-then-watchdog-`select!` producer wait, and `write_pump_*` Prometheus metrics. **T-034**: the watchdog's first genuine wait uses `select!`'s own `default(duration)` arm instead of racing `recv(after(..))` — removes `after()`'s one-shot-channel allocation per park specifically (a genuine park still costs a small `crossbeam_channel`-internal allocation of its own; see FMEA ST-16). `AbortSignal`/`NeverAbort` (T-021 `CancelToken` shim, T-033). `test_support` (`RecordingSink`/`FaultySink`/`GateSink`, now `pub`); `live_flusher_threads()` test-only thread-count instrumentation (T-034) |
+| `pump` | ~3000 | `PumpConfig` (T-030); `SegmentSink` seam + `FileSink` (T-032, now also `pwritev`); `AlignedPump` — `depth = 0` synchronous (T-032, behind `direct::DirectWriter`) **and, from T-033, `depth >= 1`**: a dedicated flusher OS thread over pre-filled `crossbeam_channel::bounded` `full`/`free`/error channels, thread-local batching, coalesced `pwritev`, a non-blocking-then-watchdog-`select!` producer wait, and `write_pump_*` Prometheus metrics. **T-034**: the watchdog's first genuine wait uses `select!`'s own `default(duration)` arm instead of racing `recv(after(..))` — removes `after()`'s one-shot-channel allocation per park specifically (T-081 subsequently primes cached wait storage and avoids rendezvous abort packets; see FMEA ST-16). `AbortSignal`/`NeverAbort` (T-021 `CancelToken` shim, T-033). `test_support` (`RecordingSink`/`FaultySink`/`GateSink`, now `pub`); `live_flusher_threads()` test-only thread-count instrumentation (T-034) |
 | `dio_align` | ~250 | `resolve_block`/`probe`/`block_for` — O_DIRECT alignment probe via a raw `SYS_statx` syscall + `STATX_DIOALIGN` against a hand-rolled kernel-UAPI `KernelStatx` (not `libc::statx`, which is gnu-only in libc 0.2.186 — see FMEA ST-13). Runs on gnu and musl Linux alike; non-Linux is the `Unsupported` stub. Wired into the write path by `pump::FileSink` (T-032) |
 
 ## Component layout
@@ -232,5 +232,26 @@ depth-0 pump. The owned-byte `finish()` API remains available without file I/O.
 
 Consumed key bounds and headers move into finalization. The partition footer is
 appended to the trie builder's returned buffer instead of copying the entire
-trie into a second buffer. T-081 still owns bounded trie, Rows and CRC building;
-T-040 does not claim allocation-free metadata construction.
+trie into a second buffer. T-081 now streams production trie nodes and CRC words
+rather than returning table-sized buffers; Bloom serialization borrows its bitset.
+
+## Streaming metadata (T-081)
+
+`io::AppendSink` lets the same trie, Bloom and CRC encoders target owned bytes or
+a component pump. `TrieBuilder<S>` emits completed branches immediately and
+retains only active-depth descriptors, a shared child-pointer arena and bounded
+node scratch. The arena is truncated as each branch becomes one parent pointer.
+Row tries reset their **local** position after each partition while continuing
+to append to Rows.db; the footer adds the global row-trie start to its root.
+This preserves page padding and pointer widths byte for byte.
+
+`ChunkCrc<S>` emits its header at open and one word per completed chunk. It
+retains only the current hasher and byte count. `BloomFilter::write_to` borrows
+existing words. Compatibility `finish()`/`into_bytes()` APIs explicitly return
+owned bytes; production `finish_to_directory()` does not read components back.
+
+Open allocations comprise component pump segments, trie workspaces (initial
+64-byte key depth, 16,640 child entries, one page of node bytes, nine payload
+bytes, two 256-entry distance buffers) and the existing fixed Bloom bitset.
+Longer or more deeply branching keys may expand reusable frontier storage;
+row count and total encoded component size never require retained output.

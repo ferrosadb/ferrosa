@@ -12,9 +12,9 @@
 //! [`TrieBuilder::finish`].
 
 use ferrosa_common::{Error, Result};
-use smallvec::SmallVec;
 
-use crate::trie::node::{encode_signed_bytes, NodeType, PAGE_SIZE};
+use crate::io::AppendSink;
+use crate::trie::node::{NodeType, PAGE_SIZE};
 
 /// Payload attached to a leaf in the trie.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +35,7 @@ struct BranchNode {
     /// For the root (stack index 0), this is unused.
     transition: u8,
     /// Children: (transition_byte, absolute_position_in_output).
-    children: SmallVec<[(u8, u64); 16]>,
+    children_start: usize,
     /// Payload if this node is a leaf (or an internal node with a payload).
     payload: Option<TriePayload>,
 }
@@ -45,16 +45,20 @@ struct BranchNode {
 /// Keys must be added in sorted (lexicographic) order. The builder
 /// maintains a stack of branch nodes and serializes completed branches
 /// as new keys are added.
-pub struct TrieBuilder {
-    /// The output buffer, written bottom-up.
-    output: Vec<u8>,
+pub struct TrieBuilder<S = Vec<u8>> {
+    /// Completed nodes stream bottom-up to this destination.
+    output: S,
     /// Stack of in-progress branch nodes.
     /// Index 0 is always the implicit root.
     /// Indices 1..N correspond to key byte depths.
     stack: Vec<BranchNode>,
+    /// Completed children of active branches, stacked in depth-first order.
+    /// Branch completion truncates this arena, then appends one parent pointer.
+    children: Vec<(u8, u64)>,
+    key_capacity: usize,
     /// The previous key, used to detect the branch point.
     prev_key: Vec<u8>,
-    /// Current write position (= output.len()).
+    /// Current position within this trie (independent of earlier sink bytes).
     write_pos: usize,
     /// Position of the last node written (becomes root after finish).
     last_node_pos: u64,
@@ -69,20 +73,66 @@ pub struct TrieBuilder {
 }
 
 impl TrieBuilder {
-    /// Create a new, empty trie builder.
+    /// Create a builder returning owned bytes for memory callers.
     pub fn new() -> Self {
+        Self::with_sink(Vec::new())
+    }
+
+    /// Finish the trie, returning its bytes and local root offset.
+    pub fn finish(self) -> Result<(Vec<u8>, u64)> {
+        self.finish_into()
+    }
+}
+
+impl<S: AppendSink> TrieBuilder<S> {
+    /// Encode completed nodes directly into a caller-owned sink. Scratch
+    /// capacity depends on key depth and the 256-byte alphabet, never row count.
+    pub fn with_sink(output: S) -> Self {
         Self {
-            output: Vec::new(),
-            stack: Vec::new(),
-            prev_key: Vec::new(),
+            output,
+            stack: Vec::with_capacity(65),
+            children: Vec::with_capacity(256 * 65),
+            key_capacity: 64,
+            prev_key: Vec::with_capacity(64),
             write_pos: 0,
             last_node_pos: 0,
             has_keys: false,
-            encoded_node: Vec::new(),
-            payload_scratch: Vec::new(),
-            distance_scratch: Vec::new(),
-            dense_distance_scratch: Vec::new(),
+            encoded_node: Vec::with_capacity(PAGE_SIZE),
+            payload_scratch: Vec::with_capacity(9),
+            distance_scratch: Vec::with_capacity(256),
+            dense_distance_scratch: Vec::with_capacity(256),
         }
+    }
+
+    /// Finish a trie and return the sink without materializing its output.
+    pub fn finish_into(mut self) -> Result<(S, u64)> {
+        let root = self.finish_trie()?;
+        Ok((self.output, root))
+    }
+
+    /// Finish one trie and reuse the same workspace for the next. Each trie
+    /// retains local page alignment, even when its sink holds earlier tries.
+    pub fn finish_trie(&mut self) -> Result<u64> {
+        if self.has_keys {
+            self.complete_branches(0)?;
+        }
+        let root = self.last_node_pos;
+        self.prev_key.clear();
+        self.write_pos = 0;
+        self.last_node_pos = 0;
+        self.has_keys = false;
+        Ok(root)
+    }
+
+    /// Access the destination to append the component's footer.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.output
+    }
+
+    /// Consume a reset builder and return its destination.
+    pub(crate) fn into_sink(self) -> S {
+        debug_assert!(!self.has_keys, "finish_trie must precede into_sink");
+        self.output
     }
 
     /// Add a key with its payload. Keys **must** be added in sorted order.
@@ -95,6 +145,16 @@ impl TrieBuilder {
             )));
         }
 
+        // Depth storage follows the longest key. The child arena holds only
+        // completed siblings on this frontier (at most 256 per active depth),
+        // not the entire trie. Its initial capacity covers all 64-byte paths.
+        if key.len() > self.key_capacity {
+            self.key_capacity = key.len();
+            self.stack.reserve(self.key_capacity + 1 - self.stack.len());
+            self.prev_key
+                .reserve(self.key_capacity.saturating_sub(self.prev_key.len()));
+        }
+
         let prefix_len = if self.has_keys {
             common_prefix_len(&self.prev_key, key)
         } else {
@@ -105,7 +165,7 @@ impl TrieBuilder {
             // First key: push the implicit root node.
             self.stack.push(BranchNode {
                 transition: 0, // unused for root
-                children: SmallVec::new(),
+                children_start: self.children.len(),
                 payload: None,
             });
         } else {
@@ -120,7 +180,7 @@ impl TrieBuilder {
         for &b in &key[prefix_len..] {
             self.stack.push(BranchNode {
                 transition: b,
-                children: SmallVec::new(),
+                children_start: self.children.len(),
                 payload: None,
             });
         }
@@ -137,20 +197,6 @@ impl TrieBuilder {
         Ok(())
     }
 
-    /// Finish the trie, returning `(output_bytes, root_position)`.
-    ///
-    /// Returns an empty output with root_position 0 if no keys were added.
-    pub fn finish(mut self) -> Result<(Vec<u8>, u64)> {
-        if !self.has_keys {
-            return Ok((Vec::new(), 0));
-        }
-
-        // Complete all remaining branches including the root (depth 0).
-        self.complete_branches(0)?;
-
-        Ok((self.output, self.last_node_pos))
-    }
-
     /// Serialize completed branches from the stack.
     ///
     /// Keeps `keep_depth` nodes on the stack, serializing everything deeper.
@@ -160,8 +206,9 @@ impl TrieBuilder {
             let node = self.stack.pop().unwrap();
             let pos = self.write_node(&node)?;
 
-            if let Some(parent) = self.stack.last_mut() {
-                parent.children.push((node.transition, pos));
+            self.children.truncate(node.children_start);
+            if !self.stack.is_empty() {
+                self.children.push((node.transition, pos));
             } else {
                 // This was the root node; record its position.
                 self.last_node_pos = pos;
@@ -175,7 +222,8 @@ impl TrieBuilder {
     /// Returns the absolute position of the written node in the output.
     fn write_node(&mut self, node: &BranchNode) -> Result<u64> {
         encode_node_into(
-            node,
+            node.payload.as_ref(),
+            &self.children[node.children_start..],
             self.write_pos as u64,
             &mut self.encoded_node,
             &mut self.payload_scratch,
@@ -188,12 +236,13 @@ impl TrieBuilder {
         let current_page_offset = self.write_pos % PAGE_SIZE;
         if current_page_offset != 0 && current_page_offset + encoded_len > PAGE_SIZE {
             let pad = PAGE_SIZE - current_page_offset;
-            self.output.resize(self.output.len() + pad, 0);
+            self.output.append(&[0; PAGE_SIZE][..pad])?;
             self.write_pos += pad;
 
             // Re-encode with the new position (distances may have changed).
             encode_node_into(
-                node,
+                node.payload.as_ref(),
+                &self.children[node.children_start..],
                 self.write_pos as u64,
                 &mut self.encoded_node,
                 &mut self.payload_scratch,
@@ -201,13 +250,13 @@ impl TrieBuilder {
                 &mut self.dense_distance_scratch,
             )?;
             let pos = self.write_pos as u64;
-            self.output.extend_from_slice(&self.encoded_node);
+            self.output.append(&self.encoded_node)?;
             self.write_pos += self.encoded_node.len();
             return Ok(pos);
         }
 
         let pos = self.write_pos as u64;
-        self.output.extend_from_slice(&self.encoded_node);
+        self.output.append(&self.encoded_node)?;
         self.write_pos += self.encoded_node.len();
 
         Ok(pos)
@@ -225,22 +274,10 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// Compute the payload bits (pb) nibble for a payload.
-///
-/// `pb = 0` means "no payload" in the trie format, so we must ensure
-/// that any present payload produces `pb >= 1`. When `position == 0`
-/// and there is no hash, we use `pb = 1` (one zero byte).
-fn compute_pb(payload: &TriePayload) -> u8 {
-    let idx_len = encode_signed_bytes(payload.position).len().max(1);
-    match payload.hash {
-        None => idx_len as u8,
-        Some(_) => (7 + idx_len) as u8,
-    }
-}
-
 /// Encode a node into reusable workspaces, avoiding a temporary Vec per node.
 fn encode_node_into(
-    node: &BranchNode,
+    payload: Option<&TriePayload>,
+    children: &[(u8, u64)],
     current_pos: u64,
     out: &mut Vec<u8>,
     payload_bytes: &mut Vec<u8>,
@@ -249,31 +286,36 @@ fn encode_node_into(
 ) -> Result<()> {
     out.clear();
     payload_bytes.clear();
-    let pb = if let Some(payload) = &node.payload {
+    let pb = if let Some(payload) = payload {
         encode_payload_into(payload, payload_bytes);
-        compute_pb(payload)
+        let len = payload_bytes.len();
+        if payload.hash.is_some() {
+            (len + 6) as u8
+        } else {
+            len as u8
+        }
     } else {
         0
     };
 
-    match node.children.len() {
+    match children.len() {
         0 => {
             out.push((NodeType::PayloadOnly as u8) << 4 | (pb & 0x0F));
             out.extend_from_slice(payload_bytes);
         }
         1 => encode_single_node_into(
-            node.children[0].0,
+            children[0].0,
             current_pos,
-            node.children[0].1,
+            children[0].1,
             pb,
             payload_bytes,
             out,
-            &node.children,
+            children,
             distances,
             dense_distances,
         )?,
         _ => encode_sparse_node_into(
-            &node.children,
+            children,
             current_pos,
             pb,
             payload_bytes,
@@ -713,5 +755,84 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("sorted order"));
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingSink {
+        bytes: u64,
+        largest_append: usize,
+    }
+    impl AppendSink for CountingSink {
+        fn append(&mut self, bytes: &[u8]) -> Result<()> {
+            self.bytes += bytes.len() as u64;
+            self.largest_append = self.largest_append.max(bytes.len());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_stream_trie_capacity_is_independent_of_key_count() {
+        let mut builder = TrieBuilder::with_sink(CountingSink::default());
+        let capacities = (
+            builder.stack.capacity(),
+            builder.children.capacity(),
+            builder.prev_key.capacity(),
+            builder.encoded_node.capacity(),
+        );
+        for i in 0..100_000u64 {
+            builder
+                .add(
+                    &i.to_be_bytes(),
+                    TriePayload {
+                        hash: Some(1),
+                        position: i as i64,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            builder.sink_mut().bytes > 65_536,
+            "nodes must stream before finish"
+        );
+        builder.finish_trie().unwrap();
+        assert_eq!(
+            capacities,
+            (
+                builder.stack.capacity(),
+                builder.children.capacity(),
+                builder.prev_key.capacity(),
+                builder.encoded_node.capacity()
+            )
+        );
+        assert!(builder.sink_mut().largest_append <= PAGE_SIZE);
+        assert!(builder.children.is_empty());
+    }
+
+    #[test]
+    fn metadata_stream_reused_trie_keeps_local_page_offsets() {
+        let mut reused = TrieBuilder::with_sink(Vec::new());
+        for _pass in 0..3 {
+            let start = reused.sink_mut().len();
+            let mut expected = TrieBuilder::new();
+            for i in 0..2000u64 {
+                let payload = TriePayload {
+                    hash: None,
+                    position: (i * 1234) as i64,
+                };
+                reused.add(&i.to_be_bytes(), payload.clone()).unwrap();
+                expected.add(&i.to_be_bytes(), payload).unwrap();
+            }
+            let root = reused.finish_trie().unwrap();
+            let (bytes, expected_root) = expected.finish().unwrap();
+            assert_eq!(root, expected_root);
+            assert_eq!(&reused.sink_mut()[start..], bytes);
+            // Deliberately shift the next trie away from a global page boundary.
+            AppendSink::append(reused.sink_mut(), &[42; 37]).unwrap();
+        }
     }
 }

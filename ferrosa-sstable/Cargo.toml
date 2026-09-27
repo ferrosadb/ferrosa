@@ -15,7 +15,6 @@ lru = "0.12"
 lz4_flex = "0.14"
 memmap2 = "0.9"
 rayon = "1"
-smallvec = "1.15"
 tracing = "0.1"
 zstd = "0.13"
 # T-034 (L6 loom model, tests/pump_loom.rs). Optional and feature-gated

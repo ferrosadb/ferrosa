@@ -101,59 +101,72 @@ pub fn parse_digest(bytes: &[u8]) -> Result<u32> {
 
 /// Streaming per-chunk CRC32 accumulator producing Cassandra's `CRC.db`
 /// layout for uncompressed Data.db. See the module docs for the byte layout.
-pub struct ChunkCrc {
+pub struct ChunkCrc<S = Vec<u8>> {
     chunk_size: u32,
     current: crc32fast::Hasher,
     current_len: usize,
-    chunks: Vec<u32>,
+    sink: S,
 }
 
 impl ChunkCrc {
     pub fn new(chunk_size: usize) -> Self {
-        assert!(chunk_size > 0, "CRC.db chunk_size must be non-zero");
-        Self {
+        Self::with_sink(chunk_size, Vec::new()).expect("memory sink cannot fail")
+    }
+
+    /// Feed bytes into an owned in-memory CRC table.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.update_sink(bytes).expect("memory sink cannot fail");
+    }
+
+    /// Return the CRC.db bytes for an in-memory caller.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.finish_sink().expect("memory sink cannot fail")
+    }
+}
+
+impl<S: crate::io::AppendSink> ChunkCrc<S> {
+    /// Write the chunk-size header and retain only the current chunk's hasher.
+    pub fn with_sink(chunk_size: usize, mut sink: S) -> Result<Self> {
+        assert!(
+            chunk_size > 0 && chunk_size <= u32::MAX as usize,
+            "CRC.db chunk_size must fit a non-zero u32"
+        );
+        sink.append(&(chunk_size as u32).to_be_bytes())?;
+        Ok(Self {
             chunk_size: chunk_size as u32,
             current: crc32fast::Hasher::new(),
             current_len: 0,
-            chunks: Vec::new(),
-        }
+            sink,
+        })
     }
 
-    /// Feed the next bytes written to Data.db. `bytes` need not align to
-    /// chunk boundaries — a single call may close out one chunk and start
-    /// the next.
-    pub fn update(&mut self, mut bytes: &[u8]) {
-        let chunk_size = self.chunk_size as usize;
+    /// Feed bytes and emit completed CRC words immediately.
+    pub fn update_sink(&mut self, mut bytes: &[u8]) -> Result<()> {
         while !bytes.is_empty() {
-            let remaining_in_chunk = chunk_size - self.current_len;
-            let take = remaining_in_chunk.min(bytes.len());
+            let take = (self.chunk_size as usize - self.current_len).min(bytes.len());
             self.current.update(&bytes[..take]);
             self.current_len += take;
             bytes = &bytes[take..];
-            if self.current_len == chunk_size {
-                self.close_chunk();
+            if self.current_len == self.chunk_size as usize {
+                self.close_chunk()?;
             }
         }
+        Ok(())
     }
 
-    fn close_chunk(&mut self) {
+    fn close_chunk(&mut self) -> Result<()> {
         let hasher = std::mem::replace(&mut self.current, crc32fast::Hasher::new());
-        self.chunks.push(hasher.finalize());
+        self.sink.append(&hasher.finalize().to_be_bytes())?;
         self.current_len = 0;
+        Ok(())
     }
 
-    /// Finish, flushing a final partial chunk if any bytes remain, and
-    /// return the CRC.db bytes.
-    pub fn into_bytes(mut self) -> Vec<u8> {
+    /// Emit a final partial CRC and return the destination.
+    pub fn finish_sink(mut self) -> Result<S> {
         if self.current_len > 0 {
-            self.close_chunk();
+            self.close_chunk()?;
         }
-        let mut out = Vec::with_capacity(4 + 4 * self.chunks.len());
-        out.extend_from_slice(&self.chunk_size.to_be_bytes());
-        for crc in &self.chunks {
-            out.extend_from_slice(&crc.to_be_bytes());
-        }
-        out
+        Ok(self.sink)
     }
 }
 

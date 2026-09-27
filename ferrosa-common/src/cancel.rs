@@ -118,10 +118,9 @@ impl Default for CancelToken {
 
 impl CancelToken {
     pub fn new() -> Self {
-        // Capacity 0 (rendezvous): nothing is ever sent here. The channel
-        // exists only to be closed — `cancel()` drops the sole `Sender`,
-        // which wakes every thread `select!`-blocked on `closed()` at once.
-        let (closed_tx, closed_rx) = crossbeam_channel::bounded(0);
+        // Nothing is sent: dropping the sole sender wakes every cloned receiver.
+        // A fixed slot avoids zero-channel select packet allocations on waits.
+        let (closed_tx, closed_rx) = crossbeam_channel::bounded(1);
         Self(Arc::new(Inner {
             flag: AtomicBool::new(false),
             reason: AtomicU8::new(0),
@@ -255,6 +254,40 @@ mod tests {
         token.cancel(CancelReason::Shutdown);
         handle.join().expect("blocked thread should wake on cancel");
         drop(data_tx);
+    }
+
+    #[test]
+    fn closed_disconnects_every_receiver_and_late_clone() {
+        let token = CancelToken::new();
+        let ready = Arc::new(std::sync::Barrier::new(5));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let closed = token.closed();
+                let ready = Arc::clone(&ready);
+                thread::spawn(move || {
+                    ready.wait();
+                    assert_eq!(
+                        closed.recv_timeout(Duration::from_secs(2)),
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+                    );
+                    assert_eq!(
+                        closed.try_recv(),
+                        Err(crossbeam_channel::TryRecvError::Disconnected)
+                    );
+                })
+            })
+            .collect();
+        ready.wait();
+        token.cancel(CancelReason::Shutdown);
+        for handle in handles {
+            handle
+                .join()
+                .expect("every cloned receiver observes cancellation");
+        }
+        assert_eq!(
+            token.closed().try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        );
     }
 
     #[test]

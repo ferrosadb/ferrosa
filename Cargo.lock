@@ -2760,7 +2760,6 @@ dependencies = [
  "proptest",
  "rayon",
  "sha2 0.10.9",
- "smallvec",
  "tempfile",
  "tracing",
  "zstd",

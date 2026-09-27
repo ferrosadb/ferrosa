@@ -14,18 +14,12 @@
 //!   there is no `Mutex`, no shared `VecDeque`, and no `Arc<Mutex<_>>`
 //!   anywhere on the write path (decisions.md D2/D7).
 //! Last revised: 2026-09-26
-//! Last changed: T-034. The producer's stall watchdog no longer calls
-//!   `crossbeam_channel::after()` (ST-16): the first genuine park uses
-//!   `select!`'s own `default(duration)` arm, a deadline the macro tracks
-//!   internally with no extra one-shot timer channel. This removes `after()`'s
-//!   own allocation specifically; a genuine `select!` park still costs a
-//!   small allocation of its own (crossbeam-channel's internal wait-queue
-//!   registration, confirmed by isolated measurement — see
-//!   `tests/pump_async_alloc.rs`'s module doc), so the write hot path is
-//!   allocation-free only when nothing must genuinely park, same as before —
-//!   `tests/pump_async_alloc.rs` now measures a tight, park-count-proportional
-//!   bound under sustained, permit-gated backpressure instead of claiming
-//!   zero. Also adds a `loom` model of the producer/flusher protocol
+//! Last changed: T-081. Open primes Crossbeam's cached TLS Context and selector
+//!   capacity before accepting writes. Built-in abort channels have one fixed
+//!   slot and only disconnect, avoiding zero-channel select packet allocations.
+//!   The watchdog still uses `select!`'s own deadline, with no timer channel.
+//!   Existing allocation bounds and cancellation tests remain unchanged. The
+//!   producer/flusher protocol also has a `loom` model
 //!   (`tests/pump_loom.rs`, gated by this crate's own `loom` Cargo feature —
 //!   not `RUSTFLAGS="--cfg loom"`, which breaks `tokio`'s own `cfg(loom)`
 //!   code since this crate pulls tokio in transitively via `ferrosa-common`
@@ -57,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, select, Receiver, Sender};
+use crossbeam_channel::{bounded, select, Receiver, Select, Sender};
 
 use ferrosa_common::{Error, Result};
 
@@ -631,7 +625,8 @@ pub struct NeverAbort {
 
 impl NeverAbort {
     pub fn new() -> Self {
-        let (tx, rx) = bounded(0);
+        // Never send a payload; one fixed slot avoids zero-channel select packets.
+        let (tx, rx) = bounded(1);
         Self {
             _keep_open: tx,
             closed: rx,
@@ -713,14 +708,35 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// following `batch.pop_front()` never conflicts with it.
 const MAX_BATCH: usize = MAX_QUEUE_DEPTH + 1;
 
+// Crossbeam 0.5 caches Context in TLS and retains each channel's selector
+// Vec capacity. Dynamic try_select registers even on an empty channel, unlike
+// recv/try_recv fast paths. Initialize that storage at open without payload I/O.
+fn prime_receiver_waiter<T>(receiver: &Receiver<T>) {
+    let mut selection = Select::new();
+    selection.recv(receiver);
+    if let Ok(operation) = selection.try_select() {
+        // Abort channels may already be disconnected. The data channels are
+        // still empty at this point; a payload here violates startup ordering.
+        assert!(
+            operation.recv(receiver).is_err(),
+            "priming consumed a payload"
+        );
+    }
+}
+
 fn run_flusher(
     mut sink: Box<dyn SegmentSink>,
     full_rx: Receiver<Filled>,
     free_tx: Sender<AlignedBuf>,
     err_tx: Sender<PumpError>,
     depth: usize,
+    ready: Sender<()>,
 ) -> FlusherOutcome {
     let mut batch: VecDeque<Filled> = VecDeque::with_capacity(depth + 1);
+    prime_receiver_waiter(&full_rx);
+    ready
+        .send(())
+        .expect("pump opener waits for flusher initialization");
     loop {
         let first = match full_rx.recv() {
             Ok(f) => f,
@@ -1093,6 +1109,9 @@ impl AlignedPump {
         let (full_tx, full_rx) = bounded::<Filled>(cap);
         let (free_tx, free_rx) = bounded::<AlignedBuf>(cap);
         let (err_tx, err_rx) = bounded::<PumpError>(1);
+        let (ready_tx, ready_rx) = bounded(1);
+        prime_receiver_waiter(&free_rx);
+        prime_receiver_waiter(abort.closed());
         for _ in 0..cap {
             // Pre-fill `free` with every segment this pump will ever own
             // (decisions.md D2): the ring IS the two channels — there is no
@@ -1120,29 +1139,34 @@ impl AlignedPump {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .take()
                     .expect("the flusher thread takes the sink exactly once, on its only run");
-                run_flusher(sink, full_rx, free_tx, err_tx, depth)
+                run_flusher(sink, full_rx, free_tx, err_tx, depth, ready_tx)
             });
         match spawned {
-            Ok(handle) => Self {
-                current: None,
-                filled: 0,
-                physical: 0,
-                digest: DigestCrc32::new(),
-                block,
-                mode,
-                path,
-                finished: false,
-                wrote_anything: false,
-                backend: PumpBackend::Async(AsyncBackend {
-                    full_tx: Some(full_tx),
-                    free_rx,
-                    err_rx,
-                    flusher: Some(handle),
-                    local_free: VecDeque::with_capacity(cap),
-                    abort,
-                    depth,
-                }),
-            },
+            Ok(handle) => {
+                ready_rx
+                    .recv()
+                    .expect("flusher initializes before accepting writes");
+                Self {
+                    current: None,
+                    filled: 0,
+                    physical: 0,
+                    digest: DigestCrc32::new(),
+                    block,
+                    mode,
+                    path,
+                    finished: false,
+                    wrote_anything: false,
+                    backend: PumpBackend::Async(AsyncBackend {
+                        full_tx: Some(full_tx),
+                        free_rx,
+                        err_rx,
+                        flusher: Some(handle),
+                        local_free: VecDeque::with_capacity(cap),
+                        abort,
+                        depth,
+                    }),
+                }
+            }
             Err(err) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -1366,23 +1390,12 @@ impl AlignedPump {
     /// timeout-free `select!` follows only after the deadline has already
     /// fired once.
     ///
-    /// **This removes `after()`'s allocation specifically — it does not make
-    /// a genuine park allocation-free outright.** Direct, isolated
-    /// measurement against bare `crossbeam_channel` (see
-    /// `tests/pump_async_alloc.rs`'s module doc) found that `select!` itself,
-    /// when it actually has to park (not satisfied by the non-blocking
-    /// attempt below), costs roughly one allocation of its own — most likely
-    /// a fresh waiter node pushed onto each channel's internal waiting list,
-    /// since a parked waiter needs a stable heap address for the wake side to
-    /// find it and the previous park's node cannot simply be reused. A plain,
-    /// non-`select!` `Receiver::recv()` (what the flusher already uses on
-    /// `full`) pays a comparable cost per genuine park. This is a property of
-    /// `crossbeam_channel` itself, present on both sides of this pump with or
-    /// without `after()`; decisions.md D2 already anticipates the tradeoff of
-    /// removing it entirely ("replace the channel with a two-atomic SPSC
-    /// ring... gated on data, not done up front") and this task does not do
-    /// that. `tests/pump_async_alloc.rs` therefore measures a small,
-    /// park-count-proportional bound under sustained backpressure, not zero.
+    /// T-081 attributes the remaining allocations to first-use TLS Context,
+    /// selector capacity, and rendezvous-channel select packets. Open primes
+    /// the first two before accepting writes; built-in abort signals use a
+    /// fixed one-slot channel and only disconnect, avoiding rendezvous packets.
+    /// The protocol still blocks on Crossbeam; no polling or custom ring is used.
+    /// A caller-provided abort signal can retain different allocation behavior.
     ///
     /// Arming any watchdog at all is only needed once this call is genuinely
     /// going to block, so a non-blocking `select! { ..., default => ... }`
@@ -1390,8 +1403,7 @@ impl AlignedPump {
     /// check (nothing to park for), never a retry loop (D7's "no polling"
     /// bars a *repeated* non-blocking check, not one). On an unthrottled sink
     /// (the flusher keeps up) this is the only branch steady-state traffic
-    /// ever takes, so the hot path stays allocation-free in practice (L6
-    /// contention budget) even though a genuine park is not free.
+    /// ever takes; genuine waits retain the same cancellation and watchdog logic.
     fn wait_for_free_segment_blocking(&mut self) -> Result<AlignedBuf> {
         let backend = self
             .backend
