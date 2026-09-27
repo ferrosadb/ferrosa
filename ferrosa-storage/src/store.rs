@@ -2679,6 +2679,17 @@ impl<F: FlushTarget> TableStore<F> {
     /// 5. Build the SSTable via [`SSTableWriter`] and [`FlushTarget::flush`].
     /// 6. Prepend the new reader to the SSTable list and clear `flushing`.
     pub fn flush(&self) -> Result<()> {
+        self.flush_with_swap_callback(|| {})
+    }
+
+    /// Flushes while notifying the owner immediately after the active
+    /// memtable has been swapped for a fresh one. The completion result still
+    /// carries the durability outcome; this callback only releases
+    /// backpressure waiters that depend on active-memtable capacity.
+    pub(crate) fn flush_with_swap_callback(
+        &self,
+        on_memtable_release: impl FnOnce(),
+    ) -> Result<()> {
         let total_start = Instant::now();
         let phase_start = Instant::now();
         let _guard = self.flush_guard.lock();
@@ -2735,6 +2746,7 @@ impl<F: FlushTarget> TableStore<F> {
             crate::metrics::FlushPhase::SwapMemtable,
             phase_start.elapsed(),
         );
+        on_memtable_release();
 
         // Step 2: Snapshot the flushing memtable.
         // Also capture any late writes from the PREVIOUS flushing memtable

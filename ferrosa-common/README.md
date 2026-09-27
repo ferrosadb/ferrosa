@@ -151,6 +151,13 @@ compatibility. Gaps and the highest-risk areas (HLC clock `expect`, geometry
 subset) are tracked in [specs/fmea.md](specs/fmea.md) and
 [specs/roadmap.md](specs/roadmap.md).
 
+### Typed write overload
+
+`Error::Overloaded { reason, table }` represents storage write admission
+rejection. Consumers should match the variant instead of parsing its display
+text; `is_backpressure()` still recognizes legacy string errors during
+transition.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, data flow

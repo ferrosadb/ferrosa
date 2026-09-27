@@ -26,11 +26,6 @@ the code, not from leftover tags.
 
 ## Next
 
-- **Promote backpressure to a typed `Error` variant (FMEA FC-7).**
-  `is_backpressure()` substring-matches `InvalidData` messages
-  (`"...below write reserve"`, `"overloaded:"`). Add an explicit
-  `Error::Overloaded`/`Backpressure` variant so load shedding can't break when a
-  message string is reworded — mirroring the typed `CorruptSstable` design.
 - **Property-test `CqlValue` total order (FMEA FC-3).** Add a proptest that the
   cross-type `Ord` (discriminant index + `total_cmp`) is a true total order
   across the full variant space — index and sort correctness depend on it.

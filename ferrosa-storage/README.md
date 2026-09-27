@@ -658,6 +658,29 @@ generation's own component files gone, some not) — the remaining scope of
 T-024 (C4: atomic per-generation retirement) needs a finer, per-component
 hook. See [Roadmap](specs/roadmap.md).
 
+### CQL write pressure admission
+
+Async CQL writes use per-table pressure `max(active memtable / hard limit,
+write-pump blocked-time rate)`. At pressure 0.7 they request a background flush
+and wait on that table's `Notify` for a pressure-scaled deadline; they re-check
+once and reject at pressure 1.0. Synchronous storage callers keep the hard
+admission check. Table pressure is updated atomically; metrics registration and
+scraping use a registry lock only off the write path.
+
+Runtime settings are read when the storage engine starts:
+
+| Variable | Default | Accepted range | Invalid value |
+|---|---:|---:|---|
+| `FERROSA_WRITE_SOFT_PRESSURE_THRESHOLD` | `0.7` | `0.05..=0.95` | ERROR log, use `0.7` |
+| `FERROSA_WRITE_SOFT_DELAY_MAX_MS` | `50` | `1..=1000` | ERROR log, use `50` |
+
+The pressure threshold is a ratio; the maximum delay caps the grace period.
+The pump blocked-time rate is clamped to `[0, 1]`. Invalid values never prevent
+startup. Prometheus exports `ferrosa_storage_write_admission_delayed_total`,
+`ferrosa_storage_write_admission_delay_seconds`,
+`ferrosa_storage_write_admission_rejected_total{reason}`, and the per-table
+`ferrosa_storage_write_pressure_ratio` gauge.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position

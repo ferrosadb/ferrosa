@@ -74,13 +74,17 @@ without changing the process environment. Digest verification is unconditional.
 **Write path** (front-end → durable): build a `Mutation` → `commit_log.append`
 (CAS allocation into the active segment, durability governed by the sync
 strategy) → `ArcSwap::load` the `StoreView` → `active.put` into one memtable
-shard (cell-level merge-on-write). When the active memtable crosses
-`memtable_backpressure_bytes`, `write()` performs a synchronous in-line flush
-before returning. On flush: a per-table `Mutex` serializes; a fresh memtable is
-swapped in and the old one becomes `flushing` (writes resume immediately); the
-flushing snapshot is serialized to a BTI SSTable via `FlushTarget`; the new
-descriptor is prepended; index/FTI sidecars are built; the SSTable components are
-submitted to `UploadManager` for S3 write-behind; STCS/UCS is evaluated.
+shard (cell-level merge-on-write). The async CQL `WritePath` applies per-table
+pressure admission: in the soft zone it requests a background flush and waits
+on that table's `Notify` until active-memtable capacity is released or a
+bounded deadline expires; pressure is checked once more before dispatch. The
+hard zone returns typed `Error::Overloaded`. Synchronous storage callers keep
+the hard admission check. On flush: a per-table `Mutex` serializes; a fresh
+memtable is swapped in and the old one becomes `flushing` (writes resume
+immediately); the flushing snapshot is serialized to a BTI SSTable via
+`FlushTarget`; the new descriptor is prepended; index/FTI sidecars are built;
+the SSTable components are submitted to `UploadManager` for S3 write-behind;
+STCS/UCS is evaluated.
 
 **Read path** (durable → front-end): `ArcSwap::load` (wait-free) a `StoreView` →
 check active memtable → check flushing memtable → prune SSTable descriptors by

@@ -285,6 +285,12 @@ Three slow `router.rs` paging/limit tests live in a `mod slow` gated behind the
 (`--all-features`) but skips running them (`--skip ::slow::`);
 `nightly-slow-tests.yml` is where they run.
 
+### Write backpressure errors
+
+Storage's typed `Error::Overloaded { reason, table }` maps directly to CQL
+`OVERLOADED` (`0x1001`). The legacy string-detected backpressure path remains
+for older storage/cluster errors and logs when it is used.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position

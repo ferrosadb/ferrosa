@@ -4,7 +4,9 @@
 //! Last revised: 2026-09-26
 //! Last changed: Retain recovery intents on atomic input retirement failures.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
@@ -322,6 +324,55 @@ static FLUSH_PARTITIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_ROWS: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_PARTITIONS: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAYED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_COUNT: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_DELAY_BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static WRITE_ADMISSION_REJECTED_HARD_MEMTABLE: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG: AtomicU64 = AtomicU64::new(0);
+static WRITE_ADMISSION_PRESSURE_BY_TABLE: OnceLock<Mutex<HashMap<String, Vec<Weak<AtomicU64>>>>> =
+    OnceLock::new();
+const WRITE_ADMISSION_DELAY_BUCKET_MS: [u64; 6] = [1, 5, 10, 25, 50, 1_000];
+
+/// Registers a table's pressure gauge. Registration happens once per table,
+/// while per-write updates use only the gauge's atomic value.
+pub fn register_write_admission_pressure(label: String, gauge: &Arc<AtomicU64>) {
+    let registry = WRITE_ADMISSION_PRESSURE_BY_TABLE.get_or_init(Default::default);
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(label)
+        .or_default()
+        .push(Arc::downgrade(gauge));
+}
+
+pub fn inc_write_admission_delayed() {
+    WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn observe_write_admission_delay(duration: Duration) {
+    let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+    WRITE_ADMISSION_DELAY_MICROS_TOTAL.fetch_add(micros, Ordering::Relaxed);
+    WRITE_ADMISSION_DELAY_COUNT.fetch_add(1, Ordering::Relaxed);
+    let millis = duration.as_millis().min(u64::MAX as u128) as u64;
+    for (index, bound) in WRITE_ADMISSION_DELAY_BUCKET_MS.iter().enumerate() {
+        if millis <= *bound {
+            WRITE_ADMISSION_DELAY_BUCKETS[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn inc_write_admission_rejected(reason: &'static str) {
+    match reason {
+        "hard_memtable" => {
+            WRITE_ADMISSION_REJECTED_HARD_MEMTABLE.fetch_add(1, Ordering::Relaxed);
+        }
+        "hard_flush_lag" => {
+            WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
 
 static UPLOAD_PHASE_MICROS_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static UPLOAD_PHASE_COUNT_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -912,6 +963,66 @@ pub fn render_prometheus() -> String {
         "ferrosa_storage_memtable_backpressure_bytes {}\n",
         MEMTABLE_BACKPRESSURE_BYTES.load(Ordering::Relaxed)
     ));
+    out.push_str("# HELP ferrosa_storage_write_admission_delayed_total CQL writes delayed in the soft-pressure zone.\n");
+    out.push_str("# TYPE ferrosa_storage_write_admission_delayed_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delayed_total {}\n",
+        WRITE_ADMISSION_DELAYED_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_write_admission_delay_seconds Soft-pressure wait duration.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_write_admission_delay_seconds histogram\n");
+    for (index, bound) in WRITE_ADMISSION_DELAY_BUCKET_MS.iter().enumerate() {
+        out.push_str(&format!(
+            "ferrosa_storage_write_admission_delay_seconds_bucket{{le=\"{}\"}} {}\n",
+            *bound as f64 / 1_000.0,
+            WRITE_ADMISSION_DELAY_BUCKETS[index].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delay_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        WRITE_ADMISSION_DELAY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_delay_seconds_sum {:.6}\nferrosa_storage_write_admission_delay_seconds_count {}\n",
+        WRITE_ADMISSION_DELAY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        WRITE_ADMISSION_DELAY_COUNT.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_admission_rejected_total Writes rejected at hard pressure by reason.\n");
+    out.push_str("# TYPE ferrosa_storage_write_admission_rejected_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_write_admission_rejected_total{{reason=\"hard_memtable\"}} {}\nferrosa_storage_write_admission_rejected_total{{reason=\"hard_flush_lag\"}} {}\n",
+        WRITE_ADMISSION_REJECTED_HARD_MEMTABLE.load(Ordering::Relaxed),
+        WRITE_ADMISSION_REJECTED_HARD_FLUSH_LAG.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_write_pressure_ratio Per-table maximum of memtable and write-pump pressure, quantized to percentage points.\n");
+    out.push_str("# TYPE ferrosa_storage_write_pressure_ratio gauge\n");
+    if let Some(registry) = WRITE_ADMISSION_PRESSURE_BY_TABLE.get() {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|label, gauges| {
+            gauges.retain(|gauge| gauge.strong_count() > 0);
+            if !gauges.is_empty() {
+                let value = gauges
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .map(|gauge| gauge.load(Ordering::Relaxed))
+                    .max()
+                    .unwrap_or(0);
+                let escaped = label
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                out.push_str(&format!(
+                    "ferrosa_storage_write_pressure_ratio{{table=\"{escaped}\"}} {:.2}\n",
+                    value as f64 / 100.0
+                ));
+            }
+            !gauges.is_empty()
+        });
+    }
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_total Total wall time spent in StorageEngine::write phases.\n");
     out.push_str("# TYPE ferrosa_storage_write_phase_seconds_total counter\n");
     out.push_str("# HELP ferrosa_storage_write_phase_seconds_max Maximum observed wall time for a StorageEngine::write phase.\n");
@@ -1691,6 +1802,24 @@ mod tests {
         // The counter is exported in the Prometheus text rendering.
         let text = render_prometheus();
         assert!(text.contains("ferrosa_storage_range_read_truncated_total"));
+    }
+
+    #[test]
+    fn write_admission_metrics_render_table_pressure_and_histogram() {
+        let gauge = Arc::new(AtomicU64::new(73));
+        register_write_admission_pressure("admission_test.unique".into(), &gauge);
+        observe_write_admission_delay(Duration::from_millis(7));
+        inc_write_admission_delayed();
+        inc_write_admission_rejected("hard_memtable");
+
+        let text = render_prometheus();
+        assert!(text.contains(
+            "ferrosa_storage_write_pressure_ratio{table=\"admission_test.unique\"} 0.73"
+        ));
+        assert!(text.contains("ferrosa_storage_write_admission_delay_seconds_bucket"));
+        assert!(text.contains("ferrosa_storage_write_admission_delayed_total"));
+        assert!(text
+            .contains("ferrosa_storage_write_admission_rejected_total{reason=\"hard_memtable\"}"));
     }
 
     #[test]

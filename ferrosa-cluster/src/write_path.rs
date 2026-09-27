@@ -346,6 +346,22 @@ pub enum WritePath {
 }
 
 impl WritePath {
+    fn admission_storage(&self) -> Option<&StorageEngine> {
+        match self {
+            Self::Direct(engine) => Some(engine.as_ref()),
+            Self::Pair(coordinator) => Some(coordinator.local_storage()),
+            Self::Cluster(coordinator) => Some(coordinator.storage.as_ref()),
+            Self::DegradedPair(_) | Self::Unavailable => None,
+        }
+    }
+
+    async fn await_write_admission(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        if let Some(storage) = self.admission_storage() {
+            storage.await_write_admission(table_id).await?;
+        }
+        Ok(())
+    }
+
     /// Create a standalone write path.
     pub fn direct(engine: Arc<StorageEngine>) -> Self {
         Self::Direct(engine)
@@ -382,6 +398,12 @@ impl WritePath {
         _cl: ConsistencyLevel,
         _rf: usize,
     ) -> ferrosa_common::Result<()> {
+        if let Some(storage) = self.admission_storage() {
+            for mutation in &mutations {
+                let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+                storage.await_write_admission(&table_id).await?;
+            }
+        }
         match self {
             Self::Direct(engine) => engine.write_atomic_batch(mutations),
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
@@ -1353,6 +1375,7 @@ impl WritePath {
         cl: ConsistencyLevel,
         strategy: &ReplicationStrategy,
     ) -> ferrosa_common::Result<()> {
+        self.await_write_admission(table_id).await?;
         match self {
             Self::Direct(engine) => engine.write(table_id, key, row, timestamp),
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(

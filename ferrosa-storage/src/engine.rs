@@ -1082,6 +1082,7 @@ fn incremental_compaction_disk_reservation(input_bytes: u64, disk_reserve_bytes:
 /// `TableStore`. The commit log is shared across all tables.
 pub struct StorageEngine {
     config: StorageEngineConfig,
+    write_admission: WriteAdmissionSettings,
     /// Shared with the index scheduler's sidecar installer (t_7ac6b0e3).
     tables: Arc<RwLock<HashMap<TableId, TableState>>>,
     /// Sidecars the scheduler built and installed, whose generation may
@@ -1150,6 +1151,12 @@ pub struct StorageEngine {
     /// The process maintenance loop consumes this flag to run an urgent flush
     /// outside request handling.
     flush_requested: AtomicBool,
+    /// Cached rate of write-pump resource blocking, sampled at a bounded
+    /// cadence so requests do not contend on a process-wide lock.
+    pump_rate_sample_at_ns: AtomicU64,
+    pump_rate_sample_total_ns: AtomicU64,
+    pump_blocked_rate_micros: AtomicU64,
+    soft_pressure_table_count: AtomicU64,
     /// Last observed live manifest object/byte totals per table. Updated by
     /// S3 sync/restore paths and used by sync-only metrics surfaces.
     s3_manifest_stats: RwLock<HashMap<String, (i32, i64)>>,
@@ -1188,6 +1195,106 @@ struct TableState {
     /// plus an atomic pointer swap, with no mutex contention even when
     /// many threads write to the same table concurrently.
     last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+    /// Per-table waiters are woken after a successful flush. This is only
+    /// consulted in the soft-pressure zone; ordinary writes do not touch it.
+    write_pressure_notify: Arc<tokio::sync::Notify>,
+    /// Pressure gauge in percentage points (0..=100), updated atomically.
+    write_pressure_percent: Arc<AtomicU64>,
+    /// Tracks soft-zone edges so logs are emitted once per transition.
+    in_write_soft_zone: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct WriteAdmissionSettings {
+    soft_pressure: f64,
+    max_soft_delay: std::time::Duration,
+}
+
+impl WriteAdmissionSettings {
+    const DEFAULT_SOFT_PRESSURE: f64 = 0.7;
+    const DEFAULT_MAX_DELAY_MS: u64 = 50;
+
+    fn from_env() -> Self {
+        let soft_pressure = read_bounded_env_f64(
+            "FERROSA_WRITE_SOFT_PRESSURE_THRESHOLD",
+            Self::DEFAULT_SOFT_PRESSURE,
+            0.05,
+            0.95,
+        );
+        let max_delay_ms = read_bounded_env_u64(
+            "FERROSA_WRITE_SOFT_DELAY_MAX_MS",
+            Self::DEFAULT_MAX_DELAY_MS,
+            1,
+            1_000,
+        );
+        Self {
+            soft_pressure,
+            max_soft_delay: std::time::Duration::from_millis(max_delay_ms),
+        }
+    }
+}
+
+fn read_bounded_env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(raw) => match parse_bounded_f64(&raw, min, max) {
+            Some(value) => value,
+            None => {
+                tracing::error!(variable = name, value = %raw, default, "invalid runtime tuning value; using safe default");
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(err) => {
+            tracing::error!(variable = name, %err, default, "cannot read runtime tuning value; using safe default");
+            default
+        }
+    }
+}
+
+fn read_bounded_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => match parse_bounded_u64(&raw, min, max) {
+            Some(value) => value,
+            None => {
+                tracing::error!(variable = name, value = %raw, default, "invalid runtime tuning value; using safe default");
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(err) => {
+            tracing::error!(variable = name, %err, default, "cannot read runtime tuning value; using safe default");
+            default
+        }
+    }
+}
+
+fn parse_bounded_f64(raw: &str, min: f64, max: f64) -> Option<f64> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (min..=max).contains(value))
+}
+
+fn parse_bounded_u64(raw: &str, min: u64, max: u64) -> Option<u64> {
+    raw.parse::<u64>()
+        .ok()
+        .filter(|value| (min..=max).contains(value))
+}
+
+#[cfg(test)]
+mod write_admission_config_tests {
+    use super::*;
+
+    #[test]
+    fn admission_settings_have_bounded_rational_defaults() {
+        assert_eq!(WriteAdmissionSettings::DEFAULT_SOFT_PRESSURE, 0.7);
+        assert_eq!(WriteAdmissionSettings::DEFAULT_MAX_DELAY_MS, 50);
+        assert_eq!(parse_bounded_f64("0.75", 0.05, 0.95), Some(0.75));
+        assert_eq!(parse_bounded_f64("NaN", 0.05, 0.95), None);
+        assert_eq!(parse_bounded_f64("1.0", 0.05, 0.95), None);
+        assert_eq!(parse_bounded_u64("50", 1, 1_000), Some(50));
+        assert_eq!(parse_bounded_u64("0", 1, 1_000), None);
+        assert_eq!(parse_bounded_u64("1001", 1, 1_000), None);
+    }
 }
 
 struct StorageSchemaView<'a>(&'a HashMap<TableId, TableState>);
@@ -2240,14 +2347,179 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<()> {
         let memtable_size = state.store.memtable_size() as u64;
         crate::metrics::observe_memtable_size(memtable_size);
+        let pressure = ((memtable_size as f64
+            / self.config.memtable_backpressure_bytes.max(1) as f64)
+            .max(self.sample_write_pump_blocked_rate()))
+        .clamp(0.0, 1.0);
+        self.update_write_pressure(state, table_id, pressure);
         if memtable_size >= self.config.memtable_backpressure_bytes {
             self.request_flush();
-            return Err(ferrosa_common::Error::InvalidData(format!(
-                "overloaded: memtable backpressure threshold exceeded: table={table_id} size={memtable_size} threshold={}",
-                self.config.memtable_backpressure_bytes
-            )));
+            crate::metrics::inc_write_admission_rejected("hard_memtable");
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: format!(
+                    "memtable backpressure threshold exceeded: size={memtable_size} threshold={}",
+                    self.config.memtable_backpressure_bytes
+                ),
+                table: table_id.to_string(),
+            });
         }
         Ok(())
+    }
+
+    /// Waits briefly for a table's flush to release pressure before allowing a
+    /// CQL write. This is called by the async write-path adapter; synchronous
+    /// storage callers retain the hard admission check in `write()`.
+    pub async fn await_write_admission(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // The overwhelmingly common path avoids even the table-map read lock.
+        // The storage write that follows samples pressure and publishes the
+        // first soft-zone edge for the next request.
+        if self.soft_pressure_table_count.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let notifier = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            Arc::clone(&state.write_pressure_notify)
+        };
+        let mut notified = std::pin::pin!(notifier.notified_owned());
+        // Register before sampling pressure so a successful flush between the
+        // sample and the await cannot be missed.
+        notified.as_mut().enable();
+
+        let hard_limit = self.config.memtable_backpressure_bytes.max(1);
+        let (pressure, memtable_pressure, memtable_size) = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            let memtable_size = state.store.memtable_size() as u64;
+            let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
+            let pressure = memtable_pressure
+                .max(self.sample_write_pump_blocked_rate())
+                .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            (pressure, memtable_pressure, memtable_size)
+        };
+
+        if pressure >= 1.0 {
+            self.request_flush();
+            crate::metrics::inc_write_admission_rejected(if memtable_pressure >= 1.0 {
+                "hard_memtable"
+            } else {
+                "hard_flush_lag"
+            });
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: if memtable_pressure >= 1.0 {
+                    format!("memtable pressure reached hard limit ({memtable_size} bytes)")
+                } else {
+                    "write-pump blocked rate reached hard limit".to_owned()
+                },
+                table: table_id.to_string(),
+            });
+        }
+
+        if pressure < self.write_admission.soft_pressure {
+            return Ok(());
+        }
+        self.request_flush();
+        let scale = ((pressure - self.write_admission.soft_pressure)
+            / (1.0 - self.write_admission.soft_pressure))
+            .clamp(0.0, 1.0);
+        let delay = self.write_admission.max_soft_delay.mul_f64(scale.max(0.02));
+        let started = Instant::now();
+        let _ = tokio::time::timeout(delay, notified.as_mut()).await;
+        let elapsed = started.elapsed();
+        crate::metrics::observe_write_admission_delay(elapsed);
+        crate::metrics::inc_write_admission_delayed();
+
+        // One bounded re-check after the wake/deadline. Do not sleep or poll;
+        // continued soft pressure is admitted after this single grace period.
+        let (pressure, memtable_pressure, memtable_size) = {
+            let tables = self.tables.read();
+            let state = tables.get(table_id).ok_or_else(|| {
+                ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
+            })?;
+            let memtable_size = state.store.memtable_size() as u64;
+            let memtable_pressure = (memtable_size as f64 / hard_limit as f64).min(1.0);
+            let pressure = memtable_pressure
+                .max(self.sample_write_pump_blocked_rate())
+                .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            (pressure, memtable_pressure, memtable_size)
+        };
+        if pressure >= 1.0 {
+            self.request_flush();
+            crate::metrics::inc_write_admission_rejected(if memtable_pressure >= 1.0 {
+                "hard_memtable"
+            } else {
+                "hard_flush_lag"
+            });
+            return Err(ferrosa_common::Error::Overloaded {
+                reason: if memtable_pressure >= 1.0 {
+                    format!("memtable pressure reached hard limit ({memtable_size} bytes)")
+                } else {
+                    "write-pump blocked rate reached hard limit".to_owned()
+                },
+                table: table_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn update_write_pressure(&self, state: &TableState, table_id: &TableId, pressure: f64) {
+        let gauge_percent = (pressure.clamp(0.0, 1.0) * 100.0).round() as u64;
+        if state.write_pressure_percent.load(Ordering::Relaxed) != gauge_percent {
+            state
+                .write_pressure_percent
+                .store(gauge_percent, Ordering::Relaxed);
+        }
+        if pressure >= self.write_admission.soft_pressure && pressure < 1.0 {
+            if state
+                .in_write_soft_zone
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.soft_pressure_table_count
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(table = %table_id, pressure, "write admission entered soft pressure zone");
+            }
+        } else if pressure < self.write_admission.soft_pressure
+            && state
+                .in_write_soft_zone
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.soft_pressure_table_count
+                .fetch_sub(1, Ordering::Relaxed);
+            tracing::info!(table = %table_id, pressure, "write admission recovered below soft pressure");
+        }
+    }
+
+    fn sample_write_pump_blocked_rate(&self) -> f64 {
+        const SAMPLE_INTERVAL_NS: u64 = 100_000_000;
+        let now_ns = reference_instant().elapsed().as_nanos() as u64;
+        let sampled_at = self.pump_rate_sample_at_ns.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(sampled_at) >= SAMPLE_INTERVAL_NS
+            && self
+                .pump_rate_sample_at_ns
+                .compare_exchange(sampled_at, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
+                * 1_000_000_000.0) as u64;
+            let previous_total = self
+                .pump_rate_sample_total_ns
+                .swap(total_ns, Ordering::Relaxed);
+            let rate = total_ns.saturating_sub(previous_total) as f64
+                / now_ns.saturating_sub(sampled_at).max(1) as f64;
+            self.pump_blocked_rate_micros.store(
+                (rate.clamp(0.0, 1.0) * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        self.pump_blocked_rate_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 
     fn request_flush_if_needed(&self, state: &TableState) {
@@ -2332,6 +2604,14 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
@@ -2538,6 +2818,14 @@ impl StorageEngine {
 
         Ok(Self {
             config,
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
@@ -2690,6 +2978,14 @@ impl StorageEngine {
 
         let engine = Self {
             config,
+            write_admission: WriteAdmissionSettings::from_env(),
+            pump_rate_sample_at_ns: AtomicU64::new(reference_instant().elapsed().as_nanos() as u64),
+            pump_rate_sample_total_ns: AtomicU64::new(
+                (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free() * 1_000_000_000.0)
+                    as u64,
+            ),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             tables,
             pending_index_uploads,
             commit_log,
@@ -3346,6 +3642,9 @@ impl StorageEngine {
             pinned_sstables: Vec::new(),
             first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64::new(0),
             last_commit_log_position: ArcSwap::from_pointee(None),
+            write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
+            write_pressure_percent: Arc::new(AtomicU64::new(0)),
+            in_write_soft_zone: AtomicBool::new(false),
         })
     }
 
@@ -3430,7 +3729,11 @@ impl StorageEngine {
         match tables.entry(table_id) {
             Entry::Occupied(_) => false,
             Entry::Vacant(slot) => {
+                let metric_label = slot.key().to_string();
+                let metric_gauge = Arc::clone(&state.write_pressure_percent);
                 slot.insert(state);
+                drop(tables);
+                crate::metrics::register_write_admission_pressure(metric_label, &metric_gauge);
                 true
             }
         }
@@ -3522,7 +3825,19 @@ impl StorageEngine {
             // guard, or name-keyed cells.
             let cl_position = **state.last_commit_log_position.load();
             if state.store.memtable_size() > 0 {
-                state.store.flush()?;
+                let pressure_notify = Arc::clone(&state.write_pressure_notify);
+                state
+                    .store
+                    .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
+                let active_size = state.store.memtable_size() as u64;
+                let pressure = ((active_size as f64
+                    / self.config.memtable_backpressure_bytes.max(1) as f64)
+                    .max(self.sample_write_pump_blocked_rate()))
+                .clamp(0.0, 1.0);
+                self.update_write_pressure(state, table_id, pressure);
+                // Schema changes can flush the active memtable too; notify at
+                // both release and completion, in case a waiter re-checks early.
+                state.write_pressure_notify.notify_waiters();
                 state
                     .first_unflushed_write_at_nanos
                     .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -3557,7 +3872,12 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
-        self.tables.write().remove(table_id);
+        if let Some(state) = self.tables.write().remove(table_id) {
+            if state.in_write_soft_zone.swap(false, Ordering::Relaxed) {
+                self.soft_pressure_table_count
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         self.remove_time_series_consolidator(table_id);
 
         // Drop live in-memory index state for the table. The per-index maps
@@ -8788,7 +9108,19 @@ impl StorageEngine {
             // can rebuild the memtable. Removing the fsync from flush(), or
             // moving discard_completed before this line, reintroduces the P0
             // "kill mid-flush loses both the torn SSTable and the WAL copy" bug.
-            state.store.flush()?;
+            let pressure_notify = Arc::clone(&state.write_pressure_notify);
+            state
+                .store
+                .flush_with_swap_callback(|| pressure_notify.notify_waiters())?;
+            let active_size = state.store.memtable_size() as u64;
+            let pressure = ((active_size as f64
+                / self.config.memtable_backpressure_bytes.max(1) as f64)
+                .max(self.sample_write_pump_blocked_rate()))
+            .clamp(0.0, 1.0);
+            self.update_write_pressure(state, table_id, pressure);
+            // Completion is a second useful edge: the active memtable was
+            // already released at swap, while durability is now established.
+            state.write_pressure_notify.notify_waiters();
 
             // Reset the unflushed-write timestamp so the next write starts a
             // fresh age window. This must happen after flush() succeeds.
@@ -12041,9 +12373,13 @@ impl StorageEngine {
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
+        let pump_sample_at_ns = reference_instant().elapsed().as_nanos() as u64;
+        let pump_sample_total_ns = (ferrosa_sstable::pump::write_pump_blocked_seconds_total_free()
+            * 1_000_000_000.0) as u64;
 
         Ok(Self {
             config,
+            write_admission: WriteAdmissionSettings::from_env(),
             tables,
             pending_index_uploads,
             commit_log,
@@ -12076,6 +12412,10 @@ impl StorageEngine {
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
+            pump_rate_sample_at_ns: AtomicU64::new(pump_sample_at_ns),
+            pump_rate_sample_total_ns: AtomicU64::new(pump_sample_total_ns),
+            pump_blocked_rate_micros: AtomicU64::new(0),
+            soft_pressure_table_count: AtomicU64::new(0),
             s3_manifest_stats: RwLock::new(HashMap::new()),
             reader_pool,
             upload_store_override: Some((store, prefix)),
@@ -16465,6 +16805,7 @@ mod tests {
             err.to_string().contains("memtable backpressure"),
             "write past memtable_backpressure_bytes must fail closed; got {err}"
         );
+        assert!(matches!(err, ferrosa_common::Error::Overloaded { .. }));
         assert_eq!(
             engine.sstable_count(&tid),
             0,
@@ -16477,6 +16818,64 @@ mod tests {
 
         engine.flush_if_needed().unwrap();
         assert_eq!(engine.sstable_count(&tid), 1);
+    }
+
+    #[tokio::test]
+    async fn write_admission_soft_zone_wakes_after_successful_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let mut engine = StorageEngine::new(config, None).unwrap();
+        engine.write_admission = WriteAdmissionSettings {
+            soft_pressure: 0.4,
+            max_soft_delay: std::time::Duration::from_secs(1),
+        };
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .unwrap();
+        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
+        engine.tables.read()[&tid]
+            .in_write_soft_zone
+            .store(true, Ordering::Relaxed);
+        engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
+        let engine = Arc::new(engine);
+
+        let waiter_engine = Arc::clone(&engine);
+        let waiter_table = tid.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_engine.await_write_admission(&waiter_table).await });
+        tokio::task::yield_now().await;
+        assert!(engine.take_flush_request());
+        engine.flush(&tid).unwrap();
+        waiter.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_admission_soft_zone_times_out_once_then_rechecks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let mut engine = StorageEngine::new(config, None).unwrap();
+        engine.write_admission = WriteAdmissionSettings {
+            soft_pressure: 0.4,
+            max_soft_delay: std::time::Duration::from_millis(5),
+        };
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+        engine
+            .write(&tid, &make_key("soft"), make_row(b"data", 1000), 1000)
+            .unwrap();
+        let current_size = engine.tables.read()[&tid].store.memtable_size() as u64;
+        engine.config.memtable_backpressure_bytes = current_size.saturating_mul(2).max(2);
+        engine.tables.read()[&tid]
+            .in_write_soft_zone
+            .store(true, Ordering::Relaxed);
+        engine.soft_pressure_table_count.store(1, Ordering::Relaxed);
+        let started = Instant::now();
+        engine.await_write_admission(&tid).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert!(engine.take_flush_request());
     }
 
     #[test]
