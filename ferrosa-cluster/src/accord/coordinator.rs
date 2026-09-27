@@ -1755,25 +1755,16 @@ impl AccordCoordinatorDriver {
                 }
             }
 
-            // Commit above already established Accord's slow quorum for a
-            // snapshot barrier. Only this node's engine can serve the session
-            // that is beginning here, so wait for its local conflicting deps
-            // below but do not ask remote engines for redundant ReadVotes. A
-            // remote can be waiting for an earlier barrier to finish applying,
-            // which would make this barrier wait on the transaction behind it.
-            let remote_read_futs: Vec<_> = if is_snapshot_barrier {
-                Vec::new()
-            } else {
-                self.replica_ids
-                    .iter()
-                    .filter(|&&id| id != self_id)
-                    .map(|&peer_id| {
-                        let peers = Arc::clone(&self.peers);
-                        let msg = read_msg.clone();
-                        async move { peers.send(peer_id, msg, Lane::Data).await }
-                    })
-                    .collect()
-            };
+            let remote_read_futs: Vec<_> = self
+                .replica_ids
+                .iter()
+                .filter(|&&id| id != self_id)
+                .map(|&peer_id| {
+                    let peers = Arc::clone(&self.peers);
+                    let msg = read_msg.clone();
+                    async move { peers.send(peer_id, msg, Lane::Data).await }
+                })
+                .collect();
             let read_responses = futures::future::join_all(remote_read_futs).await;
 
             for result in &read_responses {
@@ -1818,8 +1809,10 @@ impl AccordCoordinatorDriver {
             }
 
             // A successful Commit phase already proves the Accord slow quorum.
-            // This local dep-wait is the remaining condition: the node serving
-            // this session must not expose an older engine view.
+            // This local dep-wait is the remaining snapshot condition: the node
+            // serving this session must not expose an older engine view. Remote
+            // ReadVotes are still collected for the shared read path, but their
+            // availability cannot block a snapshot on this coordinator.
             if is_snapshot_barrier && !local_snapshot_vote {
                 return Err(AccordDriverError::Network(
                     "PostgreSQL snapshot barrier dependencies were not applied locally".into(),
