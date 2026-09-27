@@ -90,7 +90,6 @@ struct KernelStatxTimestamp {
 /// documents this as a stable, fixed-size (256-byte) ABI; the compile-time
 /// asserts below hold the port to that contract.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct KernelStatx {
     stx_mask: u32,
     stx_blksize: u32,

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 const DEFAULT_MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 8;
 const DEFAULT_MAX_COMPACTION_INPUTS_PER_TASK: usize = 64;
 const DEFAULT_MAX_SCHEDULED_TABLES_PER_POLL: usize = 8;
-const DEFAULT_MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 8;
+const DEFAULT_MAINTENANCE_DRAIN_BATCH: usize = 8;
 const DEFAULT_MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MAX_AUTO_COMPACTION_PARALLELISM: usize = 8;
@@ -26,7 +26,7 @@ const DEFAULT_RESULT_QUEUE_CAPACITY_PER_WORKER: usize = 2;
 const MAX_AUTOMATIC_FLUSHES_PER_POLL: usize = 1024;
 const MAX_COMPACTION_INPUTS_PER_TASK: usize = 256;
 const MAX_SCHEDULED_TABLES_PER_POLL: usize = 1024;
-const MAX_RESULTS_PER_MAINTENANCE_POLL: usize = 1024;
+const MAX_MAINTENANCE_DRAIN_BATCH: usize = 1024;
 const MAX_AGE_FLUSH_FLOOR_BYTES: u64 = 1 << 40; // 1 TiB
 const MAX_PER_COMPACTION_MEM_BUDGET_BYTES: u64 = 1 << 40; // 1 TiB
 const MAX_AUTO_COMPACTION_PARALLELISM: usize = 64;
@@ -79,7 +79,7 @@ impl StorageRuntimeTuning {
                 "FERROSA_MAX_RESULTS_PER_MAINTENANCE_POLL",
                 defaults.max_results_per_maintenance_poll,
                 1,
-                MAX_RESULTS_PER_MAINTENANCE_POLL,
+                MAX_MAINTENANCE_DRAIN_BATCH,
             ),
             max_age_flush_floor_bytes: read_u64(
                 "FERROSA_MAX_AGE_FLUSH_FLOOR_BYTES",
@@ -133,7 +133,7 @@ impl Default for StorageRuntimeTuning {
             max_automatic_flushes_per_poll: DEFAULT_MAX_AUTOMATIC_FLUSHES_PER_POLL,
             max_compaction_inputs_per_task: DEFAULT_MAX_COMPACTION_INPUTS_PER_TASK,
             max_scheduled_tables_per_poll: DEFAULT_MAX_SCHEDULED_TABLES_PER_POLL,
-            max_results_per_maintenance_poll: DEFAULT_MAX_RESULTS_PER_MAINTENANCE_POLL,
+            max_results_per_maintenance_poll: DEFAULT_MAINTENANCE_DRAIN_BATCH,
             max_age_flush_floor_bytes: DEFAULT_MAX_AGE_FLUSH_FLOOR_BYTES,
             per_compaction_mem_budget_bytes: DEFAULT_PER_COMPACTION_MEM_BUDGET_BYTES,
             max_auto_compaction_parallelism: DEFAULT_MAX_AUTO_COMPACTION_PARALLELISM,
@@ -261,7 +261,7 @@ mod tests {
         );
         assert_eq!(
             tuning.max_results_per_maintenance_poll,
-            DEFAULT_MAX_RESULTS_PER_MAINTENANCE_POLL
+            DEFAULT_MAINTENANCE_DRAIN_BATCH
         );
         assert_eq!(
             tuning.max_age_flush_floor_bytes,
@@ -296,7 +296,7 @@ mod tests {
             (MAX_AUTOMATIC_FLUSHES_PER_POLL, "1025"),
             (MAX_COMPACTION_INPUTS_PER_TASK, "257"),
             (MAX_SCHEDULED_TABLES_PER_POLL, "1025"),
-            (MAX_RESULTS_PER_MAINTENANCE_POLL, "1025"),
+            (MAX_MAINTENANCE_DRAIN_BATCH, "1025"),
             (MAX_AUTO_COMPACTION_PARALLELISM, "65"),
             (MAX_FLUSH_PARALLELISM, "257"),
             (MAX_DIGEST_READ_CHUNK_BYTES, "67108865"),

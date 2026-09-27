@@ -2360,7 +2360,7 @@ pub mod test_support {
                     let total: usize = bufs.iter().map(|b| b.len()).sum();
                     let n = n.min(total);
                     let mut remaining = n;
-                    let mut truncated: Vec<u8> = Vec::with_capacity(n);
+                    let mut truncated: Vec<u8> = Vec::new();
                     for buf in bufs {
                         if remaining == 0 {
                             break;
@@ -2400,8 +2400,7 @@ pub mod test_support {
                     self.inner.record_write(&[&stale], offset, bufs.len())
                 }
                 Some(Fault::BitFlip(byte, bit)) => {
-                    let total: usize = bufs.iter().map(|b| b.len()).sum();
-                    let mut corrupted: Vec<u8> = Vec::with_capacity(total);
+                    let mut corrupted: Vec<u8> = Vec::new();
                     for buf in bufs {
                         corrupted.extend_from_slice(buf);
                     }

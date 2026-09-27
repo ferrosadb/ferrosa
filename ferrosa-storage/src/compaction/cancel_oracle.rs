@@ -1,8 +1,8 @@
 //! Acknowledged-write oracle + cancel-safety invariant checker (T-020,
 //! `test-specification.md` L10, `compaction-cancel-safety.md` I1-I6).
 //!
-//! [`WriteOracle`] is a plain model of every acknowledged write and delete a
-//! test made, kept independently of the engine. [`assert_cancel_invariants`]
+//! `WriteOracle` is a plain model of every acknowledged write and delete a
+//! test made, kept independently of the engine. `assert_cancel_invariants`
 //! compares that model against a (re)opened engine and inspects the table
 //! directory on disk, so a cancel-harness or crash-sweep test can assert the
 //! same four invariants (I1-I4) regardless of which `CancelPoint` it hit.

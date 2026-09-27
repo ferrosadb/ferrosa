@@ -7,13 +7,13 @@
 //! observe or interrupt the task at exactly one of them.
 //!
 //! This module provides:
-//! - [`CancelPoint`]: every named step in the lifecycle table and the C1
+//! - `CancelPoint`: every named step in the lifecycle table and the C1
 //!   check-point list.
-//! - [`record_cancel_point`]: the hook production code calls at each step.
+//! - `record_cancel_point`: the hook production code calls at each step.
 //!   Fires a test-installed callback (record or crash).
-//! - [`set_cancel_hook`] / [`clear_cancel_hook`]: install/remove the
+//! - `set_cancel_hook` / `clear_cancel_hook`: install/remove the
 //!   callback for one **scope** (a table id string).
-//! - [`register_cancel_token`] / [`cancel_now`]: T-021's real-cancellation
+//! - `register_cancel_token` / `cancel_now`: T-021's real-cancellation
 //!   wiring. `execute_task_with_read_mode` registers the live
 //!   [`ferrosa_common::CancelToken`] for the task it is running under the
 //!   same scope `record_cancel_point` uses, so a test's cancel-point hook can
@@ -33,7 +33,7 @@
 //! its own dedicated table name is naturally isolated from every other test,
 //! with no cross-test locking required.
 //!
-//! The [`cancel_point!`](crate::compaction::cancel_point) macro (defined in
+//! The `cancel_point!` macro (defined in
 //! `compaction::mod`) is what production code actually calls; it expands to
 //! nothing outside `cfg(any(test, feature = "test-support"))`, so call sites
 //! carry zero cost and zero code in production builds.
@@ -124,7 +124,7 @@ impl fmt::Display for CancelPoint {
 impl std::str::FromStr for CancelPoint {
     type Err = String;
 
-    /// Parses the [`Display`](fmt::Display) form back into a [`CancelPoint`].
+    /// Parses the [`Display`](fmt::Display) form back into a `CancelPoint`.
     /// Used by the crash-twin subprocess harness to pass the target point
     /// through an environment variable across the `exec` boundary.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -156,7 +156,7 @@ impl std::str::FromStr for CancelPoint {
     }
 }
 
-/// A test-installed callback invoked from [`record_cancel_point`]. Boxed as
+/// A test-installed callback invoked from `record_cancel_point`. Boxed as
 /// `Arc<dyn Fn>` (not `FnMut`) because compaction can call it from more than
 /// one worker thread concurrently; a recording hook owns its own interior
 /// mutability (e.g. a `Mutex<Vec<_>>`).
@@ -170,8 +170,8 @@ fn hooks() -> &'static RwLock<HashMap<String, CancelHookFn>> {
 
 /// Installs a cancel-point hook for `scope` (a table id string). Tests call
 /// this before driving a compaction on that table and must pair it with
-/// [`clear_cancel_hook`] (`#[test]` bodies that can panic mid-test should use
-/// [`CancelHookGuard`] instead).
+/// `clear_cancel_hook` (`#[test]` bodies that can panic mid-test should use
+/// `CancelHookGuard` instead).
 pub fn set_cancel_hook(scope: impl Into<String>, hook: CancelHookFn) {
     hooks().write().insert(scope.into(), hook);
 }
@@ -182,7 +182,7 @@ pub fn clear_cancel_hook(scope: &str) {
 }
 
 /// Fires the hook registered for `scope`, if any, with `point`. Called only
-/// through the [`cancel_point!`](super::cancel_point) macro, never directly,
+/// through the `cancel_point!` macro, never directly,
 /// so every call site stays a one-line, self-documenting statement and the
 /// macro is the single place that decides whether the call exists at all.
 pub fn record_cancel_point(scope: &str, point: CancelPoint) {
@@ -220,7 +220,7 @@ fn tokens() -> &'static RwLock<HashMap<String, CancelToken>> {
 }
 
 /// Registers the live [`CancelToken`] a running compaction task is checking,
-/// under `scope` (same convention as [`set_cancel_hook`]: a table id
+/// under `scope` (same convention as `set_cancel_hook`: a table id
 /// string). Called by `execute_task_with_read_mode` for the duration of one
 /// task. As with the hooks map, this is scoped by table rather than by task:
 /// two tasks concurrently in flight for the same table would clobber each
@@ -255,7 +255,7 @@ pub fn cancel_now(scope: &str, reason: CancelReason) -> bool {
 }
 
 /// RAII guard that unregisters its scope's token on drop, including on an
-/// early return or a panic unwind, mirroring [`CancelHookGuard`].
+/// early return or a panic unwind, mirroring `CancelHookGuard`.
 pub struct CancelTokenGuard {
     scope: String,
 }
