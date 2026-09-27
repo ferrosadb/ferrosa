@@ -585,6 +585,8 @@ Scale with `RACE_KEYS` / `RACE_READERS` / `RACE_SECS` / `RACE_FLUSH_EVERY`.
 The T-023 retirement crash seam is scoped to the explicitly injected Tokio
 poll task. Concurrent tests and startup reconciliation do not inherit the
 fault; unwinding or dropping the scoped future removes the injection.
+The digest-corruption test passes a per-task structural verification policy;
+it never disables the verification checkpoint for concurrent cancellation tests.
 
 `src/compaction/cancel_harness.rs` names every step in the compaction
 lifecycle (`CancelPoint`) and gives production code a `cancel_point!(...)`

@@ -100,6 +100,9 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **T-012 verification test isolation.** Digest-corruption tests disable the
+  structural scan for their task only, preserving concurrent cancellation checks.
+
 - **T-023 test isolation.** The retirement crash seam is task-local and resets
   on unwind or cancellation; unrelated compactions can run concurrently.
 

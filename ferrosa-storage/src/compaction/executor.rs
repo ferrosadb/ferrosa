@@ -2,7 +2,7 @@
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
 //! Last revised: 2026-09-26
-//! Last changed: Forwarded cancellation to streaming output and scoped scratch cleanup after pump teardown.
+//! Last changed: Made per-task output verification explicit so tests do not mutate process policy.
 //!
 //! Background compaction executor.
 //!
@@ -301,10 +301,10 @@ fn compaction_verify_output_enabled() -> bool {
 // Test-only fault-injection hook for the staged compaction output, called
 // right after `finish_to_directory` returns and before `flush_files`
 // renames/digest-verifies it. See the call site in
-// `execute_task_with_read_mode` and `digest_verify_compaction_output_*`
+// `execute_task_with_policy` and `digest_verify_compaction_output_*`
 // tests (T-012).
 //
-// `execute_task_with_read_mode` runs synchronously on the caller's thread
+// `execute_task_with_policy` runs synchronously on the caller's thread
 // (no internal thread handoff between `finish_to_directory` and the hook
 // call below), so a `thread_local` -- rather than a process-wide `static
 // Mutex` -- confines a test's injected corruption to its own call. `cargo
@@ -1051,7 +1051,7 @@ impl CompactionExecutor {
         // No external cancellation source for this test-only entry point: a
         // fresh, never-cancelled token. A test that wants to exercise
         // cancellation installs a `CancelHookGuard` + calls
-        // `cancel_harness::cancel_now` — `execute_task_with_read_mode`
+        // `cancel_harness::cancel_now` — `execute_task_with_policy`
         // registers whatever token it is given (including this fresh one)
         // under the task's table-id scope for the duration of the call.
         let cancel = CancelToken::new();
@@ -1106,19 +1106,21 @@ impl CompactionExecutor {
     where
         F: FnMut(usize),
     {
-        Self::execute_task_with_read_mode(
+        Self::execute_task_with_policy(
             task,
             reader_pool,
             configured_input_read_mode(),
+            compaction_verify_output_enabled(),
             cancel,
             observe_group_width,
         )
     }
 
-    fn execute_task_with_read_mode<F>(
+    fn execute_task_with_policy<F>(
         task: &CompactionTask,
         reader_pool: Option<&CompactionReaderPool>,
         read_mode: InputReadMode,
+        verify_output: bool,
         cancel: &CancelToken,
         mut observe_group_width: F,
     ) -> std::result::Result<ExecutedCompaction, String>
@@ -1620,7 +1622,7 @@ impl CompactionExecutor {
             local_write_start.elapsed(),
         );
 
-        if compaction_verify_output_enabled() {
+        if verify_output {
             // 5. Streaming readback verification — count partitions and rows
             //    without materializing the output back into a Vec.  Catches
             //    Data.db / Partitions.db inconsistencies that would corrupt
@@ -2561,9 +2563,15 @@ mod tests {
                 purge: None,
             };
             let cancel = ferrosa_common::CancelToken::new();
-            let done =
-                CompactionExecutor::execute_task_with_read_mode(&task, None, mode, &cancel, |_| {})
-                    .expect("compaction");
+            let done = CompactionExecutor::execute_task_with_policy(
+                &task,
+                None,
+                mode,
+                true,
+                &cancel,
+                |_| {},
+            )
+            .expect("compaction");
             read_output_partitions(&output_dir, &done.metadata.id)
         };
 
@@ -2611,10 +2619,11 @@ mod tests {
         };
         let pool: CompactionReaderPool = Arc::new(crate::reader_pool::ReaderPool::new(256));
         let cancel = ferrosa_common::CancelToken::new();
-        let result = CompactionExecutor::execute_task_with_read_mode(
+        let result = CompactionExecutor::execute_task_with_policy(
             &task,
             Some(&pool),
             InputReadMode::DirectScan { window: 4096 },
+            true,
             &cancel,
             |_| {},
         )
@@ -2832,7 +2841,6 @@ mod tests {
     /// retires them, because `execute_task` returns `Err` before its caller
     /// ever gets a chance to swap.
     #[test]
-    #[serial_test::serial(compaction_verify_output_env)]
     fn digest_verify_compaction_output_corruption_refused_even_with_verify_output_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let schema = test_schema_with_columns();
@@ -2865,8 +2873,6 @@ mod tests {
             purge: None,
         };
 
-        let prev = std::env::var("FERROSA_COMPACTION_VERIFY_OUTPUT").ok();
-        std::env::set_var("FERROSA_COMPACTION_VERIFY_OUTPUT", "0");
         set_compaction_output_hook(|output| {
             let good = std::fs::read(&output.data).unwrap();
             let mut damaged = good.clone();
@@ -2876,13 +2882,18 @@ mod tests {
             std::fs::write(&output.data, &damaged).unwrap();
         });
 
-        let result = CompactionExecutor::execute_task(&task);
+        // Disable only this task's structural scan. Digest verification remains
+        // unconditional, and parallel cancellation tests retain their scan.
+        let result = CompactionExecutor::execute_task_with_policy(
+            &task,
+            None,
+            configured_input_read_mode(),
+            false,
+            &CancelToken::new(),
+            |_| {},
+        );
 
         clear_compaction_output_hook();
-        match prev {
-            Some(v) => std::env::set_var("FERROSA_COMPACTION_VERIFY_OUTPUT", v),
-            None => std::env::remove_var("FERROSA_COMPACTION_VERIFY_OUTPUT"),
-        }
 
         let msg = match result {
             Ok(_) => panic!(
@@ -3302,10 +3313,11 @@ mod tests {
         // The cached (pool-routed) mode is what this pins, so ask for it. It used
         // to be inherited from the default, which is now the direct scan.
         let cancel = ferrosa_common::CancelToken::new();
-        let result = CompactionExecutor::execute_task_with_read_mode(
+        let result = CompactionExecutor::execute_task_with_policy(
             &task,
             Some(&pool),
             InputReadMode::Cached,
+            true,
             &cancel,
             |_| {},
         )

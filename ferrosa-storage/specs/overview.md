@@ -41,6 +41,9 @@ Startup removes legacy `Data.raw` scratch before generation discovery.
 The test-only mid-retirement crash injection uses Tokio task-local scope, so
 concurrent compaction tests and synchronous recovery cannot inherit a fault.
 The scope unwinds with the injected future, including panic and cancellation.
+Compaction resolves structural output verification once at task entry and
+passes it explicitly to the executor; tests can choose a policy per task
+without changing the process environment. Digest verification is unconditional.
 
 ## Module map
 
