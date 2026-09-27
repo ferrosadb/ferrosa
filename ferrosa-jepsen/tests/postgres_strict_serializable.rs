@@ -27,6 +27,7 @@ use uuid::Uuid;
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 4;
 const INITIAL_BALANCE: i64 = 10_000;
+const POSTGRES_DEFAULT_SCHEMA: &str = "public";
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
 const CQL_URLS_ENV: &str = "FERROSA_TEST_CQL_URLS";
 const FAULT_READY_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_READY_FILE";
@@ -80,7 +81,9 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .context("connect to CQL cluster for strict-serializability table setup")?;
     cql_session
         .query_unpaged(
-            format!("CREATE TABLE postgres.{table} (id text PRIMARY KEY, balance bigint)"),
+            format!(
+                "CREATE TABLE {POSTGRES_DEFAULT_SCHEMA}.{table} (id text PRIMARY KEY, balance bigint)"
+            ),
             &[],
         )
         .await
@@ -186,7 +189,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .context("PostgreSQL transaction history violated strict serializability")?;
 
     cql_session
-        .query_unpaged(format!("DROP TABLE postgres.{table}"), &[])
+        .query_unpaged(format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}"), &[])
         .await
         .context("drop strict-serializability workload table through CQL")?;
     drop(clients);
