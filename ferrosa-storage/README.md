@@ -87,6 +87,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   predating T-011 still opens everywhere, treated as "not checked" and logged
   once per generation, never as an error.
 
+  **Streaming writer callers (T-039):** file flush and compaction open staged
+  `Data.db` directly. Compaction passes its task cancellation token into the
+  writer so backpressure wakes on cancellation; a borrowed staging guard joins
+  writer teardown before deleting abandoned output. Startup removes legacy
+  `Data.raw` scratch along with abandoned staging directories, preserving live
+  generation files.
+
   **Automatic-flush admission (t_889b0d9a):** maintenance cadence alone never
   creates a tiny SSTable. The age trigger requires at least 16 MiB (or the
   configured flush threshold when smaller), while the size/backpressure

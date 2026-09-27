@@ -1,8 +1,8 @@
 //! Module: Compose lock-free memtable, flush, SSTable read, and metadata views.
 //! Correctness: Correct when every ArcSwap view is internally aligned and read
 //! and compaction planning preserve key bounds without resident-reader fanout.
-//! Last revised: 2026-09-01
-//! Last changed: Added bounded high-SSTable-fanout read diagnostics.
+//! Last revised: 2026-09-26
+//! Last changed: Opened staged Data.db directly for streaming flush output.
 //!
 //! Lock-free composition of memtable, flush, and SSTable reads.
 //!
@@ -2928,7 +2928,7 @@ impl<F: FlushTarget> TableStore<F> {
         let header = flush::build_serialization_header(&schema, &partitions);
         let staged_output = self.flush_target.file_output_staging_dir()?;
         let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw"))?
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db"))?
         } else {
             SSTableWriter::new(options, header)
         };

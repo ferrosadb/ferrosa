@@ -100,6 +100,10 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **Streaming writer callers (T-039).** Flush and compaction target staged
+  `Data.db`; compaction shares cancellation with the pump and cleans partial
+  output after writer teardown. Startup sweeps legacy `Data.raw` scratch.
+
 - **Compaction cancel-safety test harness (T-020, 2026-09-26).** Test
   infrastructure only, no behavior change: `CancelPoint` names every step in
   the compaction lifecycle table (`compaction-cancel-safety.md`), a

@@ -33,6 +33,11 @@ serve standalone (`LocalDataStore`) and cluster-routed deployments. Its downstre
 boundary is `ferrosa-sstable` (BTI I/O) and `object_store` (S3). It knows nothing
 about CQL/SQL protocol framing or query planning — those belong to the front-ends.
 
+File flush and compaction stream into staged `Data.db` through the SSTable
+writer. Compaction shares its task cancellation token with the pump, and a
+borrowed staging guard removes incomplete output after the writer has dropped.
+Startup removes legacy `Data.raw` scratch before generation discovery.
+
 ## Module map
 
 | Module | Responsibility |

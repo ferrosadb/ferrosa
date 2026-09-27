@@ -1,8 +1,8 @@
 //! Module: Execute bounded streaming compaction work on background threads.
 //! Correctness: Correct when input claims prevent overlap, completed outputs are
 //! finalized once, and maintenance result batches remain explicitly bounded.
-//! Last revised: 2026-09-01
-//! Last changed: Added count-bounded result polling for backlog maintenance.
+//! Last revised: 2026-09-26
+//! Last changed: Forwarded cancellation to streaming output and scoped scratch cleanup after pump teardown.
 //!
 //! Background compaction executor.
 //!
@@ -427,6 +427,17 @@ fn remove_staging_dir(staging_dir: &std::path::Path) {
                 "compaction cancel: failed to remove merge staging directory"
             );
         }
+    }
+}
+
+/// Declared before the writer so its pumps join before scratch is removed.
+/// Borrowing the path adds no allocation and also covers I/O errors between
+/// explicit cancellation checkpoints.
+struct StagingCleanup<'a>(&'a std::path::Path);
+
+impl Drop for StagingCleanup<'_> {
+    fn drop(&mut self) {
+        remove_staging_dir(self.0);
     }
 }
 
@@ -1301,10 +1312,12 @@ impl CompactionExecutor {
             .file_output_staging_dir()
             .map_err(|e| format!("flush staging dir: {e}"))?
             .ok_or_else(|| "file flush target did not provide staging directory".to_string())?;
-        let mut writer = SSTableWriter::new_file_backed(
+        let _staging_cleanup = StagingCleanup(&staging_dir);
+        let mut writer = SSTableWriter::new_file_backed_with_cancel(
             options,
             output_header.clone(),
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
+            cancel.clone(),
         )
         .map_err(|e| format!("writer staging: {e}"))?;
 
@@ -1408,7 +1421,6 @@ impl CompactionExecutor {
                 merge_loop_iteration += 1;
             }
             if let Err(c) = cancel.check() {
-                remove_staging_dir(&staging_dir);
                 return Err(c.to_string());
             }
             // Drain all heap entries that share this key (multiple inputs
@@ -1536,7 +1548,6 @@ impl CompactionExecutor {
         let (min_token, max_token) = (tally.min_token, tally.max_token);
         cancel_point!(&pool_table_key, CancelPoint::MergePartitionLast);
         if let Err(c) = cancel.check() {
-            remove_staging_dir(&staging_dir);
             return Err(c.to_string());
         }
 
@@ -1570,14 +1581,11 @@ impl CompactionExecutor {
 
         cancel_point!(&pool_table_key, CancelPoint::BeforeFinish);
         if let Err(c) = cancel.check() {
-            remove_staging_dir(&staging_dir);
             return Err(c.to_string());
         }
         let finish_start = Instant::now();
-        // Cloned so `staging_dir` stays valid for the BeforeFlushFiles
-        // checkpoint below (`finish_to_directory` takes it by value).
         let output = writer
-            .finish_to_directory(staging_dir.clone())
+            .finish_to_directory(&staging_dir)
             .map_err(|e| format!("finish: {e}"))?;
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::WriterFinish,
@@ -1601,7 +1609,6 @@ impl CompactionExecutor {
         // 4. Promote staged output files via FileFlushTarget.
         cancel_point!(&pool_table_key, CancelPoint::BeforeFlushFiles);
         if let Err(c) = cancel.check() {
-            remove_staging_dir(&staging_dir);
             return Err(c.to_string());
         }
         let local_write_start = Instant::now();
@@ -2133,6 +2140,64 @@ mod tests {
             "nothing is pending once it was delivered"
         );
         executor.shutdown();
+    }
+
+    #[test]
+    fn writer_callers_compaction_publishes_without_raw_scratch() {
+        for compression in ["lz4", "none"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut task = real_compaction_task(tmp.path());
+            task.schema
+                .extensions
+                .insert("compression.class".into(), compression.into());
+            let output = CompactionExecutor::execute_task(&task).unwrap();
+            assert_eq!(output.metadata.partition_count, 30);
+            assert_no_raw_scratch(&task.output_dir);
+            let staged = task.output_dir.join(".sstable-staging");
+            assert!(!staged.exists(), "successful publication removes staging");
+        }
+    }
+
+    fn assert_no_raw_scratch(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            assert_ne!(entry.file_name(), "Data.raw");
+            if entry.file_type().unwrap().is_dir() {
+                assert_no_raw_scratch(&entry.path());
+            }
+        }
+    }
+
+    #[test]
+    fn writer_callers_compaction_cancellation_reaches_writer_and_cleans_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = real_compaction_task(tmp.path());
+        // Uncompressed writes reach the pump immediately, so this test isolates
+        // token propagation from the compressor's bounded batch buffering.
+        task.schema
+            .extensions
+            .insert("compression.class".into(), "none".into());
+        let cancel = CancelToken::new();
+        let err = match CompactionExecutor::execute_task_inner(&task, None, &cancel, |_| {
+            // This callback runs after the partition checkpoint and immediately
+            // before emission. Only the writer sees cancellation for this row.
+            cancel.cancel(CancelReason::Operator);
+        }) {
+            Ok(_) => panic!("cancellation must stop the writer"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("write partition"),
+            "cancel must reach the pump: {err}"
+        );
+        let staging_root = task.output_dir.join(".sstable-staging");
+        assert_eq!(std::fs::read_dir(staging_root).unwrap().count(), 0);
+        for input in &task.inputs {
+            assert!(
+                input.path.join(format!("{}-Data.db", input.id)).exists(),
+                "cancel must preserve input files"
+            );
+        }
     }
 
     #[test]

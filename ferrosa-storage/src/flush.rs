@@ -1,4 +1,7 @@
 //! FlushTarget abstraction and serialization header construction.
+//! Correctness: staged output is verified before publication; abandoned scratch is swept.
+//! Last revised: 2026-09-26
+//! Last changed: Removed legacy Data.raw scratch at startup and targeted Data.db in writer callers.
 //!
 //! This module provides the [`FlushTarget`] trait, which decouples memtable
 //! flush logic from the destination: in-memory buffers ([`InMemoryFlushTarget`])
@@ -890,7 +893,8 @@ pub(crate) mod fsync_probe {
 /// (`StorageEngine::cleanup_stale_compaction_staging`), they are only ever
 /// live while a flush or merge-read is running in this process; there is
 /// nothing at startup to resume one, so they are pure debris and are removed
-/// outright rather than quarantined.
+/// outright rather than quarantined. Legacy `Data.raw` scratch files directly
+/// in the component directory are also removed; they are never live components.
 ///
 /// Called from `StorageEngine::load_existing_sstables_and_sidecars_with_repair_mode`
 /// before generation discovery, and again from `FileFlushTarget::new`/
@@ -928,6 +932,16 @@ pub(crate) fn sweep_stale_flush_staging(dir: &Path) {
                     dir = %entry.path().display(),
                     "flush: could not remove stale flush staging dir"
                 ),
+            }
+            continue;
+        }
+
+        // The streaming writer never produces Data.raw. An exact legacy
+        // basename is uncommitted scratch; generation-prefixed Data.db stays live.
+        if !is_dir && name_str == "Data.raw" {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::error!(%e, path = %entry.path().display(),
+                    "flush: could not remove stale legacy raw data");
             }
             continue;
         }
@@ -2487,7 +2501,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2534,7 +2548,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2647,7 +2661,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2711,7 +2725,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -2750,7 +2764,32 @@ mod tests {
     }
 
     #[test]
-    fn file_flush_target_promotes_staged_sstable_files() {
+    fn writer_callers_restart_removes_legacy_raw_without_touching_live_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(".sstable-staging").join("old-writer");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("Data.raw"), b"abandoned staging").unwrap();
+        std::fs::write(dir.path().join("Data.raw"), b"abandoned raw output").unwrap();
+        std::fs::write(dir.path().join("1-Data.db"), b"live component").unwrap();
+
+        FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+
+        assert!(!staging.exists());
+        assert!(!dir.path().join("Data.raw").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("1-Data.db")).unwrap(),
+            b"live component"
+        );
+    }
+
+    #[test]
+    fn writer_callers_flush_promotes_staged_sstable_files() {
+        for compression in [None, Some(ferrosa_sstable::Compression::Lz4)] {
+            assert_writer_caller_flush(compression);
+        }
+    }
+
+    fn assert_writer_caller_flush(compression: Option<ferrosa_sstable::Compression>) {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut partitions = vec![
@@ -2765,9 +2804,13 @@ mod tests {
             .unwrap()
             .expect("file target staging dir");
         let header = build_serialization_header(&schema, &partitions);
-        let options = WriteOptions::default();
+        let compressed = compression.is_some();
+        let options = WriteOptions {
+            compression,
+            ..WriteOptions::default()
+        };
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
@@ -2784,10 +2827,12 @@ mod tests {
             std::fs::metadata(&data_path).unwrap().len(),
             staged_data_len
         );
-        assert!(dir
-            .path()
-            .join(format!("{gen}-CompressionInfo.db"))
-            .exists());
+        assert_eq!(
+            dir.path()
+                .join(format!("{gen}-CompressionInfo.db"))
+                .exists(),
+            compressed
+        );
 
         for p in &partitions {
             let got = reader.get_partition(&p.key).unwrap().expect("partition");
@@ -3049,7 +3094,7 @@ mod tests {
         let header = build_serialization_header(&schema, &partitions);
         let options = WriteOptions::default();
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
@@ -3295,7 +3340,7 @@ mod tests {
         let header = build_serialization_header(&schema, &partitions);
         let options = WriteOptions::default();
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in &partitions {
             writer.add_partition(p).unwrap();
         }
@@ -3367,7 +3412,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &partitions {
@@ -3442,7 +3487,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &bad_partitions {
@@ -3470,7 +3515,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &good_partitions {
@@ -3528,7 +3573,7 @@ mod tests {
             .expect("file target staging dir");
         let header = build_serialization_header(&schema, partitions);
         let mut writer =
-            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.raw")).unwrap();
+            SSTableWriter::new_file_backed(options, header, staging_dir.join("Data.db")).unwrap();
         for p in partitions {
             writer.add_partition(p).unwrap();
         }
@@ -3711,7 +3756,7 @@ mod tests {
         let mut writer = SSTableWriter::new_file_backed(
             WriteOptions::default(),
             header,
-            staging_dir.join("Data.raw"),
+            staging_dir.join("Data.db"),
         )
         .unwrap();
         for p in &good_partitions {
