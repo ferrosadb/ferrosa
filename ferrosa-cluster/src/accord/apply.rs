@@ -605,6 +605,15 @@ impl DepWaitApplier {
         }
     }
 
+    /// Install the PostgreSQL MVCC observer on the storage applier that this
+    /// replica actually uses for Accord Apply.
+    pub fn register_postgres_mvcc_observer(
+        &self,
+        observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        self.applier.register_postgres_mvcc_observer(observer)
+    }
+
     /// Attempt to apply a committed transaction.
     ///
     /// If all dependencies in `deps` are already applied, calls `applier.apply`
