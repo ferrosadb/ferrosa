@@ -292,7 +292,7 @@ async fn run_program(program: &[u8]) {
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 8,
-        rng_seed: proptest::test_runner::RngSeed::Fixed(0x027_c5_11),
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x00_27_c5_11),
         ..ProptestConfig::default()
     })]
 
