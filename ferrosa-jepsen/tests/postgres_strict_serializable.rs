@@ -28,6 +28,7 @@ use uuid::Uuid;
 const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
 const WRITE_SKEW_WRITERS: usize = 2;
+const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
 const POSTGRES_DEFAULT_SCHEMA: &str = "public";
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
@@ -203,7 +204,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         return Err(error);
     }
 
-    let final_state = read_workload_state(&clients[0], &table).await?;
+    let final_state = read_workload_state_after_fault(&clients[0], &table).await?;
     let final_a = final_state["a"];
     let final_b = final_state["b"];
     let initial = BTreeMap::from([
@@ -376,6 +377,31 @@ async fn read_workload_state(client: &Client, table: &str) -> Result<BTreeMap<St
         }
     }
     Ok(state)
+}
+
+async fn read_workload_state_after_fault(
+    client: &Client,
+    table: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let mut last_error = None;
+    for attempt in 0..=WORKLOAD_STATE_READ_RETRIES {
+        match read_workload_state(client, table).await {
+            Ok(state) => return Ok(state),
+            Err(error)
+                if error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .is_some_and(is_serialization_failure) =>
+            {
+                last_error = Some(error);
+                if attempt < WORKLOAD_STATE_READ_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("retry loop records a serialization failure"))
+        .context("read workload state after the replica fault")
 }
 
 async fn wait_for_workload_state(
@@ -731,7 +757,11 @@ async fn wait_for_phase(
 fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
-        .is_some_and(|sqlstate| sqlstate.code() == "40001")
+        .is_some_and(|sqlstate| is_retryable_serialization_state(sqlstate.code()))
+}
+
+fn is_retryable_serialization_state(sqlstate: &str) -> bool {
+    sqlstate == "40001"
 }
 
 fn initial_workload_statements(table: &str) -> [String; 5] {
@@ -859,8 +889,8 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        is_write_skew_writer, predicate_observations, wait_for_phase, FaultSchedule,
-        TransactionOperation, ACTORS,
+        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
+        wait_for_phase, FaultSchedule, TransactionOperation, ACTORS,
     };
 
     #[test]
@@ -928,6 +958,13 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn only_serialization_failures_are_retryable_for_final_state_reads() {
+        assert!(is_retryable_serialization_state("40001"));
+        assert!(!is_retryable_serialization_state("23505"));
+        assert!(!is_retryable_serialization_state("08006"));
     }
 
     #[tokio::test]
