@@ -137,52 +137,57 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         let write_skew_barrier = Arc::clone(&write_skew_barrier);
         let actor_failure_tx = actor_failure_tx.clone();
         let mut actor_failure_rx = actor_failure_rx.clone();
+        let mut actor_cancel_rx = actor_failure_rx.clone();
         let table = table.clone();
         actors.push(tokio::spawn(async move {
-            let result = async {
-                for iteration in 0..TRANSACTIONS_PER_ACTOR {
-                    let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
-                    let transfers =
-                        transfer_once(&client, &table, operation_id, &event_clock).await?;
-                    transfer_retry_count
-                        .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
+            let result = run_until_actor_failure(
+                async {
+                    for iteration in 0..TRANSACTIONS_PER_ACTOR {
+                        let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
+                        let transfers =
+                            transfer_once(&client, &table, operation_id, &event_clock).await?;
+                        transfer_retry_count
+                            .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .extend(transfers);
+                        let register =
+                            register_once(&client, &table, operation_id * 2 + 1, &event_clock)
+                                .await?;
+                        history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(register);
+                    }
+
+                    wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
+                    let predicate = if actor == 0 {
+                        insert_phantom_once(&client, &table, 1_000, &event_clock).await?
+                    } else {
+                        observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
+                            .await?
+                    };
                     history
                         .lock()
                         .expect("history mutex poisoned")
-                        .extend(transfers);
-                    let register =
-                        register_once(&client, &table, operation_id * 2 + 1, &event_clock).await?;
+                        .push(predicate);
+
+                    wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
+                    let write_skew = if is_write_skew_writer(actor) {
+                        write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?
+                    } else {
+                        observe_predicate_once(&client, &table, 2_000 + actor as u64, &event_clock)
+                            .await?
+                    };
                     history
                         .lock()
                         .expect("history mutex poisoned")
-                        .push(register);
-                }
-
-                wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
-                let predicate = if actor == 0 {
-                    insert_phantom_once(&client, &table, 1_000, &event_clock).await?
-                } else {
-                    observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
-                        .await?
-                };
-                history
-                    .lock()
-                    .expect("history mutex poisoned")
-                    .push(predicate);
-
-                wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
-                let write_skew = if is_write_skew_writer(actor) {
-                    write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock).await?
-                } else {
-                    observe_predicate_once(&client, &table, 2_000 + actor as u64, &event_clock)
-                        .await?
-                };
-                history
-                    .lock()
-                    .expect("history mutex poisoned")
-                    .push(write_skew);
-                Ok(())
-            }
+                        .push(write_skew);
+                    Ok(())
+                },
+                &mut actor_cancel_rx,
+            )
             .await;
 
             if let Err(error) = &result {
@@ -792,6 +797,31 @@ async fn wait_for_phase(
     }
 }
 
+async fn run_until_actor_failure<F>(
+    work: F,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    if let Some(error) = actor_failure_rx.borrow().clone() {
+        bail!("{error}");
+    }
+
+    tokio::select! {
+        result = work => result,
+        changed = actor_failure_rx.changed() => {
+            if changed.is_err() {
+                bail!("PostgreSQL workload actor failure signal closed during actor work");
+            }
+            if let Some(error) = actor_failure_rx.borrow().as_ref() {
+                bail!("{error}");
+            }
+            bail!("PostgreSQL workload actor failure signal changed without an error");
+        }
+    }
+}
+
 fn is_serialization_failure(error: &tokio_postgres::Error) -> bool {
     error
         .code()
@@ -928,8 +958,8 @@ mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
         is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
-        retry_serializable_transactions, wait_for_phase, FaultSchedule, RecordedTransaction,
-        TransactionOperation, ACTORS, TRANSFER_SERIALIZATION_RETRIES,
+        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
+        RecordedTransaction, TransactionOperation, ACTORS, TRANSFER_SERIALIZATION_RETRIES,
     };
 
     #[tokio::test]
@@ -1079,6 +1109,43 @@ mod tests {
         let error = result.expect_err("peer should receive the actor failure");
         assert!(error.to_string().contains("actor 2"));
         assert!(error.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn actor_failure_cancels_peer_work_and_preserves_originating_error() {
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
+        let peer = tokio::spawn(async move {
+            run_until_actor_failure(std::future::pending(), &mut failure_rx).await
+        });
+
+        failure_tx.send_replace(Some(
+            "PostgreSQL workload actor 2 failed: execute PostgreSQL register transaction: connection reset"
+                .to_owned(),
+        ));
+        let error = tokio::time::timeout(std::time::Duration::from_millis(100), peer)
+            .await
+            .expect("actor failure should cancel peer database work")
+            .expect("peer task should not panic")
+            .expect_err("peer should receive the originating actor failure");
+
+        assert!(error.to_string().contains("actor 2"));
+        assert!(error.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn actor_failure_already_signaled_cancels_late_peer_work() {
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
+        failure_tx.send_replace(Some("PostgreSQL workload actor 1 failed".to_owned()));
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_until_actor_failure(std::future::pending(), &mut failure_rx),
+        )
+        .await
+        .expect("late actors must observe an already signaled peer failure")
+        .expect_err("peer should receive the prior actor failure");
+
+        assert!(error.to_string().contains("actor 1"));
     }
 
     #[test]

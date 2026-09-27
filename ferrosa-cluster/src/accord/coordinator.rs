@@ -1319,23 +1319,39 @@ impl AccordCoordinatorDriver {
         // Fanout to the REMOTE replicas only (self is handled locally above / by
         // the leaseholder implicit vote); a self-send would hit "unknown peer".
         if decision == CoordinatorDecision::Pending {
-            let futs: Vec<_> = self
+            use futures::StreamExt;
+
+            let mut pending = futures::stream::FuturesUnordered::new();
+            for &peer_id in self
                 .replica_ids
                 .iter()
                 .filter(|&&peer_id| peer_id != self.self_id)
-                .map(|&peer_id| {
-                    let peers = Arc::clone(&self.peers);
-                    let msg = pa_msg.clone();
-                    async move {
-                        peers
-                            .send(peer_id, msg, Lane::Data)
-                            .await
-                            .map(|resp| (peer_id, resp))
+            {
+                let peers = Arc::clone(&self.peers);
+                let msg = pa_msg.clone();
+                pending.push(async move {
+                    let result = peers.send(peer_id, msg, Lane::Data).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            txn_id = ?txn_id,
+                            error = %error,
+                            peer = ?peer_id,
+                            "accord: PreAccept RPC failed (non-fatal, continuing)"
+                        );
                     }
-                })
-                .collect();
-
-            let responses = futures::future::join_all(futs).await;
+                    (peer_id, result)
+                });
+            }
+            let (response_tx, mut response_rx) =
+                tokio::sync::mpsc::channel(self.replica_ids.len().max(1));
+            tokio::spawn(async move {
+                while let Some(response) = pending.next().await {
+                    // A closed receiver means the coordinator already decided.
+                    // Keep polling so every already-enqueued peer send is driven
+                    // and its result can be observed/logged.
+                    let _ = response_tx.send(response).await;
+                }
+            });
 
             // Count the outcomes so a failed round says WHY, not just that it
             // failed. An empty AccordPreAcceptOK is the replica's encoding for
@@ -1344,14 +1360,26 @@ impl AccordCoordinatorDriver {
             let mut votes = 0usize;
             let mut no_votes = 0usize;
             let mut rpc_failures = 0usize;
+            let mut response_count = 0usize;
+            let mut phase_error = None;
 
-            for result in &responses {
+            while let Some(result) = response_rx.recv().await {
+                response_count += 1;
+                if phase_error.is_some() {
+                    continue;
+                }
                 match result {
-                    Ok((_peer_id, Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
-                        let ok: PreAcceptOkPayload = bincode::deserialize(b)
-                            .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                    (_peer_id, Ok(Message::AccordPreAcceptOK(b))) if !b.is_empty() => {
+                        let ok: PreAcceptOkPayload = match bincode::deserialize(&b) {
+                            Ok(ok) => ok,
+                            Err(error) => {
+                                phase_error = Some(AccordDriverError::Codec(error.to_string()));
+                                continue;
+                            }
+                        };
                         if ok.snapshot_stale {
-                            return Err(AccordDriverError::SnapshotStale);
+                            phase_error = Some(AccordDriverError::SnapshotStale);
+                            continue;
                         }
                         votes += 1;
                         let resp = PreAcceptResponse {
@@ -1360,11 +1388,8 @@ impl AccordCoordinatorDriver {
                             deps: ok.deps,
                         };
                         decision = self.coordinator.handle_preaccept_ok(resp);
-                        if decision != CoordinatorDecision::Pending {
-                            break;
-                        }
                     }
-                    Ok((peer_id, _)) => {
+                    (peer_id, Ok(_)) => {
                         // The peer answered without a usable vote. The wire
                         // shape cannot say whether that was a Nack, a persist
                         // failure, or an unexpected state — so record it and
@@ -1376,15 +1401,23 @@ impl AccordCoordinatorDriver {
                             "accord: PreAccept returned no vote (empty or unexpected response)"
                         );
                     }
-                    Err(e) => {
+                    (_peer_id, Err(_)) => {
                         rpc_failures += 1;
-                        tracing::warn!(
-                            txn_id = ?txn_id,
-                            error = %e,
-                            "accord: PreAccept RPC failed (non-fatal, continuing)"
-                        );
                     }
                 }
+
+                if decision != CoordinatorDecision::Pending {
+                    // The coordinator has enough votes to decide this phase.
+                    // The fanout task continues best-effort sends without
+                    // keeping the transaction caller behind a slow minority.
+                    break;
+                }
+            }
+
+            if let Some(error) = phase_error {
+                // Drain already-sent PreAccepts before no-write finalization so
+                // no late registration can race with its cleanup.
+                return Err(error);
             }
 
             // Every response that will ever arrive has arrived, so a fast
@@ -1405,7 +1438,7 @@ impl AccordCoordinatorDriver {
             if decision == CoordinatorDecision::Pending {
                 tracing::warn!(
                     txn_id = ?txn_id,
-                    peers = responses.len(),
+                    peers = response_count,
                     votes,
                     no_votes,
                     rpc_failures,
@@ -1470,30 +1503,60 @@ impl AccordCoordinatorDriver {
                 }
 
                 if ac_decision == CoordinatorDecision::Pending {
-                    let ac_futs: Vec<_> = self
+                    use futures::StreamExt;
+
+                    let mut ac_pending = futures::stream::FuturesUnordered::new();
+                    for &peer_id in self
                         .replica_ids
                         .iter()
                         .filter(|&&peer_id| peer_id != self.self_id)
-                        .map(|&peer_id| {
-                            let peers = Arc::clone(&self.peers);
-                            let msg = ac_msg.clone();
-                            async move { (peer_id, peers.send(peer_id, msg, Lane::Data).await) }
-                        })
-                        .collect();
+                    {
+                        let peers = Arc::clone(&self.peers);
+                        let msg = ac_msg.clone();
+                        ac_pending.push(async move {
+                            let result = peers.send(peer_id, msg, Lane::Data).await;
+                            if let Err(error) = &result {
+                                tracing::warn!(
+                                    txn_id = ?txn_id,
+                                    error = %error,
+                                    peer = ?peer_id,
+                                    "accord: Accept RPC failed"
+                                );
+                            }
+                            (peer_id, result)
+                        });
+                    }
+                    let (accept_tx, mut accept_rx) =
+                        tokio::sync::mpsc::channel(self.replica_ids.len().max(1));
+                    tokio::spawn(async move {
+                        while let Some(response) = ac_pending.next().await {
+                            let _ = accept_tx.send(response).await;
+                        }
+                    });
 
-                    let ac_responses = futures::future::join_all(ac_futs).await;
-
-                    for (peer_id, result) in &ac_responses {
+                    let mut accept_error = None;
+                    while let Some((peer_id, result)) = accept_rx.recv().await {
+                        if accept_error.is_some() {
+                            continue;
+                        }
                         match result {
                             Ok(Message::AccordAcceptOK(b)) if !b.is_empty() => {
-                                let ok: AcceptOkPayload = match bincode::deserialize(b) {
+                                let ok: AcceptOkPayload = match bincode::deserialize(&b) {
                                     Ok(ok) => ok,
                                     Err(_) => {
                                         // Older replicas only echo txn_id. Their Accept
                                         // request carried this coordinator's dependency
                                         // set, so retain that as the compatibility value.
-                                        let legacy: LegacyAcceptOkPayload = bincode::deserialize(b)
-                                            .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                                        let legacy: LegacyAcceptOkPayload =
+                                            match bincode::deserialize(&b) {
+                                                Ok(legacy) => legacy,
+                                                Err(error) => {
+                                                    accept_error = Some(AccordDriverError::Codec(
+                                                        error.to_string(),
+                                                    ));
+                                                    continue;
+                                                }
+                                            };
                                         AcceptOkPayload {
                                             txn_id: legacy.txn_id,
                                             deps: accept_deps.clone(),
@@ -1513,19 +1576,20 @@ impl AccordCoordinatorDriver {
                                     deps: ok.deps,
                                 };
                                 ac_decision = self.coordinator.handle_accept_ok(resp);
-                                if ac_decision != CoordinatorDecision::Pending {
-                                    break;
-                                }
                             }
                             Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    txn_id = ?txn_id,
-                                    error = %e,
-                                    "accord: Accept RPC failed"
-                                );
-                            }
+                            Err(_) => {}
                         }
+                        if ac_decision != CoordinatorDecision::Pending {
+                            // The fanout task continues best-effort sends after
+                            // this slow quorum is sufficient for Accept.
+                            break;
+                        }
+                    }
+                    if let Some(error) = accept_error {
+                        // Drain already-sent Accepts before no-write
+                        // finalization to avoid racing a late accepted state.
+                        return Err(error);
                     }
                 }
 
@@ -2137,28 +2201,52 @@ impl AccordCoordinatorDriver {
         build_msg: impl Fn(uuid::Uuid) -> Message,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
     ) -> bool {
+        use futures::StreamExt;
+
         let self_id = self.self_id;
         let mut quorum = participant.quorum();
         if self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil() {
             quorum.record_node_ack(self_id);
         }
 
-        let futs: Vec<_> = self
-            .replica_ids
-            .iter()
-            .filter(|&&id| id != self_id)
-            .map(|&peer_id| {
-                let peers = Arc::clone(&self.peers);
-                let msg = build_msg(peer_id);
-                async move { (peer_id, peers.send(peer_id, msg, Lane::Data).await) }
-            })
-            .collect();
+        let txn_id = self.coordinator.txn_id;
+        if quorum.all_reached() {
+            return true;
+        }
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for &peer_id in self.replica_ids.iter().filter(|&&id| id != self_id) {
+            let peers = Arc::clone(&self.peers);
+            let msg = build_msg(peer_id);
+            pending.push(async move {
+                let result = peers.send(peer_id, msg, Lane::Data).await;
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        txn_id = ?txn_id,
+                        error = %error,
+                        peer = ?peer_id,
+                        "accord: quorum broadcast RPC failed"
+                    );
+                }
+                (peer_id, result)
+            });
+        }
+        let (response_tx, mut response_rx) =
+            tokio::sync::mpsc::channel(self.replica_ids.len().max(1));
+        tokio::spawn(async move {
+            while let Some(response) = pending.next().await {
+                let _ = response_tx.send(response).await;
+            }
+        });
 
-        for (peer_id, result) in futures::future::join_all(futs).await {
+        while let Some((peer_id, result)) = response_rx.recv().await {
             if is_ack(&result) {
                 quorum.record_node_ack(peer_id);
-            } else if let Err(e) = &result {
-                tracing::warn!(error = %e, peer = %peer_id, "accord: quorum broadcast RPC failed");
+                if quorum.all_reached() {
+                    // A quorum makes this phase durable. The fanout task keeps
+                    // sending to remaining peers without holding the PostgreSQL
+                    // session on a slow or unavailable minority replica.
+                    return true;
+                }
             }
         }
         quorum.all_reached()
@@ -3446,6 +3534,7 @@ mod tests {
     /// (`Err`), per a configured map. Routes nothing — it only decides ack/fail.
     struct MockTransport {
         behavior: std::collections::HashMap<uuid::Uuid, bool>,
+        slow: std::collections::HashSet<uuid::Uuid>,
         ok: Message,
     }
 
@@ -3457,6 +3546,9 @@ mod tests {
             _msg: Message,
             _lane: ferrosa_net::codec::Lane,
         ) -> ferrosa_net::error::Result<Message> {
+            if self.slow.contains(&host_id) {
+                std::future::pending::<()>().await;
+            }
             if *self.behavior.get(&host_id).unwrap_or(&false) {
                 Ok(self.ok.clone())
             } else {
@@ -3615,21 +3707,18 @@ mod tests {
     /// Accept. It records every peer that received an `AccordAccept`.
     ///
     /// - PreAccept: `remote2` proposes a higher timestamp + a dependency, so the
-    ///   two remote votes disagree → the coordinator needs an Accept round.
-    /// - Accept: `remote1` votes; `remote2` times out. Slow quorum (RF=3) is 2,
-    ///   so the transaction can ONLY commit if the coordinator counts its OWN
-    ///   Accept vote locally. Under the pre-fix code the coordinator instead sent
-    ///   `AccordAccept` to itself (which fails "unknown peer" in production and
-    ///   is silently dropped here), so it saw one remote vote and failed.
+    ///   local vote plus that remote vote prove a fast quorum is impossible and
+    ///   the coordinator must move to Accept without waiting for `remote1`.
+    /// - Accept: `remote1` votes; `remote2` never replies. Slow quorum (RF=3) is
+    ///   2, so the local Accept vote plus `remote1` must complete the phase.
+    ///   Waiting for every remote response would make this transaction hang.
     /// - Commit/Apply: every remote acks, so only the Accept phase is stressed.
     struct SlowPathSelfVoteTransport {
         remote1: uuid::Uuid,
         remote2: uuid::Uuid,
         t0: Timestamp,
         conflict_t: Timestamp,
-        conflict_dep: TxnId,
         accept_targets: parking_lot::Mutex<Vec<uuid::Uuid>>,
-        accept_delay: std::time::Duration,
         accept_delay_hits: std::sync::atomic::AtomicUsize,
     }
 
@@ -3651,10 +3740,14 @@ mod tests {
             };
             match msg {
                 Message::AccordPreAccept(_) | Message::AccordPreAcceptV2(_) => {
+                    if host_id == self.remote1 {
+                        std::future::pending::<()>().await;
+                        unreachable!("the unanswered PreAccept replica must stay pending");
+                    }
                     let (t, deps) = if host_id == self.remote1 {
                         (self.t0, vec![])
                     } else if host_id == self.remote2 {
-                        (self.conflict_t, vec![self.conflict_dep])
+                        (self.conflict_t, Vec::new())
                     } else {
                         panic!("PreAccept to an unexpected host {host_id} (self must be local)");
                     };
@@ -3673,7 +3766,6 @@ mod tests {
                     if host_id == self.remote1 {
                         self.accept_delay_hits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tokio::time::sleep(self.accept_delay).await;
                         let ap: AcceptPayload = bincode::deserialize(&b).unwrap();
                         let ok = AcceptOkPayload {
                             txn_id: ap.txn_id,
@@ -3683,11 +3775,11 @@ mod tests {
                             bincode::serialize(&ok).unwrap(),
                         )))
                     } else if host_id == self.remote2 {
-                        // remote2 is slow during Accept — its vote never arrives,
-                        // so the coordinator's own local vote is what reaches quorum.
-                        Err(ferrosa_net::error::NetError::Timeout(
-                            "slow remote during Accept".into(),
-                        ))
+                        // This replica stays silent in both phases. Its PreAccept
+                        // must not block the proven NeedAccept decision; its Accept
+                        // must not block the local + remote slow quorum.
+                        std::future::pending::<()>().await;
+                        unreachable!("the unanswered Accept replica must stay pending");
                     } else {
                         // A self-send would land here under the pre-fix code — the
                         // recorded target is what the test's assertion catches.
@@ -3742,9 +3834,7 @@ mod tests {
             remote2,
             t0,
             conflict_t: make_ts(2000),
-            conflict_dep: make_txn_id(7, 500),
             accept_targets: parking_lot::Mutex::new(Vec::new()),
-            accept_delay: std::time::Duration::from_millis(7),
             accept_delay_hits: std::sync::atomic::AtomicUsize::new(0),
         });
         let clock = HybridLogicalClock::new(self_node, 0);
@@ -3760,7 +3850,15 @@ mod tests {
         .with_local_accord_state(local_state)
         .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()));
 
-        let result = driver.run_transaction().await;
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), driver.run_transaction()).await;
+        assert!(
+            completed.is_ok(),
+            "PreAccept and Accept must complete without their silent minority replies; \
+             Accept targets before timeout: {:?}",
+            transport.accept_targets.lock()
+        );
+        let result = completed.expect("completion was checked above");
         assert!(
             result.is_ok(),
             "slow-path transaction must commit via the coordinator's LOCAL Accept \
@@ -3782,7 +3880,7 @@ mod tests {
                 .accept_delay_hits
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "the deterministic remote Accept response delay must fire exactly once"
+            "the responsive remote Accept reply must be processed exactly once"
         );
     }
 
@@ -4060,6 +4158,7 @@ mod tests {
         .collect();
         let mock = Arc::new(MockTransport {
             behavior,
+            slow: std::collections::HashSet::new(),
             ok: Message::AccordApplyOK(Bytes::new()),
         });
         let driver = driver_with(mock, n.clone());
@@ -4091,6 +4190,7 @@ mod tests {
         .collect();
         let mock = Arc::new(MockTransport {
             behavior,
+            slow: std::collections::HashSet::new(),
             ok: Message::AccordApplyOK(Bytes::new()),
         });
         let driver = driver_with(mock, n.clone());
@@ -4101,5 +4201,31 @@ mod tests {
             })
             .await;
         assert!(reached, "both shards at 2/3 → quorum in each");
+    }
+
+    #[tokio::test]
+    async fn quorum_broadcast_returns_without_waiting_for_slow_minority_peers() {
+        let n = six_nodes();
+        let behavior = [(n[0], true), (n[1], true), (n[3], true), (n[4], true)]
+            .into_iter()
+            .collect();
+        let slow = [n[2], n[5]].into_iter().collect();
+        let mock = Arc::new(MockTransport {
+            behavior,
+            slow,
+            ok: Message::AccordApplyOK(Bytes::new()),
+        });
+        let driver = driver_with(mock, n.clone());
+
+        let reached = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            driver.quorum_broadcast(Message::AccordCommit(Bytes::new()), &two_shards(&n), |r| {
+                r.is_ok()
+            }),
+        )
+        .await
+        .expect("quorum must not wait for unanswered minority replicas");
+
+        assert!(reached, "both shards have enough responsive replicas");
     }
 }
