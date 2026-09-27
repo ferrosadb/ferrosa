@@ -126,7 +126,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     )));
     let predicate_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
     let write_skew_barrier = Arc::new(tokio::sync::Barrier::new(ACTORS));
-    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(false);
+    let (actor_failure_tx, actor_failure_rx) = tokio::sync::watch::channel(None::<String>);
     let mut actors = Vec::with_capacity(ACTORS);
     for (actor, actor_client) in actor_clients.iter().enumerate() {
         let client = Arc::clone(actor_client);
@@ -185,8 +185,16 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
             }
             .await;
 
-            if result.is_err() {
-                actor_failure_tx.send_replace(true);
+            if let Err(error) = &result {
+                let failure = format!("PostgreSQL workload actor {actor} failed: {error:#}");
+                actor_failure_tx.send_if_modified(|first_failure| {
+                    if first_failure.is_none() {
+                        *first_failure = Some(failure);
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             result
         }));
@@ -763,18 +771,21 @@ where
 
 async fn wait_for_phase(
     barrier: &tokio::sync::Barrier,
-    actor_failure_rx: &mut tokio::sync::watch::Receiver<bool>,
+    actor_failure_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<()> {
     loop {
-        if *actor_failure_rx.borrow() {
-            bail!("another PostgreSQL workload actor failed before the phase barrier");
+        if let Some(error) = actor_failure_rx.borrow().as_ref() {
+            bail!("{error}");
         }
 
         tokio::select! {
             _ = barrier.wait() => return Ok(()),
             changed = actor_failure_rx.changed() => {
-                if changed.is_err() || *actor_failure_rx.borrow() {
-                    bail!("another PostgreSQL workload actor failed at the phase barrier");
+                if changed.is_err() {
+                    bail!("PostgreSQL workload actor failure signal closed at the phase barrier");
+                }
+                if let Some(error) = actor_failure_rx.borrow().as_ref() {
+                    bail!("{error}");
                 }
             }
         }
@@ -1052,17 +1063,22 @@ mod tests {
     #[tokio::test]
     async fn actor_failure_releases_peers_waiting_at_a_workload_phase() {
         let barrier = tokio::sync::Barrier::new(2);
-        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(false);
+        let (failure_tx, mut failure_rx) = tokio::sync::watch::channel(None::<String>);
         let waiting_actor =
             tokio::spawn(async move { wait_for_phase(&barrier, &mut failure_rx).await });
 
-        failure_tx.send_replace(true);
+        failure_tx.send_replace(Some(
+            "PostgreSQL workload actor 2 failed: execute PostgreSQL register transaction: connection reset"
+                .to_owned(),
+        ));
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting_actor)
             .await
             .expect("failed actor should release its peers from the barrier")
             .expect("waiting actor task should not panic");
 
-        assert!(result.is_err());
+        let error = result.expect_err("peer should receive the actor failure");
+        assert!(error.to_string().contains("actor 2"));
+        assert!(error.to_string().contains("connection reset"));
     }
 
     #[test]
