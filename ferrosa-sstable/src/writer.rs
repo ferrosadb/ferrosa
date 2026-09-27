@@ -5011,12 +5011,9 @@ mod tests {
             ..verify_b_options()
         };
         let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
-        let mut writer = SSTableWriter::new_file_backed(
-            options,
-            header.clone(),
-            staging.join("Data.db"),
-        )
-        .unwrap();
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header.clone(), staging.join("Data.db"))
+                .unwrap();
         writer.add_partition(&partition).unwrap();
         let output = writer.finish_to_directory(&staging).unwrap();
 
@@ -5027,7 +5024,10 @@ mod tests {
             .set_len(1)
             .unwrap();
         let result = SSTableWriter::verify_output_files(&output, &header, 1);
-        assert!(result.is_err(), "truncated partition framing must fail verification");
+        assert!(
+            result.is_err(),
+            "truncated partition framing must fail verification"
+        );
     }
 
     #[test]
@@ -5040,18 +5040,18 @@ mod tests {
             ..verify_b_options()
         };
         let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
-        let mut writer = SSTableWriter::new_file_backed(
-            options,
-            header.clone(),
-            staging.join("Data.db"),
-        )
-        .unwrap();
+        let mut writer =
+            SSTableWriter::new_file_backed(options, header.clone(), staging.join("Data.db"))
+                .unwrap();
         writer.add_partition(&partition).unwrap();
         let output = writer.finish_to_directory(&staging).unwrap();
 
         std::fs::write(&output.partitions, []).unwrap();
         let result = SSTableWriter::verify_output_files(&output, &header, 1);
-        assert!(result.is_err(), "malformed partition index must fail verification");
+        assert!(
+            result.is_err(),
+            "malformed partition index must fail verification"
+        );
     }
 
     #[test]

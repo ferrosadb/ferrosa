@@ -3659,7 +3659,9 @@ mod tests {
         refresh_staged_digest(&mut output);
 
         let error = match target.flush_files(output) {
-            Ok(_) => panic!("the readback framing check must reject a missing partition terminator"),
+            Ok(_) => {
+                panic!("the readback framing check must reject a missing partition terminator")
+            }
             Err(error) => error.to_string(),
         };
         assert!(
