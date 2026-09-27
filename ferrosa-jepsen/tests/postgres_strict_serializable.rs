@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
+use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +28,7 @@ const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 4;
 const INITIAL_BALANCE: i64 = 10_000;
 const CLIENT_NODE_COUNT_ENV: &str = "FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT";
+const CQL_URLS_ENV: &str = "FERROSA_TEST_CQL_URLS";
 const FAULT_READY_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_READY_FILE";
 const FAULT_ACTIVE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE";
 const FAULT_COMPLETE_FILE_ENV: &str = "FERROSA_TEST_POSTGRES_FAULT_COMPLETE_FILE";
@@ -53,17 +55,36 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         urls.len(),
         std::env::var(CLIENT_NODE_COUNT_ENV).ok().as_deref(),
     )?;
+    let cql_urls = std::env::var(CQL_URLS_ENV)
+        .context("set FERROSA_TEST_CQL_URLS to semicolon-separated CQL node addresses")?;
+    let cql_urls: Vec<_> = cql_urls
+        .split(';')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if cql_urls.is_empty() {
+        bail!("FERROSA_TEST_CQL_URLS must contain at least one CQL node address");
+    }
     let fault_schedule = FaultSchedule::from_env()?;
 
     let (clients, connections) = connect_all(&urls).await?;
     let table = format!("pg_ssi_{}", Uuid::new_v4().simple());
-    clients[0]
-        .execute(
-            &format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, balance BIGINT NOT NULL)"),
+    // PostgreSQL DDL is not part of this gateway's supported SQL surface. Create
+    // the backing CQL table through CQL, then exercise only SQL DML/transactions
+    // through the native PostgreSQL driver below.
+    let cql_session = SessionBuilder::new()
+        .known_nodes(&cql_urls)
+        .build()
+        .await
+        .context("connect to CQL cluster for strict-serializability table setup")?;
+    cql_session
+        .query_unpaged(
+            format!("CREATE TABLE postgres.{table} (id text PRIMARY KEY, balance bigint)"),
             &[],
         )
         .await
-        .context("create strict-serializability workload table")?;
+        .context("create strict-serializability workload table through CQL")?;
     clients[0]
         .execute(
             &format!(
@@ -167,10 +188,10 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .map_err(anyhow::Error::from)
         .context("PostgreSQL transaction history violated strict serializability")?;
 
-    clients[0]
-        .batch_execute(&format!("DROP TABLE {table}"))
+    cql_session
+        .query_unpaged(format!("DROP TABLE postgres.{table}"), &[])
         .await
-        .context("drop strict-serializability workload table")?;
+        .context("drop strict-serializability workload table through CQL")?;
     drop(clients);
     for connection in connections {
         connection

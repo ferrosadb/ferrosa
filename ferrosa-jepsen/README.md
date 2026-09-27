@@ -125,6 +125,9 @@ created any schema.
 PostgreSQL strict-serializability workload (external cluster):
 
 ```bash
+# CQL nodes create the backing table used by the PostgreSQL transaction test.
+export FERROSA_TEST_CQL_URLS='127.0.0.1:49042;127.0.0.1:49043;127.0.0.1:49044'
+
 # Start the bundled cluster once (all three nodes use the one built image):
 docker compose -f tests/docker/jepsen-cluster.yml build node1
 docker compose -f tests/docker/jepsen-cluster.yml up -d --no-build
@@ -139,8 +142,10 @@ FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@1
   --test postgres_strict_serializable -- --nocapture
 ```
 
-This native-driver workload creates a unique two-row table, runs concurrent
-explicit `SERIALIZABLE` transfers through all supplied node URLs, records
+The test creates a unique two-row backing table through CQL because PostgreSQL
+DDL is not part of the gateway's supported SQL surface. It then uses the native
+PostgreSQL driver for concurrent explicit `SERIALIZABLE` transfers through the
+supplied node URLs and records
 invocation/completion order and each committed transaction's reads/writes, then
 checks the full history and final balances on every node with the bounded
 strict-serializability checker. At least three reachable PostgreSQL URLs using
