@@ -1577,9 +1577,9 @@ impl SSTableWriter {
     }
 
     /// Gate B: reopen the finished SSTable via `SSTableReader` and confirm
-    /// the partition count matches what was written. Runs in-memory
-    /// (`Vec<u8>` implements `ReadAt`), but streams partition objects instead
-    /// of materializing the full SSTable into a `Vec<Partition>`.
+    /// the partition count matches what was written. Walk partition framing
+    /// while skipping cell payloads; decoding every value adds no coverage for
+    /// this count/truncation check.
     ///
     /// Caught in production: `data_file_len=2,937,236` bytes vs. partition
     /// index claiming 209 MB — the flush serialized a partial memtable
@@ -1613,10 +1613,10 @@ impl SSTableWriter {
         })?;
         let mut read_count = 0u64;
         while iter
-            .next_partition()
+            .next_partition_count()
             .map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
-                    "ferrosa-sstable/writer: verify_output_readable: partition read failed: {e}"
+                    "ferrosa-sstable/writer: verify_output_readable: partition count read failed: {e}"
                 ))
             })?
             .is_some()
@@ -1633,6 +1633,9 @@ impl SSTableWriter {
         Ok(())
     }
 
+    /// Reopen file components and walk partition framing to verify the count.
+    /// Cell payloads are skipped by the reader's count path; metadata and
+    /// framing errors still propagate before the output is returned.
     fn verify_output_files(
         output: &SSTableOutputFiles,
         _header: &SerializationHeader,
@@ -1661,10 +1664,10 @@ impl SSTableWriter {
         })?;
         let mut read_count = 0u64;
         while iter
-            .next_partition()
+            .next_partition_count()
             .map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
-                    "ferrosa-sstable/writer: verify_output_files: partition read failed: {e}"
+                    "ferrosa-sstable/writer: verify_output_files: partition count read failed: {e}"
                 ))
             })?
             .is_some()
@@ -4996,6 +4999,59 @@ mod tests {
             msg.contains("partition") && (msg.contains("1") || msg.contains("5")),
             "error message must identify partition-count mismatch — got: {msg}"
         );
+    }
+
+    #[test]
+    fn verify_output_files_rejects_truncated_partition_framing() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let header = test_header();
+        let options = WriteOptions {
+            verify_output: false,
+            ..verify_b_options()
+        };
+        let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
+        let mut writer = SSTableWriter::new_file_backed(
+            options,
+            header.clone(),
+            staging.join("Data.db"),
+        )
+        .unwrap();
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish_to_directory(&staging).unwrap();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&output.data)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        let result = SSTableWriter::verify_output_files(&output, &header, 1);
+        assert!(result.is_err(), "truncated partition framing must fail verification");
+    }
+
+    #[test]
+    fn verify_output_files_rejects_malformed_partition_index_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let header = test_header();
+        let options = WriteOptions {
+            verify_output: false,
+            ..verify_b_options()
+        };
+        let partition = make_partition(b"pk1", &[0x00, 0x00, 0x00, 0x01], b"v", 1_000_001);
+        let mut writer = SSTableWriter::new_file_backed(
+            options,
+            header.clone(),
+            staging.join("Data.db"),
+        )
+        .unwrap();
+        writer.add_partition(&partition).unwrap();
+        let output = writer.finish_to_directory(&staging).unwrap();
+
+        std::fs::write(&output.partitions, []).unwrap();
+        let result = SSTableWriter::verify_output_files(&output, &header, 1);
+        assert!(result.is_err(), "malformed partition index must fail verification");
     }
 
     #[test]
