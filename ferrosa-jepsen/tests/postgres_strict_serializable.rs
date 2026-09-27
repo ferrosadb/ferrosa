@@ -103,6 +103,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     }
     wait_for_table_on_all_nodes(&clients, &table).await?;
 
+    // Each Jepsen actor needs a distinct PostgreSQL session. Sharing one
+    // Client per node lets concurrent actors interleave BEGIN/COMMIT on the
+    // same server-side transaction state.
+    let actor_urls = actor_client_urls(&urls, actor_client_count);
+    let (actor_clients, actor_connections) = connect_all(&actor_urls).await?;
+
     if let Some(schedule) = &fault_schedule {
         schedule.announce_ready().await?;
         schedule.wait_until_injected().await?;
@@ -113,8 +119,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         ACTORS * TRANSACTIONS_PER_ACTOR,
     )));
     let mut actors = Vec::with_capacity(ACTORS);
-    for actor in 0..ACTORS {
-        let client = Arc::clone(&clients[actor % actor_client_count]);
+    for (actor, actor_client) in actor_clients.iter().enumerate() {
+        let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let history = Arc::clone(&history);
         let table = table.clone();
@@ -200,7 +206,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .await
         .context("drop strict-serializability workload table through CQL")?;
     drop(clients);
-    for connection in connections {
+    drop(actor_clients);
+    for connection in connections.into_iter().chain(actor_connections) {
         connection
             .await
             .context("join PostgreSQL connection task")?
@@ -412,6 +419,12 @@ fn actor_client_count(url_count: usize, configured: Option<&str>) -> Result<usiz
     Ok(count)
 }
 
+/// Assign one session endpoint per actor, spreading sessions across the
+/// selected nodes without sharing a PostgreSQL transaction state machine.
+fn actor_client_urls<'a>(urls: &'a [&'a str], node_count: usize) -> Vec<&'a str> {
+    (0..ACTORS).map(|actor| urls[actor % node_count]).collect()
+}
+
 /// Coordinates a real node failure with an external process controller. The
 /// test reports that schema setup is complete, waits until the controller has
 /// paused a replica, runs the workload, then signals that the replica can be
@@ -480,7 +493,7 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_client_count, initial_balance_statements, FaultSchedule};
+    use super::{actor_client_count, actor_client_urls, initial_balance_statements, FaultSchedule};
 
     #[test]
     fn balance_fixture_uses_single_row_inserts_supported_by_the_postgres_gateway() {
@@ -500,6 +513,16 @@ mod tests {
     #[test]
     fn fault_workload_can_leave_one_of_three_nodes_unused_by_clients() {
         assert_eq!(actor_client_count(3, Some("2")).unwrap(), 2);
+    }
+
+    #[test]
+    fn fault_workload_gives_each_actor_a_separate_session_on_active_nodes() {
+        let nodes = ["node1", "node2", "paused-node"];
+
+        assert_eq!(
+            actor_client_urls(&nodes, 2),
+            ["node1", "node2", "node1", "node2", "node1"]
+        );
     }
 
     #[test]
