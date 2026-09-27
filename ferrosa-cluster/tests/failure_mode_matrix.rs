@@ -183,7 +183,7 @@ async fn s_01_late_join_via_membership_changer_lands_in_openraft_voter_set() {
     // node.  Pre-Sprint-1 the raw client_write path could leave the
     // openraft side out of sync; the changer closes that gap.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let new_host = Uuid::new_v4();
     let new_addr: std::net::SocketAddr = "127.0.0.1:9201".parse().unwrap();
@@ -220,7 +220,7 @@ async fn s_02_concurrent_late_joins_serialize_via_inprogress_retry() {
     // succeed; the second hits `InProgress` and the changer's
     // backoff retries.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let h1 = Uuid::new_v4();
     let h2 = Uuid::new_v4();
@@ -313,7 +313,7 @@ async fn s_05_approve_node_replicates_through_raft() {
     // here we re-run the smoke shape so the matrix has direct
     // attribution.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let pending = Uuid::new_v4();
     let changer = MembershipChanger::new(
         cluster.leader_node().raft.clone(),
@@ -349,7 +349,7 @@ async fn s_05_approve_node_replicates_through_raft() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s_06_decommission_follower_removes_from_openraft_voter_set() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9401".parse().unwrap();
     let n = uuid_to_node_id(h);
@@ -360,14 +360,14 @@ async fn s_06_decommission_follower_removes_from_openraft_voter_set() {
         cluster.membership_network(),
     );
     changer.add_voter(h, a).await.unwrap();
-    // We must remove a non-leader node — pick the just-added one, which
-    // is unlikely to be leader.
-    let leader_id = cluster.leader_node().node_id;
-    if leader_id == n {
-        // Skip — covered by S-07.
-        cluster.shutdown().await;
-        return;
-    }
+    // We must remove a non-leader node — the just-added one. Leadership is pinned,
+    // so it cannot have moved there (that case is S-07). This used to be a silent
+    // early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
     changer.remove_voter(h).await.unwrap();
     let pred = || {
         for node in &cluster.nodes() {
@@ -420,7 +420,9 @@ async fn s_07_decommission_leader_auto_transfers_first() {
 async fn s_08_decommission_concurrent_with_add_serializes() {
     // S-08: concurrent add+remove serialize through `InProgress` retry.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    // Pinned: no election can move leadership between finding the leader and
+    // calling it, or onto the node this test adds.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
     let h_add = Uuid::new_v4();
     let n_add = uuid_to_node_id(h_add);
     let a: std::net::SocketAddr = "127.0.0.1:9501".parse().unwrap();
@@ -436,11 +438,13 @@ async fn s_08_decommission_concurrent_with_add_serializes() {
         .add_voter(h_rem, a_rem)
         .await
         .unwrap();
-    if cluster.leader_node().node_id == n_rem {
-        // Concurrent remove would hit S-07 — skip.
-        cluster.shutdown().await;
-        return;
-    }
+    // Leadership is pinned, so it cannot have moved to the node just added (which
+    // would put this test in S-07 territory). This used to be a silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n_rem,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     let c1 = MembershipChanger::new(leader_raft.clone(), cluster.membership_network());
     let c2 = MembershipChanger::new(leader_raft, cluster.membership_network());
@@ -455,7 +459,8 @@ async fn s_09_decommission_partitioned_node_succeeds_for_quorum() {
     // S-09: removing a partitioned node still succeeds because the
     // remaining {N1, N2} have quorum.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    // Pinned: leadership cannot move between finding the leader and calling it.
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Add a 4th node we'll partition+remove (avoids touching the
     // bootstrap voters' identities).
@@ -469,11 +474,13 @@ async fn s_09_decommission_partitioned_node_succeeds_for_quorum() {
         .await
         .unwrap();
 
-    if cluster.leader_node().node_id == n {
-        // Skip S-07 territory.
-        cluster.shutdown().await;
-        return;
-    }
+    // Pinned leadership cannot have moved to the node just added (S-07 territory).
+    // This used to be a silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     // Partition the 4th node — use isolate_by_node_id because partition()
     // indexes into bootstrap voters only.
@@ -494,7 +501,7 @@ async fn s_10_readd_previously_decommissioned_node() {
     // pre-flight checks treat the existing-but-removed entry as a
     // fresh add.
     let cluster = TestCluster::with_voters(3).await;
-    cluster.require_leader(Duration::from_secs(5)).await;
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let h = Uuid::new_v4();
     let a: std::net::SocketAddr = "127.0.0.1:9701".parse().unwrap();
@@ -509,10 +516,13 @@ async fn s_10_readd_previously_decommissioned_node() {
         )
         .await
     );
-    if cluster.leader_node().node_id == n {
-        cluster.shutdown().await;
-        return;
-    }
+    // Pinned leadership cannot have moved to the node just added. This used to be a
+    // silent early return.
+    assert_ne!(
+        cluster.leader_node().node_id,
+        n,
+        "pinned leadership must not move to the newly added voter"
+    );
 
     remove_voter_on_current_leader(&cluster, h).await.unwrap();
     assert!(

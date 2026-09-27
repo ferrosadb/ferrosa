@@ -35,10 +35,9 @@ use ferrosa_cluster::raft::{uuid_to_node_id, NodeState};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_learner_only_does_not_make_voter() {
     let cluster = TestCluster::with_voters(3).await;
-    let _leader = cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .expect("3-voter cluster should elect a leader");
+    // Pinned: all voters agree on one leader and no election can start behind the
+    // test's back (see `TestCluster::pin_leadership`).
+    let _leader = cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let new_host_id = Uuid::new_v4();
     let new_addr: std::net::SocketAddr = "127.0.0.1:9991".parse().unwrap();
@@ -116,10 +115,7 @@ async fn add_learner_only_does_not_make_voter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promote_learner_to_voter_preserves_log_position() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     let host = Uuid::new_v4();
     let addr: std::net::SocketAddr = "127.0.0.1:9992".parse().unwrap();
@@ -208,10 +204,7 @@ async fn promote_learner_to_voter_preserves_log_position() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn demote_voter_to_learner_preserves_application_state() {
     let cluster = TestCluster::with_voters(3).await;
-    cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .unwrap();
+    cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Add a 4th node as a voter, then demote it back to a learner.
     let host = Uuid::new_v4();
@@ -302,10 +295,7 @@ async fn demote_voter_to_learner_preserves_application_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn demote_voter_to_learner_transfers_leader_first_if_needed() {
     let cluster = TestCluster::with_voters(3).await;
-    let _initial_leader = cluster
-        .wait_for_leader(Duration::from_secs(5))
-        .await
-        .expect("leader");
+    let _initial_leader = cluster.pin_leadership(Duration::from_secs(10)).await;
 
     // Add a fresh voter, transfer leadership to it, then demote it on
     // its own raft instance. We need to pin the host so its node_id is
@@ -362,6 +352,11 @@ async fn demote_voter_to_learner_transfers_leader_first_if_needed() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    // Setup is done, and it ran with leadership pinned so no election could start
+    // behind the test's back. The rest of this test IS about elections (a leadership
+    // transfer is one), so let them run again.
+    cluster.unpin_leadership();
 
     // Transfer leadership to the new voter. The post-dispatch deadline
     // (election_timeout_max × 2) is probabilistic: the target may win its

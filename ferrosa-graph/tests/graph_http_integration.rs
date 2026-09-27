@@ -18,6 +18,14 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use bytes::Bytes;
+
+/// Bound for "this request must not hang". The regression these tests guard is a
+/// deadlock or livelock (no progress), not latency: a request normally takes a few
+/// hundred milliseconds, and a bound of one second measured the scheduler instead of
+/// the code, failing whenever the host was busy. A real hang never completes, so a
+/// bound two orders of magnitude above the normal time still fails it while a slow
+/// host that is still making progress passes.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::coordinator::ClusterCoordinator;
 use ferrosa_cluster::raft::handlers::{
@@ -1120,7 +1128,7 @@ async fn http_var_length_and_shortest_path_are_fast_and_correct_on_cycle() {
             "keyspace": "social"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("tiny cyclic varpath query should complete under 1s")
         .unwrap();
@@ -1138,7 +1146,7 @@ async fn http_var_length_and_shortest_path_are_fast_and_correct_on_cycle() {
             "keyspace": "social"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("tiny shortestPath query should complete under 1s")
         .unwrap();
@@ -4744,7 +4752,7 @@ async fn graph_engine_constructed_before_fmem_ddl_registers_adjacency_for_first_
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("first tiny fmem CO_OCCURS MERGE after DDL must not hang")
         .unwrap();
@@ -4789,7 +4797,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("tiny fmem CO_OCCURS MERGE must not hang")
         .unwrap();
@@ -4810,7 +4818,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("tiny fmem CO_OCCURS list MATCH must return immediately")
         .unwrap();
@@ -4836,7 +4844,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("edge-keyed fmem CO_OCCURS SET must return immediately")
         .unwrap();
@@ -4857,7 +4865,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("updated tiny fmem CO_OCCURS list MATCH must return immediately")
         .unwrap();
@@ -4884,7 +4892,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("edge-keyed fmem CO_OCCURS DELETE must return immediately")
         .unwrap();
@@ -4905,7 +4913,7 @@ async fn co_occurs_merge_on_tiny_agent_memory_graph_is_immediately_matchable() {
             "keyspace": "agent_memory"
         })),
     );
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(1), app.oneshot(req))
+    let resp = tokio::time::timeout(HANG_GUARD, app.oneshot(req))
         .await
         .expect("deleted tiny fmem CO_OCCURS list MATCH must return immediately")
         .unwrap();

@@ -425,7 +425,8 @@ async fn run_cluster_load_test_async(
     }
     drop(dashboard);
 
-    let resource_summary = resource_mon.summary();
+    // Always present: see orchestrator.rs.
+    let resource_summary = Some(resource_mon.summary());
     let bw_final = bytes_written.load(Ordering::Relaxed);
 
     // Final server metrics.

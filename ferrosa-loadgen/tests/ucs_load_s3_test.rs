@@ -8,9 +8,11 @@
 //!   - RustFS S3: 29000
 //!   - Node CQL:  29042, 29043, 29044
 //!
-//! Run with --nocapture to see the full stats report:
+//! Opt-in behind the `live-infra-tests` feature. Run with --nocapture to see the
+//! full stats report:
 //!   FERROSA_TEST_CONTAINERS=1 \
-//!   cargo test -p ferrosa-loadgen --test ucs_load_s3_test -- --nocapture
+//!   cargo test -p ferrosa-loadgen --features live-infra-tests --test ucs_load_s3_test -- --nocapture
+#![cfg(feature = "live-infra-tests")]
 
 use std::path::Path;
 use std::time::Duration;

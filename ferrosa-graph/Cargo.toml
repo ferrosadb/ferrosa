@@ -40,4 +40,7 @@ ferrosa-net = { path = "../ferrosa-net" }
 proptest = "1"
 serde_json = "1"
 tempfile = "3"
+# Paused virtual time (`start_paused`) makes timer tests deterministic: time moves
+# only when the test advances it, so CPU starvation cannot reorder two timers.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

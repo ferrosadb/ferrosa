@@ -25,7 +25,10 @@ pub mod jepsen_nemesis;
 pub mod leaseholder;
 pub mod linearizable_read;
 pub mod metrics;
+// Wall-clock benchmarks: opt-in via `perf-tests` (see the feature's note in Cargo.toml).
+#[cfg(feature = "perf-tests")]
 pub mod perf;
+#[cfg(feature = "perf-tests")]
 pub mod perf_regression;
 pub mod proptests;
 pub mod recovery;

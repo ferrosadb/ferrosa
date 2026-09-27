@@ -393,6 +393,9 @@ pub struct CompactionExecutor {
     task_txs: Vec<std::sync::mpsc::SyncSender<QueuedCompactionTask>>,
     next_worker: AtomicUsize,
     result_rx: Mutex<std::sync::mpsc::Receiver<CompactionResult>>,
+    /// At most one result received by [`Self::await_result_available`] and not yet
+    /// handed to a poll. Lock order: this slot, then `result_rx`.
+    held_result: Mutex<Option<CompactionResult>>,
     handles: Mutex<Vec<thread::JoinHandle<()>>>,
     stop_flag: Arc<AtomicBool>,
     in_flight_inputs: Arc<Mutex<HashSet<String>>>,
@@ -561,6 +564,7 @@ impl CompactionExecutor {
             task_txs,
             next_worker: AtomicUsize::new(0),
             result_rx: Mutex::new(result_rx),
+            held_result: Mutex::new(None),
             handles: Mutex::new(handles),
             stop_flag,
             in_flight_inputs,
@@ -630,8 +634,12 @@ impl CompactionExecutor {
     /// neither materialize every completion nor starve later maintenance
     /// stages. `poll_results()` remains for fixed-size unit-test fixtures.
     pub fn poll_results_bounded(&self, max_results: usize) -> Vec<CompactionResult> {
+        let mut held = self.held_result.lock();
         let rx = self.result_rx.lock();
         let mut results = Vec::with_capacity(max_results.min(8));
+        if max_results > 0 {
+            results.extend(held.take());
+        }
         while results.len() < max_results {
             let Ok(result) = rx.try_recv() else {
                 break;
@@ -639,6 +647,31 @@ impl CompactionExecutor {
             results.push(result);
         }
         results
+    }
+
+    /// Block until a completed compaction result is available to
+    /// [`Self::poll_results`], or `hang_guard` elapses. Returns whether one is.
+    ///
+    /// The result is NOT consumed: it is held and handed out by the next poll, so the
+    /// caller then runs its usual integration path. This is the completion signal for
+    /// callers (tests, mostly) that used to poll `poll_results` on a wall clock and
+    /// raced the worker thread; `hang_guard` only turns a worker that never finishes
+    /// into a failure instead of a hang.
+    pub fn await_result_available(&self, hang_guard: std::time::Duration) -> bool {
+        let mut held = self.held_result.lock();
+        if held.is_some() {
+            return true;
+        }
+        let rx = self.result_rx.lock();
+        match rx.recv_timeout(hang_guard) {
+            Ok(result) => {
+                *held = Some(result);
+                true
+            }
+            // Timeout: the worker never finished (or nothing was submitted).
+            // Disconnected: the executor is shut down. Neither is a result.
+            Err(_) => false,
+        }
     }
 
     /// Releases a successful task's inputs after its result has been finalized.
@@ -1658,6 +1691,62 @@ mod tests {
         let results = executor.poll_results();
         assert_eq!(results.len(), 0);
 
+        executor.shutdown();
+    }
+
+    fn real_compaction_task(tmp: &std::path::Path) -> CompactionTask {
+        let schema = test_schema_with_columns();
+        let mut inputs = Vec::new();
+        for (name, range, ts) in [("a", 0..20, 1000), ("b", 10..30, 2000)] {
+            let dir = tmp.join(format!("in_{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let partitions: Vec<_> = range
+                .map(|i| make_test_partition(&format!("key_{i:04}"), "v", ts))
+                .collect();
+            inputs.push(write_sstable_to_dir(&dir, &partitions, &schema));
+        }
+        let output_dir = tmp.join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        CompactionTask {
+            inputs,
+            output_dir,
+            schema,
+            table_id: test_table_id(),
+            purge: None,
+        }
+    }
+
+    /// Waiting is a completion signal, not a wall-clock poll, and it must not consume
+    /// the result: the caller's next poll still gets it.
+    #[test]
+    fn await_result_available_blocks_until_done_without_consuming_the_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor = CompactionExecutor::new();
+        executor.submit(real_compaction_task(tmp.path())).unwrap();
+
+        assert!(
+            executor.await_result_available(std::time::Duration::from_secs(60)),
+            "a real compaction produces a result"
+        );
+        // Asking again must not lose or duplicate it.
+        assert!(executor.await_result_available(std::time::Duration::from_secs(60)));
+        let results = executor.poll_results();
+        assert_eq!(
+            results.len(),
+            1,
+            "the awaited result is still delivered, once"
+        );
+        assert!(
+            !executor.await_result_available(std::time::Duration::from_millis(20)),
+            "nothing is pending once it was delivered"
+        );
+        executor.shutdown();
+    }
+
+    #[test]
+    fn await_result_available_reports_false_when_nothing_is_running() {
+        let executor = CompactionExecutor::new();
+        assert!(!executor.await_result_available(std::time::Duration::from_millis(20)));
         executor.shutdown();
     }
 

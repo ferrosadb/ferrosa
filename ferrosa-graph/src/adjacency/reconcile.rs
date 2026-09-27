@@ -514,20 +514,32 @@ mod tests {
         assert!(!should_yield_during_reconciliation(32, 0));
     }
 
-    #[tokio::test]
+    /// Virtual time: with the clock paused, time advances only when the runtime is
+    /// idle and a timer is pending, so the two timers below fire strictly in deadline
+    /// order however starved the CPU is. The earlier version raced a real 10 ms
+    /// timeout against a real 50 ms interval, so a stall between two statements
+    /// could let the interval elapse first.
+    #[tokio::test(start_paused = true)]
     async fn reconciliation_timer_skips_immediate_first_tick() {
-        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        let interval = Duration::from_millis(50);
+        let mut ticker = tokio::time::interval(interval);
 
         // This would otherwise complete immediately. After the helper, the next
         // tick should wait for the configured interval instead of launching a
         // full reconciliation pass at process startup.
         skip_immediate_reconciliation_tick(&mut ticker).await;
 
-        let next_tick = tokio::time::timeout(Duration::from_millis(10), ticker.tick()).await;
+        let started = tokio::time::Instant::now();
+        let early = tokio::time::timeout(Duration::from_millis(10), ticker.tick()).await;
         assert!(
-            next_tick.is_err(),
+            early.is_err(),
             "reconciliation should not run again until the configured interval elapses"
         );
+
+        // And it does run once the interval has elapsed: the tick lands exactly one
+        // interval after the skipped one, not sooner and not later.
+        ticker.tick().await;
+        assert_eq!(started.elapsed(), interval);
     }
 
     fn test_storage_engine(dir: &std::path::Path) -> Arc<StorageEngine> {

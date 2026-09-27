@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Tests that need infrastructure outside the workspace (a spawned `cargo run` of the
+# binary, or a RustFS container). Off by default so `cargo test` reports only what it
+# can actually run; opt in with `--features live-infra-tests` plus the env vars named
+# in each test file (FERROSA_TEST_LOADGEN=1, FERROSA_TEST_CONTAINERS=1). Once enabled,
+# a test whose prerequisite is missing panics with setup instructions.
+live-infra-tests = []
+
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
 ferrosa-schema = { path = "../ferrosa-schema" }

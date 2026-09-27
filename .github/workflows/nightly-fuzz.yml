@@ -372,4 +372,5 @@ jobs:
         # --all-features: the same build these bounds were set against when
         # they ran in ci.yml's --all-features `test` job.
         run: |
-          cargo test -p ferrosa-cluster --all-features --lib accord::perf_regression -- --nocapture
+          # `accord::perf` matches both accord::perf and accord::perf_regression.
+          cargo test -p ferrosa-cluster --all-features --lib accord::perf -- --nocapture

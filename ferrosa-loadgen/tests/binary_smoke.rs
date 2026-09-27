@@ -5,6 +5,11 @@
 //! 2. Output includes all expected report sections
 //! 3. Resource leak detection runs and reports
 //! 4. Exit code is 0 for passing tests
+//!
+//! Opt-in (they spawn `cargo run`, which compiles the binary): enable the feature and
+//! the env var together, e.g.
+//! `FERROSA_TEST_LOADGEN=1 cargo test -p ferrosa-loadgen --features live-infra-tests --test binary_smoke`.
+#![cfg(feature = "live-infra-tests")]
 
 use std::process::Command;
 
