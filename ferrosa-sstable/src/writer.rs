@@ -62,34 +62,121 @@ use crate::varint;
 
 const ROW_INDEX_MIN_ROWS: usize = 32;
 const DEFAULT_COMPRESSION_BATCH_CHUNKS: usize = 16;
+const MIN_COMPRESSION_BATCH_CHUNKS: usize = 1;
+const MAX_COMPRESSION_BATCH_CHUNKS: usize = 64;
+const MIN_COMPRESSION_THREADS: usize = 1;
+const MAX_COMPRESSION_THREADS: usize = 4;
+const MIN_COMPRESSION_CHUNK_BYTES: usize = 1024;
+const MAX_COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_ROW_INDEX_MIN_ROWS: usize = ROW_INDEX_MIN_ROWS;
+const MAX_ROW_INDEX_MIN_ROWS: usize = 4096;
 
-fn compression_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+fn parse_bounded_usize(
+    value: &str,
+    min: usize,
+    max: usize,
+) -> std::result::Result<usize, &'static str> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "not an unsigned integer")?;
+    if !(min..=max).contains(&parsed) {
+        return Err("outside the supported range");
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+fn value_or_default(value: Option<&str>, default: usize, min: usize, max: usize) -> usize {
+    value
+        .and_then(|value| parse_bounded_usize(value, min, max).ok())
+        .unwrap_or(default)
+}
+
+fn configured_usize(name: &'static str, default: usize, min: usize, max: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => match parse_bounded_usize(&value, min, max) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                tracing::error!(
+                    name,
+                    value,
+                    reason,
+                    default,
+                    "invalid SSTable tuning value; using default"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::error!(name, %error, default, "could not read SSTable tuning value; using default");
+            default
+        }
+    }
+}
+
+fn compression_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let thread_count = std::env::var("FERROSA_SSTABLE_COMPRESSION_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|threads| *threads > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(2)
-                    .clamp(1, 4)
-            });
-        rayon::ThreadPoolBuilder::new()
+        let default_threads = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(MIN_COMPRESSION_THREADS, MAX_COMPRESSION_THREADS);
+        let thread_count = configured_usize(
+            "FERROSA_SSTABLE_COMPRESSION_THREADS",
+            default_threads,
+            MIN_COMPRESSION_THREADS,
+            MAX_COMPRESSION_THREADS,
+        );
+        match rayon::ThreadPoolBuilder::new()
             .num_threads(thread_count)
             .thread_name(|idx| format!("sstable-compress-{idx}"))
             .build()
-            .expect("failed to build SSTable compression thread pool")
+        {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::error!(%error, "failed to create SSTable compression pool; using serial compression");
+                None
+            }
+        }
     })
+    .as_ref()
 }
 
 fn compression_batch_chunks() -> usize {
-    std::env::var("FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|chunks| *chunks > 0)
-        .unwrap_or(DEFAULT_COMPRESSION_BATCH_CHUNKS)
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        configured_usize(
+            "FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS",
+            DEFAULT_COMPRESSION_BATCH_CHUNKS,
+            MIN_COMPRESSION_BATCH_CHUNKS,
+            MAX_COMPRESSION_BATCH_CHUNKS,
+        )
+    })
+}
+
+fn row_index_min_rows() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        configured_usize(
+            "FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS",
+            DEFAULT_ROW_INDEX_MIN_ROWS,
+            1,
+            MAX_ROW_INDEX_MIN_ROWS,
+        )
+    })
+}
+
+fn default_compression_chunk_bytes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        configured_usize(
+            "FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES",
+            Compression::DEFAULT_CHUNK_SIZE,
+            MIN_COMPRESSION_CHUNK_BYTES,
+            MAX_COMPRESSION_CHUNK_BYTES,
+        )
+    })
 }
 
 /// Whether Data.db is written through the page-cache-bypassing
@@ -756,7 +843,7 @@ impl Default for WriteOptions {
         WriteOptions {
             compression: Some(Compression::Lz4),
             bloom_fp_chance: 0.01,
-            chunk_size: 65536,
+            chunk_size: default_compression_chunk_bytes(),
             verify_output: true,
         }
     }
@@ -1593,8 +1680,8 @@ impl SSTableWriter {
     /// Serialize a single partition to the data buffer.
     fn serialize_partition(&mut self, partition: &Partition, data_pos: u64) -> Result<Option<u64>> {
         let row_index_start = self.row_trie.sink_mut().len();
-        let build_row_index =
-            !self.header.clustering_types.is_empty() && partition.rows.len() >= ROW_INDEX_MIN_ROWS;
+        let build_row_index = !self.header.clustering_types.is_empty()
+            && partition.rows.len() >= row_index_min_rows();
 
         // Key: u16 BE length + key bytes
         let key_bytes = partition.key.key.as_bytes();
@@ -2068,8 +2155,10 @@ impl SSTableWriter {
                     if batch.is_empty() {
                         return Ok(());
                     }
-                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
-                        .install(|| {
+                    let compressed_chunks: Result<Vec<CompressedChunk>> = if let Some(pool) =
+                        compression_pool()
+                    {
+                        pool.install(|| {
                             batch
                                 .par_iter()
                                 .map(|chunk| {
@@ -2083,7 +2172,22 @@ impl SSTableWriter {
                                     })
                                 })
                                 .collect()
-                        });
+                        })
+                    } else {
+                        batch
+                            .iter()
+                            .map(|chunk| {
+                                let payload = compression.compress(chunk)?;
+                                let crc = crc32fast::hash(&payload).to_be_bytes();
+                                let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                Ok(CompressedChunk {
+                                    payload,
+                                    crc,
+                                    stored_size,
+                                })
+                            })
+                            .collect()
+                    };
 
                     for chunk in compressed_chunks? {
                         chunk_offsets.push(compressed_data.len() as u64);
@@ -2168,8 +2272,10 @@ impl SSTableWriter {
                     if batch.is_empty() {
                         return Ok(());
                     }
-                    let compressed_chunks: Result<Vec<CompressedChunk>> = compression_pool()
-                        .install(|| {
+                    let compressed_chunks: Result<Vec<CompressedChunk>> = if let Some(pool) =
+                        compression_pool()
+                    {
+                        pool.install(|| {
                             batch
                                 .par_iter()
                                 .map(|chunk| {
@@ -2183,7 +2289,22 @@ impl SSTableWriter {
                                     })
                                 })
                                 .collect()
-                        });
+                        })
+                    } else {
+                        batch
+                            .iter()
+                            .map(|chunk| {
+                                let payload = compression.compress(chunk)?;
+                                let crc = crc32fast::hash(&payload).to_be_bytes();
+                                let stored_size = payload.len() + std::mem::size_of::<u32>();
+                                Ok(CompressedChunk {
+                                    payload,
+                                    crc,
+                                    stored_size,
+                                })
+                            })
+                            .collect()
+                    };
 
                     for chunk in compressed_chunks? {
                         chunk_offsets.push(file.position());
@@ -2515,6 +2636,29 @@ mod tests {
     use crate::types::{DeletionTime, LivenessInfo, Row};
     use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
     use proptest::prelude::*;
+
+    #[test]
+    fn tuning_values_enforce_bounds_and_default_on_invalid_input() {
+        assert_eq!(value_or_default(Some("64"), 16, 1, 64), 64);
+        assert_eq!(value_or_default(Some("0"), 16, 1, 64), 16);
+        assert_eq!(value_or_default(Some("65"), 16, 1, 64), 16);
+        assert_eq!(value_or_default(Some("invalid"), 16, 1, 64), 16);
+        assert_eq!(value_or_default(None, 16, 1, 64), 16);
+    }
+
+    #[test]
+    fn write_options_default_uses_cassandra_chunk_default() {
+        let configured = std::env::var("FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES").ok();
+        assert_eq!(
+            WriteOptions::default().chunk_size,
+            value_or_default(
+                configured.as_deref(),
+                Compression::DEFAULT_CHUNK_SIZE,
+                MIN_COMPRESSION_CHUNK_BYTES,
+                MAX_COMPRESSION_CHUNK_BYTES,
+            )
+        );
+    }
 
     #[test]
     fn component_pump_all_components_mode_parity() {

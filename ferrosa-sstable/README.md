@@ -406,3 +406,27 @@ unchanged 64 MiB row test measures zero allocations; existing pump allocation
 and cancellation gates remain unchanged. The compressed steady-state gate
 still detects one Rayon external-job injection allocation per measured run;
 that scheduling issue remains separate from metadata serialization.
+
+`CompressionInfo::read` rejects negative signed fields, non-positive chunk
+lengths, inconsistent chunk counts, and offset lists that are not zero-based
+and strictly increasing. It validates the encoded option/offset extents before
+walking them or allocating the offset vector. The `fuzz/` package keeps
+`sstable_offsets` and `checksum_parsing` targets seeded from the checked-in
+golden SSTables; the offset target pairs mutated metadata with the golden
+Data.db and compares any accepted chunk reads with the golden decoded bytes.
+
+The writer accepts these process-start tuning variables; each value is read
+once and an invalid value logs an error before falling back to its default:
+
+| Variable | Default | Accepted values |
+|---|---:|---:|
+| `FERROSA_SSTABLE_COMPRESSION_CHUNK_BYTES` | 16 KiB | 1 KiB–1 MiB |
+| `FERROSA_SSTABLE_COMPRESSION_BATCH_CHUNKS` | 16 | 1–64 |
+| `FERROSA_SSTABLE_COMPRESSION_THREADS` | available CPUs, capped at 4 | 1–4 |
+| `FERROSA_SSTABLE_ROW_INDEX_MIN_ROWS` | 32 | 1–4096 |
+
+A schema's explicit `compression.chunk_length_kb` setting takes precedence over
+the chunk-size environment variable. Larger chunks reduce chunk and index
+operations while increasing read amplification. File-format values such as
+CRC width, offset encoding, chunk ordering, and row serialization flags remain
+fixed for compatibility.

@@ -46,13 +46,28 @@ fn read_compressed_chunk<R: ReadAt>(
         .get(chunk_index + 1)
         .copied()
         .unwrap_or(compressed_file_len);
+    if chunk_offset > compressed_file_len || next_offset > compressed_file_len {
+        return Err(ferrosa_common::Error::InvalidFormat(format!(
+            "compressed chunk offset exceeds Data.db length at index {chunk_index}"
+        )));
+    }
     if next_offset < chunk_offset {
         return Err(ferrosa_common::Error::InvalidFormat(format!(
             "compressed chunk offsets are not monotonic at index {chunk_index}"
         )));
     }
 
-    let chunk_size = (next_offset - chunk_offset) as usize;
+    let chunk_size = usize::try_from(next_offset - chunk_offset).map_err(|_| {
+        ferrosa_common::Error::InvalidFormat(format!(
+            "compressed chunk length overflows address space at index {chunk_index}"
+        ))
+    })?;
+    if chunk_size > ci.max_compressed_size {
+        return Err(ferrosa_common::Error::InvalidFormat(format!(
+            "compressed chunk length {chunk_size} exceeds declared maximum {} at index {chunk_index}",
+            ci.max_compressed_size
+        )));
+    }
     if chunk_size < std::mem::size_of::<u32>() {
         return Err(ferrosa_common::Error::InvalidFormat(
             "compressed chunk shorter than CRC trailer".into(),
@@ -64,6 +79,21 @@ fn read_compressed_chunk<R: ReadAt>(
 
     let payload_len = chunk_size - std::mem::size_of::<u32>();
     let payload = &compressed[..payload_len];
+    if matches!(ci.compression, crate::compression::Compression::Lz4) {
+        let prefix = payload.get(..4).ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(
+                "compressed chunk shorter than LZ4 length prefix".into(),
+            )
+        })?;
+        let declared_len =
+            u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        if declared_len > ci.chunk_length {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "LZ4 chunk declares {declared_len} uncompressed bytes, above chunk length {}",
+                ci.chunk_length
+            )));
+        }
+    }
     let stored_crc = u32::from_be_bytes([
         compressed[payload_len],
         compressed[payload_len + 1],
@@ -78,7 +108,14 @@ fn read_compressed_chunk<R: ReadAt>(
     }
 
     let chunk = ci.compression.decompress(payload, ci.chunk_length)?;
-    let chunk_start = chunk_index as u64 * ci.chunk_length as u64;
+    let chunk_start = u64::try_from(chunk_index)
+        .ok()
+        .and_then(|index| index.checked_mul(ci.chunk_length as u64))
+        .ok_or_else(|| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "uncompressed chunk offset overflows at index {chunk_index}"
+            ))
+        })?;
     let max_len = ci.data_length.saturating_sub(chunk_start);
     if chunk.len() as u64 > max_len.min(ci.chunk_length as u64) {
         return Err(ferrosa_common::Error::InvalidData(format!(
@@ -87,6 +124,19 @@ fn read_compressed_chunk<R: ReadAt>(
         )));
     }
     Ok(chunk)
+}
+
+/// Test seam for the offset-fuzz target. This is absent from normal builds and
+/// delegates to the same chunk reader used by `SSTableReader`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_read_compressed_chunk<R: ReadAt>(
+    data: &R,
+    ci: &CompressionInfo,
+    compressed_file_len: u64,
+    chunk_index: usize,
+) -> Result<Vec<u8>> {
+    read_compressed_chunk(data, ci, compressed_file_len, chunk_index)
 }
 
 struct ChunkedCompressedData<'a, R: ReadAt> {
@@ -1994,6 +2044,38 @@ mod tests {
         fn len(&self) -> Result<u64> {
             Ok(self.data.len() as u64)
         }
+    }
+
+    #[test]
+    fn compressed_chunk_rejects_out_of_file_extent_before_reading() {
+        let data = CountingReadAt::new(Vec::new());
+        let info = CompressionInfo {
+            compression: crate::compression::Compression::Lz4,
+            chunk_length: 16,
+            max_compressed_size: usize::MAX,
+            data_length: 32,
+            chunk_offsets: vec![0, u64::MAX],
+        };
+
+        assert!(read_compressed_chunk(&data, &info, 0, 0).is_err());
+        assert_eq!(data.bytes_read(), 0);
+    }
+
+    #[test]
+    fn compressed_chunk_rejects_oversized_lz4_length_before_decompression() {
+        let payload = u32::MAX.to_le_bytes();
+        let mut data = payload.to_vec();
+        data.extend_from_slice(&crc32fast::hash(&payload).to_be_bytes());
+        let data = CountingReadAt::new(data);
+        let info = CompressionInfo {
+            compression: crate::compression::Compression::Lz4,
+            chunk_length: 4096,
+            max_compressed_size: 8,
+            data_length: 4096,
+            chunk_offsets: vec![0],
+        };
+
+        assert!(read_compressed_chunk(&data, &info, 8, 0).is_err());
     }
 
     #[test]

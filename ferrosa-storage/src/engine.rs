@@ -233,7 +233,7 @@ pub(crate) fn write_options_for_schema(
         .and_then(|v| v.parse::<usize>().ok())
         .map(|kb| kb.saturating_mul(1024))
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(ferrosa_sstable::Compression::DEFAULT_CHUNK_SIZE);
+        .unwrap_or_else(|| ferrosa_sstable::WriteOptions::default().chunk_size);
 
     Ok(ferrosa_sstable::WriteOptions {
         compression,
@@ -246,6 +246,18 @@ pub(crate) fn write_options_for_schema(
 fn compression_from_schema(
     schema: &TableSchema,
 ) -> ferrosa_common::Result<Option<ferrosa_sstable::Compression>> {
+    if let Some(enabled) = schema.extensions.get("compression.enabled") {
+        let enabled = enabled.trim();
+        if enabled.eq_ignore_ascii_case("false") || enabled == "0" {
+            return Ok(None);
+        } else if !enabled.eq_ignore_ascii_case("true") && enabled != "1" {
+            tracing::error!(
+                value = enabled,
+                "invalid compression.enabled schema value; treating compression as enabled"
+            );
+        }
+    }
+
     let Some(class) = schema
         .extensions
         .get("compression.class")
@@ -13276,6 +13288,35 @@ mod tests {
             Some(ferrosa_sstable::Compression::Lz4)
         ));
         assert!(options.verify_output);
+        assert_eq!(
+            options.chunk_size,
+            ferrosa_sstable::WriteOptions::default().chunk_size
+        );
+    }
+
+    #[test]
+    fn write_options_honor_disabled_compression_schema_extension() {
+        for enabled in ["false", "0"] {
+            let mut schema = test_schema();
+            schema
+                .extensions
+                .insert("compression.enabled".to_string(), enabled.to_string());
+            let options = write_options_for_schema(&schema, true).unwrap();
+            assert_eq!(options.compression, None, "enabled={enabled}");
+        }
+    }
+
+    #[test]
+    fn invalid_compression_enabled_uses_enabled_default() {
+        let mut schema = test_schema();
+        schema
+            .extensions
+            .insert("compression.enabled".to_string(), "perhaps".to_string());
+        let options = write_options_for_schema(&schema, true).unwrap();
+        assert!(matches!(
+            options.compression,
+            Some(ferrosa_sstable::Compression::Lz4)
+        ));
     }
 
     #[test]

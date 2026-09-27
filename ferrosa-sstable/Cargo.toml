@@ -51,6 +51,8 @@ test-support = []
 # ferrosa-sstable --release --features test-support,loom pump_loom_` — no
 # RUSTFLAGS needed, and none of `tokio`'s own loom-gated code is touched.
 loom = ["dep:loom"]
+# Exposes the compressed-chunk reader seam only to the cargo-fuzz target.
+fuzzing = []
 
 [dev-dependencies]
 # Enables `ferrosa_common::test_generators` (shared CellValue/DecoratedKey

@@ -311,104 +311,107 @@ pub struct CompressionInfo {
 
 impl CompressionInfo {
     /// Read CompressionInfo from a byte buffer.
+    ///
+    /// Counts and lengths are validated before conversion or allocation. In
+    /// particular, the offset vector is allocated only after its encoded byte
+    /// extent has been checked against the remaining input.
     pub fn read(data: &[u8]) -> Result<Self> {
         let mut pos = 0;
 
         // Compressor name: Java UTF-8 (u16 len + bytes)
-        if data.len() < pos + 2 {
-            return Err(Error::InvalidFormat(
-                "truncated compressor name length".into(),
-            ));
-        }
-        let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        if data.len() < pos + name_len {
-            return Err(Error::InvalidFormat("truncated compressor name".into()));
-        }
-        let name = std::str::from_utf8(&data[pos..pos + name_len])
+        let name_len = usize::from(u16::from_be_bytes(take_array::<2>(
+            data,
+            &mut pos,
+            "compressor name length",
+        )?));
+        let name_bytes = take_bytes(data, &mut pos, name_len, "compressor name")?;
+        let name = std::str::from_utf8(name_bytes)
             .map_err(|e| Error::InvalidFormat(format!("invalid compressor name UTF-8: {e}")))?;
-        pos += name_len;
-
         let compression = Compression::from_compressor_name(name)?;
 
         // Option count: i32
-        if data.len() < pos + 4 {
-            return Err(Error::InvalidFormat("truncated option count".into()));
+        let option_count = i32::from_be_bytes(take_array::<4>(data, &mut pos, "option count")?);
+        let option_count = usize::try_from(option_count)
+            .map_err(|_| Error::InvalidFormat("negative compression option count".into()))?;
+        let min_option_bytes = option_count.checked_mul(4).ok_or_else(|| {
+            Error::InvalidFormat("compression option count overflows size".into())
+        })?;
+        if min_option_bytes > data.len().saturating_sub(pos) {
+            return Err(Error::InvalidFormat(
+                "compression option count exceeds remaining input".into(),
+            ));
         }
-        let option_count =
-            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        pos += 4;
 
         // Skip options (key-value pairs, each Java UTF-8)
         for _ in 0..option_count {
             for _ in 0..2 {
-                if data.len() < pos + 2 {
-                    return Err(Error::InvalidFormat("truncated option".into()));
-                }
-                let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-                pos += 2 + len;
+                let len = usize::from(u16::from_be_bytes(take_array::<2>(
+                    data,
+                    &mut pos,
+                    "option length",
+                )?));
+                take_bytes(data, &mut pos, len, "option value")?;
             }
         }
 
         // Chunk length: i32
-        if data.len() < pos + 4 {
-            return Err(Error::InvalidFormat("truncated chunk length".into()));
-        }
-        let chunk_length =
-            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
+        let chunk_length = i32::from_be_bytes(take_array::<4>(data, &mut pos, "chunk length")?);
+        let chunk_length = usize::try_from(chunk_length)
+            .ok()
+            .filter(|&length| length > 0)
+            .ok_or_else(|| Error::InvalidFormat("chunk length must be positive".into()))?;
 
         // Max compressed size: i32
-        if data.len() < pos + 4 {
-            return Err(Error::InvalidFormat("truncated max compressed size".into()));
-        }
         let max_compressed_size =
-            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
+            i32::from_be_bytes(take_array::<4>(data, &mut pos, "max compressed size")?);
+        let max_compressed_size = usize::try_from(max_compressed_size)
+            .map_err(|_| Error::InvalidFormat("negative max compressed size".into()))?;
 
         // Data length: i64
-        if data.len() < pos + 8 {
-            return Err(Error::InvalidFormat("truncated data length".into()));
-        }
-        let data_length = i64::from_be_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]) as u64;
-        pos += 8;
+        let data_length = i64::from_be_bytes(take_array::<8>(data, &mut pos, "data length")?);
+        let data_length = u64::try_from(data_length)
+            .map_err(|_| Error::InvalidFormat("negative data length".into()))?;
 
         // Chunk count: i32
-        if data.len() < pos + 4 {
-            return Err(Error::InvalidFormat("truncated chunk count".into()));
-        }
-        let chunk_count =
-            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
+        let chunk_count = i32::from_be_bytes(take_array::<4>(data, &mut pos, "chunk count")?);
+        let chunk_count = usize::try_from(chunk_count)
+            .map_err(|_| Error::InvalidFormat("negative chunk count".into()))?;
 
         // Chunk offsets: i64[chunk_count]
+        let offset_bytes = chunk_count
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or_else(|| Error::InvalidFormat("chunk offset count overflows size".into()))?;
+        if offset_bytes > data.len().saturating_sub(pos) {
+            return Err(Error::InvalidFormat(
+                "chunk offset count exceeds remaining input".into(),
+            ));
+        }
+        let chunk_length_u64 = chunk_length as u64;
+        let expected_chunk_count = data_length / chunk_length_u64
+            + if data_length % chunk_length_u64 == 0 {
+                0
+            } else {
+                1
+            };
+        if usize::try_from(expected_chunk_count).ok() != Some(chunk_count) {
+            return Err(Error::InvalidFormat(
+                "chunk count does not match data length and chunk length".into(),
+            ));
+        }
+
         let mut chunk_offsets = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
-            if data.len() < pos + 8 {
-                return Err(Error::InvalidFormat("truncated chunk offset".into()));
-            }
-            let offset = i64::from_be_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]) as u64;
+            let offset = i64::from_be_bytes(take_array::<8>(data, &mut pos, "chunk offset")?);
+            let offset = u64::try_from(offset)
+                .map_err(|_| Error::InvalidFormat("negative chunk offset".into()))?;
             chunk_offsets.push(offset);
-            pos += 8;
+        }
+        if chunk_offsets.first().is_some_and(|&offset| offset != 0)
+            || chunk_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::InvalidFormat(
+                "chunk offsets must start at zero and increase strictly".into(),
+            ));
         }
 
         Ok(CompressionInfo {
@@ -437,6 +440,23 @@ impl CompressionInfo {
         }
         Ok(buf)
     }
+}
+
+fn take_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize, field: &str) -> Result<&'a [u8]> {
+    let end = (*pos)
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidFormat(format!("{field} length overflows size")))?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| Error::InvalidFormat(format!("truncated {field}")))?;
+    *pos = end;
+    Ok(bytes)
+}
+
+fn take_array<const N: usize>(data: &[u8], pos: &mut usize, field: &str) -> Result<[u8; N]> {
+    take_bytes(data, pos, N, field)?
+        .try_into()
+        .map_err(|_| Error::InvalidFormat(format!("truncated {field}")))
 }
 
 /// Everything in `CompressionInfo.db` before the offset list: compressor
@@ -545,6 +565,109 @@ mod tests {
         assert_eq!(parsed.max_compressed_size, 16393);
         assert_eq!(parsed.data_length, 65536);
         assert_eq!(parsed.chunk_offsets, vec![0, 4096, 8192, 12000]);
+    }
+
+    #[test]
+    fn compression_info_rejects_negative_lengths_and_counts() {
+        let valid = CompressionInfo {
+            compression: Compression::Lz4,
+            chunk_length: 16,
+            max_compressed_size: 20,
+            data_length: 32,
+            chunk_offsets: vec![0, 24],
+        }
+        .write()
+        .unwrap();
+        let fields = compression_info_field_offsets(&valid);
+
+        for (offset, value) in [
+            (fields.option_count, -1_i32),
+            (fields.chunk_length, -1),
+            (fields.max_compressed_size, -1),
+            (fields.data_length, -1),
+            (fields.chunk_count, -1),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            assert!(CompressionInfo::read(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn compression_info_checks_counts_before_allocating_offsets() {
+        let valid = CompressionInfo {
+            compression: Compression::Lz4,
+            chunk_length: 16,
+            max_compressed_size: 20,
+            data_length: 32,
+            chunk_offsets: vec![0, 24],
+        }
+        .write()
+        .unwrap();
+        let fields = compression_info_field_offsets(&valid);
+
+        let mut too_many_options = valid.clone();
+        too_many_options[fields.option_count..fields.option_count + 4]
+            .copy_from_slice(&i32::MAX.to_be_bytes());
+        assert!(CompressionInfo::read(&too_many_options).is_err());
+
+        let mut too_many_offsets = valid;
+        too_many_offsets[fields.chunk_count..fields.chunk_count + 4]
+            .copy_from_slice(&i32::MAX.to_be_bytes());
+        assert!(CompressionInfo::read(&too_many_offsets).is_err());
+    }
+
+    #[test]
+    fn compression_info_rejects_negative_and_non_monotonic_offsets() {
+        let valid = CompressionInfo {
+            compression: Compression::Lz4,
+            chunk_length: 16,
+            max_compressed_size: 20,
+            data_length: 32,
+            chunk_offsets: vec![0, 24],
+        }
+        .write()
+        .unwrap();
+        let fields = compression_info_field_offsets(&valid);
+
+        let mut negative = valid.clone();
+        negative[fields.offsets..fields.offsets + 8].copy_from_slice(&(-1_i64).to_be_bytes());
+        assert!(CompressionInfo::read(&negative).is_err());
+
+        let mut nonzero_start = valid.clone();
+        nonzero_start[fields.offsets..fields.offsets + 8].copy_from_slice(&1_i64.to_be_bytes());
+        assert!(CompressionInfo::read(&nonzero_start).is_err());
+
+        let mut duplicate = valid;
+        duplicate[fields.offsets + 8..fields.offsets + 16].copy_from_slice(&0_i64.to_be_bytes());
+        assert!(CompressionInfo::read(&duplicate).is_err());
+    }
+
+    struct CompressionInfoFieldOffsets {
+        option_count: usize,
+        chunk_length: usize,
+        max_compressed_size: usize,
+        data_length: usize,
+        chunk_count: usize,
+        offsets: usize,
+    }
+
+    fn compression_info_field_offsets(bytes: &[u8]) -> CompressionInfoFieldOffsets {
+        let name_length = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+        let option_count = 2 + name_length;
+        let chunk_length = option_count + 4;
+        let max_compressed_size = chunk_length + 4;
+        let data_length = max_compressed_size + 4;
+        let chunk_count = data_length + 8;
+        let offsets = chunk_count + 4;
+        CompressionInfoFieldOffsets {
+            option_count,
+            chunk_length,
+            max_compressed_size,
+            data_length,
+            chunk_count,
+            offsets,
+        }
     }
 
     #[test]
