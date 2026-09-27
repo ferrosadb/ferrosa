@@ -149,3 +149,7 @@ cluster/integration suites, not from here. One in-code `TODO` remains
 - [Data flow](specs/data-flow.md) — startup sequence wiring the crates + listeners
 - [FMEA / known issues](specs/fmea.md) — startup-ordering, auth kill-switch, port-binding, partial-boot risks
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+### Pump wiring acceptance (T-045)
+
+The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.

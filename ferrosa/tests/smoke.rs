@@ -44,9 +44,13 @@ fn column_index(result: &QueryResult, name: &str) -> Option<usize> {
 /// Create storage engine, schema, and shared state for a test.
 /// Returns the shared state and the TempDir (must be kept alive).
 fn setup_state() -> (Arc<SharedState>, TempDir) {
+    setup_state_with_log_segment(4096)
+}
+
+fn setup_state_with_log_segment(segment_size: usize) -> (Arc<SharedState>, TempDir) {
     let dir = TempDir::new().unwrap();
     let commit_log = CommitLogConfig {
-        segment_size: 4096,
+        segment_size,
         max_segment_age: std::time::Duration::from_secs(60),
         sync_strategy: SyncStrategyConfig::Batch,
         batch: Default::default(),
@@ -85,6 +89,10 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         })
         .unwrap(),
     );
+    (setup_state_for(engine, schema), dir)
+}
+
+fn setup_state_for(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> Arc<SharedState> {
     let node_config = Arc::new(NodeConfig {
         cluster_name: "smoke-test".into(),
         data_center: "dc1".into(),
@@ -104,7 +112,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         Arc::new(ferrosa_udf::UdfExecutor::new(ferrosa_udf::SandboxConfig::default()).unwrap());
     let mode_controller =
         ferrosa_cluster::ModeController::standalone_for_test(schema.clone(), engine.clone());
-    let state = Arc::new(SharedState {
+    Arc::new(SharedState {
         core: Arc::new(ferrosa_session::SessionCore {
             engine: engine.clone(),
             schema: schema.clone(),
@@ -135,8 +143,7 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         topology_policy: ClientTopologyPolicy::default(),
         txn_registry: ferrosa_cql::txn_registry::TransactionRegistry::shared_default(),
         cql_metrics: Arc::new(ferrosa_cql::observability::CqlMetrics::new()),
-    });
-    (state, dir)
+    })
 }
 
 /// Server config with auth disabled, binding to a random port.
@@ -497,3 +504,6 @@ async fn bt004_standalone_concurrent_sessions() {
         );
     }
 }
+
+#[path = "smoke/wiring.rs"]
+mod wiring;

@@ -50,3 +50,7 @@ own their own internal FMEAs.
 - `ferrosa-net` `default_bind_port_is_not_7000` guard (FE-6).
 - `apply_internode_toml_overrides_sets_other_fields` pins TOML broadcast
   propagation into the handshake advertisement (FE-10).
+
+### Pump wiring acceptance (T-045)
+
+The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.

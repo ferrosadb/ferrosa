@@ -116,3 +116,7 @@ drains cluster tasks → internode → memtables → schema in a 30 s timeout wi
 `ferrosa-sparql`, `ferrosa-storage`, `ferrosa-udf`. Depended on by nothing — it
 is the binary. See the [root crate index](../../specs/crates.md) for the full
 graph.
+
+### Pump wiring acceptance (T-045)
+
+The CQL wiring acceptance test writes compressed and plain tables through a real client/server, includes a row larger than a pump segment, flushes and compacts, tears down the first runtime, and verifies all rows through a reopened engine and fresh server.
